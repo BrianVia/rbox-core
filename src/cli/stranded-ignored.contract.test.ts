@@ -84,6 +84,7 @@ function readPort<M extends StatusMode>(mode: M = "json" as M): StatusReadPort<M
         ownership: "stopped" as const,
         running: false,
         stale: false,
+        ownsRoot: false,
         ownsWorkspace: false,
         sidecarBinding: "absent" as const,
         ambient: { kind: "absent" as const },

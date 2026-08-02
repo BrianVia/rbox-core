@@ -45,9 +45,10 @@ type DaemonSidecarBinding =
 /**
  * The single read-only answer about a workspace daemon.
  *
- * `running` proves an exact root-scoped process. `ownsWorkspace` additionally
- * proves its startup binding. `trustedAmbient` is present only when the ambient
- * record belongs to that live incarnation and its heartbeat is current.
+ * `running` proves an exact root-scoped process. `ownsRoot` adds that the
+ * process is not bound to some OTHER workspace; `ownsWorkspace` additionally
+ * proves a matching startup binding. `trustedAmbient` is present only when the
+ * ambient record belongs to that live incarnation and its heartbeat is current.
  */
 export interface DaemonObservation {
   ownership: DaemonOwnership;
@@ -58,6 +59,15 @@ export interface DaemonObservation {
   /** Compatibility/user-facing meaning: a live daemon explicitly bound to a
    * different workspace. Missing or boot-untrusted binding remains unknown. */
   stale: boolean;
+  /** Live here and not bound elsewhere. The binding record is absent for the
+   * whole of daemon startup (`rbox start` clears it before spawning and the
+   * child rewrites it after loading its hash cache), so requiring it in the
+   * POSITIVE direction would silence a starting daemon's own halt and call it
+   * stuck. The root-scoped pid probe is the stronger half of the proof; only an
+   * explicit foreign binding refuses. */
+  ownsRoot: boolean;
+  /** Live here WITH a matching startup binding. The stricter form, used where a
+   * claim depends on the binding itself (display elision, local snapshots). */
   ownsWorkspace: boolean;
   /** Binding-only attribution for daemon-owned sidecars such as logs and
    * metrics. Unlike process ownership, this remains meaningful after exit. */
@@ -106,7 +116,7 @@ function ambientTrustOf(
   if (ambient.kind === "absent") return { trust: "absent" };
   if (ambient.kind === "corrupt") return { trust: "corrupt" };
   if (ownership === "stopped") return { trust: "daemon-stopped" };
-  if (ownership !== "owned") return { trust: "binding-untrusted" };
+  if (ownership === "wrong-workspace") return { trust: "binding-untrusted" };
   if (pid.bootId === undefined) return { trust: "pid-boot-unbound" };
   if (ambient.status.bootId === undefined) return { trust: "ambient-boot-unbound" };
   if (ambient.status.bootId !== pid.bootId) return { trust: "boot-mismatch" };
@@ -143,6 +153,7 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
       ? { boundWorkspaceId: snapshot.binding.workspaceId }
       : {}),
     stale,
+    ownsRoot: running && !stale,
     ownsWorkspace: ownership === "owned",
     sidecarBinding: sidecarBindingOf(snapshot.binding, snapshot.expectedWorkspaceId),
     ambient: snapshot.ambient,

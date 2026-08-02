@@ -18,7 +18,7 @@ import {
   syncStreamId,
   type WorkspaceConfig,
 } from "./config.js";
-import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
+import { observeDaemon, type DaemonObservation, type DaemonObservationDeps } from "./daemon/observation.js";
 import { readMergedDaemonLogTail } from "./daemon-control.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { scopeProjectionFor } from "./scope/projection.js";
@@ -55,11 +55,15 @@ type WorkspaceObservation = AmbientWorkspaceObservation | LocalWorkspaceObservat
 interface AmbientObservationRequest {
   depth?: "ambient";
   now?: number;
+  /** The daemon record/process reads. Injecting them here — rather than around
+   * the observation — keeps the authorization rule itself unstubbable. */
+  daemon?: DaemonObservationDeps;
 }
 
 interface LocalObservationRequest {
   depth: "local";
   now?: number;
+  daemon?: DaemonObservationDeps;
 }
 
 async function readDeferrals(
@@ -99,9 +103,10 @@ export async function observeWorkspace(
 ): Promise<WorkspaceObservation> {
   const observedAt = request.now ?? Date.now();
   const config = await loadConfig(root);
-  const daemon = observeDaemon(root, config.remoteWorkspaceId, observedAt);
-  const reobserveDaemon = () => observeDaemon(root, config.remoteWorkspaceId, Date.now());
-  const activityAuthorized = (current: DaemonObservation) => !current.running || current.ownsWorkspace;
+  const daemonDeps = request.daemon ?? {};
+  const daemon = observeDaemon(root, config.remoteWorkspaceId, observedAt, daemonDeps);
+  const reobserveDaemon = () => observeDaemon(root, config.remoteWorkspaceId, Date.now(), daemonDeps);
+  const activityAuthorized = (current: DaemonObservation) => !current.running || current.ownsRoot;
   // Missing bindings are a supported legacy/stopped-residue case. Foreign and
   // unreadable bindings fail closed, both before and after the physical reads.
   const sidecarsAuthorized = (current: DaemonObservation) =>

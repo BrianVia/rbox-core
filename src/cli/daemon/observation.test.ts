@@ -117,24 +117,44 @@ test("one closed observation proves process, binding, boot, freshness, version, 
 });
 
 test("process and binding failures cannot lend trust to daemon sidecars", () => {
-  const rows: Array<[string, Partial<ObservationInput>, string, boolean]> = [
-    ["dead/reused pid", { processMatches: false }, "stopped", false],
-    ["missing pid", { pid: { present: false } }, "stopped", false],
-    ["missing binding", { binding: { present: false } }, "unbound", false],
-    ["wrong workspace", { binding: { present: true, workspaceId: "ws_old", version: "legacy" } }, "wrong-workspace", true],
+  // `ownsRoot` is the base-compatible attribution gate: only a DEAD daemon or an
+  // explicitly foreign binding withholds a live daemon's own records. Startup and
+  // mixed-format bindings stay readable, and only `ownsWorkspace` narrows to a
+  // proven binding.
+  const rows: Array<[string, Partial<ObservationInput>, string, boolean, boolean]> = [
+    ["dead/reused pid", { processMatches: false }, "stopped", false, false],
+    ["missing pid", { pid: { present: false } }, "stopped", false, false],
+    ["missing binding", { binding: { present: false } }, "unbound", false, true],
+    ["wrong workspace", { binding: { present: true, workspaceId: "ws_old", version: "legacy" } }, "wrong-workspace", true, false],
     ["v2 pid with legacy binding", {
       binding: { present: true, workspaceId: "ws_live", version: "legacy" },
-    }, "record-format-mismatch", false],
+    }, "record-format-mismatch", false, true],
     ["legacy pid with v2 binding", {
       pid: { present: true, pid: 42, version: "legacy" },
-    }, "record-format-mismatch", false],
+    }, "record-format-mismatch", false, true],
   ];
-  for (const [name, over, ownership, stale] of rows) {
+  for (const [name, over, ownership, stale, ownsRoot] of rows) {
     const observed = observedDaemon(over);
     expect(`${name}:${observed.ownership}:${observed.stale}`).toBe(`${name}:${ownership}:${stale}`);
+    expect(`${name}:${observed.ownsRoot}`).toBe(`${name}:${ownsRoot}`);
     expect(observed.ownsWorkspace).toBe(false);
-    expect(observed.trustedAmbient).toBeUndefined();
   }
+});
+
+test("a live daemon still in startup keeps its ambient record trustworthy", () => {
+  // `rbox start` clears the binding before spawning; the child rewrites it only
+  // after loading its hash cache. Its own status record stays evidence.
+  const starting = observedDaemon({ binding: { present: false } });
+  expect(starting.ownership).toBe("unbound");
+  expect(starting.ownsRoot).toBe(true);
+  expect(starting.ownsWorkspace).toBe(false);
+  expect(starting.ambientTrust).toBe("trusted");
+  expect(starting.trustedAmbient?.bootId).toBe("boot-live");
+
+  const foreign = observedDaemon({ binding: { present: true, workspaceId: "ws_old", version: "legacy" } });
+  expect(foreign.ownsRoot).toBe(false);
+  expect(foreign.ambientTrust).toBe("binding-untrusted");
+  expect(foreign.trustedAmbient).toBeUndefined();
 });
 
 test("binding boot metadata cannot override the pidfile incarnation", () => {

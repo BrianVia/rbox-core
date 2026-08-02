@@ -84,7 +84,7 @@ export function unverifiedChecks(checks: DoctorChecks): string[] {
  * rebound elsewhere: a restart re-evaluates every halt and quota refusal, so
  * status drops it (status-view.ts) and diagnosis must drop it too. */
 export function daemonOwnsActivity(input: TriageInputs): boolean {
-  return input.daemon.ownsWorkspace;
+  return input.daemon.ownsRoot;
 }
 
 /** The status record describes ONE daemon incarnation, and is evidence only

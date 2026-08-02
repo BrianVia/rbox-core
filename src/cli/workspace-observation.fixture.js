@@ -18,6 +18,7 @@ const owned = (overrides = {}) => ({
   bootId: "boot-observed",
   boundWorkspaceId: CONFIG.remoteWorkspaceId,
   stale: false,
+  ownsRoot: true,
   ownsWorkspace: true,
   sidecarBinding: "workspace",
   ambient: { kind: "absent" },
@@ -57,7 +58,8 @@ mock.module("./daemon-control.js", () => ({
     counts.log++;
     if (rebindDuringSidecars) {
       current = owned({
-        ownership: "binding-mismatch",
+        ownership: "wrong-workspace",
+        ownsRoot: false,
         ownsWorkspace: false,
         stale: true,
         sidecarBinding: "other-workspace",
@@ -89,10 +91,17 @@ const ambientResult = {
   counts: { ...counts },
 };
 
-reset(owned({ ownership: "record-format-mismatch", ownsWorkspace: false, ambientTrust: "binding-untrusted" }));
+reset(owned({ ownership: "wrong-workspace", ownsRoot: false, ownsWorkspace: false, stale: true, ambientTrust: "binding-untrusted" }));
 const unowned = await observeWorkspace(ROOT, { depth: "ambient", now: NOW });
 const rejectedActivity = await unowned.readActivity();
 const unownedResult = { activity: rejectedActivity, counts: { ...counts } };
+
+// A daemon still in startup has no binding record yet; its own activity is not
+// residue, so the observation must admit it.
+reset(owned({ ownership: "unbound", ownsWorkspace: false, boundWorkspaceId: undefined }));
+const starting = await observeWorkspace(ROOT, { depth: "ambient", now: NOW });
+const startingActivity = await starting.readActivity();
+const startingResult = { activity: startingActivity?.at, counts: { ...counts } };
 
 reset();
 const local = await observeWorkspace(ROOT, { depth: "local", now: NOW });
@@ -107,7 +116,7 @@ const localResult = {
 
 reset();
 const rebound = await observeWorkspace(ROOT, { depth: "local", now: NOW });
-current = owned({ ownership: "binding-mismatch", ownsWorkspace: false, stale: true, sidecarBinding: "other-workspace" });
+current = owned({ ownership: "wrong-workspace", ownsRoot: false, ownsWorkspace: false, stale: true, sidecarBinding: "other-workspace" });
 const reboundSidecars = await rebound.readDaemonSidecars();
 const reboundResult = { sidecars: reboundSidecars, counts: { ...counts } };
 
@@ -117,4 +126,4 @@ rebindDuringSidecars = true;
 const racingSidecars = await racing.readDaemonSidecars();
 const raceResult = { sidecars: racingSidecars, counts: { ...counts } };
 
-process.stdout.write(JSON.stringify({ ambientResult, unownedResult, localResult, reboundResult, raceResult }));
+process.stdout.write(JSON.stringify({ ambientResult, unownedResult, startingResult, localResult, reboundResult, raceResult }));

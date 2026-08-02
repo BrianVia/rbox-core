@@ -47,6 +47,7 @@ const STOPPED: DaemonObservation = {
   ownership: "stopped",
   running: false,
   stale: false,
+  ownsRoot: false,
   ownsWorkspace: false,
   sidecarBinding: "absent",
   ambientTrust: "absent",
@@ -61,6 +62,7 @@ const inputs = (over: Partial<TriageInputs> = {}): TriageInputs => ({
     ownership: "owned",
     running: true,
     stale: false,
+    ownsRoot: true,
     ownsWorkspace: true,
     sidecarBinding: "workspace",
     pid: LIVE_PID,
@@ -85,31 +87,28 @@ const workspaceConfig = () => ({
 });
 
 /** Drive the single liveness/binding seam. A `boundTo` differing from this
- * root's workspace id reproduces a daemon that rebound elsewhere. */
-function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string }) {
+ * root's workspace id reproduces a daemon that rebound elsewhere; `unbound`
+ * reproduces a daemon that has not written its startup binding yet. The
+ * records are injected INTO the observation, so the authorization rule that
+ * admits or drops daemon-owned residue is the production one. */
+function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string; unbound?: boolean }) {
+  const daemon = {
+    readPid: () => opts.running
+      ? { present: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT, version: "v2" as const }
+      : { present: false },
+    readBinding: () => opts.running && opts.unbound !== true
+      ? {
+        present: true,
+        workspaceId: opts.boundTo ?? workspaceConfig().remoteWorkspaceId,
+        bootId: opts.bootId ?? BOOT,
+        version: "v2" as const,
+      }
+      : { present: false },
+    processMatches: () => opts.running,
+  };
   return {
-    observeWorkspace: async (observedRoot: string, request: { depth: "local"; now?: number }) => {
-      const observed = await observeWorkspaceState(observedRoot, request);
-      const daemon = observeDaemonState(observedRoot, observed.config.remoteWorkspaceId, request.now, {
-        readPid: () => opts.running
-          ? { present: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT, version: "v2" }
-          : { present: false },
-        readBinding: () => opts.running
-          ? {
-            present: true,
-            workspaceId: opts.boundTo ?? observed.config.remoteWorkspaceId,
-            bootId: opts.bootId ?? BOOT,
-            version: "v2",
-          }
-          : { present: false },
-        processMatches: () => opts.running,
-      });
-      return {
-        ...observed,
-        daemon,
-        activity: daemon.running && !daemon.ownsWorkspace ? undefined : observed.activity,
-      };
-    },
+    observeWorkspace: (observedRoot: string, request: { depth: "local"; now?: number }) =>
+      observeWorkspaceState(observedRoot, { ...request, daemon }),
   };
 }
 
@@ -372,6 +371,28 @@ test("a daemon bound to another workspace also drops halt residue", async () => 
   const findings = triageWorkspace(collected).findings;
   expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
   expect(findingById(findings, "daemon-stale-binding")).toBeDefined();
+});
+
+test("a daemon that has not written its startup binding yet still reports its live halt", async () => {
+  // `rbox start` clears the previous binding before spawning, and the child
+  // rewrites it only after loading its hash cache — seconds to tens of seconds
+  // on a large workspace. A halt raised in that window is a REAL halt.
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 900 of 1000 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+  });
+  await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
+  const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, unbound: true }));
+  expect(collected.daemon.ownership).toBe("unbound");
+  expect(collected.daemon.ownsWorkspace).toBe(false);
+  expect(collected.activity?.halt?.typedReason?.kind).toBe("mass-delete");
+  expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeDefined();
 });
 
 // ---- R2 HIGH 3: ownership is ONE fresh, root-aware observation ----

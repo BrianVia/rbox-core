@@ -58,6 +58,7 @@ function contextObservation(
       ownership: "stopped",
       running: false,
       stale: false,
+      ownsRoot: false,
       ownsWorkspace: false,
       sidecarBinding,
       ambient: { kind: "absent" },

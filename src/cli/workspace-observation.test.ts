@@ -21,6 +21,10 @@ test("WorkspaceObservation keeps its construction private and its capabilities d
   expect(result.unownedResult).toEqual({
     counts: { config: 1, daemon: 2, activity: 0, state: 0, adopt: 0, log: 0, metrics: 0 },
   });
+  expect(result.startingResult).toEqual({
+    activity: new Date("2026-07-31T12:00:00.000Z").toISOString(),
+    counts: { config: 1, daemon: 3, activity: 1, state: 0, adopt: 0, log: 0, metrics: 0 },
+  });
   expect(result.localResult).toEqual({
     depth: "local",
     activity: new Date("2026-07-31T12:00:00.000Z").toISOString(),

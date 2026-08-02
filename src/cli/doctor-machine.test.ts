@@ -38,6 +38,8 @@ async function seedWorkspace(name: string, opts: {
   status?: Partial<AmbientDaemonStatusV1> & Record<string, unknown>;
   pidBootId?: string;
   withPidfile?: boolean;
+  /** Omit the startup binding, as a daemon still in startup has. */
+  withBinding?: boolean;
   /** Omit the record's boot id entirely, as a pre-design-178 daemon would. */
   noStatusBootId?: boolean;
   missing?: boolean;
@@ -61,7 +63,9 @@ async function seedWorkspace(name: string, opts: {
   }));
   if (opts.withPidfile !== false) {
     await fs.writeFile(daemonPidPath(root), `v2 ${LIVE_PID} ${opts.pidBootId ?? BOOT}\n`);
-    await fs.writeFile(daemonBoundPath(root), `v2 ${opts.boundWorkspaceId ?? workspaceId} ${opts.pidBootId ?? BOOT}\n`);
+    if (opts.withBinding !== false) {
+      await fs.writeFile(daemonBoundPath(root), `v2 ${opts.boundWorkspaceId ?? workspaceId} ${opts.pidBootId ?? BOOT}\n`);
+    }
   }
   if (opts.status) {
     await fs.writeFile(daemonStatusPath(root), JSON.stringify({
@@ -116,6 +120,15 @@ test("a future-dated heartbeat from a live daemon is not trusted either", async 
   const triage = await collectWith(true);
   expect(triage.workspaces[0]!.state).toBe("unknown");
   expect(triage.workspaces[0]!.summary).toContain("may be stuck");
+});
+
+test("a starting daemon that has not written its binding yet is reported, not called stuck", async () => {
+  const root = await seedWorkspace("starting", { status: { state: "synced" }, withBinding: false });
+  const triage = await collectWith(true);
+  const workspace = triage.workspaces[0]!;
+  expect(workspace.state).toBe("synced");
+  expect(workspace.summary).toBe("up to date");
+  expect(workspace.command).toBe(`cd ${root} && rbox doctor`);
 });
 
 test("a live daemon with a fresh record gets its plain-English line and a cd-into-it command", async () => {
