@@ -149,8 +149,9 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
   const ambient = ambientTrustOf(ownership, snapshot.pid, snapshot.ambient, snapshot.now);
   const running = ownership !== "stopped";
   const stale = ownership === "wrong-workspace";
+  const ownsRoot = running && !stale;
   const trusted = ambient.status;
-  const reportedVersion = !stale && running && snapshot.ambient.kind === "ok"
+  const reportedVersion = ownsRoot && snapshot.ambient.kind === "ok"
     && validDaemonVersion(snapshot.ambient.status.daemonVersion)
     ? snapshot.ambient.status.daemonVersion
     : undefined;
@@ -163,7 +164,7 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
       ? { boundWorkspaceId: snapshot.binding.workspaceId }
       : {}),
     stale,
-    ownsRoot: running && !stale,
+    ownsRoot,
     ownsWorkspace: ownership === "owned",
     sidecarBinding: sidecarBindingOf(snapshot.binding, snapshot.expectedWorkspaceId),
     ambient: snapshot.ambient,
