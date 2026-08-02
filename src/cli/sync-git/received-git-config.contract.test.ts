@@ -221,6 +221,20 @@ test("follow config executes while the actual common-directory lock is held", as
   });
 });
 
+test("production follow selects the common-directory-lock asserting config window", async () => {
+  const child = Bun.spawn([
+    process.execPath,
+    new URL("./follow-config-lock.fixture.js", import.meta.url).pathname,
+  ], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exit, stderr).toBe(0);
+  expect(JSON.parse(stdout)).toEqual(["applyWhileCommonDirLocked"]);
+});
+
 test("prepare observes recovery quarantining a partial fresh repository", async () => {
   let leftoverPresent = true;
   await withHarness({
@@ -315,10 +329,10 @@ test("sanitize-present resets a foreign shape before seeding the local hash", as
     incomingAbsent: true,
   }, async ({ receiver }) => {
     const transition = await receiver.recordBaseline();
-    expect(transition?.cfgSynced).not.toBe("hash-A");
-    expect(transition?.cfgApplied).toBeUndefined();
-    expect(transition?.cfgToken).toBeUndefined();
-    expect(transition?.cfgShape).toEqual(standalone);
+    expect(transition).toEqual({
+      cfgSynced: gitConfigHash({}),
+      cfgShape: standalone,
+    });
   });
 });
 

@@ -530,25 +530,49 @@ The implementation does not touch `state-plane/**`, `sync-state*`, reset,
 genesis, persisted state shapes, migration capabilities, or CAS sequencing.
 `docs/CODEMAP.md` records every changed owner.
 
-Validation at the implementation snapshot:
+Validation re-measured in the PR-remediation worktree:
 
-- TypeScript typecheck and architecture guards pass.
-- The final merged command/daemon/config compatibility set passes 303/303
-  tests.
-- Received-config contracts pass 18/18; clean-materialization contracts pass
-  25/25. The set covers mixed daemon-record formats, real dispatch parity,
-  existing/fresh clean config, journal-recovery lane rebinding, and exact
-  common-directory lock identity.
-- The wider config-pull suite remains at its recorded Bun-canary baseline:
-  the same 8 failures, with 4 passing tests after adding two new recovery
-  cases. The failures retain the capable-lineage and SQLite sidecar symptoms
-  present before this tranche.
-- The official Darwin release builder completes; compiled version/help/zsh
-  completion and the compiled TUI smoke pass.
-- Rig unit tests pass 152/153; the unrelated dated-log harvest test retains its
-  pre-existing host-shell failure. The live two-device rig is unavailable
-  because the local container service is stopped and the checkout has no dev
-  bootstrap/platform secrets.
+```text
+$ bun test ./src/cli/sync-git/received-git-config.contract.test.ts
+bun test v1.4.0-canary.1 (6c12afd8e)
+
+ 19 pass
+ 0 fail
+ 47 expect() calls
+Ran 19 tests across 1 file. [534.00ms]
+```
+
+```text
+$ bun test ./src/cli/sync-git/clean-materialization.contract.test.ts
+bun test v1.4.0-canary.1 (6c12afd8e)
+
+ 18 pass
+ 0 fail
+ 52 expect() calls
+Ran 18 tests across 1 file. [66.00ms]
+```
+
+```text
+$ bun test ./src/cli/sync-git/sync-git-config-pull.test.ts
+bun test v1.4.0-canary.1 (6c12afd8e)
+
+ 12 pass
+ 0 fail
+ 76 expect() calls
+Ran 12 tests across 1 file. [2.00s]
+```
+
+```text
+$ bun test ./scripts/rig/
+bun test v1.4.0-canary.1 (6c12afd8e)
+
+ 153 pass
+ 0 fail
+ 547 expect() calls
+Ran 153 tests across 24 files. [1074.00ms]
+```
+
+The live two-device rig was not run in this documentation-only remediation.
 
 No feature or compatibility deletion is approved by this implementation.
 
@@ -561,8 +585,10 @@ reductions without entering the U3 exclusion zone:
    pull-then-push sync. It holds one workspace lease across authenticated remote
    construction, reporting, the complete mutation, presentation completion, and
    the advisory drift check. `main-dispatch.ts` no longer imports sync engines,
-   remote construction, reports, progress projection, or the workspace mutex.
-   Only the ten reachable direct/sync mass-delete policies are representable.
+   remote construction, reports, or progress projection; it still imports
+   `withWorkspaceSyncMutex` for export, restore, and Git republish. `LocalRuntime`
+   remains the sole workspace-mutex owner for foreground pull, push, and sync.
+   Only reachable direct/sync mass-delete policies are representable.
 2. `WorkspaceObservation` owns bounded config/daemon attribution and the
    explicitly ambient/local observations shared by status and doctor. Status
    retains its reset-halt fast path and defers activity I/O until admitted.
@@ -591,26 +617,11 @@ only deletion candidates executed in this wave were internal protocols with a
 single immediate caller and no package/script/barrel consumer. All challenged
 product requirements in section 6 remain preserved pending their decisions.
 
-Validation at this wave snapshot:
-
-- TypeScript for root, API, and scripts passes; repository guards pass.
-- The integrated changed-surface run records 178 passes and 11 host failures.
-  The identical run at pre-wave commit `26316d066` records the same 178 passes
-  and the same 11 failures by name. They are the established `/var` symlink,
-  credential-safety, process-probe, and compatible-lock/deferral host baseline.
-- The new runtime policy/lease contracts, observation depth/attribution
-  contracts, received-config contracts, and clean-materialization contracts are
-  green. The wider config-pull suite remains at its exact 4-pass/8-failure
-  baseline; the shutdown suite remains at its exact 4-pass/1-failure baseline.
-- The mutation meta-gate covers 2/7 guards and refuses the other five because
-  their unmutated state-plane fixture cannot acquire a compatible lock on this
-  host (`degraded-fence`). This wave does not touch those sources.
-- The official host dev builder produces a Darwin arm64 binary. Compiled
-  version/help/zsh completion and the tmux TUI smoke pass.
-- Rig units retain their exact 152/153 baseline; dated-log harvest is the known
-  host-shell failure. Live rig preflight cannot proceed because the local Apple
-  container service is stopped and dev bootstrap/platform secrets are absent;
-  the dev API itself is reachable.
+The received-config, clean-materialization, config-pull, and rig commands and
+raw output above are the re-measured validation for this wave. Earlier unscoped
+aggregate and host-failure counts are intentionally removed because they did
+not name a reproducible file set or command. Live rig preflight was not run in
+this documentation-only remediation.
 
 This wave does not claim that all later cycles are complete. Daemon mutation
 cutover, complete state-snapshot consolidation, remaining Git operations,
