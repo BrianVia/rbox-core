@@ -17,7 +17,7 @@ import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/co
 import { ProoflessBaseError, StageChangedError, decodeAuthorityRow } from "../errors.js";
 import type { CasRejectionReason, ManifestHeader } from "../ports.js";
 import { internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
-import { streamRows } from "./stage-artifacts.js";
+import { runStatement, selectRow, streamRows, withStatement } from "./statements.js";
 import {
   canonicalEvidenceOf, type SealedTransitionReader, type TransitionEvidenceBindings,
 } from "./transition-stages.js";
@@ -68,10 +68,10 @@ interface LineageRow {
 /** Step 1: every predicate, including each row's source evidence against the
  * stages this CAS actually verified. */
 export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified: ReadonlySet<string>): void {
-  const row = db.query(`SELECT l.lineage_id,l.stream,l.state_nonce,l.state_revision,
+  const row = selectRow<LineageRow>(db, `SELECT l.lineage_id,l.stream,l.state_nonce,l.state_revision,
     l.last_synced_sequence,l.active_base_generation,l.local_revision
     FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-    WHERE m.singleton=1`).get() as LineageRow | null;
+    WHERE m.singleton=1`);
   if (!row) throw new Error("state store singleton disappeared");
   const expected = frozen.expected;
   if (row.lineage_id !== expected.lineageId) reject("lineage");
@@ -81,10 +81,10 @@ export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified:
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
   if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
-  const drift = db.query(`SELECT t.rel_path FROM ${CAS_TRANSITION_TEMP} t
+  const drift = selectRow<{ rel_path: string }>(db, `SELECT t.rel_path FROM ${CAS_TRANSITION_TEMP} t
     WHERE t.expected_repo_gen <> COALESCE(
       (SELECT r.repo_gen FROM repo_records r WHERE r.lineage_id=? AND r.rel_path=t.rel_path), 0)
-    LIMIT 1`).get(expected.lineageId) as { rel_path: string } | null;
+    LIMIT 1`, expected.lineageId);
   if (drift) reject("repo-generation");
   assertEvidenceAgainstVerified(db, verified, frozen.globalBinding);
   if (!frozen.ownerToken.isOwner()) reject("owner-lost");
@@ -129,15 +129,15 @@ export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: st
   internStagedEntryValues(db);
   promoteFilesIntoPlane(db, lineageId, "base", generation);
   const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = frozen.globalHeader!;
-  db.query(`UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
-    trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='base'`).run(
+  runStatement(db, `UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
+    trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='base'`,
     generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch ?? null,
     Object.keys(extras).length === 0 ? null : canonicalJson(extras), lineageId,
   );
-  db.query("UPDATE state_lineage SET last_synced_sequence=? WHERE lineage_id=?").run(frozen.sourceGlobalSeq, lineageId);
-  db.query("DELETE FROM manifest_chain WHERE lineage_id=?").run(lineageId);
-  db.query("DELETE FROM global_manifest_meta WHERE lineage_id=?").run(lineageId);
-  db.query("DELETE FROM manifest_git_sections WHERE lineage_id=? AND role='meta-wire'").run(lineageId);
+  runStatement(db, "UPDATE state_lineage SET last_synced_sequence=? WHERE lineage_id=?", frozen.sourceGlobalSeq, lineageId);
+  runStatement(db, "DELETE FROM manifest_chain WHERE lineage_id=?", lineageId);
+  runStatement(db, "DELETE FROM global_manifest_meta WHERE lineage_id=?", lineageId);
+  runStatement(db, "DELETE FROM manifest_git_sections WHERE lineage_id=? AND role='meta-wire'", lineageId);
   if (frozen.globalManifestMeta === undefined) return;
   // The admission invariants U1a could only read are enforced here, by the one
   // definition the wire codec and the JSON authority already share.
@@ -145,21 +145,23 @@ export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: st
   if (!meta) throw new TypeError("CAS manifestMeta is not a valid GlobalManifestMeta");
   const { encManifestSha, manifestHash, accountEpoch, keyEpoch, chainBytes, snapshotBytes,
     chain, gitRepos, ...metaExtras } = meta as GlobalManifestMeta & Record<string, unknown>;
-  db.query(`INSERT INTO global_manifest_meta(lineage_id,base_generation,enc_manifest_sha,manifest_hash,
-    account_epoch,key_epoch,chain_bytes,snapshot_bytes,extras_cjson) VALUES (?,?,?,?,?,?,?,?,?)`).run(
+  runStatement(db, `INSERT INTO global_manifest_meta(lineage_id,base_generation,enc_manifest_sha,manifest_hash,
+    account_epoch,key_epoch,chain_bytes,snapshot_bytes,extras_cjson) VALUES (?,?,?,?,?,?,?,?,?)`,
     lineageId, generation, Buffer.from(encManifestSha, "hex"), Buffer.from(manifestHash, "hex"),
     accountEpoch, keyEpoch, chainBytes, snapshotBytes,
     Object.keys(metaExtras).length === 0 ? null : canonicalJson(metaExtras),
   );
-  const chainInsert = db.query("INSERT INTO manifest_chain(lineage_id,base_generation,ordinal,enc_sha) VALUES (?,?,?,?)");
-  for (const [ordinal, encSha] of chain.entries()) {
-    chainInsert.run(lineageId, generation, ordinal, Buffer.from(encSha, "hex"));
-  }
-  const gitInsert = db.query(`INSERT INTO manifest_git_sections(lineage_id,base_generation,role,rel_path,path_order,section_cjson)
-    VALUES (?,?,'meta-wire',?,?,?)`);
-  for (const [relPath, section] of Object.entries(gitRepos)) {
-    gitInsert.run(lineageId, generation, relPath, utf16beOrderKey(relPath), canonicalJson(section));
-  }
+  withStatement(db, "INSERT INTO manifest_chain(lineage_id,base_generation,ordinal,enc_sha) VALUES (?,?,?,?)", (chainInsert) => {
+    for (const [ordinal, encSha] of chain.entries()) {
+      chainInsert.run(lineageId, generation, ordinal, Buffer.from(encSha, "hex"));
+    }
+  });
+  withStatement(db, `INSERT INTO manifest_git_sections(lineage_id,base_generation,role,rel_path,path_order,section_cjson)
+    VALUES (?,?,'meta-wire',?,?,?)`, (gitInsert) => {
+    for (const [relPath, section] of Object.entries(gitRepos)) {
+      gitInsert.run(lineageId, generation, relPath, utf16beOrderKey(relPath), canonicalJson(section));
+    }
+  });
 }
 
 const REPO_VALUE_COLUMNS = [
@@ -175,32 +177,34 @@ const REPO_VALUE_COLUMNS = [
  * packet is never collected in JS: one row is in memory at a time.
  */
 export function applyTransitions(db: Database, lineageId: string): void {
-  const previous = db.query(`SELECT base_cjson,branch_base_origins_cjson
-    FROM repo_records WHERE lineage_id=? AND rel_path=?`);
-  const upsert = db.query(`INSERT INTO repo_records(
-    lineage_id,rel_path,path_order,repo_gen,source_seq,${REPO_VALUE_COLUMNS.join(",")},
-    extras_cjson,canonical_bytes,retained_estimate
-  ) VALUES (${Array.from({ length: 5 + REPO_VALUE_COLUMNS.length + 3 }, () => "?").join(",")})
-  ON CONFLICT(lineage_id,rel_path) DO UPDATE SET
-    path_order=excluded.path_order, repo_gen=excluded.repo_gen, source_seq=excluded.source_seq,
-    ${REPO_VALUE_COLUMNS.map((column) => `${column}=excluded.${column}`).join(",")},
-    extras_cjson=excluded.extras_cjson, canonical_bytes=excluded.canonical_bytes,
-    retained_estimate=excluded.retained_estimate`);
-  streamRows<{ rel_path: string; expected_repo_gen: number; record_cjson: string; base_proof_cjson: string | null }>(
-    db, `SELECT rel_path,expected_repo_gen,record_cjson,base_proof_cjson
-    FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`, [], (row) => {
-      const candidate = parseCanonicalJson(row.record_cjson) as unknown as RepoRecordInput;
-      const before = previous.get(lineageId, row.rel_path) as {
-        base_cjson: string | null; branch_base_origins_cjson: string | null;
-      } | null;
-      const next = recomposeBase(row.rel_path, candidate, row.base_proof_cjson, before);
-      const encoded = encodeRepoRecord(row.rel_path, { ...next, repoGen: row.expected_repo_gen + 1 } as RepoRecord);
-      upsert.run(
-        lineageId, row.rel_path, encoded.pathOrder, encoded.repoGen, encoded.sourceSeq,
-        ...REPO_VALUE_COLUMNS.map((column) => encoded.values[column] ?? null),
-        encoded.extrasCjson, encoded.canonicalBytes, encoded.retainedEstimate,
-      );
+  withStatement(db, `SELECT base_cjson,branch_base_origins_cjson
+    FROM repo_records WHERE lineage_id=? AND rel_path=?`, (previous) => {
+    withStatement(db, `INSERT INTO repo_records(
+      lineage_id,rel_path,path_order,repo_gen,source_seq,${REPO_VALUE_COLUMNS.join(",")},
+      extras_cjson,canonical_bytes,retained_estimate
+    ) VALUES (${Array.from({ length: 5 + REPO_VALUE_COLUMNS.length + 3 }, () => "?").join(",")})
+    ON CONFLICT(lineage_id,rel_path) DO UPDATE SET
+      path_order=excluded.path_order, repo_gen=excluded.repo_gen, source_seq=excluded.source_seq,
+      ${REPO_VALUE_COLUMNS.map((column) => `${column}=excluded.${column}`).join(",")},
+      extras_cjson=excluded.extras_cjson, canonical_bytes=excluded.canonical_bytes,
+      retained_estimate=excluded.retained_estimate`, (upsert) => {
+      streamRows<{ rel_path: string; expected_repo_gen: number; record_cjson: string; base_proof_cjson: string | null }>(
+        db, `SELECT rel_path,expected_repo_gen,record_cjson,base_proof_cjson
+        FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`, [], (row) => {
+          const candidate = parseCanonicalJson(row.record_cjson) as unknown as RepoRecordInput;
+          const before = previous.get(lineageId, row.rel_path) as {
+            base_cjson: string | null; branch_base_origins_cjson: string | null;
+          } | null;
+          const next = recomposeBase(row.rel_path, candidate, row.base_proof_cjson, before);
+          const encoded = encodeRepoRecord(row.rel_path, { ...next, repoGen: row.expected_repo_gen + 1 } as RepoRecord);
+          upsert.run(
+            lineageId, row.rel_path, encoded.pathOrder, encoded.repoGen, encoded.sourceSeq,
+            ...REPO_VALUE_COLUMNS.map((column) => encoded.values[column] ?? null),
+            encoded.extrasCjson, encoded.canonicalBytes, encoded.retainedEstimate,
+          );
+        });
     });
+  });
 }
 
 /** Step 2. A record that asks for BASE without an explicit proof never reaches an
@@ -265,11 +269,11 @@ function recomposeBase(
 /** The manifest projection is derived, never carried: removal and suppression hide
  * a repository from it without destroying its BASE provenance anchor. */
 export function rebuildManifestProjection(db: Database, lineageId: string, generation: number): void {
-  db.query("DELETE FROM manifest_git_sections WHERE lineage_id=? AND role='manifest-projection'").run(lineageId);
-  db.query(`INSERT INTO manifest_git_sections(lineage_id,base_generation,role,rel_path,path_order,section_cjson)
+  runStatement(db, "DELETE FROM manifest_git_sections WHERE lineage_id=? AND role='manifest-projection'", lineageId);
+  runStatement(db, `INSERT INTO manifest_git_sections(lineage_id,base_generation,role,rel_path,path_order,section_cjson)
     SELECT ?,?,'manifest-projection',rel_path,path_order,base_cjson FROM repo_records
-    WHERE lineage_id=? AND base_cjson IS NOT NULL AND repo_absent IS NULL AND removed_key IS NULL`)
-    .run(lineageId, generation, lineageId);
+    WHERE lineage_id=? AND base_cjson IS NOT NULL AND repo_absent IS NULL AND removed_key IS NULL`,
+  lineageId, generation, lineageId);
 }
 
 /* ------------------------------------------------------- the CAS input copy */
@@ -291,13 +295,12 @@ export function dropTransitionTemp(db: Database): void {
  * it against the packet's verified source stages. Dropping it here would make the
  * check unfalsifiable. */
 export function copyTransitionRowsIntoTemp(db: Database, reader: SealedTransitionReader): number {
-  const insert = db.query(`INSERT INTO ${CAS_TRANSITION_TEMP}(rel_path,path_order,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson)
-    VALUES (?,?,?,?,?,?)`);
-  return reader.streamRows((row) => {
+  return withStatement(db, `INSERT INTO ${CAS_TRANSITION_TEMP}(rel_path,path_order,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson)
+    VALUES (?,?,?,?,?,?)`, (insert) => reader.streamRows((row) => {
     insert.run(
       row.relPath, utf16beOrderKey(row.relPath), row.expectedRepoGen,
       canonicalJson(row.newRecord), row.baseProof === undefined ? null : canonicalJson(row.baseProof),
       canonicalEvidenceOf(row.evidenceBindings),
     );
-  });
+  }));
 }

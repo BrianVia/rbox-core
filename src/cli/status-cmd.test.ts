@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { loadState, repoRecordsForState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, repoRecordsForState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -12,9 +12,11 @@ import { daemonDatedLogPath } from "./rbox-paths.js";
 import { main } from "./main-dispatch.js";
 import { writeResetHaltHealth } from "./reset-health.js";
 import { RBOX_VERSION } from "./version.js";
-import { saveActivity } from "./activity.js";
+import { loadActivity, saveActivity } from "./activity.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 import { flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
+import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
+import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -24,6 +26,85 @@ let root = "";
 let runtime = "";
 let home = "";
 let cfg: WorkspaceConfig;
+
+function stoppedDaemon(overrides: Partial<DaemonObservation> = {}): DaemonObservation {
+  return {
+    ownership: "stopped",
+    running: false,
+    stale: false,
+    ownsRoot: false,
+    ownsWorkspace: false,
+    sidecarBinding: "absent",
+    ambient: { kind: "absent" },
+    ambientTrust: "absent",
+    ...overrides,
+  };
+}
+
+function liveDaemon(overrides: Partial<DaemonObservation> = {}): DaemonObservation {
+  return {
+    ownership: "owned",
+    running: true,
+    pid: 1234,
+    bootId: "boot_status",
+    boundWorkspaceId: cfg.remoteWorkspaceId,
+    stale: false,
+    ownsRoot: true,
+    ownsWorkspace: true,
+    sidecarBinding: "workspace",
+    ambient: { kind: "absent" },
+    ambientTrust: "absent",
+    ...overrides,
+  };
+}
+
+/** A live root-scoped daemon whose ambient record is whatever the caller wrote,
+ * classified by the REAL observation — the version and skew claims below are the
+ * production rule, not a restatement of it. */
+const observedLiveDaemon = (
+  record: Partial<AmbientDaemonStatusV1> & Record<string, unknown>,
+  opts: { legacyRecords?: boolean } = {},
+): DaemonObservation => observeDaemon(root, cfg.remoteWorkspaceId, NOW, {
+  readPid: () => opts.legacyRecords
+    ? { present: true, pid: 1234, version: "legacy" }
+    : { present: true, pid: 1234, bootId: "boot_status", version: "v2" },
+  readBinding: () => opts.legacyRecords
+    ? { present: true, workspaceId: cfg.remoteWorkspaceId, version: "legacy" }
+    : { present: true, workspaceId: cfg.remoteWorkspaceId, bootId: "boot_status", version: "v2" },
+  readAmbient: () => ({
+    kind: "ok",
+    status: {
+      schemaVersion: 1,
+      state: "synced",
+      heartbeatAt: new Date(NOW).toISOString(),
+      sequence: 7,
+      lastSyncedAt: null,
+      ...record,
+    } as AmbientDaemonStatusV1,
+  }),
+  processMatches: () => true,
+});
+
+const observeWithDaemon = (
+  readDaemon: () => DaemonObservation,
+): StatusCmdDeps["observeWorkspace"] => async (observedRoot, request) => {
+  const config = await loadConfig(observedRoot);
+  const daemon = readDaemon();
+  return {
+    depth: "ambient",
+    root: observedRoot,
+    observedAt: request.now,
+    config,
+    daemon,
+    readActivity: async () => {
+      const before = readDaemon();
+      if (before.running && !before.ownsWorkspace) return undefined;
+      const activity = await loadActivity(observedRoot).catch(() => undefined);
+      const after = readDaemon();
+      return after.running && !after.ownsWorkspace ? undefined : activity;
+    },
+  };
+};
 
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-status-root-"));
@@ -66,7 +147,7 @@ function deps(): StatusCmdDeps {
       throw new Error("git divergence should not run while populate marker is fresh");
     },
     gitDivergenceFastRepoSource: async () => [],
-    daemonBindingStatus: () => ({ alive: { running: false }, stale: false }),
+    observeWorkspace: observeWithDaemon(() => stoppedDaemon()),
     readDaemonPidRecord: () => ({ present: false }),
   } as StatusCmdDeps;
 }
@@ -84,7 +165,7 @@ function scanDeps(): StatusCmdDeps {
     }),
     gitDivergenceCount: async () => 0,
     gitDivergenceFastRepoSource: async () => [],
-    daemonBindingStatus: () => ({ alive: { running: false }, stale: false }),
+    observeWorkspace: observeWithDaemon(() => stoppedDaemon()),
     readDaemonPidRecord: () => ({ present: false }),
   } as StatusCmdDeps;
 }
@@ -782,7 +863,7 @@ test("human status shows conflict snapshots only when pruning is actionable whil
 
 test("status returns the effective daemon state in text and json modes", async () => {
   const d = cleanScanDeps();
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.observeWorkspace = observeWithDaemon(() => liveDaemon());
   d.readDaemonPidRecord = () => ({ present: true });
   const oldLog = console.log;
   const oldWrite = process.stdout.write;
@@ -791,7 +872,12 @@ test("status returns the effective daemon state in text and json modes", async (
   try {
     expect(await statusCmdWithDeps(root, {}, d)).toEqual({ daemonRunning: true });
     expect(await statusCmdWithDeps(root, { json: true }, d)).toEqual({ daemonRunning: true });
-    d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: "ws_previous", stale: true });
+    d.observeWorkspace = observeWithDaemon(() => liveDaemon({
+      ownership: "wrong-workspace",
+      boundWorkspaceId: "ws_previous",
+      stale: true,
+      ownsWorkspace: false,
+    }));
     expect(await statusCmdWithDeps(root, { json: true }, d)).toEqual({ daemonRunning: false });
   } finally {
     console.log = oldLog;
@@ -801,7 +887,7 @@ test("status returns the effective daemon state in text and json modes", async (
 
 test("status projects case-colliding paths as a healthy advisory in brief, verbose, and JSON", async () => {
   const d = cleanScanDeps();
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.observeWorkspace = observeWithDaemon(() => liveDaemon());
   d.readDaemonPidRecord = () => ({ present: true });
   const entry = (path: string) => ({
     path, type: "file" as const, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 1,
@@ -822,7 +908,7 @@ test("status projects case-colliding paths as a healthy advisory in brief, verbo
 
 test("default suppresses real legacy daemon/history/footer facts while --verbose retains them", async () => {
   const d = cleanScanDeps();
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.observeWorkspace = observeWithDaemon(() => liveDaemon());
   d.readDaemonPidRecord = () => ({ present: true });
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   await fs.writeFile(path.join(root, ".rbox", "state", "activity.json"), JSON.stringify({
@@ -851,7 +937,7 @@ test("status --verbose preserves the complete legacy text golden byte for byte",
 
 test("JSON adds optional top-level haltReason and otherwise keeps the detailed path", async () => {
   const d = cleanScanDeps();
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.observeWorkspace = observeWithDaemon(() => liveDaemon());
   d.readDaemonPidRecord = () => ({ present: true });
   const activityPath = path.join(root, ".rbox", "state", "activity.json");
   await fs.mkdir(path.dirname(activityPath), { recursive: true });
@@ -970,12 +1056,12 @@ test("live daemon version is rendered and exact skew warning is closed in human 
     promotions++;
     return true;
   };
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
   d.readDaemonPidRecord = () => ({ present: true });
-  d.readAmbientDaemonStatusRecord = () => ({
-    kind: "ok",
-    status: { schemaVersion: 1, daemonVersion: "1.7.17", mode: "pull-only", bootId: "boot_status", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
-  });
+  d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+    daemonVersion: "1.7.17",
+    mode: "pull-only",
+    bootId: "boot_status",
+  }));
   const logs: string[] = [];
   const oldLog = console.log;
   const oldWrite = process.stdout.write;
@@ -990,28 +1076,47 @@ test("live daemon version is rendered and exact skew warning is closed in human 
     await statusCmdWithDeps(root, { json: true }, d);
     expect(promotions).toBe(2);
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.7.17", mode: "pull-only", cliVersion: RBOX_VERSION, versionSkew: true } });
-    d.readAmbientDaemonStatusRecord = () => ({
-      kind: "ok",
-      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, mode: "read-write", bootId: "boot_status", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
-    });
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: RBOX_VERSION,
+      mode: "read-write",
+      bootId: "boot_status",
+    }));
     logs.length = 0;
     await statusCmdWithDeps(root, { verbose: true }, d);
     expect(promotions).toBe(3);
     expect(logs.join("\n")).toContain(`(v${RBOX_VERSION}, read-write)`);
     expect(logs.join("\n")).not.toContain("restart to finish the upgrade");
-    d.readAmbientDaemonStatusRecord = () => ({
-      kind: "ok",
-      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, mode: "pull-only", bootId: "boot_stale", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
-    });
+    // A record from a PREVIOUS boot cannot claim `mode`, but the version it
+    // reports is still the version of the daemon that is running right now —
+    // and the upgrade nudge exists for exactly these old daemons.
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: "1.7.17",
+      mode: "pull-only",
+      bootId: "boot_stale",
+    }));
     logs.length = 0;
     await statusCmdWithDeps(root, { verbose: true }, d);
     expect(promotions).toBe(4);
-    expect(logs.join("\n")).toContain(`background sync: running (v${RBOX_VERSION}) (pid 1234)`);
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
     expect(logs.join("\n")).not.toContain("pull-only");
-    d.daemonBindingStatus = () => ({ alive: { running: false }, stale: false });
+    // A wedged daemon stops heartbeating — the moment users reach for status.
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: "1.7.17",
+      mode: "pull-only",
+      bootId: "boot_status",
+      heartbeatAt: new Date(NOW - 30 * 60_000).toISOString(),
+    }));
+    logs.length = 0;
+    await statusCmdWithDeps(root, { verbose: true }, d);
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
+    expect(logs.join("\n")).not.toContain("pull-only");
+    expect(promotions).toBe(5);
+    d.observeWorkspace = observeWithDaemon(() => stoppedDaemon());
     stdout.length = 0;
     await statusCmdWithDeps(root, { json: true }, d);
-    expect(promotions).toBe(4);
+    expect(promotions).toBe(5);
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: null, mode: null, versionSkew: false } });
   } finally {
     console.log = oldLog;
@@ -1021,11 +1126,7 @@ test("live daemon version is rendered and exact skew warning is closed in human 
 
 test("live ambient record without daemonVersion is tolerated without display or warning", async () => {
   const d = cleanScanDeps();
-  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234 }, bound: cfg.remoteWorkspaceId, stale: false });
-  d.readAmbientDaemonStatusRecord = () => ({
-    kind: "ok",
-    status: { schemaVersion: 1, state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
-  });
+  d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ bootId: "boot_status" }));
   const logs: string[] = [];
   const oldLog = console.log;
   console.log = (...parts) => void logs.push(parts.join(" "));

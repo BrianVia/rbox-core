@@ -694,6 +694,13 @@ export class RboxDaemon {
     // ...and the DISK race too (design 49): macOS throttle tier / linux BE-7.
     this.log(`io priority: ${lowerIoPriority()}`);
 
+    // Record the binding FIRST. `rbox start` cleared the previous one before
+    // spawning us, and every reader treats "no binding" as an unproven daemon —
+    // so any work before this write is a window in which third parties cannot
+    // attribute this root's daemon. Only the workspace id and boot id are
+    // needed, and both are known here.
+    if (!(await this.writeStartupBinding())) return;
+
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
     const persistedActivity = await loadActivity(this.root);
@@ -710,9 +717,6 @@ export class RboxDaemon {
     // a corrupt one can never start a scoped binding read-write.
     if (!await this.refreshScopeAuthority()) return;
     this.log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
-    // Record the binding so `rbox start` can tell a live daemon from a STALE one
-    // (bound to a workspace this root was since re-initialized away from).
-    if (!(await this.writeStartupBinding())) return;
     this.writeAmbientStatus();
     await this.activityWrite;
     this.markWsStartupDisconnected();

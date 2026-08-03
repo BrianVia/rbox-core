@@ -1,15 +1,15 @@
 /**
- * Per-command help (design 29 §"Per-command help"). A small STATIC registry — one
- * entry per command — decoupled from the dispatcher `switch`. It feeds two things
- * from a single source of truth:
+ * Command grammar and help (design 29 §"Per-command help"). One static,
+ * syntax-only authority feeds:
  *
  *   - `rbox <cmd> --help` / `rbox help <cmd>` → that command's block, and
  *   - bare `rbox help` (or an unknown command) → the essential-flows screen, and
  *   - `rbox help --all` → the grouped full-reference screen.
  *
- * It can still drift from the real `switch` (separate code), so a parity test
- * (help-registry.test.ts) asserts the public registry matches the command catalog.
- * Presentation only — no entry here changes any command's behavior.
+ * It can still drift from the real lazy dispatcher `switch`, so parity tests
+ * assert that every projected top-level token remains dispatchable.
+ * This module owns command syntax, visibility, aliases, and their projections.
+ * Domain validation and orchestration remain in command handlers.
  */
 import { style } from "./style.js";
 
@@ -28,16 +28,58 @@ export interface CommandHelp {
   summary: string;
   /** Full invocation, e.g. "rbox track <path> [--workspace <id>]". */
   usage: string;
-  flags?: { flag: string; desc: string }[];
+  flags?: CommandFlag[];
   notes?: string[];
   examples?: string[];
   /** Grouped-screen left column override, for when the derived form is too wide. */
   brief?: string;
   /** Excluded from the grouped screen (init, deprecated aliases, internal). */
   hidden?: boolean;
-  /** If set, this is a deprecated alias forwarding to that command path. */
-  alias?: string;
+  /** If set, this is a deprecated alias forwarding to canonical syntax. */
+  alias?: DeprecatedAlias;
 }
+
+export interface CommandFlag {
+  /** Display spelling, including the metavar when present. */
+  flag: string;
+  /** Accepted short spelling, when one exists. */
+  short?: `-${string}`;
+  desc: string;
+  /** Explicit parser/completion arity; never inferred from display prose. */
+  takesValue?: true;
+  /** Preserve every occurrence in the parser's string-valued compatibility shape. */
+  repeatable?: true;
+  /** Accepted syntax omitted from help and completions. */
+  hidden?: true;
+}
+
+interface AliasRoute {
+  target: string;
+  notice: string;
+}
+
+export type DeprecatedAlias =
+  | ({ kind: "rename" } & AliasRoute)
+  | {
+      kind: "subcommands";
+      /** Target shown by the legacy detailed-help deprecation line. */
+      helpTarget: string;
+      routes: Readonly<Record<string, AliasRoute>>;
+      fallbackNotice: string;
+    };
+
+export interface ResolvedAlias {
+  cmd: string;
+  positional: string[];
+  notice: string;
+}
+
+/** Globally accepted parser syntax. `--help` keeps its legacy value-taking parse
+ * shape because help dispatch inspects raw argv before any command handler runs. */
+export const GLOBAL_FLAGS: readonly CommandFlag[] = [
+  { flag: "--json", desc: "request JSON when the selected command supports it", hidden: true },
+  { flag: "--help <ignored>", desc: "show command help", takesValue: true, hidden: true },
+];
 
 /** Group render order for the grouped screen. */
 export const GROUP_ORDER: HelpGroup[] = [
@@ -56,13 +98,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "guided onboarding: account → workspace → start syncing",
     usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
     flags: [
-      { flag: "--workspace <name|id>", desc: "with RBOX_KEY, sync an existing workspace non-interactively (alias: -w)" },
-      { flag: "--dir <path>", desc: "target directory (keyed setup only)" },
-      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
-      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
+      { flag: "--workspace <name|id>", short: "-w", desc: "with RBOX_KEY, sync an existing workspace non-interactively (alias: -w)", takesValue: true },
+      { flag: "--dir <path>", desc: "target directory (keyed setup only)", takesValue: true },
+      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)", takesValue: true },
+      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file", takesValue: true },
       { flag: "--daemon", desc: "after the first pull, start background sync (keyed setup only)" },
       { flag: "--pull-only", desc: "with --daemon, never push local changes (keyed setup only)" },
       { flag: "--force", desc: "allow a non-empty target directory (keyed setup only)" },
+      { flag: "--new", desc: "internal guided-setup selection", hidden: true },
+      { flag: "--name <name>", desc: "internal guided-setup workspace name", takesValue: true, hidden: true },
+      { flag: "--no-sync", desc: "internal guided-setup first-sync selection", hidden: true },
+      { flag: "--respect-gitignore", desc: "internal guided-setup ignore selection", hidden: true },
     ],
     examples: ["rbox setup"],
   },
@@ -72,12 +118,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "authorize this machine",
     usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>] [--kit] [--kit-path <path>]",
     flags: [
-      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret (a one-time secret; this machine becomes the account's first key-holding device)" },
-      { flag: "--plan <solo|pro>", desc: "request a bootstrap plan when the server supports plan selection" },
-      { flag: "--label <text>", desc: "set the device label (defaults to this machine's hostname)" },
+      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret (a one-time secret; this machine becomes the account's first key-holding device)", takesValue: true },
+      { flag: "--plan <solo|pro>", desc: "request a bootstrap plan when the server supports plan selection", takesValue: true },
+      { flag: "--label <text>", desc: "set the device label (defaults to this machine's hostname)", takesValue: true },
       { flag: "--kit", desc: "save the recovery phrase to a plaintext 'recovery kit' file at the default path" },
-      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file" },
-      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
+      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file", takesValue: true },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)", takesValue: true },
     ],
   },
   {
@@ -105,19 +151,21 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox init [--new | --workspace <id>] [--root <path>] [--scope <folder>[,<folder>…] --pull-only] [--adopt] [--respect-gitignore] [--new-device] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
     flags: [
       { flag: "--new", desc: "create a new workspace" },
-      { flag: "--workspace <id>", desc: "join an existing workspace (alias: -w)" },
-      { flag: "--root <path>", desc: "directory to track (default: cwd)" },
-      { flag: "--scope <folder>…", desc: "sync only these workspace folders on this machine (comma-separated); requires --pull-only" },
+      { flag: "--workspace <id>", short: "-w", desc: "join an existing workspace (alias: -w)", takesValue: true },
+      { flag: "--root <path>", desc: "directory to track (default: cwd)", takesValue: true },
+      { flag: "--scope <folder>…", desc: "sync only these workspace folders on this machine (comma-separated); requires --pull-only", takesValue: true },
       { flag: "--pull-only", desc: "only receive changes, never send them" },
       { flag: "--adopt", desc: "on a non-empty join, retain local content and adopt it over the remote baseline" },
-      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret before initializing" },
+      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret before initializing", takesValue: true },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
       { flag: "--new-device", desc: "mint a new device identity instead of reusing this machine's enrolled device (advanced)" },
       { flag: "--kit", desc: "save the recovery phrase to a plaintext 'recovery kit' file at the default path" },
-      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file" },
+      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file", takesValue: true },
       { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing" },
-      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
-      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)", takesValue: true },
+      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)", takesValue: true },
+      { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
+      { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
     ],
   },
   {
@@ -192,9 +240,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "tail background-sync logs",
     usage: "rbox logs [path] [--follow] [--limit N]",
     flags: [
-      { flag: "--follow", desc: "stream new log lines (Ctrl-C to exit) (alias: -f)" },
-      { flag: "--limit N", desc: "show the last N lines (default 50)" },
-      { flag: "--lines N", desc: "alias for --limit (alias: -n)" },
+      { flag: "--follow", short: "-f", desc: "stream new log lines (Ctrl-C to exit) (alias: -f)" },
+      { flag: "--limit N", desc: "show the last N lines (default 50)", takesValue: true },
+      { flag: "--lines N", short: "-n", desc: "alias for --limit (alias: -n)", takesValue: true },
     ],
   },
   {
@@ -232,7 +280,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming]",
     flags: [
       { flag: "--json", desc: "print a typed JSON result (commit OIDs are omitted)" },
-      { flag: "--confirm <token>", desc: "confirm the exact snapshot printed by show-me" },
+      { flag: "--confirm <token>", desc: "confirm the exact snapshot printed by show-me", takesValue: true },
       { flag: "--force-discard-incoming", desc: "keep-mine only: acknowledge your other computer's waiting Git artifacts cannot be retained" },
     ],
     notes: [
@@ -277,8 +325,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox export [--all | --workspace <id>] [--out <dir | file.tar.gz>]",
     flags: [
       { flag: "--all", desc: "export every workspace (default)" },
-      { flag: "--workspace <id>", desc: "export one workspace (alias: -w)" },
-      { flag: "--out <path>", desc: "write to a directory or .tar.gz (default: ~/Downloads)" },
+      { flag: "--workspace <id>", short: "-w", desc: "export one workspace (alias: -w)", takesValue: true },
+      { flag: "--out <path>", desc: "write to a directory or .tar.gz (default: ~/Downloads)", takesValue: true },
     ],
     examples: ["rbox export", "rbox export --workspace ws_ab12cd34", "rbox export --out ~/backup.tar.gz"],
   },
@@ -288,12 +336,16 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "bind a directory to a workspace (create/join; no first sync)",
     usage: "rbox track [path] [--workspace <id>] [--include <folder>] [--respect-gitignore] [--new-device]",
     flags: [
-      { flag: "--workspace <id>", desc: "join an existing workspace instead of creating one (alias: -w)" },
-      { flag: "--include <folder>", desc: "sync only this folder (repeat for more); implies this machine never sends changes" },
+      { flag: "--workspace <id>", short: "-w", desc: "join an existing workspace instead of creating one (alias: -w)", takesValue: true },
+      { flag: "--include <folder>", desc: "sync only this folder (repeat for more); implies this machine never sends changes", takesValue: true, repeatable: true },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
       { flag: "--new-device", desc: "mint a new device identity instead of reusing this machine's enrolled device (advanced)" },
-      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
-      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)", takesValue: true },
+      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)", takesValue: true },
+      { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
+      { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
+      { flag: "--device <id>", desc: "internal device identifier override", takesValue: true, hidden: true },
+      { flag: "--no-interactive", desc: "internal non-interactive mode", hidden: true },
     ],
     notes: ["[path] defaults to the current directory"],
     examples: ["rbox track ~/code/myapp", "rbox track ~/code/myapp --workspace ws_ab12cd34"],
@@ -311,11 +363,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "manage .rboxignore",
     usage: "rbox ignore <glob> | --list | --respect-gitignore <on|off> | --purge [--yes] [--path <dir>]",
     flags: [
-      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true },
       { flag: "--list", desc: "print the effective ignore rules" },
-      { flag: "--respect-gitignore <on|off>", desc: "toggle skipping gitignored untracked files" },
+      { flag: "--respect-gitignore <on|off>", desc: "toggle skipping gitignored untracked files", takesValue: true },
       { flag: "--purge", desc: "delete already-synced paths that are now ignored after a dry-run" },
-      { flag: "--yes", desc: "confirm --purge in headless mode (alias: -y)" },
+      { flag: "--yes", short: "-y", desc: "confirm --purge in headless mode (alias: -y)" },
       { flag: "--allow-mass-delete", desc: "also consent to the push-side mass-delete guard" },
     ],
     examples: ["rbox ignore 'dist/**'", "rbox ignore --list"],
@@ -332,7 +384,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "list files rbox moved to the local trash",
     usage: "rbox trash list [--path <dir>] [--json]",
     flags: [
-      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true },
       { flag: "--json", desc: "print JSON" },
     ],
   },
@@ -342,8 +394,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "restore a trashed file back into the workspace",
     usage: "rbox trash restore <path> [--batch <name>] [--path <dir>]",
     flags: [
-      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
-      { flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)" },
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true },
+      { flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)", takesValue: true },
     ],
     notes: ["restores files rbox itself moved to the local trash — to fetch an older synced version, see `rbox restore`"],
   },
@@ -352,7 +404,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "SYNCING",
     summary: "permanently delete trashed files (frees disk)",
     usage: "rbox trash empty [--path <dir>]",
-    flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" }],
+    flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true }],
   },
   {
     name: "versions",
@@ -360,7 +412,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "list version history (or a file's change history)",
     usage: "rbox versions [file] [--limit <n>] [--json]",
     flags: [
-      { flag: "--limit <n>", desc: "maximum versions to show" },
+      { flag: "--limit <n>", desc: "maximum versions to show", takesValue: true },
       { flag: "--json", desc: "print JSON" },
     ],
     notes: ["[file] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
@@ -433,7 +485,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "DEVICES & ACCOUNT",
     summary: "authorize + encrypt this machine with a pairing token",
     usage: "rbox connect [<pairing-token>]",
-    flags: [{ flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" }],
+    flags: [{ flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)", takesValue: true }],
     notes: ["Run `rbox pair` on an enrolled machine and paste its complete command here. Omit the argument for a masked prompt/stdin."],
     examples: ["rbox connect rbox-pair_<id>.<secret>", "rbox connect", "echo <token> | rbox connect"],
   },
@@ -443,7 +495,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "clear the local head pin and re-baseline a halted workspace",
     usage: "rbox recover [path] [--yes] [--repair-chain] [--allow-mass-delete]",
     flags: [
-      { flag: "--yes", desc: "skip the confirmation prompt (alias: -y)" },
+      { flag: "--yes", short: "-y", desc: "skip the confirmation prompt (alias: -y)" },
       { flag: "--repair-chain", desc: "confirm superseding an authenticated unreadable manifest suffix" },
       { flag: "--allow-mass-delete", desc: "consent to both pull-side and push-side mass-delete guards" },
     ],
@@ -471,7 +523,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [
       { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
-      { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
+      { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file", takesValue: true },
     ],
   },
   {
@@ -486,7 +538,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "DEVICES & ACCOUNT",
     summary: "save a validated recovery phrase to Keychain or an explicit file",
     usage: "rbox key save [--kit-path <path>]",
-    flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default" }],
+    flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default", takesValue: true }],
   },
   {
     name: "key backup",
@@ -495,7 +547,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox key backup [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--kit", desc: "write the cached recovery phrase to the default recovery kit path" },
-      { flag: "--kit-path <path>", desc: "write the cached recovery phrase to a specific recovery kit file" },
+      { flag: "--kit-path <path>", desc: "write the cached recovery phrase to a specific recovery kit file", takesValue: true },
     ],
   },
   {
@@ -505,7 +557,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox key recover [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
-      { flag: "--kit-path <path>", desc: "write the entered recovery phrase to a specific recovery kit file" },
+      { flag: "--kit-path <path>", desc: "write the entered recovery phrase to a specific recovery kit file", takesValue: true },
     ],
   },
   {
@@ -514,9 +566,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "set up encryption on the first machine",
     usage: "rbox key genesis --yes [--kit] [--kit-path <path>]",
     flags: [
-      { flag: "--yes", desc: "required to mint the account's first encryption keys (alias: -y)" },
+      { flag: "--yes", short: "-y", desc: "required to mint the account's first encryption keys (alias: -y)" },
       { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
-      { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
+      { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file", takesValue: true },
     ],
   },
   {
@@ -525,8 +577,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "create an agent/CI sync key bundle",
     usage: "rbox key create-ci --expires <dur> [--label <text>] [--accept-root-key]",
     flags: [
-      { flag: "--expires <dur>", desc: "required; suggested 90d, maximum 1y" },
-      { flag: "--label <text>", desc: "dashboard label" },
+      { flag: "--expires <dur>", desc: "required; suggested 90d, maximum 1y", takesValue: true },
+      { flag: "--label <text>", desc: "dashboard label", takesValue: true },
       { flag: "--accept-root-key", desc: "skip the interactive account-root warning confirmation" },
     ],
   },
@@ -536,9 +588,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "unpack RBOX_KEY into the local keystore",
     usage: "rbox key materialize [--dir <path>] [--key -] [--key-file <path>]",
     flags: [
-      { flag: "--dir <path>", desc: "RBOX_HOME directory to write (default: standard location)" },
-      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
-      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
+      { flag: "--dir <path>", desc: "RBOX_HOME directory to write (default: standard location)", takesValue: true },
+      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)", takesValue: true },
+      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file", takesValue: true },
     ],
   },
   {
@@ -579,6 +631,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
+    name: "migrate",
+    group: "BILLING & MAINTENANCE",
+    summary: "convert this workspace's sync records to rbox's current format",
+    usage: "rbox migrate [path] [--json]",
+    flags: [{ flag: "--json", desc: "print the outcome as JSON (for scripts, CI, and agents)" }],
+    notes: [
+      "Nothing else may be using the workspace: run `rbox stop` first if background sync is on.",
+      "rbox does this for you during `rbox upgrade`; run it by hand only when doctor asks you to.",
+    ],
+  },
+  {
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "explain what is stuck and how to fix it, in plain English",
@@ -589,10 +652,12 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--report", desc: "build and print the support report locally" },
       { flag: "--residue-bytes", desc: "measure known Git quarantine and conflict directories" },
       { flag: "--diagnostics", desc: "with --report, upload the report to rbox support (stored unencrypted for 30 days)" },
-      { flag: "--yes", desc: "skip the upload consent prompt; required with --report --diagnostics in non-interactive mode (alias: -y)" },
-      { flag: "--path <dir>", desc: "compatibility alias for the [path] positional" },
+      { flag: "--yes", short: "-y", desc: "skip the upload consent prompt; required with --report --diagnostics in non-interactive mode (alias: -y)" },
+      { flag: "--path <dir>", desc: "compatibility alias for the [path] positional", takesValue: true },
       { flag: "--quarantine", desc: "with reset-journal, preserve and remove an unsafe standing journal" },
-      { flag: "--restore <bundle>", desc: "with reset-journal, restore a committed quarantine bundle" },
+      { flag: "--restore <bundle>", desc: "with reset-journal, restore a committed quarantine bundle", takesValue: true },
+      { flag: "--retry-state-migration", desc: "resume a paused conversion of this workspace's sync records after fixing what stopped it" },
+      { flag: "--abort-state-migration", desc: "abandon an unfinished conversion and keep the sync records rbox is using now" },
     ],
   },
   {
@@ -602,8 +667,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox upgrade [--check] [--channel <latest|next>]",
     flags: [
       { flag: "--check", desc: "report whether an update is available, without installing" },
-      { flag: "--channel <latest|next>", desc: "switch and persist the release channel (default: latest)" },
-      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
+      { flag: "--channel <latest|next>", desc: "switch and persist the release channel (default: latest)", takesValue: true },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)", takesValue: true },
     ],
   },
   {
@@ -611,7 +676,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "remove local rbox state and installed files",
     usage: "rbox uninstall [--yes]",
-    flags: [{ flag: "--yes", desc: "perform the removal; without it, print the steps only (alias: -y)" }],
+    flags: [{ flag: "--yes", short: "-y", desc: "perform the removal; without it, print the steps only (alias: -y)" }],
   },
   {
     name: "version",
@@ -645,8 +710,32 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
 
   // ── hidden: deprecated aliases ───────────────────────────────────────────
-  { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
-  { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
+  {
+    name: "link",
+    group: "SYNCING",
+    summary: "deprecated → rbox track",
+    usage: "rbox link <path>",
+    hidden: true,
+    alias: { kind: "rename", target: "track", notice: "note: 'rbox link' is now 'rbox track'." },
+  },
+  {
+    name: "daemon",
+    group: "SYNCING",
+    summary: "deprecated → rbox start/stop/logs",
+    usage: "rbox daemon <start|stop|status|logs>",
+    hidden: true,
+    alias: {
+      kind: "subcommands",
+      helpTarget: "start",
+      fallbackNotice: "note: 'rbox daemon …' is now 'rbox start/stop/logs'.",
+      routes: {
+        start: { target: "start", notice: "note: 'rbox daemon …' is now 'rbox start/stop/logs'." },
+        stop: { target: "stop", notice: "note: 'rbox daemon …' is now 'rbox start/stop/logs'." },
+        logs: { target: "logs", notice: "note: 'rbox daemon …' is now 'rbox start/stop/logs'." },
+        status: { target: "status", notice: "note: daemon status is now part of 'rbox status'." },
+      },
+    },
+  },
   // hydrate/detect aliases commented out along with `deps` itself (design 51)
   // — their forward target no longer exists, so keeping them would dangle.
   // The old deps-doctor alias is intentionally not restored; `doctor` is support diagnostics.
@@ -655,6 +744,48 @@ export const COMMAND_HELP: CommandHelp[] = [
 ];
 
 const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));
+const firstWord = (name: string): string => name.split(" ")[0]!;
+
+/** Public command paths shown by help and completion projections. */
+export const PUBLIC_COMMANDS: readonly string[] = COMMAND_HELP.filter((command) => !command.hidden).map((command) => command.name);
+
+/** Deprecated command tokens accepted by the parser and dispatcher. */
+export const ALIAS_COMMANDS: readonly string[] = COMMAND_HELP.filter((command) => command.alias).map((command) => command.name);
+
+/** Every top-level token the existing lazy dispatcher handles. */
+export const KNOWN_TOP_LEVEL: ReadonlySet<string> = new Set([
+  ...COMMAND_HELP.map((command) => firstWord(command.name)),
+  "help",
+  "__daemon-run",
+  "__boot-resume",
+]);
+
+export function isKnownTopLevel(command: string | undefined): boolean {
+  return command !== undefined && KNOWN_TOP_LEVEL.has(command);
+}
+
+function aliasTarget(alias: DeprecatedAlias): string {
+  return alias.kind === "rename" ? alias.target : alias.helpTarget;
+}
+
+/** Resolve deprecated syntax before the existing lazy dispatcher switch. */
+export function resolveAlias(command: string, positional: string[]): ResolvedAlias | null {
+  const alias = byName.get(command)?.alias;
+  if (!alias) return null;
+  if (alias.kind === "rename") {
+    const [cmd, subcommand] = alias.target.split(" ");
+    return {
+      cmd: cmd!,
+      positional: subcommand ? [subcommand, ...positional] : positional,
+      notice: alias.notice,
+    };
+  }
+  const [subcommand, ...rest] = positional;
+  const route = subcommand === undefined ? undefined : alias.routes[subcommand];
+  return route
+    ? { cmd: route.target, positional: rest, notice: route.notice }
+    : { cmd: command, positional, notice: alias.fallbackNotice };
+}
 
 /**
  * Help entries for a command path. A bare group token ("deps") returns all of its
@@ -670,13 +801,14 @@ export function helpFor(commandPath: string): CommandHelp[] | undefined {
 
 /**
  * Resolve a deprecated alias entry (`link`, `daemon`) to the command path it forwards to.
- * An alias runs the target's exact operation on the same argv (`deprecations.ts`) but
+ * An alias runs the target's exact operation on the same argv but
  * declares no flags of its own, so anything reading a command's flag DECLARATIONS — the
  * parser's per-command arity — must read the target's. Help rendering deliberately does
  * NOT resolve: `rbox link --help` shows the alias entry and its "deprecated → …" line.
  */
 export function resolveCommandAlias(commandPath: string): string {
-  return byName.get(commandPath)?.alias ?? commandPath;
+  const alias = byName.get(commandPath)?.alias;
+  return alias ? aliasTarget(alias) : commandPath;
 }
 
 /** Render one command's detailed help block. */
@@ -686,12 +818,13 @@ export function renderCommand(c: CommandHelp): string {
   lines.push("");
   lines.push(`${style.dim("usage:")} ${c.usage}`);
   if (c.notes?.length) for (const note of c.notes) lines.push(style.dim(note));
-  if (c.alias) lines.push(style.yellow(`deprecated: use \`rbox ${c.alias}\``));
-  if (c.flags?.length) {
+  if (c.alias) lines.push(style.yellow(`deprecated: use \`rbox ${aliasTarget(c.alias)}\``));
+  const visibleFlags = c.flags?.filter((flag) => !flag.hidden);
+  if (visibleFlags?.length) {
     lines.push("");
     lines.push(style.dim("flags:"));
-    const w = Math.max(...c.flags.map((f) => f.flag.length));
-    for (const f of c.flags) lines.push(`  ${f.flag.padEnd(w)}  ${style.dim(f.desc)}`);
+    const w = Math.max(...visibleFlags.map((flag) => flag.flag.length));
+    for (const flag of visibleFlags) lines.push(`  ${flag.flag.padEnd(w)}  ${style.dim(flag.desc)}`);
   }
   if (c.examples?.length) {
     lines.push("");
@@ -810,7 +943,7 @@ export function helpKeyFor(cmd: string, positional: string[]): string {
 
 function commandHasFlag(c: CommandHelp, flagName: string): boolean {
   const normalized = flagName.startsWith("--") ? flagName : `--${flagName}`;
-  return c.flags?.some((f) => f.flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1] === normalized) ?? false;
+  return c.flags?.some((flag) => flag.flag.split(/\s+/, 1)[0] === normalized) ?? false;
 }
 
 export function commandSupportsFlag(cmd: string | undefined, positional: string[], flagName: string): boolean {

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { BackupFileHash } from "../ports.js";
 import { validateOpen } from "../schema/validate-open.js";
 import type { StateStoreHandle } from "../store/open.js";
+import { selectRow, selectRows } from "../store/statements.js";
 import { vacuumInto } from "./vacuum-into.js";
 
 export interface StateBackupOptions {
@@ -79,9 +80,9 @@ function publishStateBackupWithPublication(
     try {
       validateOpen(verifier, staging);
       if ((options.integrity ?? "full") === "full") {
-        const result = verifier.query("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>;
+        const result = selectRows<{ integrity_check: string }>(verifier, "PRAGMA integrity_check");
         if (result.length !== 1 || result[0]?.integrity_check !== "ok") throw new Error("backup integrity check failed");
-        if (verifier.query("PRAGMA foreign_key_check").get()) throw new Error("backup foreign key check failed");
+        if (selectRow(verifier, "PRAGMA foreign_key_check")) throw new Error("backup foreign key check failed");
       }
     } finally {
       verifier.close();

@@ -303,7 +303,10 @@ export interface ResetParseAdmissionOptions {
   expansionMultiplier?: number;
 }
 
-function envBudget(): number {
+/** The effective parse budget: the sanctioned `RBOX_RESET_PARSE_BUDGET_BYTES`
+ * override (163:3309) when it is a positive safe integer, else the machine
+ * default. Migration admission budgets against the same number. */
+export function resetParseBudgetBytes(): number {
   const raw = process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
   if (raw === undefined) return defaultResetParseBudgetBytes();
   const value = Number(raw);
@@ -313,7 +316,7 @@ function envBudget(): number {
 export function assertResetParseAdmission(fileSize: number, options: ResetParseAdmissionOptions = {}): void {
   if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new RangeError("reset parse size must be a non-negative safe integer");
   if (fileSize > RESET_MATERIALIZED_BYTE_LIMIT) throw new ResetCorruptionError("materialized reset state exceeds the 512 MiB file limit");
-  const budget = options.processBudgetBytes ?? envBudget();
+  const budget = options.processBudgetBytes ?? resetParseBudgetBytes();
   const rss = options.currentRssBytes ?? process.memoryUsage.rss();
   const multiplier = options.expansionMultiplier ?? RESET_PARSE_EXPANSION_MULTIPLIER;
   const available = Math.max(0, budget - rss);

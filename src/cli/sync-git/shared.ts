@@ -215,7 +215,20 @@ export function nestedRepoChains(keys: readonly string[]): string[][] {
   return chains;
 }
 
-export async function chainLock<T>(locks: Map<string, Promise<void>>, key: string, fn: () => Promise<T>): Promise<T> {
+const heldChainLockBrand: unique symbol = Symbol("held-chain-lock");
+
+/** Opaque proof that `chainLock` is currently serializing this key. */
+export interface HeldChainLock {
+  readonly key: string;
+  readonly [heldChainLockBrand]: true;
+  assertHeld(): void;
+}
+
+export async function chainLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  fn: (lock: HeldChainLock) => Promise<T>,
+): Promise<T> {
   const previous = locks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
@@ -224,9 +237,17 @@ export async function chainLock<T>(locks: Map<string, Promise<void>>, key: strin
   const tail = previous.then(() => current, () => current);
   locks.set(key, tail);
   await previous.catch(() => undefined);
+  let held = true;
   try {
-    return await fn();
+    return await fn({
+      key,
+      [heldChainLockBrand]: true,
+      assertHeld() {
+        if (!held) throw new Error(`chain lock is no longer held: ${key}`);
+      },
+    });
   } finally {
+    held = false;
     release();
     if (locks.get(key) === tail) locks.delete(key);
   }

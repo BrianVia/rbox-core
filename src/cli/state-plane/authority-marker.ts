@@ -19,6 +19,16 @@ export const AUTHORITY_MARKER_MAGIC = "RBOX-SQLITE-AUTHORITY-v1";
 /** magic + LF + 32 lowercase hex + LF. */
 export const AUTHORITY_MARKER_BYTES = 58;
 const AUTHORITY_MARKER_RE = new RegExp(`^${AUTHORITY_MARKER_MAGIC}\\n[0-9a-f]{32}\\n$`);
+
+/** The exact bytes `Q` holds for this authority id. This module recognizes the
+ * marker, so it is also the only thing that composes it. */
+export function authorityMarkerBytes(authorityId: string): Buffer {
+  const bytes = Buffer.from(`${AUTHORITY_MARKER_MAGIC}\n${authorityId}\n`, "latin1");
+  if (bytes.byteLength !== AUTHORITY_MARKER_BYTES || !AUTHORITY_MARKER_RE.test(bytes.toString("latin1"))) {
+    throw new Error(`not a valid authority id: ${authorityId}`);
+  }
+  return bytes;
+}
 const DETECT_BYTES = 128;
 
 /** What the bytes at `.rbox/state.json` are, decided without parsing them. */
@@ -49,11 +59,16 @@ function looksLikeJson(bytes: Buffer): boolean {
  * modules do: a pathname lookup followed by a second one could be answered by a
  * symlink swapped in after the first, which would let the attacker's file be
  * read as the state document under the original file's type and size.
+ *
+ * `O_NONBLOCK` is part of that descriptor's contract, not hygiene: without it a
+ * FIFO at this path makes the open wait for a writer that never comes, so every
+ * caller of this barrier hangs indefinitely (issue #556). `formatOf`'s `isFile`
+ * check classifies the FIFO as `foreign` one step later.
  */
 export async function classifyStateFormat(file: string): Promise<StateFormat> {
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return "absent";
@@ -104,6 +119,36 @@ function formatOf(stat: Stats, head: Buffer): StateFormat {
   if (!stat.isFile() || stat.size === 0) return "foreign";
   if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
   return looksLikeJson(head) ? "json" : "foreign";
+}
+
+/**
+ * The authority id `Q` names, or `undefined` when the bytes at `file` are not
+ * the exact marker. Same single no-follow, non-blocking descriptor as
+ * {@link classifyStateFormat}, for the same reason.
+ *
+ * Selection needs the id, not just the format: a marker whose id the database
+ * does not carry is contradictory durable state, and deciding that from the
+ * marker's own bytes keeps the refusal file-level (design 222 §1.2, §6.4).
+ */
+export async function readAuthorityMarkerId(file: string): Promise<string | undefined> {
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  try {
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") return undefined;
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size !== AUTHORITY_MARKER_BYTES) return undefined;
+    const bytes = Buffer.alloc(AUTHORITY_MARKER_BYTES);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (bytesRead !== AUTHORITY_MARKER_BYTES || !isAuthorityMarkerBytes(bytes)) return undefined;
+    return bytes.toString("latin1").slice(AUTHORITY_MARKER_MAGIC.length + 1, -1);
+  } finally {
+    await handle.close();
+  }
 }
 
 /** True only for the exact 58-byte marker. Exposed for fixtures and tests;

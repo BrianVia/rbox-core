@@ -13,8 +13,9 @@ import { StageDigestBuilder, type StageCounts, type StageLogicalDigest } from ".
 import { CursorWindowError, GitSectionOversizeError, StageChangedError } from "../errors.js";
 import type { CursorPage, GitSectionRole, ManifestHeader, Plane } from "../ports.js";
 import {
-  StageLock, openSealedArtifact, streamRows, type SealedArtifactAccessor,
+  StageLock, openSealedArtifact, type SealedArtifactAccessor,
 } from "./stage-artifacts.js";
+import { selectRow, streamRows } from "./statements.js";
 
 export const PAGE_BYTES = 4 * 1024 * 1024;
 export const MAX_FILE_BATCH = 512;
@@ -66,9 +67,9 @@ function deriveStageRef(
   physicalSha256: string,
   bytes: number,
 ): SealedStageRef {
-  const meta = accessor.db.query("SELECT stage_id,plane,state,header_cjson,digest,counts_cjson FROM stage_meta").get() as {
+  const meta = selectRow<{
     stage_id: string; plane: Plane; state: string; header_cjson: string; digest: string; counts_cjson: string;
-  } | null;
+  }>(accessor.db, "SELECT stage_id,plane,state,header_cjson,digest,counts_cjson FROM stage_meta");
   if (!meta) throw new StageChangedError(stageId, "sealed stage has no stage_meta row");
   if (meta.stage_id !== stageId || meta.state !== "sealed") {
     throw new StageChangedError(stageId, "sealed stage identity does not match its ref");
@@ -205,8 +206,9 @@ class SqliteSealedStage implements SealedStageReader {
   }
 
   gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined {
-    const row = this.accessor.db.query("SELECT section_cjson FROM stage_git_sections WHERE stage_id=? AND role=? AND rel_path=?")
-      .get(this.ref.stageId, role, relPath) as { section_cjson: string } | null;
+    const row = selectRow<{ section_cjson: string }>(this.accessor.db,
+      "SELECT section_cjson FROM stage_git_sections WHERE stage_id=? AND role=? AND rel_path=?",
+      this.ref.stageId, role, relPath);
     return row ? this.#decodeSealedSection(relPath, row.section_cjson) : undefined;
   }
 

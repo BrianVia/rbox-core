@@ -177,7 +177,9 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     "src/cli/adopt-git.ts": 1,
     "src/cli/reset-z-runtime.ts": 3,
     "src/cli/state-plane/reset/crash-rig-child.ts": 1,
-    "src/cli/sync-git/follow.ts": 1,
+    // Was sync-git/follow.ts; the same single site moved with stageIncoming
+    // when follow.ts was split into domain modules. Count unchanged.
+    "src/cli/sync-git/follow-staging.ts": 1,
     "src/cli/sync-git/orig-head.ts": 1,
     "src/engine/git/apply.ts": 3,
     "src/engine/git/base-artifacts.ts": 1,
@@ -213,7 +215,9 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/state-plane/store/cas-steps.ts": 8,
     "src/cli/sync-git/apply.ts": 24,
     "src/cli/sync-git/base-composer.ts": 2,
-    "src/cli/sync-git/follow.ts": 1,
+    // Was sync-git/follow.ts; the same single read-only site moved with
+    // classifyCheckout when follow.ts was split. Count unchanged.
+    "src/cli/sync-git/follow-classify.ts": 1,
     "src/cli/sync-git/p-repair-state.ts": 1,
     "src/cli/sync-git/p-settlement.ts": 1,
     // The unreadable-terminal carry moved with its owner

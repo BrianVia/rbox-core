@@ -10,15 +10,20 @@ import {
   captureGitState,
   gitIdentity,
   gitIdentityKey,
+  repoCtxFromDisk,
   validateManifest,
+  writeCheckoutJournal,
+  type CheckoutJournal,
   type GitSection,
   type Manifest,
 } from "../../engine/index.js";
 import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-sync.js";
+import { readConfigSnapshot } from "../../engine/git/config-txn.js";
 import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
 import { applyGitSections, gitConfigHash } from "../sync-git.js";
 import { readLocalGitConfig } from "./config-lane.js";
+import { checkoutJournalBinding } from "./follow-journal.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -163,6 +168,48 @@ test("cfgToken detects a manual config delete and heals it through the first unc
   expect(await git(receiver, "config", "--get", "remote.upstream.url")).toBe(desired["remote.upstream.url"]![0]);
   expect(healed.configLane?.["."]?.cfgApplied).toBe(gitConfigHash(desired));
   expect(healed.configLane?.["."]?.cfgToken).not.toEqual(lane.cfgToken);
+});
+
+test("clean Git progress applies due config to an existing receiver in the same transition", async () => {
+  await git(source, "tag", "remote-marker");
+  const remote = { ...(await capture()), config: desired };
+  let configApplyCalls = 0;
+  const outcome = await applyGitSections(
+    receiver,
+    cfg(),
+    stateWith(base),
+    manifest(remote),
+    store,
+    buildIgnoreMatcher(receiver),
+    () => {},
+    {
+      applyConfig: async (repoDir, configPath, incoming) => {
+        configApplyCalls++;
+        await git(repoDir, "config", "remote.upstream.url", incoming["remote.upstream.url"]![0]!);
+        const snapshot = await readConfigSnapshot(configPath);
+        if (!snapshot.ok) throw new Error("test config unreadable");
+        return {
+          status: "completed",
+          preHash: gitConfigHash({}),
+          postHash: gitConfigHash(incoming),
+          incomingHash: gitConfigHash(incoming),
+          postToken: snapshot.snapshot.token,
+          warnings: [],
+          attempts: 1,
+        };
+      },
+    },
+  );
+
+  expect(await git(receiver, "rev-parse", "refs/tags/remote-marker")).toBe(
+    remote.refs["refs/tags/remote-marker"],
+  );
+  expect(configApplyCalls).toBe(1);
+  expect(await git(receiver, "config", "--get", "remote.upstream.url")).toBe(
+    desired["remote.upstream.url"]![0],
+  );
+  expect(outcome.configLane?.["."]?.cfgApplied).toBe(gitConfigHash(desired));
+  expect(outcome.partial?.["."]?.configApplied).not.toBe(false);
 });
 
 test("workspace-wide legacy degradation leaves receiver config untouched and advances Git", async () => {
@@ -311,6 +358,56 @@ test("fresh materialization uses the private helper and installs config last", a
   expect(outcome.gitPendingRemote).toBeUndefined();
   expect(await git(fresh, "config", "--get", "remote.upstream.url")).toBe(desired["remote.upstream.url"]![0]);
   expect(outcome.configLane?.["."]?.cfgApplied).toBe(gitConfigHash(desired));
+});
+
+test("created-fresh crash quarantine still installs config during the recovery pull", async () => {
+  const remote = { ...base, config: desired };
+  const state = stateWith(base);
+  const ctx = await repoCtxFromDisk(receiver);
+  if (!ctx) throw new Error("test repository unreadable");
+  const binding = await checkoutJournalBinding(state.stream, state.stateNonce!, ctx);
+  const headContent = await fs.readFile(path.join(receiver, ".git", "HEAD"), "utf8");
+  const journal: CheckoutJournal<{}> = {
+    journalId: `1700000000000-${"a".repeat(16)}`,
+    phase: "intent",
+    incomingKey: "created-fresh-crash",
+    incomingSection: remote,
+    old: {
+      headContent,
+      indexPresent: false,
+      opState: {},
+    },
+    expectedNew: {
+      opState: {},
+      refs: remote.refs,
+      head: remote.head,
+    },
+    binding,
+    createdFresh: true,
+    intended: {},
+  };
+  await writeCheckoutJournal(receiver, ".", journal, {
+    indexPath: path.join(receiver, ".git", "index"),
+    gitDir: path.join(receiver, ".git"),
+  });
+
+  const logs: string[] = [];
+  const outcome = await applyGitSections(
+    receiver,
+    cfg(),
+    state,
+    manifest(remote),
+    store,
+    buildIgnoreMatcher(receiver),
+    (line) => logs.push(line),
+  );
+
+  expect(logs.some((line) => line.includes("partial fresh repository quarantined"))).toBe(true);
+  expect(await git(receiver, "config", "--get", "remote.upstream.url")).toBe(
+    desired["remote.upstream.url"]![0],
+  );
+  expect(outcome.configLane?.["."]?.cfgApplied).toBe(gitConfigHash(desired));
+  expect(outcome.partial?.["."]?.configApplied).not.toBe(false);
 });
 
 test("conflict checkpoint waits for identity resolution before applying config", async () => {

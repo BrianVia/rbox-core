@@ -20,8 +20,12 @@ import { runAstSweep } from "../sync-git/ast-sweep-runner.js";
 
 const REPO = path.resolve(import.meta.dir, "../../..");
 const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sweep.mjs");
-// 16,683 bytes when introduced; leave room for new guarded entry points.
-const AST_SWEEP_MAX_BYTES = 24 * 1024;
+// 16,683 bytes when introduced; leave room for new guarded entry points. Raised
+// to 28 KiB by U3 wave 4A, which enrolled `flipAuthority` — the one rename that
+// elects SQLite — as an order-tracked owner, adding roughly 1 KiB of records.
+// This is a transport bound on the sweep's stdout, not a policy on how many
+// entry points may exist.
+const AST_SWEEP_MAX_BYTES = 28 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -49,15 +53,44 @@ interface EntryPoint {
 
 const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reads — refuse a state plane written by a newer rbox instead of guessing.
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
-  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawLegacyJsonState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadLegacyJsonState", kind: "read", sites: 1, guards: ["loadRawLegacyJsonState"] },
+  // 163 §C4, wave 5B: doctor is authority-aware. It classifies the document
+  // FIRST and then reads through the selecting seam, so a healthy migrated
+  // workspace is reported as healthy instead of being told to upgrade a binary
+  // that is already current.
+  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
+
+  // The whole-state compatibility adapter (design 222 §1.2 A-2): one selection
+  // from the document's bytes, and every backend-specific read or write behind
+  // it. The refusals are file-level, so nothing here opens a database first.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectSqliteAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
+  // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
+  // legacy document, so the repositories it covers are the same set in either
+  // format. It used to classify and refuse instead, which made every lock bundle
+  // unobtainable on a workspace rbox had just migrated.
+  //
+  // It classifies FIRST and only then reads, because the `M5 + Q` row requires the
+  // database to be at rest and an open here would deposit the sidecars that row
+  // reads as corruption. The classify is the extra access site.
+  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
+  { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
+  // The migration classifier's sole reader of the document. It must handle the
+  // marker rather than refuse it, so its guard is the classifier that decides
+  // the format, not the barrier that throws on it.
+  { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "publishWholeState", kind: "write", sites: 0, guards: ["assertStatePublishable"] },
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "afterStatePublication", kind: "write", sites: 0, guards: ["recordLastWriterWitness", "ensureStateReserve"] },
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyStateSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyLegacyJsonSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
+  // The SQLite save boundary: the lock, then the ONE write fence, then the
+  // selection re-read under that lock, and only then a database open.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectSqliteAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectSqliteAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 
@@ -73,6 +106,22 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/reset-quarantine.ts", symbol: "restoreResetQuarantineUnderFence", kind: "reset", sites: 1, guards: ["assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "withResetJournalDoctorFence", kind: "reset", sites: 5, guards: ["classifyStateFormat", "assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "quarantineStandingJournal", kind: "reset", sites: 4, guards: ["withResetJournalDoctorFence"] },
+
+  // Genesis (design 222 §2) — the only writer that publishes `Q` rather than a
+  // legacy document. It never replaces an existing document: every path here
+  // classifies first, and `finishWithQ` renames only over a re-confirmed absence.
+  { file: "src/cli/state-plane/genesis.ts", symbol: "inspect", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "eligibility", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "resume", kind: "read", sites: 2, guards: ["classifyStateFormat", "holdsMarkerFor"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["classifyStateFormat", "fsp.rename"] },
+
+  // Design 163's authority flip (M-6): the one rename in the product that
+  // replaces a live legacy document with `Q`. Its barrier is deliberately not
+  // `assertStatePublishable` — that guards a binary about to write legacy JSON,
+  // and this is the writer publishing the marker that barrier exists to protect.
+  // Its obligations instead are the sibling fence, the exact-sibling image, and
+  // the re-read of the live body digest as the LAST thing before the rename.
+  { file: "src/cli/state-plane/migration/authority-flip.ts", symbol: "flipAuthority", kind: "write", sites: 0, guards: ["requireSibling", "observeQSibling", "revalidateBackups", "revalidateActive", "cleanupCursor", "renameSync"] },
 ];
 
 /** Access sites that neither read nor replace the document's contents. Each
@@ -81,9 +130,10 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
 const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/state-plane/errors.ts::<module>", { sites: 1, reason: "StreamMismatchError renders the stable legacy authority path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
-  ["src/cli/state-plane/paths.ts::<module>", { sites: 1, reason: "the SQLite reset path table names the legacy authority-marker path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
+  ["src/cli/state-plane/locks.ts::withStatePlaneLocks", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the document is read by the guarded inspectInventory" }],
+  ["src/cli/state-plane/migration/authority-flip.ts::completeFlip", { sites: 2, reason: "names `.rbox` only as the parent to fsync after the flip's rename; the document itself is replaced by flipAuthority, which is inventoried above" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
 ]);
@@ -193,7 +243,7 @@ describe("state barrier pinning inventory", () => {
   });
 
   test("inline CAS publication proves its callback and post-publication order", () => {
-    for (const symbol of ["applyStateSavePacket", "ensureTelemetryBindingId"]) {
+    for (const symbol of ["applyLegacyJsonSavePacket", "ensureTelemetryBindingId"]) {
       const publish = requiredCall("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, "writeFileAtomic");
       const options = publish.arguments?.[2] ?? "";
       expect(options).toContain("beforeRename");
@@ -223,6 +273,26 @@ describe("state barrier pinning inventory", () => {
     expect(stateParentSyncIndex).toBeGreaterThan(renameIndex);
     expect(calls[stateParentSyncIndex]?.arguments?.[0]).toBe("activeParent");
     expectOrderedCalls(file, owner, ["fs.rename", "fsyncDirectory", "recordLastWriterWitness"]);
+  });
+
+  // 222 §2.4: a resume that rebuilt from step 4 with caller-supplied ids would
+  // install values §2.5.1 can never satisfy, live-locking a HEALTHY workspace
+  // into a permanent halt on every retry. The intent is the sole source.
+  test("installGenesisLineage's only genesis caller derives its ids from the intent", async () => {
+    const genesis = await fs.readFile(path.join(REPO, "src/cli/state-plane/genesis.ts"), "utf8");
+
+    expect(genesis.split("installGenesisLineage(").length - 1, "genesis.ts must install a lineage exactly once").toBe(1);
+    const call = genesis.slice(genesis.indexOf("installGenesisLineage("));
+    const argument = call.slice(0, call.indexOf("})") + 1);
+    for (const binding of ["stream: intent.evidence.stream", "authorityId: intent.authorityId", "lineageId: intent.lineageId"]) {
+      expect(argument, `the installed lineage must come from the intent, not a caller: ${binding}`).toContain(binding);
+    }
+
+    expect(genesis.split("mintIds()").length - 1, "the id thunk must be called from exactly one place").toBe(1);
+    expect(
+      genesis.slice(genesis.indexOf("async function resume(")).split("\n}")[0],
+      "resume must never mint ids — only §2.5.2 case 4 does, by returning to establish",
+    ).not.toContain("mintIds");
   });
 
   test("the barrier module is the only thing that recognizes the marker bytes", async () => {

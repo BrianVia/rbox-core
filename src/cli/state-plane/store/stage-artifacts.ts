@@ -25,33 +25,10 @@ import {
   SQLITE_SIDECARS, assertNoSidecars, copyWhileHashing, fsyncDirectory, hashDescriptor, identityOf,
   openNoFollow, sameInode, type PhysicalProof,
 } from "./artifact-proof.js";
+import { selectRow } from "./statements.js";
 
 export { assertNoSidecars, fsyncDirectory, type PhysicalIdentity } from "./artifact-proof.js";
-
-/**
- * Stream rows through a private statement that is always finalized, including on
- * an early throw. A refusal raised mid-iteration must not leave a cursor open on a
- * connection-owned TEMP table the caller is about to drop. Returning `false` from
- * the visitor stops the scan, which is how byte ceilings are applied DURING paging.
- */
-export function streamRows<T>(
-  db: Database,
-  sql: string,
-  params: Array<string | number | Uint8Array | null>,
-  visit: (row: T) => boolean | void,
-): number {
-  const statement = db.prepare(sql);
-  let count = 0;
-  try {
-    for (const row of statement.iterate(...params) as Iterable<T>) {
-      count++;
-      if (visit(row) === false) break;
-    }
-    return count;
-  } finally {
-    statement.finalize();
-  }
-}
+export { streamRows } from "./statements.js";
 
 export const STAGE_ID_RE = /^[0-9a-f]{32}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -159,7 +136,7 @@ export function sealAndPublish(
   destination: string,
   stageId: string,
 ): { sha256: string; bytes: number } {
-  db.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  selectRow(db, "PRAGMA wal_checkpoint(TRUNCATE)");
   db.close();
   assertNoSidecars(privateFile, stageId);
   const fd = openNoFollow(privateFile, stageId);
@@ -253,7 +230,7 @@ export function openSealedArtifact(
     try {
       db.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA temp_store=FILE");
       // The priming read materializes the WAL index; only then can the names go.
-      db.query("SELECT count(*) AS n FROM sqlite_schema").get();
+      selectRow(db, "SELECT count(*) AS n FROM sqlite_schema");
       for (const suffix of ["", ...SQLITE_SIDECARS]) fs.rmSync(`${contained}${suffix}`, { force: true });
     } catch (error) {
       // The handle must never outlive the names: an unclosed anonymous inode is
@@ -335,7 +312,7 @@ export function configureStageBuilder(db: Database): void {
     PRAGMA busy_timeout=5000;
     PRAGMA temp_store=FILE;
   `);
-  const mode = String((db.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toLowerCase();
+  const mode = String(selectRow<{ journal_mode: string }>(db, "PRAGMA journal_mode")!.journal_mode).toLowerCase();
   if (mode !== "wal") throw new Error(`stage builder journal_mode is ${mode}`);
 }
 

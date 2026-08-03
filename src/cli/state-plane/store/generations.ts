@@ -16,8 +16,9 @@ import type { GitSectionRole, ManifestHeader, Plane } from "../ports.js";
 import { MAX_FILE_BATCH, PAGE_BYTES, type SealedStageReader, type SealedStageRef } from "./sealed-stages.js";
 import {
   PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, sealAndPublish,
-  sealedStagePath, streamRows,
+  sealedStagePath,
 } from "./stage-artifacts.js";
+import { runStatement, streamRows, withStatement } from "./statements.js";
 
 export const STAGE_DDL = `
 CREATE TABLE stage_meta(
@@ -63,8 +64,8 @@ export function beginGeneration(
     db = new Database(privateDirectory.file(), { create: true, readwrite: true });
     configureStageBuilder(db);
     db.exec(STAGE_DDL);
-    db.query("INSERT INTO stage_meta(stage_id,plane,state,header_cjson) VALUES (?,?,'building',?)")
-      .run(stageId, plane, canonicalJson(header));
+    runStatement(db, "INSERT INTO stage_meta(stage_id,plane,state,header_cjson) VALUES (?,?,'building',?)",
+      stageId, plane, canonicalJson(header));
   } catch (error) {
     abandonBuilder(db, lock, privateDirectory);
     throw error;
@@ -91,18 +92,19 @@ class SqliteGenerationBuilder implements GenerationBuilder {
   putEntries(entries: readonly FileEntry[]): void {
     this.#assertOpen();
     if (entries.length > MAX_FILE_BATCH) throw new CursorWindowError("file", entries.length, MAX_FILE_BATCH);
-    const insert = this.db.query("INSERT INTO stage_entries(stage_id,path,path_order,entry_cjson) VALUES (?,?,?,?)");
-    for (const entry of entries) {
-      const encoded = encodeFileEntry(entry);
-      this.#flushBefore(encoded.retainedEstimate);
-      insert.run(this.stageId, encoded.path, encoded.pathOrder, encoded.canonical);
-      this.#pendingBytes += encoded.retainedEstimate;
-    }
+    withStatement(this.db, "INSERT INTO stage_entries(stage_id,path,path_order,entry_cjson) VALUES (?,?,?,?)", (insert) => {
+      for (const entry of entries) {
+        const encoded = encodeFileEntry(entry);
+        this.#flushBefore(encoded.retainedEstimate);
+        insert.run(this.stageId, encoded.path, encoded.pathOrder, encoded.canonical);
+        this.#pendingBytes += encoded.retainedEstimate;
+      }
+    });
   }
 
   declareGitRole(role: GitSectionRole): void {
     this.#assertOpen();
-    this.db.query("INSERT OR IGNORE INTO stage_git_roles(stage_id,role) VALUES (?,?)").run(this.stageId, role);
+    runStatement(this.db, "INSERT OR IGNORE INTO stage_git_roles(stage_id,role) VALUES (?,?)", this.stageId, role);
   }
 
   putGitSection(role: GitSectionRole, relPath: string, section: GitSection): void {
@@ -115,8 +117,8 @@ class SqliteGenerationBuilder implements GenerationBuilder {
     if (encoded.bytes > PAGE_BYTES) throw new GitSectionOversizeError(relPath, encoded.bytes);
     this.#flushBefore(encoded.bytes);
     this.declareGitRole(role);
-    this.db.query("INSERT INTO stage_git_sections(stage_id,role,rel_path,path_order,section_cjson) VALUES (?,?,?,?,?)")
-      .run(this.stageId, role, relPath, utf16beOrderKey(relPath), encoded.canonical);
+    runStatement(this.db, "INSERT INTO stage_git_sections(stage_id,role,rel_path,path_order,section_cjson) VALUES (?,?,?,?,?)",
+      this.stageId, role, relPath, utf16beOrderKey(relPath), encoded.canonical);
     this.#pendingBytes += encoded.bytes;
   }
 
@@ -144,8 +146,8 @@ class SqliteGenerationBuilder implements GenerationBuilder {
         [this.stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
       const counts = digest.counts;
       const logicalDigest = digest.seal(expectedCounts);
-      this.db.query("UPDATE stage_meta SET state='sealed',digest=?,counts_cjson=? WHERE stage_id=?")
-        .run(logicalDigest, canonicalJson(counts), this.stageId);
+      runStatement(this.db, "UPDATE stage_meta SET state='sealed',digest=?,counts_cjson=? WHERE stage_id=?",
+        logicalDigest, canonicalJson(counts), this.stageId);
       this.db.exec("COMMIT");
       this.#open = false;
       const physical = sealAndPublish(
@@ -224,44 +226,46 @@ export function dropStageFileTemp(db: Database): void {
  * IMMEDIATE`, so interning and promotion stay entirely inside the CAS transaction.
  */
 export function copyStageFilesIntoTemp(db: Database, stage: SealedStageReader): number {
-  const insertTemp = db.query(`INSERT INTO ${CAS_FILE_TEMP}(${ENTRY_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  return stage.streamFiles((encoded) => {
-    insertTemp.run(
-      encoded.entryId, encoded.exactFingerprint, encoded.path, encoded.pathOrder, encoded.sha256,
-      encoded.size, encoded.mode, encoded.mtimeMs, encoded.kind, encoded.symlinkTarget,
-      encoded.encSha, encoded.comp, encoded.payloadSha, encoded.cipherSize, encoded.extrasCjson,
-      encoded.canonicalBytes, encoded.retainedEstimate,
-    );
-  });
+  return withStatement(db,
+    `INSERT INTO ${CAS_FILE_TEMP}(${ENTRY_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    (insertTemp) => stage.streamFiles((encoded) => {
+      insertTemp.run(
+        encoded.entryId, encoded.exactFingerprint, encoded.path, encoded.pathOrder, encoded.sha256,
+        encoded.size, encoded.mode, encoded.mtimeMs, encoded.kind, encoded.symlinkTarget,
+        encoded.encSha, encoded.comp, encoded.payloadSha, encoded.cipherSize, encoded.extrasCjson,
+        encoded.canonicalBytes, encoded.retainedEstimate,
+      );
+    }));
 }
 
 /** Intern every staged value, then resolve each staged row to the authority's entry
  * id. Both halves are indexed SQL set operations over the whole stage. */
 export function internStagedEntryValues(db: Database): void {
-  db.query(`INSERT INTO entry_values(${ENTRY_COLUMNS})
+  runStatement(db, `INSERT INTO entry_values(${ENTRY_COLUMNS})
     SELECT ${ENTRY_COLUMNS.split(",").map((column) => `t.${column.trim()}`).join(",")}
     FROM ${CAS_FILE_TEMP} t
-    WHERE NOT EXISTS(SELECT 1 FROM entry_values e WHERE ${EXACT_MATCH})`).run();
-  db.query(`UPDATE ${CAS_FILE_TEMP} AS t SET entry_id=(
-    SELECT e.entry_id FROM entry_values e WHERE ${EXACT_MATCH} LIMIT 1)`).run();
+    WHERE NOT EXISTS(SELECT 1 FROM entry_values e WHERE ${EXACT_MATCH})`);
+  runStatement(db, `UPDATE ${CAS_FILE_TEMP} AS t SET entry_id=(
+    SELECT e.entry_id FROM entry_values e WHERE ${EXACT_MATCH} LIMIT 1)`);
 }
 
 /** Indexed SQL set-difference. Deleted paths go in this transaction, unchanged
  * paths keep their row and generation, and only dirty rows are stamped. */
 export function promoteFilesIntoPlane(db: Database, lineageId: string, plane: Plane, generation: number): void {
-  db.query(`DELETE FROM plane_entries WHERE lineage_id=? AND plane=?
-    AND NOT EXISTS(SELECT 1 FROM ${CAS_FILE_TEMP} f WHERE f.path=plane_entries.path)`).run(lineageId, plane);
-  db.query(`INSERT INTO plane_entries(lineage_id,plane,path,path_order,entry_id,changed_generation)
+  runStatement(db, `DELETE FROM plane_entries WHERE lineage_id=? AND plane=?
+    AND NOT EXISTS(SELECT 1 FROM ${CAS_FILE_TEMP} f WHERE f.path=plane_entries.path)`, lineageId, plane);
+  runStatement(db, `INSERT INTO plane_entries(lineage_id,plane,path,path_order,entry_id,changed_generation)
     SELECT ?,?,f.path,f.path_order,f.entry_id,? FROM ${CAS_FILE_TEMP} f
     WHERE NOT EXISTS(SELECT 1 FROM plane_entries p
       WHERE p.lineage_id=? AND p.plane=? AND p.path=f.path AND p.entry_id=f.entry_id)
     ON CONFLICT(lineage_id,plane,path) DO UPDATE SET
       path_order=excluded.path_order, entry_id=excluded.entry_id,
-      changed_generation=excluded.changed_generation`).run(lineageId, plane, generation, lineageId, plane);
+      changed_generation=excluded.changed_generation`, lineageId, plane, generation, lineageId, plane);
 }
 
 /** GC: an interned value is collectable only once no plane row references it. */
 export function collectUnreferencedEntryValues(db: Database): number {
-  return db.query(`DELETE FROM entry_values WHERE NOT EXISTS(
-    SELECT 1 FROM plane_entries p WHERE p.entry_id=entry_values.entry_id)`).run().changes;
+  return withStatement(db, `DELETE FROM entry_values WHERE NOT EXISTS(
+    SELECT 1 FROM plane_entries p WHERE p.entry_id=entry_values.entry_id)`,
+  (statement) => statement.run().changes);
 }

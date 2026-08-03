@@ -51,16 +51,37 @@ const STATE_ORDER_OWNERS = new Map([
     "publishWholeState",
   ])],
   ["src/cli/state-plane/adapters/legacy-json-store.ts", new Set([
-    "applyStateSavePacket",
+    "applyLegacyJsonSavePacket",
     "ensureTelemetryBindingId",
     "installGenesisResetStateUnderHeldLock",
-    "loadRawState",
-    "loadState",
+    "loadRawLegacyJsonState",
+    "loadLegacyJsonState",
     "writeWholeStateUnsafe",
   ])],
+  ["src/cli/state-plane/adapters/whole-state-compat.ts", new Set([
+    "applyStateSavePacket",
+    "loadRawState",
+    "loadState",
+    "saveThroughStore",
+    "selectSqliteAuthority",
+  ])],
+  // Design 163's authority flip. It reaches `.rbox/state.json` through a local
+  // binding rather than a `statePath(...)` argument, so without this entry its
+  // ordering — the sibling fence, the exact-sibling image, the revalidations,
+  // and the live-body re-read last — would be invisible to the inventory.
+  ["src/cli/state-plane/migration/authority-flip.ts", new Set(["flipAuthority"])],
+  // The lock bundle's read-only inventory (wave 5B). It reaches the document
+  // only through the selecting seam now — no `statePath(...)` argument — so
+  // without this entry the obligation the fence rests on would be invisible.
+  ["src/cli/state-plane/locks.ts", new Set(["inspectInventory"])],
 ]);
 const STATE_ORDER_CALLEES = new Set([
   "acquireLock",
+  "assertAuthorityWritable",
+  "markResetLineageProvenance",
+  "openAuthorityStore",
+  "recoverStandingResetJournal",
+  "selectSqliteAuthority",
   "afterStatePublication",
   "assertStatePublishable",
   "assertStateReadable",
@@ -73,6 +94,14 @@ const STATE_ORDER_CALLEES = new Set([
   "handle.stat",
   "isOwner",
   "isSymbolicLink",
+  // The authority flip's own obligations (design 163 M6).
+  "requireSibling",
+  "observeQSibling",
+  "revalidateBackups",
+  "revalidateActive",
+  "cleanupCursor",
+  "fs.renameSync",
+  "loadRawLegacyJsonState",
   "loadRawState",
   "publishWholeState",
   "recordLastWriterWitness",

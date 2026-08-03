@@ -524,10 +524,7 @@ const wsActivity = (over: Partial<NonNullable<DaemonActivity["ws"]>> = {}, activ
 const attrBase = (over: Partial<Parameters<typeof attributeDaemonForStatus>[0]> = {}) =>
   attributeDaemonForStatus({
     activity: wsActivity(),
-    daemonRunning: true,
-    boundWorkspaceId: "ws_current",
-    currentWorkspaceId: "ws_current",
-    livePidfileBootId: "boot-live",
+    daemon: { running: true, ownsWorkspace: true, bootId: "boot-live" },
     localSequence: 78,
     now: NOW,
     ...over,
@@ -549,10 +546,10 @@ test("elided remote sequence is at least the local synced sequence", () => {
 
 test("daemon remote evidence is used only when every trust condition passes", () => {
   const cases: Array<[string, Partial<Parameters<typeof attributeDaemonForStatus>[0]>]> = [
-    ["daemon stopped", { daemonRunning: false }],
-    ["binding missing", { boundWorkspaceId: undefined }],
-    ["binding stale", { boundWorkspaceId: "ws_old" }],
-    ["pidfile legacy/missing boot", { livePidfileBootId: undefined }],
+    ["daemon stopped", { daemon: { running: false, ownsWorkspace: false, bootId: "boot-live" } }],
+    ["binding missing", { daemon: { running: true, ownsWorkspace: false, bootId: "boot-live" } }],
+    ["binding stale", { daemon: { running: true, ownsWorkspace: false, bootId: "boot-live" } }],
+    ["pidfile legacy/missing boot", { daemon: { running: true, ownsWorkspace: true } }],
     ["disconnected", { activity: wsActivity({ connected: false }) }],
     ["not caught up", { activity: wsActivity({ caughtUp: false }) }],
     ["halted", { activity: wsActivity({}, { halt: { at: iso(1), reason: "boom", count: 1, op: "pull" } }) }],
@@ -562,7 +559,7 @@ test("daemon remote evidence is used only when every trust condition passes", ()
     expect(`${name}:${r.elided}`).toBe(`${name}:false`);
     expect(r.remote).toBeUndefined();
   }
-  expect(attrBase({ livePidfileBootId: undefined }).activity).toBeDefined();
+  expect(attrBase({ daemon: { running: true, ownsWorkspace: true } }).activity).toBeDefined();
 });
 
 test("daemon remote evidence expires after the freshness window", () => {
@@ -583,7 +580,7 @@ test("conflicting ws boot suppresses inherited activity", () => {
 
 test("binding bootId does not affect attribution when pidfile and activity match", () => {
   const activity = wsActivity({ bootId: "boot-live" });
-  const r = attrBase({ activity, boundWorkspaceId: "ws_current", livePidfileBootId: "boot-live" });
+  const r = attrBase({ activity, daemon: { running: true, ownsWorkspace: true, bootId: "boot-live" } });
   expect(r.activity).toBe(activity);
   expect(r.elided).toBe(true);
 });

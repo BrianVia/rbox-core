@@ -178,6 +178,10 @@ jobs:
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run guards
 
+      - name: Mutation gate (curated guards, design 222 §7.9)
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
+        run: bun run gate:mutation
+
       - name: Typecheck (root + apps/api + scripts)
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run typecheck

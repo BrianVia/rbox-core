@@ -22,7 +22,7 @@
  *   - Only PUBLIC commands appear (no `hidden`, no deprecated `alias`, no
  *     internal tokens like `__daemon-run`).
  */
-import { COMMAND_HELP, type CommandHelp } from "./help-registry.js";
+import { COMMAND_HELP, type CommandFlag, type CommandHelp } from "./help-registry.js";
 import { shQuote } from "./shell-quote.js";
 
 /** Wrap content as a single-quoted zsh word (after single-quote escaping). */
@@ -50,19 +50,19 @@ interface ParsedFlag {
   metavar: string; // e.g. "id" (without <>), "" for boolean flags
 }
 
-/** Parse a registry flag string ("--only <id>", "--allow-mass-delete", "--lines N"). */
-function parseFlag(flag: string): ParsedFlag {
-  const parts = flag.trim().split(/\s+/);
+/** Project one typed flag declaration into zsh's display-oriented shape. */
+function parseFlag(flag: CommandFlag): ParsedFlag {
+  const parts = flag.flag.trim().split(/\s+/);
   const name = parts[0]!;
   const rest = parts.slice(1).join(" ").replace(/[<>]/g, "").trim();
-  return { name, takesArg: parts.length > 1, metavar: rest };
+  return { name, takesArg: flag.takesValue === true, metavar: rest };
 }
 
 /** `_arguments` optspecs for one command's flags, in registry order. */
 function flagSpecs(c: CommandHelp): string[] {
   if (!c.flags?.length) return [];
-  return c.flags.map((f) => {
-    const { name, takesArg, metavar } = parseFlag(f.flag);
+  return c.flags.filter((flag) => !flag.hidden).map((f) => {
+    const { name, takesArg, metavar } = parseFlag(f);
     const desc = bracketDesc(f.desc);
     if (!takesArg) return q(`${name}[${desc}]`);
     // A path-shaped argument gets file completion; everything else just names

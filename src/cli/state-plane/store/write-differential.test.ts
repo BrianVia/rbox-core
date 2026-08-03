@@ -3,7 +3,7 @@
  *
  * The SAME logical delta — byte-identical transition inputs and the same file-only
  * manifest — is applied to the JSON authority through `applyStateSavePacket` and to
- * the SQLite store through `applyCasPacket`. Both sides are then read back through
+ * the SQLite store through its save adapter. Both sides are then read back through
  * their own durable form, and the resulting `SyncState` values must be strictly
  * equal. A store that merely round-trips its own writes would pass a self-test;
  * only this comparison proves the write seam preserves the JSON authority's
@@ -23,12 +23,9 @@ import type {
   GlobalManifestMeta, RepoRecordInput, StateSavePacket, SyncState,
 } from "../../sync-state-model.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
+import { applySavePacketToStore } from "../adapters/sqlite-state-save.js";
 import type { ManifestHeader } from "../ports.js";
-import { beginGeneration, type SealedStageRef } from "./generations.js";
-import { createStateStore, type StateStoreHandle } from "./open.js";
-import { openReadSnapshot } from "./read-snapshot.js";
-import { beginRepoTransitionStage, type SealedRepoTransitionRef, type TransitionInput } from "./transition-stages.js";
-import { applyCasPacket, type CasPacket } from "./write-packet.js";
+import { createStateStore, openStateStore } from "./open.js";
 import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
 const roots: string[] = [];
@@ -120,59 +117,6 @@ function jsonPacket(delta: Delta, expectedNonce: string): StateSavePacket {
   };
 }
 
-/* ------------------------------------------------------------- SQLite authority */
-
-function sealGlobal(directory: string, delta: Delta): SealedStageRef {
-  const builder = beginGeneration(directory, "base", delta.header);
-  builder.putEntries(delta.files);
-  return builder.finishGeneration({ files: delta.files.length, gitSections: 0 });
-}
-
-function sealTransitions(
-  directory: string,
-  handle: StateStoreHandle,
-  delta: Delta,
-  global: SealedStageRef | undefined,
-): SealedRepoTransitionRef {
-  const bindings = global ? [{ stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256 }] : [];
-  const builder = beginRepoTransitionStage(directory, openReadSnapshot(handle).token, bindings,
-    global ? { globalBinding: bindings[0]! } : {});
-  for (const transition of delta.transitions) {
-    const input: TransitionInput = {
-      relPath: transition.relPath,
-      expectedRepoGen: transition.expectedRepoGen,
-      newRecord: transition.newRecord,
-      ...(transition.baseProof ? { baseProof: transition.baseProof } : {}),
-      evidenceBindings: { sourceStages: bindings },
-    };
-    builder.putTransition(input);
-  }
-  return builder.finishRepoTransitionStage();
-}
-
-function storePacket(directory: string, handle: StateStoreHandle, delta: Delta): CasPacket {
-  const token = openReadSnapshot(handle).token;
-  const global = sealGlobal(directory, delta);
-  return {
-    expected: {
-      lineageId: token.lineageId,
-      stream: token.stream,
-      nonce: token.nonce ?? "legacy",
-      stateRevision: token.stateRevision ?? 0,
-      baseGeneration: token.baseGeneration,
-      localRevision: token.localRevision,
-    },
-    sourceGlobalSeq: delta.sourceGlobalSeq,
-    global: {
-      stage: global,
-      fileHeader: delta.header,
-      ...(delta.manifestMeta ? { manifestMeta: delta.manifestMeta } : {}),
-    },
-    repoTransitions: sealTransitions(directory, handle, delta, global),
-    ownerToken: OWNER,
-  };
-}
-
 /* ------------------------------------------------------------------ the deltas */
 
 const SEED: Delta = {
@@ -241,7 +185,6 @@ function seedJsonAuthority(jsonRoot: string): void {
 test("write-then-read round trips are strictly differential with the JSON authority", async () => {
   const jsonRoot = root("rbox-cas-json-");
   const sqlRoot = root("rbox-cas-sql-");
-  const stages = path.join(sqlRoot, "stages");
   seedJsonAuthority(jsonRoot);
   const handle = createStateStore(path.join(sqlRoot, "state.db"), {
     authorityId: "a".repeat(32), lineageId: LINEAGE, stream: STREAM,
@@ -249,10 +192,11 @@ test("write-then-read round trips are strictly differential with the JSON author
   });
 
   for (const delta of [SEED, DELTA]) {
-    const jsonResult = await applyStateSavePacket(jsonRoot, jsonPacket(delta, NONCE), { lock: lockOptions });
+    const packet = jsonPacket(delta, NONCE);
+    const jsonResult = await applyStateSavePacket(jsonRoot, packet, { lock: lockOptions });
     expect(jsonResult.status).toBe("accepted");
 
-    const casResult = applyCasPacket(handle, stages, storePacket(stages, handle, delta));
+    const casResult = await applySavePacketToStore(handle, packet, OWNER);
     expect(casResult.status).toBe("accepted");
 
     const fromJson = await loadRawState(jsonRoot);
@@ -277,14 +221,13 @@ test("write-then-read round trips are strictly differential with the JSON author
 test("a repo-only packet preserves the whole global plane and still increments the revision", async () => {
   const jsonRoot = root("rbox-cas-json-repo-only-");
   const sqlRoot = root("rbox-cas-sql-repo-only-");
-  const stages = path.join(sqlRoot, "stages");
   seedJsonAuthority(jsonRoot);
   const handle = createStateStore(path.join(sqlRoot, "state.db"), {
     authorityId: "a".repeat(32), lineageId: LINEAGE, stream: STREAM,
     createdBy: "test", stateNonce: NONCE, stateRevision: 0,
   });
   expect((await applyStateSavePacket(jsonRoot, jsonPacket(SEED, NONCE), { lock: lockOptions })).status).toBe("accepted");
-  expect(applyCasPacket(handle, stages, storePacket(stages, handle, SEED)).status).toBe("accepted");
+  expect((await applySavePacketToStore(handle, jsonPacket(SEED, NONCE), OWNER)).status).toBe("accepted");
 
   const repoOnly: Delta = { ...DELTA, transitions: DELTA.transitions };
   const jsonResult = await applyStateSavePacket(jsonRoot, {
@@ -295,21 +238,60 @@ test("a repo-only packet preserves the whole global plane and still increments t
   }, { lock: lockOptions });
   expect(jsonResult.status).toBe("accepted");
 
-  const token = openReadSnapshot(handle).token;
-  const result = applyCasPacket(handle, stages, {
-    expected: {
-      lineageId: token.lineageId, stream: token.stream, nonce: token.nonce ?? "legacy",
-      stateRevision: token.stateRevision ?? 0, baseGeneration: token.baseGeneration,
-      localRevision: token.localRevision,
-    },
+  const packet: StateSavePacket = {
+    expectedStream: STREAM,
+    expectedNonce: NONCE,
     sourceGlobalSeq: repoOnly.sourceGlobalSeq,
-    repoTransitions: sealTransitions(stages, handle, repoOnly, undefined),
-    ownerToken: OWNER,
-  });
+    repos: repoOnly.transitions.map((transition) => ({ ...transition })),
+  };
+  const result = await applySavePacketToStore(handle, packet, OWNER);
   expect(result.status).toBe("accepted");
 
   const fromJson = await loadRawState(jsonRoot);
   expect(loadRawStateFromStore(handle)).toStrictEqual(fromJson!);
   expect(fromJson!.lastSyncedSequence).toBe(5);
   handle.close();
+});
+
+test("adapter preserves raw stream and nonce rejections and leaves authority unchanged", async () => {
+  const sqlRoot = root("rbox-cas-sql-reject-");
+  const handle = createStateStore(path.join(sqlRoot, "state.db"), {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: STREAM,
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+  });
+  const before = loadRawStateFromStore(handle);
+  for (const [packet, reason] of [
+    [{ ...jsonPacket(SEED, NONCE), expectedStream: "other-stream" }, "stream"],
+    [jsonPacket(SEED, "d".repeat(32)), "nonce"],
+  ] as const) {
+    const result = await applySavePacketToStore(handle, packet, OWNER);
+    expect(result.status).toBe("rejected");
+    if (result.status === "rejected") {
+      expect(result.reason).toBe(reason);
+      result.retry.close();
+    }
+    expect(loadRawStateFromStore(handle)).toStrictEqual(before);
+    expect(fs.readdirSync(sqlRoot).filter((name) => name.startsWith("stage-"))).toEqual([]);
+  }
+  handle.close();
+});
+
+test("adapter owns sealed-stage cleanup before CAS ownership and on unsupported stores", async () => {
+  const sqlRoot = root("rbox-cas-sql-cleanup-");
+  const target = path.join(sqlRoot, "state.db");
+  const handle = createStateStore(target, {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: STREAM,
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+  });
+  const invalid = jsonPacket(SEED, NONCE);
+  invalid.repos = [{ ...invalid.repos[0]!, expectedRepoGen: -1 }];
+  await expect(applySavePacketToStore(handle, invalid, OWNER)).rejects.toThrow("invalid expected generation");
+  expect(fs.readdirSync(sqlRoot).filter((name) => name.startsWith("stage-"))).toEqual([]);
+  handle.close();
+
+  const readonly = openStateStore(target, { readonly: true });
+  const result = await applySavePacketToStore(readonly, jsonPacket(SEED, NONCE), OWNER);
+  expect(result.status).toBe("unsupported");
+  expect(fs.readdirSync(sqlRoot).filter((name) => name.startsWith("stage-"))).toEqual([]);
+  readonly.close();
 });

@@ -9,12 +9,19 @@ import {
   AUTHORITY_MARKER_MAGIC,
   classifyStateFormat,
   isAuthorityMarkerBytes,
+  readAuthorityMarkerId,
   rethrowIfStateBarrier,
 } from "./authority-marker.js";
 import {
+  StateAuthorityCorruptError,
   StateFormatTooNewError,
   StateWriteRefusedError,
 } from "./errors.js";
+import {
+  applyLegacyJsonSavePacket,
+  loadLegacyJsonState,
+  loadRawLegacyJsonState,
+} from "./adapters/legacy-json-store.js";
 import {
   applyStateSavePacket,
   loadRawState,
@@ -45,6 +52,25 @@ test("the authority marker is exactly 58 bytes and recognized only in its exact 
   expect(isAuthorityMarkerBytes(Buffer.from(AUTHORITY_MARKER.replace(/\n$/, "")))).toBe(false);
   expect(isAuthorityMarkerBytes(Buffer.from(`${AUTHORITY_MARKER_MAGIC}\n${"A".repeat(32)}\n`))).toBe(false);
   expect(isAuthorityMarkerBytes(Buffer.from(`${AUTHORITY_MARKER}x`))).toBe(false);
+});
+
+test("the marker's authority id is read only from the exact bytes", async () => {
+  const root = await workspace("rbox-barrier-id-");
+  expect(await readAuthorityMarkerId(statePath(root)), "absent").toBeUndefined();
+  await fs.writeFile(statePath(root), AUTHORITY_MARKER);
+  expect(await readAuthorityMarkerId(statePath(root))).toBe("a".repeat(32));
+  for (const impostor of [
+    `${AUTHORITY_MARKER_MAGIC}\n${"A".repeat(32)}\n`, // uppercase hex
+    AUTHORITY_MARKER.replace(/\n$/, "x"),
+    AUTHORITY_MARKER.slice(0, -1),
+    '{"stream":"s"}',
+  ]) {
+    await fs.writeFile(statePath(root), impostor);
+    expect(await readAuthorityMarkerId(statePath(root)), impostor.slice(0, 24)).toBeUndefined();
+  }
+  await fs.rm(statePath(root));
+  await fs.symlink(path.join(root, "elsewhere"), statePath(root));
+  expect(await readAuthorityMarkerId(statePath(root)), "symlink").toBeUndefined();
 });
 
 test("state formats are classified without parsing", async () => {
@@ -103,11 +129,24 @@ test("a symlink swapped in at the path is refused rather than read as the docume
   expect((await fs.lstat(statePath(root))).isSymbolicLink(), "the swap fixture never armed").toBe(true);
 });
 
-test("every state read refuses the authority marker with a typed error", async () => {
+test("every legacy-JSON state read refuses the authority marker with a typed error", async () => {
   const root = await workspace("rbox-barrier-read-");
   await fs.writeFile(statePath(root), AUTHORITY_MARKER);
-  await expect(loadRawState(root)).rejects.toBeInstanceOf(StateFormatTooNewError);
-  await expect(loadState(root, "stream")).rejects.toBeInstanceOf(StateFormatTooNewError);
+  await expect(loadRawLegacyJsonState(root)).rejects.toBeInstanceOf(StateFormatTooNewError);
+  await expect(loadLegacyJsonState(root, "stream")).rejects.toBeInstanceOf(StateFormatTooNewError);
+});
+
+/** From U3 the whole-state seam is authority-aware (design 222 §1.2 A-2): it
+ * selects the SQLite backend on `Q` instead of refusing. The barrier's promise
+ * survives as the corruption refusal below — a marker naming a database that is
+ * not there is contradictory durable state, and rbox repairs nothing. */
+test("the whole-state seam selects on the marker and refuses a marker with no database", async () => {
+  const root = await workspace("rbox-barrier-select-");
+  await fs.writeFile(statePath(root), AUTHORITY_MARKER);
+  await expect(loadRawState(root)).rejects.toBeInstanceOf(StateAuthorityCorruptError);
+  await expect(loadState(root, "stream")).rejects.toBeInstanceOf(StateAuthorityCorruptError);
+  expect(await fs.readFile(statePath(root), "utf8")).toBe(AUTHORITY_MARKER);
+  expect(await fs.readdir(path.join(root, ".rbox", "state"))).toEqual([]);
 });
 
 test("the write-side barrier leaves the authority marker byte-identical", async () => {
@@ -120,12 +159,17 @@ test("the write-side barrier leaves the authority marker byte-identical", async 
   expect((await fs.readdir(path.join(root, ".rbox"))).filter((name) => name.startsWith(".rbox-tmp-"))).toEqual([]);
 });
 
-test("the transactional CAS writer also refuses to publish over the marker", async () => {
+test("the transactional CAS writer never publishes JSON over the marker", async () => {
   const root = await workspace("rbox-barrier-cas-");
   await fs.writeFile(statePath(root), AUTHORITY_MARKER);
-  await expect(applyStateSavePacket(root, {
+  // The legacy JSON CAS still refuses outright; the selecting seam routes to
+  // SQLite and refuses there. Neither writes.
+  await expect(applyLegacyJsonSavePacket(root, {
     expectedStream: "stream", expectedNonce: "legacy", sourceGlobalSeq: 0, repos: [],
   })).rejects.toBeInstanceOf(StateFormatTooNewError);
+  await expect(applyStateSavePacket(root, {
+    expectedStream: "stream", expectedNonce: "legacy", sourceGlobalSeq: 0, repos: [],
+  })).rejects.toBeInstanceOf(StateAuthorityCorruptError);
   expect(await fs.readFile(statePath(root), "utf8")).toBe(AUTHORITY_MARKER);
 });
 

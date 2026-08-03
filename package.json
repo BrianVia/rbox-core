@@ -9,7 +9,7 @@
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
     "dev:install": "bun scripts/dev-install.ts",
-    "test": "bun test ./src/ ./scripts/gc-drain.test.ts",
+    "test": "bun test ./src/ ./scripts/gc-drain.test.ts ./scripts/mutation-gate.test.ts ./scripts/bench/migration-baseline.test.ts",
     "test:api": "cd apps/api && vitest run",
     "test:affected": "bun scripts/test-affected.ts",
     "test:parallel": "bun scripts/test-parallel.ts",
@@ -17,6 +17,7 @@
     "test:all": "bun test ./src/ ./scripts/gc-drain.test.ts && bun run test:storage-truth && cd apps/api && vitest run",
     "typecheck": "mkdir -p .cache/tsbuildinfo && tsc --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/root.tsbuildinfo && tsc -p apps/api --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/apps-api.tsbuildinfo && bun run typecheck:scripts",
     "guards": "bun scripts/guards.ts",
+    "gate:mutation": "bun scripts/mutation-gate.ts",
     "typecheck:scripts": "tsc -p scripts/tsconfig.json",
     "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",
     "rig": "bun scripts/rig/rig.ts",
