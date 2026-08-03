@@ -5,6 +5,33 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-03: **PR #621 (codex 60-file CLI/daemon runtime-primitives
+refactor on 2.0) reviewed, remediated, MERGED — plus #619 (rules port) and
+#622 (file-size ratchet).** 5-lane adversarial review (deletion evidence /
+receive path / concurrency / test integrity / doc honesty) + independent codex
+pass. Receive path + mutex PROVEN preserved (old assertions re-run against new
+code; 11 mutations red; daemon.ts/sync-mutex.ts byte-identical). 4 real
+regressions found in the OBSERVATION layer, all fixed on the branch before
+merge: daemon-startup blind window (binding deleted at spawn, rewritten only
+after HashCache.load — doctor silenced a real halt; fixed both halves),
+doctor rebind race (revalidation used captured workspace id; could leak prior
+workspace's sidecars into --diagnostics), status lost version+upgrade-nudge in
+5 states (test had been RELAXED to match), multi-site RBOX_ALLOW_MASS_DELETE
+consent untested (env reads deletable, 492 green). Docs: 226 §12–13 rewritten
+as literal runs (its baselines didn't reproduce — a pre-#615 8-failure
+baseline re-asserted as current); REVIEW-226-R1/R2/R3 self-ratification files
+deleted from corpus. Rig onboard-smoke PASS on the branch (2 devices, 101
+files byte-identical). **Bun Rust-rewrite drift LANDED**: canary 54bbd5dd9
+finalizes outstanding statements at close() (older canaries deferred);
+sqlite-contract re-pinned to the shared subset — statements.ts unaffected
+(explicit finalize, #615). CI canary shards are the deliberate early-warning
+lane; the 1.3.14 floor job is the pin — do NOT try to pin canary (tag is
+overwritten, not addressable). #622: allowlisted files now ratchet — >10%
+growth past recorded size fails the build. 2.0 tip: bc25d930f. Flake registry:
+design-206 trusted-pull SIGHTING (shard fail, rerun green, no local repro).
+Standing: parallel-wave review verdicts get ONE serial pass before ruling;
+codex self-review docs never land in docs/design/.**_
+
 _SESSION 2026-07-31: **The quota arc CLOSED. Billing flip shipped to PROD
 (#618, design 228, migration 0036): rbox bills/shows/cap-gates on ACTIVE bytes
 — founder billed 4.16 GB (was 158 GiB), Max 0.13 GB (was 186 GiB). R2 reclaim
