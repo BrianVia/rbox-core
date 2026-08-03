@@ -119,6 +119,85 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/engine/manifest.ts", "pending split — 665 nonblank lines and 29.7 KiB when the gate landed"],
 ]);
 
+
+/** The ratchet. The allowlist above excuses a file from the absolute limit; it
+ * must not become a license to keep growing. Each entry records the file's
+ * measured size on the day the ratchet landed, and the gate fails any
+ * allowlisted file that grows more than 10% past its recorded ceiling — big
+ * enough for bugfixes, small enough that the next 100-line drift is a build
+ * failure instead of a review comment. When a split shrinks a file, re-record
+ * the smaller measurement so the ratchet tightens; never raise a ceiling
+ * without the split plan that 163 requires. */
+const RATCHET_SLACK = 1.1;
+const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Map([
+  ["src/cli/activity.ts", { nonblank: 448, bytes: 21345 }],
+  ["src/cli/adopt-git.ts", { nonblank: 557, bytes: 33507 }],
+  ["src/cli/adopt-journal.ts", { nonblank: 431, bytes: 20541 }],
+  ["src/cli/auth/device-login.ts", { nonblank: 658, bytes: 28684 }],
+  ["src/cli/auth/genesis-destination-flow.ts", { nonblank: 432, bytes: 24199 }],
+  ["src/cli/credentials.ts", { nonblank: 900, bytes: 43316 }],
+  ["src/cli/daemon/ambient-status.ts", { nonblank: 544, bytes: 22968 }],
+  ["src/cli/daemon/daemon.ts", { nonblank: 3223, bytes: 158816 }],
+  ["src/cli/daemon/git-ref-watch.ts", { nonblank: 800, bytes: 37575 }],
+  ["src/cli/daemon/key-delivery-fulfill.ts", { nonblank: 1006, bytes: 39721 }],
+  ["src/cli/daemon/process-control.ts", { nonblank: 436, bytes: 21311 }],
+  ["src/cli/daemon/watcher.ts", { nonblank: 424, bytes: 17809 }],
+  ["src/cli/doctor-cmd.ts", { nonblank: 950, bytes: 44610 }],
+  ["src/cli/doctor-triage.ts", { nonblank: 473, bytes: 23025 }],
+  ["src/cli/e2ee-client.ts", { nonblank: 765, bytes: 53107 }],
+  ["src/cli/e2ee-remote.ts", { nonblank: 987, bytes: 55332 }],
+  ["src/cli/genesis-durable.ts", { nonblank: 707, bytes: 53107 }],
+  ["src/cli/git/resolve-command.ts", { nonblank: 1048, bytes: 53741 }],
+  ["src/cli/help-registry.ts", { nonblank: 919, bytes: 43383 }],
+  ["src/cli/init-cmd.ts", { nonblank: 680, bytes: 35799 }],
+  ["src/cli/login-attempt-journal.ts", { nonblank: 686, bytes: 26643 }],
+  ["src/cli/main-dispatch.ts", { nonblank: 706, bytes: 35139 }],
+  ["src/cli/publish-pipeline/pipeline.ts", { nonblank: 504, bytes: 23259 }],
+  ["src/cli/recovery-kit-1password.ts", { nonblank: 574, bytes: 24789 }],
+  ["src/cli/recovery-kit.ts", { nonblank: 543, bytes: 33184 }],
+  ["src/cli/remote/blob-batch/uploader.ts", { nonblank: 480, bytes: 21406 }],
+  ["src/cli/reset-journal.ts", { nonblank: 457, bytes: 26147 }],
+  ["src/cli/reset-quarantine.ts", { nonblank: 444, bytes: 25212 }],
+  ["src/cli/reset-state.ts", { nonblank: 473, bytes: 25139 }],
+  ["src/cli/setup-cmd.ts", { nonblank: 873, bytes: 45858 }],
+  ["src/cli/state-plane/adapters/legacy-json-store.ts", { nonblank: 417, bytes: 21408 }],
+  ["src/cli/state-plane/reset/recovery.ts", { nonblank: 455, bytes: 21036 }],
+  ["src/cli/status-projection.ts", { nonblank: 424, bytes: 18693 }],
+  ["src/cli/status-view.ts", { nonblank: 875, bytes: 47095 }],
+  ["src/cli/sync-git/apply.ts", { nonblank: 1434, bytes: 77114 }],
+  ["src/cli/sync-git/base-composer.ts", { nonblank: 611, bytes: 28706 }],
+  ["src/cli/sync-git/deferral-hygiene.ts", { nonblank: 507, bytes: 24777 }],
+  ["src/cli/sync-git/follow.ts", { nonblank: 1183, bytes: 61997 }],
+  ["src/cli/sync-git/plan.ts", { nonblank: 1447, bytes: 73664 }],
+  ["src/cli/sync-git/state-cas-locks.ts", { nonblank: 572, bytes: 23935 }],
+  ["src/cli/sync-recovery.ts", { nonblank: 542, bytes: 27521 }],
+  ["src/cli/sync-state-model.ts", { nonblank: 446, bytes: 23328 }],
+  ["src/cli/sync-state.ts", { nonblank: 599, bytes: 31488 }],
+  ["src/cli/sync/pull.ts", { nonblank: 465, bytes: 25252 }],
+  ["src/cli/sync/push.ts", { nonblank: 949, bytes: 51561 }],
+  ["src/cli/upgrade-cmd.ts", { nonblank: 499, bytes: 23827 }],
+  ["src/engine/apply-receipt.ts", { nonblank: 689, bytes: 30017 }],
+  ["src/engine/apply.ts", { nonblank: 488, bytes: 23221 }],
+  ["src/engine/crypto-pool/pool.ts", { nonblank: 814, bytes: 35035 }],
+  ["src/engine/e2ee/bip39-wordlist.ts", { nonblank: 2053, bytes: 23640 }],
+  ["src/engine/e2ee/session.ts", { nonblank: 535, bytes: 29087 }],
+  ["src/engine/entry-arena/owner.ts", { nonblank: 455, bytes: 19110 }],
+  ["src/engine/git/apply.ts", { nonblank: 761, bytes: 37551 }],
+  ["src/engine/git/base-artifacts.ts", { nonblank: 465, bytes: 30298 }],
+  ["src/engine/git/checkout-txn.ts", { nonblank: 956, bytes: 51608 }],
+  ["src/engine/git/config-txn.ts", { nonblank: 486, bytes: 23219 }],
+  ["src/engine/git/journal.ts", { nonblank: 933, bytes: 52219 }],
+  ["src/engine/git/keep-pins.ts", { nonblank: 716, bytes: 34805 }],
+  ["src/engine/git/lockfile.ts", { nonblank: 1368, bytes: 66601 }],
+  ["src/engine/git/p-repair-transaction.ts", { nonblank: 469, bytes: 25104 }],
+  ["src/engine/git/p-repair.ts", { nonblank: 413, bytes: 21242 }],
+  ["src/engine/git/shared.ts", { nonblank: 735, bytes: 33479 }],
+  ["src/engine/ignore.ts", { nonblank: 734, bytes: 33445 }],
+  ["src/engine/index.ts", { nonblank: 413, bytes: 11163 }],
+  ["src/engine/manifest-delta.ts", { nonblank: 486, bytes: 24400 }],
+  ["src/engine/manifest.ts", { nonblank: 685, bytes: 31668 }],
+]);
+
 function sourceFiles(): string[] {
   const files: string[] = [];
   for (const entry of fs.readdirSync(SRC, { recursive: true, encoding: "utf8" })) {
@@ -186,6 +265,24 @@ describe("module size", () => {
     const wide = Array(40).fill(`const a = "${"x".repeat(700)}";`).join("\n");
     expect(sizeOf("fixture.ts", wide).nonblankLines).toBeLessThan(MAX_NONBLANK_LINES);
     expect(overLimit(sizeOf("fixture.ts", wide))).toBeTrue();
+  });
+
+
+  test("allowlisted files do not grow — the ratchet", () => {
+    const over: string[] = [];
+    for (const [file, ceiling] of RATCHET) {
+      const m = sizeOf(file, fs.readFileSync(path.resolve(SRC, "..", file), "utf8"));
+      if (m.nonblankLines > ceiling.nonblank * RATCHET_SLACK || m.bytes > ceiling.bytes * RATCHET_SLACK) {
+        over.push(file + ": " + m.nonblankLines + " nonblank / " + m.bytes + " bytes exceeds its"
+          + " recorded ceiling of " + ceiling.nonblank + " / " + ceiling.bytes + " by more than 10%"
+          + " — an allowlist entry is a debt record, not a license to grow. Split it, or shrink it back.");
+      }
+    }
+    expect(over).toEqual([]);
+  });
+
+  test("the ratchet covers exactly the allowlist", () => {
+    expect([...RATCHET.keys()].sort()).toEqual([...ALLOWED.keys()].sort());
   });
 
   test("every allowlist entry states a reason", () => {
