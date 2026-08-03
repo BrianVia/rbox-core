@@ -1,7 +1,7 @@
 # 113 — Codebase modularization: splitting the sync-engine giants
 
 **Status:** PLAN (scoping only — no code moves in this doc's cycle)
-**Review:** round 1 CHANGES-REQUIRED → revised; ledger: [REVIEW-113](./REVIEW-113.md)
+**Review:** round 1 CHANGES-REQUIRED → revised; ledger: [REVIEW-113](./reviews/REVIEW-113.md)
 **Depends on:** `impl/110-111-instrumentation` merging first (see §7)
 **Goal:** restore codex/agent navigability. Six files have accreted into
 multi-responsibility giants (8,692 lines combined); comment content has

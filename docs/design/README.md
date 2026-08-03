@@ -5,6 +5,11 @@ design-review status — each doc's own header records its codex-review history.
 
 **Legend:** ✅ DONE (in `main`) · 🟡 IN PROGRESS · 🔴 NOT STARTED (design only)
 
+**Layout:** numbered design docs live directly in this directory. Review
+ledgers live in [`reviews/`](./reviews/); per-design working artifacts
+(specs, fold notes, syntheses) live in `notes/<N>/`, with unnumbered strays
+in `notes/misc/`.
+
 _Last updated: 2026-07-08._
 
 ## Shipped (1–15)
