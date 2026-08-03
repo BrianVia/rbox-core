@@ -82,7 +82,6 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/status-view.ts", "pending split — 862 nonblank lines and 45.1 KiB when the gate landed"],
   ["src/cli/sync-git/apply.ts", "pending split — 1470 nonblank lines and 77.7 KiB when the gate landed"],
   ["src/cli/sync-git/base-composer.ts", "pending split — 611 nonblank lines and 28.0 KiB when the gate landed"],
-  ["src/cli/sync-git/clean-materialization.ts", "pending split — 451 nonblank lines when the gate landed"],
   ["src/cli/sync-git/deferral-hygiene.ts", "pending split — 507 nonblank lines when the gate landed"],
   // Was 1800 nonblank / 88.7 KiB when the gate landed; the domain split took it to
   // 1183. The residual is two functions that each exceed the gate on their own —

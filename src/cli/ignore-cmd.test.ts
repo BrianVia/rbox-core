@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { FileEntry, IgnoreMatcher, Manifest } from "../engine/index.js";
 import { listIgnoreRules } from "./ignore-cmd.js";
 import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError } from "./sync/policy.js";
@@ -46,6 +45,7 @@ test("bare ignore collapses builtins while --list prints every rule", async () =
 // ---------------------------------------------------------------------------
 
 const PURGE_HINT = "rbox ignore --purge --allow-mass-delete";
+const SYNC_HINT = "rbox sync --allow-mass-delete";
 
 const entry = (p: string): FileEntry => ({ path: p, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 0, type: "file" });
 const manifest = (files: FileEntry[]): Manifest => ({ generatedAt: "2026-07-29T00:00:00.000Z", files });
@@ -126,16 +126,45 @@ test("without a hint the guard still falls back to the push wording (unchanged f
   expect(err!.message).toContain("rbox push --allow-mass-delete");
 });
 
-test("purge honors RBOX_ALLOW_MASS_DELETE, exactly like every other consent site", async () => {
-  const dir = path.dirname(fileURLToPath(import.meta.url));
-  const consent = /allowMassDeletePush = [^;]*process\.env\.RBOX_ALLOW_MASS_DELETE === "1"/;
-  for (const file of ["ignore-cmd.ts", "sync-cmd.ts", "main-dispatch.ts", "recover-cmd.ts"]) {
-    const source = await fs.readFile(path.join(dir, file), "utf8");
-    expect([file, consent.test(source)]).toEqual([file, true]);
-  }
-  // …and the purge invocation is exactly the hint the guard prints.
-  const ignoreCmd = await fs.readFile(path.join(dir, "ignore-cmd.ts"), "utf8");
-  expect(ignoreCmd).toContain(`deps.massDeleteHint = "${PURGE_HINT}"`);
+test("purge honors explicit and RBOX_ALLOW_MASS_DELETE consent", async () => {
+  expect(await fixtureJson("./ignore-consent.fixture.js")).toEqual([
+    { allow: false, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+  ]);
+});
+
+async function fixtureJson(name: string): Promise<unknown> {
+  const child = Bun.spawn([
+    process.execPath,
+    new URL(name, import.meta.url).pathname,
+  ], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exit, stderr).toBe(0);
+  return JSON.parse(stdout);
+}
+
+test("push and sync map explicit and RBOX_ALLOW_MASS_DELETE consent into LocalRuntime operations", async () => {
+  expect(await fixtureJson("./sync-consent.fixture.js")).toEqual([
+    { operation: { kind: "push", massDelete: "guarded" } },
+    { operation: { kind: "push", massDelete: "allow" } },
+    { operation: { kind: "push", massDelete: "allow" } },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "guard-both" }, hint: SYNC_HINT },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "allow-push" }, hint: SYNC_HINT },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "allow-both" }, hint: SYNC_HINT },
+  ]);
+});
+
+test("recover maps env consent to push only and explicit consent to both directions", async () => {
+  expect(await fixtureJson("./recover-consent.fixture.js")).toEqual([
+    { allow: false, allowPush: false },
+    { allow: false, allowPush: true },
+    { allow: true, allowPush: true },
+  ]);
 });
 
 test("consent lets the same purge through, so the guard is the only thing refusing", async () => {

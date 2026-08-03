@@ -204,7 +204,7 @@ CLI entirely for now, see §7).
 ## 7. Dependencies (hydration) — temporarily disabled
 
 **The whole `deps` command group is commented out of the CLI right now**
-(`src/cli/index.ts`, `help-registry.ts`, `deprecations.ts`) — `rbox deps ...`
+(`src/cli/main-dispatch.ts`, `help-registry.ts`) — `rbox deps ...`
 and its old aliases `hydrate`/`detect` are unknown commands until this is
 revisited. The underlying implementation (`hydrate-cmd.ts`,
 `deps-drift.ts`, `deps-notify.ts`) is untouched, just disconnected from the

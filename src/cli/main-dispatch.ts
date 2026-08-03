@@ -1,21 +1,24 @@
 import path from "node:path";
-import { progressLabel } from "./status-view.js";
 import { findRoot as findWorkspaceRoot } from "./config.js";
 import { rememberResolvedRoot } from "./binding-registry.js";
-import { pull, push } from "./sync.js";
-import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize, summarizeCaseCollisions } from "./sync-cmd.js";
-import { beginReport, logDebugSummary } from "./metrics.js";
+import { runPullCommand, runPushCommand, runSyncCommand } from "./sync-cmd.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonForUser, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keySave, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
-import { buildAuthedRemote } from "./e2ee-client.js";
 import { DEFAULT_REMOTE } from "./api-base.js";
 import { fail, setJsonErrorMode, style } from "./style.js";
 import { spinner } from "./spinner.js";
-import { resolveAlias } from "./deprecations.js";
-import { isKnownTopLevel } from "./command-catalog.js";
-import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
+import {
+  commandSupportsFlag,
+  helpFor,
+  helpKeyFor,
+  isKnownTopLevel,
+  renderCommand,
+  renderEssentialHelp,
+  renderGroupedHelp,
+  resolveAlias,
+} from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
@@ -34,7 +37,7 @@ function printHelp(cmd: string | undefined, positional: string[], fullReference 
 
 // `rbox deps <sub>` group dispatch — commented out (design 51): the whole `deps`
 // CLI surface (install/list/check/drift/notify, plus the old hydrate/detect
-// aliases in deprecations.ts and their entries in help-registry.ts) is disabled
+// aliases and their entries in the command grammar) is disabled
 // for now. The underlying implementations (hydrate-cmd.ts, deps-drift.ts,
 // deps-notify.ts) are untouched, so re-enabling is: uncomment this function +
 // its `case "deps"` below + the registry/alias entries. `postSyncNudge` below is
@@ -345,56 +348,15 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     }
     case "push": {
       const root = await resolveRoot(positional[0]);
-      // Design 212 §3.1b layer 2: refuse before the scan, not after it.
-      await (await import("./scope/binding-scope.js")).assertCommandAllowedOnScopedBinding(root, "push");
-      const sp = spinner("pushing");
-      try {
-        await withWorkspaceSyncMutex(root, async (syncMutex) => {
-          const { cfg, deps } = await buildAuthedRemote(root, Date.now, (line) => process.stderr.write(`${line}\n`));
-          deps.syncMutex = syncMutex;
-          deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-          // Push-side consent (design 50 §4): op-scoped — NEVER the pull-side
-          // `allowMassDelete`, which the 409-recovery pull inside pushManifest would inherit.
-          deps.allowMassDeletePush = flags["allow-mass-delete"] === "true" || process.env.RBOX_ALLOW_MASS_DELETE === "1";
-          const report = beginReport("push");
-          deps.report = report;
-          const { sequence: seq, committed, caseCollisions } = await push(root, cfg, deps);
-          sp.succeed(
-            committed
-              ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
-              : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
-          );
-          summarizeCaseCollisions(caseCollisions);
-          logDebugSummary(report, (l) => console.log(style.dim(l)));
-        });
-      } catch (e) {
-        sp.fail("push failed");
-        throw e;
-      }
+      await runPushCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true" });
       break;
     }
     case "pull": {
       const root = await resolveRoot(positional[0]);
-      const sp = spinner("pulling");
-      try {
-await withWorkspaceSyncMutex(root, async (syncMutex) => {
-          const { cfg, deps } = await buildAuthedRemote(root, Date.now, (line) => process.stderr.write(`${line}\n`));
-          deps.syncMutex = syncMutex;
-          deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-          attachGitSyncProgress(deps, sp, { verbose: flags["verbose"] === "true" });
-          deps.allowMassDelete = flags["allow-mass-delete"] === "true";
-          const report = beginReport("pull");
-          deps.report = report;
-          const actions = await pull(root, cfg, deps);
-          sp.stop();
-          summarize("pulled", actions, root);
-          logDebugSummary(report, (l) => console.log(style.dim(l)));
-          await postSyncNudge(root, actions, cfg);
-        });
-      } catch (e) {
-        sp.fail("pull failed");
-        throw e;
-      }
+      await runPullCommand(root, {
+        allowMassDelete: flags["allow-mass-delete"] === "true",
+        verbose: flags["verbose"] === "true",
+      });
       break;
     }
     case "sync": {

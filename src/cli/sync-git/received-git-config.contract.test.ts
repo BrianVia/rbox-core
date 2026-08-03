@@ -1,320 +1,421 @@
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { repoCtxFromDisk, type GitSection } from "../../engine/index.js";
 import type { GitConfig } from "../../engine/git/config-sync.js";
-import type { ConfigStatToken, ConfigTransactionResult } from "../../engine/git/config-txn.js";
-import type { ConfigShapeIdentity } from "../config.js";
-import type { ConfigLaneState } from "../sync-state.js";
-import { configLaneState } from "../sync-state.js";
-import { gitConfigHash } from "./config-lane.js";
 import {
-  ConfigLaneLedger,
-  ReceivedGitConfigPhaseMismatch,
-  applyReceivedGitConfig,
-  planReceivedGitConfigApply,
-  type GitConfigExecutor,
-  type ReceivedGitConfigIdentity,
-  type ReceivedGitConfigPlan,
-} from "./received-git-config.js";
+  readConfigSnapshot,
+  type ConfigStatToken,
+  type ConfigTransactionResult,
+} from "../../engine/git/config-txn.js";
+import type { ConfigShapeIdentity, RepoRecordInput } from "../config.js";
+import type { ConfigLaneState } from "../sync-state.js";
+import { configReceiver, gitConfigHash } from "./config-lane.js";
+import { createReceivedGitConfig } from "./received-git-config.js";
+import { chainLock, type HeldChainLock } from "./shared.js";
 
-const IDENTITY: ReceivedGitConfigIdentity = {
-  root: "/ws",
-  relPath: "repo",
-  repoDir: "/ws/repo",
-};
-
-const shapeOf = (ino: string, shape: ConfigShapeIdentity["shape"] = "dir"): ConfigShapeIdentity => ({
-  shape,
-  commonDir: { realpath: `/ws/repo/.git`, dev: "1", ino, birthtime: "7" },
-});
-
-const STANDALONE = shapeOf("100");
-const POINTER = shapeOf("200", "worktree");
+const exec = promisify(execFile);
+const INCOMING: GitConfig = { "core.bare": ["false"] };
+const OTHER: GitConfig = { "core.bare": ["false"], "user.name": ["x"] };
 
 const token = (value: string): ConfigStatToken =>
   ({ dev: "1", ino: "9", size: "1", mtimeNs: value, ctimeNs: value });
 
-function ledgerWith(stored: ConfigLaneState = {}): {
-  ledger: ConfigLaneLedger;
-  lane: Record<string, ConfigLaneState>;
-} {
-  const lane: Record<string, ConfigLaneState> = {};
-  const ledger = new ConfigLaneLedger({
-    lane,
-    sourceSeq: () => 4,
-    storedLane: () => configLaneState(stored),
-  });
-  return { ledger, lane };
-}
+const section = (
+  config: GitConfig | undefined,
+  refScope: GitSection["refScope"] = "all",
+): GitSection => ({
+  bundleSha: "bundle",
+  bundleEncSha: "encrypted",
+  bundleCipherSize: 1,
+  head: "ref: refs/heads/main\n",
+  refs: {},
+  refScope,
+  generatedAt: "test",
+  ...(config === undefined ? {} : { config }),
+});
 
-interface FakeExecutorOptions {
-  phase: GitConfigExecutor["phase"];
-  ledger: ConfigLaneLedger;
-  commonDirToken?: string;
-  identity?: ReceivedGitConfigIdentity;
+const completedTransaction = (
+  over: Partial<Extract<ConfigTransactionResult, { status: "completed" }>> = {},
+): ConfigTransactionResult => ({
+  status: "completed",
+  preHash: "pre",
+  postHash: "post",
+  incomingHash: gitConfigHash(INCOMING),
+  postToken: token("post"),
+  warnings: [],
+  attempts: 1,
+  ...over,
+});
+
+let tmp = "";
+let root = "";
+let repoDir = "";
+let standalone: ConfigShapeIdentity;
+
+beforeAll(async () => {
+  tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-received-config-"));
+  root = path.join(tmp, "workspace");
+  repoDir = path.join(root, "repo");
+  await fs.mkdir(repoDir, { recursive: true });
+  await exec("git", ["-C", repoDir, "init", "-q"]);
+  const ctx = await repoCtxFromDisk(repoDir);
+  standalone = (await configReceiver(root, ctx!)).shape;
+});
+
+afterAll(async () => fs.rm(tmp, { recursive: true, force: true }));
+
+interface HarnessOptions {
+  priorLane?: ConfigLaneState;
+  wireSection?: GitSection;
+  incoming?: GitConfig;
+  incomingAbsent?: boolean;
+  leftoverPresent?: boolean;
   result?: ConfigTransactionResult;
   fresh?: { shape: ConfigShapeIdentity; config: GitConfig; token: ConfigStatToken };
+  laneDisabled?: boolean;
+  priorRecord?: () => RepoRecordInput;
+  observeLeftover?: () => boolean;
 }
 
-function fakeExecutor(options: FakeExecutorOptions): GitConfigExecutor & {
-  calls: string[];
-  logs: string[];
-} {
+function harness(lock: HeldChainLock, options: HarnessOptions = {}) {
   const calls: string[] = [];
   const logs: string[] = [];
-  return {
-    identity: options.identity ?? IDENTITY,
-    phase: options.phase,
-    ...(options.commonDirToken === undefined ? {} : { commonDirToken: options.commonDirToken }),
-    ledger: options.ledger,
-    calls,
-    logs,
+  const incoming = options.incomingAbsent ? undefined : options.incoming ?? INCOMING;
+  const receiver = createReceivedGitConfig({
+    root,
+    relPath: "repo",
+    repoDir,
+    wireSection: options.wireSection ?? section(incoming),
+    incoming,
+    laneDisabled: options.laneDisabled === true,
+    priorRecord: options.priorRecord ?? (() => ({
+      sourceSeq: 4,
+      ...(options.priorLane ?? {}),
+    })),
+    leftoverPresent: options.observeLeftover ?? (() => options.leftoverPresent !== false),
+    commonDirLock: lock,
+    repoContext: () => repoCtxFromDisk(repoDir),
     async materializeFresh() {
       calls.push("materializeFresh");
     },
     async inspectFreshInstall() {
       calls.push("inspectFreshInstall");
       if (!options.fresh) throw new Error("no fresh install configured");
-      return { shape: options.fresh.shape, config: options.fresh.config, token: options.fresh.token };
+      return options.fresh;
     },
     async applyExisting() {
       calls.push("applyExisting");
       if (!options.result) throw new Error("no transaction result configured");
       return options.result;
     },
-    log(message: string) {
+    log(message) {
       logs.push(message);
     },
-  };
+  });
+  return { receiver, calls, logs };
 }
 
-const completedTransaction = (over: Partial<Extract<ConfigTransactionResult, { status: "completed" }>> = {}) =>
-  ({
-    status: "completed",
-    preHash: "pre",
-    postHash: "post",
-    incomingHash: "incoming",
-    postToken: token("post"),
-    warnings: [],
-    attempts: 1,
-    ...over,
-  }) as ConfigTransactionResult;
+async function withHarness<T>(
+  options: HarnessOptions,
+  operation: (value: ReturnType<typeof harness>) => Promise<T>,
+): Promise<T> {
+  return chainLock(new Map(), path.join(repoDir, ".git"), async (lock) =>
+    operation(harness(lock, options)));
+}
 
-const applyPlan = (
-  phase: "config-only" | "after-materialization" | "inside-follow-lock",
-  over: Partial<{ commonDirToken: string; incoming: GitConfig }> = {},
-): ReceivedGitConfigPlan =>
-  planReceivedGitConfigApply({
-    identity: IDENTITY,
-    phase,
-    disposition: { due: true, target: { fresh: false, shape: STANDALONE, configPath: "/ws/repo/.git/config" } },
-    incoming: over.incoming ?? { "core.bare": ["false"] },
-    baseConfig: undefined,
-    ...(phase === "inside-follow-lock" ? { commonDirToken: over.commonDirToken ?? "/ws/repo/.git" } : {}),
-  })!;
-
-test("phase legality: an executor refuses a plan minted for another phase", async () => {
-  const { ledger } = ledgerWith();
-  const plan = applyPlan("inside-follow-lock");
-  const executor = fakeExecutor({ phase: "config-only", ledger, result: completedTransaction() });
-  await expect(applyReceivedGitConfig(plan, executor)).rejects.toBeInstanceOf(ReceivedGitConfigPhaseMismatch);
-  expect(executor.calls).toEqual([]);
-});
-
-test("phase legality: an executor refuses a plan bound to another repository", async () => {
-  const { ledger } = ledgerWith();
-  const plan = applyPlan("config-only");
-  const executor = fakeExecutor({
-    phase: "config-only",
-    ledger,
-    identity: { ...IDENTITY, relPath: "other", repoDir: "/ws/other" },
-    result: completedTransaction(),
-  });
-  await expect(applyReceivedGitConfig(plan, executor)).rejects.toBeInstanceOf(ReceivedGitConfigPhaseMismatch);
-  expect(executor.calls).toEqual([]);
-});
-
-test("common-dir serialization: a follow-lock plan refuses an executor holding another common dir", async () => {
-  const { ledger } = ledgerWith();
-  const plan = applyPlan("inside-follow-lock", { commonDirToken: "/ws/repo/.git" });
-  const executor = fakeExecutor({
-    phase: "inside-follow-lock",
-    ledger,
-    commonDirToken: "/ws/elsewhere/.git",
-    result: completedTransaction(),
-  });
-  await expect(applyReceivedGitConfig(plan, executor)).rejects.toBeInstanceOf(ReceivedGitConfigPhaseMismatch);
-  expect(executor.calls).toEqual([]);
-
-  const matched = fakeExecutor({
-    phase: "inside-follow-lock",
-    ledger,
-    commonDirToken: "/ws/repo/.git",
-    result: completedTransaction(),
-  });
-  const receipt = await applyReceivedGitConfig(plan, matched);
-  expect(receipt.outcome).toBe("applied");
-  expect(matched.calls).toEqual(["applyExisting"]);
-});
-
-test("only after-materialization may execute a fresh target", () => {
-  const disposition = { due: true, target: { fresh: true } } as const;
-  const base = { identity: IDENTITY, disposition, incoming: {} as GitConfig, baseConfig: undefined };
-  expect(planReceivedGitConfigApply({ ...base, phase: "config-only" })).toBeUndefined();
-  expect(planReceivedGitConfigApply({ ...base, phase: "inside-follow-lock", commonDirToken: "t" })).toBeUndefined();
-  expect(planReceivedGitConfigApply({ ...base, phase: "after-materialization" })?.phase).toBe("after-materialization");
-});
-
-test("a plan is minted only when the disposition is due with a target", () => {
-  const target = { fresh: false, shape: STANDALONE, configPath: "/ws/repo/.git/config" } as const;
-  const base = { identity: IDENTITY, phase: "config-only" as const, incoming: {} as GitConfig, baseConfig: undefined };
-  expect(planReceivedGitConfigApply({ ...base, disposition: { due: false, target } })).toBeUndefined();
-  expect(planReceivedGitConfigApply({ ...base, disposition: { due: true, target: undefined } })).toBeUndefined();
-  expect(planReceivedGitConfigApply({ ...base, disposition: { due: true, target }, incoming: undefined })).toBeUndefined();
-});
-
-test("a completed transaction records the lane completion and echoes transaction warnings", async () => {
-  const { ledger, lane } = ledgerWith();
-  const plan = applyPlan("config-only");
-  const executor = fakeExecutor({
-    phase: "config-only",
-    ledger,
+test("one repository-bound operation applies an existing target and records warnings", async () => {
+  await withHarness({
+    priorLane: { cfgShape: standalone },
     result: completedTransaction({ warnings: ["dropped credential"], baseHash: "basePre" }),
+  }, async ({ receiver, calls, logs }) => {
+    expect(await receiver.prepare(undefined)).toMatchObject({ due: true, requiresMaterialization: false });
+    expect(await receiver.applyExisting()).toEqual({
+      cfgApplied: gitConfigHash(INCOMING),
+      cfgToken: token("post"),
+      cfgShape: standalone,
+    });
+    expect(calls).toEqual(["applyExisting"]);
+    expect(logs).toEqual(["git-sync WARNING repo: config dropped credential"]);
   });
-  const receipt = await applyReceivedGitConfig(plan, executor);
-  expect(receipt).toEqual({ identity: IDENTITY, phase: "config-only", outcome: "applied" });
-  expect(executor.logs).toEqual(["git-sync WARNING repo: config dropped credential"]);
-  expect(lane["repo"]).toEqual({ cfgApplied: "incoming", cfgToken: token("post"), cfgShape: STANDALONE });
 });
 
-test("independent retry: a failed transaction throws and leaves the lane byte-exact", async () => {
-  const { ledger, lane } = ledgerWith({ cfgApplied: "old", cfgToken: token("old"), cfgShape: STANDALONE });
-  const before = JSON.stringify(lane);
-  const plan = applyPlan("config-only");
-  const executor = fakeExecutor({
-    phase: "config-only",
-    ledger,
+test("independent retry leaves the config transition byte-exact on failure", async () => {
+  await withHarness({
+    priorLane: { cfgApplied: "old", cfgToken: token("old"), cfgShape: standalone },
     result: { status: "deferred", attempts: 3, fault: { disposition: "transient", reason: "unstable" } },
-  });
-  await expect(applyReceivedGitConfig(plan, executor)).rejects.toThrow("config deferred: unstable");
-  expect(JSON.stringify(lane)).toBe(before);
-});
-
-test("after-materialization completes the lane from the post-install read, not the incoming value", async () => {
-  const { ledger, lane } = ledgerWith();
-  const installed: GitConfig = { "core.bare": ["false"] };
-  const incoming: GitConfig = { "core.bare": ["false"], "user.name": ["x"] };
-  const plan = planReceivedGitConfigApply({
-    identity: IDENTITY,
-    phase: "after-materialization",
-    disposition: { due: true, target: { fresh: true } },
-    incoming,
-    baseConfig: { "core.bare": ["true"] },
-  })!;
-  const executor = fakeExecutor({
-    phase: "after-materialization",
-    ledger,
-    fresh: { shape: STANDALONE, config: installed, token: token("fresh") },
-  });
-  const receipt = await applyReceivedGitConfig(plan, executor);
-  expect(receipt.outcome).toBe("applied");
-  expect(executor.calls).toEqual(["materializeFresh", "inspectFreshInstall"]);
-  // The post-install read differs from the incoming value, so this device
-  // authored nothing publishable: no `cfgSynced` baseline is claimed.
-  expect(lane["repo"]).toEqual({
-    cfgApplied: gitConfigHash(incoming),
-    cfgToken: token("fresh"),
-    cfgShape: STANDALONE,
+  }, async ({ receiver }) => {
+    await receiver.prepare(undefined);
+    const before = JSON.stringify(receiver.transition());
+    await expect(receiver.applyExisting()).rejects.toThrow("config deferred: unstable");
+    expect(JSON.stringify(receiver.transition())).toBe(before);
   });
 });
 
-test("after-materialization claims a baseline only when the install equals the incoming value", async () => {
-  const { ledger, lane } = ledgerWith();
-  const incoming: GitConfig = { "core.bare": ["false"] };
-  const plan = planReceivedGitConfigApply({
-    identity: IDENTITY,
-    phase: "after-materialization",
-    disposition: { due: true, target: { fresh: true } },
-    incoming,
-    baseConfig: undefined,
-  })!;
-  await applyReceivedGitConfig(plan, fakeExecutor({
-    phase: "after-materialization",
-    ledger,
-    fresh: { shape: STANDALONE, config: incoming, token: token("fresh") },
-  }));
-  expect(lane["repo"]?.cfgSynced).toBe(gitConfigHash(incoming));
+test("fresh config is unrepresentable in existing and follow windows", async () => {
+  await withHarness({
+    leftoverPresent: false,
+    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+  }, async ({ receiver, calls }) => {
+    expect(await receiver.prepare(undefined)).toMatchObject({ due: true, requiresMaterialization: true });
+    expect(await receiver.applyExisting()).toBeUndefined();
+    expect(await receiver.applyWhileCommonDirLocked()).toBeUndefined();
+    expect(calls).toEqual([]);
+    expect(await receiver.applyAfterMaterialization()).toBeDefined();
+    expect(calls).toEqual(["materializeFresh", "inspectFreshInstall"]);
+  });
 });
 
-test("sanitize-present seeds the unchanged local hash so the next push authors no corrective echo", async () => {
-  const { ledger, lane } = ledgerWith();
-  const plan: ReceivedGitConfigPlan = {
-    phase: "sanitize-present",
-    identity: IDENTITY,
-    shape: STANDALONE,
-    localHash: "local-hash",
+test("clean materialization window applies a due existing receiver", async () => {
+  await withHarness({
+    priorLane: { cfgShape: standalone },
+    result: completedTransaction(),
+  }, async ({ receiver, calls }) => {
+    expect(await receiver.prepare(undefined)).toMatchObject({
+      due: true,
+      requiresMaterialization: false,
+    });
+    expect(await receiver.applyAfterMaterialization()).toBeDefined();
+    expect(calls).toEqual(["applyExisting"]);
+  });
+});
+
+test("follow config refuses an escaped common-directory lock scope", async () => {
+  let escaped: ReturnType<typeof harness> | undefined;
+  await chainLock(new Map(), path.join(repoDir, ".git"), async (lock) => {
+    escaped = harness(lock, {
+      priorLane: { cfgShape: standalone },
+      result: completedTransaction(),
+    });
+    await escaped.receiver.prepare(undefined);
+  });
+  await expect(escaped!.receiver.applyWhileCommonDirLocked()).rejects.toThrow("chain lock is no longer held");
+  expect(escaped!.calls).toEqual([]);
+});
+
+test("follow config refuses a live lock for another common directory", async () => {
+  await chainLock(new Map(), path.join(root, "other", ".git"), async (lock) => {
+    const { receiver, calls } = harness(lock, {
+      priorLane: { cfgShape: standalone },
+      result: completedTransaction(),
+    });
+    await receiver.prepare(undefined);
+    await expect(receiver.applyWhileCommonDirLocked()).rejects.toThrow(
+      "received git config common-directory lock mismatch",
+    );
+    expect(calls).toEqual([]);
+  });
+});
+
+test("follow config executes while the actual common-directory lock is held", async () => {
+  await withHarness({
+    priorLane: { cfgShape: standalone },
+    result: completedTransaction(),
+  }, async ({ receiver, calls }) => {
+    await receiver.prepare(undefined);
+    expect(await receiver.applyWhileCommonDirLocked()).toBeDefined();
+    expect(calls).toEqual(["applyExisting"]);
+  });
+});
+
+test("production follow selects the common-directory-lock asserting config window", async () => {
+  const child = Bun.spawn([
+    process.execPath,
+    new URL("./follow-config-lock.fixture.js", import.meta.url).pathname,
+  ], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exit, stderr).toBe(0);
+  expect(JSON.parse(stdout)).toEqual(["applyWhileCommonDirLocked"]);
+});
+
+test("prepare observes recovery quarantining a partial fresh repository", async () => {
+  let leftoverPresent = true;
+  await withHarness({
+    observeLeftover: () => leftoverPresent,
+    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+  }, async ({ receiver, calls }) => {
+    leftoverPresent = false;
+    expect(await receiver.prepare(undefined)).toMatchObject({
+      due: true,
+      requiresMaterialization: true,
+    });
+    await receiver.applyAfterMaterialization();
+    expect(calls).toEqual(["materializeFresh", "inspectFreshInstall"]);
+  });
+});
+
+test("prepare observes the config lane landed by published-journal recovery", async () => {
+  const snapshot = await readConfigSnapshot(path.join(repoDir, ".git", "config"));
+  if (!snapshot.ok) throw new Error("test config unreadable");
+  let prior: RepoRecordInput = { sourceSeq: 4 };
+  await withHarness({
+    priorRecord: () => prior,
+    result: completedTransaction(),
+  }, async ({ receiver, calls }) => {
+    prior = {
+      sourceSeq: 9,
+      cfgApplied: gitConfigHash(INCOMING),
+      cfgToken: snapshot.snapshot.token,
+      cfgShape: standalone,
+    };
+    expect(await receiver.prepare(undefined)).toEqual({
+      due: false,
+      requiresMaterialization: false,
+      transition: undefined,
+    });
+    expect(await receiver.applyExisting()).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+});
+
+test("after-materialization derives state from the installed config", async () => {
+  await withHarness({
+    incoming: OTHER,
+    leftoverPresent: false,
+    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+  }, async ({ receiver }) => {
+    await receiver.prepare({ "core.bare": ["true"] });
+    expect(await receiver.applyAfterMaterialization()).toEqual({
+      cfgApplied: gitConfigHash(OTHER),
+      cfgToken: token("fresh"),
+      cfgShape: standalone,
+    });
+  });
+});
+
+test("after-materialization claims authorship only when install equals incoming", async () => {
+  await withHarness({
+    leftoverPresent: false,
+    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+  }, async ({ receiver }) => {
+    await receiver.prepare(undefined);
+    expect((await receiver.applyAfterMaterialization())?.cfgSynced).toBe(gitConfigHash(INCOMING));
+  });
+});
+
+test("sanitize-present seeds the local hash and preserves a same-shape baseline", async () => {
+  await withHarness({
+    priorLane: { cfgSynced: "hash-A", cfgApplied: "applied-A", cfgShape: standalone },
+    wireSection: section(INCOMING, "scoped"),
+    incomingAbsent: true,
+  }, async ({ receiver }) => {
+    const transition = await receiver.recordBaseline();
+    expect(transition?.cfgSynced).toBe("hash-A");
+    expect(transition?.cfgApplied).toBe("applied-A");
+    expect(transition?.cfgShape).toEqual(standalone);
+  });
+});
+
+test("sanitize-present resets a foreign shape before seeding the local hash", async () => {
+  const pointer: ConfigShapeIdentity = {
+    shape: "worktree",
+    commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
   };
-  const executor = fakeExecutor({ phase: "sanitize-present", ledger });
-  const receipt = await applyReceivedGitConfig(plan, executor);
-  expect(receipt.outcome).toBe("baseline-recorded");
-  expect(lane["repo"]).toEqual({ cfgSynced: "local-hash", cfgShape: STANDALONE });
-});
-
-test("sanitize-present preserves a same-shape baseline so a genuine later edit stays publishable", async () => {
-  const { ledger, lane } = ledgerWith({ cfgSynced: "hash-A", cfgApplied: "applied-A", cfgShape: STANDALONE });
-  const plan: ReceivedGitConfigPlan = {
-    phase: "sanitize-present",
-    identity: IDENTITY,
-    shape: STANDALONE,
-    localHash: "hash-B",
-  };
-  await applyReceivedGitConfig(plan, fakeExecutor({ phase: "sanitize-present", ledger }));
-  expect(lane["repo"]?.cfgSynced).toBe("hash-A");
-  expect(lane["repo"]?.cfgApplied).toBe("applied-A");
-});
-
-test("pointer/standalone transition drops the prior baseline before seeding the new shape", async () => {
-  const { ledger, lane } = ledgerWith({
-    cfgSynced: "hash-A",
-    cfgApplied: "applied-A",
-    cfgToken: token("old"),
-    cfgShape: POINTER,
+  await withHarness({
+    priorLane: {
+      cfgSynced: "hash-A",
+      cfgApplied: "applied-A",
+      cfgToken: token("old"),
+      cfgShape: pointer,
+    },
+    wireSection: section(INCOMING, "scoped"),
+    incomingAbsent: true,
+  }, async ({ receiver }) => {
+    const transition = await receiver.recordBaseline();
+    expect(transition).toEqual({
+      cfgSynced: gitConfigHash({}),
+      cfgShape: standalone,
+    });
   });
-  const plan: ReceivedGitConfigPlan = {
-    phase: "sanitize-present",
-    identity: IDENTITY,
-    shape: STANDALONE,
-    localHash: "hash-B",
-  };
-  await applyReceivedGitConfig(plan, fakeExecutor({ phase: "sanitize-present", ledger }));
-  expect(lane["repo"]).toEqual({ cfgSynced: "hash-B", cfgShape: STANDALONE });
 });
 
-test("wire-absent consumes only the authorship marker", async () => {
-  const { ledger, lane } = ledgerWith({
-    cfgSynced: "hash-A",
-    cfgApplied: "applied-A",
-    cfgToken: token("old"),
-    cfgShape: STANDALONE,
+test("wire absence consumes only the authorship marker", async () => {
+  await withHarness({
+    priorLane: {
+      cfgSynced: "hash-A",
+      cfgApplied: "applied-A",
+      cfgToken: token("old"),
+      cfgShape: standalone,
+    },
+    wireSection: section(undefined),
+    incomingAbsent: true,
+  }, async ({ receiver }) => {
+    expect(await receiver.recordBaseline()).toEqual({
+      cfgApplied: "applied-A",
+      cfgToken: token("old"),
+      cfgShape: standalone,
+    });
   });
-  const plan: ReceivedGitConfigPlan = { phase: "wire-absent", identity: IDENTITY };
-  const receipt = await applyReceivedGitConfig(plan, fakeExecutor({ phase: "wire-absent", ledger }));
-  expect(receipt.outcome).toBe("baseline-cleared");
-  expect(lane["repo"]).toEqual({ cfgApplied: "applied-A", cfgToken: token("old"), cfgShape: STANDALONE });
 });
 
-test("wire-absent with no authorship marker is a no-op", async () => {
-  const { ledger, lane } = ledgerWith({ cfgApplied: "applied-A", cfgShape: STANDALONE });
-  const plan: ReceivedGitConfigPlan = { phase: "wire-absent", identity: IDENTITY };
-  const receipt = await applyReceivedGitConfig(plan, fakeExecutor({ phase: "wire-absent", ledger }));
-  expect(receipt.outcome).toBe("baseline-unchanged");
-  expect(lane["repo"]).toBeUndefined();
+test("wire absence with no authorship marker is a no-op", async () => {
+  await withHarness({
+    priorLane: { cfgApplied: "applied-A", cfgShape: standalone },
+    wireSection: section(undefined),
+    incomingAbsent: true,
+  }, async ({ receiver }) => {
+    expect(await receiver.recordBaseline()).toBeUndefined();
+    expect(receiver.transition()).toBeUndefined();
+  });
 });
 
-test("the ledger's shape invalidation resets the lane exactly once per shape", () => {
-  const { ledger, lane } = ledgerWith({ cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgShape: POINTER });
-  const first = ledger.invalidateShape("repo", STANDALONE);
-  expect(first).toEqual({ sourceSeq: 4, cfgShape: STANDALONE });
-  expect(lane["repo"]).toEqual({ cfgShape: STANDALONE });
-  ledger.replace("repo", { ...first, cfgApplied: "next" });
-  expect(ledger.invalidateShape("repo", STANDALONE)).toEqual({ sourceSeq: 4, cfgShape: STANDALONE, cfgApplied: "next" });
-  expect(lane["repo"]).toEqual({ cfgShape: STANDALONE, cfgApplied: "next" });
+test("shape invalidation returns the existing ConfigLaneState shape exactly once", async () => {
+  const pointer: ConfigShapeIdentity = {
+    shape: "worktree",
+    commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
+  };
+  await withHarness({
+    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgShape: pointer },
+  }, async ({ receiver }) => {
+    const first = await receiver.prepare(undefined);
+    expect(first.transition).toEqual({ cfgShape: standalone });
+    const second = await receiver.prepare(undefined);
+    expect(second.transition).toEqual({ cfgShape: standalone });
+    expect(receiver.transition()).toEqual({ cfgShape: standalone });
+  });
+});
+
+test("unchanged hash and stat token perform no config effect or state transition", async () => {
+  const snapshot = await readConfigSnapshot(path.join(repoDir, ".git", "config"));
+  if (!snapshot.ok) throw new Error("test config unreadable");
+  await withHarness({
+    priorLane: {
+      cfgApplied: gitConfigHash(INCOMING),
+      cfgToken: snapshot.snapshot.token,
+      cfgShape: standalone,
+    },
+    result: completedTransaction(),
+  }, async ({ receiver, calls }) => {
+    expect(await receiver.prepare(undefined)).toEqual({
+      due: false,
+      requiresMaterialization: false,
+      transition: undefined,
+    });
+    expect(await receiver.applyExisting()).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+});
+
+test("the config-lane kill switch preserves the prior lane and performs no effects", async () => {
+  await withHarness({
+    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgShape: standalone },
+    laneDisabled: true,
+    result: completedTransaction(),
+  }, async ({ receiver, calls }) => {
+    expect(await receiver.recordBaseline()).toBeUndefined();
+    expect(await receiver.prepare(undefined)).toEqual({
+      due: false,
+      requiresMaterialization: false,
+      transition: undefined,
+    });
+    expect(await receiver.applyExisting()).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
 });

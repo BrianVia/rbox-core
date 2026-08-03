@@ -13,6 +13,7 @@ import { CommitRejectedError, QuotaExceededError, type CommitOptions, type Commi
 import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
+import { observeDaemon } from "./observation.js";
 import { RBOX_VERSION } from "../version.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
@@ -1763,18 +1764,17 @@ test("binding bootId mismatch does not block attribution when pidfile and activi
     const activity = await loadActivity(root);
     const binding = readDaemonBindingRecord(root);
     const pidfile = readDaemonPidRecord(root);
+    const observed = observeDaemon(root, "ws_act", Date.now(), { processMatches: () => true });
     const attributed = attributeDaemonForStatus({
       activity,
-      daemonRunning: true,
-      boundWorkspaceId: binding.workspaceId,
-      currentWorkspaceId: "ws_act",
-      livePidfileBootId: pidfile.bootId,
+      daemon: observed,
       localSequence: 10,
       now: Date.now(),
     });
 
     expect(binding.bootId).toBe("boot-loser");
     expect(pidfile.bootId).toBe("boot-test");
+    expect(observed.ownership).toBe("owned");
     expect(attributed.activity?.lastPush?.sequence).toBe(12);
     expect(attributed.elided).toBe(true);
     expect(attributed.remote?.sequence).toBe(12);

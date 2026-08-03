@@ -31,7 +31,6 @@ import path from "node:path";
 import type { GitSection, Manifest } from "../../engine/types.js";
 import type { DoctorCheck } from "../doctor-cmd.js";
 import { checkState, checkStateMigration } from "../doctor-state-plane.js";
-import { inspectResetJournal } from "../reset-journal.js";
 import { migrateCmd } from "../state-plane-cmd.js";
 import { statusCmd } from "../status-cmd.js";
 import { repoRecordsForState, stateFromRepoRecords, type RepoRecord, type SyncState } from "../sync-state-model.js";
@@ -89,13 +88,11 @@ const file = (n: number) => ({
 /**
  * The observation vector — the whole reachable-offline product surface.
  *
- * ORDER IS LOAD-BEARING and is the same on both sides: `statusCmd` runs FIRST,
- * because reading the migrated authority deposits SQLite sidecars that change
- * what a later status call reports (see the FINDING test at the bottom, which
- * owns that divergence instead of this comparison hiding it). For the same
- * reason the vector holds exactly ONE status invocation — a second one on the
- * migrated side is measuring the defect, not the migration — so each scenario
- * declares which surface (`--json` or the human brief) it measures.
+ * ORDER IS STABLE and is the same on both sides: `statusCmd` runs first so the
+ * user surface is observed before the state and doctor consumers. Each scenario
+ * declares which surface (`--json` or the human brief) it measures. Repeated
+ * reads and SQLite sidecar cleanliness are positively covered by
+ * `store/reads-leave-the-store-at-rest.test.ts`.
  */
 type StatusSurface = "json" | "brief";
 
@@ -362,128 +359,4 @@ test("the comparator is not satisfied by a merely-similar vector", async () => {
   assertDifferential(before, after);
   const bent: Observation = { ...after, state: { ...after.state, lastSyncedSequence: 3 } };
   expect(() => assertDifferential(before, bent)).toThrow();
-});
-
-// ---------------------------------------------------------------------------
-// FINDING (wave 5C). Post-migration behavior genuinely DIFFERS here.
-//
-// `rbox status` reports a healthy, freshly migrated workspace as HALTED — "⛔
-// sync halted to protect recovery state · rbox doctor reset-journal" — on a
-// workspace with an empty manifest, no repos, and nothing wrong with it. It
-// takes hold as soon as ANY command has read the migrated store once; whether
-// the very first `rbox status` or the next one shows it is a race inside a
-// single invocation, which is worse, not better.
-//
-// Chain: any read-only open of the migrated authority deposits `state.db-wal` +
-// `state.db-shm` and never removes them; `classifySqliteResetPredecode` reads
-// that `SW` sidecar vector as row W1 ("ordinary WAL crash requiring writer
-// takeover"); `inspectResetJournal` turns W1 — which 163 §"Decoder/WAL rows"
-// treats as an ordinary recoverable takeover, not an operator condition — into
-// `status: "halt"`; and `status-view.ts` renders any halt as the protective
-// stop. It is sticky, not transient: the next read recreates the sidecars.
-//
-// This test PINS THE DEFECT so it cannot be lost, and must be DELETED when the
-// defect is fixed — at which point the ordinary differential above covers the
-// second status call too. It is not a statement that this behavior is correct.
-//
-// ON DETERMINISM. Whether SQLite reaps the sidecars at close varies run to run —
-// `crash-matrix.test.ts` records the same observation and excludes sidecars from
-// its residue comparison for exactly this reason. Measured here at 4/25 and
-// 7/25 runs NOT reproducing. So the precondition is established by observation
-// rather than assumed: fresh machine-produced workspaces are tried until one
-// actually carries the WAL, and the defect assertions run against that one. If
-// no attempt reproduces it, the test FAILS loudly saying the defect may be
-// fixed — which is the correct signal, because this test's job is to be deleted.
-// It never degrades into asserting nothing.
-const FINDING_ATTEMPTS = 12;
-const HALT_BRIEF = "sync halted to protect recovery state";
-
-test("FINDING: `rbox status` falsely reports a halt once anything has read the migrated store", async () => {
-  const halt = {
-    status: "halt", reason: "SQLite authority has an ordinary WAL crash requiring writer takeover",
-  };
-  let root: string | undefined;
-  let observed: {
-    shm: boolean; journal: unknown; payload: { halted?: boolean; reason?: string };
-    brief: string; doctorState: boolean; doctorMigration: boolean;
-  } | undefined;
-  let attempts = 0;
-  const outcomes: string[] = [];
-  // Discarded attempts are removed. `/tmp` is RAM-backed tmpfs on the Linux
-  // fleet host and its INODE table is the binding limit long before its bytes
-  // are: an earlier run of this loop left 5,690 workspaces behind and drove
-  // /tmp to 100% inodes at 47% capacity, which surfaces as a flood of unrelated
-  // ENOSPC failures across the whole suite. A retry loop that keeps every
-  // attempt is a leak multiplied by its retry count.
-  const discarded: string[] = [];
-  for (let attempt = 0; attempt < FINDING_ATTEMPTS; attempt++) {
-    attempts = attempt + 1;
-    const candidate = await legacyWorkspace(`finding-${attempt}`, (stream) => ({
-      stream, lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
-    }));
-    expect(await migrateCmd(candidate, { log: () => undefined })).toBe(0);
-    // The migration itself sometimes leaves the sidecars behind — the same
-    // run-to-run reaping variance, one step earlier. Such a workspace is already
-    // in the bad state, so it cannot demonstrate that the READ is what causes
-    // it. Not a failure; a different manifestation. Try another workspace.
-    if ((await fsp.readdir(sqliteResetPaths.stateRoot(candidate))).includes("state.db-wal")) {
-      outcomes.push("wal-before-any-read");
-      discarded.push(candidate);
-      continue;
-    }
-
-    // ONE ordinary read-only load — the cheapest thing any command does. It is
-    // the only mutation between the healthy workspace above and the halt below.
-    await loadRawState(candidate);
-    const sidecars = await fsp.readdir(sqliteResetPaths.stateRoot(candidate));
-    const journal = await inspectResetJournal(candidate, syncStreamId(configOf(candidate)));
-    outcomes.push(`${sidecars.includes("state.db-wal") ? "wal" : "no-wal"}/${journal.status}`);
-    if (!sidecars.includes("state.db-wal") || journal.status !== "halt") {
-      discarded.push(candidate);
-      continue;
-    }
-
-    // Both operator surfaces, captured here rather than asserted here. Each
-    // `statusCmd` invocation opens the store itself and so can change what the
-    // NEXT journal inspection sees — the intra-invocation race this finding is
-    // partly about. An attempt that diverges part-way through is therefore not a
-    // failure; it is an attempt that did not reproduce, and the next fresh
-    // workspace gets a turn. The captured values are asserted below, so nothing
-    // is judged against a workspace that moved underneath the judgement.
-    const captured = {
-      shm: sidecars.includes("state.db-shm"),
-      journal,
-      payload: JSON.parse((await captureConsole(() => statusCmd(candidate, { json: true, now: NOW }))).out.join("")),
-      brief: (await captureConsole(() => statusCmd(candidate, { now: NOW }))).out.join(" "),
-      doctorState: (await checkState(candidate, configOf(candidate))).ok,
-      doctorMigration: checkStateMigration(candidate).ok,
-    };
-    if (captured.payload?.halted !== true || !captured.brief.includes(HALT_BRIEF)) {
-      outcomes.push(`surfaces-diverged(json=${String(captured.payload?.halted)})`);
-      discarded.push(candidate);
-      continue;
-    }
-    root = candidate;
-    observed = captured;
-    break;
-  }
-  await Promise.all(discarded.map((dir) => fsp.rm(dir, { recursive: true, force: true })));
-  expect(
-    root,
-    `no attempt in ${attempts} reproduced the sidecar-classified halt (${outcomes.join(", ")}). `
-    + "If the defect is fixed, DELETE this test and 222 §7.14's row; if it is not, this rig stopped reaching it.",
-  ).toBeDefined();
-
-  // The defect, asserted against one workspace's single consistent observation.
-  expect(observed!.shm).toBeTrue();
-  expect(observed!.journal).toEqual(halt);
-  expect(observed!.payload.halted).toBeTrue();
-  expect(observed!.payload.reason).toBe(halt.reason);
-  expect(observed!.brief).toContain(HALT_BRIEF);
-
-  // Doctor does not surface the halt — but NOT because it disagrees. It makes
-  // the same read-only load; it simply never consults the reset journal. The
-  // divergence is which surfaces ask, not which are right (222 §7.14).
-  expect(observed!.doctorState).toBeTrue();
-  expect(observed!.doctorMigration).toBeTrue();
 });

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { daemonRuntimeDir } from "./daemon-control.js";
+import { daemonRuntimeDir, readMergedDaemonLogTail } from "./daemon-control.js";
 import {
   buildDiagnosticsBundle,
   checkDeviceIdentity,
@@ -24,6 +24,10 @@ import { saveDevice } from "./e2ee-keystore.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveCredentials } from "./credentials.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
+import { loadActivity } from "./activity.js";
+import { loadMetrics } from "./metrics.js";
+import type { DaemonObservation } from "./daemon/observation.js";
+import { observeWorkspace, type LocalWorkspaceObservation } from "./workspace-observation.js";
 
 let home: string;
 let logs: string[];
@@ -32,6 +36,47 @@ const origFetch = globalThis.fetch;
 const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
 const originalHome = process.env.HOME;
+
+function contextObservation(
+  root: string,
+  sidecarBinding: DaemonObservation["sidecarBinding"],
+): LocalWorkspaceObservation {
+  return {
+    depth: "local",
+    root,
+    observedAt: Date.parse("2026-07-03T00:00:00.000Z"),
+    config: {
+      schema: "e2ee/v1",
+      remoteWorkspaceId: "ws_diag",
+      projectId: "root",
+      rootPath: root,
+      remoteUrl: "https://api.test",
+      token: "",
+      deviceId: "dev_1",
+    },
+    daemon: {
+      ownership: "stopped",
+      running: false,
+      stale: false,
+      ownsRoot: false,
+      ownsWorkspace: false,
+      sidecarBinding,
+      ambient: { kind: "absent" },
+      ambientTrust: "absent",
+    },
+    readActivity: async () => undefined,
+    readDaemonSidecars: async () =>
+      sidecarBinding === "other-workspace" || sidecarBinding === "unreadable"
+        ? undefined
+        : {
+            daemonLogTail: await readMergedDaemonLogTail(root, 64 * 1024),
+            metrics: await loadMetrics(root),
+            activity: await loadActivity(root),
+          },
+    deferrals: [],
+    adopt: { status: "none" },
+  };
+}
 
 const checks: DoctorChecks = {
   credentials: { ok: true, label: "credentials", message: "authenticated" },
@@ -258,13 +303,17 @@ async function expectReportReachesConsent(opts: { diagnostics?: boolean; env?: b
 }
 
 test("stale daemon binding excludes daemon log, metrics, and activity sections", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-root-"));
+  const root = await makeWorkspace();
   try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "workspace.bound"), "ws_previous\n");
+    await fs.writeFile(path.join(runtime, "daemon.log"), "previous workspace path src/secret.ts\n");
     const ctx: DoctorContext = {
       root,
       cfg: {
         schema: "e2ee/v1",
-        remoteWorkspaceId: "ws_new",
+        remoteWorkspaceId: "ws_diag",
         projectId: "root",
         rootPath: root,
         remoteUrl: "https://api.test",
@@ -273,7 +322,7 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
       },
       checks,
       workspaceShape: { fileCount: 2, totalBytes: 99 },
-      daemonStale: true,
+      observation: await observeWorkspace(root, { depth: "local" }),
       ...emptyWorktrees,
     };
     const bundle = await buildDiagnosticsBundle(ctx);
@@ -281,6 +330,30 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
     expect(bundle.metrics).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.activity).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.workspaceShape).toEqual({ fileCount: 2, totalBytes: 99 });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostics emits no sidecar bytes when local observation denies attribution", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-rebind-"));
+  const cfg = contextObservation(root, "workspace").config;
+  try {
+    const observation = contextObservation(root, "workspace");
+    observation.readDaemonSidecars = async () => undefined;
+    const ctx: DoctorContext = {
+      root,
+      cfg,
+      checks,
+      workspaceShape: { fileCount: 0, totalBytes: 0 },
+      observation,
+      ...emptyWorktrees,
+    };
+
+    const bundle = await buildDiagnosticsBundle(ctx);
+    expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
+    expect(bundle.metrics).toEqual({ excluded: "stale daemon binding" });
+    expect(bundle.activity).toEqual({ excluded: "stale daemon binding" });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -357,7 +430,7 @@ test("design 200 P2: doctor prints absolute leftover paths but the bundle contai
       cfg,
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 4 },
-      daemonStale: true,
+      observation: contextObservation(root, "other-workspace"),
       localOnly: { leftoverWorktrees: worktrees.localOnly },
       diagnostics: { leftoverWorktrees: worktrees.diagnostics },
     };
@@ -490,7 +563,7 @@ test("207.7: repo residue is local-only, verdicts are neutral, and quarantine si
       cfg,
       checks,
       workspaceShape: { fileCount: 3, totalBytes: 1 },
-      daemonStale: true,
+      observation: contextObservation(root, "other-workspace"),
       localOnly,
       diagnostics: {
         leftoverWorktrees: { count: 0, entries: [] },
@@ -538,9 +611,14 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
       },
       checks: { ...checks, daemon: { ok: false, label: "background sync", message: "stopped", status: "stopped" } },
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      daemonStale: false,
+      // The REAL observation, reading the real records written above: the
+      // exclusion has to come from production authorization, not a fixture.
+      observation: await observeWorkspace(root, { depth: "local" }),
       ...emptyWorktrees,
     };
+
+    expect(await readMergedDaemonLogTail(root, 64 * 1024)).toContain("src/secret.ts");
+    expect(ctx.observation.daemon.sidecarBinding).toBe("other-workspace");
 
     const bundle = await buildDiagnosticsBundle(ctx);
     expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
@@ -613,7 +691,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
       },
       checks: { ...checks, daemon: { ok: true, label: "background sync", message: "running", status: "running" } },
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      daemonStale: false,
+      observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
     const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
@@ -647,7 +725,7 @@ test("a byte-truncated Git log record cannot leak a continuation", async () => {
       },
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      daemonStale: false,
+      observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
     const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
@@ -675,7 +753,7 @@ test("diagnostics merges bounded dated and crash channels before redaction", asy
       },
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      daemonStale: false,
+      observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
     const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;
@@ -700,7 +778,7 @@ test("diagnostics retains the bounded tail of an oversized daemon source", async
       },
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      daemonStale: false,
+      observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
     const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;

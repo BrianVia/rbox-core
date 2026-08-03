@@ -1,11 +1,12 @@
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
 import { systemLockIdentity } from "../../engine/git/lockfile.js";
 import { isStandaloneBinary } from "../runtime.js";
 import { daemonCrashLogPath } from "../rbox-paths.js";
 import { AMBIENT_STATUS_STALE_MS, readAmbientDaemonStatusRecord, validDaemonVersion, type DaemonMode } from "./ambient-status.js";
+import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, daemonBindingStatus } from "./observation.js";
+import { DAEMON_PROCESS_MARKER, daemonProcessMatches, isDaemonProcess } from "./process-identity.js";
 import { RBOX_VERSION } from "../version.js";
 import {
   DAEMON_BOOT_ID_ENV,
@@ -21,23 +22,8 @@ import {
   type DaemonPidRecord,
 } from "./runtime-state.js";
 
-const DAEMON_MARKER = "__daemon-run";
 const logPath = daemonCrashLogPath;
-export const DAEMON_HEARTBEAT_FUTURE_SKEW_MS = 2 * 60_000;
-
-/** The daemon-binding verdict for user-facing liveness: only a LIVE daemon with a
- *  known mismatching startup binding is stale. Unknown binding (pre-binding daemon)
- *  remains "can't tell", matching the existing status rule. Diagnostics sidecar
- *  exclusion separately reads `workspace.bound` independent of liveness. */
-export function daemonBindingStatus(root: string, workspaceId: string): {
-  alive: { running: boolean; pid?: number; bootId?: string };
-  bound?: string;
-  stale: boolean;
-} {
-  const alive = isDaemonRunning(root);
-  const bound = alive.running ? readDaemonBinding(root) : undefined;
-  return { alive, bound, stale: alive.running && bound !== undefined && bound !== workspaceId };
-}
+export { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, daemonBindingStatus, daemonProcessMatches, isDaemonProcess };
 /** argv for re-spawning THIS CLI as the detached daemon (with `process.execPath`).
  *
  *  A compiled binary IS its own entry — `process.execPath` is the rbox binary and Bun
@@ -45,9 +31,9 @@ export function daemonBindingStatus(root: string, workspaceId: string): {
  *  shift the marker out of the child's command slot, the dispatcher would read a bogus
  *  command and print help, and the daemon would exit without syncing. Under `bun run`
  *  (dev) `process.execPath` is Bun, so the script path (`entry`) IS required. Either
- *  way `DAEMON_MARKER` leads so `isOurDaemon` can match it in `ps` for PID ownership. */
+ *  way the process marker leads so `isOurDaemon` can match it in `ps` for PID ownership. */
 export function daemonSpawnArgs(entry: string, root: string, standalone: boolean): string[] {
-  return standalone ? [DAEMON_MARKER, root] : [entry, DAEMON_MARKER, root];
+  return standalone ? [DAEMON_PROCESS_MARKER, root] : [entry, DAEMON_PROCESS_MARKER, root];
 }
 
 function isAlive(pid: number): boolean {
@@ -57,57 +43,6 @@ function isAlive(pid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === "EPERM"; // exists but not ours to signal
   }
-}
-
-function readDaemonCommand(pid: number): string {
-  return execFileSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8" });
-}
-
-const normalizedRoot = (value: string): string => path.resolve(value.trim());
-
-/**
- * Does this command line name `root` as the daemon's OWN workspace?
- *
- * `daemonSpawnArgs` puts the root last, so everything after the `__daemon-run`
- * marker IS the root — including any spaces in it, which the space-joined `ps`
- * output (macOS and Linux alike) gives no safe way to split on. Comparing that
- * whole tail as a normalized path is what makes this an exact argument match
- * rather than a substring test: a live daemon for `/w/work-old` must never be
- * read as owning the prefix sibling `/w/work`, or a reused pid would resurrect
- * another workspace's halt residue. Every whole-token occurrence of the marker
- * is tried, so neither an entry path nor a root containing the marker text can
- * mis-anchor the tail.
- */
-function commandNamesRoot(cmd: string, root: string): boolean {
-  const target = normalizedRoot(root);
-  const line = cmd.replace(/\s+$/u, "");
-  for (let at = line.indexOf(DAEMON_MARKER); at !== -1; at = line.indexOf(DAEMON_MARKER, at + 1)) {
-    const startsToken = at === 0 || /\s/u.test(line[at - 1]!);
-    const after = line[at + DAEMON_MARKER.length];
-    if (!startsToken || after === undefined || !/\s/u.test(after)) continue;
-    const tail = line.slice(at + DAEMON_MARKER.length).trimStart();
-    if (tail.length > 0 && normalizedRoot(tail) === target) return true;
-  }
-  return false;
-}
-
-/** Confirm the pid is an rbox daemon, optionally for one exact workspace root.
- * The command line is read once so the ownership hot path does not spawn two ps
- * subprocesses. The reader seam keeps the single-read contract testable. */
-export function daemonProcessMatches(pid: number, root?: string, readCommand: (pid: number) => string = readDaemonCommand): boolean {
-  if (!isAlive(pid)) return false;
-  try {
-    const cmd = readCommand(pid);
-    if (!cmd.includes(DAEMON_MARKER)) return false;
-    return root === undefined || commandNamesRoot(cmd, root);
-  } catch {
-    return false; // ps failed / process gone
-  }
-}
-
-/** Standalone daemon ownership check used by upgrade discovery. */
-export function isDaemonProcess(pid: number): boolean {
-  return daemonProcessMatches(pid);
 }
 
 function isOurDaemon(pid: number, root: string): boolean {
