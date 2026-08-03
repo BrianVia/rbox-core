@@ -1,7 +1,18 @@
 import { test, expect } from "bun:test";
-import { COMMAND_HELP, helpFor, helpKeyFor, renderCommand, renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
-import { ALIAS_COMMANDS, KNOWN_TOP_LEVEL, PUBLIC_COMMANDS } from "./command-catalog.js";
-import { resolveAlias } from "./deprecations.js";
+import { readFileSync } from "node:fs";
+import {
+  ALIAS_COMMANDS,
+  COMMAND_HELP,
+  KNOWN_TOP_LEVEL,
+  PUBLIC_COMMANDS,
+  helpFor,
+  helpKeyFor,
+  renderCommand,
+  renderEssentialHelp,
+  renderGroupedHelp,
+  resolveAlias,
+  resolveCommandAlias,
+} from "./help-registry.js";
 
 const firstWord = (s: string) => s.split(" ")[0]!;
 const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));
@@ -31,6 +42,8 @@ test("include help uses the founder-approved surface and track documents repeata
   expect(byName.get("track")?.flags).toContainEqual({
     flag: "--include <folder>",
     desc: "sync only this folder (repeat for more); implies this machine never sends changes",
+    takesValue: true,
+    repeatable: true,
   });
 });
 
@@ -47,6 +60,12 @@ test("guided setup help marks flags that only keyed setup honors", () => {
   const flags = (setup.flags ?? []).filter(({ flag }) => keyedOnly.has(flag));
   expect(flags.map(({ flag }) => flag)).toEqual([...keyedOnly]);
   for (const { desc } of flags) expect(desc).toContain("(keyed setup only)");
+});
+
+test("accepted hidden syntax stays out of rendered help", () => {
+  expect(renderCommand(byName.get("setup")!)).not.toContain("--no-sync");
+  expect(renderCommand(byName.get("track")!)).not.toContain("--device");
+  expect(renderCommand(byName.get("track")!)).not.toContain("--no-interactive");
 });
 
 test("per-command help: a command with registered sub-verbs includes them", () => {
@@ -96,13 +115,40 @@ test("the public surface (derived from the registry) and KNOWN_TOP_LEVEL stay co
   expect(KNOWN_TOP_LEVEL.has("__boot-resume")).toBe(true);
 });
 
+test("every canonical registry head has one real lazy-dispatch or fast-path handler", () => {
+  const dispatchSource = readFileSync(new URL("./main-dispatch.ts", import.meta.url), "utf8");
+  const indexSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const switchHandlers = [...dispatchSource.matchAll(/^    case "([^"]+)":/gm)]
+    .map((match) => match[1]!)
+    .filter((command) => !command.startsWith("__"));
+  const fastPathHandlers: string[] = [];
+  if (/if \(cmd === "--version" \|\| cmd === "-v" \|\| cmd === "version"\)/.test(dispatchSource)) {
+    fastPathHandlers.push("version");
+  }
+  if (/if \(cmd === "prompt-status"\)/.test(indexSource)) {
+    fastPathHandlers.push("prompt-status");
+  }
+
+  const registeredCanonicalHeads = new Set(
+    COMMAND_HELP
+      .filter((command) => !command.alias)
+      .map((command) => firstWord(command.name)),
+  );
+  expect([...new Set([...switchHandlers, ...fastPathHandlers])].sort()).toEqual(
+    [...registeredCanonicalHeads].sort(),
+  );
+  expect(dispatchSource.indexOf("resolveAlias(cmd, positional)")).toBeLessThan(
+    dispatchSource.indexOf("switch (cmd)"),
+  );
+});
+
 test("every deprecated alias is hidden and forwards to a real command path", () => {
   for (const alias of ALIAS_COMMANDS) {
     const entry = byName.get(alias)!;
     expect(entry.hidden, `alias ${alias} must be hidden`).toBe(true);
     expect(entry.alias, `alias ${alias} must name a forward target`).toBeDefined();
     // The forward target is itself a known top-level command (no dangling forward).
-    expect(KNOWN_TOP_LEVEL.has(firstWord(entry.alias!))).toBe(true);
+    expect(KNOWN_TOP_LEVEL.has(firstWord(resolveCommandAlias(alias)))).toBe(true);
   }
 });
 
@@ -113,7 +159,7 @@ test("the registry's alias targets agree with the deprecations resolver (no drif
     expect(resolved, `resolveAlias(${alias}) should rewrite`).not.toBeNull();
     // e.g. registry alias "deps install" ↔ resolver { cmd: "deps", positional: ["install"] }.
     const target = [resolved!.cmd, ...resolved!.positional].join(" ");
-    expect(target).toBe(byName.get(alias)!.alias!);
+    expect(target).toBe(resolveCommandAlias(alias));
   }
 });
 

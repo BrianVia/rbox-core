@@ -16,10 +16,8 @@
  */
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
-import { readDaemonPidRecord } from "./daemon-control.js";
-import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, isDaemonProcess } from "./daemon/process-control.js";
-import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
-import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
+import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
+import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import { style } from "./style.js";
 
@@ -62,9 +60,7 @@ export interface MachineTriage {
 
 export interface MachineTriageDeps {
   readBindingRegistry?: typeof readBindingRegistry;
-  readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
-  readDaemonPidRecord?: typeof readDaemonPidRecord;
-  isDaemonProcess?: typeof isDaemonProcess;
+  observeDaemon?: typeof observeDaemon;
   now?: () => number;
 }
 
@@ -128,10 +124,8 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
 
 export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
   const rows = await (deps.readBindingRegistry ?? readBindingRegistry)().catch(() => []);
-  const readAmbient = deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord;
-  const readPid = deps.readDaemonPidRecord ?? readDaemonPidRecord;
-  const alive = deps.isDaemonProcess ?? isDaemonProcess;
   const now = (deps.now ?? Date.now)();
+  const observe = deps.observeDaemon ?? observeDaemon;
 
   const workspaces: MachineWorkspaceSummary[] = [];
   for (const row of rows) {
@@ -147,23 +141,10 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
       workspaces.push(unreachable(row, REBOUND_SUMMARY, command));
       continue;
     }
-    const record = readAmbient(row.root);
-    const status = record.kind === "ok" ? record.status : undefined;
-    const pid = readPid(row.root);
-    // Liveness FIRST: a daemon that just died leaves a fresh-looking record
-    // behind, and reporting that as "up to date" is the worst possible lie.
-    const running = pid.pid !== undefined && alive(pid.pid);
-    const age = status ? now - Date.parse(status.heartbeatAt) : Number.NaN;
-    // The record must belong to the incarnation that is running RIGHT NOW —
-    // same gate the in-workspace report applies (doctor-evidence.liveAmbient).
-    // A record from a previous boot describes a daemon that no longer exists.
-    const bootBound = status?.bootId !== undefined && pid.bootId !== undefined && status.bootId === pid.bootId;
-    const usable = running
-      && status !== undefined
-      && bootBound
-      && Number.isFinite(age)
-      && age <= AMBIENT_STATUS_STALE_MS
-      && age >= -DAEMON_HEARTBEAT_FUTURE_SKEW_MS;
+    const daemon = observe(row.root, row.currentWorkspaceId ?? row.workspaceId, now);
+    const running = daemon.running;
+    const status = daemon.trustedAmbient;
+    const usable = status !== undefined;
     // Deferral counts are evidence like any other field: a record the gates
     // rejected describes a daemon that no longer exists, and quoting its count
     // would put invented pending work in the `status --all` table.

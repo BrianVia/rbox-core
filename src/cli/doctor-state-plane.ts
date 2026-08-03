@@ -1,33 +1,48 @@
 /**
  * State-plane doctor policy.
  *
- * The checks and copy that speak for the local state plane — the `.rbox/state`
- * document today, and the migration halts design 163 §U3 adds — live here rather
- * than in `doctor-cmd.ts`, so the orchestrator stays orchestration and the
- * halt-copy contract has one home. Two things live in this file:
+ * The checks that speak for the local state plane live here rather than in
+ * `doctor-cmd.ts`, so the orchestrator stays orchestration. Three of them:
  *
- *   1. The current `state` and `upgrade reserve` doctor checks (moved verbatim).
- *   2. `MIGRATION_HALT_COPY`: an exhaustive `satisfies Record<MigrationHaltCode,
- *      …>` mapping of every migration halt to its plain-English AND machine copy.
- *      The `satisfies` is the merge gate — U3 cannot add a halt code (in
- *      `migration/health.ts`) without also giving it copy here, or this file
- *      stops compiling.
+ *   1. `state` — the live sync records, in EITHER format (163 §C4).
+ *   2. `upgrade reserve` — the reserved 1 MiB of runway.
+ *   3. `migration` — a conversion that is suspended, interrupted, or unfinished.
  *
- * `doctor-cmd.ts` wires these into its named check descriptors; nothing here
- * reaches back into orchestration or rendering.
+ * The words all three speak come from `state-plane-copy.ts`, whose exhaustive
+ * `satisfies` clauses are the merge gate; `state-plane-report.ts` turns a typed
+ * outcome into them. Nothing here invents copy, and nothing here mutates.
  */
 import path from "node:path";
-import { loadRawState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { syncStreamId, type WorkspaceConfig } from "./config.js";
 import { ResetCorruptionError } from "./reset-io.js";
-import { inspectStateReserve, StateFormatTooNewError } from "./state-plane/index.js";
+import { classifyStateFormat } from "./state-plane/authority-marker.js";
+// The SELECTING whole-state seam. 163 §C4 makes doctor authority-aware, and this
+// is that change for the `state` check: on `Q` the legacy reader raised
+// `StateFormatTooNewError`, so a healthy migrated workspace was told to upgrade a
+// binary that is already current — the one thing a doctor must never do.
+import { loadRawState } from "./state-plane/adapters/whole-state-compat.js";
+import { readGenesisIntent } from "./state-plane/genesis-intent.js";
+import { readCanonicalControl } from "./state-plane/migration/control-publication.js";
+import { statePath } from "./state-plane/paths.js";
+import { MIGRATION_STEP_COPY } from "./state-plane-copy.js";
+import { describeMigrationHalt } from "./state-plane-report.js";
+import {
+  inspectStateReserve, StateAuthorityCorruptError, StateFormatTooNewError,
+} from "./state-plane/index.js";
 import type { DoctorCheck } from "./doctor-cmd.js";
-import type { TriageSeverity } from "./doctor-triage.js";
-import type { MigrationHaltCode } from "./state-plane/migration/health.js";
 
 export async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
   const file = path.join(root, ".rbox", "state.json");
+  const migrated = await classifyStateFormat(statePath(root)).catch(() => "json" as const)
+    === "authority-marker";
   try {
     const parsed = await loadRawState(root);
+    if (migrated) {
+      return {
+        ok: true, label: "state", status: "sqlite",
+        message: "sync records are in rbox's current format and readable",
+      };
+    }
     if (!parsed) return { ok: true, label: "state", message: "no sync state yet" };
     const expected = syncStreamId(cfg);
     if (parsed.stream !== undefined && parsed.stream !== expected) {
@@ -36,11 +51,22 @@ export async function checkState(root: string, cfg: WorkspaceConfig): Promise<Do
     return { ok: true, label: "state", message: "state file parses and matches this stream" };
   } catch (e) {
     const message = e instanceof Error ? e.message : "";
+    // Only reachable now for a marker this binary genuinely cannot read, which is
+    // the sole case where "upgrade" is the honest advice.
     if (e instanceof StateFormatTooNewError) {
       return {
         ok: false, status: "format-too-new", label: "state",
         message: ".rbox/state.json was written by a newer version of rbox",
         hint: "run `rbox upgrade`; do not delete this file",
+      };
+    }
+    // The marker says the new format; the records behind it are missing or do not
+    // match. 222 §6.4: never a halt, never a retry, and never "upgrade".
+    if (e instanceof StateAuthorityCorruptError) {
+      return {
+        ok: false, status: "authority-corrupt", label: "state",
+        message: "this workspace's sync records are missing or do not match their marker",
+        hint: "rbox stop, move this workspace's `.rbox` folder aside, then run `rbox adopt` here",
       };
     }
     if (e instanceof ResetCorruptionError
@@ -75,32 +101,87 @@ export async function checkStateReserve(root: string, cfg: WorkspaceConfig): Pro
 }
 
 /**
- * Plain-English + machine copy for one migration halt (design 163 R4-ROLLOUT
- * M5): what happened, what is safe, the one next action — plus the structured
- * twin the non-interactive `--json` surface emits. Two of the four external
- * users are non-technical, so `human` is written for them; `machine` is written
- * for agents, CI, and the rig.
+ * The `migration` check: is a conversion of this workspace's sync records
+ * suspended, interrupted, or unfinished?
+ *
+ * READ-ONLY and file-level. It reads the canonical control record and the
+ * genesis intent — both plain files — and never classifies artifacts, never
+ * takes a lock, and never opens a database. 163 v13's rule is that a read-only
+ * SQLite open is not zero-write, and doctor is the surface a worried user runs
+ * most, so it is the last place that should deposit sidecars.
+ *
+ * Every message comes from `state-plane-report.ts`, so what doctor prints about
+ * a halt and what `rbox migrate` printed when it hit that halt are the same
+ * sentences.
  */
-export interface MigrationHaltCopy {
-  /** What a non-technical user reads: the halt, the safety line, one command. */
-  readonly human: {
-    readonly problem: string;
-    readonly safety: string;
-    readonly command?: string;
-  };
-  /** The non-interactive twin: a stable id and severity mirroring the doctor
-   * triage findings (see `TriageFinding` in `doctor-triage.ts`). */
-  readonly machine: {
-    readonly id: string;
-    readonly severity: TriageSeverity;
-  };
+export function checkStateMigration(root: string): DoctorCheck {
+  const control = read(() => readCanonicalControl(root));
+  if (control?.halt) {
+    const report = describeMigrationHalt(root, control.halt, true, control);
+    return {
+      ok: report.ok,
+      label: "migration",
+      status: report.finding.id,
+      // The check LINE carries what happened plus the facts it names; the safety
+      // answer and the one command belong to the triage finding, which is the
+      // surface a non-developer actually reads. Duplicating them into a
+      // paragraph-long check line would push the other checks off the screen.
+      message: [report.finding.problem, ...report.facts].join(" "),
+      ...(report.finding.command === undefined ? {} : { hint: report.finding.command }),
+      finding: report.finding,
+    };
+  }
+  if (control) {
+    // "Interrupted" would be a LIE while a conversion is running: doctor takes no
+    // lock, so an unhalted control is equally the record of a migration in
+    // progress in another process and one a crash abandoned. Doctor cannot tell
+    // them apart without the exclusivity it deliberately does not take, so it
+    // says what it observed — a conversion is part-way — and lets the remedy be
+    // safe in both readings. `rbox migrate` on a live one refuses
+    // `migration-not-exclusive`; on an abandoned one it resumes.
+    return {
+      ok: false,
+      label: "migration",
+      status: "state-migration/in-progress",
+      // The phase name is an internal noun; `MIGRATION_STEP_COPY` is the same
+      // fact in the words the progress renderer already uses.
+      message: `converting this workspace's sync records is part-way through — ${MIGRATION_STEP_COPY[control.witness.phase]}`,
+      hint: "rbox migrate",
+      finding: {
+        id: "state-migration/in-progress",
+        severity: "attention",
+        problem: "Converting this workspace's sync records to rbox's current format is part-way through. If nothing is running it, it stopped early.",
+        safety: "Nothing was lost. The records rbox is using right now are the ones it was already using.",
+        command: "rbox migrate",
+      },
+    };
+  }
+  if (read(() => readGenesisIntent(root))) {
+    return {
+      ok: false,
+      label: "migration",
+      status: "state-genesis/unfinished",
+      message: "setting up this workspace's sync records didn't finish",
+      hint: "rbox migrate",
+      finding: {
+        id: "state-genesis/unfinished",
+        severity: "attention",
+        problem: "rbox was setting up this workspace's sync records and didn't finish.",
+        safety: "No files were changed. rbox will pick the setup back up where it left off.",
+        command: "rbox migrate",
+      },
+    };
+  }
+  return { ok: true, label: "migration", message: "no conversion in progress" };
 }
 
-/**
- * Exhaustive halt-code → copy map. The `satisfies Record<MigrationHaltCode, …>`
- * is the gate the sweep asked for: the day U3 adds a code to `MigrationHaltCode`
- * without human + machine copy here, this file stops compiling. Empty today
- * because `MigrationHaltCode` is empty today; U3 fills one entry per code.
- */
-export const MIGRATION_HALT_COPY = {
-} satisfies Record<MigrationHaltCode, MigrationHaltCopy>;
+/** A record that cannot be read is reported by the `state` check above and by
+ * the migration machine's own corruption halt; a doctor that crashed on it would
+ * report neither. */
+function read<T>(reader: () => T | undefined): T | undefined {
+  try {
+    return reader();
+  } catch {
+    return undefined;
+  }
+}

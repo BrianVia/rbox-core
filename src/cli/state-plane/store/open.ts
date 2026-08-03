@@ -10,6 +10,7 @@ import {
   type GenesisLineage,
 } from "../schema/application.js";
 import { validateOpen, type StoreHeader } from "../schema/validate-open.js";
+import { selectRow } from "./statements.js";
 
 export interface StorePragmas {
   pageSize: number;
@@ -28,8 +29,13 @@ export interface StorePragmas {
   checkpointFullfsync?: number;
 }
 
+export interface ClaimedInode {
+  readonly dev: number;
+  readonly ino: number;
+}
+
 function scalar(db: Database, pragma: string): number | string {
-  const row = db.query(`PRAGMA ${pragma}`).get() as Record<string, number | string> | null;
+  const row = selectRow<Record<string, number | string>>(db, `PRAGMA ${pragma}`);
   if (!row) throw new Error(`PRAGMA ${pragma} returned no row`);
   return Object.values(row)[0]!;
 }
@@ -68,7 +74,7 @@ function assertPragmas(values: StorePragmas, readonly: boolean, file: string): v
     cacheSize: readonly ? -8192 : -32768,
     busyTimeout: readonly ? 250 : 5000,
     tempStore: 1,
-    queryOnly: readonly ? 1 : 0,
+    queryOnly: 0,
     ...(process.platform === "darwin" ? { fullfsync: 1, checkpointFullfsync: 1 } : {}),
   };
   if (!readonly) expected.journalSizeLimit = 67108864;
@@ -94,6 +100,13 @@ function configureWriter(db: Database): void {
   if (process.platform === "darwin") db.exec("PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON");
 }
 
+/**
+ * A reader is an owning connection with reader-sized cache and busy timeout.
+ * It is never a SQLite `readonly:true` connection: such a connection creates
+ * `-wal`/`-shm` on its first read and cannot remove them at close, leaving the
+ * database off `S0`. Read-only-ness is therefore a handle-level flag the
+ * store's own write entry points honour, not a SQLite or OS lock.
+ */
 function configureReader(db: Database): void {
   if (process.platform === "darwin") db.exec("PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON");
   db.exec(`
@@ -103,7 +116,6 @@ function configureReader(db: Database): void {
     PRAGMA cache_size=-8192;
     PRAGMA busy_timeout=250;
     PRAGMA temp_store=FILE;
-    PRAGMA query_only=ON;
   `);
 }
 
@@ -112,6 +124,8 @@ export class StateStoreHandle {
 
   constructor(
     readonly file: string,
+    /** Advisory: the store's write entry points refuse on it. The connection
+     * underneath is always read-write, so `stateStoreDatabase` bypasses it. */
     readonly readonly: boolean,
     readonly header: StoreHeader,
     readonly pragmas: StorePragmas,
@@ -128,9 +142,6 @@ export class StateStoreHandle {
     if (this.#closed) return;
     this.#closed = true;
     const connection = connections.get(this)!;
-    if (!this.readonly) {
-      try { connection.query("PRAGMA wal_checkpoint(TRUNCATE)").get(); } catch {}
-    }
     connection.close();
     connections.delete(this);
     const reference = liveStoreReferences.get(this);
@@ -171,9 +182,8 @@ export interface ResetCheckpointResult {
 export function checkpointStateStoreForReset(store: StateStoreHandle): ResetCheckpointResult {
   if (store.readonly) throw new Error("reset checkpoint requires the owning writer");
   const db = stateStoreDatabase(store);
-  const row = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as
-    | { busy?: unknown; log?: unknown; checkpointed?: unknown }
-    | null;
+  const row = selectRow<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>(
+    db, "PRAGMA wal_checkpoint(TRUNCATE)");
   const values = row ? Object.values(row) : [];
   const result = {
     busy: Number(row?.busy ?? values[0]),
@@ -206,25 +216,35 @@ export function stateStoreDatabase(store: StateStoreHandle): Database {
   return connection;
 }
 
-/** @internal state-plane vertical only; future installers own their transaction. */
-export function initializeStateStore(
+type ClaimStateStore = () => ClaimedInode;
+
+function namedInode(file: string): ClaimedInode | undefined {
+  try {
+    const stat = fs.lstatSync(file);
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function sameClaim(left: ClaimedInode | undefined, right: ClaimedInode): boolean {
+  return left?.dev === right.dev && left.ino === right.ino;
+}
+
+function initializeClaimedStateStore(
   file: string,
+  claim: ClaimStateStore,
   install: (db: Database) => void,
 ): StateStoreHandle {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   let db: Database | undefined;
-  let claimed = false;
+  let claimed: ClaimedInode | undefined;
   try {
-    const claim = fs.openSync(file, "wx", 0o600);
-    claimed = true;
-    try {
-      fs.closeSync(claim);
-    } catch (error) {
-      fs.rmSync(file, { force: true });
-      claimed = false;
-      throw error;
-    }
+    claimed = claim();
     db = new Database(file, { create: false, readwrite: true });
+    if (!sameClaim(namedInode(file), claimed)) {
+      throw new Error("claimed state store path changed while it was opened");
+    }
     db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${STATE_STORE_SQLITE_APPLICATION_ID}; PRAGMA user_version=${STATE_STORE_SQLITE_USER_VERSION}`);
     configureWriter(db);
     applySchemaV1(db);
@@ -235,46 +255,129 @@ export function initializeStateStore(
     return new StateStoreHandle(file, false, header, pragmas, db);
   } catch (error) {
     try { db?.close(); } catch {}
-    if (claimed) {
+    if (claimed && sameClaim(namedInode(file), claimed)) {
       for (const suffix of ["", "-wal", "-shm", "-journal"]) fs.rmSync(`${file}${suffix}`, { force: true });
     }
     throw error;
   }
 }
 
+/** @internal state-plane vertical only; future installers own their transaction. */
+export function initializeStateStore(
+  file: string,
+  install: (db: Database) => void,
+): StateStoreHandle {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return initializeClaimedStateStore(file, () => {
+    const fd = fs.openSync(file, "wx", 0o600);
+    try {
+      const stat = fs.fstatSync(fd);
+      fs.closeSync(fd);
+      return { dev: stat.dev, ino: stat.ino };
+    } catch (error) {
+      try { fs.closeSync(fd); } catch {}
+      fs.rmSync(file, { force: true });
+      throw error;
+    }
+  }, install);
+}
+
+export function adoptClaimedStateStore(
+  file: string,
+  expected: ClaimedInode,
+  install: (db: Database) => void,
+): StateStoreHandle {
+  return initializeClaimedStateStore(file, () => {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      const named = fs.lstatSync(file);
+      const exact = opened.isFile()
+        && opened.size === 0
+        && (opened.mode & 0o7777) === 0o600
+        && opened.dev === expected.dev
+        && opened.ino === expected.ino
+        && named.dev === opened.dev
+        && named.ino === opened.ino;
+      if (!exact) throw new Error("claimed state store does not match its expected inode");
+      for (const suffix of ["-wal", "-shm", "-journal"]) {
+        if (namedInode(`${file}${suffix}`)) throw new Error("claimed state store has a SQLite sidecar");
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return expected;
+  }, install);
+}
+
 export function createStateStore(file: string, genesis: GenesisLineage): StateStoreHandle {
   return initializeStateStore(file, (db) => installGenesisLineage(db, genesis));
 }
 
-export function openStateStore(file: string, options: { readonly?: boolean } = {}): StateStoreHandle {
-  const readonly = options.readonly === true;
-  // Read-only preflight first: a foreign SQLite file must not be converted to
-  // WAL or otherwise mutated merely because rbox refuses it.
-  let preflight: Database;
+const SQLITE_HEADER_BYTES = 100;
+const SQLITE_HEADER_MAGIC = "SQLite format 3\0";
+
+/**
+ * Decide ownership from file bytes, before anything opens the file. Opening a
+ * WAL database is a mutation — the first read creates `-wal`/`-shm` — so a
+ * refusal that has already opened has already written to data rbox does not
+ * own. The 100-byte SQLite header carries every fact this needs: the magic,
+ * the page size, the read/write format versions (2 means WAL), and rbox's own
+ * `application_id`/`user_version`.
+ */
+function requireOwnedStateStoreFile(file: string): void {
+  const bytes = Buffer.alloc(SQLITE_HEADER_BYTES);
+  let read: number;
   try {
-    preflight = new Database(file, { create: false, readonly: true });
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      read = fs.readSync(fd, bytes, 0, bytes.length, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch (error) {
     throw new StateStoreOpenError("not-a-database", file, String(error), error);
   }
-  let opened: Database | undefined;
+  if (read !== SQLITE_HEADER_BYTES || bytes.subarray(0, 16).toString("latin1") !== SQLITE_HEADER_MAGIC) {
+    throw new StateStoreOpenError("not-a-database", file, "file does not begin with a SQLite header");
+  }
+  const applicationId = bytes.readUInt32BE(68);
+  const userVersion = bytes.readUInt32BE(60);
+  if (applicationId !== STATE_STORE_SQLITE_APPLICATION_ID || userVersion !== STATE_STORE_SQLITE_USER_VERSION) {
+    throw new StateStoreOpenError("wrong-application", file, `SQLite header identity is application=${applicationId}, user_version=${userVersion}`);
+  }
+  const pageSize = bytes.readUInt16BE(16);
+  if (pageSize !== 4096) {
+    throw new StateStoreOpenError("structural-invariant", file, `SQLite header page size is ${pageSize === 1 ? 65536 : pageSize}`);
+  }
+  if (bytes[18] !== 2 || bytes[19] !== 2) {
+    throw new StateStoreOpenError("structural-invariant", file, `SQLite header format versions are ${bytes[18]}/${bytes[19]}, expected WAL (2/2)`);
+  }
+}
+
+export function openStateStore(file: string, options: { readonly?: boolean } = {}): StateStoreHandle {
+  const readonly = options.readonly === true;
+  requireOwnedStateStoreFile(file);
+  let db: Database | undefined;
   try {
-    const header = validateOpen(preflight, file);
-    preflight.close();
-    opened = new Database(file, { create: false, readonly, readwrite: !readonly });
-    if (readonly) configureReader(opened); else configureWriter(opened);
-    const pragmas = readPragmas(opened);
+    db = new Database(file, { create: false, readwrite: true });
+    // Validate before configuring: `validateOpen` is what types a SQLite
+    // failure as `corrupt`, so nothing may touch the database ahead of it.
+    const header = validateOpen(db, file);
+    if (readonly) configureReader(db); else configureWriter(db);
+    const pragmas = readPragmas(db);
     assertPragmas(pragmas, readonly, file);
-    return new StateStoreHandle(file, readonly, header, pragmas, opened);
+    return new StateStoreHandle(file, readonly, header, pragmas, db);
   } catch (error) {
-    try { preflight.close(); } catch {}
-    try { opened?.close(); } catch {}
+    try { db?.close(); } catch {}
     throw error;
   }
 }
 
 /**
- * W1-only owning-writer open. A read-only preflight is forbidden here because
- * opening a WAL-mode database may itself participate in recovery.
+ * W1-only owning-writer open. It skips the header gate because W1 exists to
+ * recover a database whose current page 1 may still be in the WAL; its caller
+ * proves ownership from the authority marker and re-checks `authority_id`.
  */
 export function openStateStoreForWalTakeover(file: string): StateStoreHandle {
   let db: Database | undefined;

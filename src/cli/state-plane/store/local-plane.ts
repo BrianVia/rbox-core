@@ -14,6 +14,7 @@ import {
   promoteFilesIntoPlane,
 } from "./generations.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
+import { runStatement, selectRow } from "./statements.js";
 import { currentSnapshot } from "./read-snapshot.js";
 import { openSealedStage, type SealedStageRef } from "./sealed-stages.js";
 import { StageLock, deleteSealedArtifact } from "./stage-artifacts.js";
@@ -82,8 +83,8 @@ function promote(
 ): LocalScanResult {
   db.exec("BEGIN IMMEDIATE");
   try {
-    const current = db.query("SELECT generation FROM plane_heads WHERE lineage_id=? AND plane='local'")
-      .get(expected.lineageId) as { generation: number } | null;
+    const current = selectRow<{ generation: number }>(
+      db, "SELECT generation FROM plane_heads WHERE lineage_id=? AND plane='local'", expected.lineageId);
     if (!current) throw new Error("state store LOCAL head disappeared");
     if (current.generation !== expected.localRevision) {
       throw new StageChangedError(stage.stageId, `LOCAL head moved to ${current.generation}, expected ${expected.localRevision}`);
@@ -93,8 +94,8 @@ function promote(
     promoteFilesIntoPlane(db, expected.lineageId, "local", generation);
     const header: ManifestHeader = stage.header;
     const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = header;
-    db.query(`UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
-      trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='local'`).run(
+    runStatement(db, `UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
+      trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='local'`,
       generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch as string,
       Object.keys(extras).length === 0 ? null : canonicalJson(extras), expected.lineageId,
     );
@@ -116,11 +117,11 @@ export function invalidateLocalPlane(store: StateStoreHandle, lineageId: string)
   const db = stateStoreDatabase(store);
   db.exec("BEGIN IMMEDIATE");
   try {
-    const current = db.query("SELECT generation,complete FROM plane_heads WHERE lineage_id=? AND plane='local'")
-      .get(lineageId) as { generation: number; complete: number } | null;
+    const current = selectRow<{ generation: number; complete: number }>(
+      db, "SELECT generation,complete FROM plane_heads WHERE lineage_id=? AND plane='local'", lineageId);
     if (!current) throw new Error("state store LOCAL head disappeared");
-    db.query("UPDATE plane_heads SET generation=?,complete=0,trust_epoch=NULL WHERE lineage_id=? AND plane='local'")
-      .run(current.generation + 1, lineageId);
+    runStatement(db, "UPDATE plane_heads SET generation=?,complete=0,trust_epoch=NULL WHERE lineage_id=? AND plane='local'",
+      current.generation + 1, lineageId);
     db.exec("COMMIT");
     return { localRevision: current.generation + 1, token: currentSnapshot(db) };
   } catch (error) {

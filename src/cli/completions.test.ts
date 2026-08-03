@@ -46,6 +46,8 @@ test("no hidden or internal tokens leak into the script", () => {
   const script = zshCompletions();
   expect(script).not.toContain("__daemon-run");
   expect(script).not.toContain("__boot-resume");
+  expect(script).not.toContain("--no-sync[");
+  expect(script).not.toContain("--device[");
   // Scope the leak check to the TOP-LEVEL command list. A hidden top-level command
   // (e.g. the version-history `restore`) can legitimately share a token with a PUBLIC
   // subcommand leaf (`trash restore`), which appears as a nested `_describe` value —

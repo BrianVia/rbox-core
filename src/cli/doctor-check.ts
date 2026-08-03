@@ -13,12 +13,14 @@ import { style } from "./style.js";
 import type { Credentials, CredentialLoadResult } from "./credentials.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 
 /** Everything a doctor check may read. One shared, pre-resolved input keeps the
  * descriptors index-free: each names the fields it needs. */
 export interface DoctorCheckRunInput {
   root: string;
   cfg: WorkspaceConfig;
+  daemon: DaemonObservation;
   creds: Credentials | undefined;
   loaded: CredentialLoadResult;
 }

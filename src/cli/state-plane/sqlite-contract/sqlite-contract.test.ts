@@ -203,7 +203,7 @@ test("an invalid interior b-tree page is diagnosed and surfaces SQLITE_CORRUPT",
   }
 });
 
-test("finalized statements reject reuse and close defers for outstanding statements", () => {
+test("finalized statements reject reuse; close either defers or finalizes outstanding statements", () => {
   const finalizedDb = new Database(":memory:");
   const finalized = finalizedDb.prepare("SELECT 1 AS value");
   expect(finalized.get()).toEqual({ value: 1 });
@@ -211,10 +211,26 @@ test("finalized statements reject reuse and close defers for outstanding stateme
   expect(() => finalized.get()).toThrow();
   finalizedDb.close();
 
+  // Close-with-outstanding-statements DRIFTED across the Bun Zig->Rust rewrite:
+  // through canary 6c12afd8e close() deferred finalization and the statement
+  // remained usable; from canary 54bbd5dd9 close() finalizes it immediately
+  // (2026-08-02, CI). The state plane relies on NEITHER branch — statements.ts
+  // finalizes explicitly before any close — so this row pins only what both
+  // contracts share: close() returns undefined, the connection is unusable
+  // afterward, and a finalized statement rejects reuse. If a third behavior
+  // appears here, stop and re-read #615 before touching statements.ts.
   const deferredDb = new Database(":memory:");
   const outstanding = deferredDb.prepare("SELECT 2 AS value");
   expect(deferredDb.close()).toBeUndefined();
-  expect(outstanding.get()).toEqual({ value: 2 });
+  const survived = (() => {
+    try {
+      return outstanding.get();
+    } catch {
+      return "finalized-at-close";
+    }
+  })();
+  expect([JSON.stringify({ value: 2 }), JSON.stringify("finalized-at-close")])
+    .toContain(JSON.stringify(survived));
   expect(() => deferredDb.prepare("SELECT 3")).toThrow();
   outstanding.finalize();
   expect(() => outstanding.get()).toThrow();

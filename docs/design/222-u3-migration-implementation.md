@@ -1,6 +1,17 @@
 # 222 — U3 implementation design: the migration unit, the `Q` flip, and the whole-state adapter
 
-> Status: **r5**. Folds the codex review of r3 (NOT-ALIGNED, 3 CRITICAL + 2 HIGH)
+> Status: **r6**. Folds one falsified premise. **A read-only SQLite open is not
+> a zero-write operation** — on a WAL-mode database in a writable parent the
+> first read, a bare `PRAGMA` included, creates `-wal`/`-shm` that a read-only
+> close cannot remove. r5's §2.5.1 named that defect and then prescribed it.
+> r6 replaces it with the **ownership rule** (163 v13): files this code does not
+> own are never opened at all; files it owns may be opened and must then be
+> checkpointed and closed. §M-3's zero-write requirement is **re-scoped, not
+> deleted**, by whether the database is frozen — and §2.5.1's amendment plus
+> §M-3's re-scoping are **one unit; neither is correct alone**. §10 records the
+> superseding disposition.
+>
+> Prior status for the record: **r5**. Folds the codex review of r3 (NOT-ALIGNED, 3 CRITICAL + 2 HIGH)
 > and the independent adversarial validation of §2.6
 > (RATIFY-WITH-CORRECTIONS, 9 items). §10 records both dispositions.
 >
@@ -8,7 +19,8 @@
 > conjunction closes the hazard, and the v12 fold is accurate and correctly
 > scoped. Four doc-level corrections are folded in this revision (§10) — none
 > touches 163 v12's ratified row text: the intent is the sole source of ids on
-> resume; §2.5.1 evaluates through the read-only preflight, case 7 precedes case
+> resume; §2.5.1 evaluates through the read-only preflight **(false — superseded
+> in r6)**, case 7 precedes case
 > 5, and cases 6–7 raise `StateAuthorityCorruptError` rather than a new halt
 > code; the write fence collapses to one coordinator-owned call; and two 163
 > editorial qualifications around (not inside) the ratified rows.
@@ -119,19 +131,20 @@ migration modules, not twelve.
 | # | Module | The one protocol outcome it owns | Budget |
 |---|---|---|---:|
 | M-1 | `control-codec.ts` | The control record as a value: closed union, canonical bytes, pure predicates, the C1 trigger type | 300 |
-| M-2 | `control-publication.ts` | Every durable transition of the canonical control file | 280 |
+| M-2 | `control-publication.ts` | Every durable transition of the canonical control file | 280 (352 shipped) |
 | M-3 | `classifier.ts` | One admitted migration observation row, mutating nothing | 300 |
 | M-4 | `admission.ts` | May a migration begin or continue right now | 260 |
 | M-5 | `import-json.ts` | A **proven staging DB** derived from an admitted source | 340 |
 | M-6 | `finalize.ts` | The prepared DB becomes authority — the one flip | 280 |
 | M-7 | `retirement.ts` | C1: a superseded migration's artifacts are gone | 260 |
-| M-8 | `cleanup.ts` | Terminalization: cursor, runway, M7 | 360 |
+| M-8 | `cleanup.ts` + `cleanup-runway.ts` | Terminalization: cursor, runway, M7 (two files — see §M-8) | 360 (302 + 396 shipped) |
 | M-9 | `authority.ts` | Migration sequencing over typed receipts. No filesystem primitives, **no genesis** | 240 |
 
 M-3, M-5, M-8 sit in the 301–399 band; the review note is that each is one
 correlated machine 163 specifies as a unit.
 
-**Migration production budget: 2,620.** Genesis 240 (§2), coordinator 90 (§1.3),
+**Migration production budget: 2,620.** Genesis **393** (§2 — revised from the
+estimated 240 when wave 1C shipped; see §2.1), coordinator 90 (§1.3),
 adapters 600 (§1.2).
 
 ---
@@ -214,6 +227,83 @@ export function readCanonicalControl(root: string): MigrationControl | undefined
 Owns revision **arithmetic and validation** (safe integers, exact spacing, the
 monotone `r → r+2` gap as the only permitted one). Paths live in `paths.ts`.
 
+3C adds three members here rather than anywhere else, because this module is the
+sole writer of the canonical control: `readCanonicalControlExact` (the record
+plus the inode it occupies, which the promoted-halt retry's whole admission test
+needs), `retireCanonicalControl` (M7's terminal unlink, under the same CAS as
+every other transition), and an `export` on `releaseHaltResource` so its refusal
+path has the direct test 1A's review flagged as missing.
+
+##### What wave 1A pinned (record, so later waves do not re-decide it)
+
+- **`FIRST_CONTROL_REVISION = 1`.** Neither document named the first published
+  revision. With `expect.revision === "absent"` the publisher admits exactly
+  `1`; `0` reads as "no control" and is refused. 3C's ledger arithmetic is
+  relative to `b`, so this only fixes the M0 origin.
+- **`r → r+2` is gated on the promoted record's phase.** It is the direct-M7
+  success transition alone (163:2919). A halt promotion is `r → r+1` and
+  doctor's retry promotion is `r+1 → r+2`; both are ordinary steps. The gap is
+  admitted only when the prepared record's witness phase is `M7`.
+- **M-1 and M-2 are synchronous.** The signatures above carry no `Promise`
+  while every other module's do, and §1.3's `assertAuthorityWritable(root): void`
+  is synchronous and consumes `readCanonicalControl`. **Lane 1C's
+  `readGenesisIntent` must be synchronous for the same reason** — the same
+  fence calls it on the SQLite save boundary.
+- **Three duplicated members are not stored**, each being one value written
+  twice whose only reachable disagreement is corruption: the control's
+  top-level `phase` (the witness union is discriminated by phase), the halt
+  record's own `phase` (halts are phase-preserving), and M6's `qAuthorityId`
+  (the control already carries `authorityId`).
+- **One path policy: every artifact the record names stores its own path.**
+  163 prints paths inside the retirement vector, the M6 preparation ledger, and
+  the M7 terminal sibling, and the record is not a delete-authorizing input the
+  way the genesis intent is (§2.3.1) — cleanup identity-brackets before every
+  unlink. The M6 ledger therefore keeps `version`, both slots' `kind`, and both
+  slots' `path`; its outer discriminant is named `stage` so it does not collide
+  with the slots' own `kind`.
+
+  **Corrected by 3C: `promoted-halt`'s `preparedSuccess` stores no `bytes`.**
+  163 prints no schema for the consumed `promoted-halt` form — only for the
+  one-way `preparing` ledger — and says of it only that `preparedSuccess`
+  "omits the M7 SHA-256". 1A read that as *carries `dev`/`ino`/`bytes`*, which
+  makes the two prepared records mutually self-sizing: the halt record's
+  canonical length depends on the decimal width of the M7 length it stores, and
+  vice versa. 163's own five-row ordering then breaks before any fixpoint does
+  — the halt bytes must be final before M7 is derived from them — and the
+  fixpoint has no specified convergence. The member is also exactly the class of
+  stored duplicate this list already refuses three times: 163:3092 requires the
+  retry to recompute and byte-check the M7 record, so a stored length has no
+  reachable use except to disagree with the recomputation. Full statement in
+  163 § "V5 future-control preparation".
+- **M6's `cleanup.order` is named `items`**, so the M6 cleanup cursor and the
+  C1 retirement cursor are one `Cursor` type over one vector shape. They are
+  the same one-target machine (163:2761, :2899) over different vectors.
+- **The halt record's reason member is named `code`**, not 163:3339's `reason`.
+  A rename only, matching `MigrationHaltCode`; no halt record is durable yet,
+  so nothing on disk changes.
+- **A crash between rendering a revision sibling and renaming it is resumable
+  ONLY when the record recurs byte-for-byte — the non-deterministic case is an
+  open decision, not a solved one.** Every phase after M0 pins both the
+  migration id and the revision, so blanket-refusing the occupied path would
+  wedge the migration permanently. The publisher therefore adopts the sibling
+  when every byte is that exact record at that exact revision, re-fsyncs it and
+  its parent, and treats anything else as foreign.
+
+  That covers only records whose content is a pure function of the phase.
+  **It does not cover M2, M3, or any halt**, whose bytes carry freshly created
+  inodes, a wall-clock `completedAt`, or live failure detail — a crash in their
+  render→rename window strands a sibling whose bytes will never recur, and that
+  revision is then permanently unpublishable. The state is fail-closed and
+  data-safe (JSON stays authority, the halt stays in memory) and unreachable in
+  1A, where nothing is wired. Later waves must not "fix" this by letting the
+  publisher overwrite any unpublished temp in its own namespace: **the M6
+  runway legitimately owns prepared siblings at `b+5`/`b+6` while control sits
+  at `b+4`**, so a blanket replace would destroy a live ledger-owned artifact.
+  The intended remover is doctor's inert-temp quarantine (163's designated sole
+  remover), which is a later wave; **the wave that wires the first post-M0
+  publication owns closing this**, either by making those records deterministic
+  or by landing quarantine alongside.
+
 ---
 
 #### M-3 `classifier.ts`
@@ -252,8 +342,31 @@ foreign, or wrong-`authority_id` DB — is a hard `StateAuthorityCorruptError`
 `MigrationHaltCode`, never retryable. `Q` + a *matching complete* DB with M5
 control is not corruption; it is `m5-artifact-ahead-q`.
 
-Zero writes, enforced by import graph. One table-driven test per row, plus a
-byte-for-byte `.rbox` snapshot before/after every corruption row.
+Zero writes, enforced by import graph — an **import-graph ban on `bun:sqlite`
+in every refusal-path module** is the right mechanism and generalizes beyond
+this file (r6). One table-driven test per row, plus a byte-for-byte `.rbox`
+snapshot, **sidecars included**, before/after every corruption row.
+
+**The ban is re-scoped by frozen-versus-live, not deleted (r6).** §2.5.1's
+amendment and this re-scoping are **one unit; neither is correct alone.**
+
+- **Frozen window** — M4 rename-ahead, `m5-resume`, `m5-artifact-ahead-q`.
+  Writes are blocked by `blocksSqliteWrites`, so the physical
+  `{bytes, sha256}` match is exact and genuinely stronger than anything the
+  database says about itself. The ban stands as written: pure `fs`, no
+  `bun:sqlite`.
+- **Live window** — `m6-cleanup`, `m7`, `cleanup-deferred`, `terminal-sqlite`.
+  The store is **explicitly writable and in normal use**, so a physical
+  `{bytes, sha256}` predicate goes stale on the user's next sync and then throws
+  an unretryable `StateAuthorityCorruptError` on a healthy workspace. The
+  durable predicate 163 actually names — `store_meta.authority_id` plus the
+  `migration_completion` singleton — requires an open. That open is **legal**:
+  past the authority flip the active database is rbox's own store, rbox owns
+  the inode, and the ownership rule never forbade rbox reading its own DB.
+
+The ban therefore reads: no `bun:sqlite` on any refusal path or in the frozen
+window; in the live window, read the workspace's own store through the owning
+connection and nothing else.
 
 ---
 
@@ -325,7 +438,10 @@ export interface PublishedStagingClaim { readonly identity: ClaimedInode; readon
  * asserts, no-follow, that it is exactly the recorded `{dev, ino}` zero-byte
  * 0600 regular inode — the expected identity is a PARAMETER, not an assumption.
  * Both delegate to one private body; both remove the file and its sidecars on
- * any caught failure. `createStateStore` keeps the creating variant.
+ * any caught failure — legal precisely because the adopter OWNS the inode it
+ * was handed (r6). This is the model the ownership rule generalizes: only the
+ * owner may open, and only the owner may clean up after itself.
+ * `createStateStore` keeps the creating variant.
  * `genesis.ts` uses the same adopter (§2.2 step 3).
  *
  * Then: re-run 52×/RSS admission immediately before the sole guarded parse,
@@ -379,6 +495,82 @@ No nullable witness, no genesis caller. Both invariants stay under attack: no
 fsync, hash, or logging between the check and the rename; all five M0 conditions
 re-checked here.
 
+**Shipped as two files (4A), and the signatures amended.** The budget above was
+280 and the honest single file measured 475 nonblank against 163:3994's hard 400,
+so M-6 is `finalize.ts` (M5's rename onto `state.db`, the Q sibling's
+`absent → building → exact` ladder, and the primitives both halves share — 331
+nonblank) plus `authority-flip.ts` (the one rename that elects SQLite, its
+pre-rename evidence, the initial M6 cleanup vector, and everything after the
+rename — 339 nonblank). Both sit in 163's 301–399 band, and the review note is
+the one M-3/M-5/M-8 already carry: each is one correlated machine, and most of
+the growth is the reasoning that review demanded be written where the code lives
+(which side of 163:2988 each refusal falls on, why a length conjunct is or is not
+compared, what contains each stale witness member). Same disposition M-8 took for the same reason, and the
+dependency runs strictly one way: the flip imports the receipt guard, the marker
+bytes, and the sibling fence from `finalize.ts`, never the reverse. The seam is
+the rename — everything in `finalize.ts` runs under legacy-JSON authority. The
+module count is therefore eleven, not ten.
+
+Two signature amendments, both ratified in review:
+
+- `flipAuthority(root, receipt, locks)` — the `source: SourceIdentity` parameter
+  is dropped. `SourceIdentity` does not exist in the tree, and 3A already made
+  this amendment for `preserveSource`/`importOwnedStaging`: the source comes from
+  `control.source`, because a second parameter could only ever disagree with the
+  record the CAS is keyed on.
+- It returns `{ kind: "flipped"; control }`, not a witness. 163:2988 forbids
+  publishing a lower revision once the rename begins, and the only code that can
+  honour that is code owning both the rename and the publication — a witness
+  return implies the driver publishes M6 afterwards, which is exactly the gap a
+  driver could interpose in. The flip therefore also owns the `.rbox` parent
+  fsync and the `M5 + exact Q` resume branch.
+
+**The M5 witness records `stagingMain: "absent"`** (163:2748), published by M5
+itself through the layered witness. Keeping M3's `{state: "present"}` is not
+merely stale: `retirement.ts` reads that member, finds the staging name empty at a
+phase that is not M4, and refuses — which makes C1 retirement from M5 impossible.
+
+**The rename's own failure is typed.** 163:2988's rule is stated for the
+aftermath of a rename, not for the syscall, so 4A decides it explicitly:
+`durability-indeterminate` with `wrote: true`. `rename(2)` is atomic, so the
+failure left one of the two admitted images and the caller cannot know which —
+`wrote` is genuinely unknowable at that instant and a zero-write row is an
+assertion that must not be guessed. The code cannot over-fence, because
+`blocksSqliteWrites` is already TRUE for every phase below M6. This does not
+contradict `promoteSuccess`'s refusal to mislabel a CAS error, where the fence
+would otherwise be lifted.
+
+**An empty M6 cleanup vector is refused, not published**, because `stepCleanup`
+has no complete-prefix transition into M7 and the runway has no final item, so an
+empty cursor wedges the migration one phase past the point of no return. A
+shorter-but-nonempty vector is admitted. **Constraint on whichever wave introduces
+halt clearing:** `haltRunway` returns `[]` only at M6/M7, so at M5 a halt may
+still consume both resources, and clearing that halt without recreating them
+would reach the flip with an empty vector — a post-rename `reserved-path` refusal
+that no row can clear. That wave must either exclude `emergency` from
+`haltRunway` below M6, or let a complete-prefix empty cursor reach M7. Not
+reachable today only because nothing clears a halt yet.
+
+**Which M5 witness members go stale, and what contains each** — carried here
+because the containment is a property of who reads what on which row, no row
+dispatcher exists yet, and nothing asserts it. **5A must not break these.**
+
+| Member | Stale from | Contained by |
+|---|---|---|
+| `staging` (the M4 proof) | M5's rename | Every consumer at phase ≥ M5 reads `active` instead: `retirement.ts` selects on the phase to do exactly that, and `classifier.ts` compares `witness.active` on both M5 rows |
+| `completion.sourceJsonSha256`, `source` | the flip | Their only comparisons — `bracketSource` and the flip's pre-rename body re-read — run under legacy-JSON authority and are unreachable from any row where `Q` is live. The flip's resume branch is the boundary and deliberately skips both |
+| `active` | **never** | `blocksSqliteWrites` is TRUE for every phase below M6, so the frozen window spans the rename and ends only when M6 publishes. This is why the flip may still compare it after `Q` is live |
+
+**Known asymmetry, for a 163 answer.** The flip's resume branch does not
+revalidate the two legacy-JSON backups, while the pre-rename path treats a
+missing one as a hard refusal. 163's `M5 + exact Q` row admits exactly one
+action — complete/retry the `.rbox` fsync and publish M6 — and lists no backup
+precondition; refusing would wedge a fenced M5 forever, because the document the
+backups copy no longer exists to re-derive them from. The cost is that a backup
+deleted inside the rename → publish window is never noticed, and it cannot be
+recorded either: the control schema is closed and strict, so a "backups
+unchecked" note needs a codec member 4A does not own.
+
 ---
 
 #### M-7 `retirement.ts`
@@ -422,6 +614,55 @@ ledger stage and inode; a caught ENOSPC there publishes no alternate control
 (the named scoped f6 exception). No genesis branch — genesis has no cleanup
 vector because it claims no reserve and no emergency candidate.
 
+**Shipped as two files (3C).** The budget above was 360 and the honest
+implementation is 636 lines, so M-8 is `cleanup.ts` (the cursor, the
+identity-bracketed removal of a vector item, M7, and the primitives both halves
+share — 302 lines) plus `cleanup-runway.ts` (the `b..b+4` preparation ledger,
+the two prepared records, slot I/O, the final item, and `retryPromotedHalt` —
+396 total, 376 nonblank). 163's ceiling is stated once as nonblank and once
+without, so both readings are satisfied rather than argued. It is not a budget
+to be renegotiated, and
+the correlation the one-file review note was protecting is preserved by the
+dependency running strictly one way: the runway imports from the cursor, never
+the reverse. The module count is therefore ten, not nine.
+
+**`completeFinalItem` and the 128 reserve header bytes.** §M-8's earlier
+sentence attached the role-7 header re-match to `completeFinalItem`, but role 7
+is the *nonfinal* item in every vector where the emergency candidate exists, so
+the rule belongs to the shared item bracket rather than to one step. 3C puts it
+there: any vector item of role `reserve` is unlinked only after its first 128
+bytes are re-read through the same descriptor that proves the inode and hashed
+against the digest the vector recorded. **That digest is the contract M-6 (wave
+4A) must honour when it builds the vector**: an item of role `reserve` whose
+`sha256` is `null` is refused, so the requirement cannot be silently skipped.
+
+**Two hazards for 4A's vector builder, stated because nothing in the schema
+catches either.**
+
+- For role `reserve`, `ArtifactItem.sha256` is the SHA-256 of exactly the first
+  `RESERVE_HEADER_BYTES` (128) bytes — the same value M1 recorded on adoption.
+  It is not a whole-file digest and it is not `haltResources.reserve.sha256`.
+  Both names describe the same file, nothing cross-checks them, and 4A builds
+  the vector from the resource record, so a wire-up error would satisfy the
+  codec and every 3C test. 163:4429 states these must not drift; this is the
+  drift it means. (`releaseHaltResource` verifies
+  `haltResources.reserve.sha256` as a whole-file digest, which is the shape
+  every other `{bytes, sha256}` witness in the codec carries.)
+- `ArtifactItem.path` is schema-typed as a bare `"string"` with no confinement.
+  **Now fenced rather than documented.** 3B landed `notDerived` over the C1
+  vector while this lane was in review, so M-8 adopted the same rule at the door
+  of every M6 mutator: each item's `path` must equal the path its role derives
+  to from `migrationPaths`, and its `parent` must be that path's own directory
+  or the post-unlink fsync is aimed elsewhere. A row reading
+  `/tmp/outside/precious.txt` is refused, not removed. 4A's builder should still
+  derive every `path` from `migrationPaths` — the fence now makes anything else
+  fail closed instead of silently working.
+
+  The two vectors derive their own roles separately because they admit
+  different ones (C1 carries the staging artifacts and the Q sibling; M6 carries
+  two). **5A consolidation candidate:** one role→path derivation consumed by
+  both, rather than the two that exist now.
+
 ---
 
 #### M-9 `authority.ts` — migration only
@@ -460,6 +701,157 @@ export async function abortMigration(root, locks): Promise<MigrationOutcome>;
 
 Structural test: no `node:fs`, `node:crypto`, or `bun:sqlite` in this module's
 import graph.
+
+**Shipped as four files (5A), and six amendments.** M-9's budget was 240; the
+honest driver measured 465 nonblank against 163:3994's hard 400, and two of the
+phases it must sequence did not exist. What shipped:
+
+| File | Nonblank | Owns |
+|---|---:|---|
+| `authority.ts` | 342 | `runMigration`, `ROW_DISPATCH`, and every publication a phase body does not make itself |
+| `halt-recovery.ts` | 158 | the four retry buckets and the pre-`Q` abort — the only code that clears a halt |
+| `begin.ts` | 255 | **M0 and M1**, which no wave built |
+| `control-sibling.ts` | 235 | split out of M-2 to carry the strand repair (below) |
+
+`authority.ts` sits in the 301–399 band; the review note is the one M-3/M-5/M-6/M-8
+already carry — the M0→M7 sequence is one correlated machine 163 specifies as a
+unit. The dependency runs strictly one way in both splits: recovery imports the
+driver, and the publisher imports the sibling primitives.
+
+1. **M0 and M1 had no owner.** §8's wave table gives 3A "M-5 (M2 / M3 / M4)" and
+   2B "admission, which publishes nothing", so nothing minted a migration id,
+   published a first control, claimed the reserve, or created the emergency
+   candidate: `publishMigrationControl` at `FIRST_CONTROL_REVISION` and
+   `migrationPaths.emergency` had **no production caller at all**. 5A builds both
+   as `begin.ts`, because a driver with no M0 is not a driver. The emergency
+   candidate's size is unstated in 163 and is derived rather than picked:
+   `CONTROL_MAX_BYTES`, zero-filled, which is exactly the one record it exists to
+   let a halt publish.
+
+2. **§M-9's "no `node:fs`/`node:crypto`/`bun:sqlite` in this module's import
+   graph" is unimplementable read transitively** — the driver's whole job is
+   sequencing bodies that open databases and rename files. It is implemented as
+   §7.9 states it: `authority.ts` (and `halt-recovery.ts`) import none of the
+   three *themselves*, which is what actually protects the property. Same class of
+   finding as 163 v13's M4.
+
+3. **`{kind: "retired"}` carries the durable reason, not a `C1Trigger`.** A
+   retirement resumed from a record has no trigger; the record keeps the one
+   durable `reason` plus `fromPhase`, and synthesizing a disposition from
+   `triggeringSource` would invent the fact §M-7 deliberately does not store.
+
+4. **`retryHaltedMigration`/`abortMigration` take an `EntryProof`, not bare
+   `locks`.** Both delegate to `runMigration` when the row is drivable again, and
+   admission's exclusivity condition reads the entry point.
+
+5. **2D's generics collapsed** onto the real `MigrationOutcome`.
+   `MigrationDriver` stays an *injected* function rather than a direct call:
+   binding the progress sink is the entry site's job, and injection is what lets
+   the coordinator's own tests drive the C8 re-inspect without a whole migration.
+   The stub in `authority-bootstrap.test.ts` returned a bare string, invisible to
+   both gates (`tsconfig` excludes tests, Bun erases annotations) — now typed.
+
+6. **§M-6's halt-clearing constraint needs neither escape.** Bucket 1 recreates
+   whatever the halt spent and republishes both dispositions `available` in the
+   *same* publication that clears, so a cleared M5 halt cannot reach the flip with
+   an empty cleanup vector. `emergency` stays in `haltRunway` and no
+   complete-prefix empty cursor reaches M7.
+
+**The halt-record wedge — closed, and by a third path.** 1A's pin assigned the
+render→rename wedge to the wave that first wires a post-M0 publication of a
+non-deterministic record; 3A closed M2/M3 by determinism and left halts here.
+Halts cannot be made deterministic — §6.3 requires them to print what was
+*measured*, and `memory-admission`/`disk-preflight` measure live RSS and `statfs`
+— and quarantine-later is not sufficient, because the wedge is worse than
+"un-haltable": a strand at `r+1` blocks the **successful** publication at `r+1`
+too, so a workspace that halts on low disk and then has disk freed can never
+migrate. `control-sibling.ts` therefore repairs its own strand, bounded by the
+*actual* ownership predicate rather than a phase proxy: the canonical record is
+asked which revision-scoped paths it still owns (the M6 runway's two prepared
+slots, M7's terminal sibling — 3C's negative control), those are refused, and at
+every other path in this migration's own id-and-revision-scoped namespace exactly
+two occupant shapes are admitted — a complete record for this exact id and
+revision, or a nonempty strict byte prefix of the record about to be written,
+which is the only image `writeSync` can tear. The repair is in place on the
+recorded inode, the precedent genesis case 3 and 3A's M2 rebuild both set. A
+crafted occupant is refused exactly as before.
+
+**`claimSibling`/`claimSlot`: NOT consolidated.** 4A recorded the mechanism as
+identical line-by-line with the refusal channel as the only difference. The
+mechanism is identical — `O_CREAT|O_EXCL` → EEXIST → no-follow reopen → validate
+the sole create-ahead shape → fsync — but the difference is **two** axes, not one:
+`claimSibling` converts a non-`EEXIST` open failure into a typed `reserved-path`
+halt because it runs where every refusal must carry a halt code, while `claimSlot`
+rethrows so `stepFutureControlPreparation`'s out-of-space catch can see it. A
+shared body parameterized over both the refusal channel and the propagation
+policy for non-`EEXIST` errors is a worse abstraction than two honest copies of
+twenty lines of `openSync` boilerplate, and both copies are separately
+mutation-pinned by their own lanes. The 5A consolidation note is withdrawn rather
+than deferred.
+
+**§7.9's prose-only items, now executable** in `migration/authority.test.ts`: the
+stale-witness routing gate (below), the CODEMAP one-line-per-module rule — which
+no wave-1-to-4 lane could satisfy because nothing enforced it — and the pinned
+count of `establishStateAuthority` entry call sites. That count is pinned at what
+exists (zero) rather than asserted at two: §6.3 already states both commands land
+with §3.2 and 5B, and the gate's purpose is identical either way — an unenumerated
+third caller fails it. `EXPECTED_SITES` is the one line 5B edits. The
+`HeldStatePlaneLocks` cast gate was already made executable by 2B and is pinned
+from the inventory's home so its deletion is visible.
+
+**The stale-witness containment, now asserted.** §M-6 recorded it as "no consumer
+reaches this from that row", with no row dispatcher in existence. The driver is
+that dispatcher, so `ROW_DISPATCH` is *data* and three gates cross it against what
+each body reads: no body dispatched from a row where `Q` is live calls
+`bracketSource`; the one unguarded reader of the stale M4 `staging` proof
+(`publishPreparedDatabase`) appears under exactly one row, and it is `m4-resume`;
+and `m5-resume`/`m5-artifact-ahead-q` stay disjoint on everything but
+`flipAuthority`. For the flip the containment is a *branch* rather than a row —
+it does read both flip-stale members — so its own gate asserts source order: the
+resume branch's return precedes every stale read, and the resume branch itself
+reads only `active`, the member §M-6 marks never stale.
+
+**Round-3 fold — behavioral coverage and four blockers.** The first 5A submission's
+tests were entirely static (the sandbox's `bun test <path>` argv is heuristically
+refused; a pinned wrapper script runs it, which the first pass missed). The fold
+adds `authority-behavior.test.ts` — a real migratable workspace under a real
+`withStatePlaneLocks` bundle that drives M0→M3 organically (M4 needs an importable
+corpus, which is 3A/5C fixture territory), plus synthetic-control units — and every
+new guard is mutation-verified (15 named production mutants, all killed; baseline
+green). Four blockers the review found, all closed:
+
+- **B1** — `createEmergencyCandidate` had no strand repair, so a torn own write
+  (partial/zero-length, at this migration's own id-scoped path) wedged M1 forever
+  under exactly the `ENOSPC` this file exists to survive. It now repairs its own
+  torn write in place on the recorded inode (`rewriteEmergencyStrand`), the
+  `control-sibling.ts` shape, admitting only a strictly-shorter all-zero image.
+- **B2** — `ownedRevisionPaths`' fail-closed branch returned
+  `[migrationPaths.control(root)]`, which the caller compares against a
+  `controlRevision()` path, so it never matched: the degraded/unreadable-canonical
+  state became the *permissive* one. It now lets `readCanonicalControl`'s throw
+  propagate, so a corrupt canonical refuses the render rather than licensing a
+  sibling overwrite.
+- **B3** — `abortMigration` could not abort a *halted* pre-`Q` migration (163:2614's
+  "essentially every case"), because `armRetirement` refused on `control.halt`.
+  `armRetirement` gains an operator-only `clearHalt` that publishes `halt: null` in
+  the same revision that arms the retirement (bucket-1 discipline; no runway
+  restoration, since `haltRunway` is `[]` under a retirement and consumed resources
+  stay `consumed-for-halt`, which `retirementVector` skips). `abortMigration` passes
+  it.
+- **B4** — the post-flip data-loss fence (`SQLITE_LIVE_ROWS.includes(row)`) had zero
+  coverage; now behavioral (abort refuses/does-not-refuse by row) plus an
+  exact-members assertion.
+
+Ride-alongs taken: the flip stale-read gate is window-scoped (kills the aliasing
+evasion, rev1 M24); `dispatch` gains a `default: assertNever(observation)` so a new
+row is a compile error, not a spin; `runMigration` non-convergence returns a typed
+`corruptionHalt` rather than a bare `throw`; `abortMigration` on a pristine
+workspace returns a distinct `nothing-to-abort` (never `already-migrated`, so 5B
+cannot tell a pristine workspace it was migrated); the strand prefix branch is bound
+to the encoded id+revision, not merely "control-record-shaped"; `rewriteStrand`
+carries `O_NONBLOCK`. Noted for doctor, not blocking: a crashed M0 leaks one inert
+~1 KiB revision temp per crash (re-entry mints a fresh id), for the inert-temp
+quarantine sweep.
 
 ---
 
@@ -586,7 +978,28 @@ purpose is safely retiring a source. Threading a no-source case through it
 produced, in r2, a `null` witness, an empty cleanup vector that does not fit the
 control schema, and phase rows with nothing to observe.
 
-Genesis is `src/cli/state-plane/genesis.ts`, ~240 lines, outside `migration/`.
+Genesis is `src/cli/state-plane/genesis.ts`, **393 non-blank lines / 20,008
+bytes** as shipped in wave 1C, outside `migration/`.
+
+**§7.9 review note (the 301–399 band requires one).** The pre-implementation
+estimate was ~240. The delivered file is 65% larger, and the difference is not
+drift — it is four things this section had not yet costed, each of which was
+argued for and kept:
+
+- the eight-row §2.5.1 conjunction with its read-only sidecar undo (§2.5.1),
+  which the estimate predated;
+- seven distinct crash images, each with its own legal action, rather than the
+  single resume path the estimate assumed;
+- the strict closed-record decode, now delegated to `closed-record.ts` — this
+  one made the file *smaller*;
+- the fenced-evidence construction and comparison (§2.3.2).
+
+It stays one file: 163 v12 and §2.3 name `genesis.ts` sole owner of the intent
+and of every path derived from `authorityId`, and the seven crash images are one
+decision table that splitting would scatter. It is inside §7.9's 400-line /
+25 KiB ceiling with 7 lines of headroom, so **the next change to this file
+should remove something or split deliberately** — it must not be absorbed
+silently.
 
 ### 2.2 What r3 got wrong, and the repair
 
@@ -722,19 +1135,24 @@ export type GenesisRefusal = "legacy-present" | "artifact-present" | "evidence-m
 /** Does this workspace belong to genesis? Read-only. */
 export async function inspect(root: string, locks: HeldStatePlaneLocks): Promise<GenesisInspection>;
 
+/** The two ids the intent publishes before the database exists. */
+export interface GenesisIds { authorityId: string; lineageId: string }
+
 /** Establish SQLite authority on a workspace that has none.
  *
- * FRESH START ONLY. `mintLineage` is called at most once, and only when there
+ * FRESH START ONLY. `mintIds` is called at most once, and only when there
  * is no intent to resume (§2.4 step 3, and §2.5.2 case 4's rebuild). */
 export async function establish(
-  root: string, mintLineage: () => GenesisLineage, locks: HeldStatePlaneLocks,
+  root: string, mintIds: () => GenesisIds, locks: HeldStatePlaneLocks,
 ): Promise<GenesisOutcome>;
 
 /** Resume an existing attempt. The intent is the SOLE source of `authorityId`
  * and `lineageId`; no caller-supplied lineage reaches this path. */
 async function resume(root: string, intent: GenesisIntent, locks: HeldStatePlaneLocks): Promise<GenesisOutcome>;
 
-/** Read-only; consumed by A-2's write fence. */
+/** Read-only; consumed by A-2's write fence. SYNCHRONOUS, like M-2's
+ * `readCanonicalControl`: §1.3's `assertAuthorityWritable(root): void` calls
+ * both on the SQLite save boundary and is itself synchronous. */
 export function readGenesisIntent(root: string): GenesisIntent | undefined;
 ```
 
@@ -774,10 +1192,22 @@ housekeeping: §2.5.1 checks the database's `store_meta` against the *intent's*
 ids, so any resume path that rebuilds from step 4 with caller-supplied ids
 installs values that can never satisfy the conjunction — and a **healthy**
 workspace live-locks into a permanent halt on every retry. `establish` therefore
-takes a `mintLineage` thunk it calls at most once, `resume` takes the intent and
-no lineage at all, and step 4's `install` closes over `lineageFrom(intent)`.
+takes a `mintIds` thunk it calls at most once, `resume` takes the intent and
+no ids at all, and step 4's `install` reads its stream and both ids straight off
+the intent.
+
+**Signature amendment (implementation, wave 1C).** The thunk is
+`mintIds: () => GenesisIds`, not `mintLineage: () => GenesisLineage`.
+`GenesisLineage` is `schema/application.ts`'s install argument and additionally
+carries `stream` and `createdBy` — values genesis derives itself, from the
+fenced evidence and a module constant. Letting a caller supply them would widen
+exactly the surface this paragraph closes, so the thunk returns only the two ids
+the intent publishes. This is stronger than the signature first drafted here;
+the code is normative and this text now matches it.
+
 An inventory test asserts `installGenesisLineage`'s only genesis caller derives
-its argument from an intent.
+its argument from an intent (`inventory.test.ts`), that the thunk is called from
+exactly one place, and that `resume` never reaches it.
 
 Step 6 before step 7 is deliberate: r3 checked absence and *then* did four
 filesystem operations before renaming, leaving exactly the window the check
@@ -806,19 +1236,118 @@ turning a healthy migrated workspace into a permanent
 So the predicate is a **conjunction**. A database is this intent's genesis
 database only if **all** of the following hold:
 
-**Evaluated through the read-only preflight, never a read-write open.** The
-merged `openStateStore(file, { readonly: true })` opens a preflight handle
-`readonly: true` first, precisely "so a foreign SQLite file must not be
-converted to WAL or otherwise mutated merely because rbox refuses it"
-(`store/open.ts:249-262`). §2.5.1 uses that path. Evaluating the conjunction
-through a read-write open would let WAL replay mutate the candidate — a
-"zero-write halt" rule that performs a write, which is the defect this whole
-section exists to prevent.
+**Evaluated only on a database this code owns; never opened otherwise (r6).**
+r5 required this conjunction to be evaluated "through the read-only preflight,
+never a read-write open", reasoning that a read-write open would let WAL replay
+mutate the candidate. **That premise is falsified.** A read-only open of a
+WAL-mode database in a writable parent creates `-wal`/`-shm` on its first read —
+a bare `PRAGMA user_version` is enough — and a read-only close cannot remove
+them, while a read-write close can. Read-only does not avoid the write; it
+abandons the debris — and with a `0555` parent the same open instead throws
+`attempt to write a readonly database` on its first read, so the outcome is
+environment-dependent and a read-only parent is not a fix. The effect is
+**WAL-only** (a `journal_mode=delete` database is inert), but the rule stays
+ownership-scoped, because journal mode is a property of the candidate — the
+thing a refusal path does not get to inspect first.
+`openStateStore(file, { readonly: true })`'s stated purpose
+(`store/open.ts:249-262`) does not survive contact with WAL mode, and
+`immutable=1` is not the fix either: it creates no sidecars but silently ignores
+uncheckpointed WAL content, so on a healthy candidate whose `store_meta` and
+`migration_completion` rows are still in an uncheckpointed WAL it returns a
+confidently wrong verdict.
+
+The governing rule is **163 v13's ownership rule**, and it maps onto this
+section's own refusal/work boundary:
+
+- **Refusal path — the candidate is not ours.** Cases 6 and 7 refuse from
+  file-level facts alone (`{dev,ino}` identity, `state.json` shape, live fenced
+  evidence). No SQLite open of any kind occurs on any path that ends in a
+  refusal.
+- **Work path — the database *is* ours.** Cases 2 and 3 reach the conjunction
+  only after the intent's recorded `{dev,ino}` has already matched, which is
+  what makes the file this intent's own staged inode. Only then is it opened,
+  **read-write, as its owner**, and the case's own sequence
+  (recover/checkpoint/validate/close/require `S0`/fsync) is what restores the
+  at-rest signature. Opening without checkpointing and closing is the defect,
+  not opening writable.
+
+**The premise above is false, and two independent waves measured it.** A
+read-only connection to a WAL database creates `-wal` and `-shm` at its **first
+read**, and — unlike a read-write connection, which checkpoints and unlinks them
+on close — it **cannot remove them again**. The read-only preflight closes the
+WAL-replay hazard but **not** the sidecar hazard. So a halt against a real user
+database left two sidecars beside it, and 163:1136-1138 then classifies that
+file set as a corruption signature rbox is forbidden to clean up. Choosing
+read-only does not deliver the guarantee this section claims; it only changes
+which file gets written. **Wave 2A reached the identical conclusion from M-3 and
+wave 1C from §2.5.2 — treat "evaluate through the read-only preflight" as
+*insufficient on its own* wherever this design says it, not just here.**
+`immutable=1` is not the escape: beyond suppressing WAL replay, `bun:sqlite`
+does not enable URI filenames, so the open fails outright (measured).
+
+**The remedy is to not open, wherever an independent fact decides.** 2A
+eliminated its opens entirely — the classifier matches a candidate against the
+control's own `witness.active` physical `{bytes, sha256}`, which is *stronger*
+than reading `store_meta.authority_id` because it does not trust the candidate's
+self-description, and defers the no-control case to A-2 at selection.
+
+**Genesis cannot borrow that discriminator, and this is structural, not an
+oversight.** Genesis runs precisely when there is no control record, so there is
+no independent witness to match against; and §2.3.3 deliberately excluded a
+staging-content hash from the intent ("the DB is not final when the intent is
+published, so the hash would be of nothing"). The intent's physical facts are
+`staging{dev,ino}` and the fenced evidence — nothing that describes *contents*.
+
+So the conjunction is ordered cheapest-first — evidence, then the recorded
+`{dev, ino}` — and the halt images were measured one by one:
+
+| Image | Opens? | Why |
+|---|---|---|
+| 7, bound evidence differs | **no open** | `resume` halts before the predicate |
+| 6, foreign inode at either path | **no open** | the identity row decides |
+| 6, **recycled** inode at the active path (C2) | **opens** | only `store_meta` discriminates |
+| 5, foreign active DB under an `L` | **opens** | same image, reached from the refusal path |
+| 1, 2, 3 | opens, and **accepts** | success paths; `sealAtRest`/case 3's truncate already leave S0 |
+
+Every zero-write halt is therefore decided with **no open at all except the
+recycled-inode image C2 exists for** — and for that one image no file-level fact
+can discriminate, because `store_meta.authority_id` lives inside the b-tree. For
+it alone the open happens and then **undoes exactly the sidecars it created**,
+never a pre-existing one, which would discard unreplayed frames. Measured: such
+a `-wal` is 0 bytes and the main database is byte-identical afterwards.
+
+**The undo stays in `genesis.ts` and is not a property of `openStateStore` —
+but state the reason accurately.** An earlier draft of this section claimed that
+removing a `-shm` under a live sibling reader splits the wal-index across two
+inodes. **That does not reproduce** (Linux, bun 1.4 / SQLite): with a sibling
+reader live, removing `-shm`, or `-wal`+`-shm`, with an empty or a frame-holding
+WAL, left the sibling reading correctly in every combination tried, and a
+subsequent commit was still visible to both readers. A proposed
+`SQLITE_IOERR_SHORT_READ` failure mode did not reproduce either.
+
+So the placement is a **precaution resting on an invariant, not on a
+demonstrated corruption**: `openStateStore` supports several concurrent
+read-only handles per file — `closeOwnedStateStoreReadersForReset` exists
+precisely to close them all — so an unlink there would act on shared state whose
+other users that layer does not account for. Genesis runs under §3.1's
+exclusivity window, where there is exactly one opener, so it needs no such
+reasoning. Do not promote this undo to the shared layer on the strength of the
+genesis case; that would require its own analysis of concurrent readers.
+
+**Accepted residual: the guarantee covers a completed halt, not a crash inside
+one.** The undo runs in a `finally`. A SIGKILL or power cut between the
+read-only open and that `finally` leaves exactly the `-wal`/`-shm` signature
+163:1136-1138 forbids, beside a real user database. Nothing in this design
+closes that window — the sidecars are created by SQLite before any rbox code
+regains control. It is narrow (one open, no user-visible work between) and it
+degrades to the same state the unfixed code produced on *every* halt rather than
+on a crash inside one, but it is not zero. A reader of this section must not
+infer an absolute guarantee.
 
 | Check | Value |
 |---|---|
 | identity | the file's no-follow `{dev, ino}` equals `intent.staging` |
-| opens cleanly | `validateOpen` succeeds **through the read-only preflight** |
+| opens cleanly | `validateOpen` succeeds **on the owning read-write connection**, reached only after the identity row above matched (r6) |
 | authority | `store_meta.authority_id === intent.authorityId` |
 | lineage | `store_meta.active_lineage_id === intent.lineageId` |
 | origin | a `migration_completion` singleton with `origin_kind = 'genesis'` |
@@ -827,7 +1356,11 @@ section exists to prevent.
 | evidence | `intent.evidence` equals the live fenced evidence |
 
 Any failure raises **`StateAuthorityCorruptError`**: nothing is adopted, nothing
-is deleted, no `Q` is published, and nothing is retryable.
+is deleted, no `Q` is published, and nothing is retryable. Cases 6 and 7 are
+**zero writes only because the cheapest-first ordering above holds** (r6): the
+identity and evidence checks are pure `fs`, so every refusal is decided before
+any open. If a later lane reorders the conjunction so an open precedes them, the
+zero-write claim becomes false.
 
 **Two members are deliberately not load-bearing, named here so nobody later
 mistakes them for safety.** `entry_count = repo_count = 0` is *tautological* —
@@ -870,7 +1403,7 @@ anything is mutated, and are not halts.
 |---|---|---|
 | 1 | `Q` matching `authorityId` + active path satisfies §2.5.1 | **Terminal.** Retry the (idempotent) `.rbox` fsync, remove the sibling if present, retire the intent. **Writes stay blocked until the intent is retired** (A-2 fence) |
 | 2 | `state.json` absent + active path satisfies §2.5.1 | Recover/checkpoint, fully validate, close, require `S0`, fsync DB and parent — **all of it**, then steps 6 and 7 |
-| 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it. If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
+| 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it — legally, because the recorded inode matched, so this is **our** staged file and this is 1C's sole remaining open (r6). If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
 | 4 | `state.json` absent + the recorded inode is at neither path, both absent | Nothing durable happened after the intent. Rebuild from step 2 under a **fresh** `authorityId`; the new intent is published before the old one is unlinked |
 | 5 | `state.json` is `L` | **Refuse `legacy-present`.** JSON is authority. Remove only our own confirmed artifacts, retire the intent — and the coordinator then re-inspects once and dispatches to migration in the same pass (§1.3, C8) |
 | 6 | A foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent, or any §2.5.1 check failing | **`StateAuthorityCorruptError`**, zero writes. Never adopt, never delete |
@@ -1042,13 +1575,30 @@ The repository fence is **callback-scoped**, so the bundle is a witness of what
 is held, not a set of handles:
 
 ```ts
+declare const heldStatePlaneLocks: unique symbol;   // not exported: the brand
+
 export interface HeldStatePlaneLocks {
-  readonly mutex: WorkspaceSyncMutex;      // healthy, live-owned
+  readonly mutex: WorkspaceSyncMutex;      // non-degraded, acquired for this root
   readonly stateLock: OwnedLock;           // held for this exact root
   readonly underRepositoryFence: true;
+  readonly [heldStatePlaneLocks]: true;    // mintable only in `locks.ts` (§7.9)
 }
-export async function withStatePlaneLocks<T>(root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>): Promise<T>;
+
+/** Degradation is a typed outcome, not an exception: 163's `degraded-fence` is
+ * a refusal with plain-English copy, and it must be decided BEFORE the standing
+ * reset recovery below, which copies, creates, and renames. */
+export type StatePlaneLockOutcome<T> =
+  | { readonly held: true;  readonly value: T }
+  | { readonly held: false; readonly refusal: { code: "degraded-fence"; detail: string } };
+
+export async function withStatePlaneLocks<T>(
+  root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>,
+): Promise<StatePlaneLockOutcome<T>>;
 ```
+
+Live mutex ownership is verified where the answer is consumed — admission's
+exclusivity-window condition, re-called immediately before the M6 rename —
+rather than at the moment the handle is made, where it is a tautology.
 
 Order inside it, adopted verbatim from the N1 ruling:
 
@@ -1098,6 +1648,34 @@ try {
 **Entry B — foreground `rbox migrate`.** Refuses inside a daemon process, same
 bundle, same coordinator, progress rendering, `--json` twin the rig drives.
 
+**LANDED in wave 5B, with three amendments the implementation forced.**
+
+1. **Entry A lives in its own module** (`upgrade-state-window.ts`) rather than
+   inside `upgrade-cmd.ts`, which is already past the module-size law. The
+   §7.9 gate names it as one of the exactly-two, and it contracts *never to
+   throw* — the `finally` restart is then the second of two independent
+   guarantees rather than the only one.
+2. **A conversion that did not happen never fails `rbox upgrade`.** §3.2's
+   pseudocode says `recordWorkspaceOutcome(error)`; that is a line to print, not
+   an exit code. `UpgradeDaemonRestartError` keeps meaning exactly what it meant
+   — a stop or a restart failed. The window is also SILENT on every refusal: a
+   refusal published nothing and `.rbox` is byte-identical, and an upgrade that
+   printed a paragraph per not-yet-eligible workspace would bury the restart
+   lines that are the command's answer.
+3. **The post-`Q` inventory debt is CLOSED, here, not deferred.** The note below
+   used to say the SQLite-backed inventory was future work. It was not
+   separable: `inspectInventory` raised `StateFormatTooNewError` on an authority
+   marker, so **no lock bundle was obtainable on a migrated workspace at all** —
+   `rbox migrate` could not report success on its own work, and the two post-`Q`
+   halts (`durability-indeterminate`, `cleanup-deferred`) were unreachable by
+   the `--retry-state-migration` that exists for them. The fix is one line of
+   derivation rather than a second inventory: the read goes through the
+   **selecting whole-state seam** (`loadRawState`), which answers both formats
+   with one signature, so the fence covers the same repositories either way.
+   This is the ordinary post-`Q` read every other caller already performs; it is
+   not the byte-identical-refusal path, where opening the authority would itself
+   be the violation.
+
 ### 3.3 Proving the window
 
 M0 admits only when both hold: the caller presents an `EntryProof` whose mutex is
@@ -1143,7 +1721,7 @@ pre-published.
 
 | Kind | Publishes | Suspends | Cleared by | Members |
 |---|---|---|---|---|
-| **Refusal** | Nothing; `.rbox` byte-identical | No | Nothing | `degraded-fence`, `quarantine-pending`, `barrier-witness-missing`, `migration-not-exclusive`, `reserve-foreign`; genesis `legacy-present`, `artifact-present`, `evidence-missing` |
+| **Refusal** | Nothing; `.rbox` byte-identical — **the strongest promise in this document, and false for any refusal that opened a DB. 5C must actually test it, sidecars included (r6)** | No | Nothing | `degraded-fence`, `quarantine-pending`, `barrier-witness-missing`, `migration-not-exclusive`, `reserve-foreign`; genesis `legacy-present`, `artifact-present`, `evidence-missing` |
 | **Disposition** | Arms C1 (durable reason always the literal `"source-changed"`) | No | Terminal retirement prefix | `source-changed`, `legacy-write-detected` |
 | **Halt** | Same-phase revision with exact `halt` + `haltResources` | Yes | `--retry-state-migration`, four buckets | `filesystem-full`, `verification`, `reserved-path`, `durability-indeterminate`, `cleanup-deferred`, `source-oversize`, `memory-admission`, `record-oversize`, `disk-preflight`, `source-changed` **only as a retirement-cursor halt** |
 
@@ -1156,7 +1734,7 @@ pre-published.
 | **M1** | Exact M0; **source + control revalidated** | 52×, 512 MiB cap, RSS/cgroup, advisory `statfs`; claim/create the reserve; create + fsync the emergency candidate | Only after **both** identities and parents are durable | Row `M1`: backup absent, exact temp, exact current, or valid prior. Resume M2 idempotently | `source-oversize`, `memory-admission`, `disk-preflight`, `filesystem-full` |
 | **M2** | Exact M1; **revalidated** | Preamble-prefixed streaming copy to `legacy-json/<body-sha>.json`; publish/reuse the fixed `.bak`, preserving a differing prior under its own body hash first | Only after both exact backup witnesses and parents are durable | Row `M2`, **both branches**: `stagingMain: "absent"` (no file, or the sole create-ahead shape); or a recorded exact identity, where an incomplete id-owned main and only its own sidecars may be recovered/removed and rebuilt. Sidecar-without-main halts | `filesystem-full`, `reserved-path` |
 | **M3** | Exact M2; **revalidated before each of the three seams** | `claimStagingMain` (four observations) → **M-9 CAS-publishes the same-phase M2 revision recording that identity** → `importOwnedStaging` via `adoptClaimedStateStore(file, expected, install)`, one transaction, `migration_completion` last. A `completed` claim skips the import | Only after the committed completion tuple is reread and exact. WAL sidecars allowed until M4 | Row `M3`: exact committed id-bound staging; its own WAL/SHM may exist. Open only as migration owner, recover, rerun all M4 work | `record-oversize`, `memory-admission`, `filesystem-full`, `verification` |
-| **M4** | Exact M3; **revalidated** | Recover WAL, `wal_checkpoint(TRUNCATE)`, close, `S0`; reopen read-only, recompute the SQL digest/counts, validate ids, `foreign_key_check`, `integrity_check`; close, `S0` again; fsync; physical-hash bracketed | Publish M4 with the complete proof | Row `M4`: staging-only, or the M5 rename ran ahead. Revalidate identical hashes/completion, never move active backward, remove only a redundant exact staging name | `verification`, `filesystem-full`, `durability-indeterminate` |
+| **M4** | Exact M3; **revalidated** | **Rewritten in r6 / 163 v13.** On the **owning read-write** connection: recover WAL, recompute the SQL digest/counts, validate ids, `foreign_key_check`, `integrity_check` — *then* `wal_checkpoint(TRUNCATE)`, close, `S0` **once**; fsync; physical-hash bracketed. The withdrawn "reopen read-only … `S0` again" cannot succeed: staging is WAL-mode, the read-only verifier's first read recreates the sidecars and its close cannot remove them. Owned by lane 3A | Publish M4 with the complete proof | Row `M4`: staging-only, or the M5 rename ran ahead. Revalidate identical hashes/completion, never move active backward, remove only a redundant exact staging name | `verification`, `filesystem-full`, `durability-indeterminate` |
 | **M5** | Exact M4 hash; **revalidated** | Rename staging → `state.db`; remove only a redundant exact staging name; require staging absent and active `S0`; fsync `.rbox/state` | Publish M5 with the Q-sibling path + 58-byte hash **prebound**, disposition `absent`. **JSON remains authority** | Row `M5 + exact L`: sibling absent (+ the sole zero-byte create-ahead), recorded `building` at zero/partial/exact bytes, or recorded exact | `filesystem-full`, `reserved-path`, `durability-indeterminate` |
 | **M6** | Exact M5; exact sibling; **revalidated** | Ladder via same-phase CAS; revalidate live JSON + `.bak` + M5 completion/hash; **then, as the last operation before the rename with nothing between, re-verify the live body sha against the M3 source digest under the held `stateLockPath`**; rename; fsync `.rbox` | Publish M6 with sibling absent + the initial cleanup cursor. **Observing `Q` elects SQLite even if publication was interrupted** | Row `M5 + exact Q`: SQLite elected; never rename back. Complete/retry the `.rbox` fsync, publish M6. **`blocksSqliteWrites` is TRUE for this row** | `filesystem-full`, `reserved-path`, `durability-indeterminate` |
 | **M7** | Exact M6; complete nonfinal prefix; final item absent; prepared runway | **Publish M7 first**, converting resources to `retired`; **then** unlink the unused `r+1` sibling if exact-terminal and fsync; **then** unlink the control and fsync | M7 is the durable record of the final cleanup-absent prefix | Row `M7`: recorded `r+1` sibling exact-terminal or delete-ahead absent. **Retry bucket 3** covers a halt here | `cleanup-deferred`, `durability-indeterminate` |
@@ -1234,6 +1812,61 @@ use the same copy shape through the same renderer.
 | `durability-indeterminate` | "rbox can't confirm the last write reached the disk, so it has paused writing to this workspace." | "No data was lost; rbox is being cautious." | `rbox doctor --retry-state-migration` | `state-migration/durability-indeterminate` · error |
 | `cleanup-deferred` | "The conversion finished; tidying up one leftover file didn't." | "Your workspace is fully working on the new format and syncing normally." | `rbox doctor --retry-state-migration` | `state-migration/cleanup-deferred` · warn |
 
+**Interpolation, and what wave 1A deferred.** 163:3300 requires the refusals to
+print what was *measured*, not merely that a limit was hit. `MigrationHaltCopy`
+therefore carries an optional `measured(halt)` renderer alongside the three
+fixed strings, and `source-oversize`, `memory-admission`, `disk-preflight`, and
+`filesystem-full` use it for the `required`/`available` pair the durable halt
+record carries. The remaining facts are **deferred to wave 5B**, which owns the
+renderer and the `--json` twin: `verification`'s backup path and
+`reserved-path`'s occupant come from the control witness, not the halt, and
+`memory-admission`'s exact `RBOX_RESET_PARSE_BUDGET_BYTES` value comes from the
+environment. The copy map is the merge gate, so the shape is pinned now and
+only the data sources are outstanding.
+
+Both commands above land with §3.2 (`rbox migrate`) and §5B
+(`rbox doctor --retry-state-migration`). Until they do, no halt is reachable;
+5B is the gate for "every command is real and non-interactively twinned".
+
+**LANDED in wave 5B.** The tables moved to `state-plane-copy.ts` (the
+`satisfies` clauses, and therefore the merge gate, are unchanged) and
+`state-plane-report.ts` decides which one an outcome reaches. Five rows of the
+table above are AMENDED, each because the shipped wording was false rather than
+merely improvable:
+
+| Row | What was wrong | Amendment |
+|---|---|---|
+| `reserved-path` | "rbox found an unexpected file" is **factually inverted** for 163's authority-matrix row 17 (`absent`/`absent`/`absent` — no file at all), and for every corruption verdict `authority.ts`, `classifier.ts`, and `retirement.ts` raise through this code. It is the taxonomy's catch-all, not a statement about an occupant | "the files it keeps this workspace's sync records in weren't the ones it expected", which is true for every producer. Its `command` also stops being `rbox doctor` — the surface printing the message — and becomes an action |
+| `source-oversize` | `measured()` rendered it **backwards**: the record's `required` is the document's own size and `available` is the 512 MiB ceiling, so the generic "N available against M required" printed the cap as what was available | Its own line: "This workspace's state file is X; the most rbox can convert is Y" |
+| every `measured()` row | `?? "unknown"` leaked the literal word into user text where a number belongs | A row with no numbers renders **no measurement line at all**. Pinned by a test over every message |
+| `memory-admission` | §6.3 owed the exact `RBOX_RESET_PARSE_BUDGET_BYTES` value | Rendered from the live budget, beside the two measured figures |
+| `verification`, and the `underlyingCode` tokens generally | `verification` covers seven distinct refusals in `prove-staging.ts` and printed one sentence for all of them | `UNDERLYING_TOKEN_COPY` renders each stable token (`completion-tuple`, `semantic-digest`, `integrity-check`, …) in plain English. An errno reads as one; an unrecognised value is quoted rather than dropped |
+
+Two further 5B corrections outside the table:
+
+- **`nothing-to-abort`** (5A's outcome member) has its own message. Rendering it
+  as `already-migrated` told a user on a pristine workspace that their records
+  had been converted.
+- **The halted-retirement detail** in `retirement.ts` said "resumes only through
+  doctor", which reached the user as `rbox doctor` — a command that prints the
+  halt again and changes nothing. It now names
+  `rbox doctor --retry-state-migration`, which 163:3461 makes the only thing that
+  clears a halt.
+- **`source-unreadable`** is a NEW message, not a new halt code. 163's
+  "malformed JSON / unreadable legacy path" row halts before any database open,
+  and it escaped the operator commands as a raw `ResetCorruptionError` naming a
+  JSON parser. It is rendered as a refusal with a next step.
+
+**§6.4's `format-too-new` story is corrected (163 §C4).** `classifyStateFormat`
+returns `authority-marker` only for the marker THIS binary writes — a future one
+is `foreign` — so a healthy migrated workspace was reaching doctor's
+"written by a newer version of rbox / run `rbox upgrade`" copy, telling a user to
+upgrade a binary that is already the newest one there is. The `state` check now
+reads through the selecting seam: a migrated workspace is reported healthy, and a
+marker with no records behind it gets §6.4's re-adoption procedure spelled out
+under a new `authority-corrupt` status. The 2C review flagged this as blocking
+before any 2.0 tag; it lands here.
+
 ### 6.4 Not halts, never offered a retry
 
 `StateAuthorityCorruptError` — "This workspace says it uses the new format, but
@@ -1268,6 +1901,14 @@ English past 5 s per phase, with a structured `--json` twin.
 | **G6** | A leftover zero-byte staged file, or a `Q` sibling, at a path scoped to a **different authority id**; and a well-formed intent whose bound evidence differs from the live evidence (case 7) | Never deleted, never adopted, no `Q` published; reported by doctor as an inert artifact. **U3 grants no deletion authority over any of them** | — |
 
 F5/F6 assert **silence**; G5 asserts a **refusal**. One comment line each says so.
+
+**Widen the comparisons (r6).** `Q` byte-identical (F2) and `L` byte-identical
+(G3) survive literally but are too narrow: a stray `-wal`/`-shm` beside an
+untouched `Q` passes both. Every such fixture compares the **whole `.rbox`
+tree, sidecars included**. 5C additionally extends that snapshot to every
+genesis refusal, every migration halt, and every doctor inspection, and carries
+a **negative control in which a read-only open of the inspected database must
+fail the snapshot** — that control is what would have caught this defect.
 
 ### 7.2 Crash/disk-full/resume coverage
 
@@ -1366,7 +2007,22 @@ dated and re-checked before the 2.0 tag.
   `whole-state-compat.ts` imports `assertAuthorityWritable` from the coordinator
   and nothing else from either domain.
 - Exactly two entry call sites of `establishStateAuthority`, plus one doctor
-  authorization site.
+  authorization site. **Executable and asserted at TWO since wave 5B**, with
+  three conjuncts rather than one, because a list of admitted files alone would
+  have passed for a single site and a count of one: the files are exactly
+  `state-plane-cmd.ts` and `upgrade-state-window.ts`; each calls it **once**; and
+  each `EntryPoint` literal is CONSTRUCTED in exactly one production module, so
+  the union stays a fact rather than a label. The doctor authorization site is
+  pinned the same way — `retryHaltedMigration` has exactly one production
+  caller, because a second one is a second repair path.
+- **`as`-casts to `HeldStatePlaneLocks` occur only in `locks.ts`** (production
+  `src/**`; test files are the enumerated exception, since adversarial
+  construction is what they are for). The bundle is the proof object every
+  mutator trusts without re-verifying — `control-publication.ts` takes it and
+  does `void locks` — so its unforgeability rests on the brand alone. A cast
+  anywhere else reaches an admitted migration with no lock held. **Executable**
+  in `locks.test.ts`, not prose: an unenforced structural claim is how the
+  brand quietly stops being load-bearing.
 - The canonical control file is written only by `control-publication.ts`,
   including both prepared-sibling promotions, which share one private primitive.
 - The genesis intent is written only by `genesis.ts`; `readGenesisIntent` is its
@@ -1377,6 +2033,260 @@ dated and re-checked before the 2.0 tag.
 - `legacy-writer-live` and paired-interval sampling appear nowhere in `src/`.
 - Every file ≤400 lines / 25 KiB; 301–399 carries a review note.
 - `docs/CODEMAP.md` gains one ownership line per new module in the same change.
+
+### 7.10 Wave 5C — the fault primitive, and what it changed (LANDED)
+
+**The rule 5C was created to enforce.** Across eight lanes the most-repeated
+defect class was a fixture encoding a state the machine cannot produce: 3A's M4
+halt written off as "fixture territory" when no corpus could pass it; 4A's row
+test passing only because its fixture recorded a Q-sibling disposition no crash
+produces; 5B's `format-too-new` fixture encoding the wrong verdict, and its
+post-flip abort test passing for the wrong reason. Each was self-consistent and
+wrong. **5C plants nothing.** Every state it asserts against is produced by
+driving the real machine to a real instant and ending it there.
+
+**The primitive** (`migration/fault-rig.ts`). Every migration and genesis module
+uses `import fs from "node:fs"` and calls through the namespace object, so the
+property is resolved at call time and one assignment reaches all of them. A
+fault point is `{syscall, match, nth, when}` and an action is `kill`, `errno`,
+`short-write`, or `side-effect`. It is not a fake filesystem: every untargeted
+call, and every `when: "after"` targeted call, performs the real syscall.
+`fault-rig-child.ts` is the spawnable half, because SIGKILL only means something
+in a process the test does not need back; **it exits 65 when its point is never
+reached**, so an unreachable kill point reads as a failure rather than a pass.
+
+**The matrix is derived, not authored.** `scripts/probe/u3-5c-trace.ts` makes the
+machine report its own `node:fs` mutations per phase. The kill points below are
+that output, not a reading of this document — which is the same discipline
+applied to the test design itself:
+
+| Window | The physical effect the machine actually performs |
+|---|---|
+| every phase | `rename migration-v1.json.<id>.<rev>.tmp -> migration-v1.json` |
+| M1 | the body-sha backup and the fixed `pre-163-latest.json.bak` renames |
+| M4 -> M5 | `rename state.db.migrate.<id> -> state.db` |
+| M5 -> M6 | `rename state.json.migrate.<id>.q -> state.json` — the flip |
+| M6 | `unlink reserve-1mib.bin`, `unlink migration-emergency.<id>.bin` |
+| M7 | `unlink` the prepared sibling, then `unlink` the control |
+
+The first thing the probe caught was one of 5C's own fixtures: a manifest built
+with `hash` instead of `sha256` and no `type` halted at `verification`, and the
+machine refused it rather than importing it. A hand-planted corpus would have
+encoded that halt as expected behaviour.
+
+### 7.11 FINDING — `filesystem-full` is unreachable for an ordinary control publication
+
+**Scope, measured by the crash and I/O matrices: nine sites, not one.** A real
+`ENOSPC` escapes `runMigration` as a raw `ErrnoException` — no typed halt, no
+`durableHalt`, not a member of `MigrationOutcome` at all — at M0's, M1's, M2's,
+M3's, and M5's control publications; at M2's backup temp create and both backup
+renames; at the M4→M5 staging rename; and at M7's control retirement.
+`filesystem-full` is reachable at **exactly one** site: `begin.ts`'s exclusive
+create of the emergency candidate.
+
+`isOutOfSpace` in `control-publication.ts` guards only the **halt** publication's
+runway, through `haltRunway`. An `ENOSPC`/`EDQUOT` during an **ordinary** control
+publication is classified by nothing: it unwinds past `step`'s two typed catches
+(`MigrationPhaseHaltError`, `MigrationControlError`), out of `runMigration`, and
+out of `state-plane-cmd.ts`'s `inWindow` — whose own comment says the "no bare
+throws to the CLI" rule exists to prevent exactly this. §5.2 lists
+`filesystem-full` as a reachable halt for M1–M5 and §6.3 writes copy for it, but
+no code path can produce that halt for the publication itself before M6 prepares
+a runway.
+
+**A second wrong diagnosis, same family.** `artifact-observation.ts` maps every
+non-`ENOENT` open failure to `foreign`, so an `ENOSPC` or `EIO` on the FIRST open
+of `reserve-1mib.bin` or `migration-emergency.*.bin` is reported as
+`reserve-foreign` — "a file rbox keeps as a safety reserve doesn't look like rbox
+wrote it" (§6.1). Fail-closed and retryable, but the user is told their reserve
+looks foreign when the real condition is a full disk or failing media.
+
+These are pinned by the `ESCAPING` table in `io-halt-matrix.test.ts`, which
+asserts the escape at each site, so a wave that closes the gap must edit that
+table deliberately rather than discovering the rows by surprise.
+
+**Severity: copy and typed-outcome, not corruption.** The behaviour is still
+fail-closed — the prepared sibling is removed, the canonical control is
+untouched, and re-entry re-classifies at the previous phase and converges. The
+user gets a stack trace instead of the sentence §6.3 already wrote. Pinned by
+`guard-coverage.test.ts`'s `FINDING:` test, which asserts the behaviour that
+EXISTS and must be **inverted, not deleted**, when the gap is closed.
+
+### 7.12 The standing mutation gate (§7.9, executable)
+
+Eight review rounds found "correct guard, no test that notices its deletion" one
+at a time, by hand. `scripts/mutation-gate.ts` makes it a gate: a **curated**
+table of load-bearing guards, each naming an exact source anchor and the one test
+that must fail when the guard is removed. Deliberately not exhaustive AST
+mutation — that costs minutes and yields mostly equivalent mutants, which is how
+mutation testing usually dies. Three properties make it a gate:
+
+1. **The anchor must match exactly once** — zero means the guard moved or was
+   deleted, two means the anchor is ambiguous. Same self-expiry as the duplicate
+   and file-size gates; a row cannot outlive what it excuses.
+2. **The baseline must pass before the mutant is judged.** A test that cannot run
+   in the sandbox would otherwise "fail" under mutation for the wrong reason and
+   report a healthy guard — the gate reproducing its own bug. Baseline failure is
+   a BROKEN row, never a surviving guard.
+3. **A surviving mutant fails loudly**, naming guard, file, and the test that was
+   supposed to notice.
+
+`src/` is copied once into `.cache/mutation-gate` and mutated there, so the
+working tree is never touched. Runs in ~4 s; wired as `bun run gate:mutation` in
+the `checks` CI leg.
+
+**On its first run, three of five guards SURVIVED** — `runway-enospc-predicate`,
+`phase-receipt-phase-match`, and `source-rebracket` were all deletable with the
+suite green. `guard-coverage.test.ts` was written to close them. Review added
+two more rows (`flip-last-instant-reverify`, `cleanup-m6-receipt`); the table
+now stands at **seven, all killed**. Two lessons are worth keeping: a mutation whose anchor
+covers only the first line of a multi-line condition does **not** remove the
+guard (`source-rebracket` first appeared covered for that reason), and a guard
+that is a second line of defence needs a test that reaches **its** window
+specifically — perturbing between driver iterations proves nothing about
+`bracketSource`, because the classifier catches it one layer earlier.
+
+---
+
+### 7.13 Open items settled by 5C
+
+**The flip/backup asymmetry — ANSWERED, standing. Do not "fix".** The resume
+branch's omission of `revalidateBackups` is correct and permanent, not a
+deferred repair. The two legacy-JSON backups have no consumer past the flip:
+their only production readers are M2 (the writer), the pre-rename check
+(`authority-flip.ts:302`), and the `verification` halt copy that names the path
+(`state-plane-report.ts:133`). Post-`Q` abort is refused (`ABORT_AFTER_FLIP` in
+`halt-recovery.ts`) and §5.2's M6 row forbids renaming back, so no rollback can
+ever read them. They are also undeletable by rbox — `retirement.ts`'s
+`derivedPath` has no backup role, per §5.4's ownership rule. Revalidating on
+resume could therefore only convert an out-of-band deletion into an
+**unclearable** `verification` halt on a workspace that is already
+`blocksSqliteWrites = TRUE` and whose source document no longer exists: strictly
+worse than not noticing. The residual is observability only, and its surface is
+doctor, never the flip.
+
+**Anchor correction.** The open item called the pinning test "5A's G2 gate".
+`G2` is the *genesis* crash-matrix row (§7.1); the test that actually pins this
+is `migration/authority.test.ts`'s **"the flip's resume branch reads no
+stale-source member"**, which lists `revalidateBackups` as a forbidden token
+inside the resume window and separately asserts it DOES appear after the resume
+return, so the gate is non-vacuous in both directions. It **must not be
+deleted**.
+
+**The M0 strand — ACCEPTED and documented; removal is doctor's, not U3's.** A
+SIGKILL between M0's control render and its rename leaves one inert
+revision-scoped sibling at `migration-v1.json.<dead-id>.1.tmp` — a canonical M0
+record, ~630 bytes (one filesystem block), not the 64 KiB emergency candidate,
+which is an M1 artifact and is adopted or repaired in place on resume rather
+than leaked. Re-entry mints a fresh id and `renderControlSibling`'s adoption is
+scoped to the live id, so the strand is never adopted, never read, and
+coordinates nothing. It is unbounded only in the sense that each crashed M0 adds
+one: the window is a few syscalls, every *caught* failure already calls
+`removeOwnSibling`, and M0 is reachable only from the two operator-driven
+`establishStateAuthority` entry sites, so ~250 kills inside that window are
+needed to reach 1 MiB. **No U3 code may delete it** — §5.4's ownership rule
+excludes it (no durable record names it) and §7.1's G6 precedent is
+report-don't-delete. 163:657 and 163:2909 designate doctor's inert-temp
+quarantine as the sole remover. The gap worth closing before that lands is
+**observation**: `checkStateMigration` reads only the canonical control and the
+genesis intent, so nothing today can see a dead-id strand at all.
+
+**Strand sizes, measured — two different artifacts.** The MIGRATION M0 strand
+(`migration-v1.json.<dead-id>.1.tmp`) is a complete canonical control record,
+~630 bytes modelled. The GENESIS step-2 strand is a different artifact and was
+measured empirically at **0 bytes with 0 allocated blocks** — five crashes
+produced exactly five strands, one per crash, and a healthy genesis completes
+over them and adopts none. Neither justifies building a quarantine sweep; both
+argue for the same thing, which is that doctor should be able to SEE them.
+
+### 7.14 Further findings from 5C's matrices
+
+**FINDING — genesis is unreachable through the `node:fs` default export.**
+Genesis performs 28 of its 36 workspace calls through `node:fs/promises`,
+including the intent publication, both renames, and both parent fsyncs — every
+kill point §7.2 names for it. The fault rig originally patched only the default
+export and could not reach any of them. **It stayed findable only because an
+unreached point exits 65 rather than passing quietly**, which is the single
+design decision in 5C that paid for itself. The rig now takes a `surface`.
+
+**FINDING — §7.1's G2 case 4 is not SIGKILL-reachable.** Step 2 creates the
+staged file and fsyncs its parent BEFORE step 3 publishes the intent, so on an
+ordered filesystem an intent never survives without its staged file. The row is
+driven to the intent-published state by a real crash and then reduced by one
+removal, with the reachability argument (external reaper, partial restore,
+crash-consistency reordering) recorded at the fixture.
+
+**FINDING — r6's "byte-identical whole `.rbox` tree" is not literally
+satisfiable for genesis.** `installGenesisLineage` stamps
+`migration_completion.completed_at` with `new Date().toISOString()`, so no two
+genesis runs produce identical `state.db` bytes. `Q` and everything else are
+compared byte-for-byte; `state.db` is compared on the §2.5.1 tuple. §7.1's
+wording should say so rather than implying a comparison no run can pass.
+
+**FINDING — G6's doctor clause is unimplemented.** `checkStateMigration` reads
+only the canonical control and the genesis intent and never classifies
+artifacts, so an inert strand is invisible and doctor answers "no conversion in
+progress". Same gap as §7.13's strand item, reached from a second direction.
+
+**SELF-REVIEW — the wave's own matrices were mutation-tested, and two guards
+are still uncovered.** An ad-hoc mutation sweep was run against 5C's new
+matrices rather than trusting their test counts. **Three of three mutants
+initially SURVIVED**, including the M6 last-instant re-verify — F5's entire
+subject — against a 55-test crash matrix. Review found a FOURTH,
+`cleanup.ts`'s M6 receipt gate, which survived all six 5C matrices AND all
+fourteen behavioural state-plane suites including its own owning
+`cleanup.test.ts`. The cause is the same shape twice
+over: every other path that notices a changed source catches it one layer
+earlier, so a second-line-of-defence guard's own window is never entered by a
+test that perturbs between driver iterations. `guard-coverage.test.ts` now
+drives F5's true `check -> rename` microwindow with the `side-effect` action —
+deterministic, no sleeping — and that mutant is killed and in the standing
+table. Two remain uncovered and are recorded rather than hidden:
+
+| Guard | Why it is still uncovered |
+|---|---|
+| `revalidateActive`'s Q-sibling exactness (`authority-flip.ts`) | Needs the active database to change between M5 and the flip. Reachable with the rig's `side-effect` action; not written. |
+| `begin.ts`'s ENOSPC refill halt | On the halt-runway REFILL path, reached only through `restoreHaltRunway` on a retry, which the I/O matrix does not drive. |
+
+Review also confirmed the complement, which matters for reading the numbers
+correctly: the crash matrix's 12/12 survival rate is the CORRECT result for a
+convergence matrix — a second-line guard's window is never entered by one — and
+re-running those same 12 against the pre-existing behavioural suites killed 11.
+The gate table, not the matrix, is where a guard's coverage is owed.
+
+The lesson generalizes past this wave: **a test count is not coverage, and a
+matrix that passes 55 cells can still notice nothing.** The gate table is the
+artifact that makes that measurable, and it should grow by exactly this
+procedure — mutate, observe the survivor, write the test that reaches its
+window.
+
+**FINDING — the plane's tests exhaust `/tmp`'s INODE table, not its bytes.**
+On the Linux fleet host `/tmp` is RAM-backed tmpfs with ~1M inodes. The
+state-plane suite leaks its `mkdtemp` workspaces, and repeated runs drove
+inodes to **100% at 47% byte capacity**, which surfaces as a flood of `ENOSPC`
+failures across unrelated suites — a failure that reads as a code defect and is
+not one. Repeated local runs multiply the leak, so temporary workspaces must be
+removed after each attempt. The general leak predates this wave and is
+survivable only because CI runners are fresh containers; anyone running the
+plane's suites repeatedly on a fleet host should expect it.
+
+**FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
+carrying `removedKey` on a repo that still has a live manifest section causes
+the migration to drop the section, and the fidelity check does not object. A
+correct read of a contradictory input, but the fidelity gate's silence on it is
+worth knowing.
+
+**FINDING — the CODEMAP gate does not exist.** §M-9 states the
+one-line-per-module rule is "now executable in `migration/authority.test.ts`".
+It is not: no test in the repository mentions CODEMAP (`grep -rin codemap src/
+scripts/ --include='*.ts'` is empty). The content half did land — the state-plane
+block of `docs/CODEMAP.md` is populated — but nothing prevents the next module
+from regressing. When the gate is built it must match at LINE START on the
+module path and assert no path appears twice; a substring check on the directory
+prefix is vacuous, since it passes for every module in a directory that
+documents exactly one.
+
+---
 
 ---
 
@@ -1411,7 +2321,7 @@ tests; other lanes propose their one-line entries in the PR body.
 
 | Lane | Deliverable | Depends on | Routing |
 |---|---|---|---|
-| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate | 1A, 1B, 2A | codex |
+| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate. **Also owns the `disk-preflight` halt**: 2B deliberately left it undecided because 163:3319 budgets it from staging/backup/WAL size estimates only this lane has, and a guessed multiplier would land a fabricated number in a durable halt record | 1A, 1B, 2A | codex |
 | **3B** | M-7 `retirement.ts` + cursor tests (consumes `C1Trigger` from 1A, not Wave 4) | 1A, 2A | **opus** |
 | **3C** | M-8 `cleanup.ts` (cursor + ledger + `retryPromotedHalt` + M7 in normative order) + runway fault injection | 1A, 2A | **opus** |
 
@@ -1428,6 +2338,24 @@ Depends on 1A, 2A, 2B, 3A, 3B, 3C. **opus, alone.**
 | **5A** | M-9 `authority.ts` — per-mutator revalidation, the four retry buckets, both entry sites (upgrade with the `finally` guarantee, `rbox migrate` + `--json`), progress UX. Integration owner | **opus** |
 | **5B** | Doctor: the four buckets wired, `--abort-state-migration`, the standing-halt projection modeled on `reset-health.ts`, final copy pass | **opus** |
 | **5C** | **The genesis fleet checkpoint** (§7.7 — first reachable here), then F2/F3/F5/F6, the abort differential, the no-regression harness, duration budget, rig scenario. Harness *preparation* may run in parallel from Wave 3 | codex (harness) + **opus** (fixtures) |
+
+### The ownership rule, per lane (r6)
+
+Carried here so unbuilt lanes inherit the fix instead of rediscovering it. Full
+statement and evidence: 163 § "R4-v13 the ownership rule (v13)".
+
+| Lane | Inheritance |
+|---|---|
+| **3A** | **Blocker.** M4 verification as r5 specified it is impossible. Verify on the owning read-write connection, checkpoint after |
+| **5B** | Doctor must be **observation-only** on files it does not own |
+| **2D** | `assertAuthorityWritable` runs on the **hot path, every SQLite save**. File-level only, never a SQLite open, so nobody optimizes it into one |
+| **2C** | Selection via `classifyStateFormat` is pure-`fs` and safe; `reset/lifecycle.ts:65` `readLineage` is a live read-only open — do not adopt or resurrect it |
+| **4A** | "Any sidecar halts" is a precondition of M4→M5→M6 resume; an open-based check both leaves debris and trips its own halt |
+| **5A** | Per-mutator revalidation runs many times per migration; open-based revalidation multiplies debris linearly |
+| **5C** | Extend the sidecar-inclusive snapshot to every genesis refusal, migration halt, and doctor inspection; add the read-only-open negative control |
+| **3C** | Inertness must be a file-level judgement |
+| **3B** | No DB open in spec; note only |
+| **1B** | Not a victim — the **model**. The adopter removes the file *and* its sidecars on failure legally, because it owns the inode |
 
 ### Wave 6 — validation, serial
 
@@ -1466,8 +2394,9 @@ final serial review** → merge to `2.0` → dual-binary differential against si
    forward for `status` only, or **do not ship the flip** — the third stays on
    the table per the revert rule.
 7. **F5/F6 assertion maintenance.** Not a leading implementation risk.
-8. **~3,550 production lines** (2,620 migration + 240 genesis + 90 coordinator +
-   600 adapters) of one-way, unrevertible-after-`Q` fail-closed surface.
+8. **~3,700 production lines** (2,620 migration + 393 genesis as shipped +
+   90 coordinator + 600 adapters) of one-way, unrevertible-after-`Q`
+   fail-closed surface.
 
 ---
 
@@ -1517,7 +2446,7 @@ None touches 163 v12's ratified row text; both v12 rows remain byte-identical.
 | # | Correction | Disposition |
 |---|---|---|
 | **1** (lane 1C, highest value) | The intent must be the sole source of `authorityId`/`lineageId` on every resume. As written, `establish(root, lineage, locks)` took a caller lineage while cases 2/3 rebuild "from step 4", whose `install` closes over it — so a coordinator minting a fresh lineage per invocation (the natural reading of that signature) installs ids that can never satisfy §2.5.1, and a **healthy** workspace live-locks into a permanent halt | **Folded, and carried by the signature, not just prose.** `establish(root, mintLineage: () => GenesisLineage, locks)` calls the thunk at most once and only with no intent to resume; a private `resume(root, intent, locks)` takes the intent and no lineage; step 4 installs `lineageFrom(intent)`. §2.4 states the rule in bold with the live-lock consequence spelled out, and an inventory test asserts `installGenesisLineage`'s only genesis caller derives its argument from an intent |
-| **2** (lane 1C) | §2.5.1 must evaluate through the read-only preflight; case 7 must precede case 5; cases 6–7 must raise `StateAuthorityCorruptError` | **Folded, all three.** §2.5.1 evaluates through `openStateStore`'s `readonly: true` preflight (`store/open.ts:249-262`, which exists precisely so a foreign SQLite file is not converted to WAL merely by being inspected) — otherwise a "zero-write halt" rule performs a write via WAL replay. §2.5.2 states the ordering and why (case 5 keys on `L` and does not reference §2.5.1, so it does not inherit the evidence check; without the ordering a copied `.rbox` would take case 5's cleanup path and delete another workspace's artifacts). Cases 6 and 7 now raise `StateAuthorityCorruptError`, which **deletes the genesis halt taxonomy before it is born**: no `MigrationHaltCode` member, no `MIGRATION_HALT_COPY` entry, no new copy — §6.4 already covers it — and it resolves the contradiction an unnamed "halt" created with §5.3 and 163:2612. The three genesis **refusals** are unaffected; they fire at step 1, before any mutation |
+| **2** (lane 1C) | §2.5.1 must evaluate through the read-only preflight; case 7 must precede case 5; cases 6–7 must raise `StateAuthorityCorruptError` | **SUPERSEDED IN PART (r6) — do not re-derive this.** The first of the three is **false**: a read-only open is not zero-write (163 v13's evidence), so the preflight prescription is withdrawn and replaced by the ownership rule; the other two stand. Original r5 disposition, for the record: **Folded, all three.** §2.5.1 evaluates through `openStateStore`'s `readonly: true` preflight (`store/open.ts:249-262`, which exists precisely so a foreign SQLite file is not converted to WAL merely by being inspected) — otherwise a "zero-write halt" rule performs a write via WAL replay. §2.5.2 states the ordering and why (case 5 keys on `L` and does not reference §2.5.1, so it does not inherit the evidence check; without the ordering a copied `.rbox` would take case 5's cleanup path and delete another workspace's artifacts). Cases 6 and 7 now raise `StateAuthorityCorruptError`, which **deletes the genesis halt taxonomy before it is born**: no `MigrationHaltCode` member, no `MIGRATION_HALT_COPY` entry, no new copy — §6.4 already covers it — and it resolves the contradiction an unnamed "halt" created with §5.3 and 163:2612. The three genesis **refusals** are unaffected; they fire at step 1, before any mutation |
 | **3** (lanes 2C + 2D) | Collapse A-2's two-read fence into one exported `assertAuthorityWritable(root)` in the coordinator | **Folded.** One call replaces a duplicated branch, halves the hot-path reads, and fixes a **real §7.9 boundary violation**: as written, `whole-state-compat.ts` imported from both `migration/` and `genesis.ts`, so "exactly one module imports both" was false and lanes 2C/2D would have collided over ownership. 2D now owns the predicate and **lands before 2C** |
 | **4** (163 editorial) | Qualify 163:2613 and widen `C` at 163:2589 | **Folded.** `absent \| absent \| absent` becomes `absent \| absent \| absent, and no genesis intent`, so it cannot overlap the v12 in-progress row under first-match reading; `C`'s definition now reads "evidence for the record that owns it — the migration control ordinarily, or the genesis intent on the two v12 intent-keyed rows". Both are surrounding definitions, **not** the amendment; the two v12 row texts are untouched |
 | — | `entry_count = repo_count = 0` and `lineageId` are tautological / defense-in-depth | **Recorded, not changed** (§2.5.1). Both are in the ratified row text; cutting either costs a re-ratification for zero safety. They are now explicitly named non-load-bearing so nobody later mistakes them for the reason the conjunction is sound — `authorityId`, the identity, and the evidence are |

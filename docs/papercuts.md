@@ -373,6 +373,156 @@ behind-origin count; loudly warn when behind.
   release blocker. Fix hint: label each merged source section
   ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
   tails once dated logs exist.
+
+- **A shape the design never printed got read into existence, and it was
+  circular (2026-07-29, U3 wave 3C, cost ~40 min):** 163:3086 says the M6
+  ledger's consumed `promoted-halt` form "omits the M7 SHA-256" and prints no
+  schema for it — only the one-way `preparing` ledger is printed. Wave 1A
+  reasonably read the omission as *carries dev/ino/**bytes***, and that reading
+  is unimplementable: the halted-M6 record would name the M7 record's byte
+  length while the M7 record names the halt record's, so each record's canonical
+  size depends on the decimal width of the other's. 163's own five-row ordering
+  breaks before the fixpoint does — the halt bytes must be final before M7 can
+  be derived from them, yet under that shape they cannot be — and the fixpoint
+  has no specified convergence, so two conforming implementations could disagree
+  on canonical bytes. Nobody noticed across five design rounds because the
+  circularity lives in JSON *lengths*, not in named dependencies. Fixed by
+  pinning the shape without the length (163:3092 already required the retry to
+  recompute the M7 record, so it was a duplicate too).
+
+  **Rule 1 — an omission list is not a schema.** When a design says which fields
+  a record leaves out, it has not said which fields it leaves in, and the
+  implementer who fills that gap is authoring schema under the impression they
+  are transcribing it. Treat an omission sentence as an open decision: write the
+  shape into the document and get it reviewed before building on it. This is not
+  an anecdote about one field — it is the root cause of the cycle above, and any
+  lane reading a "carries X but not Y" sentence is in the same position.
+
+  **Rule 2 — never store a length or hash of a record that stores yours.** Check
+  for the cycle before implementing, and prefer deriving over storing, which
+  removes the question entirely. A stored copy of a derivable value can only
+  ever disagree with the derivation.
+
+- **The state-plane file-size law has no CI gate (2026-07-29):** 163:3994 states
+  "400 lines / 25 KiB is the hard CI failure" for production files, and nothing
+  in `src/`, `scripts/`, or `.github/` enforces it — the number is honoured only
+  by whoever remembers to run `wc`. Wave 3C's first draft landed at 636 lines
+  and would have merged clean. Fix hint: one test beside
+  `duplicate-declarations.test.ts` over `src/cli/state-plane/**`, with the
+  301-399 review-note band as a warning list rather than a failure.
+
+- **A "one line per module in the same change" doc rule with no gate is a rule
+  nobody keeps (2026-07-29, wave 5A):** 222 §7.9 required `docs/CODEMAP.md` to
+  gain one ownership line per new module in the same change. Eleven merged lanes
+  instead *proposed* their line in the PR body, because 5A was named the CODEMAP
+  owner and nothing failed without it — leaving **29 production state-plane
+  modules undocumented** by the time the integration lane opened. Worse, the
+  obvious gate is vacuous: `codemap.includes("src/cli/state-plane/migration/")`
+  passes for every module in a directory that documents exactly one of them, so
+  the first version of the check reported zero missing. Fix hint: match at LINE
+  START, and pin that no path appears twice — two lines for one path is two
+  owners. Rule: a documentation obligation stated in a design doc is a decoration
+  until a test reads the document.
+
+- **"Import graph" and "imports" are not the same structural claim
+  (2026-07-29, wave 5A):** 222 §M-9 required "no `node:fs`, `node:crypto`, or
+  `bun:sqlite` in this module's **import graph**" for the migration driver, while
+  §7.9 wrote the same gate as "`authority.ts` **imports** no …". The transitive
+  reading is unimplementable for a module whose entire job is sequencing bodies
+  that open databases and rename files — the same shape as 163 v13's finding that
+  M4's specified verification could not be performed. Rule: when a structural gate
+  is stated twice in one document, implement it once and say which reading
+  survived; a gate nobody can satisfy gets quietly reinterpreted by whoever
+  implements it.
+
+- **Two phase bodies fell between two lanes' scopes and nobody noticed for four
+  waves (2026-07-29, wave 5A):** 222 §8 assigned M2/M3/M4 to lane 3A and
+  "admission, which publishes nothing" to 2B, and M0/M1 — mint the ids, publish
+  the first control, claim the reserve, create the emergency candidate — belonged
+  to neither. The tree therefore carried `publishMigrationControl`'s
+  `FIRST_CONTROL_REVISION` branch and `migrationPaths.emergency` with **zero
+  production callers** through eleven merged PRs, and every lane's tests
+  hand-planted the control records M0 was supposed to produce. Fix hint: a wave
+  plan derived from a module inventory should be cross-checked against the *phase*
+  inventory — one row of §5.2 per named owner — before dispatch. Rule: when every
+  lane's fixtures construct the same precondition by hand, that precondition has
+  no owner.
+
+- **A `verification` halt names no cause, and that cost wave 5A the M4 defect
+  (2026-07-30, snapshot-replay):** `prove-staging.ts` raises five distinct
+  `halt("verification", …)` refusals with a message each, but the message is
+  dropped — the durable record and the returned outcome both carry
+  `underlyingCode: null`. Wave 5A's own behavior test saw M4 refuse an empty
+  corpus and attributed it to "3A/5C fixture territory"; replaying a real 81 MiB
+  workspace showed every fidelity check passing and the refusal coming from M4's
+  `JSON.stringify` tuple comparison. Fix hint: `halt`'s detail string already
+  exists at every raise site — put it in `underlyingCode`, which the taxonomy
+  already uses for exactly this in `authority.ts`'s `corruptionHalt`.
+
+- **`os.tmpdir()` is a RAM-backed tmpfs on the Linux desktop (2026-07-30):** a
+  harness that staged copies of an 81 MiB legacy state under `/tmp` spent ~1 GiB
+  of MEMORY per run and pushed a 31 GiB tmpfs to 80% before commands started
+  failing with bare exit-1 and no output. Cost ~20 minutes of misdiagnosis. Fix
+  hint: anything staging workspace-sized data should default to `/var/tmp`
+  (disk-backed) and never `os.tmpdir()` on this host.
+
+- **A test that pins a defect as "fixture territory" makes it unfindable
+  (2026-07-30, M4 tuple fix):** wave 5A's `authority-behavior.test.ts` header
+  documented "this harness's empty legacy state halts `verification` at M4" and
+  its driver test asserted `kind: "halted", durableHalt: true` as the expected
+  outcome. No corpus could ever have passed — M4 compared a JCS-round-tripped
+  tuple against a SELECT-order one with `JSON.stringify` — so the test was
+  encoding a total failure of the machine as a property of the fixture. Fixing
+  the defect turned 5 of that file's 18 tests red, which is the only reason the
+  premise was ever re-examined. Fix hint: when a test's comment explains WHY the
+  system refuses rather than asserting that it works, treat the explanation as an
+  unverified claim. A "the fixture is too small" excuse for a fail-closed gate is
+  cheap to falsify — build the fixture, or drive the real thing.
+
+- **Every migration test built its control in memory, so no test ever saw the
+  record's own bytes (2026-07-30):** `import-json.test.ts` says outright
+  "Nothing here encodes unless the test is about the bytes", and every M4 fixture
+  therefore handed `proveStaging` an object whose key order matched
+  `readCompletionTuple`'s. The one thing that differs on a real resume — the
+  control has been through `encodeMigrationControl`/`decodeMigrationControl` —
+  was the thing no fixture exercised. Fix hint: for any phase body that reads a
+  witness off a durable record, at least one test must feed it a control that
+  round-tripped through the real codec. In-memory fixtures cannot see key order,
+  number spelling, or anything else canonicalization normalizes.
+
+- **A test that sets `process.env.RBOX_HOME` at module load poisons every other
+  suite in the process (2026-07-30, u3/5b):** `state-plane-cmd.test.ts` copied a
+  pattern from `migration/admission.test.ts` — a top-level
+  `process.env.RBOX_HOME = await fs.mkdtemp(...)` to keep daemon pid records out
+  of the real home — and turned **56 tests in `credentials.test.ts` and
+  `auth-cmd.test.ts` red** in the full-suite run while both files passed in
+  isolation. One of them is literally named "RBOX_HOME isolates the credential
+  store while HOME stays untouched (#505)". Cost ~15 minutes and one false
+  "56 pre-existing environmental failures" conclusion. Fix hints: (a) a suite
+  whose failures vanish when the file is run alone is cross-test state, never
+  environment — check env mutation before blaming the host; (b) don't override
+  an env var for a code path that only READS the location; (c) the existing
+  in-tree copies of this pattern are latent versions of the same bug.
+
+- **The gate that pinned "exactly two entry sites" at zero could have been
+  satisfied by one (2026-07-30, u3/5b):** `authority.test.ts` compared a list of
+  admitted FILES, so adding a single call site and updating the list to one entry
+  would have passed a gate whose stated claim is "exactly two". The wave's own
+  brief had to warn "don't be that", which is the tell: a gate that needs a prose
+  warning is under-specified. It now asserts three conjuncts — the file set, one
+  call per file, and one construction site per `EntryPoint` literal. Fix hint: a
+  structural gate over a numbered claim must assert the NUMBER, not a list whose
+  length the next author edits in the same commit as the violation.
+
+- **`git grep`-based structural gates silently pass for untracked new files
+  (2026-07-30, u3/5b):** the §7.9 entry-site gate reported zero call sites for
+  brand-new modules that plainly contained them, because `git grep` only searches
+  the index. A gate whose whole job is to catch a NEW caller is blind to exactly
+  the shape it exists to catch until someone runs `git add`. Fix hint: either
+  `git add -A` before trusting a `git grep` gate locally, or have the gate walk
+  the filesystem. CI never sees this because everything is committed there —
+  which is worse, not better: the gate is weakest in the loop where it is used.
+
 - 2026-07-30: interactive `rm -rf` cleanup (13 dirs, one at a time) aggregated into one 46k mass-delete halt; surfaced only in admin/CLI, founder discovered it an hour later. Friction: intentional local deletions need a visible propagate-or-not surface, not a silent halt.
 - 2026-07-30: Max blocked for DAYS on `rbox git resolve keep-mine` → "daemon/CLI is syncing". The unconfirmed pass waits only ~0.8s for the sync mutex (16×50ms) while the confirmed pass gets 60s (resolve-command.ts acquisitionDeadlineMs); a busy daemon makes the 0.8s window unlandable. Fix hint: same 60s deadline + "waiting…" line on the unconfirmed pass.
 - 2026-07-31: a repo can sit wedged on a deferral for 7 DAYS with no escalation beyond a status line the user must ask for. Friction: long-lived deferrals need louder surfacing (menu-bar/notification), not silent parking. (Related backlog: RboxBar git-resolve shortcut.)

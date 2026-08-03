@@ -16,11 +16,13 @@ export {
   type StorePragmas,
 } from "./store/open.js";
 export { openReadSnapshot } from "./store/read-snapshot.js";
+export { runStatement, selectRow, selectRows, streamRows, withStatement } from "./store/statements.js";
 export { stateSemanticDigest } from "./digest/state-semantic-v1.js";
 export {
   loadRawStateFromStore,
   materializeManifestFromStore,
 } from "./adapters/read-only.js";
+export { applySavePacketToStore } from "./adapters/sqlite-state-save.js";
 export { publishStateBackup, type StateBackupOptions, type StateBackupResult } from "./backup/publish.js";
 export { beginGeneration, collectUnreferencedEntryValues, type GenerationBuilder } from "./store/generations.js";
 export {

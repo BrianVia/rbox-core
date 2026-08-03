@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -9,12 +8,10 @@ import {
   openStateStore,
   openStateStoreForWalTakeover,
   ownedStateStoreWriterForReset,
+  selectRow,
   stateStoreDatabase,
 } from "../store-facade.js";
-import {
-  AUTHORITY_MARKER_BYTES,
-  isAuthorityMarkerBytes,
-} from "../authority-marker.js";
+import { readAuthorityMarkerId } from "../authority-marker.js";
 import { fsyncDirectory } from "../../../engine/fsutil.js";
 import {
   fsyncDbAndParent,
@@ -22,8 +19,6 @@ import {
   requireDbArtifactS0,
   sqliteResetPaths,
 } from "./artifacts.js";
-
-const AUTHORITY_BYTES = /^RBOX-SQLITE-AUTHORITY-v1\n([0-9a-f]{32})\n$/;
 
 export interface SqliteResetLineage {
   stream: string;
@@ -40,54 +35,9 @@ export interface PreparedResetDbSeed {
 }
 
 export async function readSqliteAuthorityId(root: string): Promise<string> {
-  const marker = sqliteResetPaths.authorityMarker(root);
-  const handle = await fs.open(marker, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let bytes: Buffer;
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size !== AUTHORITY_MARKER_BYTES) {
-      throw new Error("SQLite reset requires the exact authority marker");
-    }
-    bytes = Buffer.alloc(AUTHORITY_MARKER_BYTES);
-    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    if (bytesRead !== bytes.length || !isAuthorityMarkerBytes(bytes)) {
-      throw new Error("SQLite reset requires the exact authority marker");
-    }
-  } finally {
-    await handle.close();
-  }
-  const match = AUTHORITY_BYTES.exec(bytes.toString("latin1"));
-  if (!match) throw new Error("SQLite reset requires the exact authority marker");
-  return match[1]!;
-}
-
-function readLineage(file: string): SqliteResetLineage & { authorityId: string } {
-  const store = openStateStore(file, { readonly: true });
-  try {
-    const row = stateStoreDatabase(store).query(`SELECT
-      m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
-      l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
-      FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string;
-        stream: string;
-        stateNonce: string | null;
-        stateRevision: number | null;
-        telemetryBindingId: string | null;
-      } | null;
-    if (!row || !row.stateNonce || row.stateRevision === null) {
-      throw new Error("SQLite reset requires a complete active lineage");
-    }
-    return {
-      authorityId: row.authorityId,
-      stream: row.stream,
-      stateNonce: row.stateNonce,
-      stateRevision: row.stateRevision,
-      ...(row.telemetryBindingId === null ? {} : { telemetryBindingId: row.telemetryBindingId }),
-    };
-  } finally {
-    store.close();
-  }
+  const authorityId = await readAuthorityMarkerId(sqliteResetPaths.authorityMarker(root));
+  if (authorityId === undefined) throw new Error("SQLite reset requires the exact authority marker");
+  return authorityId;
 }
 
 export async function quiesceActiveDbForReset(root: string): Promise<SqliteResetLineage> {
@@ -95,17 +45,17 @@ export async function quiesceActiveDbForReset(root: string): Promise<SqliteReset
   const file = sqliteResetPaths.active(root);
   closeOwnedStateStoreReadersForReset(file);
   const store = ownedStateStoreWriterForReset(file) ?? openStateStore(file);
-  let lineage: ReturnType<typeof readLineage> | undefined;
+  let lineage: (SqliteResetLineage & { authorityId: string }) | undefined;
   try {
     const db = stateStoreDatabase(store);
-    const row = db.query(`SELECT
+    const row = selectRow<{
+      authorityId: string; stream: string; stateNonce: string | null;
+      stateRevision: number | null; telemetryBindingId: string | null;
+    }>(db, `SELECT
       m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
       l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
       FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string; stream: string; stateNonce: string | null;
-        stateRevision: number | null; telemetryBindingId: string | null;
-      } | null;
+      WHERE m.singleton=1`);
     if (!row || !row.stateNonce || row.stateRevision === null) throw new Error("SQLite reset active lineage is incomplete");
     lineage = {
       authorityId: row.authorityId,
@@ -143,14 +93,14 @@ export async function recoverOrdinaryWalCrash(
   let observed: SqliteResetLineage & { authorityId: string };
   try {
     const db = stateStoreDatabase(store);
-    const row = db.query(`SELECT
+    const row = selectRow<{
+      authorityId: string; stream: string; stateNonce: string | null;
+      stateRevision: number | null; telemetryBindingId: string | null;
+    }>(db, `SELECT
       m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
       l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
       FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string; stream: string; stateNonce: string | null;
-        stateRevision: number | null; telemetryBindingId: string | null;
-      } | null;
+      WHERE m.singleton=1`);
     if (!row || !row.stateNonce || row.stateRevision === null) throw new Error("W1 active lineage is incomplete");
     observed = {
       authorityId: row.authorityId,

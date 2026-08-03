@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
-import { ALIAS_COMMANDS } from "./command-catalog.js";
 import { flagValues, parseFlags, unknownFlagError } from "./flags.js";
-import { COMMAND_HELP, helpFor } from "./help-registry.js";
+import { ALIAS_COMMANDS, COMMAND_HELP, GLOBAL_FLAGS, helpFor, resolveCommandAlias, type CommandFlag } from "./help-registry.js";
 
 test("--json is a boolean long flag before or after a status path", () => {
   expect(parseFlags(["--json", "."])).toEqual({ positional: ["."], flags: { json: "true" } });
@@ -66,7 +65,7 @@ test("init/track --respect-gitignore is valueless and never swallows the directo
 });
 
 test("flags a command accepts but does not document keep their registry-wide arity", () => {
-  // `--no-interactive` is a HIDDEN_FLAGS entry for `track` (declared only under `init`).
+  // `--no-interactive` is declared as hidden syntax for `track`.
   expect(parseFlags(["--no-interactive", "/home/dev/app"], "track")).toEqual({
     positional: ["/home/dev/app"],
     flags: { "no-interactive": "true" },
@@ -74,7 +73,7 @@ test("flags a command accepts but does not document keep their registry-wide ari
 });
 
 test("a deprecated alias parses its target's flags at the target's arity", () => {
-  // `link` forwards the SAME argv to `track` (deprecations.ts) but declares no flags of
+  // `link` forwards the SAME argv to `track` but declares no flags of
   // its own, so resolving arity from the alias entry alone left `--git` on the colliding
   // fallback (valueless): `rbox link --git false <path>` lost the path AND inverted --git.
   expect(parseFlags(["--git", "false", "/desired/project"], "link")).toEqual({
@@ -93,11 +92,11 @@ test("an unresolvable command falls back to the union, valueless for names that 
 
 const FLAG_TOKEN = /^(--[a-z0-9][a-z0-9-]*)\b/i;
 
-function declaredFlags(command: { name: string; flags?: { flag: string }[] }): { name: string; takesValue: boolean }[] {
+function declaredFlags(command: { name: string; flags?: CommandFlag[] }): { name: string; takesValue: boolean }[] {
   const declared: { name: string; takesValue: boolean }[] = [];
-  for (const { flag } of command.flags ?? []) {
+  for (const { flag, takesValue } of command.flags ?? []) {
     const token = flag.match(FLAG_TOKEN)?.[1];
-    if (token) declared.push({ name: token.slice(2), takesValue: flag.slice(token.length).trim().length > 0 });
+    if (token) declared.push({ name: token.slice(2), takesValue: takesValue === true });
   }
   return declared;
 }
@@ -105,7 +104,7 @@ function declaredFlags(command: { name: string; flags?: { flag: string }[] }): {
 const arityWord = (takesValue: boolean) => (takesValue ? "WITH a value" : "WITHOUT a value");
 
 /** Deprecated alias → the command path it forwards the same argv to (`link` → `track`). */
-const ALIAS_TARGETS = new Map(ALIAS_COMMANDS.map((name) => [name, COMMAND_HELP.find((c) => c.name === name)!.alias!]));
+const ALIAS_TARGETS = new Map(ALIAS_COMMANDS.map((name) => [name, resolveCommandAlias(name)]));
 
 test("registry guard: one resolved help key never declares a flag name at two arities", () => {
   // `parseFlags` resolves a command to `helpFor(cmd)`, which for a group token unions
@@ -130,6 +129,98 @@ test("registry guard: one resolved help key never declares a flag name at two ar
   expect(conflicts).toEqual([]);
 });
 
+test("registry guard: typed arity, repetition, and hidden syntax are explicit", () => {
+  expect(GLOBAL_FLAGS.map(({ flag, takesValue }) => [flag, takesValue === true])).toEqual([
+    ["--json", false],
+    ["--help <ignored>", true],
+  ]);
+  const repeatable: string[] = [];
+  const hidden: string[] = [];
+  const short = new Map<string, Set<string>>();
+  for (const command of COMMAND_HELP) {
+    for (const flag of command.flags ?? []) {
+      const token = flag.flag.match(FLAG_TOKEN)?.[1];
+      expect(token, `${command.name}: ${flag.flag} must start with a long flag`).toBeDefined();
+      const displayHasValue = flag.flag.slice(token!.length).trim().length > 0;
+      expect(
+        flag.takesValue === true,
+        `${command.name} ${flag.flag}: typed arity must match the compatibility display spelling`,
+      ).toBe(displayHasValue);
+      if (flag.repeatable) {
+        expect(flag.takesValue, `${command.name} ${flag.flag}: repeatable flags must take values`).toBe(true);
+        repeatable.push(`${command.name} ${token}`);
+      }
+      if (flag.hidden) hidden.push(`${command.name} ${token}`);
+      if (flag.short) {
+        const shape = `${token}:${flag.takesValue === true ? "value" : "boolean"}`;
+        short.set(flag.short, new Set([...(short.get(flag.short) ?? []), shape]));
+      }
+    }
+  }
+  expect(repeatable).toEqual(["track --include"]);
+  expect(hidden).toEqual([
+    "setup --new",
+    "setup --name",
+    "setup --no-sync",
+    "setup --respect-gitignore",
+    "init --name",
+    "init --project",
+    "track --project",
+    "track --name",
+    "track --device",
+    "track --no-interactive",
+  ]);
+  expect(Object.fromEntries([...short].map(([spelling, shapes]) => [spelling, [...shapes]]))).toEqual({
+    "-w": ["--workspace:value"],
+    "-f": ["--follow:boolean"],
+    "-n": ["--lines:value"],
+    "-y": ["--yes:boolean"],
+  });
+});
+
+test("every declared short spelling executes its typed parser behavior", () => {
+  for (const command of COMMAND_HELP) {
+    for (const flag of command.flags ?? []) {
+      if (!flag.short) continue;
+      const name = flag.flag.match(FLAG_TOKEN)![1]!.slice(2);
+      const parsed = parseFlags([flag.short, "NEXT"], command.name.split(" ")[0]!);
+      expect(
+        { command: command.name, short: flag.short, ...parsed },
+        `${command.name} ${flag.short} must behave like ${flag.flag}`,
+      ).toEqual(
+        flag.takesValue
+          ? { command: command.name, short: flag.short, positional: [], flags: { [name]: "NEXT" } }
+          : { command: command.name, short: flag.short, positional: ["NEXT"], flags: { [name]: "true" } },
+      );
+    }
+  }
+});
+
+test("every hidden accepted flag has independently pinned parser behavior", () => {
+  const cases = [
+    { command: "setup", flag: "new", takesValue: false },
+    { command: "setup", flag: "name", takesValue: true },
+    { command: "setup", flag: "no-sync", takesValue: false },
+    { command: "setup", flag: "respect-gitignore", takesValue: false },
+    { command: "init", flag: "name", takesValue: true },
+    { command: "init", flag: "project", takesValue: true },
+    { command: "track", flag: "project", takesValue: true },
+    { command: "track", flag: "name", takesValue: true },
+    { command: "track", flag: "device", takesValue: true },
+    { command: "track", flag: "no-interactive", takesValue: false },
+  ] as const;
+
+  for (const { command, flag, takesValue } of cases) {
+    const parsed = parseFlags([`--${flag}`, "NEXT"], command);
+    expect({ command, flag, ...parsed }).toEqual(
+      takesValue
+        ? { command, flag, positional: [], flags: { [flag]: "NEXT" } }
+        : { command, flag, positional: ["NEXT"], flags: { [flag]: "true" } },
+    );
+    expect(unknownFlagError(command, parsed.positional, parsed.flags)).toBeUndefined();
+  }
+});
+
 test("registry guard: flag names that collide ACROSS commands are resolved per command", () => {
   // Cross-command collisions are legitimate (`--git` is a status presentation toggle
   // and an init/track setting), so this pins the inventory instead of banning it: a new
@@ -146,7 +237,7 @@ test("registry guard: flag names that collide ACROSS commands are resolved per c
 
   expect(colliding.map(([name, decls]) => `--${name}: ${decls.map((d) => `${d.command} ${arityWord(d.takesValue)}`).join("; ")}`).sort()).toEqual([
     "--git: status WITHOUT a value; init WITH a value; track WITH a value",
-    "--respect-gitignore: init WITHOUT a value; track WITHOUT a value; ignore WITH a value",
+    "--respect-gitignore: setup WITHOUT a value; init WITHOUT a value; track WITHOUT a value; ignore WITH a value",
   ]);
 
   for (const [name, decls] of colliding) {

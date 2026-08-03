@@ -5,7 +5,8 @@ import type { DaemonActivity } from "./activity.js";
 import type { AccountSummary } from "./account-cmd.js";
 import type { GitDeferral, SyncState, WorkspaceConfig } from "./config.js";
 import type { CredentialLoadResult, Credentials } from "./credentials.js";
-import type { AmbientDaemonStatusRecord, DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonMode } from "./daemon/ambient-status.js";
+import type { AmbientWorkspaceObservation } from "./workspace-observation.js";
 import type { PathWarningsV1 } from "./path-warnings.js";
 import type { PopulateStatusV1 } from "./populate-status.js";
 import type { ResetSafetyInspection } from "./reset-halt-inspection.js";
@@ -58,17 +59,13 @@ export interface StatusReadPort<M extends StatusMode> {
   now: () => number;
   readCredentials: () => Promise<CredentialLoadResult>;
   readPendingGenesis: (accountId: string) => Promise<boolean>;
-  readConfig: (root: string) => Promise<WorkspaceConfig>;
-  readDaemonBinding: (root: string, workspaceId: string) => {
-    alive: { running: boolean; pid?: number; bootId?: string };
-    bound?: string;
-    stale: boolean;
-  };
-  readAmbientDaemonStatus: (root: string) => AmbientDaemonStatusRecord;
+  readWorkspaceObservation: (
+    root: string,
+    request: { depth: "ambient"; now: number },
+  ) => Promise<AmbientWorkspaceObservation>;
   inspectResetJournal: (root: string, stream: string) => Promise<ResetSafetyInspection>;
   readResetHaltHealth: (root: string) => Promise<ResetHaltHealthV1 | undefined>;
   readState: (root: string, stream: string) => Promise<SyncState>;
-  readActivity: (root: string) => Promise<DaemonActivity | undefined>;
   readPathWarnings: (root: string) => Promise<PathWarningsV1 | undefined>;
   readTrashStats: (root: string) => Promise<TrashStats | undefined>;
   readLockingHealth: (root: string) => Promise<LockingHealth>;

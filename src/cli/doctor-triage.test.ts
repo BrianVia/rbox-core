@@ -3,16 +3,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  observeDaemon,
   readTriageInputs,
   renderWorkspaceTriage,
   triageWorkspace,
   type TriageFinding,
   type TriageInputs,
 } from "./doctor-triage.js";
+import { observeDaemon as observeDaemonState } from "./daemon/observation.js";
+import { observeWorkspace as observeWorkspaceState } from "./workspace-observation.js";
 import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks } from "./doctor-cmd.js";
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
+import { loadActivity } from "./activity.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
 import { saveCredentials } from "./credentials.js";
@@ -42,16 +44,35 @@ const healthyChecks = (): DoctorChecks => ({
   chain: { ok: true, label: "manifest chain", message: "head 3" },
 });
 
-const STOPPED: DaemonObservation = { running: false, stale: false, ownsRoot: false };
+const STOPPED: DaemonObservation = {
+  ownership: "stopped",
+  running: false,
+  stale: false,
+  ownsRoot: false,
+  ownsWorkspace: false,
+  sidecarBinding: "absent",
+  ambientTrust: "absent",
+};
 
 const inputs = (over: Partial<TriageInputs> = {}): TriageInputs => ({
   root,
   checks: healthyChecks(),
   deferrals: [],
   ambient: { kind: "absent" },
-  daemon: { running: true, stale: false, ownsRoot: true, pid: LIVE_PID, bootId: BOOT },
+  daemon: {
+    ownership: "owned",
+    running: true,
+    stale: false,
+    ownsRoot: true,
+    ownsWorkspace: true,
+    sidecarBinding: "workspace",
+    pid: LIVE_PID,
+    bootId: BOOT,
+    ambient: { kind: "absent" },
+    ambientTrust: "absent",
+  },
   adopt: { status: "none" },
-  now: NOW,
+  observedAt: NOW,
   cliVersion: "1.9.0",
   ...over,
 });
@@ -67,16 +88,28 @@ const workspaceConfig = () => ({
 });
 
 /** Drive the single liveness/binding seam. A `boundTo` differing from this
- * root's workspace id reproduces a daemon that rebound elsewhere. */
-function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string }) {
+ * root's workspace id reproduces a daemon that rebound elsewhere; `unbound`
+ * reproduces a daemon that has not written its startup binding yet. The
+ * records are injected INTO the observation, so the authorization rule that
+ * admits or drops daemon-owned residue is the production one. */
+function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string; unbound?: boolean }) {
+  const daemon = {
+    readPid: () => opts.running
+      ? { present: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT, version: "v2" as const }
+      : { present: false },
+    readBinding: () => opts.running && opts.unbound !== true
+      ? {
+        present: true,
+        workspaceId: opts.boundTo ?? workspaceConfig().remoteWorkspaceId,
+        bootId: opts.bootId ?? BOOT,
+        version: "v2" as const,
+      }
+      : { present: false },
+    processMatches: () => opts.running,
+  };
   return {
-    daemonBindingStatus: (_root: string, workspaceId: string) => {
-      const alive = opts.running
-        ? { running: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT }
-        : { running: false };
-      const bound = opts.running ? opts.boundTo ?? workspaceId : undefined;
-      return { alive, bound, stale: opts.running && bound !== undefined && bound !== workspaceId };
-    },
+    observeWorkspace: (observedRoot: string, request: { depth: "local"; now?: number }) =>
+      observeWorkspaceState(observedRoot, { ...request, daemon }),
   };
 }
 
@@ -310,7 +343,7 @@ test("a stopped daemon's halt and quota residue is read but never reported", asy
   // Producer proof: the residue IS on disk and WAS read — the gate is what drops it.
   expect(collected.activity?.halt?.typedReason?.kind).toBe("mass-delete");
   expect(collected.activity?.outOfStorage).toBeDefined();
-  expect(collected.daemon.ownsRoot).toBe(false);
+  expect(collected.daemon.ownsWorkspace).toBe(false);
 
   const triage = triageWorkspace(collected);
   expect(findingById(triage.findings, "halt:mass-delete")).toBeUndefined();
@@ -330,15 +363,75 @@ test("a daemon bound to another workspace also drops halt residue", async () => 
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
   const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, boundTo: "ws_elsewhere" }));
-  // Producer proof: the halt IS on disk and the daemon IS alive — the binding
-  // mismatch alone is what makes the residue unowned.
-  expect(collected.activity?.halt).toBeDefined();
+  // Producer proof: the halt IS on disk and the daemon IS alive. Reading it
+  // unauthorized still finds it — the foreign binding alone is what makes the
+  // observation refuse to hand it over.
+  expect((await loadActivity(root))?.halt?.typedReason?.kind).toBe("mass-delete");
+  expect(collected.activity).toBeUndefined();
   expect(collected.daemon.running).toBe(true);
   expect(collected.daemon.stale).toBe(true);
-  expect(collected.daemon.ownsRoot).toBe(false);
+  expect(collected.daemon.ownsWorkspace).toBe(false);
   const findings = triageWorkspace(collected).findings;
   expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
   expect(findingById(findings, "daemon-stale-binding")).toBeDefined();
+});
+
+test("a daemon that has not written its startup binding yet still reports its live halt", async () => {
+  // `rbox start` clears the previous binding before spawning, and the child
+  // rewrites it only after loading its hash cache — seconds to tens of seconds
+  // on a large workspace. A halt raised in that window is a REAL halt.
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 900 of 1000 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+  });
+  await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
+  const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, unbound: true }));
+  expect(collected.daemon.ownership).toBe("unbound");
+  expect(collected.daemon.ownsWorkspace).toBe(false);
+  expect(collected.activity?.halt?.typedReason?.kind).toBe("mass-delete");
+  expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeDefined();
+});
+
+test("a folder re-bound while doctor was running gets no findings from the previous workspace", async () => {
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 900 of 1000 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+  });
+  // The remote, version and chain checks take seconds. `rbox init` rebinding
+  // this folder in that window makes every collected byte the OLD workspace's,
+  // and triage recommends destructive recovery (`--allow-mass-delete`).
+  globalThis.fetch = (async () => {
+    await fs.writeFile(
+      path.join(root, ".rbox", "workspace.json"),
+      JSON.stringify({ ...workspaceConfig(), remoteWorkspaceId: "ws_2" }),
+    );
+    throw new Error("getaddrinfo ENOTFOUND");
+  }) as typeof fetch;
+
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...parts: unknown[]) => void logs.push(parts.map(String).join(" "));
+  try {
+    await doctorCmd(root, {});
+  } finally {
+    console.log = origLog;
+  }
+  const out = logs.join("\n");
+  expect(out).toContain("re-bound to a different workspace while rbox doctor was running");
+  expect(out).not.toContain("rbox doctor — ");
+  expect(out).not.toContain("--allow-mass-delete");
 });
 
 // ---- R2 HIGH 3: ownership is ONE fresh, root-aware observation ----
@@ -363,7 +456,7 @@ test("a pid that is alive but is not this root's daemon leaves residue unowned",
   const collected = await readTriageInputs(root, healthyChecks(), NOW);
   expect(collected.activity?.halt).toBeDefined();
   expect(collected.daemon.running).toBe(false);
-  expect(collected.daemon.ownsRoot).toBe(false);
+  expect(collected.daemon.ownsWorkspace).toBe(false);
 
   const findings = triageWorkspace(collected).findings;
   expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
@@ -376,7 +469,13 @@ test("a live daemon for a PREFIX SIBLING root does not claim this one", async ()
   // used a substring test, so a daemon for `<root>-old` owned `<root>` — and a
   // reused pid then attributed that workspace's halt to this one.
   const sibling = `${root}-old`;
-  const squatter = Bun.spawn(["sh", "-c", "sleep 30", "__daemon-run", sibling], { stdout: "ignore", stderr: "ignore" });
+  // Keep the marker/root in the observed process argv. Newer Bun/macOS
+  // combinations let `sh -c "sleep 30"` exec sleep, which erases the shell's
+  // trailing test arguments before `ps` can observe them.
+  const squatter = Bun.spawn(
+    [process.execPath, "-e", "await Bun.sleep(30_000)", "__daemon-run", sibling],
+    { stdout: "ignore", stderr: "ignore" },
+  );
   try {
     // The SAME live pid is recorded for both roots — the pid reuse this defect
     // needed. Only the command line can tell the two workspaces apart.
@@ -394,9 +493,10 @@ test("a live daemon for a PREFIX SIBLING root does not claim this one", async ()
         typedReason: { kind: "mass-delete", op: "pull" },
       },
     });
-    expect(observeDaemon(root).ownsRoot).toBe(false);
+    expect(observeDaemonState(root, "ws_1").ownsRoot).toBe(false);
+    expect(observeDaemonState(root, "ws_1").ownsWorkspace).toBe(false);
     // ...and the same process IS still recognized as the sibling's own daemon.
-    expect(observeDaemon(sibling).running).toBe(true);
+    expect(observeDaemonState(sibling, undefined).running).toBe(true);
 
     const collected = await readTriageInputs(root, healthyChecks(), NOW);
     expect(collected.activity?.halt).toBeDefined();
@@ -426,7 +526,7 @@ test("a live rbox daemon for ANOTHER root does not claim this one", async () => 
       },
     });
     const collected = await readTriageInputs(root, healthyChecks(), NOW);
-    expect(collected.daemon.ownsRoot).toBe(false);
+    expect(collected.daemon.ownsWorkspace).toBe(false);
     expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeUndefined();
   } finally {
     squatter.kill();
@@ -450,7 +550,7 @@ test("ownership comes from the triage-time observation, not the earlier check ve
   const staleChecks = healthyChecks();
   staleChecks.daemon = { ok: false, label: "background sync", message: "stale", status: "stale" };
   const collected = await readTriageInputs(root, staleChecks, NOW, liveness({ running: true }));
-  expect(collected.daemon.ownsRoot).toBe(true);
+  expect(collected.daemon.ownsWorkspace).toBe(true);
   const findings = triageWorkspace(collected).findings;
   expect(findingById(findings, "halt:mass-delete")).toBeDefined();
   expect(findingById(findings, "daemon-stale-binding")).toBeUndefined();
@@ -462,7 +562,7 @@ test("a pull-only claim requires the status record to match the live pidfile inc
   await writeDaemonRecords({ statusBootId: "boot-other", pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
   const mismatched = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   expect(mismatched.daemon.bootId).toBe(BOOT);
-  expect(mismatched.ambient.kind).toBe("ok");
+  expect(mismatched.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(mismatched).findings, "pull-only")).toBeUndefined();
 
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
@@ -484,8 +584,8 @@ test("a record from a PREVIOUS boot yields no watcher and no version-skew findin
   const old = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   // Producer proof: the record parsed, the daemon is live and owns this root —
   // the boot-id mismatch is the only thing standing between them.
-  expect(old.ambient.kind).toBe("ok");
-  expect(old.daemon.ownsRoot).toBe(true);
+  expect(old.daemon.ambient.kind).toBe("ok");
+  expect(old.daemon.ownsWorkspace).toBe(true);
   expect(old.daemon.bootId).toBe(BOOT);
 
   const findings = triageWorkspace(old).findings;
@@ -501,7 +601,7 @@ test("a legacy record with no boot id at all is not trusted", async () => {
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
   const legacy = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
-  expect(legacy.ambient.kind).toBe("ok");
+  expect(legacy.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(legacy).findings, "watcher-degraded")).toBeUndefined();
 });
 
@@ -512,7 +612,7 @@ test("a dead daemon's fresh record produces no watcher or version finding", asyn
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
   const dead = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: false }));
-  expect(dead.ambient.kind).toBe("ok");
+  expect(dead.daemon.ambient.kind).toBe("ok");
   const findings = triageWorkspace(dead).findings;
   expect(findingById(findings, "watcher-degraded")).toBeUndefined();
   expect(findingById(findings, "daemon-version-skew")).toBeUndefined();
@@ -525,7 +625,7 @@ test("a future-dated heartbeat is not trusted as live state", async () => {
     status: { state: "attention", attentionReason: "watcher-degraded", heartbeatAt: new Date(NOW + 3 * 3600_000).toISOString() },
   });
   const skewed = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
-  expect(skewed.ambient.kind).toBe("ok");
+  expect(skewed.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(skewed).findings, "watcher-degraded")).toBeUndefined();
 });
 
@@ -576,7 +676,7 @@ test("a pull-side mass-delete halt consents to that pull only, and names the cou
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
   const live = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
-  expect(live.daemon.ownsRoot).toBe(true);
+  expect(live.daemon.ownsWorkspace).toBe(true);
   const finding = findingById(triageWorkspace(live).findings, "halt:mass-delete");
   expect(finding?.command).toBe(`cd ${root} && rbox pull --allow-mass-delete`);
   expect(finding?.command).not.toContain("rbox sync");
@@ -620,20 +720,49 @@ test("malformed local state is honest that rbox cannot repair it, and never offe
   expect(finding?.safety).not.toMatch(/[^&] `rbox setup`/);
 });
 
-test("a state plane from a newer rbox is reported end to end and never advises deleting it", async () => {
+/**
+ * Rewritten by wave 5B (163 §C4).
+ *
+ * This fixture writes rbox's OWN authority marker with no database behind it, and
+ * the old code reported it as "written by a newer version of rbox — run `rbox
+ * upgrade`". That copy was wrong in both halves: `classifyStateFormat` returns
+ * `authority-marker` only for the marker THIS binary writes (a future one is
+ * `foreign`), so the workspace is not from a newer rbox, and the binary being
+ * told to upgrade is already current. The 2C review flagged it as blocking before
+ * any 2.0 tag.
+ *
+ * What the fixture actually is: 163's contradictory-authority row. 222 §6.4 gives
+ * it the one honest remedy — re-adoption, spelled out — and the never-advise-
+ * deleting property carries over unchanged.
+ */
+test("a marker with no records behind it is contradictory authority, not a too-new format", async () => {
   await fs.writeFile(path.join(root, ".rbox", "state.json"), `RBOX-SQLITE-AUTHORITY-v1\n${"a".repeat(32)}\n`);
   const ctx = await collectDoctorContext(root);
   expect(ctx.checks.state.ok).toBe(false);
-  expect(ctx.checks.state.status).toBe("format-too-new");
-  expect(ctx.checks.state.hint).not.toContain("delete it");
+  expect(ctx.checks.state.status).toBe("authority-corrupt");
+  // The one thing a doctor must never do: tell a current binary to upgrade itself.
+  expect(ctx.checks.state.hint).not.toContain("rbox upgrade");
+  expect(ctx.checks.state.hint).not.toContain("delete");
 
-  const finding = findingById(triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings, "state-format-too-new");
+  const finding = findingById(triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings, "state-authority-corrupt");
   expect(finding?.severity).toBe("blocked");
-  expect(finding?.problem).toContain("newer version of rbox");
-  expect(finding?.command).toBe("rbox upgrade");
-  // The only mention of deletion anywhere in the finding is the instruction NOT to.
-  expect(`${finding?.problem} ${finding?.safety} ${finding?.command}`.match(/delet/gi)?.length).toBe(1);
-  expect(finding?.safety).toContain("Do not delete");
+  expect(finding?.problem).toContain("missing or do not match");
+  expect(finding?.command).toContain("rbox adopt");
+  // 163: never advise deleting the marker, and never advise restoring a backup.
+  const whole = `${finding?.problem} ${finding?.safety} ${finding?.command}`;
+  expect(whole).not.toMatch(/delet/i);
+  expect(whole).not.toMatch(/restore/i);
+});
+
+/** A healthy migrated workspace is the case this must never regress into: the
+ * `state` check reports it as healthy, and no finding is produced at all. The
+ * store-backed positive is proved by the snapshot-replay harness against real
+ * data; what is pinned here is that "migrated" alone is not a fault. */
+test("a healthy legacy workspace still reports a healthy state check", async () => {
+  const ctx = await collectDoctorContext(root);
+  expect(ctx.checks.state.ok).toBe(true);
+  expect(ctx.checks.migration?.ok).toBe(true);
+  expect(ctx.checks.migration?.message).toBe("no conversion in progress");
 });
 
 test("a foreign occupant of the upgrade reserve is reported without threatening it", () => {

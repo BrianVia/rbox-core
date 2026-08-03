@@ -21,8 +21,9 @@ import type { LineageSnapshot } from "../ports.js";
 import { PAGE_BYTES } from "./sealed-stages.js";
 import {
   PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, openSealedArtifact,
-  sealAndPublish, sealedStagePath, streamRows,
+  sealAndPublish, sealedStagePath,
 } from "./stage-artifacts.js";
+import { runStatement, selectRow, streamRows } from "./statements.js";
 
 const MAX_ROW_CANONICAL_BYTES = 8 * 1024 * 1024;
 const MAX_ROW_RETAINED_BYTES = 24 * 1024 * 1024;
@@ -117,8 +118,8 @@ export function beginRepoTransitionStage(
     db = new Database(privateDirectory.file(), { create: true, readwrite: true });
     configureStageBuilder(db);
     db.exec(TRANSITION_DDL);
-    db.query(`INSERT INTO transition_meta(stage_id,state,snapshot_cjson,source_bindings_cjson,importer,global_binding_cjson)
-      VALUES (?,'building',?,?,?,?)`).run(
+    runStatement(db, `INSERT INTO transition_meta(stage_id,state,snapshot_cjson,source_bindings_cjson,importer,global_binding_cjson)
+      VALUES (?,'building',?,?,?,?)`,
       stageId, canonicalJson(snapshotToken), canonicalJson(bindings), importer,
       globalBinding === undefined ? null : canonicalJson(globalBinding),
     );
@@ -179,10 +180,10 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
       this.#pendingBytes = 0;
     }
     try {
-      this.db.query(`INSERT INTO transition_rows(stage_id,rel_path,path_order,expected_repo_gen,
+      runStatement(this.db, `INSERT INTO transition_rows(stage_id,rel_path,path_order,expected_repo_gen,
         record_cjson,base_proof_cjson,evidence_cjson,canonical_bytes,retained_estimate)
-        VALUES (?,?,?,?,?,?,?,?,?)`).run(
-        this.stageId, input.relPath, encoded.pathOrder, input.expectedRepoGen,
+        VALUES (?,?,?,?,?,?,?,?,?)`,
+      this.stageId, input.relPath, encoded.pathOrder, input.expectedRepoGen,
         canonicalRecord, canonicalProof ?? null, canonicalEvidence, rowCanonical, rowRetained,
       );
     } catch (error) {
@@ -205,8 +206,8 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
       });
       const rowCount = digest.rows;
       const logicalDigest = digest.seal();
-      this.db.query("UPDATE transition_meta SET state='sealed',digest=?,row_count=? WHERE stage_id=?")
-        .run(logicalDigest, rowCount, this.stageId);
+      runStatement(this.db, "UPDATE transition_meta SET state='sealed',digest=?,row_count=? WHERE stage_id=?",
+        logicalDigest, rowCount, this.stageId);
       this.db.exec("COMMIT");
       this.#open = false;
       const physical = sealAndPublish(
@@ -291,12 +292,12 @@ export function openSealedRepoTransitionStage(
 ): SealedTransitionReader {
   const accessor = openSealedArtifact(directory, ref, lock);
   try {
-    const meta = accessor.db.query(`SELECT stage_id,state,snapshot_cjson,source_bindings_cjson,importer,
-      global_binding_cjson,digest,row_count FROM transition_meta`).get() as {
+    const meta = selectRow<{
       stage_id: string; state: string; snapshot_cjson: string; source_bindings_cjson: string;
       importer: "engine" | "migration"; global_binding_cjson: string | null;
       digest: string; row_count: number;
-    } | null;
+    }>(accessor.db, `SELECT stage_id,state,snapshot_cjson,source_bindings_cjson,importer,
+      global_binding_cjson,digest,row_count FROM transition_meta`);
     if (!meta || meta.stage_id !== ref.stageId || meta.state !== "sealed") {
       throw new StageChangedError(ref.stageId, "sealed transition identity does not match its ref");
     }
