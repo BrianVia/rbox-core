@@ -4,7 +4,7 @@
 # perWorkspace came back empty. This round clears grace atomically with the
 # plan flip via D1 SQL, runs retention (floors -> head-1), restores pro+100.
 # Run AFTER the round-1 phase1 loop exits, daemons still stopped:
-#   ! bash scratchpad-purge-founder-2.sh
+#   ! bash scripts/purge-founder-history-2.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 set -a; source prod-keys.local.secret; source ~/.secret_env_vars; set +a
