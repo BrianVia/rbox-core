@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-03 (later): **2.0 MERGED INTO MAIN (#623, squash `098d00643`)
+— the U3 line now ships from the integration branch.** Branch tip preserved as
+tag `archive/2.0` (repo forbids merge commits); `origin/2.0` can be deleted
+(classifier blocked the agent; run `git push origin --delete 2.0`). Conflict
+port (opus lane): main's #620 ORIG_HEAD waiver moved into `follow-classify.ts`,
+#617 copy kept in the consolidated help registry, fairuse #603/#618 taken
+as-is; #606's growth of `engine/git/capture.ts` (402 lines) tripped 2.0's new
+size gate → allowlisted + ratchet-pinned. Full CI green on the merged tree.
+Also **docs reorg (#624)**: 96 loose `REVIEW-*.md` → `docs/design/reviews/`,
+root SPEC/CODEX strays → `docs/design/notes/<N>/`; repo root is down to
+AGENTS/CHANGELOG/CLAUDE/README. OPEN: product-model discussion (Max's
+feedback) — leaning "one folder, workspaces demoted to internal"; no design
+doc yet._
+
 _SESSION 2026-08-03: **PR #621 (codex 60-file CLI/daemon runtime-primitives
 refactor on 2.0) reviewed, remediated, MERGED — plus #619 (rules port) and
 #622 (file-size ratchet).** 5-lane adversarial review (deletion evidence /
