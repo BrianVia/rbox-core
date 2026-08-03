@@ -2,7 +2,7 @@
 # Founder-account manual purge — drops ALL version history (head survives) and
 # drains stranded refs NOW instead of over ~3 weeks of 2000-row cron ticks.
 #
-# RUN AS:  ! bash scratchpad-purge-founder.sh          (from the repo root)
+# RUN AS:  ! bash scripts/purge-founder-history.sh   (from the repo root)
 # PRECONDITION: rbox daemons STOPPED on all three hosts:
 #   via-desktop-ubuntu / dfinitiv-macbook-pro / flat-meadow-prod-main-01:
 #     cd ~/Development && ~/.rbox/bin/rbox stop
