@@ -3,7 +3,8 @@ import { diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../en
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
 import { knownRepoKeys } from "./sync-state-model.js";
-import { validDaemonVersion, type DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import {
@@ -71,14 +72,10 @@ function trustedLocalSnapshot(input: {
   activity: DaemonActivity | undefined;
   state: SyncState;
   now: number;
-  daemonRunning: boolean;
-  boundWorkspaceId?: string;
-  currentWorkspaceId: string;
-  livePidfileBootId?: string;
+  daemon: Pick<DaemonObservation, "running" | "ownsWorkspace" | "bootId">;
 }): { local: NonNullable<DaemonActivity["local"]>; ageMs: number } | undefined {
-  if (!input.daemonRunning) return undefined;
-  if (input.boundWorkspaceId !== input.currentWorkspaceId) return undefined;
-  if (input.livePidfileBootId === undefined) return undefined;
+  if (!input.daemon.running || !input.daemon.ownsWorkspace) return undefined;
+  if (input.daemon.bootId === undefined) return undefined;
   const { activity, state, now } = input;
   if (!activity) return undefined;
   const local = activity.local;
@@ -156,24 +153,18 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const loadedCredentials = await port.readCredentials();
   const creds = loadedCredentials.state === "valid" ? loadedCredentials.credentials : undefined;
   const genesisPending = Boolean(creds?.accountId && await port.readPendingGenesis(creds.accountId));
-  const rawCfg = await port.readConfig(root);
+  const observationNow = port.now();
+  const workspaceObservation = await port.readWorkspaceObservation(root, { depth: "ambient", now: observationNow });
+  const rawCfg = workspaceObservation.config;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const binding = port.readDaemonBinding(root, cfg.remoteWorkspaceId);
-  const alive = binding.alive;
-  const running = alive.running && !binding.stale;
-  let daemonVersion: string | undefined;
-  let daemonMode: DaemonMode | undefined;
-  if (running) {
-    const record = port.readAmbientDaemonStatus(root);
-    if (record.kind === "ok") {
-      if (validDaemonVersion(record.status.daemonVersion)) daemonVersion = record.status.daemonVersion;
-      if (alive.bootId !== undefined && record.status.bootId === alive.bootId) daemonMode = record.status.mode;
-    }
-  }
+  const observedDaemon = workspaceObservation.daemon;
+  const running = observedDaemon.running && !observedDaemon.stale;
+  const daemonVersion = observedDaemon.version;
+  const daemonMode: DaemonMode | undefined = observedDaemon.mode;
   const daemon: StatusDaemonProjection = {
     running,
-    ...(alive.pid === undefined ? {} : { pid: alive.pid }),
-    stale: binding.stale,
+    ...(observedDaemon.pid === undefined ? {} : { pid: observedDaemon.pid }),
+    stale: observedDaemon.stale,
     version: daemonVersion,
     mode: daemonMode,
     versionSkew: daemonVersion !== undefined && daemonVersion !== RBOX_VERSION,
@@ -210,6 +201,8 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     return halt as WorkspaceStatusProjection<M>;
   }
 
+  const rawActivityP = workspaceObservation.readActivity();
+
   const accountSummaryP = probes.mode === "verbose" ? probes.readAccountSummary(loadedCredentials) : undefined;
   let state = await port.readState(root, syncStreamId(cfg));
   let hygieneDetails: StatusDeferralDisplayDetails = new Map();
@@ -221,21 +214,18 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   };
   await runHygiene();
 
-  const activityP = binding.stale ? Promise.resolve(undefined) : port.readActivity(root);
   const pathWarningsP = port.readPathWarnings(root);
   const trashP = port.readTrashStats(root);
   const lockingP = port.readLockingHealth(root);
   const accountJsonP = probes.mode === "json" ? probes.readAccountUsage(loadedCredentials) : undefined;
-  const [rawActivity, durablePathWarnings] = await Promise.all([activityP, pathWarningsP]);
+  const rawActivity = await rawActivityP;
+  const durablePathWarnings = await pathWarningsP;
   let pathWarnings: PathWarningsV1 | undefined = durablePathWarnings;
   const attributionNow = port.now();
   const attributeActivity = (base: SyncState) =>
     attributeDaemonForStatus({
       activity: rawActivity,
-      daemonRunning: running,
-      boundWorkspaceId: binding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
+      daemon: observedDaemon,
       localSequence: base.lastSyncedSequence,
       now: attributionNow,
     });
@@ -259,10 +249,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       activity,
       state,
       now: attributionNow,
-      daemonRunning: running,
-      boundWorkspaceId: binding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
+      daemon: observedDaemon,
     });
 
   const evaluateGit = async (

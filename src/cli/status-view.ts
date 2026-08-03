@@ -12,6 +12,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, isSafetyHaltReason, type DaemonActivity } from "./activity.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 import type { GitDeferral, GitDeferralReason, RepoRecord } from "./sync-state-model.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
@@ -206,28 +207,24 @@ const BINARY_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"] as const;
 
 export function attributeDaemonForStatus(input: {
   activity: DaemonActivity | undefined;
-  daemonRunning: boolean;
-  boundWorkspaceId?: string;
-  currentWorkspaceId: string;
-  livePidfileBootId?: string;
+  daemon: Pick<DaemonObservation, "running" | "ownsWorkspace" | "bootId">;
   localSequence: number;
   now: number;
 }): DaemonStatusAttribution {
   const { activity } = input;
   const ws = activity?.ws;
-  if (ws && input.livePidfileBootId !== undefined && ws.bootId !== input.livePidfileBootId) {
+  if (ws && input.daemon.bootId !== undefined && ws.bootId !== input.daemon.bootId) {
     return { activity: undefined, elided: false };
   }
   if (!activity || !ws) return { activity, elided: false };
 
-  const bindingCurrent = input.boundWorkspaceId === input.currentWorkspaceId;
   const ageMs = input.now - Date.parse(ws.at);
   const finiteAge = Number.isFinite(ageMs) ? ageMs : Number.POSITIVE_INFINITY;
   const connectionTrusted = finiteAge >= 0 && finiteAge < WS_TRUST_MS;
   const canElide =
-    input.daemonRunning &&
-    bindingCurrent &&
-    ws.bootId === input.livePidfileBootId &&
+    input.daemon.running &&
+    input.daemon.ownsWorkspace &&
+    ws.bootId === input.daemon.bootId &&
     ws.connected === true &&
     ws.caughtUp === true &&
     connectionTrusted &&

@@ -1,7 +1,8 @@
 import { test, expect } from "bun:test";
 import { daemonSpawnArgs } from "./daemon-control.js";
+import { DAEMON_PROCESS_MARKER } from "./daemon/process-identity.js";
 
-const MARKER = "__daemon-run";
+const MARKER = DAEMON_PROCESS_MARKER;
 // Inside a COMPILED binary, process.argv[1] is Bun's virtual entry, not a real file.
 const BUNFS_ENTRY = "/$bunfs/root/index.ts";
 // Under `bun run`, process.argv[1] is the real script path.

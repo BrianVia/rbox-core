@@ -445,3 +445,16 @@ removed; the redacted result is retained at
 - **Generalizes to the whole Workers suite**: one D1 is shared across every
   file in a shard, so any test whose subject reads a table **globally** must
   neutralize rows it did not create, not merely clean up its own.
+
+## SUSPECTED (proof pending): daemon-trusted-pull design-206 fallback case
+
+- 2026-08-02, PR #621 push fcfd22479, `tests · shard 1/6` attempt 1:
+  `(fail) design 206 (#464): a git-topology pull falls back once, then the
+  NEXT pull is trusted again` — `Received: undefined` at
+  `daemon-trusted-pull.test.ts:528`. Attempt 2: pass. Locally: file alone
+  27/27, `src/cli/daemon/` together 412/412 (same SHA).
+- The registry bar is a reproduction, not a rerun-went-green — this entry is
+  a SIGHTING, recorded because that PR moved the daemon's startup binding
+  write earlier in `start()` and this test drives pull trust. If it recurs,
+  suspect that interaction first and reproduce under shard ordering
+  (`bun test --shard`), not the file alone.

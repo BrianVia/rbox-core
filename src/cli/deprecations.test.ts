@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { resolveAlias } from "./deprecations.js";
+import { resolveAlias } from "./help-registry.js";
 
 test("simple renames forward to the canonical command and warn with the replacement", () => {
   expect(resolveAlias("link", ["~/code/app"])).toEqual({

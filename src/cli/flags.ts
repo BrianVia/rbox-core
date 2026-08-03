@@ -1,13 +1,5 @@
-import { COMMAND_HELP, helpFor, helpKeyFor, resolveCommandAlias } from "./help-registry.js";
+import { COMMAND_HELP, GLOBAL_FLAGS, helpFor, helpKeyFor, resolveCommandAlias, type CommandFlag } from "./help-registry.js";
 
-const SHORT_FLAGS: Record<string, { key: string; takesValue?: true }> = {
-  "-f": { key: "follow" },
-  "-n": { key: "lines", takesValue: true },
-  "-y": { key: "yes" },
-  "-w": { key: "workspace", takesValue: true },
-};
-
-const REPEATABLE_VALUE_FLAGS = new Set(["include"]);
 const REPEATABLE_VALUE_SEPARATOR = "\0";
 
 /** Return every value of an allowlisted repeatable flag without widening the
@@ -18,19 +10,33 @@ export function flagValues(flags: Record<string, string>, key: string): string[]
   return value === undefined ? [] : value.split(REPEATABLE_VALUE_SEPARATOR);
 }
 
-function setLongFlag(flags: Record<string, string>, key: string, value: string): void {
+function setLongFlag(flags: Record<string, string>, key: string, value: string, repeatable: boolean): void {
   const previous = flags[key];
-  flags[key] = REPEATABLE_VALUE_FLAGS.has(key) && previous !== undefined
+  flags[key] = repeatable && previous !== undefined
     ? `${previous}${REPEATABLE_VALUE_SEPARATOR}${value}`
     : value;
 }
 
-/** A help entry's `--flag`/`--flag <value>` spec → its name and whether it takes a value. */
-function declaredArity(flag: string): { name: string; takesValue: boolean } | undefined {
-  const token = flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1];
-  if (!token) return undefined;
-  return { name: token.slice(2), takesValue: flag.slice(token.length).trim().length > 0 };
+interface FlagSyntax {
+  takesValue: boolean;
+  repeatable: boolean;
 }
+
+function flagName(flag: CommandFlag): string | undefined {
+  const token = flag.flag.split(/\s+/, 1)[0];
+  return token?.startsWith("--") ? token.slice(2) : undefined;
+}
+
+function flagSyntax(flag: CommandFlag): FlagSyntax {
+  return { takesValue: flag.takesValue === true, repeatable: flag.repeatable === true };
+}
+
+const SHORT_FLAGS: ReadonlyMap<string, { key: string } & FlagSyntax> = new Map(
+  COMMAND_HELP.flatMap((command) => (command.flags ?? []).flatMap((flag) => {
+    const key = flagName(flag);
+    return flag.short && key ? [[flag.short, { key, ...flagSyntax(flag) }] as const] : [];
+  })),
+);
 
 /**
  * Fallback arity for a command we cannot resolve (`rbox help`, an internal `__…`
@@ -41,49 +47,49 @@ function declaredArity(flag: string): { name: string; takesValue: boolean } | un
  * A flag that really wanted a value then fails loudly downstream instead of silently
  * eating a path. `flags.test.ts` pins the colliding-name inventory.
  */
-const FALLBACK_LONG_FLAG_ARITY = ((): Map<string, boolean> => {
-  const arity = new Map<string, boolean>();
+const FALLBACK_LONG_FLAG_SYNTAX = ((): Map<string, FlagSyntax> => {
+  const syntax = new Map<string, FlagSyntax>();
   const collides = new Set<string>();
-  for (const command of COMMAND_HELP) {
-    for (const { flag } of command.flags ?? []) {
-      const declared = declaredArity(flag);
-      if (!declared) continue;
-      const prev = arity.get(declared.name);
-      if (prev !== undefined && prev !== declared.takesValue) collides.add(declared.name);
-      arity.set(declared.name, declared.takesValue);
+  for (const flags of [GLOBAL_FLAGS, ...COMMAND_HELP.map((command) => command.flags ?? [])]) {
+    for (const flag of flags) {
+      const name = flagName(flag);
+      if (!name) continue;
+      const declared = flagSyntax(flag);
+      const previous = syntax.get(name);
+      if (previous !== undefined && previous.takesValue !== declared.takesValue) collides.add(name);
+      syntax.set(name, declared);
     }
   }
-  for (const name of collides) arity.set(name, false);
-  return arity;
+  for (const name of collides) syntax.set(name, { takesValue: false, repeatable: false });
+  return syntax;
 })();
 
 /**
  * Arity for one command: the fallback union overlaid with that command's OWN
  * declarations. The overlay is what makes `rbox status --git <path>` (valueless) and
- * `rbox init --git false` (valued) both parse correctly; the base keeps flags a
- * command accepts but does not document (HIDDEN_FLAGS below — e.g. `rbox track
- * --no-interactive`) parsing exactly as the registry-wide union always did.
+ * `rbox init --git false` (valued) both parse correctly; hidden accepted syntax is
+ * declared beside visible syntax in the same command entry.
  * `helpFor` unions a group's sub-verbs, which is unambiguous only because no single
  * help key declares one name at two arities — enforced by a guard in `flags.test.ts`.
  * A deprecated alias is resolved to its target first: the dispatcher rewrites `link` to
  * `track` only AFTER parsing, so without that hop `rbox link --git false <path>` parsed
  * against the alias's empty declarations and lost the path.
  */
-function longFlagArityFor(cmd: string | undefined): Map<string, boolean> {
+function longFlagSyntaxFor(cmd: string | undefined): Map<string, FlagSyntax> {
   const entries = cmd ? helpFor(resolveCommandAlias(cmd)) : undefined;
-  if (!entries) return FALLBACK_LONG_FLAG_ARITY;
-  const arity = new Map(FALLBACK_LONG_FLAG_ARITY);
+  if (!entries) return FALLBACK_LONG_FLAG_SYNTAX;
+  const syntax = new Map(FALLBACK_LONG_FLAG_SYNTAX);
   for (const entry of entries) {
-    for (const { flag } of entry.flags ?? []) {
-      const declared = declaredArity(flag);
-      if (declared) arity.set(declared.name, declared.takesValue);
+    for (const flag of entry.flags ?? []) {
+      const name = flagName(flag);
+      if (name) syntax.set(name, flagSyntax(flag));
     }
   }
-  return arity;
+  return syntax;
 }
 
 export function parseFlags(args: string[], cmd?: string): { positional: string[]; flags: Record<string, string> } {
-  const longFlagArity = longFlagArityFor(cmd);
+  const longFlagSyntax = longFlagSyntaxFor(cmd);
   const positional: string[] = [];
   const flags: Record<string, string> = {};
   for (let i = 0; i < args.length; i++) {
@@ -92,17 +98,17 @@ export function parseFlags(args: string[], cmd?: string): { positional: string[]
       const eq = a.indexOf("=");
       const key = eq === -1 ? a.slice(2) : a.slice(2, eq);
       const value = eq === -1 ? undefined : a.slice(eq + 1);
-      const takesValue = longFlagArity.get(key);
+      const syntax = longFlagSyntax.get(key);
       if (value !== undefined) {
-        setLongFlag(flags, key, value);
-      } else if (takesValue === false) {
+        setLongFlag(flags, key, value, syntax?.repeatable === true);
+      } else if (syntax?.takesValue === false) {
         flags[key] = "true";
       } else {
         const next = args[i + 1] && !args[i + 1]!.startsWith("--") ? args[++i]! : undefined;
-        setLongFlag(flags, key, next ?? (REPEATABLE_VALUE_FLAGS.has(key) ? "" : "true"));
+        setLongFlag(flags, key, next ?? (syntax?.repeatable ? "" : "true"), syntax?.repeatable === true);
       }
-    } else if (SHORT_FLAGS[a]) {
-      const spec = SHORT_FLAGS[a]!;
+    } else if (SHORT_FLAGS.has(a)) {
+      const spec = SHORT_FLAGS.get(a)!;
       flags[spec.key] = spec.takesValue && args[i + 1] && !args[i + 1]!.startsWith("-") ? args[++i]! : "true";
     } else {
       positional.push(a);
@@ -111,20 +117,14 @@ export function parseFlags(args: string[], cmd?: string): { positional: string[]
   return { positional, flags };
 }
 
-const HIDDEN_FLAGS: Record<string, string[]> = {
-  track: ["project", "name", "device", "no-interactive"],
-  init: ["name", "project", "pull-only"],
-  setup: ["new", "name", "no-sync", "respect-gitignore"],
-};
-
 export function unknownFlagError(cmd: string, positional: string[], flags: Record<string, string>): string | undefined {
   const entries = helpFor(helpKeyFor(cmd, positional));
   if (!entries) return undefined;
-  const allowed = new Set(["json", "help", ...(HIDDEN_FLAGS[cmd] ?? [])]);
+  const allowed = new Set(GLOBAL_FLAGS.flatMap((flag) => flagName(flag) ?? []));
   for (const entry of entries) {
-    for (const { flag } of entry.flags ?? []) {
-      const token = flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1];
-      if (token) allowed.add(token.slice(2));
+    for (const flag of entry.flags ?? []) {
+      const name = flagName(flag);
+      if (name) allowed.add(name);
     }
   }
   const key = Object.keys(flags).find((candidate) => !allowed.has(candidate));

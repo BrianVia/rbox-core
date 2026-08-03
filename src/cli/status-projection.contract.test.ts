@@ -50,6 +50,41 @@ function trustedActivity(): DaemonActivity {
   };
 }
 
+const stoppedWorkspaceObservation = (readActivity: () => Promise<DaemonActivity | undefined> = async () => undefined) => ({
+  depth: "ambient" as const,
+  root: ROOT,
+  observedAt: NOW,
+  config: CFG,
+  daemon: {
+    ownership: "stopped" as const,
+    running: false,
+    stale: false,
+    ownsRoot: false,
+    ownsWorkspace: false,
+    sidecarBinding: "absent" as const,
+    ambient: { kind: "absent" as const },
+    ambientTrust: "absent" as const,
+  },
+  readActivity,
+});
+
+const ownedWorkspaceObservation = (activity: DaemonActivity) => ({
+  ...stoppedWorkspaceObservation(async () => activity),
+  daemon: {
+    ownership: "owned" as const,
+    running: true,
+    pid: 9,
+    bootId: "boot-1",
+    boundWorkspaceId: CFG.remoteWorkspaceId,
+    stale: false,
+    ownsRoot: true,
+    ownsWorkspace: true,
+    sidecarBinding: "workspace" as const,
+    ambient: { kind: "absent" as const },
+    ambientTrust: "absent" as const,
+  },
+});
+
 interface Recorder {
   calls: string[];
   countOf: (name: string) => number;
@@ -91,13 +126,12 @@ function readPort<M extends StatusMode>(
     now: () => NOW,
     readCredentials: note("readCredentials", async () => ({ state: "absent" as const })),
     readPendingGenesis: note("readPendingGenesis", async () => false),
-    readConfig: note("readConfig", async () => CFG),
-    readDaemonBinding: note("readDaemonBinding", () => ({ alive: { running: false }, stale: false })),
-    readAmbientDaemonStatus: note("readAmbientDaemonStatus", () => ({ kind: "absent" as const })),
+    readWorkspaceObservation: note("readWorkspaceObservation", async () => stoppedWorkspaceObservation(
+      note("readWorkspaceActivity", async () => undefined),
+    )),
     inspectResetJournal: note("inspectResetJournal", async () => ({ status: "none" as const })),
     readResetHaltHealth: note("readResetHaltHealth", async () => undefined),
     readState: note("readState", async () => current),
-    readActivity: note("readActivity", async () => undefined),
     readPathWarnings: note("readPathWarnings", async () => undefined),
     readTrashStats: note("readTrashStats", async () => undefined),
     readLockingHealth: note("readLockingHealth", async () => ({ status: "ok" as const })),
@@ -112,7 +146,14 @@ function readPort<M extends StatusMode>(
     readConflictSnapshotStatus: note("readConflictSnapshotStatus", async () => ({ total: 0, prunable: 0 })),
     readCheckoutTransactionCapability: note("readCheckoutTransactionCapability", async () => ({}) as never),
     probes: probePort(mode, calls) as StatusReadPort<M>["probes"],
-    ...overrides,
+    // Overrides are recorded too. A raw spread replaced the recorder, which made
+    // every call-count assertion about an overridden read vacuously true.
+    ...Object.fromEntries(
+      Object.entries(overrides).map(([name, value]) => [
+        name,
+        typeof value === "function" ? note(name, value as (...args: unknown[]) => unknown) : value,
+      ]),
+    ) as Partial<StatusReadPort<M>>,
   };
   return { port, calls, countOf: (name) => calls.filter((entry) => entry === name).length };
 }
@@ -143,10 +184,9 @@ test("one invocation performs one projection: every admitted read happens exactl
   expect(refreshes).toHaveLength(1);
   for (const read of [
     "readCredentials",
-    "readConfig",
-    "readDaemonBinding",
+    "readWorkspaceObservation",
+    "readWorkspaceActivity",
     "readState",
-    "readActivity",
     "readPathWarnings",
     "readTrashStats",
     "readLockingHealth",
@@ -200,14 +240,14 @@ test("reset halt never dereferences state", async () => {
   if (projection.kind !== "reset-halt") throw new Error("unreachable");
   expect(projection.reason).toBe("unreadable-journal");
   expect(calls).not.toContain("readState");
-  expect(calls).not.toContain("readActivity");
+  expect(calls.filter((call) => call === "readWorkspaceObservation")).toHaveLength(1);
+  expect(calls).not.toContain("readWorkspaceActivity");
   expect(calls).not.toContain("scanManifest");
 });
 
 test("trusted local observation skips the hashcache and the manifest scan", async () => {
   const { port, calls } = readPort("brief", {
-    readDaemonBinding: () => ({ alive: { running: true, pid: 9, bootId: "boot-1" }, bound: CFG.remoteWorkspaceId, stale: false }),
-    readActivity: async () => trustedActivity(),
+    readWorkspaceObservation: async () => ownedWorkspaceObservation(trustedActivity()),
     loadHashCache: async () => {
       throw new Error("trusted local must not load the hashcache");
     },
@@ -228,12 +268,44 @@ test("trusted local observation skips the hashcache and the manifest scan", asyn
   expect(calls).not.toContain("scanManifest");
 });
 
+test("an unowned mixed-format daemon cannot make rejected activity renderable", async () => {
+  const { port, countOf } = readPort("brief", {
+    readWorkspaceObservation: async () => ({
+      ...stoppedWorkspaceObservation(async () => trustedActivity()),
+      daemon: {
+        ownership: "record-format-mismatch",
+        running: true,
+        pid: 9,
+        bootId: "boot-1",
+        boundWorkspaceId: CFG.remoteWorkspaceId,
+        stale: false,
+        ownsRoot: true,
+        ownsWorkspace: false,
+        sidecarBinding: "workspace",
+        ambient: { kind: "absent" },
+        ambientTrust: "binding-untrusted",
+      },
+    }),
+  });
+
+  const projection = await projectWorkspaceStatusDetail(ROOT, { mode: "brief" }, port, {
+    refresh: async (_cfg, next) => refreshed(next),
+  });
+
+  expect(projection.kind).toBe("detail");
+  if (projection.kind !== "detail") throw new Error("unreachable");
+  // One observation, and its binding is not proven — so the daemon's own local
+  // snapshot cannot be quoted as the file counts.
+  expect(countOf("readWorkspaceObservation")).toBe(1);
+  expect(projection.counts.source).not.toBe("daemon");
+  expect(projection.health).toBe("ok");
+});
+
 test("a local base mismatch re-reads state before falling back to the scan", async () => {
   const stale = trustedActivity();
   stale.local!.baseSequence = 6;
   const { port, calls, countOf } = readPort("brief", {
-    readDaemonBinding: () => ({ alive: { running: true, pid: 9, bootId: "boot-1" }, bound: CFG.remoteWorkspaceId, stale: false }),
-    readActivity: async () => stale,
+    readWorkspaceObservation: async () => ownedWorkspaceObservation(stale),
   });
   const refreshes: number[] = [];
 
