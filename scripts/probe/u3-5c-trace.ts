@@ -20,7 +20,9 @@ const MUTATORS = [
   "writeFileSync", "writeSync", "renameSync", "unlinkSync", "mkdirSync", "rmSync",
   "openSync", "closeSync", "fsyncSync", "ftruncateSync", "copyFileSync", "linkSync",
   "appendFileSync", "truncateSync", "chmodSync",
-];
+] as const;
+type MutatorName = typeof MUTATORS[number];
+type MutableFsTable = Partial<Record<MutatorName, (...args: unknown[]) => unknown>>;
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "u3-5c-probe-home-"));
 process.env.RBOX_HOME = home;
@@ -48,13 +50,13 @@ await saveStateUnsafeLegacyOrTest(root, {
 
 const log: { phase: string; syscall: string; args: string }[] = [];
 let phase = "start";
-const table = fs as unknown as Record<string, unknown>;
-const originals = new Map<string, unknown>();
+const table = fs as unknown as MutableFsTable;
+const originals = new Map<MutatorName, (...args: unknown[]) => unknown>();
 for (const name of MUTATORS) {
   const original = table[name];
   if (typeof original !== "function") continue;
   originals.set(name, original);
-  const call = original as (...a: unknown[]) => unknown;
+  const call = original;
   table[name] = function traced(this: unknown, ...args: unknown[]): unknown {
     const strings = args.filter((a) => typeof a === "string") as string[];
     const rel = strings.map((s) => s.replaceAll(root, "<ws>")).join(" ");

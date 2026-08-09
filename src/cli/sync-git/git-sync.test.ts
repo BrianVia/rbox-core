@@ -34,7 +34,7 @@ import {
   withRevalidatedGitPartialApplies,
   type GitPushPlan,
 } from "../sync-git.js";
-import { loadGitDivergenceCache } from "./divergence-cache.js";
+import { loadGitDivergenceCache, type GitDivergenceCacheEntry } from "./divergence-cache.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { stateCasJournalDir } from "./state-cas-locks.js";
@@ -384,11 +384,11 @@ async function observeGitSpawnsForRoot<T>(targetRoot: string, fn: () => Promise<
 
 const divergenceCachePath = (root: string) => path.join(root, ".rbox", "state", "git-divergence.json");
 
-async function readDivergenceCache(root: string): Promise<{ version?: number; repos?: Record<string, any> }> {
-  return JSON.parse(await fs.readFile(divergenceCachePath(root), "utf8")) as { version?: number; repos?: Record<string, any> };
+async function readDivergenceCache(root: string): Promise<{ version?: number; repos?: Record<string, GitDivergenceCacheEntry> }> {
+  return JSON.parse(await fs.readFile(divergenceCachePath(root), "utf8")) as { version?: number; repos?: Record<string, GitDivergenceCacheEntry> };
 }
 
-async function writeDivergenceCache(root: string, cache: { version?: number; repos?: Record<string, any> }): Promise<void> {
+async function writeDivergenceCache(root: string, cache: { version?: number; repos?: Record<string, GitDivergenceCacheEntry> }): Promise<void> {
   await fs.mkdir(path.dirname(divergenceCachePath(root)), { recursive: true });
   await fs.writeFile(divergenceCachePath(root), JSON.stringify(cache));
 }

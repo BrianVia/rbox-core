@@ -9,6 +9,11 @@ import type { TelemetryRecorder } from "./queue.js";
 export const SYNC_PHASE_SAMPLE_EVERY = 8;
 export const SYNC_PHASE_OUTLIER_MS = { pull: 20_000, push: 15_000 } as const;
 
+interface GitApplyPhaseDetails {
+  repoTimings?: Array<{ wallMs?: unknown }>;
+  results?: { skipped?: unknown };
+}
+
 function boundedInteger(value: number, max: number): number {
   return Math.min(max, Math.max(0, Math.round(value)));
 }
@@ -16,12 +21,12 @@ function boundedInteger(value: number, max: number): number {
 function gitApplyDetails(json: PhaseReportJson): Pick<SyncPhaseSample, "gitApplyMaxRepoMs" | "gitApplySkippedHeld"> {
   const detail = json.phases["git-apply"]?.details?.gitApply;
   if (detail === null || typeof detail !== "object" || Array.isArray(detail)) return {};
-  const record = detail as Record<string, unknown>;
+  const record = detail as GitApplyPhaseDetails;
   const out: Pick<SyncPhaseSample, "gitApplyMaxRepoMs" | "gitApplySkippedHeld"> = {};
   if (Array.isArray(record.repoTimings)) {
     const walls = record.repoTimings.flatMap((entry) => {
       if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return [];
-      const wallMs = (entry as Record<string, unknown>).wallMs;
+      const wallMs = entry.wallMs;
       return typeof wallMs === "number" && Number.isFinite(wallMs) && wallMs >= 0 ? [wallMs] : [];
     });
     if (walls.length > 0) out.gitApplyMaxRepoMs = boundedInteger(
@@ -31,7 +36,7 @@ function gitApplyDetails(json: PhaseReportJson): Pick<SyncPhaseSample, "gitApply
   }
   const results = record.results;
   if (results !== null && typeof results === "object" && !Array.isArray(results)) {
-    const skipped = (results as Record<string, unknown>).skipped;
+    const skipped = results.skipped;
     if (typeof skipped === "number" && Number.isFinite(skipped) && skipped >= 0) {
       out.gitApplySkippedHeld = boundedInteger(
         skipped,

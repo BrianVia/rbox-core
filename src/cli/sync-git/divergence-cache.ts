@@ -89,7 +89,7 @@ async function fastRepoAdmitted(root: string, matcher: IgnoreMatcher, rel: strin
 export async function loadGitDivergenceCache(root: string): Promise<GitDivergenceCache> {
   try {
     const raw = await fs.readFile(path.join(root, GIT_DIVERGENCE_CACHE_REL), "utf8");
-    const parsed = JSON.parse(raw) as { version?: string; repos?: Record<string, unknown> };
+    const parsed = JSON.parse(raw) as { version?: string; repos?: Record<string, Partial<GitDivergenceCacheEntry>> };
     if (parsed.version !== GIT_DIVERGENCE_CACHE_VERSION) return { repos: new Map(), dirty: true };
     const repos = new Map<string, GitDivergenceCacheEntry>();
     for (const [rel, entry] of Object.entries(parsed.repos ?? {})) {

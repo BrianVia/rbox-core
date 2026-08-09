@@ -940,11 +940,11 @@ async function readShellLine(): Promise<string> {
   return (await fs.readFile(path.join(root, ".rbox", "state", "shell.line"), "utf8")).trimEnd();
 }
 
-async function readAmbientStatus(): Promise<Record<string, unknown>> {
-  return JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8")) as Record<string, unknown>;
+async function readAmbientStatus(): Promise<AmbientDaemonStatusV1> {
+  return JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8")) as AmbientDaemonStatusV1;
 }
 
-async function waitForAmbientState(state: string, timeoutMs = 1000): Promise<Record<string, unknown>> {
+async function waitForAmbientState(state: AmbientDaemonStatusV1["state"], timeoutMs = 1000): Promise<AmbientDaemonStatusV1> {
   const deadline = Date.now() + timeoutMs;
   let last: unknown;
   while (Date.now() < deadline) {

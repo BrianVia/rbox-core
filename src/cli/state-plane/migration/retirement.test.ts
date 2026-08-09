@@ -79,7 +79,8 @@ function fixture(phase: "M3" | "M5"): Fixture {
   const history = write(paths.history!, "history");
   const fixedBackup = write(paths.fixedBackup!, "backup");
 
-  const layers: Record<string, unknown>[] = [
+  type WitnessLayer = Partial<Omit<Extract<MigrationWitness, { phase: "M7" }>, "phase">>;
+  const layers: WitnessLayer[] = [
     { admission: { sourceBytes: 24, requiredBytes: 1248, budgetBytes: 1 << 20 } },
     {
       history: { path: paths.history, ...history },

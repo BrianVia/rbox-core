@@ -23,6 +23,7 @@ import {
   type Wrap,
 } from "../../engine/e2ee/index.js";
 import type { HeadPin } from "../e2ee-keystore.js";
+import type { JsonObject } from "../../json.js";
 import { loadDevice, loadPin } from "../e2ee-keystore.js";
 import type { AccountKeysDTO } from "../e2ee-remote.js";
 import {
@@ -166,10 +167,10 @@ export class KeyDeliveryHttpError extends Error {
   }
 }
 
-const plain = (value: unknown): value is Record<string, unknown> =>
+const plain = (value: unknown): value is JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const exactKeys = (value: Record<string, unknown>, expected: readonly string[]): boolean => {
+const exactKeys = (value: JsonObject, expected: readonly string[]): boolean => {
   const actual = Object.keys(value);
   return actual.length === expected.length && actual.every((key) => expected.includes(key));
 };
@@ -455,9 +456,9 @@ async function loadStage(accountId: string, request: ValidatedRequest): Promise<
   if (body.version !== stage.rosterVersion || !Array.isArray(body.devices)) {
     throw new KeyDeliveryValidationError("staged key-delivery roster is malformed");
   }
-  const entry = body.devices.find((candidate) =>
+  const entry = body.devices.find((candidate): candidate is JsonObject =>
     plain(candidate) && candidate.deviceId === request.targetDeviceId
-  ) as Record<string, unknown> | undefined;
+  );
   if (
     !entry
     || entry.encPubKey !== request.encPubKey

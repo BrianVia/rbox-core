@@ -444,10 +444,11 @@ function validLegacyCheckoutLockJournalShape(journal: CheckoutJournal): boolean 
   const reservedLocks = legacy.reservedLocks as unknown;
   if (reservedLocks !== undefined && (!reservedLocks || typeof reservedLocks !== "object" || Array.isArray(reservedLocks)
     || Object.keys(reservedLocks).length > 256 || Object.values(reservedLocks).some((token) => !validLockToken(token)))) return false;
+  const locks = reservedLocks as LegacyCheckoutLockShape["reservedLocks"];
   const reservedRefs = journal.expectedNew.reservedRefs;
-  if (reservedRefs === undefined) return reservedLocks === undefined || Object.keys(reservedLocks as object).length === 0;
-  return reservedLocks === undefined || (Object.keys(reservedLocks as object).length === Object.keys(reservedRefs).length
-    && Object.keys(reservedRefs).every((ref) => ref in (reservedLocks as object)));
+  if (reservedRefs === undefined) return locks === undefined || Object.keys(locks).length === 0;
+  return locks === undefined || (Object.keys(locks).length === Object.keys(reservedRefs).length
+    && Object.keys(reservedRefs).every((ref) => ref in locks));
 }
 
 async function uniqueRetirePath(root: string, area: string, key: string): Promise<string> {

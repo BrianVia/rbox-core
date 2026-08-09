@@ -15,7 +15,7 @@ beforeAll(async () => {
   await applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS);
 });
 
-async function bootstrap(accountName: string, extra: Record<string, unknown> = {}): Promise<{ token: string; accountId: string; deviceId: string; userId: string }> {
+async function bootstrap(accountName: string, extra: { plan?: string } = {}): Promise<{ token: string; accountId: string; deviceId: string; userId: string }> {
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
     method: "POST",
     headers: { "content-type": "application/json" },

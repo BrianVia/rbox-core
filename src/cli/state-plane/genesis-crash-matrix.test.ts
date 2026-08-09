@@ -123,17 +123,18 @@ const BEFORE_STEP_7: KillPoint = { syscall: "realpath", nth: 2, when: "before" }
 /** The in-process half of the same primitive, for errno injection on the
  * promise surface. `hit` inspects the raw arguments rather than a joined string
  * because two different calls open the same pathname with different flags. */
-function patchPromise(name: string, hit: (args: unknown[]) => boolean, nth: number, act: () => never): () => void {
-  const table = fs.promises as unknown as Record<string, unknown>;
+function patchPromise(name: "open", hit: (args: unknown[]) => boolean, nth: number, act: () => never): () => void {
+  const table = fs.promises;
   const call = table[name] as (...args: unknown[]) => unknown;
   let matched = 0;
-  table[name] = function patched(this: unknown, ...args: unknown[]): unknown {
+  const patched = function (this: unknown, ...args: unknown[]): unknown {
     if (!hit(args)) return call.apply(this, args);
     matched += 1;
     if (matched !== nth) return call.apply(this, args);
     return act();
   };
-  return () => { table[name] = call; };
+  Object.defineProperty(table, name, { configurable: true, writable: true, value: patched });
+  return () => { Object.defineProperty(table, name, { configurable: true, writable: true, value: call }); };
 }
 
 const errno = (c: string): never => { throw Object.assign(new Error(`${c}: injected`), { code: c }); };
@@ -165,7 +166,7 @@ function storeTuple(file: string): string {
   try {
     const row = stateStoreDatabase(store).query(
       "SELECT origin_kind,migration_id,entry_count,repo_count FROM migration_completion WHERE singleton=1",
-    ).get() as Record<string, unknown>;
+    ).get() as { origin_kind: string; migration_id: string | null; entry_count: number; repo_count: number };
     return JSON.stringify([store.header.authority_id, store.header.active_lineage_id, row]);
   } finally {
     store.close();

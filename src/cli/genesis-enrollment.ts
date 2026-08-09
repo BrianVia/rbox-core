@@ -3,7 +3,8 @@ import { assertMkWrapAuthorized, canonicalString, fromB64url, openOwnMasterKey, 
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { activeGenesisQuarantines, genesisQuarantineStatus } from "./genesis-quarantine.js";
-import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseDestinationProgress, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
+import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseDestinationProgress, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness, type GenesisBootstrapRequest } from "./genesis-durable.js";
+import type { JsonObject } from "../json.js";
 
 export type EnrollmentClassification=
   |{kind:"pristine"}|{kind:"restart-prepublication";marker:GenesisPrepublishMarker}|{kind:"resume-attempt";journal:GenesisJournal}
@@ -28,7 +29,7 @@ export async function pendingGenesisState(accountId:string):Promise<boolean>{if(
 
 const legacyDeviceKeys=["deviceId","sigPubKey","sigPrivPkcs8","encPubSpki","encPrivPkcs8"] as const;
 const exactKeys=(value:object,keys:readonly string[])=>{const actual=Object.keys(value);return actual.length===keys.length&&actual.every((key)=>keys.includes(key));};
-const plain=(value:unknown):value is Record<string,unknown>=>typeof value==="object"&&value!==null&&!Array.isArray(value);
+const plain=(value:unknown):value is JsonObject=>typeof value==="object"&&value!==null&&!Array.isArray(value);
 
 /** The only local no-journal shape that may be archived after operator repair.
  * Presence alone is not proof: parse the exact historical device schema and a
@@ -80,8 +81,8 @@ async function validateLocalEnrolledPair(accountId:string,dto:AccountKeysDTO,acc
   const opened=await openOwnMasterKey(loaded.secrets,account.currentEpoch,JSON.parse(row.mkWrap) as Wrap);if(!Buffer.from(opened).equals(Buffer.from(loaded.secrets.mk)))throw new Error("local master key does not authenticate the enrolled device wrap");
 }
 
-function requestObject(journal:GenesisJournal):Record<string,unknown>{return parseGenesisBootstrapRequest(journal.requestBody,journal.deviceId) as unknown as Record<string,unknown>;}
-function exactAttempt(dto:AccountKeysDTO,journal:GenesisJournal):boolean{const b=requestObject(journal),dev=b.device as Record<string,unknown>|undefined;return dto.recoveryWrap===b.recoveryWrap&&dto.recoveryWrapId===b.recoveryWrapId&&dto.rosters[0]===b.genesisRoster&&dto.keyStates[0]===b.genesisKeyState&&!!dev&&dto.devices.some((row)=>row.deviceId===dev.deviceId&&row.sigPubkey===dev.sigPubKey&&row.encPubkey===dev.encPubKey&&row.mkWrap===dev.mkWrap);}
+function requestObject(journal:GenesisJournal):GenesisBootstrapRequest{return parseGenesisBootstrapRequest(journal.requestBody,journal.deviceId);}
+function exactAttempt(dto:AccountKeysDTO,journal:GenesisJournal):boolean{const b=requestObject(journal),dev=b.device;return dto.recoveryWrap===b.recoveryWrap&&dto.recoveryWrapId===b.recoveryWrapId&&dto.rosters[0]===b.genesisRoster&&dto.keyStates[0]===b.genesisKeyState&&dto.devices.some((row)=>row.deviceId===dev.deviceId&&row.sigPubkey===dev.sigPubKey&&row.encPubkey===dev.encPubKey&&row.mkWrap===dev.mkWrap);}
 
 async function validateJournalDeviceMaterial(accountId:string,journal:GenesisJournal):Promise<void>{
   const loaded=await loadDevice(accountId);if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId)throw new Error("journal device material mismatch");

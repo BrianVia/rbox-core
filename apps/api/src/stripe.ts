@@ -19,18 +19,21 @@ const API = "https://api.stripe.com/v1";
 const WEBHOOK_TOLERANCE_S = 300; // reject signatures older than 5 min (replay window)
 
 /** Form-encode params with Stripe's bracket notation (nested objects/arrays). */
-function encode(params: Record<string, unknown>, prefix = ""): string {
+type StripeFormValue = string | number | boolean | null | undefined | StripeFormParams;
+type StripeFormParams = { [key: string]: StripeFormValue };
+
+function encode(params: StripeFormParams, prefix = ""): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
     const key = prefix ? `${prefix}[${k}]` : k;
-    if (typeof v === "object") parts.push(encode(v as Record<string, unknown>, key));
+    if (typeof v === "object") parts.push(encode(v, key));
     else parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(v))}`);
   }
   return parts.filter(Boolean).join("&");
 }
 
-async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: string, params?: Record<string, unknown>): Promise<any> {
+async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: string, params?: StripeFormParams): Promise<any> {
   const secret = env.STRIPE_SECRET!;
   const sendsBody = method === "POST"; // GET puts params in the query; DELETE carries none
   const body = params ? encode(params) : "";

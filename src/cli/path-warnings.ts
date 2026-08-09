@@ -25,6 +25,9 @@ export interface PathWarningsV1 {
   collisions: PathCollisionGroup[];
 }
 
+type PathWarningsCandidate = Partial<Record<keyof PathWarningsV1, unknown>>;
+type PathCollisionCandidate = Partial<Record<keyof PathCollisionGroup, unknown>>;
+
 export const pathWarningsPath = (root: string): string =>
   path.join(root, ".rbox", "state", "path-warnings.json");
 
@@ -118,13 +121,13 @@ export function buildPathWarnings(groups: readonly PathCollisionGroup[]): PathWa
   return { v: 1, fingerprint, groupCount, pathCount, collisions };
 }
 
-function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+function exactKeys(value: object, expected: readonly string[]): boolean {
   return Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
 }
 
 function validate(value: unknown): PathWarningsV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
+  const record = value as PathWarningsCandidate;
   if (!exactKeys(record, ["v", "fingerprint", "groupCount", "pathCount", "collisions"])) return undefined;
   if (record.v !== 1 || typeof record.fingerprint !== "string" || !HEX64.test(record.fingerprint)) return undefined;
   if (!Number.isSafeInteger(record.groupCount) || (record.groupCount as number) < 1) return undefined;
@@ -137,7 +140,7 @@ function validate(value: unknown): PathWarningsV1 | undefined {
   let storedPaths = 0;
   for (const raw of record.collisions) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-    const group = raw as Record<string, unknown>;
+    const group = raw as PathCollisionCandidate;
     if (!exactKeys(group, ["paths"]) || !Array.isArray(group.paths)
       || group.paths.length < 2 || group.paths.length > PATH_WARNINGS_MAX_PATHS_PER_GROUP) return undefined;
     if (!group.paths.every(isSafeRelPath)) return undefined;

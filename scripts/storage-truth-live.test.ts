@@ -61,6 +61,16 @@ interface Counters {
   alarms: number;
 }
 
+type FixtureD1Row =
+  | { workspace_id: string; project_id: string }
+  | { sequence: number; created_at: number }
+  | { sha256: string; size_bytes: number; present: number; marked_at: null; deleting_at: null; created_at_ms: number }
+  | { account_id: string; sha256: string; granted_at: number; marked_at: null; size_bytes: number; pack_id: null; length: null; pack_inventory_present: null };
+type FixtureD1FirstRow =
+  | { used_bytes: number; plan: string }
+  | { account_id: string }
+  | { bytes: number };
+
 function fixtureD1(counters: Counters, sidecarSha: string): ReadOnlyD1 {
   const blobRows = [
     { sha256: retainedRoot, size_bytes: 20, present: 1, marked_at: null, deleting_at: null, created_at_ms: NOW - 10_000 },
@@ -73,7 +83,7 @@ function fixtureD1(counters: Counters, sidecarSha: string): ReadOnlyD1 {
     { account_id: ACCOUNT, sha256: headManifest, granted_at: NOW - 10_000, marked_at: null, size_bytes: 10, pack_id: null, length: null, pack_inventory_present: null },
   ].sort((a, b) => a.sha256.localeCompare(b.sha256));
 
-  const rowsFor = (sql: string, bindings: unknown[]): Array<Record<string, unknown>> => {
+  const rowsFor = (sql: string, bindings: unknown[]): FixtureD1Row[] => {
     if (sql.includes("SELECT workspace_id,project_id FROM workspaces WHERE account_id")) {
       return [{ workspace_id: WORKSPACE, project_id: PROJECT }];
     }
@@ -104,7 +114,7 @@ function fixtureD1(counters: Counters, sidecarSha: string): ReadOnlyD1 {
     throw new Error(`unexpected D1 all(): ${sql}`);
   };
 
-  const firstFor = (sql: string): Record<string, unknown> | null => {
+  const firstFor = (sql: string): FixtureD1FirstRow | null => {
     if (sql.includes("SELECT used_bytes,plan FROM accounts")) return { used_bytes: 30, plan: "pro" };
     if (sql.includes("SELECT account_id FROM workspaces")) return { account_id: ACCOUNT };
     if (sql.includes("SELECT COALESCE(SUM")) return { bytes: 0 };

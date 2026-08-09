@@ -14,7 +14,8 @@ import { observeWorkspace as observeWorkspaceState } from "./workspace-observati
 import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks } from "./doctor-cmd.js";
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
-import { loadActivity } from "./activity.js";
+import { loadActivity, type DaemonActivity } from "./activity.js";
+import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
 import { saveCredentials } from "./credentials.js";
@@ -120,7 +121,7 @@ const findingById = (findings: TriageFinding[], id: string): TriageFinding | und
  * specific folder and must carry it. */
 const ACCOUNT_LEVEL = /^(rbox login|rbox upgrade|rbox key |rbox subscribe |rbox track |brew )/;
 
-function deferral(over: Record<string, unknown> = {}): TriageInputs["deferrals"][number] {
+function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): TriageInputs["deferrals"][number] {
   return {
     repo: "savvy-core",
     oldestDeferredSince: new Date(NOW - 20 * 3600_000).toISOString(),
@@ -138,7 +139,7 @@ function deferral(over: Record<string, unknown> = {}): TriageInputs["deferrals"]
   } as TriageInputs["deferrals"][number];
 }
 
-async function writeActivity(body: Record<string, unknown>): Promise<void> {
+async function writeActivity(body: DaemonActivity): Promise<void> {
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   await fs.writeFile(path.join(root, ".rbox", "state", "activity.json"), JSON.stringify(body));
 }
@@ -146,7 +147,7 @@ async function writeActivity(body: Record<string, unknown>): Promise<void> {
 async function writeDaemonRecords(opts: {
   statusBootId?: string;
   pidBootId?: string;
-  status?: Record<string, unknown>;
+  status?: Partial<AmbientDaemonStatusV1>;
 }): Promise<void> {
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
   await fs.writeFile(daemonPidPath(root), `v2 ${LIVE_PID} ${opts.pidBootId ?? BOOT}\n`);

@@ -21,6 +21,21 @@ const account = (plan: string | null = "pro", email: string | null = "owner@exam
   identity: { plan, email },
 });
 type Full = Extract<BriefStatusSnapshot, { kind: "full" }>;
+interface LegacyStatusNoise {
+  workspaceId?: string;
+  deviceId?: string;
+  accountId?: string;
+  pid?: number;
+  localSequence?: number;
+  remoteSequence?: number;
+  lockingPath?: string;
+  lastSync?: string;
+  syncs?: number;
+  commitConflicts409?: number;
+  trackedFiles?: number;
+  crypto?: string;
+  healthyGit?: string;
+}
 
 const full = (over: Partial<Full> = {}): Full => ({
   kind: "full",
@@ -263,7 +278,7 @@ test("brief age spells and inflects every required unit", () => {
 });
 
 test("healthy brief suppresses every legacy healthy/history/footer class", () => {
-  const snapshot = full() as Full & Record<string, unknown>;
+  const snapshot: Full & LegacyStatusNoise = full();
   Object.assign(snapshot, {
     workspaceId: "ws_secret", deviceId: "dev_secret", accountId: "acct_secret", pid: 4242,
     localSequence: 78, remoteSequence: 80, lockingPath: ".rbox/state/sync.lock",

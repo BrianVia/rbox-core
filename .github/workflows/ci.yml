@@ -178,6 +178,10 @@ jobs:
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run guards
 
+      - name: Lint
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
+        run: bun run lint
+
       - name: Mutation gate (curated guards, design 222 §7.9)
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run gate:mutation

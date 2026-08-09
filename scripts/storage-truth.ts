@@ -136,6 +136,16 @@ export const phase1PageCount = (rows: number): number => Math.max(1, Math.ceil(r
 
 export type JoinOutcome = "matched" | "size-mismatch" | "r2-only" | "inventory-only";
 export interface ReconciliationCell { count: number; observedBytes: number; inventoryBytes: number; missingAnomaly: number }
+interface ReconciliationSqlRow {
+  lifecycle: string;
+  outcome: JoinOutcome;
+  count: number;
+  observed_bytes: number;
+  inventory_bytes: number;
+  missing: number;
+}
+interface PackClassSqlRow { size: number; has_active: number; has_history: number }
+interface EntitlementBucketSqlRow { label: BaseLabel; count: number; bytes: number; unknown: number }
 const emptyCell = (): ReconciliationCell => ({ count: 0, observedBytes: 0, inventoryBytes: 0, missingAnomaly: 0 });
 export interface PrefixReconciliation {
   byLifecycle: Record<string, Record<JoinOutcome, ReconciliationCell>>;
@@ -308,7 +318,7 @@ function reconcilePrefixFromDb(db: Database, prefix: "canonical" | "pack", listi
       COUNT(*) count,COALESCE(SUM(COALESCE(observed_size,0)),0) observed_bytes,
       COALESCE(SUM(COALESCE(inventory_size,0)),0) inventory_bytes,
       SUM(CASE WHEN observed_key IS NULL AND lifecycle='ready' THEN 1 ELSE 0 END) missing
-    FROM joined GROUP BY lifecycle,outcome`).all(prefix, prefix, listingStartedAt, prefix, prefix, listingStartedAt) as Array<Record<string, unknown>>;
+    FROM joined GROUP BY lifecycle,outcome`).all(prefix, prefix, listingStartedAt, prefix, prefix, listingStartedAt) as ReconciliationSqlRow[];
   for (const row of rows) {
     const lifecycle = String(row.lifecycle);
     const outcome = String(row.outcome) as JoinOutcome;
@@ -335,7 +345,7 @@ function reconcilePrefixFromDb(db: Database, prefix: "canonical" | "pack", listi
         MAX(CASE WHEN COALESCE(f.active,0)=1 THEN 1 ELSE 0 END) has_active,
         MAX(CASE WHEN COALESCE(f.active,0)=0 AND COALESCE(f.retained,0)=1 THEN 1 ELSE 0 END) has_history
       FROM inventory i LEFT JOIN inventory_members m ON m.prefix=i.prefix AND m.key=i.key
-      LEFT JOIN fleet f ON f.sha=m.sha WHERE i.prefix='pack' AND i.lifecycle='ready' GROUP BY i.key,i.size`).all() as Array<Record<string, unknown>>;
+      LEFT JOIN fleet f ON f.sha=m.sha WHERE i.prefix='pack' AND i.lifecycle='ready' GROUP BY i.key,i.size`).all() as PackClassSqlRow[];
     for (const pack of packs) {
       const active = Number(pack.has_active) === 1;
       const history = Number(pack.has_history) === 1;
@@ -543,7 +553,7 @@ export async function measureStorageTruth(source: StorageTruthSource, accountId:
     }
 
     const buckets = Object.fromEntries(LABELS.map((label) => [label, emptyMeasure()])) as Record<BaseLabel, Measure>;
-    for (const row of db.query("SELECT label,COUNT(*) count,COALESCE(SUM(COALESCE(size,0)),0) bytes,SUM(CASE WHEN size IS NULL THEN 1 ELSE 0 END) unknown FROM entitlements GROUP BY label").all() as Array<Record<string, unknown>>) {
+    for (const row of db.query("SELECT label,COUNT(*) count,COALESCE(SUM(COALESCE(size,0)),0) bytes,SUM(CASE WHEN size IS NULL THEN 1 ELSE 0 END) unknown FROM entitlements GROUP BY label").all() as EntitlementBucketSqlRow[]) {
       buckets[String(row.label) as BaseLabel] = { count: Number(row.count), knownBytes: Number(row.bytes), unknownByteRows: Number(row.unknown) };
     }
     const anomalyRow = db.query(`SELECT COUNT(*) total,COALESCE(SUM(missing_catalog),0) missing,COALESCE(SUM(inconsistent),0) inconsistent,
@@ -653,7 +663,14 @@ export interface StorageTruthRunnerFailure {
 }
 
 export function normalizeRunnerFailure(error: unknown): StorageTruthRunnerFailure {
-  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const value = error && typeof error === "object" ? error as {
+    name?: unknown;
+    component?: unknown;
+    environment?: unknown;
+    requiredEnvironment?: unknown;
+    message?: unknown;
+    timeoutMs?: unknown;
+  } : {};
   const required = Array.isArray(value.requiredEnvironment)
     ? value.requiredEnvironment.filter((item): item is string => typeof item === "string")
     : [];

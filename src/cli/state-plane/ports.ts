@@ -1,4 +1,5 @@
 import type { FileEntry, GitSection, Manifest } from "../../engine/index.js";
+import type { JsonObject, JsonValue } from "../../json.js";
 import type { GlobalManifestMeta, RepoRecord, SyncState } from "../sync-state-model.js";
 
 declare const digestBrand: unique symbol;
@@ -16,7 +17,7 @@ export interface ManifestHeader {
   sourceSequence?: number;
   trustEpoch?: string;
   complete: boolean;
-  [extension: string]: unknown;
+  [extension: string]: JsonValue | undefined;
 }
 
 export interface LineageSnapshot {
@@ -29,7 +30,7 @@ export interface LineageSnapshot {
   baseGeneration: number;
   localRevision: number;
   telemetryBindingId?: string;
-  lineageExtras: Record<string, unknown>;
+  lineageExtras: JsonObject;
   manifestGitReposPresent: boolean;
   baseHeader: ManifestHeader;
   localHeader: ManifestHeader;

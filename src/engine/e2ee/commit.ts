@@ -91,7 +91,7 @@ export function normalizeBlobRefs(refs: BlobRef[]): BlobRef[] {
  *  + hashes those). `count`/`totalBytes` are bounded non-negative safe integers. */
 export function validateBlobRefset(rs: unknown): BlobRefset {
   if (!rs || typeof rs !== "object") throw new Error("blobRefset not an object");
-  const r = rs as Record<string, unknown>;
+  const r = rs as Partial<BlobRefset>;
   if (typeof r.sidecarSha !== "string" || !SHA_RE.test(r.sidecarSha)) throw new Error("blobRefset.sidecarSha malformed");
   if (!Number.isSafeInteger(r.count) || (r.count as number) < 0) throw new Error("blobRefset.count invalid");
   if (!Number.isSafeInteger(r.totalBytes) || (r.totalBytes as number) < 0) throw new Error("blobRefset.totalBytes invalid");
@@ -151,7 +151,7 @@ export async function buildSignedCommit(fields: CommitFields, signKey: SignKeyPa
  *  already rejects non-canonical bytes (incl. duplicate JSON keys), so the discriminator
  *  runs on a trustworthy object. */
 export function parseCommit(c: SignedCommit): CommitBody {
-  const body = verifyRoundTrip(c.body) as Record<string, unknown>; // parse + assert canonical form
+  const body = verifyRoundTrip(c.body) as Partial<CommitBodyInline & CommitBodySidecar>; // parse + assert canonical form
   if (body.type !== "rbox/commit/v1") throw new Error("not a commit/v1");
   if (body.seq !== (body.parentSeq as number) + 1) throw new Error("commit seq must be parentSeq+1");
   if (!SHA_RE.test(body.encManifestSha as string)) throw new Error("encManifestSha malformed");

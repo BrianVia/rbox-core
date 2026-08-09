@@ -111,7 +111,8 @@ interface Fixture {
 
 /** The witness is monotone, so each phase is its predecessor plus one layer. */
 function witnessFor(root: string, phase: MigrationPhase, f: Fixture): MigrationWitness {
-  const layers: readonly Record<string, unknown>[] = [
+  type WitnessLayer = Partial<Omit<Extract<MigrationWitness, { phase: "M7" }>, "phase">>;
+  const layers: readonly WitnessLayer[] = [
     {},
     { admission: { sourceBytes: f.source.bytes, requiredBytes: 520, budgetBytes: 4096 } },
     {

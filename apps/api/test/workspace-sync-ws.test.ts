@@ -193,9 +193,28 @@ const SERVER_TIMING_KEYS = [
   "totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs",
 ];
 
-function expectServerTimings(body: Record<string, unknown>) {
+interface ServerTimingsFixture {
+  totalMs: number;
+  envelopeMs: number;
+  accountingMs: number;
+  sidecarMs: number;
+  commitMs: number;
+  mirrorMs: number;
+  responseMs: number;
+}
+
+interface SyncResponseFixture {
+  error?: string;
+  head?: number;
+  currentEpoch?: number;
+  sequence?: number;
+  commitHash?: string;
+  serverTimings: ServerTimingsFixture;
+}
+
+function expectServerTimings(body: SyncResponseFixture) {
   // Pinned drift detector for the client parser in src/cli/remote/commits.ts (SERVER_TIMING_KEYS).
-  const timings = body.serverTimings as Record<string, unknown>;
+  const timings = body.serverTimings;
   expect(Object.keys(timings)).toEqual(SERVER_TIMING_KEYS);
   expect(Object.values(timings).every(
     (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
@@ -420,7 +439,7 @@ describe("workspace sync websocket fanout", () => {
 
     const first = await sync.fetch(commitReq(475, "a"));
     expect(first.status).toBe(200);
-    const firstBody = (await first.json()) as { sequence: number; commitHash: string; serverTimings: Record<string, unknown> };
+    const firstBody = (await first.json()) as SyncResponseFixture & { sequence: number; commitHash: string };
     expect(firstBody).toMatchObject({ sequence: 475, commitHash: sha("a") });
     expect(Object.keys(firstBody.serverTimings).sort()).toEqual([
       "accountingMs", "commitMs", "envelopeMs", "mirrorMs", "responseMs", "sidecarMs", "totalMs",
@@ -439,7 +458,7 @@ describe("workspace sync websocket fanout", () => {
 
     const retry = await sync.fetch(commitReq(475, "a"));
     expect(retry.status).toBe(409);
-    const retryBody = (await retry.json()) as { error: string; head: number; serverTimings: Record<string, unknown> };
+    const retryBody = (await retry.json()) as SyncResponseFixture & { error: string; head: number };
     expect(retryBody).toMatchObject({ error: "conflict", head: 475 });
     expect(Object.keys(retryBody.serverTimings).sort()).toEqual([
       "accountingMs", "commitMs", "envelopeMs", "mirrorMs", "responseMs", "sidecarMs", "totalMs",
@@ -467,8 +486,8 @@ describe("workspace sync websocket fanout", () => {
     ]);
     expect(early.status).toBe(409);
     expect(authoritative.status).toBe(409);
-    const earlyBody = await early.json() as Record<string, unknown>;
-    const authoritativeBody = await authoritative.json() as Record<string, unknown>;
+    const earlyBody = await early.json() as SyncResponseFixture;
+    const authoritativeBody = await authoritative.json() as SyncResponseFixture;
     expect(earlyBody).toMatchObject({ error: "conflict", head: 1, serverTimings: expect.any(Object) });
     expect(Object.keys(earlyBody)).toEqual(Object.keys(authoritativeBody));
     expect(Object.keys(earlyBody)).toEqual(["error", "head", "serverTimings"]);
@@ -481,13 +500,13 @@ describe("workspace sync websocket fanout", () => {
   test("design 103 epoch rejection preserves parent-first precedence and the forwarded epoch snapshot", async () => {
     // There is no non-invasive mid-route pause seam. These direct requests pin that both
     // paths decide from the same already-forwarded x-rbox-account-epoch snapshot.
-    const bodies: Record<string, unknown>[] = [];
+    const bodies: SyncResponseFixture[] = [];
     for (const enabled of [false, true]) {
       const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
       const fresh = new WorkspaceSync(fakeCtx([], new Map()), e as never);
       const epoch = await fresh.fetch(customCommitReq({ seq: 1, epoch: 0, currentEpoch: 1 }));
       expect(epoch.status).toBe(409);
-      const epochBody = await epoch.json() as Record<string, unknown>;
+      const epochBody = await epoch.json() as SyncResponseFixture;
       expect(epochBody).toMatchObject({ error: "epoch_stale", currentEpoch: 1, serverTimings: expect.any(Object) });
       expect(Object.keys(epochBody)).toEqual(["error", "currentEpoch", "serverTimings"]);
       expectServerTimings(epochBody);

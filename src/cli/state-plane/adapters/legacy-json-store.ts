@@ -394,12 +394,18 @@ export async function ensureTelemetryBindingId(
 
 export async function assertResetIncarnationMarkerNormalized(root: string, state: SyncState): Promise<void> {
   if (!state.stream || !state.stateNonce) return; // legacy migration removes it
-  const marker = await boundedJsonRead<Record<string, unknown>>(stateIncarnationPath(root), 512 * 1024);
+  const marker = await boundedJsonRead<unknown>(stateIncarnationPath(root), 512 * 1024);
   if (!marker) return;
+  if (typeof marker !== "object" || Array.isArray(marker)) {
+    throw new Error("reset refused: stale or foreign state incarnation marker");
+  }
   const keys = Object.keys(marker).sort().join("\0");
+  const stream: unknown = Reflect.get(marker, "stream");
+  const stateNonce: unknown = Reflect.get(marker, "stateNonce");
+  const stateRevision: unknown = Reflect.get(marker, "stateRevision");
   if (keys !== ["stateNonce", "stateRevision", "stream"].sort().join("\0")
-    || marker.stream !== state.stream || marker.stateNonce !== state.stateNonce
-    || marker.stateRevision !== state.stateRevision) {
+    || stream !== state.stream || stateNonce !== state.stateNonce
+    || stateRevision !== state.stateRevision) {
     throw new Error("reset refused: stale or foreign state incarnation marker");
   }
 }

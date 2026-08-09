@@ -14,7 +14,16 @@ const DISPLAY_PREFIX_MAX = 80;
 const LABEL_MAX = 200;
 export const API_KEY_CREATE_MAX_BYTES = 8 * 1024;
 
-export function validateApiKeyBody(value: unknown): Record<string, unknown> | null {
+export interface ApiKeyCreateBody {
+  tokenHash: string;
+  deviceId: string;
+  expiresAt: number;
+  displayPrefix: string;
+  label?: string;
+  enrolled?: boolean;
+}
+
+export function validateApiKeyBody(value: unknown): ApiKeyCreateBody | null {
   if (!objectWithKeys(value, ["tokenHash", "deviceId", "expiresAt", "displayPrefix", "label", "enrolled"], ["tokenHash", "deviceId", "expiresAt", "displayPrefix"])) return null;
   if (typeof value.tokenHash !== "string" || !SHA256_HEX_RE.test(value.tokenHash)) return null;
   if (typeof value.deviceId !== "string" || !DEVICE_ID_RE.test(value.deviceId)) return null;
@@ -22,7 +31,14 @@ export function validateApiKeyBody(value: unknown): Record<string, unknown> | nu
   if (typeof value.displayPrefix !== "string" || !isWellFormed(value.displayPrefix) || utf8Bytes(value.displayPrefix) > 240) return null;
   if (value.label !== undefined && (typeof value.label !== "string" || !isWellFormed(value.label))) return null;
   if (value.enrolled !== undefined && typeof value.enrolled !== "boolean") return null;
-  return { ...value, ...(value.label === undefined ? {} : { label: truncateUtf8(value.label, 600) }) };
+  return {
+    tokenHash: value.tokenHash,
+    deviceId: value.deviceId,
+    expiresAt: value.expiresAt,
+    displayPrefix: value.displayPrefix,
+    ...(value.label === undefined ? {} : { label: truncateUtf8(value.label, 600) }),
+    ...(value.enrolled === undefined ? {} : { enrolled: value.enrolled }),
+  };
 }
 
 function subscribeRequired(): Response {
@@ -33,7 +49,7 @@ function subscribeRequired(): Response {
  * POST /v1/keys/api — create a PAT auth row + descriptive sidecar.
  * The client generated the secret and sends only sha256(full PAT), never the PAT.
  */
-export async function createApiKey(env: Env, p: Principal, body: unknown, now = Date.now()): Promise<Response> {
+export async function createApiKey(env: Env, p: Principal, body: ApiKeyCreateBody, now = Date.now()): Promise<Response> {
   if (p.kind !== "device") return json({ error: "forbidden" }, 403);
   if (!p.userId) return json({ error: "forbidden", message: "key creation requires a user membership" }, 403);
 
@@ -41,7 +57,7 @@ export async function createApiKey(env: Env, p: Principal, body: unknown, now = 
   const plan = await readPlan(env, p.accountId);
   if (!isPaidPlan(plan)) return subscribeRequired();
 
-  const b = (body ?? {}) as Record<string, unknown>;
+  const b = body;
   const tokenHash = typeof b.tokenHash === "string" && SHA256_HEX_RE.test(b.tokenHash) ? b.tokenHash : null;
   const deviceId = typeof b.deviceId === "string" && DEVICE_ID_RE.test(b.deviceId) ? b.deviceId : null;
   const expiresAt = typeof b.expiresAt === "number" && Number.isInteger(b.expiresAt) ? b.expiresAt : null;

@@ -29,7 +29,7 @@ function write(value: unknown): string {
   if (t === "boolean") return value ? "true" : "false";
   if (t === "number") return writeNumber(value as number);
   if (Array.isArray(value)) return `[${value.map(write).join(",")}]`;
-  if (t === "object") return writeObject(value as Record<string, unknown>);
+  if (t === "object") return writeObject(value as JcsObject);
   throw new Error(`jcs: unsupported value of type ${t}`);
 }
 
@@ -43,7 +43,10 @@ function writeNumber(n: number): string {
   return String(n);
 }
 
-function writeObject(obj: Record<string, unknown>): string {
+type JcsValue = null | boolean | number | string | undefined | JcsValue[] | JcsObject;
+interface JcsObject { [key: string]: JcsValue; }
+
+function writeObject(obj: JcsObject): string {
   // RFC 8785 sorts members by the UTF-16 code units of their keys — which is
   // exactly what the default Array.prototype.sort comparator on strings does.
   const keys = Object.keys(obj).sort();

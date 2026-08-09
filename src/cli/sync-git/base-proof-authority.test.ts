@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import type { GitSection } from "../../engine/index.js";
 import { ProoflessBaseError } from "../state-plane/errors.js";
-import { applyStateSavePacket } from "../config.js";
+import { applyStateSavePacket, type SyncState } from "../config.js";
 import { composeStateSavePacket, savePublishedRepoIntent, type StateSource } from "../sync-state.js";
 import { carryRepoBaseProof, composeRepoBase, observedLandingRepoBaseProof, type BranchBaseOrigin, type RepoBaseProof } from "./base-composer.js";
 import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
@@ -36,12 +36,11 @@ const section = (head: string): GitSection => ({
 
 const origin: BranchBaseOrigin = { v: 1, oid: T, lineageHash: LIN, kind: "pull-p", episode: EPISODE };
 
-const state = () => ({
+const state = (): SyncState => ({
   stream: "s", stateNonce: "0".repeat(32), stateRevision: 1, lastSyncedSequence: 1,
   lastSyncedManifest: { generatedAt: "old", files: [] },
   repoRecords: { r: { repoGen: 3, sourceSeq: 1, base: section(T), branchBaseOrigins: { "refs/heads/main": origin } } },
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-}) as any;
+});
 
 const source = (values: StateSource["values"], repoProofs?: StateSource["repoProofs"]): StateSource => ({
   expectedStream: "s", sourceGlobalSeq: 2, observedRepos: ["r"], values,

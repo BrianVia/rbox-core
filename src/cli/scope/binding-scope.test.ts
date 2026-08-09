@@ -9,6 +9,7 @@ import {
   resolveBindingScope,
   ScopedBindingRefusal,
 } from "./binding-scope.js";
+import type { WorkspaceConfig } from "../workspace-config.js";
 
 let home: string;
 let root: string;
@@ -31,7 +32,7 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-async function writeRecord(fields: Record<string, unknown>): Promise<void> {
+async function writeRecord(fields: Partial<Pick<WorkspaceConfig, "scope" | "scopeGeneration">>): Promise<void> {
   await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
     remoteWorkspaceId: WORKSPACE_ID,
     projectId: "root",

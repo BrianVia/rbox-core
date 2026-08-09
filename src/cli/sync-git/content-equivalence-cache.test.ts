@@ -43,6 +43,6 @@ test("content-equivalence cache evicts the least-recently-used pair at its bound
   const persisted = JSON.parse(await fs.readFile(
     path.join(root, ".rbox", "state", "git-content-equivalence.json"),
     "utf8",
-  )) as { entries: Record<string, unknown> };
+  )) as { entries: Record<string, { equivalent: boolean; accessedAtMs: number }> };
   expect(Object.keys(persisted.entries)).toHaveLength(CONTENT_EQUIVALENCE_CACHE_MAX_ENTRIES);
 });

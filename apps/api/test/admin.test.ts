@@ -1,6 +1,6 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
-import { adminOverview, computeAggregates, fetchServerMetrics, isAllowlisted, isJwksFresh, normalizeJwks, verifyAccessJwt } from "../src/admin.js";
+import { adminOverview, computeAggregates, fetchServerMetrics, isAllowlisted, isJwksFresh, normalizeJwks, verifyAccessJwt, type AdminOverview } from "../src/admin.js";
 import type { Env } from "../src/env.js";
 
 const realFetch = globalThis.fetch;
@@ -38,7 +38,9 @@ function b64url(bytes: Uint8Array): string {
 }
 const b64urlStr = (s: string): string => b64url(new TextEncoder().encode(s));
 
-async function signJwt(payload: Record<string, unknown>, kid = KID): Promise<string> {
+interface AccessClaims { iss: string; aud: string[]; exp: number; email: string }
+
+async function signJwt(payload: AccessClaims, kid = KID): Promise<string> {
   const h = b64urlStr(JSON.stringify({ alg: "RS256", kid, typ: "JWT" }));
   const p = b64urlStr(JSON.stringify(payload));
   const sig = await crypto.subtle.sign({ name: "RSASSA-PKCS1-v1_5" }, signingKey, new TextEncoder().encode(`${h}.${p}`));
@@ -46,7 +48,7 @@ async function signJwt(payload: Record<string, unknown>, kid = KID): Promise<str
 }
 
 const nowS = () => Math.floor(Date.now() / 1000);
-function claims(over: Record<string, unknown> = {}): Record<string, unknown> {
+function claims(over: Partial<AccessClaims> = {}): AccessClaims {
   return { iss: TEAM, aud: [AUD], exp: nowS() + 3600, email: ALLOWED, ...over };
 }
 
@@ -158,7 +160,7 @@ describe("admin route — Access JWT + allow-list authz (defense in depth)", () 
     const token = await signJwt(claims());
     const res = await adminOverview(reqWith(token), accessEnv());
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
+    const body = (await res.json()) as AdminOverview;
     for (const k of ["totalAccounts", "activeDevices", "durableDevices", "storageUsedBytes", "activeSubscriptions", "subscriptionsByPlan", "mrrLiveCents", "signups", "generatedAt"]) {
       expect(body).toHaveProperty(k);
     }

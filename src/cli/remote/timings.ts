@@ -7,7 +7,7 @@
  */
 export function readNumericFields<K extends string>(value: unknown, keys: readonly K[]): Record<K, number> | undefined {
   if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Record<string, unknown>;
+  const candidate = value as Partial<Record<K, unknown>>;
   for (const key of keys) {
     const n = candidate[key];
     if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;

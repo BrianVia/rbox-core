@@ -358,7 +358,19 @@ export function renderOperatorReport(report: OperatorReport): string[] {
 }
 
 /** The non-interactive twin the rig, CI, and an agent drive. */
-export function operatorReportJson(report: OperatorReport): Record<string, unknown> {
+export interface OperatorReportJson {
+  readonly schemaVersion: 1;
+  readonly ok: boolean;
+  readonly outcome: string;
+  readonly id: string;
+  readonly severity: OperatorFinding["severity"];
+  readonly problem: string;
+  readonly safety: string;
+  readonly command?: string;
+  readonly facts: readonly string[];
+}
+
+export function operatorReportJson(report: OperatorReport): OperatorReportJson {
   return {
     schemaVersion: 1,
     ok: report.ok,

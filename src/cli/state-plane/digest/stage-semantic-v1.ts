@@ -1,4 +1,4 @@
-import type { GitSectionRole, Plane } from "../ports.js";
+import type { GitSectionRole, ManifestHeader, Plane } from "../ports.js";
 import { canonicalJson, domainHash } from "./codecs.js";
 
 declare const stageDigestBrand: unique symbol;
@@ -28,7 +28,7 @@ export class StageDigestBuilder {
   #gitSections = 0;
   #sealed = false;
 
-  constructor(stageId: string, plane: Plane, header: Record<string, unknown>) {
+  constructor(stageId: string, plane: Plane, header: ManifestHeader) {
     this.#hash.token("stage-id");
     this.#hash.token(stageId);
     this.#hash.token("plane");

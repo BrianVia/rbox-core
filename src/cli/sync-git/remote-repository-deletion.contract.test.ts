@@ -53,9 +53,9 @@ interface SidecarMaps {
   pending: Record<string, GitSection>;
   needsRes: Record<string, string>;
   removedMem: Record<string, string>;
-  deferrals: Record<string, unknown>;
-  partial: Record<string, unknown>;
-  attempt: Record<string, unknown>;
+  deferrals: Record<string, { apply?: { lane: "apply" } } | null>;
+  partial: Record<string, { incomingKey: string } | null>;
+  attempt: Record<string, { generation: number } | null>;
   idxProj: Record<string, string | null>;
   repoProofs: Record<string, RepoBaseProof>;
 }
@@ -72,6 +72,11 @@ interface Harness {
   maps: SidecarMaps;
   calls: string[];
   logs: string[];
+}
+
+function restoreEntry<T>(target: Record<string, T>, source: Record<string, T>, present: boolean): void {
+  if (present) target[REL] = source[REL]!;
+  else delete target[REL];
 }
 
 function harness(options: {
@@ -107,11 +112,15 @@ function harness(options: {
       if (transition.removedKey !== null) maps.removedMem[REL] = transition.removedKey;
       return () => {
         calls.push("revert");
-        for (const [name, record] of Object.entries(maps)) {
-          const source = (before as unknown as Record<string, Record<string, unknown>>)[name]!;
-          if (present[name]) (record as Record<string, unknown>)[REL] = source[REL];
-          else delete (record as Record<string, unknown>)[REL];
-        }
+        restoreEntry(maps.applied, before.applied, present.applied);
+        restoreEntry(maps.pending, before.pending, present.pending);
+        restoreEntry(maps.needsRes, before.needsRes, present.needsRes);
+        restoreEntry(maps.removedMem, before.removedMem, present.removedMem);
+        restoreEntry(maps.deferrals, before.deferrals, present.deferrals);
+        restoreEntry(maps.partial, before.partial, present.partial);
+        restoreEntry(maps.attempt, before.attempt, present.attempt);
+        restoreEntry(maps.idxProj, before.idxProj, present.idxProj);
+        restoreEntry(maps.repoProofs, before.repoProofs, present.repoProofs);
       };
     },
     beforeCleanup: async () => {

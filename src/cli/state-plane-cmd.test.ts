@@ -17,6 +17,7 @@ import { loadConfig, saveConfig, syncStreamId, type WorkspaceConfig } from "./co
 import { checkState, checkStateMigration } from "./doctor-state-plane.js";
 import { saveStateUnsafeLegacyOrTest } from "./sync-state-store.js";
 import { abortStateMigrationCmd, migrateCmd, retryStateMigrationCmd } from "./state-plane-cmd.js";
+import type { OperatorReportJson } from "./state-plane-report.js";
 
 // Deliberately no `RBOX_HOME` override: M0's liveness condition only READS the
 // daemon pid records under it, and mutating a process-wide env var at module load
@@ -139,7 +140,7 @@ test("abort after the flip refuses on its own identity, not merely with a non-ze
 
   const { code, lines } = await run(abortStateMigrationCmd, root, true);
   expect(code).toBe(1);
-  const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+  const parsed = JSON.parse(lines[0]!) as OperatorReportJson;
   expect(parsed.outcome).toBe("halted:reserved-path:abort-after-flip");
   expect(parsed.id).toBe("state-migration/abort-after-flip");
   // And it reads as what it is, not as the catch-all's generic sentence.
@@ -184,7 +185,7 @@ test("--json emits one parseable object with a stable id, and prints no prose be
 
   expect(code).toBe(0);
   expect(lines).toHaveLength(1);
-  const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+  const parsed = JSON.parse(lines[0]!) as OperatorReportJson;
   expect(parsed.schemaVersion).toBe(1);
   expect(parsed.ok).toBeTrue();
   expect(parsed.id).toBe("state-migration/migrated");

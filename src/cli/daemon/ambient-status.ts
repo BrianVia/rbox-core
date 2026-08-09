@@ -138,8 +138,8 @@ function newestIso(a: string | undefined, b: string | undefined): string | null 
   return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
-function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
-  for (const k of Object.keys(obj)) if (obj[k] === undefined) delete obj[k];
+function stripUndefined<T extends object>(obj: T): T {
+  for (const key of Object.keys(obj)) if (Reflect.get(obj, key) === undefined) Reflect.deleteProperty(obj, key);
   return obj;
 }
 
@@ -163,7 +163,7 @@ function ambientIso(value: unknown): value is string {
 function ambientCheckout(value: unknown): AmbientGitDeferral["checkout"] | undefined | null {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const checkout = value as Record<string, unknown>;
+  const checkout = value as Partial<Record<"kind" | "label", unknown>>;
   if (checkout.kind === "detached") return { kind: "detached" };
   if (checkout.kind !== "branch") return null;
   if (checkout.label !== undefined && typeof checkout.label !== "string") return null;
@@ -175,7 +175,7 @@ function ambientCheckout(value: unknown): AmbientGitDeferral["checkout"] | undef
 
 function parseAmbientDeferral(value: unknown): AmbientGitDeferral | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const item = value as Record<string, unknown>;
+  const item = value as Partial<Record<keyof AmbientGitDeferral, unknown>>;
   if (typeof item.repo !== "string" || typeof item.reason !== "string"
     || typeof item.reasonLabel !== "string" || typeof item.reasonText !== "string"
     || typeof item.remediationClass !== "string"

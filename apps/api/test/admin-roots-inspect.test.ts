@@ -13,7 +13,7 @@ interface FakeEnvResult {
   prepare: ReturnType<typeof vi.fn>;
 }
 
-function fakeEnv(doBody: Record<string, unknown>, timestamps: Array<{ sequence: number; created_at: number }> = []): FakeEnvResult {
+function fakeEnv(doBody: unknown, timestamps: Array<{ sequence: number; created_at: number }> = []): FakeEnvResult {
   const doFetch = vi.fn(async () => new Response(JSON.stringify(doBody), {
     status: 200,
     headers: { "content-type": "application/json" },

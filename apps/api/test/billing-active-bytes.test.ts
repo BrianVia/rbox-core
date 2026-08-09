@@ -61,8 +61,17 @@ async function ledger(accountId: string): Promise<{ used: number; overhang: numb
   return { used: Number(row?.used_bytes), overhang: Number(row?.history_overhang_bytes) };
 }
 
-async function usageBody(accountId: string): Promise<Record<string, unknown>> {
-  return (await (await usage(env, principal(accountId))).json()) as Record<string, unknown>;
+interface UsageBody {
+  usedBytes: number;
+  measuredAt: number | null;
+  readOnly: boolean;
+  fairUse: { activeBytes: number };
+  capBytes: number;
+  historyOverhangBytes: number;
+}
+
+async function usageBody(accountId: string): Promise<UsageBody> {
+  return (await (await usage(env, principal(accountId))).json()) as UsageBody;
 }
 
 describe("design 228 — the billing flip", () => {

@@ -43,7 +43,7 @@ function exactObject(
   value: unknown,
   field: string,
   keys: readonly string[],
-): asserts value is Record<string, unknown> {
+): asserts value is object {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${field} must be an object`);
   }
@@ -54,13 +54,13 @@ function exactObject(
   }
 }
 
-function textMembers(value: Record<string, unknown>, field: string, keys: readonly string[]): void {
+function textMembers(value: object, field: string, keys: readonly string[]): void {
   for (const key of keys) {
-    if (typeof value[key] !== "string") throw new TypeError(`${field}.${key} must be text`);
+    if (typeof Reflect.get(value, key) !== "string") throw new TypeError(`${field}.${key} must be text`);
   }
 }
 
-function validateFixedShapes(value: Record<string, unknown>): void {
+function validateFixedShapes(value: RepoRecord): void {
   if (value.packedRefsIdentity !== undefined) {
     exactObject(value.packedRefsIdentity, "packedRefsIdentity", ["mtimeMs"]);
     if (typeof value.packedRefsIdentity.mtimeMs !== "number" || !Number.isFinite(value.packedRefsIdentity.mtimeMs)) {
@@ -104,9 +104,8 @@ export function encodeRepoRecord(relPath: string, input: RepoRecord): EncodedRep
   if (relPath !== "." && !isSafeRelPath(relPath)) {
     throw new TypeError("repository path must be POSIX-relative");
   }
-  const source = input as RepoRecord & Record<string, unknown>;
   // The one named historical member is stripped, never retained as an extra.
-  const { resolutionIntent: _obsolete, ...value } = source as RepoRecord & Record<string, unknown> & { resolutionIntent?: unknown };
+  const { resolutionIntent: _obsolete, ...value } = input as RepoRecord & { resolutionIntent?: unknown };
   counter(value.repoGen, "repoGen");
   counter(value.sourceSeq, "sourceSeq");
   for (const field of REPO_RECORD_KEYS) {
@@ -174,20 +173,28 @@ export interface RepoRecordRow {
 }
 
 export function decodeRepoRecord(row: RepoRecordRow): RepoRecord {
-  const record: Record<string, unknown> = {
+  const record = {
     ...spreadExtras(row.extras_cjson),
     repoGen: row.repo_gen,
     sourceSeq: row.source_seq,
+    ...(row.base_cjson === null ? {} : { base: parseCanonicalJson(row.base_cjson) }),
+    ...(row.advertised_cjson === null ? {} : { advertised: parseCanonicalJson(row.advertised_cjson) }),
+    ...(row.branch_base_origins_cjson === null ? {} : { branchBaseOrigins: parseCanonicalJson(row.branch_base_origins_cjson) }),
+    ...(row.packed_refs_identity === null ? {} : { packedRefsIdentity: parseCanonicalJson(row.packed_refs_identity) }),
+    ...(row.pending_cjson === null ? {} : { pending: parseCanonicalJson(row.pending_cjson) }),
+    ...(row.cfg_token_cjson === null ? {} : { cfgToken: parseCanonicalJson(row.cfg_token_cjson) }),
+    ...(row.cfg_shape_cjson === null ? {} : { cfgShape: parseCanonicalJson(row.cfg_shape_cjson) }),
+    ...(row.deferrals_cjson === null ? {} : { deferrals: parseCanonicalJson(row.deferrals_cjson) }),
+    ...(row.partial_cjson === null ? {} : { partial: parseCanonicalJson(row.partial_cjson) }),
+    ...(row.attempt_cjson === null ? {} : { attempt: parseCanonicalJson(row.attempt_cjson) }),
+    ...(row.resolution_receipt_cjson === null ? {} : { resolutionReceipt: parseCanonicalJson(row.resolution_receipt_cjson) }),
+    ...(row.repo_absent === null ? {} : { repoAbsent: true as const }),
+    ...(row.removed_key === null ? {} : { removedKey: row.removed_key }),
+    ...(row.resolution_key === null ? {} : { resolutionKey: row.resolution_key }),
+    ...(row.cfg_synced === null ? {} : { cfgSynced: row.cfg_synced }),
+    ...(row.cfg_applied === null ? {} : { cfgApplied: row.cfg_applied }),
+    ...(row.idx_proj === null ? {} : { idxProj: row.idx_proj }),
   };
-  for (const field of JSON_FIELDS) {
-    const text = row[REPO_RECORD_COLUMN_BY_FIELD[field] as keyof RepoRecordRow] as string | null;
-    if (text !== null) record[field] = parseCanonicalJson(text);
-  }
-  if (row.repo_absent !== null) record.repoAbsent = true;
-  for (const field of ["removedKey", "resolutionKey", "cfgSynced", "cfgApplied", "idxProj"] as const) {
-    const member = row[REPO_RECORD_COLUMN_BY_FIELD[field] as keyof RepoRecordRow] as string | null;
-    if (member !== null) record[field] = member;
-  }
   const decoded = record as unknown as RepoRecord;
   const encoded = encodeRepoRecord(row.rel_path, decoded);
   if (encoded.canonicalBytes !== row.canonical_bytes || encoded.retainedEstimate !== row.retained_estimate) {

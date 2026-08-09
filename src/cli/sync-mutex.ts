@@ -87,11 +87,15 @@ export type LockingHealth =
   | { status: "degraded-unlocked"; reason: "identity-unavailable" }
   | { status: "starved"; reason: LockStarvationReason };
 
+interface StarvationWarningCandidate {
+  warnedAt?: unknown;
+}
+
 async function readStarvationWarning(root: string): Promise<LockStarvationReason | undefined> {
   try {
     const episodeRaw = await fs.readFile(path.join(root, ".rbox", "state", "lock-starvation.json"), "utf8");
     if (Buffer.byteLength(episodeRaw) > 4 * 1024) return undefined;
-    const episode = JSON.parse(episodeRaw) as Record<string, unknown>;
+    const episode = JSON.parse(episodeRaw) as StarvationWarningCandidate;
     if (typeof episode.warnedAt !== "number" || !Number.isSafeInteger(episode.warnedAt)) return undefined;
     const operational = (await resolveDaemonLogSources(root)).dated;
     if (!operational) return undefined;

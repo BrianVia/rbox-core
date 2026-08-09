@@ -94,6 +94,8 @@ export interface LockStarvationEpisode {
   countedAt?: number;
 }
 
+type LockStarvationEpisodeCandidate = Partial<Record<keyof LockStarvationEpisode, unknown>>;
+
 export const lockStarvationPath = (root: string): string => path.join(root, ".rbox", "state", "lock-starvation.json");
 
 const episodeTime = (value: unknown): value is number =>
@@ -107,7 +109,7 @@ export async function readLockStarvationEpisode(root: string): Promise<LockStarv
     if (!stat.isFile() || stat.size > LOCK_STARVATION_MAX_BYTES) return undefined;
     const raw = await handle.readFile("utf8");
     if (Buffer.byteLength(raw) > LOCK_STARVATION_MAX_BYTES) return undefined;
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = JSON.parse(raw) as LockStarvationEpisodeCandidate;
     const keys = Object.keys(parsed);
     if (keys.some((key) => !["holderKey", "firstSeenAt", "warnedAt", "countedAt"].includes(key))) return undefined;
     if (typeof parsed.holderKey !== "string" || !/^[0-9a-f]{64}$/.test(parsed.holderKey)) return undefined;

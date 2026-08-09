@@ -3,7 +3,7 @@ import type { Env } from "./env.js";
 import { emit, OpSpan } from "./metrics.js";
 import { dbFor } from "./db.js";
 import type { Principal } from "./authz.js";
-import { json, logErr, sha256Hex } from "./util.js";
+import { json, logErr, objectWithKeys, sha256Hex } from "./util.js";
 
 const BODY_CAP_BYTES = 600 * 1024;
 const DAEMON_LOG_CAP_BYTES = 128 * 1024;
@@ -24,8 +24,53 @@ const METRICS_KEYS = ["syncs", "commitConflicts409", "fileConflicts", "lockStarv
 const ACTIVITY_KEYS = ["at", "lastPush", "lastPull", "active", "halt", "excluded", "truncated", "originalBytes"] as const;
 const WORKSPACE_SHAPE_KEYS = ["fileCount", "totalBytes"] as const;
 
-type JsonRecord = Record<string, unknown>;
-type ValidationResult = { ok: true; value: JsonRecord } | { ok: false; message: string };
+type ValidationResult<T> = { ok: true; value: T } | { ok: false; message: string };
+
+export interface DiagnosticsExcluded { excluded: string }
+export interface DiagnosticsPlatform { os: string; arch: string }
+export interface DiagnosticsCheckResult {
+  ok: boolean;
+  label?: string;
+  message?: string;
+  hint?: string;
+  latencyMs?: number;
+  status?: string;
+  current?: string;
+  latest?: string;
+  pid?: number;
+}
+type RequiredCheckName = (typeof REQUIRED_CHECK_KEYS)[number];
+type OptionalCheckName = (typeof OPTIONAL_CHECK_KEYS)[number];
+export type DiagnosticsChecks = Record<RequiredCheckName, DiagnosticsCheckResult> & Partial<Record<OptionalCheckName, DiagnosticsCheckResult>>;
+export interface DiagnosticsMetrics {
+  syncs?: number;
+  commitConflicts409?: number;
+  fileConflicts?: number;
+  lockStarved?: number;
+  lastConflictAt?: string;
+  truncated?: boolean;
+  originalBytes?: number;
+}
+export interface DiagnosticsActivity {
+  at?: string;
+  lastPush?: { at?: string; files?: number; sequence?: number };
+  lastPull?: { at?: string; writes?: number; deletes?: number; conflicts?: number };
+  active?: { at?: string; phase?: "encrypt" | "upload" | "download"; done?: number; total?: number };
+  halt?: { at?: string; reason?: string; count?: number; op?: "pull" | "push" | "fullScan" | "deepScan" };
+  truncated?: boolean;
+  originalBytes?: number;
+}
+export interface DiagnosticsWorkspaceShape { fileCount: number; totalBytes: number }
+export interface DiagnosticsBundle {
+  version: string;
+  platform: DiagnosticsPlatform;
+  bunVersion: string;
+  checks: DiagnosticsChecks;
+  daemonLogTail: string | DiagnosticsExcluded;
+  metrics: DiagnosticsMetrics | DiagnosticsExcluded;
+  activity: DiagnosticsActivity | DiagnosticsExcluded;
+  workspaceShape: DiagnosticsWorkspaceShape;
+}
 
 export interface DiagnosticsDeps {
   putReport: (env: Env, key: string, body: string) => Promise<void>;
@@ -36,10 +81,6 @@ export const REAL_DIAGNOSTICS_DEPS: DiagnosticsDeps = {
   putReport: (env, key, body) => env.rbox_dev_blobs.put(key, body, { httpMetadata: { contentType: "application/json" } }).then(() => undefined),
   deleteReport: (env, key) => env.rbox_dev_blobs.delete(key).then(() => undefined),
 };
-
-export function isRecord(v: unknown): v is JsonRecord {
-  return !!v && typeof v === "object" && !Array.isArray(v);
-}
 
 function badShape(message: string): Response {
   return json({ error: "bad_shape", message }, 400);
@@ -55,14 +96,14 @@ function truncateUtf8(s: string, maxBytes: number): string {
   return new TextDecoder().decode(bytes.slice(0, maxBytes));
 }
 
-function assertOnlyKeys(obj: JsonRecord, allowed: readonly string[], name: string): string | null {
+function assertOnlyKeys(obj: object, allowed: readonly string[], name: string): string | null {
   for (const k of Object.keys(obj)) {
     if (!allowed.includes(k)) return `${name} contains unknown key ${k}`;
   }
   return null;
 }
 
-function requireKeys(obj: JsonRecord, keys: readonly string[], name: string): string | null {
+function requireKeys(obj: object, keys: readonly string[], name: string): string | null {
   for (const k of keys) {
     if (!(k in obj)) return `${name} missing ${k}`;
   }
@@ -79,14 +120,14 @@ function safeNumber(v: unknown, name: string): { ok: true; value: number } | { o
   return { ok: true, value: v };
 }
 
-function validateExcluded(v: JsonRecord, name: string): JsonRecord | null {
+function validateExcluded(v: { excluded?: unknown }, name: string): DiagnosticsExcluded | null {
   if (typeof v.excluded !== "string") return null;
   if (Object.keys(v).length !== 1) throw new Error(`${name} excluded section has extra keys`);
   return { excluded: truncateUtf8(v.excluded, SECTION_STRING_CAP_BYTES) };
 }
 
-function validatePlatform(v: unknown): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: "platform must be an object" };
+function validatePlatform(v: unknown): ValidationResult<DiagnosticsPlatform> {
+  if (!objectWithKeys(v, PLATFORM_KEYS, PLATFORM_KEYS)) return { ok: false, message: "platform must be an object" };
   const unknown = assertOnlyKeys(v, PLATFORM_KEYS, "platform") ?? requireKeys(v, PLATFORM_KEYS, "platform");
   if (unknown) return { ok: false, message: unknown };
   const os = boundedString(v.os, "platform.os", 64);
@@ -96,12 +137,12 @@ function validatePlatform(v: unknown): ValidationResult {
   return { ok: true, value: { os: os.value, arch: arch.value } };
 }
 
-function validateCheckResult(v: unknown, name: string): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: `${name} must be an object` };
+function validateCheckResult(v: unknown, name: string): ValidationResult<DiagnosticsCheckResult> {
+  if (!objectWithKeys(v, CHECK_RESULT_KEYS)) return { ok: false, message: `${name} must be an object` };
   const unknown = assertOnlyKeys(v, CHECK_RESULT_KEYS, name);
   if (unknown) return { ok: false, message: unknown };
   if (typeof v.ok !== "boolean") return { ok: false, message: `${name}.ok must be boolean` };
-  const out: JsonRecord = { ok: v.ok };
+  const out: DiagnosticsCheckResult = { ok: v.ok };
   for (const key of ["label", "message", "hint", "status", "current", "latest"] as const) {
     if (v[key] === undefined) continue;
     const s = boundedString(v[key], `${name}.${key}`);
@@ -117,22 +158,22 @@ function validateCheckResult(v: unknown, name: string): ValidationResult {
   return { ok: true, value: out };
 }
 
-function validateChecks(v: unknown): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: "checks must be an object" };
+function validateChecks(v: unknown): ValidationResult<DiagnosticsChecks> {
+  if (!objectWithKeys(v, CHECK_KEYS, REQUIRED_CHECK_KEYS)) return { ok: false, message: "checks must be an object" };
   const unknown = assertOnlyKeys(v, CHECK_KEYS, "checks") ?? requireKeys(v, REQUIRED_CHECK_KEYS, "checks");
   if (unknown) return { ok: false, message: unknown };
-  const out: JsonRecord = {};
+  const out: Partial<Record<(typeof CHECK_KEYS)[number], DiagnosticsCheckResult>> = {};
   for (const key of CHECK_KEYS) {
     if (!(key in v)) continue;
     const r = validateCheckResult(v[key], `checks.${key}`);
     if (!r.ok) return r;
     out[key] = r.value;
   }
-  return { ok: true, value: out };
+  return { ok: true, value: out as DiagnosticsChecks };
 }
 
-function validateMetrics(v: unknown): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: "metrics must be an object" };
+function validateMetrics(v: unknown): ValidationResult<DiagnosticsMetrics | DiagnosticsExcluded> {
+  if (!objectWithKeys(v, METRICS_KEYS)) return { ok: false, message: "metrics must be an object" };
   try {
     const excluded = validateExcluded(v, "metrics");
     if (excluded) return { ok: true, value: excluded };
@@ -141,7 +182,7 @@ function validateMetrics(v: unknown): ValidationResult {
   }
   const unknown = assertOnlyKeys(v, METRICS_KEYS, "metrics");
   if (unknown) return { ok: false, message: unknown };
-  const out: JsonRecord = {};
+  const out: DiagnosticsMetrics = {};
   for (const key of ["syncs", "commitConflicts409", "fileConflicts", "lockStarved", "originalBytes"] as const) {
     if (v[key] === undefined) continue;
     const n = safeNumber(v[key], `metrics.${key}`);
@@ -160,32 +201,42 @@ function validateMetrics(v: unknown): ValidationResult {
   return { ok: true, value: out };
 }
 
-function validateNestedObject(v: unknown, name: string, spec: Record<string, "string" | "number" | readonly string[]>): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: `${name} must be an object` };
-  const allowed = Object.keys(spec);
+type NestedRule = "string" | "number" | readonly string[];
+type NestedResult<Spec extends Readonly<Record<string, NestedRule>>> = {
+  [Key in keyof Spec]?: Spec[Key] extends "number" ? number : Spec[Key] extends readonly (infer Value)[] ? Value : string;
+};
+
+function validateNestedObject<const Spec extends Readonly<Record<string, NestedRule>>>(
+  v: unknown,
+  name: string,
+  spec: Spec,
+): ValidationResult<NestedResult<Spec>> {
+  const allowed = Object.keys(spec) as Array<keyof Spec & string>;
+  if (!objectWithKeys(v, allowed)) return { ok: false, message: `${name} must be an object` };
   const unknown = assertOnlyKeys(v, allowed, name);
   if (unknown) return { ok: false, message: unknown };
-  const out: JsonRecord = {};
-  for (const [key, rule] of Object.entries(spec)) {
+  const out: NestedResult<Spec> = {};
+  for (const key of allowed) {
+    const rule = spec[key]!;
     if (v[key] === undefined) continue;
     if (rule === "string") {
       const s = boundedString(v[key], `${name}.${key}`);
       if (!s.ok) return s;
-      out[key] = s.value;
+      out[key] = s.value as NestedResult<Spec>[typeof key];
     } else if (rule === "number") {
       const n = safeNumber(v[key], `${name}.${key}`);
       if (!n.ok) return n;
-      out[key] = n.value;
+      out[key] = n.value as NestedResult<Spec>[typeof key];
     } else {
       if (typeof v[key] !== "string" || !rule.includes(v[key] as string)) return { ok: false, message: `${name}.${key} has invalid value` };
-      out[key] = v[key];
+      out[key] = v[key] as NestedResult<Spec>[typeof key];
     }
   }
   return { ok: true, value: out };
 }
 
-function validateActivity(v: unknown): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: "activity must be an object" };
+function validateActivity(v: unknown): ValidationResult<DiagnosticsActivity | DiagnosticsExcluded> {
+  if (!objectWithKeys(v, ACTIVITY_KEYS)) return { ok: false, message: "activity must be an object" };
   try {
     const excluded = validateExcluded(v, "activity");
     if (excluded) return { ok: true, value: excluded };
@@ -194,7 +245,7 @@ function validateActivity(v: unknown): ValidationResult {
   }
   const unknown = assertOnlyKeys(v, ACTIVITY_KEYS, "activity");
   if (unknown) return { ok: false, message: unknown };
-  const out: JsonRecord = {};
+  const out: DiagnosticsActivity = {};
   if (v.at !== undefined) {
     const s = boundedString(v.at, "activity.at");
     if (!s.ok) return s;
@@ -232,9 +283,9 @@ function validateActivity(v: unknown): ValidationResult {
   return { ok: true, value: out };
 }
 
-function validateDaemonLogTail(v: unknown): { ok: true; value: string | JsonRecord } | { ok: false; message: string } {
+function validateDaemonLogTail(v: unknown): ValidationResult<string | DiagnosticsExcluded> {
   if (typeof v === "string") return { ok: true, value: truncateUtf8(v, DAEMON_LOG_CAP_BYTES) };
-  if (isRecord(v)) {
+  if (objectWithKeys(v, ["excluded"] as const)) {
     try {
       const excluded = validateExcluded(v, "daemonLogTail");
       if (excluded) return { ok: true, value: excluded };
@@ -245,8 +296,8 @@ function validateDaemonLogTail(v: unknown): { ok: true; value: string | JsonReco
   return { ok: false, message: "daemonLogTail must be a string or excluded object" };
 }
 
-function validateWorkspaceShape(v: unknown): ValidationResult {
-  if (!isRecord(v)) return { ok: false, message: "workspaceShape must be an object" };
+function validateWorkspaceShape(v: unknown): ValidationResult<DiagnosticsWorkspaceShape> {
+  if (!objectWithKeys(v, WORKSPACE_SHAPE_KEYS, WORKSPACE_SHAPE_KEYS)) return { ok: false, message: "workspaceShape must be an object" };
   const unknown = assertOnlyKeys(v, WORKSPACE_SHAPE_KEYS, "workspaceShape") ?? requireKeys(v, WORKSPACE_SHAPE_KEYS, "workspaceShape");
   if (unknown) return { ok: false, message: unknown };
   const fileCount = safeNumber(v.fileCount, "workspaceShape.fileCount");
@@ -256,8 +307,8 @@ function validateWorkspaceShape(v: unknown): ValidationResult {
   return { ok: true, value: { fileCount: fileCount.value, totalBytes: totalBytes.value } };
 }
 
-export function validateDiagnosticsBundle(parsed: unknown): ValidationResult {
-  if (!isRecord(parsed)) return { ok: false, message: "body must be a JSON object" };
+export function validateDiagnosticsBundle(parsed: unknown): ValidationResult<DiagnosticsBundle> {
+  if (!objectWithKeys(parsed, TOP_KEYS, TOP_KEYS)) return { ok: false, message: "body must be a JSON object" };
   const top = assertOnlyKeys(parsed, TOP_KEYS, "body") ?? requireKeys(parsed, TOP_KEYS, "body");
   if (top) return { ok: false, message: top };
 

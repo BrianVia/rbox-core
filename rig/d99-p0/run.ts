@@ -6,7 +6,8 @@ import { generateKek } from "../../src/engine/crypto.js";
 import { generateCorpus, HISTOGRAM, type CorpusFile } from "./corpus.js";
 import { runDeterminism } from "./determinism.js";
 import { summary, bootstrapDeltaCI } from "./metrics.js";
-declare const Bun: { spawn(args: string[], opts: Record<string, unknown>): { stdout: ReadableStream; stderr: ReadableStream; exited: Promise<number> } };
+interface BunSpawnOptions { stdout: "pipe"; stderr: "pipe"; env: NodeJS.ProcessEnv }
+declare const Bun: { spawn(args: string[], opts: BunSpawnOptions): { stdout: ReadableStream; stderr: ReadableStream; exited: Promise<number> } };
 
 const argv = process.argv.slice(2);
 const value = (name: string, fallback: string) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : fallback; };

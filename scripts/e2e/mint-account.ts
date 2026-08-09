@@ -47,7 +47,10 @@ interface ClerkUser {
   external_id?: string | null;
   primary_email_address_id?: string | null;
   email_addresses?: Array<{ id?: string; email_address?: string; verification?: { status?: string } | null }>;
-  private_metadata?: Record<string, unknown>;
+  private_metadata?: {
+    rbox_e2e_disposable?: boolean;
+    rbox_account_id?: string;
+  };
 }
 
 interface WebSession {

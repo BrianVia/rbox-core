@@ -364,7 +364,10 @@ function num(v: unknown): number {
 
 /** Run one AE SQL statement, returning its `data` rows. Throws on any non-2xx / parse
  *  failure so the caller's single try/catch can degrade the whole block to null. */
-export async function aeSql(env: Env, token: string, sql: string): Promise<Array<Record<string, unknown>>> {
+export type AeSqlValue = string | number | boolean | null;
+export type AeSqlRow = { [column: string]: AeSqlValue };
+
+export async function aeSql(env: Env, token: string, sql: string): Promise<AeSqlRow[]> {
   const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
@@ -372,7 +375,7 @@ export async function aeSql(env: Env, token: string, sql: string): Promise<Array
     signal: AbortSignal.timeout(AE_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`ae_sql_${res.status}`);
-  const body = (await res.json()) as { data?: Array<Record<string, unknown>> };
+  const body = (await res.json()) as { data?: AeSqlRow[] };
   return body.data ?? [];
 }
 

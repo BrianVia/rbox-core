@@ -12,7 +12,7 @@
  * neither may drag the semantic-digest grammar (or `bun:sqlite`) behind it.
  */
 import type { SyncState } from "../../sync-state-model.js";
-import { canonicalJson } from "./codecs.js";
+import { canonicalJson, type JsonValue } from "./codecs.js";
 
 export interface SourceShapeFlags {
   readonly stream: boolean;
@@ -44,6 +44,17 @@ export function sourceShapeFlags(present: SourceShapePresence): SourceShapeFlags
       gitRepos: present.gitRepos,
     },
   };
+}
+
+/** The read path intentionally projects only this compatibility bit. Older
+ * rows may omit every other flag; future rows may add flags this reader does
+ * not understand. The owning question therefore returns a boolean rather than
+ * pretending the persisted value is a complete current SourceShapeFlags. */
+export function manifestGitReposWasPresent(value: JsonValue): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const manifest = value.lastSyncedManifest;
+  return typeof manifest === "object" && manifest !== null && !Array.isArray(manifest)
+    && manifest.gitRepos === true;
 }
 
 /** Genesis has a stream and nothing else; its two optional lineage members are

@@ -2,7 +2,18 @@ import { describe, expect, it } from "vitest";
 import type { Env } from "../src/env.js";
 import { MAX_SNAPSHOT_RETRIES, reachableFromWorkspaces } from "../src/gc-roots.js";
 
-const page = (overrides: Record<string, unknown> = {}) => ({
+interface RootsPageFixture {
+  head: number;
+  pruneFloor: number;
+  indexGeneration: number;
+  gap: Array<{ manifestSha: string; chainRefs?: string[]; inlineRefs?: string[] }>;
+  droppedPage: string[];
+  seqRootsPage: Array<{ manifestSha: string }>;
+  nextSha?: string;
+  nextSeq?: number;
+}
+
+const page = (overrides: Partial<RootsPageFixture> = {}): RootsPageFixture => ({
   head: 4,
   pruneFloor: 1,
   indexGeneration: 7,

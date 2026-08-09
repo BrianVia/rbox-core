@@ -11,6 +11,7 @@ import { capBytesFor } from "../src/plans.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";
 import type { Principal } from "../src/authz.js";
 import { publicKeyFingerprint } from "../src/auth/key-delivery.js";
+import type { KeyBootstrapBody } from "../src/keys.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const BASE = "https://example.com";
@@ -21,7 +22,7 @@ beforeAll(async () => {
 });
 
 // Each test bootstraps its own account/device so they're isolated.
-async function bootstrap(accountName: string, extra: Record<string, unknown> = {}): Promise<{ token: string; accountId: string; deviceId: string }> {
+async function bootstrap(accountName: string, extra: { plan?: string } = {}): Promise<{ token: string; accountId: string; deviceId: string }> {
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -726,7 +727,17 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   afterAll(() => vi.restoreAllMocks());
 
-  async function signJwt(payload: Record<string, unknown>, opts: { alg?: string; kid?: string } = {}): Promise<string> {
+  interface ClerkClaims {
+    iss: string;
+    sub: string;
+    azp?: string;
+    exp: number;
+    nbf: number;
+    iat?: number;
+    fva?: number[];
+  }
+
+  async function signJwt(payload: ClerkClaims, opts: { alg?: string; kid?: string } = {}): Promise<string> {
     const header = { alg: opts.alg ?? "RS256", kid: opts.kid ?? KID, typ: "JWT" };
     const h = b64url(new TextEncoder().encode(JSON.stringify(header)));
     const p = b64url(new TextEncoder().encode(JSON.stringify(payload)));
@@ -735,7 +746,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     return `${h}.${p}.${b64url(sig)}`;
   }
   const now = () => Math.floor(Date.now() / 1000);
-  const claims = (over: Record<string, unknown> = {}) => ({ iss: ISS, sub: "user_clerk_1", azp: AZP, exp: now() + 60, nbf: now() - 5, ...over });
+  const claims = (over: Partial<ClerkClaims> = {}): ClerkClaims => ({ iss: ISS, sub: "user_clerk_1", azp: AZP, exp: now() + 60, nbf: now() - 5, ...over });
   const webExchange = (token: string) =>
     SELF.fetch(`${BASE}/v1/web/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
 
@@ -887,7 +898,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
   });
 
   test("absent azp → 401 (web route requires origin binding)", async () => {
-    const c = claims({ sub: "u_noazp" }); delete (c as Record<string, unknown>).azp;
+    const c = claims({ sub: "u_noazp" }); delete c.azp;
     expect((await webExchange(await signJwt(c))).status).toBe(401);
   });
 
@@ -895,7 +906,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const prior = env.CLERK_ALLOWED_ORIGINS;
     env.CLERK_ALLOWED_ORIGINS = `${prior},__absent-azp__`;
     try {
-      const c = claims({ sub: "u_backend_minted" }); delete (c as Record<string, unknown>).azp;
+      const c = claims({ sub: "u_backend_minted" }); delete c.azp;
       expect((await webExchange(await signJwt(c))).status).toBe(200);
       expect((await webExchange(await signJwt(claims({ sub: "u_azp2", azp: "https://evil.test" })))).status).toBe(401);
     } finally {
@@ -921,7 +932,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   // ── E2EE opaque key storage (design 12) ──────────────────────────────────
 
-  const keysBootstrap = (token: string, deviceId: string, over: Record<string, unknown> = {}) =>
+  const keysBootstrap = (token: string, deviceId: string, over: Partial<KeyBootstrapBody> = {}) =>
     SELF.fetch(`${BASE}/v1/keys/bootstrap`, {
       method: "POST",
       headers: authed(token, { "content-type": "application/json" }),
@@ -2025,7 +2036,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     await env.rbox_dev_db.prepare("UPDATE devices SET last_seen_version = '1.6.2' WHERE device_id = ?").bind(a.deviceId).run();
     const res = await getDevices(a.token);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { devices: Array<Record<string, unknown>>; nextCursor: string | null };
+    const body = (await res.json()) as { devices: Array<{
+      createdAt: number; deviceId: string; isCurrent: boolean; kind: string; label: string | null;
+      lastSeenAt: number | null; lastSeenVersion: string | null;
+    }>; nextCursor: string | null };
     expect(body.devices.length).toBe(2);
     // The raw JSON must contain NONE of the secret/internal columns.
     const raw = JSON.stringify(body);
@@ -2077,7 +2091,9 @@ describe("worker integration (real DO + D1 + R2)", () => {
     await SELF.fetch(`${BASE}/v1/workspaces?project=my-proj`, { method: "POST", headers: authed(a.token) });
     const res = await getWorkspaces(a.token);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { workspaces: Array<Record<string, unknown>>; nextCursor: string | null };
+    const body = (await res.json()) as { workspaces: Array<{
+      createdAt: number; lastCommitAt: number | null; name: string | null; projectId: string; workspaceId: string;
+    }>; nextCursor: string | null };
     expect(body.workspaces.length).toBe(1);
     expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "lastCommitAt", "name", "projectId", "workspaceId"]);
     expect(body.workspaces[0]!.projectId).toBe("my-proj");

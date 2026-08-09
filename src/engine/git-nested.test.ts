@@ -24,6 +24,7 @@ import {
   MAX_GIT_REPOS,
   type FileEntry,
   type GitSection,
+  type Manifest,
 } from "./index.js";
 import { decideDirBundleAllArgs } from "./git/capture.js";
 
@@ -758,7 +759,8 @@ const section = (over: Partial<GitSection> = {}): GitSection => ({
   generatedAt: "",
   ...over,
 });
-const m43 = (gitRepos: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+type ManifestFixture = Partial<Omit<Manifest, "gitRepos">> & { gitRepos?: Partial<Record<string, Partial<GitSection>>> };
+const m43 = (gitRepos: Partial<Record<string, Partial<GitSection>>>, extra: Partial<ManifestFixture> = {}) => ({
   generatedAt: "",
   files: [fileEntry("src/a.ts")],
   manifestSchema: 2,

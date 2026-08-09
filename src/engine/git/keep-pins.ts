@@ -78,7 +78,7 @@ export function parseKeepPinOrigins(raw: string): KeepPinOrigins {
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error("malformed keep-pin origin sidecar"); }
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("keep-pin origin sidecar is not an object");
-  const entries = Object.entries(value as Record<string, unknown>);
+  const entries = Object.entries(value as Partial<KeepPinOrigins>);
   if (entries.length > MAX_ORIGIN_OIDS) throw new Error("keep-pin origin sidecar exceeds OID cap");
   const parsed: KeepPinOrigins = {};
   for (const [oid, origins] of entries) {
@@ -88,7 +88,7 @@ export function parseKeepPinOrigins(raw: string): KeepPinOrigins {
     const seen = new Set<string>();
     parsed[oid] = origins.map((candidate) => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error(`invalid keep-pin origin for ${oid}`);
-      const record = candidate as Record<string, unknown>;
+      const record = candidate as Partial<KeepPinOrigin>;
       if (Object.keys(record).sort().join("\0") !== ["class", "episode", "ref", "time"].join("\0")) {
         throw new Error(`unknown keep-pin origin field for ${oid}`);
       }

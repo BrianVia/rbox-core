@@ -317,11 +317,55 @@ interface InspectBody {
 
 type CursorKind = "workspaces" | "catalog" | "inventory" | "r2" | "fleet";
 
-function encode(value: Record<string, unknown>): string {
+interface DecodedCursor {
+  v?: unknown;
+  kind?: unknown;
+  fromSha?: unknown;
+  fromSeq?: unknown;
+  fromGapSeq?: unknown;
+  workspaceId?: unknown;
+  projectId?: unknown;
+  sha?: unknown;
+  prefix?: unknown;
+  cursor?: unknown;
+  key?: unknown;
+}
+
+interface EntitlementSqlRow {
+  account_id: string;
+  sha256: string;
+  granted_at: number;
+  marked_at: number | null;
+  size_bytes: number | null;
+  pack_id: string | null;
+  length: number | null;
+  pack_inventory_present: number | null;
+}
+
+interface CanonicalInventorySqlRow {
+  sha256: string;
+  size_bytes: number;
+  present: number;
+  marked_at: number | null;
+  deleting_at: number | null;
+  created_at_ms: number | null;
+}
+
+interface PackInventorySqlRow {
+  pack_id: string;
+  size_bytes: number;
+  state: string;
+  created_at: number;
+  touched_at: number;
+  marked_at: number | null;
+  deleting_at: number | null;
+}
+
+function encode(value: object): string {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
 }
 
-function decodeObject(raw: string): Record<string, unknown> {
+function decodeObject(raw: string): DecodedCursor {
   if (!/^[A-Za-z0-9_-]+$/.test(raw) || Buffer.from(raw, "base64url").toString("base64url") !== raw) throw new Error("invalid opaque cursor");
   let value: unknown;
   try {
@@ -330,10 +374,10 @@ function decodeObject(raw: string): Record<string, unknown> {
     throw new Error("invalid opaque cursor");
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid opaque cursor");
-  return value as Record<string, unknown>;
+  return value as DecodedCursor;
 }
 
-function exact(value: Record<string, unknown>, keys: string[]): boolean {
+function exact(value: object, keys: string[]): boolean {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
@@ -356,11 +400,11 @@ export function decodeRootsCursor(raw: string): RootsCursor {
   return value as unknown as RootsCursor;
 }
 
-function encodeKeyset(kind: CursorKind, fields: Record<string, unknown>): string {
+function encodeKeyset(kind: CursorKind, fields: object): string {
   return encode({ v: 1, kind, ...fields });
 }
 
-function decodeKeyset(raw: string | null, kind: CursorKind, fields: string[]): Record<string, unknown> | null {
+function decodeKeyset(raw: string | null, kind: CursorKind, fields: string[]): DecodedCursor | null {
   if (raw === null) return null;
   const value = decodeObject(raw);
   if (!exact(value, ["v", "kind", ...fields]) || value.v !== 1 || value.kind !== kind) throw new Error(`invalid ${kind} cursor`);
@@ -384,7 +428,7 @@ function sameTriple(a: SnapshotTriple, b: SnapshotTriple): boolean {
 
 function failureReason(value: unknown, fallback: string): string {
   if (!value || typeof value !== "object") return fallback;
-  const body = value as Record<string, unknown>;
+  const body = value as { error?: unknown; reason?: unknown };
   return [body.error, body.reason].filter((part): part is string => typeof part === "string").join(":") || fallback;
 }
 
@@ -488,7 +532,7 @@ export class BindingStorageTruthSource implements StorageTruthSource {
     let raw: unknown;
     try { raw = await response.json(); } catch { raw = null; }
     if (response.status === 409) {
-      const error = raw && typeof raw === "object" ? (raw as Record<string, unknown>).error : undefined;
+      const error = raw && typeof raw === "object" ? (raw as { error?: unknown }).error : undefined;
       return error === "snapshot_changed"
         ? { outcome: "snapshot_changed", reason: "snapshot changed" }
         : { outcome: "uninspectable", reason: failureReason(raw, "roots conflict") };
@@ -583,7 +627,7 @@ export class BindingStorageTruthSource implements StorageTruthSource {
       FROM blob_refs r LEFT JOIN blob_ref_candidates c ON c.account_id=r.account_id AND c.sha256=r.sha256
       LEFT JOIN blobs b ON b.sha256=r.sha256 LEFT JOIN blob_locations l ON l.sha256=r.sha256
       WHERE r.account_id=? AND r.sha256>? ORDER BY r.sha256 LIMIT ?`)
-      .bind(accountId, after, limit + 1).all<Record<string, unknown>>();
+      .bind(accountId, after, limit + 1).all<EntitlementSqlRow>();
     const page = (result.results ?? []).slice(0, limit);
     const rows = page.map((row): EntitlementRow => ({
       accountId: String(row.account_id), sha: requireSha(row.sha256), grantedAt: Number(row.granted_at),
@@ -698,7 +742,7 @@ export class BindingStorageTruthSource implements StorageTruthSource {
         unixepoch(b.created_at)*1000 AS created_at_ms FROM blobs b
       LEFT JOIN gc_candidates c ON c.sha256=b.sha256 LEFT JOIN blob_locations l ON l.sha256=b.sha256
       WHERE l.sha256 IS NULL AND b.sha256>? ORDER BY b.sha256 LIMIT ?`)
-      .bind(after, limit + 1).all<Record<string, unknown>>();
+      .bind(after, limit + 1).all<CanonicalInventorySqlRow>();
     const page = (result.results ?? []).slice(0, limit);
     const rows = page.map((row): InventoryEntry => {
       const condemned = row.marked_at != null;
@@ -722,7 +766,7 @@ export class BindingStorageTruthSource implements StorageTruthSource {
     const after = decoded === null ? "" : requireString(decoded.key, "pack inventory cursor");
     const result = await this.deps.db.prepare(`SELECT p.pack_id,p.size_bytes,p.state,p.created_at,p.touched_at,c.marked_at,c.deleting_at
       FROM packs p LEFT JOIN pack_gc_candidates c ON c.pack_id=p.pack_id WHERE p.pack_id>? ORDER BY p.pack_id LIMIT ?`)
-      .bind(after, limit + 1).all<Record<string, unknown>>();
+      .bind(after, limit + 1).all<PackInventorySqlRow>();
     const page = (result.results ?? []).slice(0, limit);
     const ids = page.map((row) => String(row.pack_id));
     const members = new Map<string, string[]>();

@@ -40,7 +40,7 @@ describe("commit dual-mode body (§24.2)", () => {
   // A commit carrying BOTH or NEITHER ref carrier must be rejected by parseCommit. We craft
   // such bodies directly (buildSignedCommit can't produce them) with a valid hash so the only
   // failure is the discriminator.
-  async function craft(extra: Record<string, unknown>) {
+  async function craft(extra: Partial<Pick<CommitFields, "blobRefs" | "blobRefset">>) {
     const body = canonicalString({ type: "rbox/commit/v1", ...base, ...extra });
     const commitHash = await sha256Hex(utf8(body));
     return { body, commitHash, sig: "x" };

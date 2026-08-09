@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createPrivateKey, generateKeyPairSync, sign as nodeSign, createPublicKey } from "node:crypto";
 import { parseSemver, semverGt } from "./semver.js";
-import { releaseSigningInput, verifyAndParseManifest } from "./release-verify.js";
+import { releaseSigningInput, verifyAndParseManifest, type Manifest } from "./release-verify.js";
 import { RELEASE_KEYS } from "./release-key.js";
 import { fromB64url, toB64url } from "../engine/e2ee/index.js";
 
@@ -54,7 +54,7 @@ describe("verifyAndParseManifest (release signature)", () => {
   // a NON-embedded key is rejected, and that tampering/garbage is rejected.
   const kp = generateKeyPairSync("ed25519");
   const privPkcs8 = toB64url(new Uint8Array(kp.privateKey.export({ format: "der", type: "pkcs8" }) as Buffer));
-  const manifest = (over: Record<string, unknown> = {}) => new TextEncoder().encode(JSON.stringify({ version: "0.0.2", keyId: RELEASE_KEYS[0]!.keyId, artifacts: { "rbox-linux-x64": { sha256: "ab".repeat(32), path: "v0.0.2/rbox-linux-x64" } }, ...over }));
+  const manifest = (over: Partial<Manifest> = {}) => new TextEncoder().encode(JSON.stringify({ version: "0.0.2", keyId: RELEASE_KEYS[0]!.keyId, artifacts: { "rbox-linux-x64": { sha256: "ab".repeat(32), path: "v0.0.2/rbox-linux-x64" } }, ...over }));
 
   test("rejects a signature from a key that isn't the embedded release key", () => {
     const bytes = manifest();

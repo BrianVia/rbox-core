@@ -17,6 +17,7 @@ import { provisionPair, startDaemons, teardownAccount } from "./preamble.js";
 import { assessIdle, IDLE_BUDGETS, type IdleAssessment } from "./budgets.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import type { RawObservation } from "../lib/capture.js";
 
 /** Idle soak length (design 56 §9 P2 spec — 3 minutes). */
 const SOAK_MS = 180_000;
@@ -24,15 +25,15 @@ const SOAK_MS = 180_000;
  *  capture channel can't pass the budget by having zero samples to violate it. */
 const MIN_SOAK_SAMPLES = 20;
 
-function readSamples(runDir: string, label: "a" | "b"): Array<Record<string, unknown> & { ts?: unknown }> {
+function readSamples(runDir: string, label: "a" | "b"): RawObservation[] {
   const file = path.join(runDir, `stats-${label}.jsonl`);
   if (!fs.existsSync(file)) return [];
-  const out: Array<Record<string, unknown> & { ts?: unknown }> = [];
+  const out: RawObservation[] = [];
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     const t = line.trim();
     if (!t) continue;
     try {
-      out.push(JSON.parse(t) as Record<string, unknown>);
+      out.push(JSON.parse(t) as RawObservation);
     } catch {
       /* skip malformed */
     }

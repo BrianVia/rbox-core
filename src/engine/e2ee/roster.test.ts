@@ -79,7 +79,7 @@ describe("pairing admission (V4-1)", () => {
       admissionPubKey: toB64url(admissionKp.publicKey),
       notAfter: NOW + 600_000,
     };
-    const grantSig = toB64url(sign(aSig.privateKey, fromHex(await sha256Hex(utf8(canonicalString(grant as unknown as Record<string, unknown>))))));
+    const grantSig = toB64url(sign(aSig.privateKey, fromHex(await sha256Hex(utf8(canonicalString(grant))))));
 
     // B's real keys. A malicious server would instead inject keys it controls,
     // but it CANNOT produce admissionSig (no tokenSecret).

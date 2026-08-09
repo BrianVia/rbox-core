@@ -17,7 +17,7 @@
  * constructor, so its charset is the fence. */
 export const RECORD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
-export type Fields = Record<string, Spec>;
+export type Fields = Readonly<Record<string, Spec>>;
 export type Spec =
   | "string" | "id" | "int" | "hex" | "hex32" | "digits"
   | { readonly oneOf: readonly string[] }
@@ -26,13 +26,13 @@ export type Spec =
   | { readonly list: Spec }
   | { readonly each: Spec }
   | { readonly fields: Fields }
-  | { readonly union: { readonly on: string; readonly cases: Record<string, Fields> } };
+  | { readonly union: { readonly on: string; readonly cases: Readonly<Record<string, Fields>> } };
 
 /** How a record refuses. It must never return. */
 export type Refuse = (at: string, why: string) => never;
 
 /** A discriminated union whose every case carries its own tag as a constant. */
-export const tagged = (on: string, cases: Record<string, Fields>): Spec => ({
+export const tagged = (on: string, cases: Readonly<Record<string, Fields>>): Spec => ({
   union: {
     on,
     cases: Object.fromEntries(Object.entries(cases).map(([tag, f]) => [tag, { [on]: { const: tag }, ...f }])),
@@ -40,9 +40,9 @@ export const tagged = (on: string, cases: Record<string, Fields>): Spec => ({
 });
 
 export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse): void {
-  const plain = (v: unknown, where: string): Record<string, unknown> =>
+  const plain = (v: unknown, where: string): object =>
     typeof v === "object" && v !== null && !Array.isArray(v)
-      ? v as Record<string, unknown>
+      ? v
       : bad(where, "is not an object");
   const v = value;
   if (spec === "string") { if (typeof v !== "string" || v.length === 0) bad(at, "is not a nonempty string"); return; }
@@ -64,7 +64,7 @@ export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse)
     return;
   }
   if ("union" in spec) {
-    const tag = plain(v, at)[spec.union.on];
+    const tag: unknown = Reflect.get(plain(v, at), spec.union.on);
     const fields = typeof tag === "string" ? spec.union.cases[tag] : undefined;
     if (!fields) bad(`${at}.${spec.union.on}`, `is not one of ${Object.keys(spec.union.cases).join("|")}`);
     return checkRecord(v, { fields: fields! }, at, bad);
@@ -74,6 +74,7 @@ export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse)
   for (const key of Object.keys(o)) if (!keys.includes(key)) bad(at, `has unknown member ${JSON.stringify(key)}`);
   for (const key of keys) {
     if (!(key in o)) bad(at, `is missing ${JSON.stringify(key)}`);
-    checkRecord(o[key], spec.fields[key]!, `${at}.${key}`, bad);
+    const member: unknown = Reflect.get(o, key);
+    checkRecord(member, spec.fields[key]!, `${at}.${key}`, bad);
   }
 }

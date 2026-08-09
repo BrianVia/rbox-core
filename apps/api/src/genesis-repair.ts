@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import { dbFor, dirDb } from "./db.js";
-import { exactObject, json, sha256Hex, utf8Bytes } from "./util.js";
+import { exactObject, json, objectWithKeys, sha256Hex, utf8Bytes } from "./util.js";
 
 export const GENESIS_TOMBSTONE_SENTINEL = "rbox:genesis-repair-tombstone:v1";
 export const GENESIS_CAPABILITY_HEADER = "x-rbox-genesis-capability";
@@ -26,6 +26,22 @@ export interface GenesisObservationRow extends GenesisPresence {
   repairId: unknown;
   repairedAt: unknown;
   claimPresent: number;
+}
+
+export interface GenesisObservationSqlRow {
+  claimPresent: unknown;
+  recoveryWrap: unknown;
+  recoveryWrapId: unknown;
+  claimCreatedAt: unknown;
+  genesisDeviceId: unknown;
+  repairId: unknown;
+  repairedAt: unknown;
+  rosters: unknown;
+  keyStates: unknown;
+  devices: unknown;
+  workspaces: unknown;
+  workspaceKeys: unknown;
+  e2eePairingTokens: unknown;
 }
 
 export interface GenesisRepairRequest {
@@ -69,7 +85,11 @@ export const GENESIS_OBSERVATION_SQL = `SELECT
        (SELECT COUNT(*) FROM workspace_keys WHERE account_id = ?1) AS workspaceKeys,
        (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AS e2eePairingTokens`;
 
-export function genesisObservationFromRow(row: Record<string, unknown> | undefined): GenesisObservationRow {
+export function genesisObservationFromRow(value: unknown): GenesisObservationRow {
+  const row = objectWithKeys(value, [
+    "claimPresent", "recoveryWrap", "recoveryWrapId", "claimCreatedAt", "genesisDeviceId", "repairId", "repairedAt",
+    "rosters", "keyStates", "devices", "workspaces", "workspaceKeys", "e2eePairingTokens",
+  ] as const) ? value : undefined;
   return {
     claimPresent: count(row?.claimPresent), recoveryWrap: row?.recoveryWrap ?? null, recoveryWrapId: row?.recoveryWrapId ?? null,
     claimCreatedAt: row?.claimCreatedAt ?? null, genesisDeviceId: row?.genesisDeviceId ?? null, repairId: row?.repairId ?? null,
@@ -81,7 +101,7 @@ export function genesisObservationFromRow(row: Record<string, unknown> | undefin
 /** One account-row/count observation: a repair update cannot appear as claim absence. */
 export async function readGenesisObservation(env: Env, accountId: string): Promise<GenesisObservationRow> {
   assertGenesisSingleDatabase(env, accountId);
-  const row = await dbFor(env, accountId).prepare(GENESIS_OBSERVATION_SQL).bind(accountId).first<Record<string, unknown>>();
+  const row = await dbFor(env, accountId).prepare(GENESIS_OBSERVATION_SQL).bind(accountId).first<GenesisObservationSqlRow>();
   return genesisObservationFromRow(row ?? undefined);
 }
 
@@ -170,8 +190,30 @@ function auditId(): string {
   return `gra_${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
-function canonicalEvidence(row: Record<string, unknown>): string {
-  const fields = ["account_id", "operator", "reason", "observed_classification", "proof_json", "completion_observation_json", "original_claim_present", "original_claim_snapshot", "original_recovery_wrap", "original_recovery_wrap_id", "original_created_at", "original_genesis_device_id", "original_repair_id", "original_repaired_at"];
+type AuditEvidenceValue = string | number | null | ArrayBuffer | ArrayBufferView;
+interface GenesisRepairAuditEvidenceRow {
+  account_id: AuditEvidenceValue;
+  operator: AuditEvidenceValue;
+  reason: AuditEvidenceValue;
+  observed_classification: AuditEvidenceValue;
+  proof_json: AuditEvidenceValue;
+  completion_observation_json: AuditEvidenceValue;
+  original_claim_present: AuditEvidenceValue;
+  original_claim_snapshot: AuditEvidenceValue;
+  original_recovery_wrap: AuditEvidenceValue;
+  original_recovery_wrap_id: AuditEvidenceValue;
+  original_created_at: AuditEvidenceValue;
+  original_genesis_device_id: AuditEvidenceValue;
+  original_repair_id: AuditEvidenceValue;
+  original_repaired_at: AuditEvidenceValue;
+}
+
+interface GenesisRepairAuditRow extends GenesisRepairAuditEvidenceRow {
+  outcome: string;
+}
+
+function canonicalEvidence(row: GenesisRepairAuditEvidenceRow): string {
+  const fields = ["account_id", "operator", "reason", "observed_classification", "proof_json", "completion_observation_json", "original_claim_present", "original_claim_snapshot", "original_recovery_wrap", "original_recovery_wrap_id", "original_created_at", "original_genesis_device_id", "original_repair_id", "original_repaired_at"] as const satisfies readonly (keyof GenesisRepairAuditEvidenceRow)[];
   return fields.map((key) => {
     const value = row[key];
     const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : null;
@@ -182,7 +224,7 @@ function canonicalEvidence(row: Record<string, unknown>): string {
 
 async function completeAudit(env: Env, accountId: string, id: string, outcome: string, vector: string | null, observation: unknown): Promise<void> {
   const db = dbFor(env, accountId);
-  const row = await db.prepare("SELECT * FROM genesis_repair_audit WHERE audit_id = ? AND account_id = ?").bind(id, accountId).first<Record<string, unknown>>();
+  const row = await db.prepare("SELECT * FROM genesis_repair_audit WHERE audit_id = ? AND account_id = ?").bind(id, accountId).first<GenesisRepairAuditRow>();
   if (!row || row.outcome !== "attempted") return;
   const digest = await sha256Hex(canonicalEvidence({ ...row, completion_observation_json: observation === null ? null : JSON.stringify(observation) }));
   await db.prepare(

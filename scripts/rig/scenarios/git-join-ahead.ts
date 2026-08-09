@@ -10,6 +10,7 @@ import { createRecorder, errMsg } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import type { SyncState } from "../../../src/cli/sync-state-model.js";
 
 const REPO = "repo";
 const MIXED = "mixed";
@@ -19,8 +20,8 @@ const A_ONLY = `${REPO}/a-only-untracked.txt`;
 interface RepoRecordView { pending?: unknown; partial?: unknown; deferrals?: { apply?: unknown } }
 interface SyncStateView {
   repoRecords?: Record<string, RepoRecordView>;
-  gitPendingRemote?: Record<string, unknown>;
-  gitNeedsResolution?: Record<string, unknown>;
+  gitPendingRemote?: SyncState["gitPendingRemote"];
+  gitNeedsResolution?: SyncState["gitNeedsResolution"];
 }
 
 interface AdoptionStatus {

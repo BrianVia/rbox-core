@@ -93,9 +93,11 @@ export interface GlobalManifestMeta {
   gitRepos: Record<string, GitSection>;
 }
 
+type GlobalManifestMetaCandidate = Partial<Record<keyof GlobalManifestMeta, unknown>>;
+
 export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
-  const meta = v as Record<string, unknown>;
+  const meta = v as GlobalManifestMetaCandidate;
   const hex = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
   const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
   if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return undefined;

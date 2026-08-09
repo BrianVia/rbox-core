@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
+import type { JsonObject } from "../json.js";
 
 export const ADOPT_VERSION = 1 as const;
 export const LINKED_WORKTREE_REFUSAL = "linked worktree not adopted — its history travels with its main clone";
@@ -277,7 +278,7 @@ export function isTerminalAdoptPhase(phase: AdoptPhase): boolean {
 function validJournal(value: unknown): value is AdoptJournal {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const j = value as Partial<AdoptJournal>;
-  const object = (candidate: unknown): candidate is Record<string, unknown> => !!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+  const object = (candidate: unknown): candidate is JsonObject => !!candidate && typeof candidate === "object" && !Array.isArray(candidate);
   const string = (candidate: unknown): candidate is string => typeof candidate === "string" && !candidate.includes("\0");
   const decimal = (candidate: unknown): candidate is string => string(candidate) && /^\d+$/.test(candidate);
   const hex = (candidate: unknown, length: number): candidate is string => string(candidate) && new RegExp(`^[0-9a-f]{${length}}$`).test(candidate);

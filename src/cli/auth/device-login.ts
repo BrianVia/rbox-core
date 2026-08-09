@@ -178,6 +178,8 @@ interface KeyDeliveryPoll {
   accountEpoch?: number;
 }
 
+type KeyDeliveryPollCandidate = Partial<Record<keyof KeyDeliveryPoll, unknown>>;
+
 interface DevicePoll {
   status: string;
   token?: string;
@@ -232,7 +234,7 @@ function recordKeys(value: object): string[] {
 function parseKeyDelivery(value: unknown, requestId: string): KeyDeliveryPoll | null | undefined {
   if (value === undefined || value === null) return value;
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("malformed keyDelivery response");
-  const delivery = value as Record<string, unknown>;
+  const delivery = value as KeyDeliveryPollCandidate;
   if (delivery.requestId !== requestId
     || typeof delivery.expiresAt !== "number"
     || !Number.isSafeInteger(delivery.expiresAt)

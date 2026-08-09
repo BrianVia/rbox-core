@@ -125,7 +125,7 @@ class SqliteGenerationBuilder implements GenerationBuilder {
   finishGeneration(expectedCounts: StageCounts): SealedStageRef {
     this.#assertOpen();
     try {
-      const digest = new StageDigestBuilder(this.stageId, this.plane, this.header as unknown as Record<string, unknown>);
+      const digest = new StageDigestBuilder(this.stageId, this.plane, this.header);
       streamRows<{ path: string; entry_cjson: string }>(
         this.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
         [this.stageId], (row) => {

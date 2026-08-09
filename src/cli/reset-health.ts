@@ -16,6 +16,8 @@ export interface ResetHaltHealthV1 {
   haltedAt: string;
 }
 
+type ResetHaltHealthCandidate = Partial<Record<keyof ResetHaltHealthV1, unknown>>;
+
 export const resetHaltHealthPath = (root: string): string =>
   path.join(root, ".rbox", "state", "health-halt.json");
 
@@ -30,12 +32,12 @@ function isCanonicalTime(value: unknown): value is string {
 
 function validate(value: unknown): ResetHaltHealthV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
+  const record = value as ResetHaltHealthCandidate;
   const keys = Object.keys(record).sort();
   if (keys.join("\0") !== ["haltedAt", "journalIdentity", "reason", "v"].sort().join("\0")) return undefined;
   if (record.v !== 1 || typeof record.reason !== "string" || Buffer.byteLength(record.reason) > MAX_REASON_BYTES || record.reason.includes("\0")) return undefined;
   if (typeof record.journalIdentity !== "string" || !HEX64.test(record.journalIdentity) || !isCanonicalTime(record.haltedAt)) return undefined;
-  return record as unknown as ResetHaltHealthV1;
+  return record as ResetHaltHealthV1;
 }
 
 /** Read-only by contract. Invalid or unsafe records are ignored: the standing

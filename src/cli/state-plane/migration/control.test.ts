@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { canonicalize } from "../../../engine/e2ee/jcs.js";
+import type { JsonObject } from "../../../json.js";
 import { MigrationControlError } from "../errors.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
 import { migrationPaths } from "../paths.js";
@@ -39,7 +40,9 @@ const PREPARING: FutureControls = {
 };
 
 /** The witness is monotone, so each phase is its predecessor plus one layer. */
-const LAYERS: readonly Record<string, unknown>[] = [
+type WitnessLayer = Partial<Omit<Extract<MigrationWitness, { phase: "M7" }>, "phase">>;
+
+const LAYERS: readonly WitnessLayer[] = [
   {},
   { admission: { sourceBytes: 10, requiredBytes: 520, budgetBytes: 4096 } },
   { history: artifact, fixedBackup: artifact, stagingMain: { state: "present", dev: 1, ino: 30 } },
@@ -83,10 +86,15 @@ const controlFor = (phase: MigrationPhase, over: Partial<MigrationControl> = {})
 });
 const control = (over: Partial<MigrationControl> = {}): MigrationControl => controlFor("M0", over);
 
-const mutated = (base: MigrationControl, edit: (raw: Record<string, unknown>) => void): Uint8Array => {
-  const raw = JSON.parse(Buffer.from(encodeMigrationControl(base)).toString("utf8")) as Record<string, unknown>;
+const mutated = (base: MigrationControl, edit: (raw: JsonObject) => void): Uint8Array => {
+  const raw = JSON.parse(Buffer.from(encodeMigrationControl(base)).toString("utf8")) as JsonObject;
   edit(raw);
   return canonicalize(raw);
+};
+const objectMember = (raw: JsonObject, key: string): JsonObject => {
+  const value = raw[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError(`${key} is not an object`);
+  return value;
 };
 /** Byte-level edits for values `canonicalize` itself refuses to emit. */
 const rawEdit = (base: MigrationControl, from: string, to: string): Uint8Array =>
@@ -133,9 +141,9 @@ describe("control codec", () => {
       () => rawEdit(base, '"controlRevision":1', '"controlRevision":-1'),
       () => rawEdit(base, '"controlRevision":1', '"controlRevision":1.5'),
       () => mutated(base, (raw) => { raw.version = 2; }),
-      () => mutated(base, (raw) => { (raw.witness as Record<string, unknown>).phase = "M9"; }),
-      () => mutated(base, (raw) => { (raw.source as Record<string, unknown>).sha256 = "AB"; }),
-      () => mutated(base, (raw) => { (raw.haltResources as Record<string, unknown>).reserve = { disposition: "available" }; }),
+      () => mutated(base, (raw) => { objectMember(raw, "witness").phase = "M9"; }),
+      () => mutated(base, (raw) => { objectMember(raw, "source").sha256 = "AB"; }),
+      () => mutated(base, (raw) => { objectMember(raw, "haltResources").reserve = { disposition: "available" }; }),
       () => Buffer.from(` ${Buffer.from(encodeMigrationControl(base)).toString("utf8")}`),
       () => Buffer.from("not json"),
     ];

@@ -3,9 +3,9 @@ import type { Principal } from "./authz.js";
 import { authorizeWorkspace } from "./authz.js";
 import { readBodyCapped } from "./util.js";
 import { dbFor } from "./db.js";
-import { isRecord } from "./diagnostics.js";
 import { rateLimited } from "./ratelimit.js";
 import { json } from "./util.js";
+import type { JsonObject, JsonValue } from "../../../src/json.js";
 
 const BODY_CAP_BYTES = 32 * 1024;
 export const TELEMETRY_BATCH_CAP = 64;
@@ -13,7 +13,6 @@ const SYNC_STATE_BATCH_CAP = 32;
 
 /** Low-cardinality drops enum: unknown_kind|unknown_field|bad_number|bad_enum|batch_cap|body_cap|bad_state|unauthorized. */
 type DropReason = "unknown_kind" | "unknown_field" | "bad_number" | "bad_enum" | "batch_cap" | "body_cap" | "bad_state" | "unauthorized";
-type JsonRecord = Record<string, unknown>;
 interface NumericDomain { readonly min: number; readonly max: number; readonly integer: boolean }
 interface NumberField extends NumericDomain { readonly field: string }
 interface EnumField { readonly field: string; readonly values: readonly string[] }
@@ -107,6 +106,10 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
 
 export type ClientTelemetryKind = keyof typeof SERVER_TELEMETRY_SAMPLE_SCHEMAS;
 
+function isClientTelemetryKind(value: string): value is ClientTelemetryKind {
+  return Object.hasOwn(SERVER_TELEMETRY_SAMPLE_SCHEMAS, value);
+}
+
 export const SERVER_CORPUS_BUCKETS = [
   { bucket: "xs", maxFileCount: 100 },
   { bucket: "s", maxFileCount: 1_000 },
@@ -160,7 +163,7 @@ function emitClientMetric(env: Env, metric: NormalizedClientMetric): void {
   }
 }
 
-function hasOnlyKeys(value: JsonRecord, allowed: ReadonlySet<string>): boolean {
+function hasOnlyKeys(value: JsonObject, allowed: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
@@ -172,34 +175,37 @@ function corpusBucket(fileCount: number): (typeof SERVER_CORPUS_BUCKETS)[number]
   return SERVER_CORPUS_BUCKETS.find((entry) => entry.maxFileCount === null || fileCount <= entry.maxFileCount)!.bucket;
 }
 
-function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMetric } | { ok: false; reason: DropReason } {
-  if (!isRecord(value) || typeof value.kind !== "string" || !Object.prototype.hasOwnProperty.call(SERVER_TELEMETRY_SAMPLE_SCHEMAS, value.kind)) {
+function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClientMetric } | { ok: false; reason: DropReason } {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || typeof value.kind !== "string"
+    || !isClientTelemetryKind(value.kind)) {
     return { ok: false, reason: "unknown_kind" };
   }
-  const kind = value.kind as ClientTelemetryKind;
+  const kind = value.kind;
+  const sample = value;
   const schema: SampleSchema = SERVER_TELEMETRY_SAMPLE_SCHEMAS[kind];
-  if (!hasOnlyKeys(value, ALLOWED_SAMPLE_KEYS.get(kind)!)) return { ok: false, reason: "unknown_field" };
+  if (!hasOnlyKeys(sample, ALLOWED_SAMPLE_KEYS.get(kind)!)) return { ok: false, reason: "unknown_field" };
 
   const wireNumbers: number[] = [];
   for (const field of schema.numbers) {
-    const raw = value[field.field];
+    const raw = sample[field.field];
     if (!validNumber(raw, field)) return { ok: false, reason: "bad_number" };
     wireNumbers.push(raw);
   }
   const canonicalEnums: string[] = [];
   for (const field of schema.enums) {
-    const raw = value[field.field];
+    const raw = sample[field.field];
     const canonical = typeof raw === "string" ? field.values.find((candidate) => candidate === raw) : undefined;
     if (canonical === undefined) return { ok: false, reason: "bad_enum" };
     canonicalEnums.push(canonical);
   }
   const recordNumbers: number[] = [];
   for (const field of schema.numericRecords ?? []) {
-    const raw = value[field.field];
-    if (!isRecord(raw)) return { ok: false, reason: "bad_number" };
+    const raw = sample[field.field];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "bad_number" };
     const allowed = new Set(field.keys);
     if (!hasOnlyKeys(raw, allowed)) return { ok: false, reason: "unknown_field" };
-    for (const key of field.keys) {
+    for (const key of SERVER_SYNC_PHASE_NAMES) {
       const item = raw[key];
       if (item === undefined) recordNumbers.push(0);
       else if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
@@ -208,7 +214,7 @@ function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMe
   }
   const optionalNumbers: number[] = [];
   for (const field of schema.optionalNumbers ?? []) {
-    const raw = value[field.field];
+    const raw = sample[field.field];
     if (raw === undefined) optionalNumbers.push(0);
     else if (!validNumber(raw, field)) return { ok: false, reason: "bad_number" };
     else optionalNumbers.push(raw);
@@ -241,14 +247,14 @@ function emitDrop(env: Env, reason: DropReason, count: number): void {
   if (count > 0) emitClientMetric(env, { index: "client.telemetry.drops", blobs: [reason], doubles: [count] });
 }
 
-async function parsedEnvelope(req: Request, env: Env): Promise<{ value: unknown } | { response: Response }> {
+async function parsedEnvelope(req: Request, env: Env): Promise<{ value: JsonValue } | { response: Response }> {
   const raw = await readBodyCapped(req, BODY_CAP_BYTES);
   if (raw === null) {
     emitDrop(env, "body_cap", 1);
     return { response: json({ error: "body_too_large" }, 413) };
   }
   try {
-    return { value: JSON.parse(raw) as unknown };
+    return { value: JSON.parse(raw) as JsonValue };
   } catch {
     return { response: json({ error: "bad_request" }, 400) };
   }
@@ -261,13 +267,14 @@ const SYNC_STATE_ENVELOPE_KEYS = new Set(["v", "states"]);
  *  limit, capped body parse, and the `{v:1, <arrayKey>:[...]}` envelope shape. */
 async function openIngest(
   req: Request, env: Env, p: Principal, arrayKey: "samples" | "states", envelopeKeys: ReadonlySet<string>,
-): Promise<{ items: unknown[] } | { response: Response }> {
+): Promise<{ items: JsonValue[] } | { response: Response }> {
   if (p.kind !== "device") return { response: json({ error: "forbidden" }, 403) };
   const limited = await rateLimited(env.RL_TELEMETRY, p.deviceId);
   if (limited) return { response: limited };
   const parsed = await parsedEnvelope(req, env);
   if ("response" in parsed) return parsed;
-  if (!isRecord(parsed.value) || !hasOnlyKeys(parsed.value, envelopeKeys) || parsed.value.v !== 1 || !Array.isArray(parsed.value[arrayKey])) {
+  if (!parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)
+    || !hasOnlyKeys(parsed.value, envelopeKeys) || parsed.value.v !== 1 || !Array.isArray(parsed.value[arrayKey])) {
     return { response: json({ error: "bad_request" }, 400) };
   }
   return { items: parsed.value[arrayKey] };
@@ -312,8 +319,9 @@ interface ValidSyncState {
   deferralReasons: string[];
 }
 
-function validateSyncState(value: unknown): ValidSyncState | null {
-  if (!isRecord(value) || !hasOnlyKeys(value, SYNC_KEYS)) return null;
+function validateSyncState(value: JsonValue): ValidSyncState | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !hasOnlyKeys(value, SYNC_KEYS)) return null;
   const { workspaceId, projectId, bindingId, fileSeq, reposTotal, reposDeferred, oldestDeferralAgeMs, deferralReasons } = value;
   if (typeof workspaceId !== "string" || workspaceId.length === 0 || typeof projectId !== "string" || projectId.length === 0) return null;
   if (typeof bindingId !== "string" || !SERVER_BINDING_ID_RE.test(bindingId)) return null;

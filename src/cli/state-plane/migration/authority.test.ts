@@ -240,7 +240,9 @@ const artifact = { path: "/w/x", dev: 1, ino: 3, bytes: 4, sha256: HASH };
 const proof = { sha256: HASH, bytes: 9, semanticDigest: HASH, entryCount: 1, repoCount: 0, proofVersion: 1 };
 const item = { role: "reserve" as const, path: "/w/r", parent: "/w", dev: 1, ino: 7, sha256: HASH };
 
-const LAYERS: readonly Record<string, unknown>[] = [
+type WitnessLayer = Partial<Omit<Extract<MigrationWitness, { phase: "M7" }>, "phase">>;
+
+const LAYERS: readonly WitnessLayer[] = [
   {},
   { admission: { sourceBytes: 10, requiredBytes: 520, budgetBytes: 4096 } },
   { history: artifact, fixedBackup: artifact, stagingMain: { state: "present", dev: 1, ino: 30 } },

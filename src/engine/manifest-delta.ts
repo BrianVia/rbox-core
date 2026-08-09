@@ -14,6 +14,9 @@ export const MAX_MANIFEST_PLAINTEXT = 512 * 1024 * 1024;
 const SHA_RE = /^[0-9a-f]{64}$/;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
+type CanonicalManifestValue = null | boolean | number | string | undefined | CanonicalManifestValue[] | CanonicalManifestObject;
+interface CanonicalManifestObject { [key: string]: CanonicalManifestValue; }
+
 /**
  * Float-tolerant canonical JSON used only for manifest integrity hashes and
  * delta bodies. The signed-object JCS serializer intentionally rejects
@@ -55,7 +58,7 @@ function canonicalJson(value: unknown): string {
     }
     case "object": {
       if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
-      const object = value as Record<string, unknown>;
+      const object = value as CanonicalManifestObject;
       const members: string[] = [];
       for (const key of Object.keys(object).sort()) {
         // Member NAMES need the same RFC 8785 well-formedness gate as values —
@@ -156,7 +159,7 @@ export function canonicalManifestHashStreaming(manifest: Manifest): string {
           });
           return write("]");
         }
-        const object = value as Record<string, unknown>;
+        const object = value as CanonicalManifestObject;
         write("{");
         let first = true;
         for (const key of Object.keys(object).sort()) {
@@ -365,13 +368,25 @@ export async function encodeDeltaEnvelope(
   };
 }
 
-function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): void {
+function exactKeys(value: object, required: readonly string[], optional: readonly string[] = []): void {
   const actual = Object.keys(value).sort();
-  const expected = [...allowed].filter((key) => value[key] !== undefined).sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) throw new Error("manifest envelope header has unknown or missing fields");
+  const allowed = new Set([...required, ...optional]);
+  if (actual.some((key) => !allowed.has(key)) || required.some((key) => !actual.includes(key))) throw new Error("manifest envelope header has unknown or missing fields");
 }
 
-function validateCommonHeader(record: Record<string, unknown>): void {
+interface ManifestEnvelopeHeaderCandidate {
+  kind?: string;
+  comp?: string;
+  bodyBytes?: number;
+  manifestHash?: string;
+  baseEncSha?: string;
+  baseManifestHash?: string;
+  generatedAt?: string;
+  manifestSchema?: number;
+  resultHash?: string;
+}
+
+function validateCommonHeader(record: ManifestEnvelopeHeaderCandidate): void {
   if (!Number.isSafeInteger(record.bodyBytes) || (record.bodyBytes as number) < 0 || (record.bodyBytes as number) > MAX_MANIFEST_PLAINTEXT) {
     throw new Error("manifest envelope bodyBytes invalid");
   }
@@ -380,15 +395,17 @@ function validateCommonHeader(record: Record<string, unknown>): void {
 
 function parseHeader(value: unknown): ManifestSnapshotHeader | ManifestDeltaHeader {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("manifest envelope header must be an object");
-  const record = value as Record<string, unknown>;
+  const record = value as ManifestEnvelopeHeaderCandidate;
   validateCommonHeader(record);
   if (record.kind === "snapshot") {
-    exactKeys(record, ["kind", "comp", "bodyBytes", "manifestHash"]);
+    exactKeys(record, ["kind", "bodyBytes", "manifestHash"], ["comp"]);
+    if ("comp" in record && record.comp === undefined) throw new Error("manifest envelope header has unknown or missing fields");
     if (typeof record.manifestHash !== "string" || !SHA_RE.test(record.manifestHash)) throw new Error("snapshot manifestHash malformed");
-    return record as unknown as ManifestSnapshotHeader;
+    return { kind: "snapshot", ...(record.comp === "zstd" ? { comp: record.comp } : {}), bodyBytes: record.bodyBytes!, manifestHash: record.manifestHash };
   }
   if (record.kind === "delta") {
-    exactKeys(record, ["kind", "comp", "bodyBytes", "baseEncSha", "baseManifestHash", "generatedAt", "manifestSchema", "resultHash"]);
+    exactKeys(record, ["kind", "bodyBytes", "baseEncSha", "baseManifestHash", "generatedAt", "resultHash"], ["comp", "manifestSchema"]);
+    if (("comp" in record && record.comp === undefined) || ("manifestSchema" in record && record.manifestSchema === undefined)) throw new Error("manifest envelope header has unknown or missing fields");
     for (const key of ["baseEncSha", "baseManifestHash", "resultHash"] as const) {
       if (typeof record[key] !== "string" || !SHA_RE.test(record[key])) throw new Error(`delta ${key} malformed`);
     }
@@ -396,7 +413,16 @@ function parseHeader(value: unknown): ManifestSnapshotHeader | ManifestDeltaHead
     if (record.manifestSchema !== undefined && (!Number.isSafeInteger(record.manifestSchema) || (record.manifestSchema as number) < 1 || (record.manifestSchema as number) > KNOWN_MANIFEST_SCHEMA)) {
       throw new Error("manifest schema is newer than this rbox supports — upgrade rbox");
     }
-    return record as unknown as ManifestDeltaHeader;
+    return {
+      kind: "delta",
+      ...(record.comp === "zstd" ? { comp: record.comp } : {}),
+      bodyBytes: record.bodyBytes!,
+      baseEncSha: record.baseEncSha!,
+      baseManifestHash: record.baseManifestHash!,
+      generatedAt: record.generatedAt,
+      ...(record.manifestSchema === undefined ? {} : { manifestSchema: record.manifestSchema }),
+      resultHash: record.resultHash!,
+    };
   }
   throw new Error("manifest envelope kind invalid");
 }
@@ -416,12 +442,12 @@ function parseOps(bytes: Uint8Array): ManifestDeltaOp[] {
   const keys = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("manifest delta op must be an object");
-    const record = item as Record<string, unknown>;
+    const record = item as { op?: string; entry?: Partial<FileEntry>; path?: string; repo?: string; section?: Partial<GitSection> };
     let op: ManifestDeltaOp;
     if (record.op === "set") {
       exactKeys(record, ["op", "entry"]);
-      if (!record.entry || typeof record.entry !== "object" || Array.isArray(record.entry) || typeof (record.entry as Record<string, unknown>).path !== "string") throw new Error("manifest delta set entry invalid");
-      op = { op: "set", entry: record.entry as unknown as FileEntry };
+      if (!record.entry || typeof record.entry !== "object" || Array.isArray(record.entry) || typeof record.entry.path !== "string") throw new Error("manifest delta set entry invalid");
+      op = { op: "set", entry: record.entry as FileEntry };
     } else if (record.op === "del") {
       exactKeys(record, ["op", "path"]);
       if (typeof record.path !== "string") throw new Error("manifest delta del path invalid");
@@ -429,7 +455,7 @@ function parseOps(bytes: Uint8Array): ManifestDeltaOp[] {
     } else if (record.op === "git-set") {
       exactKeys(record, ["op", "repo", "section"]);
       if (typeof record.repo !== "string" || !record.section || typeof record.section !== "object" || Array.isArray(record.section)) throw new Error("manifest delta git-set invalid");
-      op = { op: "git-set", repo: record.repo, section: record.section as unknown as GitSection };
+      op = { op: "git-set", repo: record.repo, section: record.section as GitSection };
     } else if (record.op === "git-del") {
       exactKeys(record, ["op", "repo"]);
       if (typeof record.repo !== "string") throw new Error("manifest delta git-del repo invalid");

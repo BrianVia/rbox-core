@@ -109,9 +109,14 @@ async function markerDisposition(file: string, journal: SQLiteResetJournalV2): P
   const bytes = await boundedRead(file, 512 * 1024);
   if (!bytes) return "absent";
   try {
-    const value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+    const value: unknown = JSON.parse(bytes.toString("utf8"));
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return "other";
     if (!value || Object.keys(value).sort().join("\0") !== ["stateNonce", "stateRevision", "stream"].join("\0")) return "other";
-    const tuple = `${value.stream}\0${value.stateNonce}\0${value.stateRevision}`;
+    const stream: unknown = Reflect.get(value, "stream");
+    const stateNonce: unknown = Reflect.get(value, "stateNonce");
+    const stateRevision: unknown = Reflect.get(value, "stateRevision");
+    if (typeof stream !== "string" || typeof stateNonce !== "string" || typeof stateRevision !== "number") return "other";
+    const tuple = `${stream}\0${stateNonce}\0${stateRevision}`;
     if (tuple === `${journal.old.stream}\0${journal.old.stateNonce}\0${journal.old.stateRevision}`) return "old";
     if (tuple === `${journal.next.stream}\0${journal.next.stateNonce}\0${journal.next.stateRevision}`) return "next";
     return "other";

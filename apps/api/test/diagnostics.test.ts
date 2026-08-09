@@ -2,7 +2,7 @@ import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { createWebSession } from "../src/auth.js";
-import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics } from "../src/diagnostics.js";
+import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics, type DiagnosticsBundle, type DiagnosticsCheckResult, type DiagnosticsChecks } from "../src/diagnostics.js";
 import type { Principal } from "../src/authz.js";
 
 const BASE = "https://example.com";
@@ -26,7 +26,12 @@ async function bootstrap(name: string): Promise<{ token: string; accountId: stri
   return { ...b, ownerUserId: owner!.user_id };
 }
 
-function bundle(over: Record<string, unknown> = {}): Record<string, unknown> {
+type DiagnosticsFixture = Omit<DiagnosticsBundle, "checks"> & {
+  checks: DiagnosticsChecks & { remote: DiagnosticsCheckResult & { rawUrl?: string } };
+  surprise?: boolean;
+};
+
+function bundle(over: Partial<DiagnosticsFixture> = {}): DiagnosticsFixture {
   return {
     version: "0.6.8",
     platform: { os: "darwin", arch: "arm64" },
@@ -60,7 +65,7 @@ describe("POST /v1/diagnostics", () => {
   test("accepts the legacy six checks while allowing the exact new optional vocabulary", async () => {
     const a = await bootstrap("diag-compatible-checks");
     const legacy = bundle();
-    const checks = legacy.checks as Record<string, unknown>;
+    const checks: Partial<DiagnosticsChecks> = legacy.checks;
     for (const key of ["device", "crypto", "locking", "git", "chain"]) delete checks[key];
     const res = await SELF.fetch(`${BASE}/v1/diagnostics`, {
       method: "POST",
@@ -112,7 +117,7 @@ describe("POST /v1/diagnostics", () => {
     expect(((await top.json()) as { error: string }).error).toBe("bad_shape");
 
     const bad = bundle();
-    ((bad.checks as Record<string, unknown>).remote as Record<string, unknown>).rawUrl = "https://secret.example";
+    bad.checks.remote.rawUrl = "https://secret.example";
     const nested = await SELF.fetch(`${BASE}/v1/diagnostics`, {
       method: "POST",
       headers: authed(a.token, { "content-type": "application/json" }),

@@ -9,6 +9,8 @@
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
     "dev:install": "bun scripts/dev-install.ts",
+    "lint": "oxlint --quiet .",
+    "lint:fix": "oxlint --quiet --fix .",
     "test": "bun test ./src/ ./scripts/gc-drain.test.ts ./scripts/mutation-gate.test.ts ./scripts/bench/migration-baseline.test.ts",
     "test:api": "cd apps/api && vitest run",
     "test:affected": "bun scripts/test-affected.ts",
@@ -39,6 +41,7 @@
     "@cloudflare/workers-types": "^4.20260626.1",
     "@types/node": "^24.13.3",
     "@types/react": "19.2.17",
+    "oxlint": "1.77.0",
     "typescript": "^7.0.2",
     "vitest": "4.1.10",
     "wrangler": "^4.107.0"

@@ -33,7 +33,7 @@ function repoEntries(repos: Map<string, unknown>): Array<[string, unknown]> {
 
 function parseRepos(v: unknown): Map<string, unknown> | undefined {
   if (v === null || typeof v !== "object" || Array.isArray(v)) return undefined;
-  return new Map(Object.entries(v as Record<string, unknown>));
+  return new Map(Object.entries(v));
 }
 
 async function loadRawCache(root: string): Promise<CacheLoad> {
@@ -55,7 +55,7 @@ async function loadRawCache(root: string): Promise<CacheLoad> {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, reason: "cache root is not an object" };
   }
-  const rootObj = parsed as Record<string, unknown>;
+  const rootObj = parsed as { version?: unknown; repos?: unknown };
   const repos = parseRepos(rootObj.repos);
   if (!repos) return { ok: false, reason: "cache repos field is not an object" };
   return {

@@ -264,8 +264,8 @@ export function parsePRepairQ(bytes: Uint8Array): PRepairQ {
   if (bytes.byteLength > MAX_P_REPAIR_Q_BYTES) throw new Error("P-repair Q exceeds byte cap");
   const parsed = verifyRoundTrip(Buffer.from(bytes).toString("utf8")) as PRepairQ;
   if (!parsed || typeof parsed !== "object" || parsed.v !== 1 || parsed.kind !== "p-repair") throw new Error("invalid P-repair Q schema");
-  const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
-  const exact = (value: unknown, keys: readonly string[]): boolean => object(value)
+  const exact = (value: unknown, keys: readonly string[]): boolean => !!value
+    && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
   const projection = (value: unknown, cap: number): value is ByteProjection => {
     if (!exact(value, ["bytes", "sha256", "prefixB64", "truncated"])) return false;
@@ -388,9 +388,8 @@ export function buildPRepairReceipt(input: Omit<PRepairReceipt, "v" | "kind" | "
 /** Strict state-side receipt reader. Q is re-canonicalized through its own
  * closed reader so an accepted receipt can safely recreate an unreferenced blob. */
 export function parsePRepairReceipt(value: unknown): PRepairReceipt {
-  const object = (candidate: unknown): candidate is Record<string, unknown> => !!candidate
-    && typeof candidate === "object" && !Array.isArray(candidate);
-  const keys = (candidate: unknown, expected: readonly string[]): boolean => object(candidate)
+  const keys = (candidate: unknown, expected: readonly string[]): boolean => !!candidate
+    && typeof candidate === "object" && !Array.isArray(candidate)
     && Object.keys(candidate).sort().join("\0") === [...expected].sort().join("\0");
   if (!keys(value, ["v", "kind", "lineageHash", "repositoryIdentityHash", "ref", "episode", "p", "k", "q", "origin", "skeep", "reflog", "baseDisposition", "eviction"])) {
     throw new Error("invalid P-repair receipt closed schema");

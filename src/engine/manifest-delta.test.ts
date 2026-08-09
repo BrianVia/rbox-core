@@ -81,7 +81,7 @@ describe("manifest delta envelope", () => {
     const { bytes: encoded } = await encodeSnapshotEnvelope(manifest("zstd", [entry("a")]), { compress: true });
     const newline = encoded.indexOf(0x0a, utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength);
     const headerStart = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
-    const header = JSON.parse(new TextDecoder().decode(encoded.subarray(headerStart, newline))) as Record<string, unknown>;
+    const header = JSON.parse(new TextDecoder().decode(encoded.subarray(headerStart, newline))) as Partial<ManifestSnapshotHeader>;
     const body = encoded.subarray(newline + 1);
     const assemble = (bodyBytes: number): Uint8Array => {
       const prefix = utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${JSON.stringify({ ...header, bodyBytes })}\n`);

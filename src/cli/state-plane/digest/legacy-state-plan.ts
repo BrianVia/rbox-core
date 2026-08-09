@@ -15,7 +15,7 @@ import {
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
-import { compareUtf16, extrasOf, parseCanonicalJson, type JsonValue } from "./codecs.js";
+import { canonicalJson, compareUtf16, extrasOf, parseCanonicalJson, type JsonValue } from "./codecs.js";
 import { legacySourceShapeFlags, type SourceShapeFlags } from "./source-shape.js";
 
 
@@ -134,21 +134,19 @@ function optionalHex(value: unknown, pattern: RegExp, field: string): string | n
   return value as string;
 }
 
-function plainObject(value: unknown, field: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) refuse(`${field} is not an object`);
-  return value as Record<string, unknown>;
-}
-
 function orderedGitSections(
-  role: LegacyGitSectionRow["role"], sections: Record<string, unknown> | undefined,
+  role: LegacyGitSectionRow["role"], sections: Readonly<Record<string, GitSection>> | undefined,
 ): LegacyGitSectionRow[] {
   if (sections === undefined) return [];
-  return Object.entries(plainObject(sections, `${role} git sections`))
+  if (typeof sections !== "object" || sections === null || Array.isArray(sections)) {
+    refuse(`${role} git sections is not an object`);
+  }
+  return Object.entries(sections)
     .map(([relPath, section]) => {
       // The store's one admission point: a section this refuses is one the wire
       // manifest would refuse too, so the import never lands an unreadable row.
-      encodeGitSection(relPath, section as GitSection);
-      return { role, relPath, section: section as GitSection };
+      encodeGitSection(relPath, section);
+      return { role, relPath, section };
     })
     .sort((a, b) => compareUtf16(a.relPath, b.relPath));
 }
@@ -158,8 +156,9 @@ function legacyMapRows(state: SyncState): LegacyMapRow[] {
   for (const field of LEGACY_MAP_FIELDS) {
     const map = state[field];
     if (map === undefined) continue;
-    for (const [relPath, value] of Object.entries(plainObject(map, field))) {
-      rows.push({ field, relPath, value: value as JsonValue });
+    if (typeof map !== "object" || map === null || Array.isArray(map)) refuse(`${field} is not an object`);
+    for (const [relPath, value] of Object.entries(map)) {
+      rows.push({ field, relPath, value: parseCanonicalJson(canonicalJson(value)) });
     }
   }
   return rows.sort((a, b) => compareUtf8(a.field, b.field) || compareUtf8(a.relPath, b.relPath));
@@ -183,7 +182,10 @@ function legacyMapRows(state: SyncState): LegacyMapRow[] {
 export function normalizeLegacyStateV1(state: SyncState, lineageId: string): NormalizedLegacyState {
   if (!HEX32.test(lineageId)) refuse("the migration lineage id is not lowercase hex32");
   if (typeof state.stream !== "string" || state.stream.length === 0) refuse("stream is not nonempty text");
-  const manifest = plainObject(state.lastSyncedManifest, "lastSyncedManifest");
+  const manifest = state.lastSyncedManifest;
+  if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
+    refuse("lastSyncedManifest is not an object");
+  }
   for (const reserved of RESERVED_MANIFEST_KEYS) {
     if (reserved in manifest) refuse(`lastSyncedManifest.${reserved} collides with a plane_heads column`);
   }
@@ -194,7 +196,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
     refuse("lastSyncedManifest.manifestSchema is not a schema version");
   }
 
-  const entries = [...(manifest.files as readonly FileEntry[])]
+  const entries = [...manifest.files]
     .map((entry) => {
       encodeFileEntry(entry);
       return entry;
@@ -212,7 +214,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
     .sort((a, b) => compareUtf16(a.relPath, b.relPath));
 
   const meta = validManifestMeta(state.manifestMeta);
-  const metaExtras = meta === undefined ? null : extrasOf(meta as unknown as Record<string, unknown>, [
+  const metaExtras = meta === undefined ? null : extrasOf(meta, [
     "encManifestSha", "manifestHash", "accountEpoch", "keyEpoch",
     "chain", "chainBytes", "snapshotBytes", "gitRepos",
   ]);
@@ -228,7 +230,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
       local_revision: generation,
       telemetry_binding_id: optionalHex(state.telemetryBindingId, HEX16, "telemetryBindingId"),
       repo_records_authoritative: 1,
-      extras_cjson: extrasOf(state as unknown as Record<string, unknown>, SYNC_STATE_KEYS),
+      extras_cjson: extrasOf(state, SYNC_STATE_KEYS),
     },
     baseHead: {
       lineage_id: lineageId, plane: "base", generation,
@@ -258,7 +260,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
     },
     chain: meta === undefined ? [] : meta.chain,
     gitSections: [
-      ...orderedGitSections("manifest-projection", manifest.gitRepos as Record<string, unknown> | undefined),
+      ...orderedGitSections("manifest-projection", manifest.gitRepos),
       ...orderedGitSections("meta-wire", meta === undefined ? undefined : meta.gitRepos),
     ],
     repos,

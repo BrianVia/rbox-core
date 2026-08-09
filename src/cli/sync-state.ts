@@ -431,7 +431,7 @@ export async function savePublishedRepoIntent(
   const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
     for (const field of fields) {
       if (desired[field] === undefined) delete target[field];
-      else (target as Record<string, unknown>)[field] = desired[field];
+      else Object.assign(target, { [field]: desired[field] });
     }
   };
   const laneDeferral = (record: RepoRecordInput | undefined, lane: "apply" | "capture" | "config") => record?.deferrals?.[lane];

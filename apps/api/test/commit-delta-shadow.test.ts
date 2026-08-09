@@ -42,6 +42,14 @@ async function fixture(name: string) {
 }
 
 type DeltaAdmissionMode = "off" | "shadow" | "enforce";
+interface CommitResponseFixture {
+  serverTimings?: object;
+  error?: string;
+  missing?: string[];
+  missingTotal?: number;
+  sequence?: number;
+  commitHash?: string;
+}
 
 function testEnv(mode: DeltaAdmissionMode, points: Array<{ blobs?: string[]; doubles?: number[] }>): Env {
   return { ...env, RBOX_COMMIT_DELTA_ADMISSION: mode, rbox_metrics: { writeDataPoint: (p: { blobs?: string[]; doubles?: number[] }) => points.push(p) } as AnalyticsEngineDataset };
@@ -54,7 +62,7 @@ async function responseBody(
   overrides: { ctx?: DurableObjectState; request?: Request } = {},
 ) {
   const response = await new WorkspaceSync(overrides.ctx ?? fakeCtx(f.parent), testEnv(mode, points)).fetch(overrides.request ?? f.request());
-  const body = await response.json() as Record<string, unknown>;
+  const body = await response.json() as CommitResponseFixture;
   delete body.serverTimings;
   return { status: response.status, body };
 }
@@ -70,7 +78,14 @@ function requestFor(f: Awaited<ReturnType<typeof fixture>>, seq: number, parentS
   });
 }
 
-function requestWithBody(f: Awaited<ReturnType<typeof fixture>>, commitBody: Record<string, unknown>, receipts = true): Request {
+type DeltaFixture = Awaited<ReturnType<typeof fixture>>;
+type CommitBodyFixture = ReturnType<DeltaFixture["body"]> & {
+  manifestChain?: string[];
+  blobRefs?: Array<{ encSha: string; size: number }>;
+  blobRefset?: { sidecarSha: string; count: number; totalBytes: number };
+};
+
+function requestWithBody(f: DeltaFixture, commitBody: CommitBodyFixture, receipts = true): Request {
   return new Request("https://api.test/v1/ws/ws/proj/root/manifests", {
     method: "POST",
     headers: {

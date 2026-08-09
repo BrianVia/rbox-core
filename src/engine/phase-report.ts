@@ -68,8 +68,19 @@ export interface PhaseTotals {
   ciphertextBytes: number;
   wireBytes: number;
   changedBytes: number;
-  details?: Record<string, unknown>;
+  details?: PhaseDetails;
 }
+
+/** JSON-safe, path-free telemetry dimensions attached to one phase. */
+export type PhaseDetailValue = null | boolean | number | string | PhaseDetailValue[] | PhaseDetails;
+export interface PhaseDetails { [name: string]: PhaseDetailValue; }
+type PhaseDetailInput<T> = T extends null | boolean | number | string | undefined
+  ? T
+  : T extends readonly (infer U)[]
+    ? PhaseDetailInput<U>[]
+    : T extends object
+      ? { [K in keyof T]: PhaseDetailInput<T[K]> }
+      : never;
 
 /** Bytes/counts to attribute to a phase. All optional; a phase sets only what it moves. */
 export interface PhaseBytes {
@@ -164,18 +175,18 @@ export class PhaseReport {
 
   /** Attach path-free, hash-free details to a phase. `summary` is appended to the
    * greppable one-line report; callers own keeping it privacy-preserving. */
-  recordDetails(name: PhaseName, details: Record<string, unknown>, summary?: string): void {
+  recordDetails<T extends object>(name: PhaseName, details: T & PhaseDetailInput<T>, summary?: string): void {
     if (!this.enabled) return;
     const t = this.ensure(name);
-    t.details = { ...(t.details ?? {}), ...details };
+    t.details = { ...(t.details ?? {}), ...details } as PhaseDetails;
     if (summary) this.phaseSummaries.set(name, summary);
   }
 
   /** Merge detail and append a summary fragment without replacing existing phase text. */
-  appendDetails(name: PhaseName, details: Record<string, unknown>, summary?: string): void {
+  appendDetails<T extends object>(name: PhaseName, details: T & PhaseDetailInput<T>, summary?: string): void {
     if (!this.enabled) return;
     const t = this.ensure(name);
-    t.details = { ...(t.details ?? {}), ...details };
+    t.details = { ...(t.details ?? {}), ...details } as PhaseDetails;
     if (summary) {
       const existing = this.phaseSummaries.get(name);
       this.phaseSummaries.set(name, existing ? `${existing} ${summary}` : summary);

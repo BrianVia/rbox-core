@@ -37,7 +37,7 @@ import { classifyMigrationState, PhaseReceipt } from "./classifier.js";
 import { stepCleanup } from "./cleanup.js";
 import {
   blocksSqliteWrites, encodeMigrationControl,
-  type MigrationControl, type MigrationWitness, type StagingProof,
+  type MigrationControl, type MigrationWitness, type SourceWitness, type StagingProof,
 } from "./control-codec.js";
 import { publishMigrationControl, readCanonicalControl } from "./control-publication.js";
 import { publishPreparedDatabase, stepQSibling } from "./finalize.js";
@@ -62,8 +62,8 @@ const spies: { restore: () => void }[] = [];
 /** Replace one `fs` entry point for the length of a test. */
 function inject<K extends keyof typeof fs>(key: K, replacement: (typeof fs)[K]): void {
   const original = fs[key];
-  (fs as Record<string, unknown>)[key as string] = replacement;
-  spies.push({ restore: () => { (fs as Record<string, unknown>)[key as string] = original; } });
+  Object.defineProperty(fs, key, { configurable: true, writable: true, value: replacement });
+  spies.push({ restore: () => { Object.defineProperty(fs, key, { configurable: true, writable: true, value: original }); } });
 }
 afterEach(() => {
   while (spies.length > 0) spies.pop()!.restore();
@@ -1000,18 +1000,19 @@ describe("the authority flip", () => {
    * inode AND the mtime AND the digest at once, so it cannot show which conjunct
    * of `sameSource` is load-bearing; tampering the RECORD one field at a time
    * can. Each must arm C1 rather than rename. */
-  test.each([
-    ["a path that is not the live document", (root: string, s: Record<string, unknown>) =>
+  const sourceTamperCases: readonly (readonly [string, (root: string, source: SourceWitness) => SourceWitness])[] = [
+    ["a path that is not the live document", (root: string, s: SourceWitness) =>
       ({ ...s, path: path.join(root, ".rbox", "state", "somewhere-else.json") })],
-    ["an inode that is not the live document's", (_root: string, s: Record<string, unknown>) =>
-      ({ ...s, ino: (s.ino as number) + 100_000 })],
-    ["a length the live document does not have", (_root: string, s: Record<string, unknown>) =>
-      ({ ...s, bytes: (s.bytes as number) + 1 })],
-    ["an mtime the live document does not have", (_root: string, s: Record<string, unknown>) =>
+    ["an inode that is not the live document's", (_root: string, s: SourceWitness) =>
+      ({ ...s, ino: s.ino + 100_000 })],
+    ["a length the live document does not have", (_root: string, s: SourceWitness) =>
+      ({ ...s, bytes: s.bytes + 1 })],
+    ["an mtime the live document does not have", (_root: string, s: SourceWitness) =>
       ({ ...s, mtimeNs: "1" })],
-    ["a digest the live document does not have", (_root: string, s: Record<string, unknown>) =>
+    ["a digest the live document does not have", (_root: string, s: SourceWitness) =>
       ({ ...s, sha256: "f".repeat(64) })],
-  ])("arms C1 when the control records %s", async (_label, tamper) => {
+  ];
+  test.each(sourceTamperCases)("arms C1 when the control records %s", async (_label, tamper) => {
     // The tamper lands AFTER the ladder: M5 and every rung call `bracketSource`,
     // so a control that already disagreed with the document could never have
     // reached the flip. This is the state where the document moved between the
@@ -1022,7 +1023,7 @@ describe("the authority flip", () => {
       {
         ...control,
         controlRevision: control.controlRevision + 1,
-        source: tamper(fx.root, control.source as unknown as Record<string, unknown>) as typeof control.source,
+        source: tamper(fx.root, control.source),
       }, locks,
     );
     const before = snapshot(fx.root);

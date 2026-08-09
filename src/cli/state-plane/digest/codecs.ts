@@ -1,6 +1,7 @@
 import { createHash, type Hash } from "node:crypto";
+import type { JsonObject, JsonValue } from "../../../json.js";
 
-export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type { JsonObject, JsonValue } from "../../../json.js";
 
 function encode(value: unknown): string {
   if (value === null) return "null";
@@ -21,11 +22,11 @@ function encode(value: unknown): string {
       }
       const prototype = Object.getPrototypeOf(value);
       if (prototype !== Object.prototype && prototype !== null) throw new TypeError("canonical JSON rejects non-JSON object prototypes");
-      const object = value as Record<string, unknown>;
       const members: string[] = [];
-      for (const key of Object.keys(object).sort()) {
-        if (object[key] === undefined) throw new TypeError(`canonical JSON does not admit undefined at ${key}`);
-        members.push(`${JSON.stringify(key)}:${encode(object[key])}`);
+      for (const key of Object.keys(value).sort()) {
+        const member: unknown = Reflect.get(value, key);
+        if (member === undefined) throw new TypeError(`canonical JSON does not admit undefined at ${key}`);
+        members.push(`${JSON.stringify(key)}:${encode(member)}`);
       }
       return `{${members.join(",")}}`;
     }
@@ -80,14 +81,13 @@ export function domainHash(domain: string): { token(value: string | Uint8Array):
   };
 }
 
-export function extrasOf(value: Record<string, unknown>, known: readonly string[]): string | null {
+export function extrasOf(value: object, known: readonly string[]): string | null {
   const knownSet = new Set(known);
-  const extras: Record<string, unknown> = {};
-  for (const [key, member] of Object.entries(value)) if (!knownSet.has(key)) extras[key] = member;
-  return Object.keys(extras).length === 0 ? null : canonicalJson(extras);
+  const extras = Object.entries(value).filter(([key]) => !knownSet.has(key));
+  return extras.length === 0 ? null : canonicalJson(Object.fromEntries(extras));
 }
 
-export function spreadExtras(text: string | null): Record<string, unknown> {
+export function spreadExtras(text: string | null): JsonObject {
   if (text === null) return {};
   const value = parseCanonicalJson(text);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("extras_cjson is not an object");

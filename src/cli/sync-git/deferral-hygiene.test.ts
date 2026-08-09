@@ -14,7 +14,7 @@ import {
   type SyncState,
   type WorkspaceConfig,
 } from "../config.js";
-import { GitBusyClassifier, reconcileGitDeferrals, type DeferralDiscoveryAuthority, type DeferralHygieneCursor } from "./deferral-hygiene.js";
+import { GitBusyClassifier, reconcileGitDeferrals, type DeferralDiscoveryAuthority, type DeferralHygieneCursor, type DeferralHygieneDeps } from "./deferral-hygiene.js";
 
 const STREAM = "test-stream";
 const CFG = {} as WorkspaceConfig;
@@ -54,7 +54,7 @@ function ctx(repoDir: string, commonDir = path.join(root, ".shared")): RepoCtx {
   return { repoDir, kind: "dir", gitDir: path.join(repoDir, ".git"), commonDir };
 }
 
-function depsFor(inspection: GitBusyInspection, extras: Record<string, unknown> = {}) {
+function depsFor(inspection: GitBusyInspection, extras: Partial<DeferralHygieneDeps> = {}): Partial<DeferralHygieneDeps> {
   return {
     now: () => T0,
     resolveRepoContext: async (repoDir: string) => ctx(repoDir),

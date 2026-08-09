@@ -29,6 +29,7 @@ const NOW = Date.now();
 const GENESIS = "0".repeat(64);
 const sha = (n: number): string => n.toString(16).padStart(64, "0");
 const db = () => env.rbox_dev_db;
+type FairUseSummary = { activeBytes: number; historyBytes: number | null; bound: number | null };
 
 beforeAll(async () => {
   await applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS);
@@ -358,7 +359,7 @@ describe("design 225 active bytes at head", () => {
     const completed = await completedScan(accountId);
     expect(completed).toMatchObject({ history_computed: 0, history_bytes: 0, bound_bytes: 0, active_bytes: 64 });
     const response = await usage(env, { accountId, deviceId: "dev", userId: "user", role: "owner", kind: "device" });
-    expect((await response.json() as { fairUse: Record<string, unknown> }).fairUse).toMatchObject({
+    expect((await response.json() as { fairUse: FairUseSummary }).fairUse).toMatchObject({
       activeBytes: 64, historyBytes: null, bound: null,
     });
 
@@ -373,7 +374,7 @@ describe("design 225 active bytes at head", () => {
         VALUES(?,1,'complete','{}',1,'[]',?,?,?,10,40,100)`).bind(legacyAccount, NOW, NOW, NOW),
     ]);
     const legacy = await usage(env, { accountId: legacyAccount, deviceId: "dev", userId: "user", role: "owner", kind: "device" });
-    expect((await legacy.json() as { fairUse: Record<string, unknown> }).fairUse).toMatchObject({
+    expect((await legacy.json() as { fairUse: FairUseSummary }).fairUse).toMatchObject({
       activeBytes: 10, historyBytes: 40, bound: 100,
     });
   });
@@ -542,7 +543,7 @@ describe("design 225 active bytes at head", () => {
     ]);
     expect(await completedScan(accountId)).toMatchObject({ active_bytes: 42, bound_bytes: 0 });
     const response = await usage(env, { accountId, deviceId: "dev", userId: "user", role: "owner", kind: "device" });
-    expect((await response.json() as { fairUse: Record<string, unknown> }).fairUse).toMatchObject({ activeBytes: 42 });
+    expect((await response.json() as { fairUse: FairUseSummary }).fairUse).toMatchObject({ activeBytes: 42 });
     // No per-stream incremental accumulation exists to double-count.
     expect(await db().prepare("SELECT COUNT(*) AS n FROM fairuse_group_progress WHERE account_id=?").bind(accountId).first())
       .toEqual({ n: 0 });
@@ -606,7 +607,11 @@ function fakeCtx(kv: Map<string, unknown>) {
   } as unknown as DurableObjectState;
 }
 
-function signedCommit(encManifestSha: string, carrier: Record<string, unknown>, manifestChain?: string[]): string {
+type CommitCarrier =
+  | { blobRefs: Array<{ encSha: string; size: number }> }
+  | { blobRefset: { sidecarSha: string; count: number; totalBytes: number } };
+
+function signedCommit(encManifestSha: string, carrier: CommitCarrier, manifestChain?: string[]): string {
   return JSON.stringify({
     body: JSON.stringify({ type: "rbox/commit/v1", seq: 1, encManifestSha, ...(manifestChain ? { manifestChain } : {}), ...carrier }),
     commitHash: sha(0xcc),
@@ -769,7 +774,7 @@ describe("migration and usage surface", () => {
       "EXPLAIN QUERY PLAN SELECT device_id,kind,last_seen_version FROM devices INDEXED BY idx_devices_capability_population "
         + "WHERE account_id=? AND revoked=0 AND kind IN ('device','api_key') AND last_seen_at>=? "
         + "AND (expires_at IS NULL OR expires_at>?) ORDER BY kind,last_seen_at,expires_at,last_seen_version,device_id LIMIT 1025",
-    ).bind("acct", 0, 0).all<Record<string, unknown>>();
+    ).bind("acct", 0, 0).all<{ detail: string }>();
     expect(JSON.stringify(plan.results)).toContain("idx_devices_capability_population");
   });
 

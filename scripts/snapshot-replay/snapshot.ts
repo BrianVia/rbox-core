@@ -32,7 +32,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { repoRecordsForState, type SyncState } from "../../src/cli/sync-state-model.js";
-import { RBOX_DIR } from "../../src/cli/workspace-config.js";
+import { RBOX_DIR, type WorkspaceConfig } from "../../src/cli/workspace-config.js";
+import type { LastWriterWitness } from "../../src/cli/state-plane/migration/last-writer-witness.js";
 import { sandboxLayout, SNAPSHOT_EXCLUDES, type SnapshotReport } from "./layout.js";
 
 const MAX_COPY_ATTEMPTS = 6;
@@ -117,7 +118,7 @@ function reanchorWitness(ws: string, fixups: string[]): void {
     fixups.push("last-writer witness absent in the source; left absent (admission will refuse `absent`)");
     return;
   }
-  const witness = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  const witness = JSON.parse(fs.readFileSync(file, "utf8")) as LastWriterWitness;
   const statePath = path.join(ws, RBOX_DIR, "state.json");
   const bytes = fs.readFileSync(statePath);
   const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
@@ -140,7 +141,7 @@ function reanchorWitness(ws: string, fixups: string[]): void {
 function repointConfig(ws: string, fixups: string[]): void {
   const file = path.join(ws, RBOX_DIR, "workspace.json");
   if (!fs.existsSync(file)) return;
-  const config = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  const config = JSON.parse(fs.readFileSync(file, "utf8")) as WorkspaceConfig;
   if (typeof config.rootPath !== "string" || config.rootPath === ws) return;
   const before = config.rootPath;
   fs.writeFileSync(file, `${JSON.stringify({ ...config, rootPath: ws }, null, 2)}\n`);

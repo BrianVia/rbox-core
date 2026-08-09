@@ -81,7 +81,7 @@ test("G1: a fresh workspace reaches Q with no leftovers and no migration artifac
     expect(store.header.active_lineage_id).toBe(IDS.lineageId);
     const row = stateStoreDatabase(store).query(
       "SELECT origin_kind,migration_id,entry_count,repo_count FROM migration_completion WHERE singleton=1",
-    ).get() as Record<string, unknown>;
+    ).get() as { origin_kind: string; migration_id: string; entry_count: number; repo_count: number };
     expect(row).toEqual({
       origin_kind: "genesis", migration_id: `genesis:${IDS.lineageId}`, entry_count: 0, repo_count: 0,
     });

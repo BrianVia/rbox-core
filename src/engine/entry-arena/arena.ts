@@ -59,7 +59,10 @@ export interface EntryArenaOptions {
  *  input into a loud `EntryShapeError` instead of a stack overflow. */
 export const MAX_EXTENSION_DEPTH = 32;
 
-function defineOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+type EntrySnapshotValue = null | boolean | number | string | undefined | readonly EntrySnapshotValue[] | EntrySnapshotObject;
+interface EntrySnapshotObject { [key: string]: EntrySnapshotValue; }
+
+function defineOwn(target: EntrySnapshotObject, key: string, value: EntrySnapshotValue): void {
   // Assignment would route an own `__proto__` key through the prototype setter
   // and silently drop a valid decoded-JSON member.
   Object.defineProperty(target, key, { value, enumerable: true, writable: false, configurable: false });
@@ -67,24 +70,23 @@ function defineOwn(target: Record<string, unknown>, key: string, value: unknown)
 
 /** Reads each source value EXACTLY once and returns a frozen, null-prototype
  *  deep copy. Every later step reads this result, never the caller's object. */
-function snapshotValue(value: unknown, path: string, depth: number): unknown {
+function snapshotValue(value: unknown, path: string, depth: number): EntrySnapshotValue {
   if (depth > MAX_EXTENSION_DEPTH) throw new EntryShapeError(path, `nested deeper than ${MAX_EXTENSION_DEPTH}`);
   if (value === null) return null;
-  const kind = typeof value;
-  if (kind !== "object") {
-    if (kind === "string" || kind === "number" || kind === "boolean" || kind === "undefined") return value;
-    throw new EntryShapeError(path, `${kind} is not representable in a manifest`);
+  if (typeof value !== "object") {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
+    throw new EntryShapeError(path, `${typeof value} is not representable in a manifest`);
   }
   if (Array.isArray(value)) {
     return Object.freeze(value.map((item, index) => snapshotValue(item, `${path}[${index}]`, depth + 1)));
   }
-  const source = value as Record<string, unknown>;
-  const copy = Object.create(null) as Record<string, unknown>;
+  const source = value as EntrySnapshotObject;
+  const copy = Object.create(null) as EntrySnapshotObject;
   for (const key of Object.keys(source)) defineOwn(copy, key, snapshotValue(source[key], `${path}.${key}`, depth + 1));
   return Object.freeze(copy);
 }
 
-function canonicalOf(value: unknown): string {
+function canonicalOf(value: EntrySnapshotValue): string {
   if (value === undefined) return "u";
   if (value === null) return "z";
   switch (typeof value) {
@@ -98,7 +100,7 @@ function canonicalOf(value: unknown): string {
       break;
   }
   if (Array.isArray(value)) return `a[${value.map(canonicalOf).join(",")}]`;
-  const record = value as Record<string, unknown>;
+  const record = value as EntrySnapshotObject;
   return `o{${Object.keys(record)
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalOf(record[key])}`)
@@ -113,7 +115,7 @@ export interface InternedSnapshot {
 }
 
 export function snapshotEntry(entry: Readonly<FileEntry>): InternedSnapshot {
-  const snapshot = snapshotValue(entry, "", 0) as Readonly<FileEntry>;
+  const snapshot = snapshotValue(entry, "", 0) as unknown as Readonly<FileEntry>;
   return { entry: snapshot, canonical: canonicalOf(snapshot) };
 }
 

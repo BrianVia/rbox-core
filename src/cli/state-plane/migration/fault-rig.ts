@@ -113,8 +113,8 @@ export function installStatePlaneFault(
   action: StatePlaneFaultAction,
 ): InstalledFault {
   const surface = point.surface ?? "sync";
-  const table = (surface === "promises" ? fsp : fs) as unknown as Record<string, unknown>;
-  const original = table[point.syscall];
+  const table: object = surface === "promises" ? fsp : fs;
+  const original = Reflect.get(table, point.syscall) as unknown;
   if (typeof original !== "function") {
     throw new TypeError(`fault rig: ${surface} surface has no callable ${point.syscall}`);
   }
@@ -124,7 +124,7 @@ export function installStatePlaneFault(
   let matches = 0;
   let fired = false;
 
-  table[point.syscall] = function patched(this: unknown, ...args: unknown[]): unknown {
+  const patched = function (this: unknown, ...args: unknown[]): unknown {
     const subject = args.filter((a) => typeof a === "string").join("\0");
     const hit = point.match === undefined || point.match.test(subject);
     if (!hit) return call.apply(this, args);
@@ -135,12 +135,13 @@ export function installStatePlaneFault(
     const result = call.apply(this, args);
     return apply(action, () => result, point.syscall);
   };
+  Object.defineProperty(table, point.syscall, { configurable: true, writable: true, value: patched });
 
   return {
     matches: () => matches,
     fired: () => fired,
     restore: () => {
-      table[point.syscall] = original;
+      Object.defineProperty(table, point.syscall, { configurable: true, writable: true, value: original });
     },
   };
 }
