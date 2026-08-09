@@ -8,6 +8,7 @@
   },
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
+    "prepare": "sh scripts/install-git-hooks.sh",
     "dev:install": "bun scripts/dev-install.ts",
     "lint": "oxlint --quiet .",
     "lint:fix": "oxlint --quiet --fix .",

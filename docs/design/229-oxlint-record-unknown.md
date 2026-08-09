@@ -71,6 +71,9 @@ Forbidden migrations:
   new merge gate in this migration. Configure categories so the new command
   reports only intentionally adopted rules.
 - Add `bun run lint` to the existing CI checks job after dependency install.
+- Install a checked-in pre-commit hook during `bun install`. The hook reuses
+  `bun run lint` as the sole policy owner and rejects violations; it must not
+  guess semantic type replacements or create a second lint configuration.
 
 ## Complexity and requirement challenges
 
@@ -106,6 +109,8 @@ Forbidden migrations:
   paths solely for lint compliance; the test rig remains the final integration
   gate if local prerequisites are available.
 - **Packaging:** frozen Bun install succeeds from the updated lockfile.
+- **Hook:** dependency setup resolves the checked-in pre-commit hook, a clean
+  tree passes it, and a temporary restricted-type fixture makes it fail.
 
 ## Safe deletion candidates
 
