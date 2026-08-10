@@ -147,7 +147,7 @@ test("a sealed stage carrying an inadmissible section fails reads as StageChange
   db.query("INSERT INTO stage_git_roles(stage_id,role) VALUES (?,?)").run(stageId, "meta-wire");
   db.query("INSERT INTO stage_git_sections(stage_id,role,rel_path,path_order,section_cjson) VALUES (?,?,?,?,?)")
     .run(stageId, "meta-wire", "repo-a", utf16beOrderKey("repo-a"), badCjson);
-  const digest = new StageDigestBuilder(stageId, "base", header as unknown as Record<string, unknown>);
+  const digest = new StageDigestBuilder(stageId, "base", header);
   digest.declareRole("meta-wire");
   digest.gitSection("meta-wire", "repo-a", badCjson);
   const counts: StageCounts = digest.counts;

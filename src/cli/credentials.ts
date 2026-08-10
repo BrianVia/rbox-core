@@ -7,6 +7,7 @@ import { compareProcessStart, systemLockIdentity } from "../engine/git/lockfile.
 import { rboxDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";
+import type { JsonObject } from "../json.js";
 
 /** The whitelisted, versioned credential document written to disk. */
 export interface CredentialsV1 {
@@ -28,7 +29,7 @@ export type CredentialLoadResult =
       source: "disk" | "env";
       credentials: CredentialsV1;
       legacy: boolean;
-      extensions: Record<string, unknown>;
+      extensions: JsonObject;
     }
   | { state: "corrupt"; path: string; detail: string; quarantinedTo?: string }
   | { state: "unreadable"; path: string; detail: string }
@@ -41,7 +42,7 @@ export type CredentialLoadResult =
 
 type DegradedCredentialResult = Exclude<CredentialLoadResult, { state: "absent" | "valid" }>;
 type ParsedCredential =
-  | { state: "valid"; credentials: CredentialsV1; legacy: boolean; extensions: Record<string, unknown> }
+  | { state: "valid"; credentials: CredentialsV1; legacy: boolean; extensions: JsonObject }
   | { state: "corrupt"; detail: string }
   | { state: "unsupported-version"; version: unknown };
 
@@ -147,7 +148,7 @@ function validRemote(value: unknown): value is string {
   }
 }
 
-function objectRecord(value: unknown): value is Record<string, unknown> {
+function objectRecord(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 

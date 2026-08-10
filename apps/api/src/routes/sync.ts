@@ -75,5 +75,5 @@ async function withDownloadGrant(env: Env, res: Response, accountId: string, wor
   if (!grant) return res; // no grant key configured — best-effort no-op
   const headers = new Headers(res.headers);
   headers.delete("content-length"); // body length changed
-  return new Response(JSON.stringify({ ...(body as Record<string, unknown>), grant }), { status: res.status, headers });
+  return new Response(JSON.stringify(Object.assign({}, body, { grant })), { status: res.status, headers });
 }

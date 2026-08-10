@@ -12,6 +12,7 @@ import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { RECOVERY_KIT_SERVICE } from "./genesis-seam.js";
 import type { KeychainArtifact, KeychainProbe } from "./recovery-kit-keychain.js";
 import { assertAccountId } from "./account-id.js";
+import type { JsonObject } from "../json.js";
 
 export const KIT_BANNER = "rbox RECOVERY KIT — keep this somewhere safe";
 const FILE_MODE = 0o600;
@@ -141,7 +142,7 @@ function exactKeys(value: object, allowed: readonly string[]): boolean {
   const actual = Object.keys(value).sort(); const expected = [...allowed].sort();
   return actual.length === expected.length && actual.every((key, i) => key === expected[i]);
 }
-function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value) }
+function isObject(value: unknown): value is JsonObject { return typeof value === "object" && value !== null && !Array.isArray(value) }
 function validIso(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 function validAbsolute(value: unknown): value is string { return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value && !value.includes("\0") && !/[\r\n]/.test(value) }
 function validProviderId(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) }

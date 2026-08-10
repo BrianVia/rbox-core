@@ -72,11 +72,22 @@ async function probeReentry(): Promise<string> {
 }
 
 interface Verdict { readonly check: string; readonly ok: boolean; readonly detail: string }
+type SqliteCheckRow = Record<string, string | number | null>;
+interface M4Forensics {
+  authorityMatches: boolean;
+  tupleStringEqual: boolean;
+  tupleValueEqual: boolean;
+  committedKeyOrder: string[];
+  witnessKeyOrder: string[];
+  semanticDigestMatches: boolean;
+  foreignKeyViolations: number;
+  integrityCheck: string | number | null | undefined;
+}
 
-function checkRows(db: ReturnType<typeof stateStoreDatabase>, pragma: string): Array<Record<string, unknown>> {
+function checkRows(db: ReturnType<typeof stateStoreDatabase>, pragma: string): SqliteCheckRow[] {
   const prepared = db.prepare(pragma);
   try {
-    return prepared.all() as Array<Record<string, unknown>>;
+    return prepared.all() as SqliteCheckRow[];
   } finally {
     prepared.finalize();
   }
@@ -170,7 +181,7 @@ function verifyFidelity(verdicts: Verdict[]): void {
  * compares the two completion tuples with `JSON.stringify`, and the control
  * record round-trips through JCS, which sorts keys.
  */
-function m4Forensics(): Record<string, unknown> | null {
+function m4Forensics(): M4Forensics | null {
   const control = readCanonicalControl(root);
   if (!control || control.witness.phase !== "M3") return null;
   const witness = control.witness.completion;
@@ -216,7 +227,7 @@ if (format === "authority-marker") {
 }
 
 const control = readCanonicalControl(root);
-let forensics: Record<string, unknown> | null = null;
+let forensics: M4Forensics | { error: string } | null = null;
 if (format !== "authority-marker") {
   try {
     forensics = m4Forensics();

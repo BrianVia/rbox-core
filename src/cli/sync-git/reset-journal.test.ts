@@ -15,6 +15,8 @@ import {
   readBasePresentArtifact,
 } from "../../engine/git/base-artifacts.js";
 import { gitRaw, setGitSpawnObserver } from "../../engine/git/shared.js";
+import type { RepoIdentityV1 } from "../../engine/git/repo-lineage.js";
+import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
 import {
   beginResetJournal,
   inspectResetJournal,
@@ -79,7 +81,8 @@ async function legacyProtocolTree(z: ResetZEntry[] = []): Promise<Record<string,
         const relative = path.relative(root, absolute);
         const bytes = await fs.readFile(absolute);
         if (relative === path.join(".rbox", "state", "last-writer.json")) {
-          const witness = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+          type RedactedLastWriterWitness = { [K in keyof LastWriterWitness]: LastWriterWitness[K] | string };
+          const witness = JSON.parse(bytes.toString("utf8")) as RedactedLastWriterWitness;
           // writerVersion is the running rbox version — it changes every
           // release and is not behavior, so redact it alongside the other
           // environment-dependent fields (else every version bump breaks this
@@ -89,9 +92,9 @@ async function legacyProtocolTree(z: ResetZEntry[] = []): Promise<Record<string,
           }
           snapshot[relative] = Buffer.from(JSON.stringify(witness)).toString("base64");
         } else if (relative === path.join(".rbox", "state", "reset-v1.json")) {
-          const journal = JSON.parse(bytes.toString("utf8")) as {
-            old?: { z?: Array<{ repositoryIdentityHash?: string; repositoryIdentity?: Record<string, unknown> }> };
-          };
+          type RedactedRepoIdentity = { [K in keyof RepoIdentityV1]?: RepoIdentityV1[K] | string };
+          type RedactedResetEntry = Partial<Omit<ResetZEntry, "repositoryIdentity">> & { repositoryIdentity?: RedactedRepoIdentity };
+          const journal = JSON.parse(bytes.toString("utf8")) as { old?: { z?: RedactedResetEntry[] } };
           for (const entry of journal.old?.z ?? []) {
             entry.repositoryIdentityHash = "<fixture-derived>";
             const identity = entry.repositoryIdentity;

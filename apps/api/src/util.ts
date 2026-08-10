@@ -102,17 +102,28 @@ export async function cappedJson<T>(
 }
 
 /** JSON-object exactness helper for route validators. */
-export function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+export function exactObject<const Keys extends readonly string[]>(
+  value: unknown,
+  keys: Keys,
+): value is { [Key in Keys[number]]: unknown } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const actual = Object.keys(value);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
+export function objectWithKeys<
+  const Allowed extends readonly string[],
+  const Required extends readonly Allowed[number][] = readonly [],
+>(
+  value: unknown,
+  allowed: Allowed,
+  required?: Required,
+): value is { [Key in Allowed[number]]?: unknown } & { [Key in Required[number]]: unknown };
 export function objectWithKeys(
   value: unknown,
   allowed: readonly string[],
   required: readonly string[] = [],
-): value is Record<string, unknown> {
+): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const actual = Object.keys(value);
   return actual.every((key) => allowed.includes(key)) && required.every((key) => Object.hasOwn(value, key));

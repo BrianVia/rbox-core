@@ -7,7 +7,7 @@
  *
  * Pure string logic only (no node:*), so it bundles cleanly into the Worker.
  */
-import type { GitArtifactRef } from "./types.js";
+import type { FileEntry, GitArtifactRef, GitPackLink, GitRefTombstone, GitSection, Manifest } from "./types.js";
 
 export const MAX_PATH_BYTES = 1024;
 export const MAX_ENTRIES = 200_000; // monorepo headroom; plan-tied caps come in M7b
@@ -48,13 +48,13 @@ const canonicalUtcMilliseconds = (value: unknown): value is string => {
 /** Strict reader-side validation for the optional design-130 wire fields. Their joint
  * absence is the skew-compatible old-writer shape; once either is present, both fields
  * and the complete bounded container must be valid before an attestation can be built. */
-export function validateRefTombstones(section: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {
+export function validateRefTombstones(section: Partial<GitSection>): { ok: true } | { ok: false; reason: string } {
   const raw = section.refTombstones;
   const generation = section.refTombstoneGeneration;
   if (raw === undefined && generation === undefined) return { ok: true };
   if (raw === undefined || generation === undefined) return { ok: false, reason: "incomplete ref tombstone fields" };
-  const chains = asRecord(raw);
-  if (!chains) return { ok: false, reason: "bad refTombstones" };
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "bad refTombstones" };
+  const chains = raw as Partial<Record<string, Array<Partial<GitRefTombstone>>>>;
   if (!isNonNegativeSafeInteger(generation)) return { ok: false, reason: "bad refTombstoneGeneration" };
   let total = 0;
   let maximum = 0;
@@ -67,8 +67,9 @@ export function validateRefTombstones(section: Record<string, unknown>): { ok: t
     const seen = new Set<string>();
     let priorGeneration = 0;
     for (const item of value) {
-      const entry = asRecord(item);
-      if (!entry || Object.keys(entry).sort().join(",") !== "generation,oid,ts") return { ok: false, reason: `bad tombstone entry ${ref}` };
+      if (!item || typeof item !== "object" || Array.isArray(item)) return { ok: false, reason: `bad tombstone entry ${ref}` };
+      const entry = item as Partial<GitRefTombstone>;
+      if (Object.keys(entry).sort().join(",") !== "generation,oid,ts") return { ok: false, reason: `bad tombstone entry ${ref}` };
       if (typeof entry.oid !== "string" || !HEX40.test(entry.oid)) return { ok: false, reason: `bad tombstone oid ${ref}` };
       if (seen.has(entry.oid)) return { ok: false, reason: `duplicate tombstone oid ${ref}` };
       seen.add(entry.oid);
@@ -140,6 +141,7 @@ export function validateGitRepos(
   filePaths: ReadonlySet<string> = new Set(),
 ): ValidationResult {
   if (gitRepos === null || typeof gitRepos !== "object" || Array.isArray(gitRepos)) return { ok: false, error: "manifest.gitRepos is not an object" };
+  const repos = gitRepos as Partial<Record<string, Partial<GitSection>>>;
   if (schema < 2) return { ok: false, error: "gitRepos requires manifestSchema >= 2" };
   const keys = Object.keys(gitRepos);
   if (keys.length > MAX_GIT_REPOS) return { ok: false, error: `too many git repos (${keys.length} > ${MAX_GIT_REPOS})` };
@@ -150,7 +152,7 @@ export function validateGitRepos(
     if (seenGitLower.has(lower)) return { ok: false, error: `case-insensitive duplicate gitRepos key: ${key}` };
     seenGitLower.add(lower);
     if (filePaths.has(key)) return { ok: false, error: `gitRepos key collides with a file entry: ${key}` };
-    const section = (gitRepos as Record<string, unknown>)[key];
+    const section = repos[key];
     if (section === null || typeof section !== "object") return { ok: false, error: `gitRepos[${key}] is not an object` };
     if (gitSectionRequiresSchema4(section) && schema < 4) return { ok: false, error: "compressed entries require manifestSchema >= 4" };
     const gv = validateGitSection(section);
@@ -171,7 +173,7 @@ export function validateManifest(m: unknown): ValidationResult {
   const files: unknown = (m as { files?: unknown }).files;
   if (!Array.isArray(files)) return { ok: false, error: "manifest.files is not an array" };
   if (files.length > MAX_ENTRIES) return { ok: false, error: `too many entries (${files.length} > ${MAX_ENTRIES})` };
-  const mm = m as Record<string, unknown>;
+  const mm = m as Partial<Manifest> & { git?: unknown };
   const schema = mm.manifestSchema;
 
   const seen = new Set<string>();
@@ -180,7 +182,7 @@ export function validateManifest(m: unknown): ValidationResult {
 
   for (const entry of files) {
     if (entry == null || typeof entry !== "object") return { ok: false, error: "entry is not an object" };
-    const e = entry as Record<string, unknown>;
+    const e = entry as Partial<FileEntry>;
 
     if (!isSafeRelPath(e.path)) return { ok: false, error: `unsafe path: ${JSON.stringify(e.path)}` };
     const p = e.path as string;
@@ -319,15 +321,10 @@ export function isSyncableRef(ref: string): boolean {
   return ref.startsWith("refs/heads/") || ref.startsWith("refs/tags/") || ref === "refs/stash";
 }
 
-/** Reject a malformed/hostile artifact ref before it touches `.git`. */
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-}
-
 function validArtifactRef(r: unknown): r is GitArtifactRef {
-  const ref = asRecord(r);
+  if (r === null || typeof r !== "object" || Array.isArray(r)) return false;
+  const ref = r as Partial<GitArtifactRef>;
   return (
-    !!ref &&
     typeof ref.sha === "string" &&
     SHA_RE.test(ref.sha) &&
     typeof ref.encSha === "string" &&
@@ -343,31 +340,29 @@ function validCompressionFields(comp: unknown, payloadSha: unknown): boolean {
 }
 
 function packChainRequiresSchema3(s: unknown): boolean {
-  const section = asRecord(s);
+  if (s === null || typeof s !== "object" || Array.isArray(s)) return false;
+  const section = s as Partial<GitSection>;
   return Array.isArray(section?.packChain) && section.packChain.length > 0;
 }
 
 function refHasCompressionFields(ref: unknown): boolean {
-  const r = asRecord(ref);
+  if (ref === null || typeof ref !== "object" || Array.isArray(ref)) return false;
+  const r = ref as Partial<GitArtifactRef>;
   return r?.comp !== undefined || r?.payloadSha !== undefined;
 }
 
-/** Does this manifest carry ANY compression descriptor (file entry or git
- *  section)? The single source of truth shared by the commit-side schema
- *  stamper (sync.ts) and the schema-4 gates in this file — stamping and
- *  validation MUST agree on the field set or a client could stamp a manifest
- *  its own validator then rejects. */
-export function manifestRequiresSchema4(m: { files: ReadonlyArray<{ comp?: string }>; gitRepos?: Record<string, unknown> }): boolean {
+/** Keep compression schema derivation aligned with capture-side stamping. */
+export function manifestRequiresSchema4(m: Pick<Manifest, "files" | "gitRepos">): boolean {
   return m.files.some((f) => f.comp !== undefined) || Object.values(m.gitRepos ?? {}).some(gitSectionRequiresSchema4);
 }
 
 function gitSectionRequiresSchema4(s: unknown): boolean {
-  const section = asRecord(s);
-  if (!section) return false;
+  if (s === null || typeof s !== "object" || Array.isArray(s)) return false;
+  const section = s as Partial<GitSection>;
   if (section.bundleComp !== undefined || section.bundlePayloadSha !== undefined || section.indexComp !== undefined || section.indexPayloadSha !== undefined) return true;
   if (Array.isArray(section.packChain) && section.packChain.some(refHasCompressionFields)) return true;
-  const opState = asRecord(section.opState);
-  return !!opState && Object.values(opState).some(refHasCompressionFields);
+  const opState = section.opState;
+  return !!opState && typeof opState === "object" && !Array.isArray(opState) && Object.values(opState).some(refHasCompressionFields);
 }
 
 function invalidPackChainReason(packChain: unknown): string | undefined {
@@ -375,10 +370,13 @@ function invalidPackChainReason(packChain: unknown): string | undefined {
   if (!Array.isArray(packChain)) return "bad packChain";
   if (packChain.length + 1 > MAX_PACK_CHAIN) return `packChain exceeds ${MAX_PACK_CHAIN} total links`;
   for (let i = 0; i < packChain.length; i++) {
-    const link = asRecord(packChain[i]);
-    if (!validArtifactRef(link)) return `bad packChain ref ${i}`;
+    const candidate = packChain[i];
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return `bad packChain ref ${i}`;
+    const link = candidate as Partial<GitPackLink>;
     if (!Array.isArray(link.tips) || link.tips.length === 0) return `bad packChain tips ${i}`;
-    for (const tip of link.tips) {
+    const tips = link.tips;
+    if (!validArtifactRef(link)) return `bad packChain ref ${i}`;
+    for (const tip of tips) {
       if (typeof tip !== "string" || !HEX40.test(tip)) return `bad packChain tip ${i}`;
     }
   }
@@ -388,8 +386,8 @@ function invalidPackChainReason(packChain: unknown): string | undefined {
 /** Reject a malformed/hostile git section before it touches `.git`. Runs on wire data
  *  (inside validateManifest) so every field is treated as untrusted. */
 export function validateGitSection(input: unknown): { ok: boolean; reason?: string } {
-  const s = asRecord(input);
-  if (!s) return { ok: false, reason: "bad git section" };
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "bad git section" };
+  const s = input as Partial<GitSection>;
   // §28: the bundle is mandatory and addressed by both its plaintext sha (decrypt-verify) and
   // its encSha (the ciphertext blob actually fetched). Both must be well-formed.
   if (typeof s.bundleSha !== "string" || !SHA_RE.test(s.bundleSha) || typeof s.bundleEncSha !== "string" || !SHA_RE.test(s.bundleEncSha)) return { ok: false, reason: "bad bundle sha/encSha" };
@@ -406,8 +404,8 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   // outside refs/heads/* or naming a branch absent from `refs` is malformed/hostile: applying
   // it would leave an unborn HEAD over restored index entries (codex repro).
   if (typeof s.head !== "string" || !/^(ref: refs\/heads\/[A-Za-z0-9._\/-]+|[0-9a-f]{40})$/.test(s.head.trim())) return { ok: false, reason: "bad HEAD" };
-  const refs = asRecord(s.refs);
-  if (!refs) return { ok: false, reason: "bad refs" };
+  const refs = s.refs;
+  if (!refs || typeof refs !== "object" || Array.isArray(refs)) return { ok: false, reason: "bad refs" };
   for (const [ref, sha] of Object.entries(refs)) {
     if (!isSyncableRef(ref) || ref.includes("..") || ref.includes("\0")) return { ok: false, reason: `bad ref ${ref}` };
     if (typeof sha !== "string" || !HEX40.test(sha)) return { ok: false, reason: `bad ref sha ${ref}` };
@@ -416,8 +414,8 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   if (headBranch && refs[headBranch] === undefined) return { ok: false, reason: `HEAD branch ${headBranch} not in refs` };
   const tombstones = validateRefTombstones(s);
   if (!tombstones.ok) return tombstones;
-  const opState = s.opState == null ? {} : asRecord(s.opState);
-  if (!opState) return { ok: false, reason: "bad opState" };
+  const opState = s.opState == null ? {} : s.opState;
+  if (typeof opState !== "object" || Array.isArray(opState)) return { ok: false, reason: "bad opState" };
   for (const [rel, ref] of Object.entries(opState)) {
     const okRel = (OP_STATE_FILES as readonly string[]).includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
     if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };

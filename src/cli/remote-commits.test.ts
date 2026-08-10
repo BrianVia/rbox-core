@@ -41,7 +41,7 @@ test("commitSigned redeems first and posts an empty receipts map", async () => {
   (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url, init) => {
     paths.push(url);
     ordering.push(url.endsWith("/receipts/redeem") ? "redeem" : "post");
-    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    const body: unknown = JSON.parse(String(init.body));
     if (url.endsWith("/receipts/redeem")) return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
     commitBodies.push(body);
     return json(200, { sequence: 1, serverTimings });

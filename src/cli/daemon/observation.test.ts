@@ -5,9 +5,10 @@ import {
   type DaemonObservationDeps,
 } from "./observation.js";
 import { AMBIENT_STATUS_STALE_MS } from "./ambient-status.js";
+import type { AmbientDaemonStatusV1 } from "./ambient-status.js";
 
 const NOW = Date.parse("2026-07-30T12:00:00.000Z");
-const status = (over: Record<string, unknown> = {}) => ({
+const status = (over: Partial<AmbientDaemonStatusV1> = {}) => ({
   kind: "ok" as const,
   status: {
     schemaVersion: 1 as const,

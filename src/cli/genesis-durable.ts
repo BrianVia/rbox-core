@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { canonicalString, fromB64url, parseStrict, rkToPhrase, sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
+import type { JsonObject } from "../json.js";
 
 export const GENESIS_ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/;
 export const GENESIS_REPAIR_ID_RE = /^gra_[0-9a-f]{32}$/;
@@ -267,7 +268,7 @@ const exactKeys = (value: object, keys: readonly string[]): boolean => {
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
 };
 const iso = (value: unknown): value is string => typeof value === "string" && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
-const plain = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const plain = (value: unknown): value is JsonObject => typeof value === "object" && value !== null && !Array.isArray(value);
 
 function parseBounded(raw: string): unknown {
   if (Buffer.byteLength(raw, "utf8") > GENESIS_MAX_JSON_BYTES) throw new Error("genesis artifact exceeds size bound");

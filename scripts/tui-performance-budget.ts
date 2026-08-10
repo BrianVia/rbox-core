@@ -17,6 +17,24 @@ const workloads = [
   { name: "daemon-startup-selftest", args: ["__watcher-selftest"], expectedExit: 0 },
 ] as const;
 
+type WorkloadName = typeof workloads[number]["name"];
+interface PerformanceSummary {
+  wallP50Ms: number;
+  wallP95Ms: number;
+  peakRssBytes: number;
+}
+interface WorkloadBudgetResult {
+  baseline: PerformanceSummary;
+  candidate: PerformanceSummary;
+  limits: { wallP95Ms: number; peakRssBytes: number };
+}
+interface TuiPerformanceReport {
+  baseline: string;
+  candidate: string;
+  binarySize: { baseline: number; candidate: number; delta: number };
+  workloads: Partial<Record<WorkloadName, WorkloadBudgetResult>>;
+}
+
 function percentile(values: number[], fraction: number): number {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]!;
@@ -69,7 +87,7 @@ try {
     throw new Error(`binary grew ${(sizeDelta / 1024 / 1024).toFixed(2)} MiB (budget: 15 MiB)`);
   }
 
-  const report: Record<string, unknown> = {
+  const report: TuiPerformanceReport = {
     baseline,
     candidate,
     binarySize: {
@@ -120,7 +138,7 @@ try {
     if (candidateSummary.peakRssBytes > rssLimit) {
       failures.push(`${workload.name} RSS ${candidateSummary.peakRssBytes} > ${Math.floor(rssLimit)}`);
     }
-    (report.workloads as Record<string, unknown>)[workload.name] = {
+    report.workloads[workload.name] = {
       baseline: baselineSummary,
       candidate: candidateSummary,
       limits: { wallP95Ms: wallLimit, peakRssBytes: rssLimit },

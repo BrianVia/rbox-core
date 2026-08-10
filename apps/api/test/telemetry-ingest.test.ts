@@ -193,7 +193,10 @@ describe("POST /v1/fleet/sync-state", () => {
     const res = await ingestSyncState(req, testEnv(), devicePrincipal(a));
     expect(res.status).toBe(202);
     expect(await res.json()).toEqual({ accepted: 1, dropped: 0 });
-    const row = await env.rbox_dev_db.prepare("SELECT * FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<Record<string, unknown>>();
+    const row = await env.rbox_dev_db.prepare("SELECT * FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<{
+      workspace_id: string; project_id: string; binding_id: string; file_seq: number; repos_total: number;
+      repos_deferred: number; oldest_deferral_age_ms: number | null; deferral_reasons: string; reported_at: number;
+    }>();
     expect(row).toMatchObject({ workspace_id: wsA, project_id: "root", binding_id: valid.bindingId, file_seq: 12, repos_total: 2, repos_deferred: 1, oldest_deferral_age_ms: 99, deferral_reasons: "stale-unattributed" });
     expect(Number(row?.reported_at)).toBeGreaterThanOrEqual(before);
   });

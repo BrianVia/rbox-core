@@ -92,6 +92,24 @@ export interface OnePasswordProvider {
   signal?: AbortSignal;
 }
 
+interface OnePasswordAccountCandidate {
+  account_uuid?: unknown;
+  id?: unknown;
+  email?: unknown;
+  url?: unknown;
+}
+
+interface OnePasswordVaultCandidate {
+  id?: unknown;
+  name?: unknown;
+}
+
+interface OnePasswordItemCandidate {
+  id?: unknown;
+  tags?: unknown;
+  vault?: { id?: unknown };
+}
+
 function wipe(bytes: Uint8Array | undefined): void {
   bytes?.fill(0);
 }
@@ -384,7 +402,7 @@ export async function listOnePasswordAccounts(provider: OnePasswordProvider): Pr
     const labels = new Map<string, number>();
     for (const value of parsed) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as Record<string, unknown>;
+      const row = value as OnePasswordAccountCandidate;
       const uuid = row.account_uuid ?? row.id;
       if (!isSafeId(uuid) || seen.has(uuid)) return { state: "unavailable", reason: "invalid-response" };
       seen.add(uuid);
@@ -420,7 +438,7 @@ export async function listOnePasswordVaults(provider: OnePasswordProvider, accou
     const names = new Map<string, number>();
     for (const value of parsed) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as Record<string, unknown>;
+      const row = value as OnePasswordVaultCandidate;
       if (!isSafeId(row.id) || ids.has(row.id)) return { state: "unavailable", reason: "invalid-response" };
       ids.add(row.id);
       const name = sanitizeLabel(row.name, `Vault ${vaults.length + 1}`);
@@ -461,11 +479,11 @@ function itemJson(phrase: string, rboxAccountId: string, operationTag: string): 
 
 function locatorFromCreate(value: unknown, accountUuid: string, vaultUuid: string, operationTag: string): OnePasswordLocator | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const row = value as Record<string, unknown>;
+  const row = value as OnePasswordItemCandidate;
   if (!isSafeId(row.id)) return undefined;
   if (row.vault !== undefined) {
     if (!row.vault || typeof row.vault !== "object" || Array.isArray(row.vault)) return undefined;
-    const returnedVault = (row.vault as Record<string, unknown>).id;
+    const returnedVault = row.vault.id;
     if (returnedVault !== undefined && returnedVault !== vaultUuid) return undefined;
   }
   return { accountUuid, vaultUuid, itemUuid: row.id, fieldId: FIELD_ID, operationTag };
@@ -525,7 +543,7 @@ export async function reconcileOnePasswordRecoveryItem(
     const matches: string[] = [];
     for (const value of parsed) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as Record<string, unknown>;
+      const row = value as OnePasswordItemCandidate;
       if (!isSafeId(row.id) || !Array.isArray(row.tags) || !row.tags.every((tag) => typeof tag === "string")) {
         return { state: "unavailable", reason: "invalid-response" };
       }

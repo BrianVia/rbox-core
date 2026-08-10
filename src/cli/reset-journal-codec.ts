@@ -248,13 +248,13 @@ export async function inspectResetJournalEnvelopeStreams(
   let value: unknown;
   try { value = tokenizeResetJournalJson(text); } catch { return undefined; }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const root = value as Record<string, unknown>;
+  const root = value as { old?: unknown; next?: unknown };
   const old = root.old;
   const next = root.next;
   if (old === null || typeof old !== "object" || Array.isArray(old)
     || next === null || typeof next !== "object" || Array.isArray(next)) return undefined;
-  const oldStream = (old as Record<string, unknown>).stream;
-  const nextStream = (next as Record<string, unknown>).stream;
+  const oldStream = (old as { stream?: unknown }).stream;
+  const nextStream = (next as { stream?: unknown }).stream;
   return typeof oldStream === "string" && typeof nextStream === "string"
     ? { oldStream, nextStream }
     : undefined;

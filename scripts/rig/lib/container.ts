@@ -95,7 +95,56 @@ export async function spawnHost(argv: string[], opts: RunOpts = {}): Promise<Run
   return spawnCapture(argv, opts);
 }
 
-function parseNumber(o: Record<string, unknown>, keys: string[]): number | undefined {
+interface RuntimeConfigCandidate {
+  mounts?: unknown;
+  Mounts?: unknown;
+  labels?: unknown;
+  Labels?: unknown;
+}
+
+interface RuntimeRowCandidate extends RuntimeConfigCandidate {
+  configuration?: unknown;
+  Configuration?: unknown;
+  Config?: unknown;
+  name?: unknown;
+  Name?: unknown;
+  container?: unknown;
+  Container?: unknown;
+  memoryUsageBytes?: unknown;
+  memory_usage_bytes?: unknown;
+  memoryUsage?: unknown;
+  cpuUsageUsec?: unknown;
+  cpu_usage_usec?: unknown;
+  cpuUsage?: unknown;
+  ts?: unknown;
+  MemUsage?: unknown;
+  memUsage?: unknown;
+  CPUPerc?: unknown;
+  cpuPerc?: unknown;
+  ID?: unknown;
+  Names?: unknown;
+  Reclaimable?: unknown;
+  Size?: unknown;
+  Type?: unknown;
+}
+
+interface RuntimeMountCandidate {
+  source?: unknown;
+  Source?: unknown;
+  destination?: unknown;
+  Destination?: unknown;
+  target?: unknown;
+  Target?: unknown;
+  options?: unknown;
+  Options?: unknown;
+  type?: unknown;
+  Type?: unknown;
+  RW?: unknown;
+}
+
+type RuntimeLabelCandidate = Partial<Record<"rig.spec", unknown>>;
+
+function parseNumber(o: RuntimeRowCandidate, keys: Array<keyof RuntimeRowCandidate>): number | undefined {
   for (const key of keys) {
     const v = o[key];
     if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -104,18 +153,18 @@ function parseNumber(o: Record<string, unknown>, keys: string[]): number | undef
   return undefined;
 }
 
-function rows(value: unknown): Record<string, unknown>[] {
-  return (Array.isArray(value) ? value : [value]).filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === "object");
+function rows(value: unknown): RuntimeRowCandidate[] {
+  return (Array.isArray(value) ? value : [value]).filter((v): v is RuntimeRowCandidate => Boolean(v) && typeof v === "object");
 }
 
-function parseNdjson(text: string): Record<string, unknown>[] {
-  const out: Record<string, unknown>[] = [];
+function parseNdjson(text: string): RuntimeRowCandidate[] {
+  const out: RuntimeRowCandidate[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const value: unknown = JSON.parse(trimmed);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("runtime NDJSON row is not an object");
-    out.push(value as Record<string, unknown>);
+    out.push(value as RuntimeRowCandidate);
   }
   return out;
 }
@@ -123,12 +172,12 @@ function parseNdjson(text: string): Record<string, unknown>[] {
 export function parseAppleInspectMounts(value: unknown): ReturnType<RunnerBackend["parseInspectMounts"]> {
   return rows(value).flatMap((row) => {
     const config = row.configuration ?? row.Configuration;
-    const c = config && typeof config === "object" ? config as Record<string, unknown> : {};
+    const c = config && typeof config === "object" ? config as RuntimeConfigCandidate : {};
     const raw = c.mounts ?? c.Mounts ?? row.mounts ?? row.Mounts;
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((candidate) => {
       if (!candidate || typeof candidate !== "object") return [];
-      const m = candidate as Record<string, unknown>;
+      const m = candidate as RuntimeMountCandidate;
       const source = m.source ?? m.Source;
       const target = m.destination ?? m.Destination ?? m.target ?? m.Target;
       if (typeof source !== "string" || typeof target !== "string") return [];
@@ -144,26 +193,26 @@ export function parseDockerInspectMounts(value: unknown): ReturnType<RunnerBacke
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((candidate) => {
       if (!candidate || typeof candidate !== "object") return [];
-      const m = candidate as Record<string, unknown>;
+      const m = candidate as RuntimeMountCandidate;
       if (typeof m.Source !== "string" || typeof m.Destination !== "string") return [];
       return [{ source: m.Source, target: m.Destination, type: typeof m.Type === "string" ? m.Type : undefined, readonly: m.RW === false }];
     });
   });
 }
 
-function labelMap(value: unknown, apple: boolean): Record<string, unknown> | undefined {
+function labelMap(value: unknown, apple: boolean): RuntimeLabelCandidate | undefined {
   const row = rows(value)[0];
   if (!row) return undefined;
   if (apple) {
     const config = row.configuration ?? row.Configuration;
-    const c = config && typeof config === "object" ? config as Record<string, unknown> : row;
+    const c = config && typeof config === "object" ? config as RuntimeConfigCandidate : row;
     const labels = c.labels ?? c.Labels ?? row.labels ?? row.Labels;
-    return labels && typeof labels === "object" && !Array.isArray(labels) ? labels as Record<string, unknown> : undefined;
+    return labels && typeof labels === "object" && !Array.isArray(labels) ? labels as RuntimeLabelCandidate : undefined;
   }
   const config = row.Config;
   if (!config || typeof config !== "object") return undefined;
-  const labels = (config as Record<string, unknown>).Labels;
-  return labels && typeof labels === "object" && !Array.isArray(labels) ? labels as Record<string, unknown> : undefined;
+  const labels = (config as RuntimeConfigCandidate).Labels;
+  return labels && typeof labels === "object" && !Array.isArray(labels) ? labels as RuntimeLabelCandidate : undefined;
 }
 
 export function parseAppleSpecLabel(value: unknown): string | undefined {
@@ -506,7 +555,7 @@ export async function ensureImagePresent(spec: BuildSpec): Promise<boolean> {
 }
 export async function imageDelete(tag: string): Promise<boolean> { return (await run([...backend().verbs.imageDelete, tag], { allowFail: true })).exitCode === 0; }
 
-function exactDockerRows(text: string, field: string, name: string): boolean { return parseNdjson(text).some((row) => row[field] === name); }
+function exactDockerRows(text: string, field: "Name" | "Names", name: string): boolean { return parseNdjson(text).some((row) => row[field] === name); }
 export async function networkExists(name: string): Promise<boolean> {
   return backend().networkExists(name);
 }

@@ -169,8 +169,8 @@ const spies: { restore: () => void }[] = [];
 /** Replace one `fs` entry point for the length of a test. */
 function inject<K extends keyof typeof fs>(key: K, replacement: (typeof fs)[K]): void {
   const original = fs[key];
-  (fs as Record<string, unknown>)[key as string] = replacement;
-  spies.push({ restore: () => { (fs as Record<string, unknown>)[key as string] = original; } });
+  Object.defineProperty(fs, key, { configurable: true, writable: true, value: replacement });
+  spies.push({ restore: () => { Object.defineProperty(fs, key, { configurable: true, writable: true, value: original }); } });
 }
 afterEach(() => {
   while (spies.length > 0) spies.pop()!.restore();

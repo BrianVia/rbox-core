@@ -30,13 +30,21 @@ import type { StatusMode, WorkspaceStatusProjection } from "./status-contract.js
 type HaltProjection = Extract<WorkspaceStatusProjection<StatusMode>, { kind: "reset-halt" }>;
 type DetailProjection<M extends StatusMode> = Extract<WorkspaceStatusProjection<M>, { kind: "detail" }>;
 
+type ResetHaltJsonPayload = {
+  workspace: { id: string; name: string | null; root: string };
+  halted: true;
+  reason: HaltProjection["reason"];
+  daemon: { running: boolean; pid: number | null };
+  credential: ReturnType<typeof credentialStatusJson>;
+};
+
 /** The one thing a status surface produces. The composition root owns emission
  * so no renderer can reorder or interleave what reaches stdout. */
 export type StatusSurfaceRender =
-  | { surface: "json"; payload: Record<string, unknown>; daemonRunning: boolean }
+  | { surface: "json"; payload: ReturnType<typeof renderStatusJson> | ResetHaltJsonPayload; daemonRunning: boolean }
   | { surface: "lines"; lines: string[]; daemonRunning: boolean };
 
-function credentialStatusJson(loaded: CredentialLoadResult): Record<string, unknown> {
+function credentialStatusJson(loaded: CredentialLoadResult) {
   if (loaded.state === "valid" || loaded.state === "absent") return { state: loaded.state };
   if (loaded.state === "invalid-environment") return { state: "credential-degraded", reason: loaded.state, variable: loaded.variable };
   return { state: "credential-degraded", reason: loaded.state, path: loaded.path };
@@ -114,7 +122,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
   return { surface: "lines", lines, daemonRunning };
 }
 
-export function renderStatusJson(projection: DetailProjection<"json">): Record<string, unknown> {
+export function renderStatusJson(projection: DetailProjection<"json">) {
   const { workspace, daemon, counts, git, locking, activity } = projection;
   const now = projection.now;
   return {

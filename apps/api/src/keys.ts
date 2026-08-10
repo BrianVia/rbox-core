@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { exactObject, json, utf8Bytes } from "./util.js";
+import { exactObject, json, objectWithKeys, utf8Bytes } from "./util.js";
 import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";
 import {
@@ -46,49 +46,75 @@ function nat(v: unknown): number | null {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER ? v : null;
 }
 
-export function validateKeyBootstrapBody(value: unknown): Record<string, unknown> | null {
-  if (!exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"])
-    && !exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device", "repairId"])) return null;
-  if (Object.hasOwn(value, "repairId") && (typeof value.repairId !== "string" || !REPAIR_ID_RE.test(value.repairId))) return null;
-  if (!str(value.recoveryWrap) || !str(value.recoveryWrapId) || !str(value.genesisRoster) || !str(value.genesisKeyState)) return null;
+export interface KeyDeviceBody {
+  deviceId: string;
+  sigPubKey: string;
+  encPubKey: string;
+  mkWrap: string;
+}
+
+export interface KeyBootstrapBody {
+  recoveryWrap: string;
+  recoveryWrapId: string;
+  genesisRoster: string;
+  genesisKeyState: string;
+  device: KeyDeviceBody;
+  repairId?: string;
+}
+
+export interface KeyRosterBody { version: number; signed: string }
+export interface KeyAdmitBody { device: KeyDeviceBody; roster: KeyRosterBody }
+export interface KeyStateBody { accountEpoch: number; signed: string }
+export interface WorkspaceKeyBody { workspaceId: string; keyEpoch: number; kekWrap: string }
+
+export function validateKeyBootstrapBody(value: unknown): KeyBootstrapBody | null {
+  if (!objectWithKeys(value,
+    ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device", "repairId"],
+    ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"],
+  )) return null;
+  const repairId = Object.hasOwn(value, "repairId") && typeof value.repairId === "string" && REPAIR_ID_RE.test(value.repairId) ? value.repairId : undefined;
+  if (Object.hasOwn(value, "repairId") && repairId === undefined) return null;
+  const recoveryWrap = str(value.recoveryWrap), recoveryWrapId = str(value.recoveryWrapId);
+  const genesisRoster = str(value.genesisRoster), genesisKeyState = str(value.genesisKeyState);
+  if (!recoveryWrap || !recoveryWrapId || !genesisRoster || !genesisKeyState) return null;
   if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
-  return str(value.device.deviceId) && str(value.device.sigPubKey) && str(value.device.encPubKey) && str(value.device.mkWrap) ? value : null;
+  const deviceId = str(value.device.deviceId), sigPubKey = str(value.device.sigPubKey);
+  const encPubKey = str(value.device.encPubKey), mkWrap = str(value.device.mkWrap);
+  return deviceId && sigPubKey && encPubKey && mkWrap
+    ? { recoveryWrap, recoveryWrapId, genesisRoster, genesisKeyState, device: { deviceId, sigPubKey, encPubKey, mkWrap }, ...(repairId ? { repairId } : {}) }
+    : null;
 }
 
-export function validateKeyDeviceBody(value: unknown): Record<string, unknown> | null {
+export function validateKeyDeviceBody(value: unknown): KeyDeviceBody | null {
   if (!exactObject(value, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
-  return str(value.deviceId) && str(value.sigPubKey) && str(value.encPubKey) && str(value.mkWrap) ? value : null;
+  const deviceId = str(value.deviceId), sigPubKey = str(value.sigPubKey), encPubKey = str(value.encPubKey), mkWrap = str(value.mkWrap);
+  return deviceId && sigPubKey && encPubKey && mkWrap ? { deviceId, sigPubKey, encPubKey, mkWrap } : null;
 }
 
-export function validateKeyRosterBody(value: unknown): Record<string, unknown> | null {
-  return exactObject(value, ["version", "signed"]) && nat(value.version) !== null && !!str(value.signed) ? value : null;
+export function validateKeyRosterBody(value: unknown): KeyRosterBody | null {
+  if (!exactObject(value, ["version", "signed"])) return null;
+  const version = nat(value.version), signed = str(value.signed);
+  return version !== null && signed ? { version, signed } : null;
 }
 
-export function validateKeyAdmitBody(value: unknown): Record<string, unknown> | null {
+export function validateKeyAdmitBody(value: unknown): KeyAdmitBody | null {
   if (!exactObject(value, ["device", "roster"])) return null;
   if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
   if (!exactObject(value.roster, ["version", "signed"])) return null;
-  return str(value.device.deviceId)
-    && str(value.device.sigPubKey)
-    && str(value.device.encPubKey)
-    && str(value.device.mkWrap)
-    && nat(value.roster.version) !== null
-    && str(value.roster.signed)
-    ? value
-    : null;
+  const device = validateKeyDeviceBody(value.device), roster = validateKeyRosterBody(value.roster);
+  return device && roster ? { device, roster } : null;
 }
 
-export function validateKeyStateBody(value: unknown): Record<string, unknown> | null {
-  return exactObject(value, ["accountEpoch", "signed"]) && nat(value.accountEpoch) !== null && !!str(value.signed) ? value : null;
+export function validateKeyStateBody(value: unknown): KeyStateBody | null {
+  if (!exactObject(value, ["accountEpoch", "signed"])) return null;
+  const accountEpoch = nat(value.accountEpoch), signed = str(value.signed);
+  return accountEpoch !== null && signed ? { accountEpoch, signed } : null;
 }
 
-export function validateWorkspaceKeyBody(value: unknown): Record<string, unknown> | null {
-  return exactObject(value, ["workspaceId", "keyEpoch", "kekWrap"])
-    && !!str(value.workspaceId)
-    && nat(value.keyEpoch) !== null
-    && !!str(value.kekWrap)
-    ? value
-    : null;
+export function validateWorkspaceKeyBody(value: unknown): WorkspaceKeyBody | null {
+  if (!exactObject(value, ["workspaceId", "keyEpoch", "kekWrap"])) return null;
+  const workspaceId = str(value.workspaceId), keyEpoch = nat(value.keyEpoch), kekWrap = str(value.kekWrap);
+  return workspaceId && keyEpoch !== null && kekWrap ? { workspaceId, keyEpoch, kekWrap } : null;
 }
 
 /** Does this workspace belong to the caller's account? (account-scoped authz.) */
@@ -106,13 +132,13 @@ async function ownsWorkspace(env: Env, accountId: string, workspaceId: string): 
  * 0), and the bootstrapping device's keys. The device MUST be the caller's own
  * device (anti-spoof). 409 if already bootstrapped (idempotency, not overwrite).
  */
-export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown, genesisCapability?: string | null, auditRetry = 0): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
+export async function bootstrapAccountKeys(env: Env, p: Principal, body: KeyBootstrapBody, genesisCapability?: string | null, auditRetry = 0): Promise<Response> {
+  const b = body;
   const recoveryWrap = str(b.recoveryWrap);
   const recoveryWrapId = str(b.recoveryWrapId);
   const genesisRoster = str(b.genesisRoster);
   const genesisKeyState = str(b.genesisKeyState);
-  const device = (b.device ?? {}) as Record<string, unknown>;
+  const device = b.device;
   const deviceId = str(device.deviceId);
   const sigPubKey = str(device.sigPubKey);
   const encPubKey = str(device.encPubKey);
@@ -250,7 +276,7 @@ export async function getAccountKeys(env: Env, p: Principal): Promise<Response> 
     db.prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId),
     db.prepare("SELECT device_id, sig_pubkey, enc_pubkey, mk_wrap FROM device_keys WHERE account_id = ? ORDER BY created_at").bind(p.accountId),
   ]);
-  const observed = genesisObservationFromRow((batch[0]?.results?.[0] ?? undefined) as Record<string,unknown>|undefined);
+  const observed = genesisObservationFromRow(batch[0]?.results?.[0]);
   const present = presenceOf(observed);
   if (observed.claimPresent === 0) return json({ error: "not_found", genesisPresenceVersion: 1, present }, 404);
   const rosters=(batch[1]?.results??[]) as Array<{signed:string}>,keyStates=(batch[2]?.results??[]) as Array<{signed:string}>,devices=(batch[3]?.results??[]) as Array<{device_id:string;sig_pubkey:string|null;enc_pubkey:string|null;mk_wrap:string|null}>;
@@ -274,8 +300,8 @@ export async function getAccountKeys(env: Env, p: Principal): Promise<Response> 
  * Account-scoped: the row is bound to the caller's account. INSERT OR IGNORE so a
  * repeated publish is a no-op (the keys are immutable once recorded).
  */
-export async function putDeviceKeys(env: Env, p: Principal, body: unknown): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
+export async function putDeviceKeys(env: Env, p: Principal, body: KeyDeviceBody): Promise<Response> {
+  const b = body;
   const deviceId = str(b.deviceId);
   const sigPubKey = str(b.sigPubKey);
   const encPubKey = str(b.encPubKey);
@@ -305,8 +331,8 @@ export async function putDeviceKeys(env: Env, p: Principal, body: unknown): Prom
  * atomic (D1 serializes writes), so two concurrent appends can't both win the
  * same version. changes===0 → 409 (someone else advanced; client refetches).
  */
-export async function appendRoster(env: Env, p: Principal, body: unknown): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
+export async function appendRoster(env: Env, p: Principal, body: KeyRosterBody): Promise<Response> {
+  const b = body;
   const version = nat(b.version);
   const signed = str(b.signed);
   if (version === null || !signed) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
@@ -328,8 +354,8 @@ export async function appendRoster(env: Env, p: Principal, body: unknown): Promi
  * POST /v1/keys/keystate — append the next signed account-key-state. Same
  * monotone-append discipline as rosters, keyed by accountEpoch.
  */
-export async function appendKeyState(env: Env, p: Principal, body: unknown): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
+export async function appendKeyState(env: Env, p: Principal, body: KeyStateBody): Promise<Response> {
+  const b = body;
   const accountEpoch = nat(b.accountEpoch);
   const signed = str(b.signed);
   if (accountEpoch === null || !signed) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
@@ -356,8 +382,8 @@ export async function appendKeyState(env: Env, p: Principal, body: unknown): Pro
  * devices that independently generated a KEK for the same epoch converge on one —
  * the loser adopts the returned wrap and discards its own. Never an UPDATE.
  */
-export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
+export async function putWorkspaceKey(env: Env, p: Principal, body: WorkspaceKeyBody): Promise<Response> {
+  const b = body;
   const workspaceId = str(b.workspaceId);
   const keyEpoch = nat(b.keyEpoch);
   const kekWrap = str(b.kekWrap);
@@ -398,10 +424,10 @@ export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Pr
  * BEFORE the roster append advances it; if the version isn't next, BOTH guards
  * match zero rows → the batch commits nothing (no orphan device row) and we 409.
  */
-export async function admitDevice(env: Env, p: Principal, body: unknown): Promise<Response> {
-  const b = (body ?? {}) as Record<string, unknown>;
-  const device = (b.device ?? {}) as Record<string, unknown>;
-  const roster = (b.roster ?? {}) as Record<string, unknown>;
+export async function admitDevice(env: Env, p: Principal, body: KeyAdmitBody): Promise<Response> {
+  const b = body;
+  const device = b.device;
+  const roster = b.roster;
   const deviceId = str(device.deviceId);
   const sigPubKey = str(device.sigPubKey);
   const encPubKey = str(device.encPubKey);

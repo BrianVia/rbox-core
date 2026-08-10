@@ -22,11 +22,26 @@ export function isSkipped<T>(v: Skippable<T>): v is { skipped: string } {
   return typeof v === "object" && v !== null && "skipped" in v;
 }
 
-type Raw = Record<string, unknown>;
+export interface RawObservation {
+  memoryUsageBytes?: unknown;
+  memory_usage_bytes?: unknown;
+  memoryUsage?: unknown;
+  cpuUsageUsec?: unknown;
+  cpu_usage_usec?: unknown;
+  cpuUsage?: unknown;
+  memBytes?: unknown;
+  cpu?: unknown;
+  ts?: unknown;
+  event?: unknown;
+  response?: unknown;
+  status?: unknown;
+  outcome?: unknown;
+  exceptions?: unknown;
+}
 export type CanonicalStatsSample = import("./container.js").StatsSample;
 
 /** First finite numeric value among the given keys (accepts numeric strings). */
-function num(o: Raw, ...keys: string[]): number | undefined {
+function num(o: RawObservation, ...keys: Array<keyof RawObservation>): number | undefined {
   for (const k of keys) {
     const v = o[k];
     if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -49,14 +64,14 @@ export interface StatSummary {
  * but re-baselines; a single-sample series yields zero CPU (no interval to measure).
  * PURE.
  */
-export function summarizeStats(samples: Array<(Raw & { ts?: unknown }) | CanonicalStatsSample>): StatSummary {
+export function summarizeStats(samples: Array<RawObservation | CanonicalStatsSample>): StatSummary {
   let peakMem = 0;
   let coreSeconds = 0;
   let peakPct = 0;
   let prevCpu: number | undefined;
   let prevWallUsec: number | undefined;
   for (const s of samples) {
-    const raw = s as Raw;
+    const raw = s as RawObservation;
     const mem = "memBytes" in s && typeof s.memBytes === "number" ? s.memBytes : num(raw, "memoryUsageBytes", "memory_usage_bytes", "memoryUsage");
     if (mem !== undefined) peakMem = Math.max(peakMem, mem);
     const canonicalCpu = "cpu" in s && s.cpu && typeof s.cpu === "object"
@@ -97,10 +112,10 @@ export interface TailSummary {
 }
 
 /** HTTP status of a wrangler-tail event, probing the known shapes defensively. */
-function tailStatus(ev: Raw): number | undefined {
-  const event = ev.event as Raw | undefined;
-  const response = (event?.response ?? ev.response) as Raw | undefined;
-  const s = num((response ?? {}) as Raw, "status") ?? num(ev, "status");
+function tailStatus(ev: RawObservation): number | undefined {
+  const event = ev.event as RawObservation | undefined;
+  const response = (event?.response ?? ev.response) as RawObservation | undefined;
+  const s = num(response ?? {}, "status") ?? num(ev, "status");
   return s;
 }
 
@@ -108,7 +123,7 @@ function tailStatus(ev: Raw): number | undefined {
  * Classify one tail event as an error: a non-"ok" outcome, a non-empty exceptions
  * array, or a logged 5xx response. PURE helper for {@link summarizeTail}.
  */
-function isTailError(ev: Raw): boolean {
+function isTailError(ev: RawObservation): boolean {
   const outcome = ev.outcome;
   if (typeof outcome === "string" && outcome !== "ok") return true;
   const exceptions = ev.exceptions;
@@ -125,8 +140,8 @@ function isTailError(ev: Raw): boolean {
  * would fail — this brace-depth scanner (string/escape aware) recovers the objects
  * either way. PURE.
  */
-export function splitJsonObjects(text: string): Raw[] {
-  const objs: Raw[] = [];
+export function splitJsonObjects(text: string): RawObservation[] {
+  const objs: RawObservation[] = [];
   let depth = 0;
   let start = -1;
   let inStr = false;
@@ -147,7 +162,7 @@ export function splitJsonObjects(text: string): Raw[] {
       if (depth > 0) depth--;
       if (depth === 0 && start >= 0) {
         try {
-          objs.push(JSON.parse(text.slice(start, i + 1)) as Raw);
+          objs.push(JSON.parse(text.slice(start, i + 1)) as RawObservation);
         } catch {
           /* not a complete/valid object — skip */
         }
@@ -412,12 +427,12 @@ export class RunCapture {
     if (this.statsSkipped) return { skipped: this.statsSkipped };
     const file = this.p(`stats-${label}.jsonl`);
     if (!fs.existsSync(file)) return { skipped: "no stats samples captured" };
-    const samples: Array<Raw & { ts?: unknown }> = [];
+    const samples: RawObservation[] = [];
     for (const line of fs.readFileSync(file, "utf8").split("\n")) {
       const t = line.trim();
       if (!t) continue;
       try {
-        samples.push(JSON.parse(t) as Raw);
+        samples.push(JSON.parse(t) as RawObservation);
       } catch {
         /* skip malformed */
       }

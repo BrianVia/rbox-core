@@ -77,16 +77,22 @@ export function parseLastWriterWitness(text: string): LastWriterWitness | undefi
     return undefined;
   }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-  const record = raw as Record<string, unknown>;
-  const keys = Object.keys(record).sort().join("\0");
+  const keys = Object.keys(raw).sort().join("\0");
   if (keys !== [...WITNESS_KEYS].sort().join("\0")) return undefined;
-  if (record.version !== 1) return undefined;
-  if (typeof record.writerVersion !== "string" || record.writerVersion.length > 40) return undefined;
-  if (typeof record.stateBodySha256 !== "string" || !/^[0-9a-f]{64}$/.test(record.stateBodySha256)) return undefined;
-  for (const key of ["writtenAtMs", "stateSizeBytes", "stateMtimeMs", "stateDev", "stateIno"] as const) {
-    if (!isSafeInt(record[key])) return undefined;
-  }
-  return record as unknown as LastWriterWitness;
+  const version: unknown = Reflect.get(raw, "version");
+  const writerVersion: unknown = Reflect.get(raw, "writerVersion");
+  const stateBodySha256: unknown = Reflect.get(raw, "stateBodySha256");
+  const writtenAtMs: unknown = Reflect.get(raw, "writtenAtMs");
+  const stateSizeBytes: unknown = Reflect.get(raw, "stateSizeBytes");
+  const stateMtimeMs: unknown = Reflect.get(raw, "stateMtimeMs");
+  const stateDev: unknown = Reflect.get(raw, "stateDev");
+  const stateIno: unknown = Reflect.get(raw, "stateIno");
+  if (version !== 1) return undefined;
+  if (typeof writerVersion !== "string" || writerVersion.length > 40) return undefined;
+  if (typeof stateBodySha256 !== "string" || !/^[0-9a-f]{64}$/.test(stateBodySha256)) return undefined;
+  if (!isSafeInt(writtenAtMs) || !isSafeInt(stateSizeBytes) || !isSafeInt(stateMtimeMs)
+    || !isSafeInt(stateDev) || !isSafeInt(stateIno)) return undefined;
+  return { version, writerVersion, writtenAtMs, stateBodySha256, stateSizeBytes, stateMtimeMs, stateDev, stateIno };
 }
 
 async function readLastWriterWitness(root: string): Promise<LastWriterWitness | undefined> {

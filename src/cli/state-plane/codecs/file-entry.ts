@@ -49,7 +49,7 @@ function nonnegativeInteger(value: unknown, field: string): asserts value is num
 }
 
 export function encodeFileEntry(input: FileEntry): EncodedFileEntry {
-  const value = input as FileEntry & Record<string, unknown>;
+  const value = input;
   assertPath(value.path);
   nonnegativeInteger(value.size, "size");
   if (!Number.isInteger(value.mode) || value.mode < 0 || value.mode > 0o7777) throw new TypeError("mode out of range");

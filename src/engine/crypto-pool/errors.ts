@@ -3,9 +3,12 @@ import type { SerializedError } from "../crypto-worker-protocol.js";
 export function rehydrateError(error: SerializedError): Error {
   const out = new Error(error.message);
   out.name = error.name || "Error";
-  for (const key of ["code", "errno", "syscall", "path", "dest"] as const) {
-    if (error[key] !== undefined) (out as unknown as Record<string, unknown>)[key] = error[key];
-  }
+  const nodeError = out as Error & Pick<SerializedError, "code" | "errno" | "syscall" | "path" | "dest">;
+  if (error.code !== undefined) nodeError.code = error.code;
+  if (error.errno !== undefined) nodeError.errno = error.errno;
+  if (error.syscall !== undefined) nodeError.syscall = error.syscall;
+  if (error.path !== undefined) nodeError.path = error.path;
+  if (error.dest !== undefined) nodeError.dest = error.dest;
   if (error.cause) (out as unknown as { cause?: Error }).cause = rehydrateError(error.cause);
   if (error.stack) {
     out.stack = out.stack ? `${out.stack}\n--- worker stack ---\n${error.stack}` : error.stack;

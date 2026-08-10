@@ -138,13 +138,13 @@ async function saveStatusWorkspace(overrides: Partial<WorkspaceConfig> = {}): Pr
   return cfg;
 }
 
-async function writeActivity(body: Record<string, unknown>): Promise<void> {
+async function writeActivity(body: DaemonActivity): Promise<void> {
   const p = path.join(tmp, ".rbox", "state", "activity.json");
   await fs.mkdir(path.dirname(p), { recursive: true });
   await fs.writeFile(p, JSON.stringify(body));
 }
 
-function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<DaemonActivity["local"]>> = {}): Record<string, unknown> {
+function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<DaemonActivity["local"]>> = {}): DaemonActivity {
   const at = new Date(STATUS_NOW - ageMs).toISOString();
   return {
     at,
@@ -317,7 +317,7 @@ test("status --json trusts attributed fresh local and skips hashcache and manife
 });
 
 test("status local trust predicate falls back on stale boot, base mismatch, stale age, and malformed local", async () => {
-  const exerciseFallback = async (activity: Record<string, unknown>, depsOverrides: Partial<StatusCmdDeps> = {}) => {
+  const exerciseFallback = async (activity: DaemonActivity, depsOverrides: Partial<StatusCmdDeps> = {}) => {
     await fs.rm(tmp, { recursive: true, force: true });
     await fs.mkdir(tmp, { recursive: true });
     await saveStatusWorkspace();

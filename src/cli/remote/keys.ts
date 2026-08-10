@@ -1,6 +1,7 @@
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "../e2ee-remote.js";
 import { AccountAlreadyBootstrappedError, errorCode, GenesisBootstrapTerminalError, LegacyGenesisServiceError, translateRemoteError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
+import type { JsonObject } from "../../json.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
 
@@ -27,9 +28,9 @@ export async function getAccountKeys(ctx: RemoteContext, signal?: AbortSignal): 
 }
 
 const keys=(value:object,expected:string[])=>{const actual=Object.keys(value);return actual.length===expected.length&&actual.every((k)=>expected.includes(k));};
-const plain=(value:unknown):value is Record<string,unknown>=>typeof value==="object"&&value!==null&&!Array.isArray(value);
+const plain=(value:unknown):value is JsonObject=>typeof value==="object"&&value!==null&&!Array.isArray(value);
 function parsePresence(value:unknown):GenesisPresence{if(!plain(value)||!keys(value,["rosters","keyStates","devices","workspaces","workspaceKeys","e2eePairingTokens"]))throw new Error("invalid genesis presence");for(const n of Object.values(value))if(typeof n!=="number"||!Number.isSafeInteger(n)||n<0)throw new Error("invalid genesis presence count");return value as unknown as GenesisPresence;}
-function legacyGenesisResponse(status:number,body:Record<string,unknown>):boolean{
+function legacyGenesisResponse(status:number,body:JsonObject):boolean{
   if(status===404)return keys(body,["error"])&&body.error==="not_found";
   if(status<200||status>=300||!keys(body,["recoveryWrap","recoveryWrapId","rosters","keyStates","devices"]))return false;
   return(body.recoveryWrap===null||typeof body.recoveryWrap==="string")&&(body.recoveryWrapId===null||typeof body.recoveryWrapId==="string")

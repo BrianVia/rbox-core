@@ -9,6 +9,11 @@ bun run test:storage-truth # Phase-0 storage-truth runner tests
 bun run test:all           # src + storage-truth runner + Worker API suites
 ```
 
+`bun install` also activates the repository's pre-commit hook. The hook runs
+`bun run lint` and blocks the commit if lint errors remain. `bun run lint:fix`
+can repair rules with safe mechanical fixes, but restricted types must be
+replaced with the correct domain type by the code that owns that boundary.
+
 The control plane deploys with `wrangler deploy` from `apps/api/`. Secrets (`RBOX_BOOTSTRAP_SECRET`, `RBOX_PLATFORM_SECRET`, and later `STRIPE_*`) are Wrangler secrets — never committed.
 
 ## Storage-truth measurement

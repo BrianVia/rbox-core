@@ -43,7 +43,7 @@ function exactObject(
   value: unknown,
   field: string,
   keys: readonly string[],
-): asserts value is Record<string, unknown> {
+): asserts value is object {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${field} must be an object`);
   }
@@ -54,13 +54,13 @@ function exactObject(
   }
 }
 
-function textMembers(value: Record<string, unknown>, field: string, keys: readonly string[]): void {
+function textMembers(value: object, field: string, keys: readonly string[]): void {
   for (const key of keys) {
-    if (typeof value[key] !== "string") throw new TypeError(`${field}.${key} must be text`);
+    if (typeof Reflect.get(value, key) !== "string") throw new TypeError(`${field}.${key} must be text`);
   }
 }
 
-function validateFixedShapes(value: Record<string, unknown>): void {
+function validateFixedShapes(value: RepoRecord): void {
   if (value.packedRefsIdentity !== undefined) {
     exactObject(value.packedRefsIdentity, "packedRefsIdentity", ["mtimeMs"]);
     if (typeof value.packedRefsIdentity.mtimeMs !== "number" || !Number.isFinite(value.packedRefsIdentity.mtimeMs)) {
@@ -104,9 +104,8 @@ export function encodeRepoRecord(relPath: string, input: RepoRecord): EncodedRep
   if (relPath !== "." && !isSafeRelPath(relPath)) {
     throw new TypeError("repository path must be POSIX-relative");
   }
-  const source = input as RepoRecord & Record<string, unknown>;
   // The one named historical member is stripped, never retained as an extra.
-  const { resolutionIntent: _obsolete, ...value } = source as RepoRecord & Record<string, unknown> & { resolutionIntent?: unknown };
+  const { resolutionIntent: _obsolete, ...value } = input as RepoRecord & { resolutionIntent?: unknown };
   counter(value.repoGen, "repoGen");
   counter(value.sourceSeq, "sourceSeq");
   for (const field of REPO_RECORD_KEYS) {
@@ -174,19 +173,19 @@ export interface RepoRecordRow {
 }
 
 export function decodeRepoRecord(row: RepoRecordRow): RepoRecord {
-  const record: Record<string, unknown> = {
+  const record = {
     ...spreadExtras(row.extras_cjson),
     repoGen: row.repo_gen,
     sourceSeq: row.source_seq,
   };
   for (const field of JSON_FIELDS) {
-    const text = row[REPO_RECORD_COLUMN_BY_FIELD[field] as keyof RepoRecordRow] as string | null;
-    if (text !== null) record[field] = parseCanonicalJson(text);
+    const text = row[REPO_RECORD_COLUMN_BY_FIELD[field]];
+    if (text !== null) Object.assign(record, { [field]: parseCanonicalJson(text) });
   }
-  if (row.repo_absent !== null) record.repoAbsent = true;
+  if (row.repo_absent !== null) Object.assign(record, { repoAbsent: true as const });
   for (const field of ["removedKey", "resolutionKey", "cfgSynced", "cfgApplied", "idxProj"] as const) {
-    const member = row[REPO_RECORD_COLUMN_BY_FIELD[field] as keyof RepoRecordRow] as string | null;
-    if (member !== null) record[field] = member;
+    const member = row[REPO_RECORD_COLUMN_BY_FIELD[field]];
+    if (member !== null) Object.assign(record, { [field]: member });
   }
   const decoded = record as unknown as RepoRecord;
   const encoded = encodeRepoRecord(row.rel_path, decoded);

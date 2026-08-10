@@ -47,7 +47,7 @@ export function dirListingReusable(liveMtimeMs: number, liveCtimeMs: number, cac
 
 function validRuleFile(value: unknown): value is RuleFileRecord {
   if (!value || typeof value !== "object" || typeof (value as { relPath?: unknown }).relPath !== "string" || !validRel((value as { relPath: string }).relPath)) return false;
-  const record = value as Record<string, unknown>;
+  const record = value as Partial<{ relPath: string; absent: true; size: number; mtimeMs: number; ctimeMs: number }>;
   return record.absent === true
     ? Object.keys(record).every((key) => key === "relPath" || key === "absent")
     : validNumber(record.size) && validNumber(record.mtimeMs) && validNumber(record.ctimeMs);
@@ -55,10 +55,10 @@ function validRuleFile(value: unknown): value is RuleFileRecord {
 
 function validEntry(value: unknown): value is DirCacheEntry {
   if (!value || typeof value !== "object") return false;
-  const entry = value as Record<string, unknown>;
+  const entry = value as Partial<DirCacheEntry>;
   return validNumber(entry.mtimeMs) && validNumber(entry.ctimeMs) && Array.isArray(entry.children) && entry.children.every((child) => {
     if (!child || typeof child !== "object") return false;
-    const c = child as Record<string, unknown>;
+    const c = child as Partial<DirCacheChild>;
     return typeof c.name === "string" && c.name !== "" && c.name !== "." && c.name !== ".." && !c.name.includes("/") && (c.type === "file" || c.type === "dir" || c.type === "symlink" || c.type === "other");
   });
 }

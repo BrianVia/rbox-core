@@ -15,8 +15,10 @@ export interface CipherDescriptor {
   payloadSha?: string;
 }
 
+type MutableFileEntry = { -readonly [K in keyof FileEntry]: FileEntry[K] };
+
 export function withCipherDescriptor(file: Readonly<FileEntry>, descriptor: CipherDescriptor): Readonly<FileEntry> {
-  const next: Record<string, unknown> = { ...file };
+  const next: MutableFileEntry = { ...file };
   next.encSha = descriptor.encSha;
   if (descriptor.comp) {
     next.comp = descriptor.comp;
@@ -27,5 +29,5 @@ export function withCipherDescriptor(file: Readonly<FileEntry>, descriptor: Ciph
     delete next.payloadSha;
     delete next.cipherSize;
   }
-  return next as Readonly<FileEntry>;
+  return next;
 }

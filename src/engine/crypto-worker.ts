@@ -22,11 +22,21 @@ const TEST_DELAY_MS = (() => {
   return Number.isSafeInteger(n) && n > 0 ? n : 0;
 })();
 
-function copyErrorField(out: SerializedError, key: keyof SerializedError, err: unknown): void {
-  if (err && typeof err === "object" && key in err) {
-    const value = (err as Record<string, unknown>)[key];
-    if (value !== undefined) (out as Record<string, unknown>)[key] = value;
-  }
+interface ErrorWithSystemFields extends Error {
+  code?: unknown;
+  errno?: unknown;
+  syscall?: unknown;
+  path?: unknown;
+  dest?: unknown;
+}
+
+function copyNodeErrorFields(out: SerializedError, err: Error): void {
+  const nodeError = err as ErrorWithSystemFields;
+  if (nodeError.code !== undefined) out.code = nodeError.code;
+  if (nodeError.errno !== undefined) out.errno = nodeError.errno;
+  if (nodeError.syscall !== undefined) out.syscall = nodeError.syscall;
+  if (nodeError.path !== undefined) out.path = nodeError.path;
+  if (nodeError.dest !== undefined) out.dest = nodeError.dest;
 }
 
 function serializeError(err: unknown, depth = 0): SerializedError {
@@ -36,11 +46,7 @@ function serializeError(err: unknown, depth = 0): SerializedError {
     out.name = err.name;
     if (err.stack) out.stack = err.stack;
   }
-  copyErrorField(out, "code", err);
-  copyErrorField(out, "errno", err);
-  copyErrorField(out, "syscall", err);
-  copyErrorField(out, "path", err);
-  copyErrorField(out, "dest", err);
+  if (err instanceof Error) copyNodeErrorFields(out, err);
   if (depth < 2 && err && typeof err === "object" && "cause" in err) {
     const cause = (err as { cause?: unknown }).cause;
     if (cause !== undefined) out.cause = serializeError(cause, depth + 1);

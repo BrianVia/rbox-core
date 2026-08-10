@@ -31,9 +31,17 @@ export interface FlowDefinition {
 const STEP_KEYS = ["exec", "guest", "tui", "keys", "typeVar", "waitFor", "assertScreen", "pollUntil", "captureVar"] as const;
 const ASSERTION_KEYS = new Set(["on", "assertStdout", "assertNotStdout", "assertStderr", "expectExit"]);
 
-function objectAt(value: unknown, at: string): Record<string, unknown> {
+interface FlowConfigObject {
+  name?: unknown; status?: unknown; machines?: unknown; steps?: unknown;
+  on?: unknown; exec?: unknown; guest?: unknown; tui?: unknown; keys?: unknown; typeVar?: unknown;
+  waitFor?: unknown; timeout?: unknown; assertScreen?: unknown; assertNotScreen?: unknown;
+  pollUntil?: unknown; captureVar?: unknown; assertStdout?: unknown; assertNotStdout?: unknown;
+  assertStderr?: unknown; expectExit?: unknown; enrolled?: unknown; pattern?: unknown;
+}
+
+function objectAt(value: unknown, at: string): FlowConfigObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${at} must be an object`);
-  return value as Record<string, unknown>;
+  return value as FlowConfigObject;
 }
 
 function stringAt(value: unknown, at: string): string {
@@ -71,7 +79,7 @@ function timeoutAt(value: unknown, at: string): number | undefined {
   return Number(value);
 }
 
-function rejectUnknownKeys(step: Record<string, unknown>, allowed: Set<string>, at: string): void {
+function rejectUnknownKeys(step: FlowConfigObject, allowed: Set<string>, at: string): void {
   const unknown = Object.keys(step).filter((key) => !allowed.has(key));
   if (unknown.length) throw new Error(`${at} has unknown field ${JSON.stringify(unknown[0])}`);
 }

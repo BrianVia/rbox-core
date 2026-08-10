@@ -20,6 +20,8 @@ import { createRecorder, errMsg, type Recorder } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import type { SyncState } from "../../../src/cli/sync-state-model.js";
+import type { GitDeferralLaneJson } from "../../../src/cli/sync-git/git-deferral-json.js";
 
 const UPLOAD = { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY };
 const DOWNLOAD = { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY };
@@ -53,8 +55,17 @@ interface RepoRecordView {
 interface SyncStateView {
   lastSyncedSequence?: number;
   repoRecords?: Record<string, RepoRecordView>;
-  gitPendingRemote?: Record<string, unknown>;
-  gitNeedsResolution?: Record<string, unknown>;
+  gitPendingRemote?: SyncState["gitPendingRemote"];
+  gitNeedsResolution?: SyncState["gitNeedsResolution"];
+}
+
+interface DeferredRepoStatus {
+  repo: string;
+  oldestDeferredSince: string;
+  displayReason: string;
+  ageSeconds: number | null;
+  bytesChanged: boolean;
+  checkout?: { kind: "branch"; label?: string } | { kind: "detached" };
 }
 
 interface StatusView {
@@ -62,8 +73,8 @@ interface StatusView {
   halted?: boolean;
   recovering?: boolean;
   git?: {
-    deferrals?: Array<Record<string, unknown>>;
-    deferredRepos?: Array<Record<string, unknown>>;
+    deferrals?: GitDeferralLaneJson[];
+    deferredRepos?: DeferredRepoStatus[];
   };
 }
 

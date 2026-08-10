@@ -11,7 +11,7 @@ export function fakeDoSql(initial?: { dropped?: FakeDroppedRow[]; seqRoots?: Fak
     __seqRoots: seqRoots,
     exec(query: string, ...bindings: unknown[]) {
       const sql = query.replace(/\s+/g, " ").trim().toLowerCase();
-      let rows: Array<Record<string, unknown>> = [];
+      let rows: Array<FakeDroppedRow | FakeSeqRootRow> = [];
       if (sql.startsWith("create table") || sql.startsWith("create index")) {
         // Schema creation is intentionally idempotent.
       } else if (sql.startsWith("insert into dropped_index")) {

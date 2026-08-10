@@ -17,6 +17,7 @@ import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import type { StateSemanticDigest } from "../ports.js";
 import { canonicalJson, domainHash, parseCanonicalJson } from "./codecs.js";
 import type { NormalizedLegacyState } from "./legacy-state-plan.js";
+import type { LegacyLineageRow, LegacyPlaneHeadRow } from "./legacy-state-plan.js";
 
 function tokens(hash: ReturnType<typeof domainHash>, tag: string, value: unknown): void {
   hash.token(tag);
@@ -79,12 +80,12 @@ function projectSemanticDigest(db: Database, statements: DigestStatements): Stat
   if (!completion) throw new Error("state semantic digest requires migration_completion singleton");
   tokens(hash, "source-shape-flags", parseCanonicalJson(completion.source_shape_flags_cjson));
   tokens(hash, "source-repo-records-present", completion.source_repo_records_present === 1);
-  const lineage = statements.one<Record<string, unknown>>(db, `SELECT l.* FROM state_lineage l JOIN store_meta m
+  const lineage = statements.one<LegacyLineageRow>(db, `SELECT l.* FROM state_lineage l JOIN store_meta m
     ON m.active_lineage_id=l.lineage_id WHERE m.singleton=1`)!;
   tokens(hash, "lineage", lineage);
   const lineageId = lineage.lineage_id as string;
   for (const plane of ["base", "local"] as const) {
-    const head = statements.one(db, "SELECT * FROM plane_heads WHERE lineage_id=? AND plane=?", lineageId, plane);
+    const head = statements.one<LegacyPlaneHeadRow>(db, "SELECT * FROM plane_heads WHERE lineage_id=? AND plane=?", lineageId, plane);
     tokens(hash, `${plane}-head`, head);
     statements.each<FileEntryRow>(db, `SELECT e.* FROM plane_entries p
       JOIN entry_values e ON e.entry_id=p.entry_id

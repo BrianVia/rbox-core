@@ -12,6 +12,10 @@ import { requireCreds } from "./session.js";
 import { createPairAuth } from "../remote/auth-command-wire.js";
 import { pairingRedemptionSuccessMessages, type AuthPresentationContext } from "./presentation.js";
 
+interface PairCreateResponse {
+  token?: unknown;
+}
+
 export async function pairCreate(): Promise<void> {
   const creds = await requireCreds();
   if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap <secret>`, `rbox connect` (paste a pairing token from an enrolled machine), or `rbox key recover` first.");
@@ -35,7 +39,7 @@ export async function pairCreate(): Promise<void> {
   if (!res.ok) throw await friendlyHttpError(res, "pair");
   const body = await res.json() as unknown;
   const token = typeof body === "object" && body !== null && !Array.isArray(body)
-    ? (body as Record<string, unknown>).token
+    ? (body as PairCreateResponse).token
     : undefined;
   const command = pairingConnectCommand(token, tokenId, tokenSecret);
   await presentPairingConnectCommand(command);

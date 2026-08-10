@@ -210,9 +210,9 @@ test("REGRESSION (r2 finding 1): the worker apply result carries no token", asyn
     const request = workerRequest(owner, "a.txt");
     const registration = await registerWorker(owner);
     await registration.markRunning();
-    let seen: Record<string, unknown> | undefined;
+    let seen: { disposition: string; entry: Readonly<FileEntry> } | undefined;
     await registration.returnResult((context) => {
-      seen = context.replace(request.path, request.expected, withCipherDescriptor(request.entry, { encSha: "enc-a" })) as unknown as Record<string, unknown>;
+      seen = context.replace(request.path, request.expected, withCipherDescriptor(request.entry, { encSha: "enc-a" }));
     });
     expect(Object.keys(seen!).sort()).toEqual(["disposition", "entry"]);
     expect("token" in seen!).toBe(false);

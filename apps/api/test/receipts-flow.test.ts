@@ -16,7 +16,7 @@ import {
   VALIDATE_IN_LIST_CHUNK,
 } from "../src/commit-accounting.js";
 import { IN_LIST_CHUNK, STMTS_PER_BATCH } from "../src/d1-batch.js";
-import { MAX_MISSING_SHAS_RESPONSE, orderChainFirst, unsatisfiedBlobsBody } from "../src/commit-envelope.js";
+import { MAX_MISSING_SHAS_RESPONSE, orderChainFirst, unsatisfiedBlobsBody, type CommitBodyView } from "../src/commit-envelope.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { blobKey } from "../src/util.js";
 import { multipartComplete } from "../src/blobs.js";
@@ -70,7 +70,7 @@ const fakeState = () =>
     } as unknown as DurableObjectState;
   };
 
-async function redeem(accountId: string, receipts: Record<string, unknown>, handlerEnv: Env = env): Promise<Response> {
+async function redeem(accountId: string, receipts: Record<string, string>, handlerEnv: Env = env): Promise<Response> {
   const sync = new WorkspaceSync(fakeState(), handlerEnv);
   return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
@@ -604,7 +604,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
       count: refs.length,
       manifestChain: [chainSha],
     });
-    const parsed = JSON.parse(commit.body) as Record<string, unknown>;
+    const parsed = JSON.parse(commit.body) as CommitBodyView;
     parsed.encManifestSha = manifestSha;
     parsed.blobRefset = {
       sidecarSha: sidecar.sha,
@@ -637,7 +637,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     await db().prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES (?,?,?)").bind(a.accountId, chain.sha, Date.now()).run();
 
     const commit = signedSidecarCommit({ accountId: a.accountId, workspaceId: "ws", deviceId: a.deviceId, count: 0, manifestChain: [chain.sha] });
-    const parsed = JSON.parse(commit.body) as Record<string, unknown>;
+    const parsed = JSON.parse(commit.body) as CommitBodyView;
     delete parsed.blobRefset;
     parsed.blobRefs = [];
     commit.body = JSON.stringify(parsed);

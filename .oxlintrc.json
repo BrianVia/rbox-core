@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "off"
+  },
+  "plugins": ["typescript"],
+  "rules": {
+    "typescript/no-restricted-types": [
+      "error",
+      {
+        "types": {
+          "Record<string, unknown>": {
+            "message": "Define the actual object shape, accept unknown at an unvalidated boundary, or use a specific key/value domain."
+          }
+        }
+      }
+    ]
+  }
+}

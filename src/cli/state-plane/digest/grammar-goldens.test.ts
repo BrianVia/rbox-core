@@ -10,6 +10,7 @@
  */
 import { expect, test } from "bun:test";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
+import type { JsonValue } from "../../../json.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
 import type { RepoRecordInput } from "../../sync-state-model.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
@@ -22,10 +23,10 @@ import { StageDigestBuilder, STAGE_GIT_ROLES, type StageCounts } from "./stage-s
 const STAGE_ID = "1".repeat(32);
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function omit<T extends Record<string, unknown>>(value: T, ...keys: string[]): Record<string, unknown> {
-  const copy: Record<string, unknown> = { ...value };
-  for (const key of keys) delete copy[key];
-  return copy;
+function omit<T extends object, K extends keyof T>(value: T, ...keys: readonly K[]): Omit<T, K> {
+  const copy = { ...value };
+  for (const key of keys) Reflect.deleteProperty(copy, key);
+  return copy as Omit<T, K>;
 }
 
 /** Every variant must move the digest, and no two may collide. */
@@ -58,7 +59,12 @@ const ENTRIES: FileEntry[] = [
   },
 ] as FileEntry[];
 
-const section = (seed: number, extras: Record<string, unknown> = {}): GitSection => ({
+type ExtendedGitSection = GitSection & { extensionNull?: JsonValue };
+type ExtendedFileEntry = FileEntry & { ext?: JsonValue };
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type OptionalFileEntryKey = "symlinkTarget" | "encSha" | "comp" | "payloadSha" | "cipherSize";
+
+const section = (seed: number, extras: Partial<ExtendedGitSection> = {}): ExtendedGitSection => ({
   ...extras,
   bundleSha: hex(64, seed + 1), bundleEncSha: hex(64, seed + 2), bundleCipherSize: seed,
   head: hex(40, seed + 3), refs: {}, config: {}, refScope: "all",
@@ -70,7 +76,7 @@ type Role = "meta-wire" | "manifest-projection";
 interface StageShape {
   stageId: string;
   plane: "base" | "local";
-  header: Record<string, unknown>;
+  header: ManifestHeader;
   entries: FileEntry[];
   roles: Role[];
   sections: Array<{ role: Role; relPath: string; section: GitSection }>;
@@ -80,7 +86,7 @@ interface StageShape {
 const STAGE_BASE: StageShape = {
   stageId: STAGE_ID,
   plane: "base",
-  header: HEADER as unknown as Record<string, unknown>,
+  header: HEADER,
   entries: ENTRIES,
   roles: ["meta-wire"],
   sections: [{ role: "meta-wire", relPath: "repo-a", section: section(30, { extensionNull: null }) }],
@@ -94,12 +100,12 @@ function stageDigest(shape: StageShape): string {
   return builder.seal(shape.counts ?? { files: shape.entries.length, gitSections: shape.sections.length });
 }
 
-const withEntry = (index: number, patch: Record<string, unknown> | { remove: string }): StageShape => ({
+const withEntry = (index: number, patch: Partial<ExtendedFileEntry> | { remove: OptionalFileEntryKey }): StageShape => ({
   ...STAGE_BASE,
   entries: STAGE_BASE.entries.map((entry, at) => {
     if (at !== index) return entry;
     if ("remove" in patch && typeof patch.remove === "string") {
-      return omit(entry as unknown as Record<string, unknown>, patch.remove) as unknown as FileEntry;
+      return omit(entry, patch.remove);
     }
     return { ...entry, ...patch } as unknown as FileEntry;
   }),
@@ -142,7 +148,7 @@ test("stage-semantic-v1 moves for every single dimension it frames", () => {
     ["compression group absent", {
       ...STAGE_BASE,
       entries: STAGE_BASE.entries.map((entry, at) => (at === 3
-        ? omit(entry as unknown as Record<string, unknown>, "comp", "payloadSha", "cipherSize") as unknown as FileEntry
+        ? omit(entry, "comp", "payloadSha", "cipherSize")
         : entry)),
     }],
     ["entry order", { ...STAGE_BASE, entries: [...STAGE_BASE.entries].reverse() }],
@@ -253,12 +259,12 @@ function transitionDigest(shape: TransitionShape): string {
   return builder.seal();
 }
 
-const withRecord = (patch: (record: Record<string, unknown>) => void): TransitionShape => {
-  const record = { ...FULL_RECORD } as Record<string, unknown>;
+const withRecord = (patch: (record: Mutable<RepoRecordInput>) => void): TransitionShape => {
+  const record: Mutable<RepoRecordInput> = { ...FULL_RECORD };
   patch(record);
   return {
     ...TRANSITION_BASE,
-    rows: TRANSITION_BASE.rows.map((row, at) => (at === 0 ? { ...row, record: record as RepoRecordInput } : row)),
+    rows: TRANSITION_BASE.rows.map((row, at) => (at === 0 ? { ...row, record } : row)),
   };
 };
 
@@ -277,7 +283,7 @@ test("repo-transition-v1 moves for every RepoRecord member it frames", () => {
       variants.set("sourceSeq value", transitionDigest(withRecord((record) => { record.sourceSeq = 42; })));
       continue;
     }
-    variants.set(`${field} absent`, transitionDigest(withRecord((record) => { delete record[field]; })));
+    variants.set(`${field} absent`, transitionDigest(withRecord((record) => { Reflect.deleteProperty(record, field); })));
   }
   expect(variants.size).toBe(REPO_RECORD_KEYS.length - 1);
   assertAllDistinct(base, variants);

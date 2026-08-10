@@ -42,6 +42,18 @@ interface Upload {
   parts: Map<number, Buffer>;
 }
 
+interface MultipartCompleteResponse {
+  ok: true;
+  sha256: string;
+  sizeBytes: number;
+  serverTimings?: {
+    totalMs: number;
+    assembleMs: number;
+    rereadPutMs: number;
+    accountingMs: number;
+  };
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   const encoded = JSON.stringify(body);
   // connection: close — every request rides a FRESH connection. Bun/undici transparently
@@ -132,7 +144,7 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
         uploads.delete(complete[2]!);
         blobs.add(actual);
         stats.completedParts += upload.totalParts;
-        const body: Record<string, unknown> = { ok: true, sha256: actual, sizeBytes: assembledBytes };
+        const body: MultipartCompleteResponse = { ok: true, sha256: actual, sizeBytes: assembledBytes };
         if (opts.includeServerTimings !== false) {
           body.serverTimings = { totalMs: Date.now() - t0, assembleMs, rereadPutMs: 0, accountingMs: 0 };
         }

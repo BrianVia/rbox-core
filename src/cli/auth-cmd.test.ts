@@ -63,7 +63,7 @@ class FakeGenesisApi {
     this.bootstrapCalls++;
     if (this.bootstrapResult === "already") {this.committed=await this.completeDto();throw new AccountAlreadyBootstrappedError();}
     if (this.bootstrapResult === "network") throw new Error("network down");
-    const b=JSON.parse(String(raw)) as Record<string,any>;const present:GenesisPresence={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};this.committed={genesisPresenceVersion:1,recoveryWrap:b.recoveryWrap,recoveryWrapId:b.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:b.device.deviceId,rosters:[b.genesisRoster],keyStates:[b.genesisKeyState],devices:[{deviceId:b.device.deviceId,sigPubkey:b.device.sigPubKey,encPubkey:b.device.encPubKey,mkWrap:b.device.mkWrap}],present,repairTombstone:null};
+    const b=JSON.parse(String(raw)) as {recoveryWrap:string;recoveryWrapId:string;genesisRoster:string;genesisKeyState:string;device:{deviceId:string;sigPubKey:string;encPubKey:string;mkWrap:string}};const present:GenesisPresence={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};this.committed={genesisPresenceVersion:1,recoveryWrap:b.recoveryWrap,recoveryWrapId:b.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:b.device.deviceId,rosters:[b.genesisRoster],keyStates:[b.genesisKeyState],devices:[{deviceId:b.device.deviceId,sigPubkey:b.device.sigPubKey,encPubkey:b.device.encPubKey,mkWrap:b.device.mkWrap}],present,repairTombstone:null};
   }
 }
 
@@ -773,7 +773,7 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) {
         startCalls++;
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const body = JSON.parse(String(init?.body)) as { label: string; encPubKey: string; sigPubKey: string };
         expect(body.label).toBe("rig-a-onboard-smoke");
         expect(String(body.encPubKey)).toMatch(/^[A-Za-z0-9_-]+$/);
         expect(String(body.sigPubKey)).toMatch(/^[A-Za-z0-9_-]{43}$/);

@@ -30,7 +30,7 @@ describe("§23.1 receipts: mint / verify", () => {
     const env = envWith(KEY);
     const receipt = await mintReceipt(env, { ...claim, packId: PACK_ID });
     const [kid, payloadB64, mac] = receipt.split(".") as [string, string, string];
-    const payload = JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/"))) as Record<string, unknown>;
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/"))) as { p?: string | string[] };
     payload.p = "c".repeat(32);
     const changedPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     expect(await verifyReceipt(env, `${kid}.${changedPayload}.${mac}`, claim)).toEqual({ ok: false, reason: "bad_mac" });

@@ -13,7 +13,7 @@ export function imageHashRecordPath(tempRoot = os.tmpdir()): string {
 export function parseImageHashRecords(text: string): ImageHashRecords {
   const parsed: unknown = JSON.parse(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("image-hash records must be an object");
-  const record = parsed as Record<string, unknown>;
+  const record = parsed as Partial<Record<RunnerName, unknown>>;
   const out: ImageHashRecords = {};
   for (const runner of ["apple-container", "docker"] as const) {
     const value = record[runner];

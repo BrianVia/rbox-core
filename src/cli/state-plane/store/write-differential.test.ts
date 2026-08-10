@@ -52,7 +52,7 @@ function root(prefix: string): string {
 
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function entry(name: string, seed: number, extras: Record<string, unknown> = {}): FileEntry {
+function entry(name: string, seed: number, extras: Partial<FileEntry> = {}): FileEntry {
   return {
     ...extras,
     path: name,

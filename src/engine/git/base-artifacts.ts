@@ -122,24 +122,19 @@ export function settledAbsenceRef(binding: ArtifactBinding): string {
   return `${SETTLED_ABSENCE_PREFIX}/${binding.lineageHash}`;
 }
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+function exactKeys(value: object, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
 function canonicalPayload<T>(payload: T): Uint8Array { return canonicalize(payload); }
 
-function parseCanonical(bytes: Uint8Array): Record<string, unknown> {
+function parseCanonical<T extends object>(bytes: Uint8Array): Partial<T> {
   const text = Buffer.from(bytes).toString("utf8");
   const parsed = verifyRoundTrip(text);
-  const object = record(parsed);
-  if (!object) throw new Error("payload is not an object");
-  return object;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("payload is not an object");
+  return parsed as Partial<T>;
 }
 
 export function baseAbsentPayload(binding: ArtifactBinding, ref: string, priorOid: string): BaseAbsentPayload {
@@ -158,7 +153,7 @@ export function basePresentPayload(binding: ArtifactBinding, ref: string, episod
 }
 
 function parseAbsentPayload(bytes: Uint8Array): BaseAbsentPayload {
-  const value = parseCanonical(bytes);
+  const value = parseCanonical<BaseAbsentPayload>(bytes);
   if (!exactKeys(value, ["lineageHash", "priorOid", "ref", "repositoryIdentityHash", "v"]) || value.v !== 2
     || typeof value.lineageHash !== "string" || !HEX64.test(value.lineageHash)
     || typeof value.repositoryIdentityHash !== "string" || !HEX64.test(value.repositoryIdentityHash)
@@ -168,7 +163,7 @@ function parseAbsentPayload(bytes: Uint8Array): BaseAbsentPayload {
 }
 
 function parsePresentPayload(bytes: Uint8Array): BasePresentPayload {
-  const value = parseCanonical(bytes);
+  const value = parseCanonical<BasePresentPayload>(bytes);
   if (!exactKeys(value, ["episode", "lineageHash", "nextOid", "priorOid", "ref", "repositoryIdentityHash", "v"]) || value.v !== 2
     || typeof value.lineageHash !== "string" || !HEX64.test(value.lineageHash)
     || typeof value.repositoryIdentityHash !== "string" || !HEX64.test(value.repositoryIdentityHash)
@@ -359,7 +354,7 @@ async function writeTree(repoDir: string, entries: readonly TreeEntry[]): Promis
 }
 
 function parseSettledMeta(bytes: Uint8Array): SettledAbsenceMeta {
-  const value = parseCanonical(bytes);
+  const value = parseCanonical<SettledAbsenceMeta>(bytes);
   if (!exactKeys(value, ["count", "lineageHash", "repositoryIdentityHash", "v"]) || value.v !== 1
     || !Number.isSafeInteger(value.count) || (value.count as number) < 0
     || typeof value.lineageHash !== "string" || !HEX64.test(value.lineageHash)

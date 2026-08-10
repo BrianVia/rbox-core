@@ -74,14 +74,14 @@ const sorted = (requests: readonly RepublishRequest[]): RepublishRequest[] =>
 
 function validate(value: unknown): RepublishRequestsV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
+  const record = value as Partial<RepublishRequestsV1>;
   if (record.v !== 1 || typeof record.stream !== "string" || record.stream.length === 0) return undefined;
   if (!Array.isArray(record.requests) || record.requests.length === 0 || record.requests.length > REPUBLISH_REQUESTS_MAX) return undefined;
   const seen = new Set<string>();
   const requests: RepublishRequest[] = [];
   for (const raw of record.requests) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-    const entry = raw as Record<string, unknown>;
+    const entry = raw as Partial<RepublishRequest>;
     if (!validRelPath(entry.relPath) || !validTimestamp(entry.requestedAt)) return undefined;
     if (typeof entry.baseBundleSha !== "string" || !HEX64.test(entry.baseBundleSha)) return undefined;
     if (!validTimestamp(entry.baseGeneratedAt)) return undefined;

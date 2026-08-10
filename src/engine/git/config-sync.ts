@@ -188,7 +188,7 @@ function serializedSize(config: Readonly<Record<string, readonly string[]>>): nu
 /** Validate that untrusted wire data is both grammatical and already canonical. */
 export function validateCanonicalGitConfig(input: unknown): GitConfigValidation {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "config is not an object" };
-  const config = input as Record<string, unknown>;
+  const config = input as Partial<Record<string, string[]>>;
   const keys = Object.keys(config);
   if (keys.length > MAX_GIT_CONFIG_KEYS) return { ok: false, reason: `config exceeds ${MAX_GIT_CONFIG_KEYS} keys` };
   const sorted = [...keys].sort(compareConfigKeysBytewise);

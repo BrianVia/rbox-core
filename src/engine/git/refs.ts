@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, isSyncableRef, type OpStateRoot } from "../manifest-validate.js";
+import type { GitArtifactRef } from "../types.js";
 import { HEX40, exists, git, gitStatus, headBranchOf, moveFileAtomic, walkFiles } from "./shared.js";
 
 function parseAllRefs(out: string): Record<string, string> {
@@ -87,7 +88,7 @@ export async function readOpStateSnapshot(
   return { files, rootsPresent };
 }
 
-export function hasInProgressOpState(snapshot: { files: Record<string, unknown>; rootsPresent: readonly OpStateRoot[] }): boolean {
+export function hasInProgressOpState(snapshot: { files: Readonly<Record<string, string | GitArtifactRef>>; rootsPresent: readonly OpStateRoot[] }): boolean {
   return Object.keys(snapshot.files).some((rel) => OP_STATE_CLASSIFICATION[rel.split("/")[0] as OpStateRoot] === "in-progress")
     || snapshot.rootsPresent.some((root) => OP_STATE_CLASSIFICATION[root] === "in-progress");
 }

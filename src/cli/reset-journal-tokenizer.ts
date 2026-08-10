@@ -1,3 +1,5 @@
+import type { JsonObject, JsonValue } from "../json.js";
+
 export type ResetJournalTokenErrorCode =
   | "JSON_SYNTAX" | "DEPTH_LIMIT" | "TOKEN_LIMIT" | "MEMBER_LIMIT"
   | "MEMBER_NAME_LIMIT" | "STRING_LIMIT" | "DUPLICATE_MEMBER"
@@ -99,7 +101,7 @@ export function tokenizeResetJournalJson(text: string): unknown {
     }
     return fail("JSON_SYNTAX", path);
   };
-  const value = (path: string, depth: number, dbBytesValue = false): unknown => {
+  const value = (path: string, depth: number, dbBytesValue = false): JsonValue => {
     whitespace();
     if (at >= text.length) fail("JSON_SYNTAX", path);
     const ch = text[at];
@@ -107,7 +109,7 @@ export function tokenizeResetJournalJson(text: string): unknown {
       if (depth > MAX_DEPTH) fail("DEPTH_LIMIT", path, MAX_DEPTH);
       charge(path);
       at++;
-      const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      const result: JsonObject = Object.create(null) as JsonObject;
       const seen = new Set<string>();
       whitespace();
       if (text[at] === "}") {
@@ -141,7 +143,7 @@ export function tokenizeResetJournalJson(text: string): unknown {
       if (depth > MAX_DEPTH) fail("DEPTH_LIMIT", path, MAX_DEPTH);
       charge(path);
       at++;
-      const result: unknown[] = [];
+      const result: JsonValue[] = [];
       whitespace();
       if (text[at] === "]") {
         at++;

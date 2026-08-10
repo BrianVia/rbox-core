@@ -133,7 +133,15 @@ function sameToken(a: FsToken, b: FsToken): boolean {
     a.executable === b.executable;
 }
 
-function semanticEntry(entry: FileEntry): Record<string, unknown> {
+interface SemanticReceiptEntry {
+  path: string;
+  type: FileEntry["type"];
+  sha256: string;
+  symlinkTarget: string;
+  executable: number;
+}
+
+function semanticEntry(entry: FileEntry): SemanticReceiptEntry {
   return {
     path: entry.path,
     type: entry.type,

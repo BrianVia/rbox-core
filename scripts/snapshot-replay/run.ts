@@ -86,6 +86,22 @@ interface ChildRun {
   readonly wallMs: number;
 }
 
+interface ReplayReportSummary {
+  exitCode?: number;
+  secondExitCode?: number;
+  migrateLines?: string[];
+  fidelity?: string;
+  entryPointVerdict?: string;
+}
+
+interface SnapshotReplayResult {
+  workspace: string;
+  sandbox: string;
+  snapshot: { ok: boolean; wallMs: number; report: unknown; stderr: string };
+  replay: { ok: boolean; wallMs: number; report: ReplayReportSummary | null; stderr: string } | undefined;
+  isolation: { snapshot: AuditResult | undefined; replay: AuditResult | undefined };
+}
+
 function runTraced(
   label: string, layout: SandboxLayout, script: string, args: readonly string[],
   env: NodeJS.ProcessEnv, profile: AuditProfile,
@@ -130,7 +146,7 @@ if (workspaces.length === 0) throw new Error("no legacy rbox workspaces found on
 fs.mkdirSync(outRoot, { recursive: true });
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const results: Array<Record<string, unknown>> = [];
+const results: SnapshotReplayResult[] = [];
 
 for (const workspace of workspaces) {
   const slug = workspace.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -178,7 +194,7 @@ for (const workspace of workspaces) {
     workspace,
     sandbox: layout.root,
     snapshot: { ok: snapshot.ok, wallMs: snapshot.wallMs, report: parse(snapshot), stderr: snapshot.ok ? "" : snapshot.stderr },
-    replay: replay && { ok: replay.ok, wallMs: replay.wallMs, report: parse(replay), stderr: replay.ok ? "" : replay.stderr },
+    replay: replay && { ok: replay.ok, wallMs: replay.wallMs, report: parse(replay) as ReplayReportSummary | null, stderr: replay.ok ? "" : replay.stderr },
     isolation: { snapshot: snapshot.audit, replay: replay?.audit },
   });
 }
@@ -187,14 +203,8 @@ const reportFile = path.join(outRoot, `report-${stamp}.json`);
 fs.writeFileSync(reportFile, `${JSON.stringify(results, null, 2)}\n`);
 
 for (const result of results) {
-  const replay = result.replay as {
-    ok?: boolean;
-    report?: {
-      exitCode?: number; secondExitCode?: number; migrateLines?: string[];
-      fidelity?: string; entryPointVerdict?: string;
-    };
-  } | undefined;
-  const audit = (result.isolation as { replay?: AuditResult }).replay;
+  const replay = result.replay;
+  const audit = result.isolation.replay;
   console.log([
     `workspace ${String(result.workspace)}`,
     `  sandbox   ${String(result.sandbox)}`,

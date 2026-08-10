@@ -2,6 +2,19 @@ import { describe, expect, test, vi } from "vitest";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { fakeDoSql } from "./helpers/fake-do-sql.js";
 
+interface RootsInspectPageFixture {
+  head: number;
+  pruneFloor: number;
+  indexGeneration: number;
+  indexSyncedSeq: number;
+  droppedPage: Array<{ sha: string; lastSeq: number }>;
+  seqRootsPage: Array<{ seq: number; manifestSha: string; carrierSha?: string }>;
+  gapPage: Array<{ seq: number; manifestSha: string; inlineRefs?: string[]; carrierSha?: string }>;
+  nextSha?: string;
+  nextSeq?: number;
+  nextGapSeq?: number;
+}
+
 const sha = (ch: string) => ch.repeat(64);
 
 if (!("WebSocketRequestResponsePair" in globalThis)) {
@@ -350,7 +363,7 @@ describe("design 142 read-only retained-roots inspection", () => {
 
     const first = await sync.fetch(new Request("https://do/roots-inspect?ws=ws_1&proj=root&limit=1"));
     expect(first.status).toBe(200);
-    const p1 = await first.json() as Record<string, unknown>;
+    const p1 = await first.json() as RootsInspectPageFixture;
     expect(p1).toMatchObject({
       head: 3, pruneFloor: 0, indexGeneration: 9, indexSyncedSeq: 1,
       droppedPage: [{ sha: sha("e"), lastSeq: 1 }], nextSha: sha("e"),
@@ -360,7 +373,7 @@ describe("design 142 read-only retained-roots inspection", () => {
 
     const second = await sync.fetch(new Request(`https://do/roots-inspect?ws=ws_1&proj=root&limit=1&fromSha=${sha("e")}&fromSeq=1&fromGapSeq=1&pinHead=3&pinFloor=0&pinGen=9`));
     expect(second.status).toBe(200);
-    const p2 = await second.json() as Record<string, unknown>;
+    const p2 = await second.json() as RootsInspectPageFixture;
     expect(p2).toMatchObject({
       droppedPage: [{ sha: sha("f"), lastSeq: 2 }],
       seqRootsPage: [{ seq: 2, manifestSha: sha("2"), carrierSha: sha("8") }],

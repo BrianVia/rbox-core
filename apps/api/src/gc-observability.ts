@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { logErr } from "./util.js";
+import { logErr, objectWithKeys } from "./util.js";
 import { startOp } from "./metrics.js";
 import { readState } from "./gc-state.js";
 
@@ -68,21 +68,46 @@ function isFixedIso(value: unknown): value is string {
 }
 
 function parseGcObservation(value: unknown): GcObservationV1 | null {
-  if (!value || typeof value !== "object") return null;
-  const o = value as Record<string, unknown>;
-  if (o.v !== 1 || !isFixedIso(o.at) || !GC_OUTCOMES.has(o.outcome as GcObservationOutcome)) return null;
-  if (o.stage !== undefined && !GC_STAGES.has(o.stage as GcObservationStage)) return null;
+  if (!objectWithKeys(value,
+    ["v", "at", "outcome", "stage", "status", "rows", "marked", "purged", "opened", "orphanRefs", "errorClass", "rootsSample"],
+    ["v", "at", "outcome", "rootsSample"],
+  )) return null;
+  const o = value;
+  const outcome = typeof o.outcome === "string" ? [...GC_OUTCOMES].find((candidate) => candidate === o.outcome) : undefined;
+  const stage = typeof o.stage === "string" ? [...GC_STAGES].find((candidate) => candidate === o.stage) : undefined;
+  if (o.v !== 1 || !isFixedIso(o.at) || outcome === undefined) return null;
+  if (o.stage !== undefined && stage === undefined) return null;
   for (const field of ["status", "rows", "marked", "purged", "opened", "orphanRefs"] as const) {
     if (o[field] !== undefined && (!Number.isFinite(o[field]) || Number(o[field]) < 0)) return null;
   }
   if (o.errorClass !== undefined && typeof o.errorClass !== "string") return null;
+  let rootsSample: GcRootsSampleV1 | null = null;
   if (o.rootsSample !== null) {
-    if (!o.rootsSample || typeof o.rootsSample !== "object") return null;
-    const sample = o.rootsSample as Record<string, unknown>;
-    if (!Number.isFinite(sample.value) || Number(sample.value) < 0 || !isFixedIso(sample.measuredAt)) return null;
+    if (!objectWithKeys(o.rootsSample, ["value", "measuredAt", "lowerBound"], ["value", "measuredAt"])) return null;
+    const sample = o.rootsSample;
+    const measuredAt = sample.measuredAt;
+    if (!Number.isFinite(sample.value) || Number(sample.value) < 0 || !isFixedIso(measuredAt)) return null;
     if (sample.lowerBound !== undefined && sample.lowerBound !== true) return null;
+    rootsSample = {
+      value: Number(sample.value),
+      measuredAt,
+      ...(sample.lowerBound === true ? { lowerBound: true } : {}),
+    };
   }
-  return value as GcObservationV1;
+  return {
+    v: 1,
+    at: o.at,
+    outcome,
+    ...(stage === undefined ? {} : { stage }),
+    ...(o.status === undefined ? {} : { status: Number(o.status) }),
+    ...(o.rows === undefined ? {} : { rows: Number(o.rows) }),
+    ...(o.marked === undefined ? {} : { marked: Number(o.marked) }),
+    ...(o.purged === undefined ? {} : { purged: Number(o.purged) }),
+    ...(o.opened === undefined ? {} : { opened: Number(o.opened) }),
+    ...(o.orphanRefs === undefined ? {} : { orphanRefs: Number(o.orphanRefs) }),
+    ...(typeof o.errorClass === "string" ? { errorClass: o.errorClass } : {}),
+    rootsSample,
+  };
 }
 
 const GC_OBSERVATION_UPSERT = `

@@ -12,18 +12,20 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const safeErrorBody = (text: string): string => text.replaceAll(secret, "[redacted]").slice(0, 200);
 
 interface Counts { commits: number; manifests: number; workspace_keys: number; workspaces: number }
+type CountsCandidate = Partial<Record<keyof Counts, unknown>>;
+type PurgeResponseCandidate = Partial<Record<"done" | "counts" | "deleted", unknown>>;
 type DryResult = { workspaceId: string; counts: Counts } | { workspaceId: string; notFound: true };
 type PurgeResult = { workspaceId: string; passes: number; deleted: Counts } | { workspaceId: string; notFound: true };
 const zero = (): Counts => ({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
 const validCounts = (value: unknown): value is Counts => {
   if (typeof value !== "object" || value === null) return false;
-  const counts = value as Record<string, unknown>;
+  const counts = value as CountsCandidate;
   return ["commits", "manifests", "workspace_keys", "workspaces"].every((key) => typeof counts[key] === "number" && Number.isFinite(counts[key]) && (counts[key] as number) >= 0);
 };
 const parseResponse = (text: string, status: number, countsKey: "counts" | "deleted"): { done: boolean; counts: Counts } => {
   let value: unknown;
   try { value = JSON.parse(text); } catch { /* handled by shape check */ }
-  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const record: PurgeResponseCandidate = typeof value === "object" && value !== null ? value as PurgeResponseCandidate : {};
   if (typeof record.done !== "boolean" || !validCounts(record[countsKey])) {
     throw new Error(`unexpected response shape (${status}): ${safeErrorBody(text)}`);
   }

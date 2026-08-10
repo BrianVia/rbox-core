@@ -227,7 +227,7 @@ test("a daemon activity.json without the field still validates, and omits the ke
     await write({ at: AT, local });
     const without = await loadActivity(d);
     expect(without?.local).toBeDefined();
-    expect("strandedIgnored" in (without!.local as object)).toBe(false);
+    expect("strandedIgnored" in without!.local!).toBe(false);
 
     await write({ at: AT, local: { ...local!, strandedIgnored: 12 } });
     expect((await loadActivity(d))?.local?.strandedIgnored).toBe(12);

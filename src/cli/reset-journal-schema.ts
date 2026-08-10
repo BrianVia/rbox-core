@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { canonicalize } from "../engine/e2ee/jcs.js";
+import type { JsonObject } from "../json.js";
 import {
   repositoryIdentityHash,
   validateRepoIdentityV1,
@@ -99,7 +100,7 @@ const MAX_Z = 256;
 const MAX_DB_B64 = 349_528;
 const MAX_DB_BYTES = 262_144;
 
-type Obj = Record<string, unknown>;
+type Obj = JsonObject;
 function fail(code: ResetJournalSchemaErrorCode, path: string, limit: number | null = null): never {
   throw new ResetJournalSchemaError(code, path, limit);
 }

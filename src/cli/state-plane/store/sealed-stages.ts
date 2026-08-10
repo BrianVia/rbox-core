@@ -75,7 +75,7 @@ function deriveStageRef(
     throw new StageChangedError(stageId, "sealed stage identity does not match its ref");
   }
   const header = parseCanonicalJson(meta.header_cjson) as unknown as ManifestHeader;
-  const digest = new StageDigestBuilder(meta.stage_id, meta.plane, header as unknown as Record<string, unknown>);
+  const digest = new StageDigestBuilder(meta.stage_id, meta.plane, header);
   streamRows<{ entry_cjson: string }>(
     accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
     [stageId], (row) => digest.file(row.entry_cjson));

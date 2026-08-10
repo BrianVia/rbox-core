@@ -8,6 +8,10 @@ function entry(overrides: Partial<FileEntry> = {}): FileEntry {
   return { path: "a.txt", sha256: "aa", size: 3, mode: 0o644, mtimeMs: 1000, type: "file", ...overrides };
 }
 
+interface FutureFileEntry extends FileEntry { futureField: string | number; }
+interface ExtrasFileEntry<T> extends FileEntry { extras: T; }
+interface CyclicFixture { self?: CyclicFixture; }
+
 test("internExact returns one shared frozen object for identical field sets", () => {
   const arena = new EntryArena();
   const first = arena.internExact(entry());
@@ -80,7 +84,7 @@ test("extension members participate in exact interning", () => {
   const plain = arena.internExact(entry());
   const extended = arena.internExact({ ...entry(), futureField: 1 } as FileEntry);
   expect(extended).not.toBe(plain);
-  expect((extended.entry as Record<string, unknown>).futureField).toBe(1);
+  expect((extended.entry as FutureFileEntry).futureField).toBe(1);
   arena.release(plain);
   arena.release(extended);
 });
@@ -115,7 +119,7 @@ test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras",
   const arena = new EntryArena();
   const extras = { nested: { list: [1, 2] } };
   const slot = arena.internExact({ ...entry(), extras } as unknown as FileEntry);
-  const interned = (slot.entry as Record<string, unknown>).extras as { nested: { list: number[] } };
+  const interned = (slot.entry as ExtrasFileEntry<{ nested: { list: number[] } }>).extras;
   expect(interned).not.toBe(extras);
   extras.nested.list.push(3);
   extras.nested = { list: [9] };
@@ -177,11 +181,11 @@ test("slot ids are monotonic and never reused", () => {
 });
 
 test("the canonical key and its fingerprint are stable across key order", () => {
-  const a: Record<string, unknown> = { path: "a", sha256: "x", size: 1, mode: 0, mtimeMs: 0, type: "file" };
-  const b: Record<string, unknown> = { type: "file", mtimeMs: 0, mode: 0, size: 1, sha256: "x", path: "a" };
-  const keyA = canonicalEntryKey(a as unknown as FileEntry);
-  expect(keyA).toBe(canonicalEntryKey(b as unknown as FileEntry));
-  expect(defaultFingerprint(keyA)).toBe(defaultFingerprint(canonicalEntryKey(b as unknown as FileEntry)));
+  const a: FileEntry = { path: "a", sha256: "x", size: 1, mode: 0, mtimeMs: 0, type: "file" };
+  const b: FileEntry = { type: "file", mtimeMs: 0, mode: 0, size: 1, sha256: "x", path: "a" };
+  const keyA = canonicalEntryKey(a);
+  expect(keyA).toBe(canonicalEntryKey(b));
+  expect(defaultFingerprint(keyA)).toBe(defaultFingerprint(canonicalEntryKey(b)));
 });
 
 test("withCipherDescriptor is pure and preserves extension members", () => {
@@ -190,7 +194,7 @@ test("withCipherDescriptor is pure and preserves extension members", () => {
   expect(next).not.toBe(source);
   expect(source.encSha).toBeUndefined();
   expect(next).toMatchObject({ encSha: "ee", comp: "zstd", payloadSha: "pp", cipherSize: 20 });
-  expect((next as Record<string, unknown>).futureField).toBe("keep");
+  expect((next as FutureFileEntry).futureField).toBe("keep");
 });
 
 test("withCipherDescriptor drops comp, payloadSha and cipherSize together", () => {
@@ -204,12 +208,12 @@ test("withCipherDescriptor drops comp, payloadSha and cipherSize together", () =
 
 test("REGRESSION (r3 finding 3): an own '__proto__' member survives interning", () => {
   const arena = new EntryArena();
-  const source: Record<string, unknown> = { ...entry() };
+  const source: FileEntry = { ...entry() };
   Object.defineProperty(source, "__proto__", { value: { a: 1 }, enumerable: true, writable: true, configurable: true });
-  const slot = arena.internExact(source as unknown as FileEntry);
+  const slot = arena.internExact(source);
   expect(Object.keys(slot.entry)).toContain("__proto__");
   expect(Object.getPrototypeOf(slot.entry)).toBeNull();
-  expect(sameEntryExact(slot.entry, source as unknown as FileEntry)).toBe(true);
+  expect(sameEntryExact(slot.entry, source)).toBe(true);
   // It is a real member, so it distinguishes just like any other extension.
   const without = arena.internExact(entry());
   expect(without).not.toBe(slot);
@@ -221,13 +225,13 @@ test("REGRESSION (r3 finding 3): an own '__proto__' member survives interning", 
 test("REGRESSION (r3 finding 3): a changing accessor cannot diverge the key from the stored entry", () => {
   const arena = new EntryArena();
   let reads = 0;
-  const shifty: Record<string, unknown> = {
+  const shifty: FileEntry = {
     ...entry(),
     get size(): number {
       return ++reads === 1 ? 1 : 999;
     },
   };
-  const slot = arena.internExact(shifty as unknown as FileEntry);
+  const slot = arena.internExact(shifty);
   expect(slot.entry.size).toBe(1);
   // The slot really is keyed under what it stores: an equal plain entry shares it.
   const plain = arena.internExact(entry({ size: 1 }));
@@ -240,21 +244,21 @@ test("REGRESSION (r3 finding 3): a changing accessor cannot diverge the key from
 
 test("REGRESSION (r3 finding 3): cyclic extras hit the depth bound, never a stack overflow", () => {
   const arena = new EntryArena();
-  const cyclic: Record<string, unknown> = {};
+  const cyclic: CyclicFixture = {};
   cyclic.self = cyclic;
   expect(() => arena.internExact({ ...entry(), extras: cyclic } as unknown as FileEntry)).toThrow(EntryShapeError);
 
   // Shallow-then-cyclic accessor: the single read wins, so the arena stores the
   // shallow value and the later cyclic one is never reachable.
   let reads = 0;
-  const shallowThenCyclic: Record<string, unknown> = {
+  const shallowThenCyclic: ExtrasFileEntry<unknown> = {
     ...entry(),
     get extras(): unknown {
       return reads++ === 0 ? { ok: 1 } : cyclic;
     },
   };
   const slot = arena.internExact(shallowThenCyclic as unknown as FileEntry);
-  expect((slot.entry as unknown as Record<string, unknown>).extras).toEqual({ ok: 1 });
+  expect((slot.entry as ExtrasFileEntry<unknown>).extras).toEqual({ ok: 1 });
   expect(canonicalEntryKey(slot.entry)).toBe(canonicalEntryKey({ ...entry(), extras: { ok: 1 } } as unknown as FileEntry));
   arena.release(slot);
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });

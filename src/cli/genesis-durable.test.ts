@@ -9,7 +9,7 @@ import {
   publishDestinationProgress,publishGenesisEnrollmentWitness,publishGenesisJournal,publishPrepublishMarker,
   reconcileRetargetIntent,recordDestinationSetReceipt,recordGenesisReceipt,replaceDestinationSetIntent,
   retargetCompletionIntent,serializeCompletionIntent,stageRecoveryKey,
-  type CompletionIntent,type DestinationCompletion,type DestinationEvent,type DestinationSetCompletionIntent,
+  type CompletionIntent,type CompletionIntentRetargetWitness,type DestinationCompletion,type DestinationEvent,type DestinationSetCompletionIntent,
   type GenesisJournal,type HardenedWriteOptions
 } from "./genesis-durable.js";
 
@@ -100,7 +100,7 @@ describe("design 180 durable genesis artifacts",()=>{
     let secondRename=0;
     await expect(retargetCompletionIntent(j,oldIntent,newIntent,"2026-07-22T12:03:00.000Z",{onStep(step){if(step==="rename"&&++secondRename===2)throw new Error("stop before replacement");}})).rejects.toThrow();
     const witnessRaw=await fs.readFile(genesisPaths(ACCOUNT).witness,"utf8");
-    const witness=JSON.parse(witnessRaw) as Record<string,unknown>;
+    const witness=JSON.parse(witnessRaw) as CompletionIntentRetargetWitness;
     for(const mutation of [
       {...witness,version:2},
       {...witness,accountId:"acct_ffffffffffffffff"},

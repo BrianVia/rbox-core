@@ -547,7 +547,10 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
       const res = (await runPhase1(envBroken, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
       expect(res).toMatchObject({ processed: 1, failed: 1, marked: 1 });
       const outcomes = [...successLog.mock.calls, ...errorLog.mock.calls]
-        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+        .map(([line]) => JSON.parse(String(line)) as {
+          event: string; outcome: string; reachable?: number; reachableCap?: number; reachableRemaining?: number;
+          marked?: number; errorClass?: string;
+        });
       expect(outcomes).toHaveLength(2); // exactly one structured outcome per account/pass
       expect(successLog).toHaveBeenCalledTimes(1);
       expect(errorLog).toHaveBeenCalledTimes(1);

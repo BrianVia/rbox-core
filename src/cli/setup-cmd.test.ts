@@ -473,7 +473,9 @@ test("keyed setup rejects literal --key values before any interactive work", asy
 const fakeMutex = (root: string) => ({ root, lock: undefined });
 const directoryStat = { isDirectory: () => true } as Awaited<ReturnType<typeof fs.stat>>;
 
-function baseCreateDeps(root: string, overrides: Record<string, unknown> = {}) {
+type StepWorkspaceTestDeps = NonNullable<Parameters<typeof stepWorkspace>[2]>;
+
+function baseCreateDeps(root: string, overrides: Partial<StepWorkspaceTestDeps> = {}): StepWorkspaceTestDeps {
   return {
     promptPath: async () => root,
     promptInput: async () => "-",
@@ -490,7 +492,7 @@ function baseCreateDeps(root: string, overrides: Record<string, unknown> = {}) {
     continueInit: async () => ({ workspaceId: "ws_created", deviceId: "dev", root }),
     writeStderr: () => undefined,
     ...overrides,
-  } as never;
+  };
 }
 
 async function writeBoundSetupRoot(root: string): Promise<void> {

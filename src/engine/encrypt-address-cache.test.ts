@@ -29,7 +29,7 @@ async function writeCache(body: unknown): Promise<void> {
   await fs.writeFile(file, typeof body === "string" ? body : JSON.stringify(body));
 }
 
-function stored(overrides: Partial<EncryptAddressCacheContext> = {}, entries: Record<string, unknown> = {}) {
+function stored(overrides: Partial<EncryptAddressCacheContext> = {}, entries: Partial<Record<string, Partial<StoredEncryptAddressCacheEntry>>> = {}) {
   return { version: 1, ...ctx, ...overrides, entries };
 }
 

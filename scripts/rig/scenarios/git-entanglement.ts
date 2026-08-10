@@ -44,6 +44,7 @@ import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { Recorder } from "./harness.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import type { SyncState } from "../../../src/cli/sync-state-model.js";
 
 /** Repo relPaths under the workspace (the `gitRepos` manifest keys they become). */
 const TOP = "repo-top";
@@ -128,8 +129,8 @@ interface RigRepoRecord {
 
 interface RigSyncState {
   lastSyncedSequence?: number;
-  gitPendingRemote?: Record<string, unknown>;
-  gitNeedsResolution?: Record<string, unknown>;
+  gitPendingRemote?: SyncState["gitPendingRemote"];
+  gitNeedsResolution?: SyncState["gitNeedsResolution"];
   repoRecords?: Record<string, RigRepoRecord>;
 }
 

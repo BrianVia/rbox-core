@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
+import type { JsonObject } from "../json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
@@ -84,8 +85,8 @@ const MAX_TEXT = 4096;
 
 export type { ResetZEntry } from "./reset-z.js";
 
-const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean => {
+const record = (value: unknown): JsonObject | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
+const exact = (value: JsonObject, keys: readonly string[]): boolean => {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);

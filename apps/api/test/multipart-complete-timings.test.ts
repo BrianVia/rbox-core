@@ -39,10 +39,13 @@ describe("multipart completion server timings", () => {
     expect(part.status).toBe(200);
     const complete = await SELF.fetch(`${BASE}/v1/blobs/${sha}/multipart/${uploadId}/complete`, { method: "POST", headers });
     expect(complete.status).toBe(200);
-    const body = (await complete.json()) as Record<string, unknown>;
+    const body = (await complete.json()) as {
+      ok: boolean; sha256: string; sizeBytes: number;
+      serverTimings: { totalMs: number; accountingMs: number; assembleMs: number; rereadPutMs: number };
+    };
     expect(body).toMatchObject({ ok: true, sha256: sha, sizeBytes: content.byteLength });
     expect(Object.keys(body.serverTimings as object).sort()).toEqual(["accountingMs", "assembleMs", "rereadPutMs", "totalMs"]);
-    const timings = body.serverTimings as Record<string, number>;
+    const timings = body.serverTimings;
     for (const value of Object.values(timings)) {
       expect(Number.isFinite(value)).toBe(true);
       expect(Number.isInteger(value)).toBe(true);

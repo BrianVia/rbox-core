@@ -21,6 +21,14 @@ export type BatchPutResponseRecord =
   | { sha256: string; ok: true; sizeBytes: number; receipt: string }
   | { sha256: string; ok: false; error: "sha_mismatch" | "too_large" | "r2_error" };
 
+interface BatchPutResponseCandidate {
+  sha256?: unknown;
+  ok?: unknown;
+  sizeBytes?: unknown;
+  receipt?: unknown;
+  error?: unknown;
+}
+
 export async function* parseBatchFrames(body: ReadableStream<Uint8Array>, onChunk?: () => void): AsyncGenerator<BatchFrame> {
   const reader = body.getReader();
   // Chunk list instead of a grow-and-recopy buffer: every payload byte is copied
@@ -104,7 +112,7 @@ export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] |
   const out: BatchPutResponseRecord[] = [];
   for (const raw of (body as { results: unknown[] }).results) {
     if (!raw || typeof raw !== "object") return null;
-    const r = raw as Record<string, unknown>;
+    const r = raw as BatchPutResponseCandidate;
     if (typeof r.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(r.sha256)) return null;
     if (r.ok === true) {
       if (typeof r.sizeBytes !== "number" || typeof r.receipt !== "string") return null;

@@ -27,6 +27,7 @@ import {
   type SignedCommit,
 } from "./commit-envelope.js";
 import { acceptConnection, broadcast as wsBroadcast, broadcastKeyDelivery } from "./ws-fanout.js";
+import type { JsonValue } from "../../../src/json.js";
 
 const ROOTS_PAGE_LIMIT = 20_000;
 // A raw gap commit may itself contain a large inline refset. Keep inspection pages
@@ -51,7 +52,32 @@ const HIGH_SEVERITY_FALLBACKS = new Set(["parent_unreadable", "fence_violation",
 
 type IndexState = "building" | "ready" | "lagging";
 type FoldCursor = { phase: "removed" | "added"; lastSha: string };
-type SqlRow = Record<string, unknown>;
+type SqlValue = string | number | bigint | boolean | null | ArrayBuffer | Uint8Array;
+type SqlRow = { [column: string]: SqlValue };
+
+type CommitResponsePayload =
+  | { error: "conflict"; head: number }
+  | { error: "epoch_stale"; currentEpoch: number }
+  | { sequence: number; commitHash: string };
+
+type RootsGapEntry = {
+  seq: number;
+  manifestSha: string;
+  chainRefs?: string[];
+} & (
+  | { inlineRefs: string[] }
+  | { carrierSha: string; sidecar: { sha: string; count: number; size: number } }
+);
+
+interface ReceiptRedeemEntry {
+  sha: string;
+  receipt: JsonValue;
+}
+
+function parseReceiptEntries(value: JsonValue | undefined): ReceiptRedeemEntry[] | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return Object.entries(value).map(([sha, receipt]) => ({ sha, receipt }));
+}
 
 interface ServerTimings {
   totalMs: number;
@@ -501,15 +527,14 @@ export class WorkspaceSync {
       ...extra,
     });
 
-    const timedResponse = (payload: Record<string, unknown>, status: number, outcome: string, emitOutcome: (outcome: string) => void): Response => {
+    const timedResponse = (payload: CommitResponsePayload, status: number, outcome: string, emitOutcome: (outcome: string) => void): Response => {
       const responseStartedAt = Date.now();
       const responsePayload = { ...payload };
       serverTimings.responseMs = Date.now() - responseStartedAt;
       serverTimings.totalMs = Date.now() - startedAt;
       timingsFinalized = true;
-      responsePayload.serverTimings = { ...serverTimings };
       emitOutcome(outcome);
-      return json(responsePayload, status);
+      return json({ ...responsePayload, serverTimings: { ...serverTimings } }, status);
     };
 
     // Design 103 Part A: cheap best-effort staleness fast-path. Returns a finished
@@ -885,18 +910,19 @@ export class WorkspaceSync {
       op.done("body_too_large", { bytes: MAX_REQUEST_BODY });
       return json({ error: "body_too_large", message: "request body too large", max: MAX_REQUEST_BODY }, 413);
     }
-    let body: { receipts?: unknown } | null;
+    let body: JsonValue;
     try {
-      body = raw ? JSON.parse(raw) : null;
+      body = raw ? JSON.parse(raw) as JsonValue : null;
     } catch {
       body = null;
     }
-    if (!body || typeof body.receipts !== "object" || body.receipts === null || Array.isArray(body.receipts)) {
+    const entries = body && typeof body === "object" && !Array.isArray(body)
+      ? parseReceiptEntries(body.receipts)
+      : null;
+    if (!entries) {
       op.done("bad_request");
       return json({ error: "bad_request", message: "missing receipts" }, 400);
     }
-
-    const entries = Object.entries(body.receipts as Record<string, unknown>);
     const max = receiptRedeemMax(this.env);
     if (entries.length > max) {
       op.done("too_many_receipts", { count: entries.length });
@@ -907,13 +933,13 @@ export class WorkspaceSync {
     const nowMs = Date.now();
     const db = dbFor(op.env, accountId);
     const precheckStartedAt = performance.now();
-    const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
+    const have = await this.entitledPresent(db, entries.map(({ sha }) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
     const precheckMs = performance.now() - precheckStartedAt;
     const verified: Array<{ sha: string; size: number; expiresAt: number; packId?: string }> = [];
     let alreadyEntitled = 0;
     let rejected = 0;
     const verifyStartedAt = performance.now();
-    for (const [sha, receipt] of entries) {
+    for (const { sha, receipt } of entries) {
       if (!SHA_RE.test(sha) || typeof receipt !== "string") {
         rejected++;
         continue;
@@ -1007,7 +1033,7 @@ export class WorkspaceSync {
     const seqRootsPage = seqRows.slice(0, limit).map((r) => ({
       seq: Number(r.seq), manifestSha: String(r.manifest_sha), ...(r.carrier_sha == null ? {} : { carrierSha: String(r.carrier_sha) }),
     }));
-    const gap: Array<Record<string, unknown>> = [];
+    const gap: RootsGapEntry[] = [];
     let gapRefs = 0;
     for (let s = Math.max(1, synced); s <= head; s++) {
       const raw = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
@@ -1175,7 +1201,7 @@ export class WorkspaceSync {
       seq: Number(r.seq), manifestSha: String(r.manifest_sha), ...(r.carrier_sha == null ? {} : { carrierSha: String(r.carrier_sha) }),
     }));
 
-    const gapPage: Array<Record<string, unknown>> = [];
+    const gapPage: RootsGapEntry[] = [];
     if (fromGapSeqRaw !== "done") {
       const firstGapSeq = Math.max(1, synced);
       const cursor = fromGapSeq ?? firstGapSeq - 1;

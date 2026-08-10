@@ -35,7 +35,7 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function isValidEntry(e: unknown): e is HashCacheEntry {
   if (typeof e !== "object" || e === null) return false;
-  const { mtimeMs, size, ctimeMs, sha256 } = e as Record<string, unknown>;
+  const { mtimeMs, size, ctimeMs, sha256 } = e as Partial<HashCacheEntry>;
   return Number.isFinite(mtimeMs) && Number.isFinite(size) && Number.isFinite(ctimeMs) && typeof sha256 === "string" && SHA256_HEX.test(sha256);
 }
 

@@ -134,10 +134,18 @@ export class QuotaExceededError extends Error {
 
 const finite = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 
-function jsonObject(text: string): Record<string, unknown> | undefined {
+interface RemoteErrorPayload {
+  error?: unknown;
+  limit?: unknown;
+  reason?: unknown;
+  used?: unknown;
+  cap?: unknown;
+}
+
+function jsonObject(text: string): RemoteErrorPayload | undefined {
   try {
     const body = JSON.parse(text) as unknown;
-    return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+    return body && typeof body === "object" && !Array.isArray(body) ? body as RemoteErrorPayload : undefined;
   } catch {
     return undefined;
   }

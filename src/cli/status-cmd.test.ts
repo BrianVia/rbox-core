@@ -62,7 +62,7 @@ function liveDaemon(overrides: Partial<DaemonObservation> = {}): DaemonObservati
  * classified by the REAL observation — the version and skew claims below are the
  * production rule, not a restatement of it. */
 const observedLiveDaemon = (
-  record: Partial<AmbientDaemonStatusV1> & Record<string, unknown>,
+  record: Partial<AmbientDaemonStatusV1>,
   opts: { legacyRecords?: boolean } = {},
 ): DaemonObservation => observeDaemon(root, cfg.remoteWorkspaceId, NOW, {
   readPid: () => opts.legacyRecords
@@ -678,7 +678,19 @@ test("degraded legacy deferral reload retains status reason and age", async () =
 
 test("status --json exposes only the stable local deferral projection and cannot report ok", async () => {
   await saveDeferralState();
-  const parsed = JSON.parse(await captureStatus({ json: true })) as Record<string, any>;
+  const parsed = JSON.parse(await captureStatus({ json: true })) as {
+    health: string;
+    git: { deferrals: Array<{
+      repo: string;
+      lane: string;
+      reason: string;
+      deferredSince: string;
+      reasonSince: string;
+      ageSeconds: number;
+      bytesChanged: boolean;
+      checkout?: { kind: "detached" } | { kind: "branch"; label?: string };
+    }> };
+  };
   expect(parsed.health).not.toBe("ok");
   expect(parsed.git.deferrals).toEqual([
     {

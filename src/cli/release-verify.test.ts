@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RELEASE_KEYS } from "./release-key.js";
-import { verifyReleaseArtifacts } from "./release-verify.js";
+import { verifyReleaseArtifacts, type Manifest } from "./release-verify.js";
 
 // verifyReleaseArtifacts is the SINGLE gate BOTH publish paths go through — the single-shot
 // `release.ts` upload and the split `--upload-only` both call uploadRelease() → this. So
@@ -23,7 +23,7 @@ function mkdist(opts: { manifest?: string; sig?: string; bins?: Record<string, B
   for (const [name, bytes] of Object.entries(opts.bins ?? {})) fs.writeFileSync(path.join(dir, name), bytes);
   return dir;
 }
-const manifestJson = (over: Record<string, unknown> = {}) =>
+const manifestJson = (over: Partial<Manifest> = {}) =>
   JSON.stringify({ version: VER, keyId: KNOWN_KEY, artifacts: { "rbox-linux-x64": { sha256: "ab".repeat(32), path: `v${VER}/rbox-linux-x64` } }, ...over });
 
 const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });

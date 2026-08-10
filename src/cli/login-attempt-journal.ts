@@ -29,6 +29,7 @@ import {
   fsyncDirectory,
   writeFileAtomic,
 } from "../engine/fsutil.js";
+import type { JsonObject } from "../json.js";
 
 const VERSION = 1 as const;
 const DEVICE_CODE_RE = /^[0-9a-f]{64}$/;
@@ -158,11 +159,11 @@ export function loginAttemptPath(requestId: string): string {
   return candidate;
 }
 
-function plain(value: unknown): value is Record<string, unknown> {
+function plain(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+function exactKeys(value: JsonObject, expected: readonly string[]): boolean {
   const actual = Object.keys(value);
   return actual.length === expected.length && actual.every((key) => expected.includes(key));
 }

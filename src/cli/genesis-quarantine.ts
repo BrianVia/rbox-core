@@ -3,6 +3,7 @@ import path from "node:path";
 import { canonicalString, parseStrict, sha256Hex, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
 import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
+import type { JsonObject } from "../json.js";
 
 export type GenesisQuarantinePurpose="repaired-legacy"|"abandoned-attempt";
 export interface GenesisQuarantineEntry{source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string}
@@ -10,7 +11,7 @@ export interface GenesisQuarantineManifest{version:1;accountId:string;purpose:Ge
 export interface GenesisQuarantineCompleted{version:1;accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;manifestSha256:string;completedAt:string}
 
 const exact=(value:object,keys:string[])=>{const actual=Object.keys(value);return actual.length===keys.length&&actual.every((k)=>keys.includes(k));};
-const plain=(value:unknown):value is Record<string,unknown>=>typeof value==="object"&&value!==null&&!Array.isArray(value);
+const plain=(value:unknown):value is JsonObject=>typeof value==="object"&&value!==null&&!Array.isArray(value);
 const iso=(value:unknown):value is string=>typeof value==="string"&&!Number.isNaN(Date.parse(value))&&new Date(value).toISOString()===value;
 const shaRe=/^[0-9a-f]{64}$/;
 

@@ -29,10 +29,28 @@ import { bracketSource, halt, requirePhase } from "./phase-io.js";
 
 export const STAGING_PROOF_VERSION = 1;
 
-function checkRows(db: Database, pragma: string): Array<Record<string, unknown>> {
-  const prepared = db.prepare(pragma);
+interface ForeignKeyViolationRow {
+  table: string;
+  rowid: number | null;
+  parent: string;
+  fkid: number;
+}
+
+interface IntegrityCheckRow { integrity_check: string }
+
+function foreignKeyViolations(db: Database): ForeignKeyViolationRow[] {
+  const prepared = db.prepare("PRAGMA foreign_key_check");
   try {
-    return prepared.all() as Array<Record<string, unknown>>;
+    return prepared.all() as ForeignKeyViolationRow[];
+  } finally {
+    prepared.finalize();
+  }
+}
+
+function integrityCheck(db: Database): IntegrityCheckRow[] {
+  const prepared = db.prepare("PRAGMA integrity_check");
+  try {
+    return prepared.all() as IntegrityCheckRow[];
   } finally {
     prepared.finalize();
   }
@@ -78,13 +96,13 @@ function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
     // only under `PRAGMA foreign_keys` for the rows it happens to touch. An
     // orphaned `plane_entries` row is structurally perfect and semantically
     // dangling, which is exactly the shape a partial import produces.
-    const violations = checkRows(db, "PRAGMA foreign_key_check");
+    const violations = foreignKeyViolations(db);
     if (violations.length > 0) {
       halt("verification", false, `the imported database has ${violations.length} foreign key violations`,
         { underlyingCode: "foreign-key-check" });
     }
-    const integrity = checkRows(db, "PRAGMA integrity_check");
-    const verdict = integrity.length === 1 ? Object.values(integrity[0]!)[0] : undefined;
+    const integrity = integrityCheck(db);
+    const verdict = integrity.length === 1 ? integrity[0]!.integrity_check : undefined;
     if (verdict !== "ok") {
       halt("verification", false, "the imported database failed integrity_check",
         { underlyingCode: "integrity-check" });

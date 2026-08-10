@@ -5,6 +5,7 @@ import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
+import { manifestGitReposWasPresent } from "../digest/source-shape.js";
 import { CursorWindowError, GitSectionOversizeError, SnapshotChangedError, decodeAuthorityRow } from "../errors.js";
 import type {
   CursorPage, GitSectionRole, LineageSnapshot, ManifestHeader, Plane,
@@ -71,12 +72,8 @@ export function currentSnapshot(db: Database): LineageSnapshot {
       snapshotBytes: meta.snapshot_bytes,
     } as Omit<GlobalManifestMeta, "chain" | "gitRepos">))
     : undefined;
-  const sourceShape = decodeAuthorityRow("migrationCompletion", core.lineage_id,
-    () => parseCanonicalJson(core.source_shape_flags_cjson) as Record<string, unknown>);
-  const manifestShape = sourceShape.lastSyncedManifest;
-  const manifestGitReposPresent = typeof manifestShape === "object" && manifestShape !== null
-    && !Array.isArray(manifestShape)
-    && (manifestShape as Record<string, unknown>).gitRepos === true;
+  const manifestGitReposPresent = decodeAuthorityRow("migrationCompletion", core.lineage_id,
+    () => manifestGitReposWasPresent(parseCanonicalJson(core.source_shape_flags_cjson)));
   return {
     authorityId: core.authority_id,
     lineageId: core.lineage_id,

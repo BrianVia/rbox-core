@@ -39,7 +39,7 @@ function hex(width: number, value: number): string {
   return value.toString(16).padStart(width, "0");
 }
 
-function section(value: number, extras: Record<string, unknown> = {}): GitSection {
+function section(value: number, extras: Partial<GitSection> = {}): GitSection {
   return {
     ...extras,
     bundleSha: hex(64, value + 1),

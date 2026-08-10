@@ -115,9 +115,22 @@ export function containerExecPrefix(runId: string, home: string): string {
 }
 
 interface DockerInspect {
-  Config?: { Image?: unknown; Env?: unknown; Labels?: unknown };
+  Config?: { Image?: unknown; Env?: unknown; Labels?: DockerLabels };
   HostConfig?: { NetworkMode?: unknown };
   Mounts?: unknown;
+}
+
+interface DockerLabels {
+  ux?: unknown;
+  "ux.run"?: unknown;
+  "ux.repo"?: unknown;
+  "ux.spec"?: unknown;
+}
+
+interface DockerMountCandidate {
+  Source?: unknown;
+  Destination?: unknown;
+  RW?: unknown;
 }
 
 function inspectRow(value: unknown): DockerInspect | undefined {
@@ -129,7 +142,7 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   const row = inspectRow(value);
   const labels = row?.Config?.Labels;
   if (!labels || typeof labels !== "object" || Array.isArray(labels)) return "collision";
-  const map = labels as Record<string, unknown>;
+  const map = labels;
   if (map.ux !== "1" || map["ux.run"] !== plan.runId || map["ux.repo"] !== plan.repoId) return "collision";
   if (row?.Config?.Image !== plan.image || row.HostConfig?.NetworkMode !== plan.network) return "collision";
   const env = Array.isArray(row.Config.Env) ? row.Config.Env : [];
@@ -138,12 +151,12 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   const mounts = Array.isArray(row.Mounts) ? row.Mounts : [];
   const mountMatches = (want: C.Mount, candidate: unknown): boolean => {
     if (!candidate || typeof candidate !== "object") return false;
-    const mount = candidate as Record<string, unknown>;
+    const mount = candidate as DockerMountCandidate;
     return mount.Source === want.source && mount.Destination === want.target && mount.RW === !want.readonly;
   };
   const actualCore = mounts.filter((candidate) =>
     candidate && typeof candidate === "object" &&
-    (candidate as Record<string, unknown>).Destination !== UX_GUEST_RBOX
+    (candidate as DockerMountCandidate).Destination !== UX_GUEST_RBOX
   );
   const desiredCore = plan.mounts.filter((want) => want.target !== UX_GUEST_RBOX);
   const coreMatches = actualCore.length === desiredCore.length &&
@@ -161,7 +174,7 @@ export function configureUxRuntime(): void {
 
 export function uxImageHasLabel(value: unknown): boolean {
   const labels = inspectRow(value)?.Config?.Labels;
-  return Boolean(labels && typeof labels === "object" && !Array.isArray(labels) && (labels as Record<string, unknown>).ux === "1");
+  return Boolean(labels && typeof labels === "object" && !Array.isArray(labels) && labels.ux === "1");
 }
 
 async function ensureImageCurrent(): Promise<string> {

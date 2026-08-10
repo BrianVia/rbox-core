@@ -6,7 +6,7 @@
  * once data accrues is a one-line edit, and the assessor is PURE (unit-tested) so the
  * "is the idle daemon quiet?" verdict never depends on a live container.
  */
-import { summarizeStats } from "../lib/capture.js";
+import { summarizeStats, type RawObservation } from "../lib/capture.js";
 
 /**
  * Provisional idle ceilings (design 56 §15 Q5 — replace with measured baselines).
@@ -41,7 +41,7 @@ export interface IdleAssessment {
   withinBudget: boolean;
 }
 
-type Sample = Record<string, unknown> & { ts?: unknown };
+type Sample = RawObservation;
 
 /** Nearest-rank percentile: p95 is the value at sorted rank ceil(0.95 * n). */
 function percentile95(values: number[]): number {

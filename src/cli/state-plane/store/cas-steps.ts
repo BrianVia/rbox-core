@@ -144,7 +144,7 @@ export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: st
   const meta = validManifestMeta(frozen.globalManifestMeta);
   if (!meta) throw new TypeError("CAS manifestMeta is not a valid GlobalManifestMeta");
   const { encManifestSha, manifestHash, accountEpoch, keyEpoch, chainBytes, snapshotBytes,
-    chain, gitRepos, ...metaExtras } = meta as GlobalManifestMeta & Record<string, unknown>;
+    chain, gitRepos, ...metaExtras } = meta;
   runStatement(db, `INSERT INTO global_manifest_meta(lineage_id,base_generation,enc_manifest_sha,manifest_hash,
     account_epoch,key_epoch,chain_bytes,snapshot_bytes,extras_cjson) VALUES (?,?,?,?,?,?,?,?,?)`,
     lineageId, generation, Buffer.from(encManifestSha, "hex"), Buffer.from(manifestHash, "hex"),

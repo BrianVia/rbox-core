@@ -7,6 +7,7 @@ import {
   exactObject,
   json,
   logErr,
+  objectWithKeys,
   sha256Hex,
   utf8Bytes,
 } from "../util.js";
@@ -319,7 +320,7 @@ interface FetchBody {
 }
 
 export function validateKeyDeliveryFetchBody(value: unknown): FetchBody | null {
-  if (!exactObject(value, ["keyReleaseOptIn"]) && !exactObject(value, ["keyReleaseOptIn", "requestId"])) return null;
+  if (!objectWithKeys(value, ["keyReleaseOptIn", "requestId"], ["keyReleaseOptIn"])) return null;
   if (typeof value.keyReleaseOptIn !== "boolean") return null;
   if (value.requestId !== undefined && (typeof value.requestId !== "string" || !REQUEST_ID_RE.test(value.requestId))) return null;
   return {

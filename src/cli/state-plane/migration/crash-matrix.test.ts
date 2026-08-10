@@ -94,7 +94,16 @@ function storeFacts(root: string): { counts: string; source: string; consistent:
       .join(",");
     const row = db.prepare(`SELECT origin_kind,source_json_sha256,source_bytes,entry_count,repo_count,
       source_shape_flags_cjson,source_repo_records_present,source_semantic_digest
-      FROM migration_completion WHERE singleton=1`).get() as Record<string, unknown>;
+      FROM migration_completion WHERE singleton=1`).get() as {
+        origin_kind: string;
+        source_json_sha256: string | null;
+        source_bytes: number;
+        entry_count: number;
+        repo_count: number;
+        source_shape_flags_cjson: string;
+        source_repo_records_present: number;
+        source_semantic_digest: string;
+      };
     return {
       counts,
       source: JSON.stringify({ ...row, source_semantic_digest: null }),

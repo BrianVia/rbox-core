@@ -35,7 +35,7 @@ afterEach(async () => {
 async function seedWorkspace(name: string, opts: {
   workspaceId?: string;
   boundWorkspaceId?: string;
-  status?: Partial<AmbientDaemonStatusV1> & Record<string, unknown>;
+  status?: Partial<AmbientDaemonStatusV1>;
   pidBootId?: string;
   withPidfile?: boolean;
   /** Omit the startup binding, as a daemon still in startup has. */

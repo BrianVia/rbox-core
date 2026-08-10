@@ -50,7 +50,7 @@ function workspace(label: string): string {
 
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function section(value: number, extras: Record<string, unknown> = {}): GitSection {
+function section(value: number, extras: Partial<GitSection> = {}): GitSection {
   return {
     ...extras,
     bundleSha: hex(64, value + 1), bundleEncSha: hex(64, value + 2), bundleCipherSize: value + 100,
@@ -266,7 +266,7 @@ test("the imported store reads back as the state the JSON path would have produc
   const store = openStateStore(imported.stagingPath, { readonly: true });
   try {
     const expected = JSON.parse(JSON.stringify(state)) as SyncState;
-    delete (expected.repoRecords!["repo-b"] as Record<string, unknown>).resolutionIntent;
+    delete (expected.repoRecords!["repo-b"] as RepoRecord & { resolutionIntent?: unknown }).resolutionIntent;
     // The one difference the import is allowed to make, stated rather than
     // hidden: manifest entries come back in `path_order`, because that is the
     // order `plane_entries` stores and the read path is a cursor over it. The
@@ -325,7 +325,7 @@ test("every imported entry is stamped with the BASE head generation", async () =
 test("resolutionIntent is stripped before the digest, not routed to extras", () => {
   const state = fixtureState();
   const stripped = JSON.parse(JSON.stringify(state)) as SyncState;
-  delete (stripped.repoRecords!["repo-b"] as Record<string, unknown>).resolutionIntent;
+  delete (stripped.repoRecords!["repo-b"] as RepoRecord & { resolutionIntent?: unknown }).resolutionIntent;
   const lineage = "e".repeat(32);
   expect(legacyStateSemanticDigest(normalizeLegacyStateV1(state, lineage)))
     .toBe(legacyStateSemanticDigest(normalizeLegacyStateV1(stripped, lineage)));
@@ -421,15 +421,19 @@ test("the normalizer refuses shapes the schema cannot hold", () => {
  */
 test.each([
   ["a malformed manifest entry", (state: SyncState) => {
-    (state.lastSyncedManifest.files as unknown as Array<Record<string, unknown>>)[0]!.mode = 99999;
+    const [first, ...rest] = state.lastSyncedManifest.files;
+    if (!first) throw new Error("fixture has no file entry");
+    state.lastSyncedManifest.files = [{ ...first, mode: 99999 }, ...rest];
   }],
   // Not a negative counter: `repoRecordsForState` normalizes those to zero by
   // design, so they never reach the encoder. This is a member no seam launders.
   ["a malformed repository record", (state: SyncState) => {
-    (state.repoRecords!["repo-a"] as unknown as Record<string, unknown>).removedKey = 42;
+    type InvalidRemovedKeyRecord = Omit<RepoRecord, "removedKey"> & { removedKey?: unknown };
+    (state.repoRecords!["repo-a"] as InvalidRemovedKeyRecord).removedKey = 42;
   }],
   ["a malformed git section", (state: SyncState) => {
-    (state.lastSyncedManifest.gitRepos as unknown as Record<string, unknown>)["repo-a"] = { bundleSha: "nope" };
+    const sections = state.lastSyncedManifest.gitRepos as Record<string, GitSection | Partial<GitSection>>;
+    sections["repo-a"] = { bundleSha: "nope" };
   }],
 ])("%s refuses before SQLite opens, with wrote=false", async (_label, corrupt) => {
   const root = workspace("typed-refusal");
@@ -935,7 +939,7 @@ test("M4 refuses a dangling plane entry that integrity_check calls healthy", asy
   db.exec("PRAGMA foreign_keys=OFF");
   db.query(`INSERT INTO plane_entries(lineage_id,plane,path,path_order,entry_id,changed_generation)
     VALUES ((SELECT lineage_id FROM state_lineage),'base','orphan.txt',x'0000','no-such-entry',0)`).run();
-  expect((db.query("PRAGMA integrity_check").all() as Array<Record<string, unknown>>)
+  expect((db.query("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>)
     .map((row) => Object.values(row)[0])).toEqual(["ok"]);
   expect(db.query("PRAGMA foreign_key_check").all().length).toBeGreaterThan(0);
   store.close();

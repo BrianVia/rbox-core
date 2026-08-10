@@ -69,6 +69,7 @@ import type { Recorder } from "./harness.js";
 import { CONCURRENCY, provisionPair, startDaemons, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import type { RepoRecord, SyncState } from "../../../src/cli/sync-state-model.js";
 
 const REPO = "repo-200";
 const BRANCH = "feat/agent-work";
@@ -112,14 +113,14 @@ interface RepoRecordView {
   base?: GitSectionView;
   advertised?: GitSectionView;
   pending?: GitSectionView | null;
-  partial?: { heldRefs?: Record<string, string>; appliedRefs?: Record<string, unknown> } | null;
+  partial?: Partial<Pick<NonNullable<RepoRecord["partial"]>, "heldRefs" | "appliedRefs">> | null;
   deferrals?: Record<string, { reason?: string; deferredSince?: string } | undefined>;
 }
 
 interface SyncStateView {
   repoRecords?: Record<string, RepoRecordView>;
-  gitPendingRemote?: Record<string, unknown>;
-  gitNeedsResolution?: Record<string, unknown>;
+  gitPendingRemote?: SyncState["gitPendingRemote"];
+  gitNeedsResolution?: SyncState["gitNeedsResolution"];
 }
 
 async function readSyncState(device: Device): Promise<SyncStateView> {

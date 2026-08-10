@@ -140,7 +140,7 @@ test("a shutdown mid-pull aborts the repo loop instead of deferring the repos it
   // nothing may be recorded against them — clearing a held attempt is destructive
   // and a spurious "other" deferral rewrites the user-visible reason.
   const untouched = new Set<string>(REPOS.slice(1));
-  const recorded = (map: Record<string, unknown> | undefined): string[] =>
+  const recorded = <T>(map: Readonly<Partial<Record<string, T>>> | undefined): string[] =>
     Object.keys(map ?? {}).filter((rel) => untouched.has(rel)).sort();
   expect(outcome.status === "resolved" ? recorded(outcome.value.attempt) : []).toEqual([]);
   expect(outcome.status === "resolved" ? recorded(outcome.value.deferrals) : []).toEqual([]);

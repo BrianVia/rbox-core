@@ -37,7 +37,7 @@ function acceptedFields(section: GitSection | undefined): AcceptedFields | undef
   if (!section || (section.refTombstones === undefined && section.refTombstoneGeneration === undefined)) {
     return { generation: 0, chains: {} };
   }
-  if (!validateRefTombstones(section as unknown as Record<string, unknown>).ok) return undefined;
+  if (!validateRefTombstones(section).ok) return undefined;
   return {
     generation: section.refTombstoneGeneration ?? 0,
     chains: Object.fromEntries(Object.entries(section.refTombstones ?? {}).map(([ref, entries]) => [
