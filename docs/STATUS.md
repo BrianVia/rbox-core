@@ -5,6 +5,30 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-11: **Design 231 (folder config authority) rewritten for
+the pre-2.0 breaking posture and two slices shipped.** Founder decision
+(standing, general posture): pre-2.0, breaking changes beat legacy migrations —
+3 external users, all manually fixable; recorded in AGENTS/CLAUDE "Simple
+primitives, less code" section (`74f8faff1`; ask "simplest off-the-shelf?" +
+"remove dumb requirements?"; SQLite for internal state, JSON only for
+human-edited records). MERGED: #629 slice-1 catalog foundation (size-gate
+split into folder-config + folder-config-codec), #630 FolderInventory
+read-only wrapper (opus review caught a CRITICAL: malformed workspace.json
+emptied machine triage; fixed + regression test; also fixed pre-existing HOME
+env leak in login-device-fsm.test.ts — 4 more leaker files logged in
+papercuts), #631 full in-place doc rewrite (3 codex rounds to ALIGNED,
+REVIEW-231-R4..R6): no marker file, no compatibility projection, states
+absent|authoritative|damaged, fresh machine generates silently, machine with
+bindings errors toward explicit destructive `rbox config regenerate`.
+DISCARDED unmerged: slice-2 projection interface (existed only for downgrade
+compat). IN FLIGHT: opus file-level plan for §11 slice 3 — ONE atomic
+activation PR (delete dormant marker/candidate code, full inventory union,
+generation, runtime switch, move/copy repair; all §12 gates incl. rigs
+pre-merge). THEN founder-authorized fleet trial: rig → workstation → MacBook →
+flat-meadow last, pre-upgrade snapshot (tar ~/.rbox + per-folder .rbox) each.
+Earlier same session: #628 folder-first review, #627 nits, FLAKE-007 Bun
+canary forensics._
+
 _SESSION 2026-08-03 (later): **2.0 MERGED INTO MAIN (#623, squash `098d00643`)
 — the U3 line now ships from the integration branch.** Branch tip preserved as
 tag `archive/2.0` (repo forbids merge commits); `origin/2.0` can be deleted
