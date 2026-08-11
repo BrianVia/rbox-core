@@ -5,6 +5,28 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-11 (later): **DESIGN 231 ACTIVATED — #632 merged; config.json
+is the live folder authority. Workstation upgraded and verified.** One atomic
+PR (7 staged commits, codex implemented / Fable folded): single-file authority
+(absent|authoritative|damaged, no marker), inventory union, write-side +
+runtime switch (one pinned admission per op; v0.9.2 reload shape kept), rbox
+config/add/regenerate/repair commands. Review: 2 opus lenses + codex (12 ruled
+findings folded) + final serial opus review (DO-NOT-SHIP → 6 more fixes: halt
+precedence N1, tolerant union reads N2, repair lock order N3, recycle backoff,
+corrupt-binding add, policy-stamped caches) → shipped. Validation: 5,197/0
+full suite, regress 11/11, docker rig e2e, all on final tree. FLEET TRIAL:
+via-desktop DONE (snapshot ~/rbox-pre-231-snapshot-20260811-194119.tar.gz;
+regenerate clean, ghost /tmp row skipped by name, sync + daemon green on
+1.11.4-dev+59c2552). NEXT: MacBook after workstation soak, flat-meadow last,
+each with pre-upgrade tar of ~/.rbox + per-folder .rbox. Release: founder
+chose next-channel v2.0.0-beta.1 for 2.0-dev distribution (tag needs fresh
+explicit yes). OPEN for founder: help copy at FOUNDER-SIGN-OFF comments;
+ruling that `git resolve show-me` requires admission; release note re one-time
+hashcache discard on upgrade. Deferred: generation-vs-recordFolder/untrack
+race fixtures. NOTE: long-running background tasks (codex + bun) were being
+externally killed all evening on this host — cause unfound, worked around
+with short dispatches + foreground runs._
+
 _SESSION 2026-08-11: **Design 231 (folder config authority) rewritten for
 the pre-2.0 breaking posture and two slices shipped.** Founder decision
 (standing, general posture): pre-2.0, breaking changes beat legacy migrations —
