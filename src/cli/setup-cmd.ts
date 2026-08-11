@@ -906,13 +906,17 @@ export async function stepWorkspace(
       );
       if (ans) name = ans;
 
-      const catalog = await ensureAuthority({ currentRoot: dir });
-      const inheritedRespectGitignore = resolveFolderPolicy(catalog.snapshot.catalog.globalOptions, {}).respectGitignore;
+      await ensureAuthority({ currentRoot: dir });
+      // The preselection is the product recommendation (design 230's pinned
+      // flow), not catalog inheritance: a generated catalog's global default
+      // equals the product default, so the two are indistinguishable here.
+      // A global respectGitignore=true also preselects "true", coinciding.
+      // The answer is recorded as an explicit folder override either way.
       const respectGitignore =
         (await select<"false" | "true">({
           message: "How should rbox handle gitignored files?",
           choices: SETUP_GITIGNORE_CHOICES,
-          default: inheritedRespectGitignore ? "true" : "false",
+          default: "true",
         })) === "true";
 
       if (!creds) throw new Error("login did not produce a credential — aborting setup");
