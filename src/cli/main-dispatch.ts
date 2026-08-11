@@ -122,15 +122,15 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
 /** #498: outside a workspace, `rbox doctor`/`rbox status` summarize every synced
  * folder on this machine instead of dead-ending on "Not inside an rbox workspace". */
 async function runMachineTriage(jsonMode: boolean, surface: "doctor" | "status" = "doctor"): Promise<void> {
-  const { collectMachineTriage, renderMachineStatusTable, renderMachineTriage } = await import("./doctor-machine.js");
-  const triage = await collectMachineTriage();
+  const { collectMachineAggregate, renderMachineStatusTable, renderMachineTriage } = await import("./doctor-machine.js");
+  const { triage, configuredButUnbound } = await collectMachineAggregate();
   if (jsonMode) {
     const { emitJson } = await import("./json.js");
     emitJson(triage);
     return;
   }
   const render = surface === "status" ? renderMachineStatusTable : renderMachineTriage;
-  for (const line of render(triage)) console.log(line);
+  for (const line of render(triage, configuredButUnbound)) console.log(line);
 }
 
 /** `--all` is an aggregate over every locally known workspace, so a PATH — which
@@ -257,6 +257,11 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       if (positional.length > 2) throw new Error("usage: rbox adopt <status|resume|abort|clean> [path] [--json] [--yes]");
       const { adoptCmd } = await import("./adopt-cmd.js");
       await adoptCmd(positional[0], positional[1] ?? process.cwd(), { json: jsonMode, yes: flags.yes === "true" });
+      break;
+    }
+    case "config": {
+      const { folderConfigCmd } = await import("./folder-config-cmd.js");
+      await folderConfigCmd(positional, { json: jsonMode, yes: flags.yes === "true" });
       break;
     }
     case "track": {

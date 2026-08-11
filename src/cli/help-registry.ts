@@ -191,6 +191,36 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--yes", desc: "confirm permanent removal for adopt clean" },
     ],
   },
+  // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
+  {
+    name: "config",
+    group: "GETTING STARTED",
+    summary: "show this machine's folder configuration",
+    usage: "rbox config [--json]",
+    flags: [{ flag: "--json", desc: "print folder intent and status as JSON" }],
+  },
+  // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
+  {
+    name: "config add",
+    group: "GETTING STARTED",
+    summary: "add a bound folder to this machine's configuration",
+    usage: "rbox config add <path>",
+  },
+  // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
+  {
+    name: "config regenerate",
+    group: "GETTING STARTED",
+    summary: "rebuild folder configuration from local bindings",
+    usage: "rbox config regenerate [--yes]",
+    flags: [{ flag: "--yes", short: "-y", desc: "replace the configuration without prompting (alias: -y)" }],
+  },
+  // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
+  {
+    name: "config repair",
+    group: "GETTING STARTED",
+    summary: "finish rebinding a folder moved on this machine",
+    usage: "rbox config repair <path>",
+  },
 
   // ── SYNCING ──────────────────────────────────────────────────────────────
   {

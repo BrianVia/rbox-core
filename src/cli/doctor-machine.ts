@@ -17,7 +17,7 @@
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
 import { inspectFolderCatalog } from "./folder-config.js";
-import { listFolderInventory } from "./folder-inventory.js";
+import { listFolderInventory, type FolderInventoryRow } from "./folder-inventory.js";
 import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
@@ -66,6 +66,13 @@ export interface MachineTriageDeps {
   listFolderInventory?: typeof listFolderInventory;
   observeDaemon?: typeof observeDaemon;
   now?: () => number;
+}
+
+export type ConfiguredButUnboundFolder = Pick<FolderInventoryRow, "root" | "catalog" | "admission">;
+
+export interface MachineAggregate {
+  triage: MachineTriage;
+  configuredButUnbound: ConfiguredButUnboundFolder[];
 }
 
 const ATTENTION_SUMMARY: Record<string, string> = {
@@ -126,9 +133,15 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
   };
 }
 
-export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
+export async function collectMachineAggregate(deps: MachineTriageDeps = {}): Promise<MachineAggregate> {
   const state = await inspectFolderCatalog();
   const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state).catch(() => ({ rows: [] }));
+  const configuredButUnbound = inventory.rows
+    .filter((row) => row.catalog !== undefined
+      && row.registry === undefined
+      && row.desired === undefined
+      && row.admission.kind !== "admitted")
+    .map((row) => ({ root: row.root, catalog: row.catalog, admission: row.admission }));
   // Machine JSON v1 is registry-shaped and closed. Catalog/current-root-only
   // evidence belongs to the folder-config surface, not this compatibility view.
   const rows = deps.readBindingRegistry === undefined
@@ -201,7 +214,14 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
     });
   }
   workspaces.sort((a, b) => a.root.localeCompare(b.root));
-  return { schemaVersion: 1, scope: "machine", workspaces };
+  return {
+    triage: { schemaVersion: 1, scope: "machine", workspaces },
+    configuredButUnbound,
+  };
+}
+
+export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
+  return (await collectMachineAggregate(deps)).triage;
 }
 
 const MARK: Record<MachineWorkspaceState, string> = {
@@ -221,14 +241,33 @@ const needsAttention = (workspace: MachineWorkspaceSummary): boolean =>
   workspace.state === "attention" || workspace.state === "unreachable" || workspace.state === "unknown"
   || (workspace.deferredRepos ?? 0) > 0;
 
-export function renderMachineTriage(triage: MachineTriage): string[] {
+function appendConfiguredButUnbound(
+  lines: string[],
+  rows: readonly ConfiguredButUnboundFolder[],
+): void {
+  if (rows.length === 0) return;
+  lines.push("");
+  lines.push(style.bold("configured but not bound"));
+  for (const row of rows) {
+    lines.push(`${style.sym.warn} ${style.bold(row.catalog?.name ?? path.basename(row.root))} ${style.dim(row.root)}`);
+    lines.push(`    ${row.admission.kind}: ${row.admission.kind === "admitted" ? "not present in the machine registry" : row.admission.reason}`);
+  }
+  lines.push(`    ${style.dim("run:")} rbox config`);
+}
+
+export function renderMachineTriage(
+  triage: MachineTriage,
+  configuredButUnbound: readonly ConfiguredButUnboundFolder[] = [],
+): string[] {
   if (triage.workspaces.length === 0) {
-    return [
+    const lines = [
       `${style.bold("rbox doctor")} — no synced folders on this machine`,
       "",
       "rbox is not syncing anything here yet.",
       `${style.dim("run:")} rbox setup`,
     ];
+    appendConfiguredButUnbound(lines, configuredButUnbound);
+    return lines;
   }
   const count = triage.workspaces.length;
   const lines = [
@@ -240,6 +279,7 @@ export function renderMachineTriage(triage: MachineTriage): string[] {
     lines.push(`    ${workspace.summary}`);
     if (workspace.command) lines.push(`    ${style.dim("run:")} ${workspace.command}`);
   }
+  appendConfiguredButUnbound(lines, configuredButUnbound);
   lines.push("");
   lines.push(style.dim("machine-readable: rbox doctor --all --json"));
   return lines;
@@ -295,14 +335,20 @@ function padCells(rows: string[][]): string[] {
  * pending work, and the highest-priority problem. Same projection as
  * `doctor --all`; only the presentation differs.
  */
-export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()): string[] {
+export function renderMachineStatusTable(
+  triage: MachineTriage,
+  configuredButUnbound: readonly ConfiguredButUnboundFolder[] = [],
+  now = Date.now(),
+): string[] {
   if (triage.workspaces.length === 0) {
-    return [
+    const lines = [
       `${style.bold("rbox status")} — no synced folders on this machine`,
       "",
       "rbox is not syncing anything here yet.",
       `${style.dim("run:")} rbox`,
     ];
+    appendConfiguredButUnbound(lines, configuredButUnbound);
+    return lines;
   }
   const count = triage.workspaces.length;
   const header = ["NAME", "FOLDER", "BINDING", "SYNC", "LAST SYNC", "PENDING", "PROBLEM"];
@@ -317,7 +363,7 @@ export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()
   ]);
   const [head, ...rest] = padCells([header, ...body]);
   const problems = triage.workspaces.filter(needsAttention).length;
-  return [
+  const lines = [
     `${style.bold("rbox status --all")} — ${count} synced folder${count === 1 ? "" : "s"} on this machine`,
     "",
     // Every mark is exactly one visible character, so two spaces keep the
@@ -328,4 +374,6 @@ export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()
     style.dim(problems === 0 ? "nothing needs your attention." : `${problems} need${problems === 1 ? "s" : ""} attention — run: rbox doctor --all`),
     style.dim("machine-readable: rbox status --all --json"),
   ];
+  appendConfiguredButUnbound(lines, configuredButUnbound);
+  return lines;
 }

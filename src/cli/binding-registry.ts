@@ -293,6 +293,39 @@ export async function forgetBinding(root: string): Promise<boolean> {
   return removed;
 }
 
+/** Strict, crash-retryable root relocation for `rbox config repair`.
+ * Preserves the complete cached row and binding lifetime under the registry's
+ * existing global lock. Unlike rememberBinding, failures are never swallowed. */
+export async function relocateBinding(
+  oldRoot: string,
+  newRoot: string,
+  expectedWorkspaceId: string,
+): Promise<"moved" | "already-relocated" | "absent"> {
+  const oldAbs = path.resolve(oldRoot);
+  const newAbs = path.resolve(newRoot);
+  let result: "moved" | "already-relocated" | "absent" = "absent";
+  await mutate((entries) => {
+    const source = entries.find((entry) => entry.root === oldAbs);
+    const destination = entries.find((entry) => entry.root === newAbs);
+    if (source !== undefined && source.workspaceId !== expectedWorkspaceId) {
+      throw new Error(`workspace registry source ${oldAbs} belongs to a different workspace`);
+    }
+    if (destination !== undefined && destination.workspaceId !== expectedWorkspaceId) {
+      throw new Error(`workspace registry destination ${newAbs} belongs to a different workspace`);
+    }
+    if (source === undefined) {
+      result = destination === undefined ? "absent" : "already-relocated";
+      return undefined;
+    }
+    result = "moved";
+    return [
+      ...entries.filter((entry) => entry.root !== oldAbs && entry.root !== newAbs),
+      { ...source, root: newAbs },
+    ];
+  });
+  return result;
+}
+
 /** Is this root known to the registry at all (persisted or daemon-derived)? */
 export async function isRegisteredRoot(root: string): Promise<boolean> {
   const abs = path.resolve(root);

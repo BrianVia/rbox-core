@@ -20,7 +20,7 @@ import {
 
 export type FolderAdmission =
   | { kind: "admitted"; generation: string; policy: ResolvedFolderPolicy }
-  | { kind: "unbound" | "missing" | "detached" | "damaged"; reason: string };
+  | { kind: "unbound" | "missing" | "detached" | "damaged" | "ambiguous"; reason: string };
 
 export interface FolderInventoryRow {
   root: string;
@@ -69,7 +69,7 @@ export function runtimeRefusal(admission: Exclude<FolderAdmission, { kind: "admi
   return new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`);
 }
 
-function classify(row: Pick<FolderUnionRow, "catalog" | "binding" | "bindingConfig" | "exists" | "observationError">, state: FolderCatalogState): FolderAdmission {
+function classify(row: Pick<FolderUnionRow, "root" | "catalog" | "binding" | "bindingConfig" | "exists" | "observationError">, state: FolderCatalogState): FolderAdmission {
   if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
   if (!row.exists) {
     return row.observationError === undefined
@@ -81,6 +81,18 @@ function classify(row: Pick<FolderUnionRow, "catalog" | "binding" | "bindingConf
       ? row.binding.unreadable
       : "the folder has no rbox binding";
     return { kind: "unbound", reason };
+  }
+  // loadConfig is a tolerant cast: pre-catalog records may omit rootPath even
+  // though the type requires it. A binding observed AT this root with no
+  // recorded path lives here; only a conflicting recorded path is ambiguous.
+  const recordedRoot = typeof row.bindingConfig.rootPath === "string"
+    ? path.resolve(row.bindingConfig.rootPath)
+    : row.root;
+  if (recordedRoot !== row.root) {
+    return {
+      kind: "ambiguous",
+      reason: `the binding still names ${recordedRoot}; if this folder moved here, run \`rbox config repair ${row.root}\``,
+    };
   }
   if (state.kind === "absent") {
     return { kind: "damaged", reason: "rbox folder configuration is absent; run `rbox config regenerate`" };
@@ -104,6 +116,29 @@ function publicRow(row: FolderUnionRow, state: FolderCatalogState): FolderInvent
   };
 }
 
+function markDuplicateBindingIdentities(rows: FolderUnionRow[], projected: FolderInventoryRow[]): void {
+  const rootsByIdentity = new Map<string, string[]>();
+  for (const row of rows) {
+    if (row.bindingConfig === undefined) continue;
+    const key = `${row.bindingConfig.remoteWorkspaceId}\0${row.bindingConfig.deviceId}`;
+    const roots = rootsByIdentity.get(key) ?? [];
+    roots.push(row.root);
+    rootsByIdentity.set(key, roots);
+  }
+  for (const roots of rootsByIdentity.values()) {
+    if (roots.length < 2) continue;
+    for (const root of roots) {
+      const row = projected.find((candidate) => candidate.root === root);
+      if (row !== undefined) {
+        row.admission = {
+          kind: "ambiguous",
+          reason: `the same workspace and device binding also exists at ${roots.find((candidate) => candidate !== root)}`,
+        };
+      }
+    }
+  }
+}
+
 export async function observeFolderAdmission(
   root: string,
   state: FolderCatalogState,
@@ -111,11 +146,11 @@ export async function observeFolderAdmission(
 ): Promise<FolderAdmission> {
   if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
   const absolute = path.resolve(root);
-  const observed = await observeFolderRoot(absolute, deps);
-  const catalog = state.kind === "authoritative"
-    ? state.snapshot.folders.find((entry) => entry.normalizedPath === absolute)
-    : undefined;
-  return classify({ ...observed, ...(catalog === undefined ? {} : { catalog }) }, state);
+  const rows = await buildFolderInventoryUnion(state, { currentRoot: absolute }, deps);
+  const projected = rows.map((row) => publicRow(row, state));
+  markDuplicateBindingIdentities(rows, projected);
+  return projected.find((row) => row.root === absolute)?.admission
+    ?? { kind: "missing", reason: "the folder does not exist" };
 }
 
 export async function listFolderInventory(
@@ -124,10 +159,12 @@ export async function listFolderInventory(
   deps: FolderInventoryDeps = {},
 ): Promise<FolderInventorySnapshot> {
   const rows = await buildFolderInventoryUnion(state, context, deps);
+  const projected = rows.map((row) => publicRow(row, state));
+  markDuplicateBindingIdentities(rows, projected);
   return {
     catalogState: state.kind,
     revision: state.revision,
-    rows: rows.map((row) => publicRow(row, state)),
+    rows: projected,
   };
 }
 

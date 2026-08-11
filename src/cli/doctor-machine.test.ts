@@ -2,8 +2,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { collectMachineTriage, renderMachineTriage } from "./doctor-machine.js";
-import { daemonBoundPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
+import { collectMachineAggregate, collectMachineTriage, renderMachineStatusTable, renderMachineTriage } from "./doctor-machine.js";
+import { serializeFolderCatalog } from "./folder-config.js";
+import { daemonBoundPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, folderCatalogPath } from "./rbox-paths.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import { observeDaemon } from "./daemon/observation.js";
 
@@ -99,6 +100,28 @@ test("no synced folders prints the setup pointer", async () => {
   // Design 211 retired the track-only disclaimer: the binding registry covers
   // folders bound with `rbox track` that never started background sync.
   expect(rendered).not.toContain("has never started background sync is not listed here");
+});
+
+test("human aggregate renderers add configured-but-unbound rows while JSON v1 stays byte-identical", async () => {
+  const configured = path.join(scratch, "configured-only");
+  await fs.mkdir(configured, { recursive: true });
+  await fs.mkdir(path.dirname(folderCatalogPath()), { recursive: true });
+  await fs.writeFile(folderCatalogPath(), serializeFolderCatalog({
+    schemaVersion: 1,
+    globalOptions: {},
+    folders: [{ name: "Configured only", path: configured }],
+  }));
+  const aggregate = await collectMachineAggregate();
+  expect(JSON.stringify(aggregate.triage)).toBe('{"schemaVersion":1,"scope":"machine","workspaces":[]}');
+  expect(aggregate.configuredButUnbound).toHaveLength(1);
+  for (const rendered of [
+    renderMachineTriage(aggregate.triage, aggregate.configuredButUnbound),
+    renderMachineStatusTable(aggregate.triage, aggregate.configuredButUnbound, NOW),
+  ]) {
+    expect(rendered.join("\n")).toContain("configured but not bound");
+    expect(rendered.join("\n")).toContain("Configured only");
+    expect(rendered.join("\n")).toContain("rbox config");
+  }
 });
 
 test("a fresh status record from a DEAD daemon is never reported as up to date", async () => {
