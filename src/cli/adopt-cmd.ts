@@ -172,7 +172,9 @@ async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal
     return continueAdoption(journal, mutex, {
       establishBaseline: async () => { await sync(root, cfg, deps); },
       finishSync: async (current) => {
-        deps.cache = new HashCache();
+        // Stamp the applied Git policy so the first daemon start reuses this
+        // cache instead of discarding it for a full re-hash.
+        deps.cache = new HashCache(undefined, { syncGit: cfg.syncGit === true, incremental: cfg.git?.incremental !== false });
         deps.dircache = new DirCache();
         deps.forceFullScan = true;
         await sync(root, cfg, deps);

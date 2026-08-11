@@ -662,7 +662,9 @@ async function executeInitPlan(
           const completed = await continueAdoption(adoptionJournal, syncMutex, {
             establishBaseline: async () => { await sync(plan.root, authed, deps); },
             finishSync: async (journal) => {
-              deps.cache = new HashCache();
+              // Stamp the applied Git policy so the first daemon start reuses
+              // this cache instead of discarding it for a full re-hash.
+              deps.cache = new HashCache(undefined, { syncGit: authed.syncGit === true, incremental: authed.git?.incremental !== false });
               deps.dircache = new DirCache();
               deps.forceFullScan = true;
               result = await sync(plan.root, authed, deps);

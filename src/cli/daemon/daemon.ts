@@ -502,6 +502,7 @@ export class RboxDaemon {
   private folderAdmissionActivityHalt?: DaemonActivity["halt"];
   private folderMatcherRebuildPending = false;
   private folderPolicyRecyclePending = false;
+  private folderRecycleDeferrals = 0;
   private folderPolicyRecycleFailure?: string;
   private observedAdoptCacheGeneration = 0;
 
@@ -1328,9 +1329,6 @@ export class RboxDaemon {
     }
     const halt = this.activity.halt;
     if (!halt) return;
-    // Folder admission is re-observed at every operation boundary. It is not an
-    // operation failure and must not enter the timed pull/push recovery loop.
-    if (halt.typedReason?.kind === "folder-admission") return;
     if (this.pullOnly && halt.op === "push") {
       this.scheduler.clearRecoveryEpisode();
       this.activity.suspendedPushHalt ??= { ...halt, recoveryState: "suspended" };
@@ -2387,7 +2385,10 @@ export class RboxDaemon {
   }
 
   private activitySnapshot(): DaemonActivity {
-    const visibleHalt = this.folderAdmissionActivityHalt ?? this.activity.halt;
+    // A real safety halt (mass-delete, chain repair) must never be masked or —
+    // via persistence — ERASED by a folder-admission halt; admission is the
+    // secondary condition and only surfaces when nothing stronger is live.
+    const visibleHalt = this.activity.halt ?? this.folderAdmissionActivityHalt;
     return {
       ...this.activity,
       local: this.activity.local ? { ...this.activity.local } : undefined,
@@ -3052,6 +3053,7 @@ export class RboxDaemon {
       }
       if (needsRecycle) {
         this.folderPolicyRecyclePending = true;
+        this.folderRecycleDeferrals = 0;
         this.log("folder config reloaded: Git policy changed; uncached rescan required");
       }
       this.workspaceConfigStat = workspaceToken;
@@ -3100,26 +3102,30 @@ export class RboxDaemon {
         this.folderMatcherRebuildPending = false;
       }
       if (this.folderPolicyRecyclePending) {
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          const fresh = new HashCache(undefined, this.hashCachePolicy());
-          const scanned = await this.localObserver.observe({
-            kind: "scan",
-            cache: fresh,
-            previous: this.local.manifest,
-            scanKind: "deep scan",
-            mode: "unpruned",
-          });
-          if (scanned.deferredPaths.size > 0) {
-            if (attempt === 3) throw new Error("folder policy recycle full scan deferred three times; retrying at the next operation boundary");
-            continue;
-          }
-          this.cache = fresh;
-          this.pruneCache();
-          await this.cache.replace(this.root);
-          this.folderPolicyRecyclePending = false;
-          this.log("folder config Git policy acknowledged after uncached rescan");
-          break;
+        // ONE uncached scan per boundary. A persistently deferring path must
+        // not turn every wakeup into a full re-hash: after three consecutive
+        // deferred boundaries, back off until the next policy edit rearms.
+        if (this.folderRecycleDeferrals >= 3) {
+          throw new Error("folder policy recycle backed off after three deferred full scans; edit the folder config (or restart) to retry");
         }
+        const fresh = new HashCache(undefined, this.hashCachePolicy());
+        const scanned = await this.localObserver.observe({
+          kind: "scan",
+          cache: fresh,
+          previous: this.local.manifest,
+          scanKind: "deep scan",
+          mode: "unpruned",
+        });
+        if (scanned.deferredPaths.size > 0) {
+          this.folderRecycleDeferrals++;
+          throw new Error("folder policy recycle full scan deferred; retrying at the next operation boundary");
+        }
+        this.folderRecycleDeferrals = 0;
+        this.cache = fresh;
+        this.pruneCache();
+        await this.cache.replace(this.root);
+        this.folderPolicyRecyclePending = false;
+        this.log("folder config Git policy acknowledged after uncached rescan");
       }
       this.folderPolicyRecycleFailure = undefined;
       return true;

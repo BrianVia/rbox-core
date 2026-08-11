@@ -121,3 +121,38 @@ test("dispatcher never walks from a catalog-only descendant to its bound ancesto
   expect(await fs.readFile(path.join(ancestor, "keep.txt"), "utf8")).toBe("ancestor data");
   expect(await absent(path.join(ancestor, ".rbox", "workspace.json"))).toBe(false);
 });
+
+test("a symlinked spelling of a catalog-only path never untracks the bound ancestor", async () => {
+  const ancestor = path.join(scratch, "sym-ancestor");
+  const descendant = path.join(ancestor, "descendant");
+  await fs.mkdir(descendant, { recursive: true });
+  await fs.writeFile(path.join(ancestor, "keep.txt"), "ancestor data");
+  await track(ancestor, { workspace: "ws_sym_ancestor" }, "https://api.test");
+  await recordFolder(descendant);
+
+  const alias = path.join(scratch, "alias-link");
+  await fs.symlink(ancestor, alias);
+  process.argv = [process.execPath, "rbox", "untrack", path.join(alias, "descendant"), "--force"];
+  await main({ refreshSystemLockIdentityLedger: async () => {} });
+
+  expect(await catalogHas(descendant)).toBe(false);
+  expect(await fs.readFile(path.join(ancestor, "keep.txt"), "utf8")).toBe("ancestor data");
+  expect(await absent(path.join(ancestor, ".rbox", "workspace.json"))).toBe(false);
+});
+
+test("untrack remains the escape hatch when the catalog is damaged", async () => {
+  const root = path.join(scratch, "damaged-catalog-root");
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(path.join(root, "keep.txt"), "user data");
+  await track(root, { workspace: "ws_damaged" }, "https://api.test");
+  const { folderCatalogPath } = await import("./rbox-paths.js");
+  await fs.writeFile(folderCatalogPath(), "{ definitely not a catalog");
+
+  await untrack({ root, force: true });
+
+  expect(await fs.readFile(path.join(root, "keep.txt"), "utf8")).toBe("user data");
+  expect(await absent(path.join(root, ".rbox"))).toBe(true);
+  expect((await readPersistedEntries()).some((entry) => entry.root === root)).toBe(false);
+  // The damaged catalog bytes are untouched; cleanup belongs to regenerate.
+  expect(await fs.readFile(folderCatalogPath(), "utf8")).toBe("{ definitely not a catalog");
+});

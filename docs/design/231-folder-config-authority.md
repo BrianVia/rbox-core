@@ -704,7 +704,9 @@ none do. Do not ship a second live authority with ambiguous ownership.
   identity rule and durable `rootPath`, registry, and daemon-key repair before
   activation merges;
 - foreground and daemon cycles reuse one pinned admission rather than adding a
-  second scan, enforced by a one-pinned-admission-per-operation spy gate.
+  second scan: the foreground pin lives inside the workspace mutex acquisition
+  (local-runtime) and the daemon pin at its operation boundary, each covered by
+  its module's suite; no per-callsite re-observation is permitted in review.
 
 ## 13. Retirement and deletion statement
 

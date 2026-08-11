@@ -86,7 +86,9 @@ async function add(rawPath: string, write: (line: string) => void): Promise<void
       throw new Error(`cannot add ${root}: it physically overlaps ${target.overlap.of} (${target.overlap.kind}); existing configured overlaps remain supported`);
     }
   }
-  const binding = await loadConfigIfPresent(root);
+  // Only a READABLE binding contributes a policy snapshot; a corrupt
+  // workspace.json must not block adding the folder (diagnosis comes after).
+  const binding = await loadConfigIfPresent(root).catch(() => undefined);
   await recordFolder(root, binding === undefined ? {} : { options: snapshotPreCatalogPolicy(binding) });
   write(`${style.sym.ok} ${existing ? "already configured" : "added"} ${root}`);
 }

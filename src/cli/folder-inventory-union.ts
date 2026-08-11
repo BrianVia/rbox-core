@@ -172,7 +172,7 @@ export async function buildFolderInventoryUnion(
   deps: FolderUnionDeps = {},
   sourceEvidence?: FolderSourceEvidence,
 ): Promise<FolderUnionRow[]> {
-  const evidence = sourceEvidence ?? await readFolderSourceEvidence(deps);
+  const evidence = sourceEvidence ?? await readFolderSourceEvidenceTolerant(deps);
   const { desiredRows, persistedEntries } = evidence;
   const currentRoot = context.currentRoot === undefined ? undefined : path.resolve(context.currentRoot);
   const byRoot = new Map<string, {
@@ -214,6 +214,24 @@ export async function buildFolderInventoryUnion(
   }));
   attachOverlaps(rows);
   return rows;
+}
+
+/** Diagnostic default: tolerant cache readers keep every valid row when one
+ * entry is malformed. Only generation (§6.2's fresh-machine test) may treat
+ * unreadable evidence as blocking — that path calls the strict variant. */
+export async function readFolderSourceEvidenceTolerant(deps: FolderUnionDeps = {}): Promise<FolderSourceEvidence> {
+  const [desired, persisted] = await Promise.allSettled([
+    (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)(),
+    (deps.readPersistedEntries ?? readPersistedEntries)(),
+  ]);
+  return {
+    desiredRows: desired.status === "fulfilled" ? desired.value : [],
+    persistedEntries: persisted.status === "fulfilled" ? persisted.value : [],
+    unavailable: [
+      ...(desired.status === "rejected" ? [errorText(desired.reason)] : []),
+      ...(persisted.status === "rejected" ? [errorText(persisted.reason)] : []),
+    ],
+  };
 }
 
 export async function readFolderSourceEvidence(deps: FolderUnionDeps = {}): Promise<FolderSourceEvidence> {

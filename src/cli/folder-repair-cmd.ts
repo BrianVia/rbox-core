@@ -140,10 +140,15 @@ export async function repairFolderMove(newRootInput: string, deps: FolderRepairD
   }
 
   const step = async (value: FolderRepairStep): Promise<void> => deps.onStep?.(value);
-  await withScopeTransitionLock(newRoot, () => withWorkspaceSyncMutex(newRoot, async () => {
+  // Stops live between the two locks: inside the scope lock so a racing
+  // `rbox start` (which takes it) cannot slip a daemon in behind them, but
+  // BEFORE the sync mutex — a live daemon owns that mutex, so acquiring it
+  // first would deadlock repair against the very process it must stop.
+  await withScopeTransitionLock(newRoot, async () => {
     await stopIfRunning(oldRoot);
     await stopIfRunning(newRoot);
     await step("daemons-stopped");
+    return withWorkspaceSyncMutex(newRoot, async () => {
     await relocateRuntime(oldRoot, newRoot, config.remoteWorkspaceId, step);
     await relocateBinding(oldRoot, newRoot, config.remoteWorkspaceId);
     await step("registry-relocated");
@@ -160,7 +165,8 @@ export async function repairFolderMove(newRootInput: string, deps: FolderRepairD
       await fsyncDirectory(path.join(newRoot, ".rbox"));
       await step("binding-parent-synced");
     }
-  }));
+    });
+  });
 
   (deps.write ?? console.log)(`${style.sym.ok} repaired moved folder ${oldRoot} → ${newRoot}`);
 }
