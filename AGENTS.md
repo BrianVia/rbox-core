@@ -42,10 +42,13 @@ pass-through files merely to stay below a threshold.
 
 ## Simple primitives, less code (always)
 
-- The best code is code we don't have to write. Before building any mechanism,
-  look for the boring, battle-tested primitive that already solves it (flock,
-  git's own index, atomic rename, one plain JSON file) — and prefer deleting
-  mechanism over adding it.
+- Before any work, ask two questions: “what's the simplest thing I can use off
+  the shelf to solve this?” and “how can I simplify or remove dumb requirements
+  instead of building for them?” The best code is code we don't have to write — reach for the
+  boring, battle-tested primitive that already solves it (flock, git's own
+  index, atomic rename, SQLite for local state) and prefer deleting mechanism
+  over adding it. Plain JSON files are only for records a human is meant to
+  read or hand-edit; internal state belongs in SQLite.
 - Build every piece from primitives a future reader can grok in one sitting:
   obvious data shapes, one clear owner, no clever indirection. If a design
   needs a new special case every review round, the plane is wrong — step out a
