@@ -43,7 +43,8 @@ export interface DaemonRecoveryHalt {
     | { kind: "push-conflict" }
     | { kind: "chain-repair" }
     | { kind: "too-many-refs" }
-    | { kind: "body-too-large" };
+    | { kind: "body-too-large" }
+    | { kind: "folder-admission" };
   terminal?: { fingerprint: string };
 }
 
@@ -230,6 +231,8 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
             ? { typedReason: { kind: "too-many-refs" as const } }
             : halt.typedReason?.kind === "body-too-large"
               ? { typedReason: { kind: "body-too-large" as const } }
+              : halt.typedReason?.kind === "folder-admission"
+                ? { typedReason: { kind: "folder-admission" as const } }
               : {}),
         ...(terminal && typeof terminal.fingerprint === "string" && terminal.fingerprint.length > 0
           ? { terminal: { fingerprint: terminal.fingerprint } }
@@ -282,7 +285,8 @@ export const isSafetyHaltReason = (kind: string | undefined): boolean =>
   kind === "mass-delete"
   || kind === "chain-repair"
   || kind === "too-many-refs"
-  || kind === "body-too-large";
+  || kind === "body-too-large"
+  || kind === "folder-admission";
 
 /** The machine-facing activity state — halt > outofstorage > active > pending
  *  (unsettled) > ok. `status --json` mirrors this verbatim. */

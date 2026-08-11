@@ -273,6 +273,33 @@ export async function readDesiredDaemonRows(): Promise<DesiredStateRow[]> {
   return readDesiredRows();
 }
 
+/** Strict evidence read for folder-authority activation. Ordinary aggregate
+ * diagnostics keep the tolerant reader above. */
+export async function readDesiredDaemonRowsStrict(): Promise<DesiredStateRow[]> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(daemonsDir());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error(`cannot read ${daemonsDir()}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const rows: DesiredStateRow[] = [];
+  for (const key of entries.sort()) {
+    const file = path.join(daemonsDir(), key, DESIRED_FILE);
+    let raw: string;
+    try {
+      raw = await fs.readFile(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error(`cannot read ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const desired = parseDesired(raw);
+    if (!desired) throw new Error(`cannot read ${file}: invalid desired daemon state`);
+    rows.push({ key, path: file, desired });
+  }
+  return rows.sort((a, b) => a.desired.rootPath.localeCompare(b.desired.rootPath));
+}
+
 async function staleReason(root: string): Promise<string | undefined> {
   if (!(await exists(root))) return "root missing";
   if (!(await exists(workspaceConfigPath(root)))) return "workspace binding missing";

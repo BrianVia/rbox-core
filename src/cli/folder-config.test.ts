@@ -207,6 +207,35 @@ describe("pre-catalog policy snapshot", () => {
     expect(options.trash).toEqual({ days: FOLDER_TRASH_MAX_DAYS, maxBytes: FOLDER_TRASH_MAX_BYTES });
     expect(() => serializeFolderCatalog(catalog({ folders: [{ name: "A", path: home, options }] }), home)).not.toThrow();
   });
+
+  test("coerces malformed legacy binding fields to their effective semantics", async () => {
+    const { home } = await isolate();
+    const fixtures = [
+      {
+        raw: { syncGit: "true", git: { incremental: "yes" }, respectGitignore: "yes", noDrift: 1, trash: { days: -99, maxBytes: Number.MAX_VALUE } },
+        expectedTrash: { days: 0, maxBytes: FOLDER_TRASH_MAX_BYTES },
+      },
+      {
+        raw: { syncGit: 1, git: { incremental: null }, respectGitignore: null, noDrift: "true", trash: { days: null, maxBytes: -50 } },
+        expectedTrash: { days: 30, maxBytes: 0 },
+      },
+      {
+        raw: { syncGit: null, git: { incremental: false }, respectGitignore: false, noDrift: false, trash: { days: 999999, maxBytes: 999999999999999 } },
+        expectedTrash: { days: FOLDER_TRASH_MAX_DAYS, maxBytes: FOLDER_TRASH_MAX_BYTES },
+      },
+    ];
+    for (const fixture of fixtures) {
+      const options = snapshotPreCatalogPolicy(fixture.raw as unknown as WorkspaceConfig);
+      expect(options).toEqual({
+        syncGit: false,
+        git: { incremental: fixture.raw.git.incremental === false ? false : true },
+        respectGitignore: false,
+        noDrift: false,
+        trash: fixture.expectedTrash,
+      });
+      expect(() => serializeFolderCatalog(catalog({ folders: [{ name: "A", path: home, options }] }), home)).not.toThrow();
+    }
+  });
 });
 
 describe("single-file authority state", () => {

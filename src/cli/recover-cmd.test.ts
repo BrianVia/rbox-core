@@ -4,6 +4,7 @@ import type { WorkspaceConfig } from "./config.js";
 import type { SyncDeps } from "./sync.js";
 import type { HeadPin } from "./e2ee-keystore.js";
 import { ManifestChainError } from "../engine/index.js";
+import { resolveFolderPolicy, snapshotPreCatalogPolicy } from "./folder-config.js";
 
 const cfg: WorkspaceConfig = {
   schema: "e2ee/v1",
@@ -39,6 +40,7 @@ describe("recover workspace command", () => {
     await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: async () => ({ state: "unsupported-version", path: "/test/credentials.json", version: 2 }),
       buildAuthedRemote: async () => { built++; throw new Error("must not build"); },
     })).rejects.toThrow(/unsupported-version/);
@@ -53,6 +55,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
@@ -82,6 +85,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { repairChain: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({ load: async () => currentPin, save: async (next) => { currentPin = next; }, clear: async () => { currentPin = undefined; } }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
@@ -109,6 +113,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: (accountId, workspaceId) => ({
         load: async () => undefined,
@@ -143,6 +148,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
@@ -193,6 +199,7 @@ describe("recover workspace command", () => {
     await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
@@ -223,6 +230,7 @@ describe("recover workspace command", () => {
     await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => localPin,
@@ -253,6 +261,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
       loadCredentials: validCredentials,
       pinStore: () => ({ load: async () => undefined, save: async () => {}, clear: async () => {} }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),

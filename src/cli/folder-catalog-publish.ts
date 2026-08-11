@@ -17,7 +17,7 @@ import codecInternals, {
   type FolderCatalogSnapshot,
   type FolderCatalogState,
 } from "./folder-config-codec.js";
-import { folderCatalogDir, folderCatalogLockPath, folderCatalogPath, rboxDir } from "./rbox-paths.js";
+import { folderCatalogDir, folderCatalogLockPath, folderCatalogPath } from "./rbox-paths.js";
 
 export type FolderCatalogPublicationStep =
   | "before-write"
@@ -208,13 +208,13 @@ async function catalogLock(options: FolderCatalogPublicationOptions): Promise<Ow
 
 async function prepareDirectory(options: FolderCatalogPublicationOptions): Promise<void> {
   const created = await ensureDirectoryChain(
-    rboxDir(),
+    folderCatalogDir(),
     "rbox config directory",
     (directory) => options.onDirectoryStep?.("after-create", directory),
     true,
   );
   await fsyncCreatedDirectoryAncestors(
-    rboxDir(),
+    folderCatalogDir(),
     created,
     (directory) => options.onDirectoryStep?.("after-created-ancestor-fsync", directory),
   );

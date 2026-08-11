@@ -3,6 +3,8 @@ import type { GitSection } from "../../engine/types.js";
 import { loadConfig, loadState, repoRecordsForState, syncStreamId, type SyncState } from "../config.js";
 import { recordRepublishRequest } from "../sync-git/republish-requests.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "../folder-inventory.js";
 
 export interface GitRepublishCmdDeps {
   now?: () => Date;
@@ -60,7 +62,10 @@ export async function gitRepublishCmd(
   const writeError = deps.stderr ?? console.error;
   try {
     const rel = normalizedRepo(root, repoArg);
-    const cfg = await (deps.loadConfig ?? loadConfig)(root);
+    const folderState = await ensureFolderAuthority({ currentRoot: root });
+    const folderAdmission = await observeFolderAdmission(root, folderState);
+    if (folderAdmission.kind !== "admitted") throw runtimeRefusal(folderAdmission);
+    const cfg = applyFolderPolicy(await (deps.loadConfig ?? loadConfig)(root), folderAdmission.policy);
     if (cfg.syncGit !== true) throw new Error("Git syncing is off for this workspace, so there is no pack chain to restart");
     const stream = syncStreamId(cfg);
     const state = await (deps.loadState ?? loadState)(root, stream);

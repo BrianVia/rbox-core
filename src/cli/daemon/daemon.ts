@@ -192,12 +192,15 @@ function sameReloadStatToken(a: ReloadStatToken | null | undefined, b: ReloadSta
     : b !== null && a.mtimeMs === b.mtimeMs && a.size === b.size);
 }
 
-function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceConfig): boolean {
+function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceConfig, observedRoot: string): boolean {
+  const bindingRoot = (binding: WorkspaceConfig): string => typeof binding.rootPath === "string"
+    ? path.resolve(binding.rootPath)
+    : path.resolve(observedRoot);
   return boot.schema === loaded.schema
     && boot.remoteWorkspaceId === loaded.remoteWorkspaceId
     && boot.projectId === loaded.projectId
     && boot.deviceId === loaded.deviceId
-    && path.resolve(boot.rootPath) === path.resolve(loaded.rootPath);
+    && bindingRoot(boot) === bindingRoot(loaded);
 }
 
 export interface GitBusyRetryClock {
@@ -496,6 +499,7 @@ export class RboxDaemon {
   private workspaceConfigStat?: ReloadStatToken | null;
   private folderCatalogStat?: ReloadStatToken | null;
   private folderAdmissionHaltReason?: string;
+  private folderAdmissionActivityHalt?: DaemonActivity["halt"];
   private folderMatcherRebuildPending = false;
   private folderPolicyRecyclePending = false;
   private folderPolicyRecycleFailure?: string;
@@ -735,11 +739,16 @@ export class RboxDaemon {
     // needed, and both are known here.
     if (!(await this.writeStartupBinding())) return;
 
-    this.cache = await HashCache.load(this.root);
+    this.cache = await HashCache.load(this.root, this.hashCachePolicy());
     this.metrics = await loadMetrics(this.root);
     const persistedActivity = await loadActivity(this.root);
     if (persistedActivity) {
-      this.activity.halt = persistedActivity.halt;
+      if (persistedActivity.halt?.typedReason?.kind === "folder-admission") {
+        this.folderAdmissionHaltReason = persistedActivity.halt.reason;
+        this.folderAdmissionActivityHalt = persistedActivity.halt;
+      } else {
+        this.activity.halt = persistedActivity.halt;
+      }
       this.activity.suspendedPushHalt = persistedActivity.suspendedPushHalt;
       this.activity.lastPush = persistedActivity.lastPush;
       this.activity.lastPull = persistedActivity.lastPull;
@@ -1319,6 +1328,9 @@ export class RboxDaemon {
     }
     const halt = this.activity.halt;
     if (!halt) return;
+    // Folder admission is re-observed at every operation boundary. It is not an
+    // operation failure and must not enter the timed pull/push recovery loop.
+    if (halt.typedReason?.kind === "folder-admission") return;
     if (this.pullOnly && halt.op === "push") {
       this.scheduler.clearRecoveryEpisode();
       this.activity.suspendedPushHalt ??= { ...halt, recoveryState: "suspended" };
@@ -2375,15 +2387,16 @@ export class RboxDaemon {
   }
 
   private activitySnapshot(): DaemonActivity {
+    const visibleHalt = this.folderAdmissionActivityHalt ?? this.activity.halt;
     return {
       ...this.activity,
       local: this.activity.local ? { ...this.activity.local } : undefined,
       ws: this.activity.ws ? { ...this.activity.ws } : undefined,
       active: this.activity.active ? { ...this.activity.active } : undefined,
-      halt: this.activity.halt ? {
-        ...this.activity.halt,
-        ...(this.activity.halt.typedReason ? { typedReason: { ...this.activity.halt.typedReason } } : {}),
-        ...(this.activity.halt.terminal ? { terminal: { ...this.activity.halt.terminal } } : {}),
+      halt: visibleHalt ? {
+        ...visibleHalt,
+        ...(visibleHalt.typedReason ? { typedReason: { ...visibleHalt.typedReason } } : {}),
+        ...(visibleHalt.terminal ? { terminal: { ...visibleHalt.terminal } } : {}),
       } : undefined,
     };
   }
@@ -2738,7 +2751,7 @@ export class RboxDaemon {
       rulesChanged,
     };
     this.openDriftAudits.add(audit);
-    const fresh = new HashCache();
+    const fresh = new HashCache(undefined, this.hashCachePolicy());
     let scanResult: ScanObservationReceipt;
     try {
       scanResult = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: this.local.manifest, scanStats: stats, scanKind: "deep scan", mode: "unpruned" });
@@ -2973,7 +2986,7 @@ export class RboxDaemon {
   private async adoptionCacheGenerationBoundary(): Promise<void> {
     const record = await readCacheGeneration(this.root);
     if (!record || record.generation <= this.observedAdoptCacheGeneration) return;
-    const fresh = new HashCache();
+    const fresh = new HashCache(undefined, this.hashCachePolicy());
     this.rebuildMatcher(this.syncBase);
     const prior = this.local.manifest;
     const scanned = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: prior, scanKind: "deep scan", mode: "unpruned" });
@@ -2994,14 +3007,12 @@ export class RboxDaemon {
     ]);
     const workspaceChanged = !sameReloadStatToken(this.workspaceConfigStat, workspaceToken);
     const catalogChanged = !sameReloadStatToken(this.folderCatalogStat, catalogToken);
-    if (!workspaceChanged && !catalogChanged) return;
-    this.workspaceConfigStat = workspaceToken;
-    this.folderCatalogStat = catalogToken;
+    if (!workspaceChanged && !catalogChanged && this.folderAdmissionHaltReason === undefined) return;
 
     try {
       if (workspaceChanged && workspaceToken !== null) {
         const loadedBinding = await loadConfig(this.root);
-        if (!sameWorkspaceBindingIdentity(this.cfg, loadedBinding)) {
+        if (!sameWorkspaceBindingIdentity(this.cfg, loadedBinding, this.root)) {
           this.setFolderAdmissionHalt("daemon binding changed while idle (workspace config identity mismatch) — stopping before mutation");
           return;
         }
@@ -3043,15 +3054,34 @@ export class RboxDaemon {
         this.folderPolicyRecyclePending = true;
         this.log("folder config reloaded: Git policy changed; uncached rescan required");
       }
-      this.folderAdmissionHaltReason = undefined;
+      this.workspaceConfigStat = workspaceToken;
+      this.folderCatalogStat = catalogToken;
+      this.clearFolderAdmissionHalt();
     } catch (error) {
       this.setFolderAdmissionHalt(error instanceof Error ? error.message : String(error));
     }
   }
 
   private setFolderAdmissionHalt(reason: string): void {
-    if (this.folderAdmissionHaltReason !== reason) this.log(`sync halted: ${reason}`);
+    if (this.folderAdmissionHaltReason === reason) return;
     this.folderAdmissionHaltReason = reason;
+    this.folderAdmissionActivityHalt = {
+      at: new Date(this.now()).toISOString(),
+      reason,
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "folder-admission" },
+    };
+    this.log(`sync halted: ${reason}`);
+    this.writeActivity();
+  }
+
+  private clearFolderAdmissionHalt(): void {
+    if (this.folderAdmissionHaltReason === undefined) return;
+    this.folderAdmissionHaltReason = undefined;
+    this.folderAdmissionActivityHalt = undefined;
+    this.log("sync resumed: folder admission recovered");
+    this.writeActivity();
   }
 
   private async folderOperationBoundary(): Promise<boolean> {
@@ -3070,22 +3100,26 @@ export class RboxDaemon {
         this.folderMatcherRebuildPending = false;
       }
       if (this.folderPolicyRecyclePending) {
-        const fresh = new HashCache();
-        const scanned = await this.localObserver.observe({
-          kind: "scan",
-          cache: fresh,
-          previous: this.local.manifest,
-          scanKind: "deep scan",
-          mode: "unpruned",
-        });
-        if (scanned.deferredPaths.size > 0) {
-          throw new Error("folder policy recycle full scan deferred; policy acknowledgement remains blocked");
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const fresh = new HashCache(undefined, this.hashCachePolicy());
+          const scanned = await this.localObserver.observe({
+            kind: "scan",
+            cache: fresh,
+            previous: this.local.manifest,
+            scanKind: "deep scan",
+            mode: "unpruned",
+          });
+          if (scanned.deferredPaths.size > 0) {
+            if (attempt === 3) throw new Error("folder policy recycle full scan deferred three times; retrying at the next operation boundary");
+            continue;
+          }
+          this.cache = fresh;
+          this.pruneCache();
+          await this.cache.replace(this.root);
+          this.folderPolicyRecyclePending = false;
+          this.log("folder config Git policy acknowledged after uncached rescan");
+          break;
         }
-        this.cache = fresh;
-        this.pruneCache();
-        await this.cache.replace(this.root);
-        this.folderPolicyRecyclePending = false;
-        this.log("folder config Git policy acknowledged after uncached rescan");
       }
       this.folderPolicyRecycleFailure = undefined;
       return true;
@@ -3095,6 +3129,10 @@ export class RboxDaemon {
       this.folderPolicyRecycleFailure = reason;
       return false;
     }
+  }
+
+  private hashCachePolicy(): { syncGit: boolean; incremental: boolean } {
+    return { syncGit: this.cfg.syncGit === true, incremental: this.cfg.git?.incremental !== false };
   }
 
   // ---- live notification channel (optional; correctness never depends on it) ----

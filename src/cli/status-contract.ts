@@ -17,6 +17,7 @@ import type { StatusDeferralDisplayDetails, StatusRefreshReceipt } from "./statu
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import type { LockingHealth } from "./sync-mutex.js";
 import type { UpdateCheckState } from "./update-check.js";
+import type { FolderAdmission } from "./folder-inventory.js";
 
 export type StatusMode = "json" | "verbose" | "brief" | "git";
 
@@ -63,6 +64,9 @@ export interface StatusReadPort<M extends StatusMode> {
     root: string,
     request: { depth: "ambient"; now: number },
   ) => Promise<AmbientWorkspaceObservation>;
+  /** Optional for embedded/test ports. Production pins one read-only catalog
+   * admission for the complete projection. */
+  readFolderAdmission?: (root: string) => Promise<FolderAdmission>;
   inspectResetJournal: (root: string, stream: string) => Promise<ResetSafetyInspection>;
   readResetHaltHealth: (root: string) => Promise<ResetHaltHealthV1 | undefined>;
   readState: (root: string, stream: string) => Promise<SyncState>;

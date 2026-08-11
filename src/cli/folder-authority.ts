@@ -11,7 +11,10 @@ export async function ensureFolderAuthority(
   if (state.kind === "authoritative") return state;
   if (state.kind === "damaged") throw publishInternals.authorityError(state);
   const inventory = await observeFolderGeneration(state, context);
-  if (inventory.discoverableBindings.length > 0) {
+  if (inventory.evidenceUnavailable?.length) {
+    throw new Error(`cannot initialize rbox folder configuration because binding evidence is unavailable: ${inventory.evidenceUnavailable.join("; ")}`);
+  }
+  if (inventory.discoverableBindings.length > 0 || inventory.skipped.length > 0) {
     throw publishInternals.authorityError(state);
   }
   await initializeFolderCatalog(inventory);

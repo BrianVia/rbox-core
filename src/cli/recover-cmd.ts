@@ -12,6 +12,9 @@ import { postSyncNudge, summarize } from "./sync-cmd.js";
 import { style } from "./style.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { repairChain, type SuffixInfo } from "./chain-repair.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
+import type { ResolvedFolderPolicy } from "./folder-config.js";
 
 export interface RecoverOptions {
   yes?: boolean;
@@ -33,6 +36,7 @@ export interface RecoverDeps {
   postSyncNudge?: typeof postSyncNudge;
   log?: (line: string) => void;
   repair?: typeof repairChain;
+  folderPolicy?: (root: string) => Promise<ResolvedFolderPolicy>;
 }
 
 function count(actions: Action[], kind: Action["kind"]): number {
@@ -47,6 +51,14 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
   // repair had already applied a historical manifest to disk, stranding this copy on
   // a deliberately older tree with no way for a scoped binding to finish the repair.
   await assertCommandAllowedOnScopedBinding(root, "recover");
+  const folderPolicy = deps.folderPolicy
+    ? await deps.folderPolicy(root)
+    : await (async () => {
+      const state = await ensureFolderAuthority({ currentRoot: root });
+      const admission = await observeFolderAdmission(root, state);
+      if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+      return admission.policy;
+    })();
   const confirmation = {
     message: `Recover ${root}? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.`,
     default: false,
@@ -68,9 +80,10 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
   const accountId = creds.accountId;
 
   await withWorkspaceSyncMutex(root, async (syncMutex) => {
-    const cfg0 = await (deps.loadConfig ?? loadConfig)(root);
+    const cfg0 = applyFolderPolicy(await (deps.loadConfig ?? loadConfig)(root), folderPolicy);
     const pins = (deps.pinStore ?? keystorePinStore)(accountId, cfg0.remoteWorkspaceId);
     const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root, Date.now, undefined, loaded);
+    built.cfg = applyFolderPolicy(built.cfg, folderPolicy);
     built.deps.syncMutex = syncMutex;
     built.deps.allowMassDelete = opts.allowMassDelete === true;
     // recover both pulls AND repair-publishes; one explicit flag covers both directions

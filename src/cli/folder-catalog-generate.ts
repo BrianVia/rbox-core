@@ -24,6 +24,7 @@ export interface FolderGenerationInventory {
   revision: FolderCatalogRevision;
   discoverableBindings: Array<{ root: string; binding: WorkspaceConfig }>;
   skipped: Array<{ root: string; reason: string }>;
+  evidenceUnavailable?: string[];
 }
 
 export interface GeneratedFolderCatalog {
@@ -84,6 +85,9 @@ export function deriveFolderLabel(normalizedPath: string, taken: ReadonlySet<str
 }
 
 export function generateFolderCatalog(inventory: FolderGenerationInventory): GeneratedFolderCatalog {
+  if (inventory.evidenceUnavailable?.length) {
+    throw new Error(`folder binding evidence is unavailable: ${inventory.evidenceUnavailable.join("; ")}`);
+  }
   const taken = new Set<string>();
   const folders = [...inventory.discoverableBindings]
     .map(({ root, binding }) => ({ root: expandFolderPath(root), binding }))

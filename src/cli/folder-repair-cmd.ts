@@ -140,11 +140,10 @@ export async function repairFolderMove(newRootInput: string, deps: FolderRepairD
   }
 
   const step = async (value: FolderRepairStep): Promise<void> => deps.onStep?.(value);
-  await stopIfRunning(oldRoot);
-  await stopIfRunning(newRoot);
-  await step("daemons-stopped");
-
   await withScopeTransitionLock(newRoot, () => withWorkspaceSyncMutex(newRoot, async () => {
+    await stopIfRunning(oldRoot);
+    await stopIfRunning(newRoot);
+    await step("daemons-stopped");
     await relocateRuntime(oldRoot, newRoot, config.remoteWorkspaceId, step);
     await relocateBinding(oldRoot, newRoot, config.remoteWorkspaceId);
     await step("registry-relocated");

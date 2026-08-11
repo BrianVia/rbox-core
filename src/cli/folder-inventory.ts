@@ -12,6 +12,7 @@ import type { WorkspaceConfig } from "./workspace-config.js";
 import {
   buildFolderInventoryUnion,
   observeFolderRoot,
+  readFolderSourceEvidence,
   type FolderBindingObservation,
   type FolderOverlap,
   type FolderUnionDeps,
@@ -173,13 +174,14 @@ export async function observeFolderGeneration(
   context: { currentRoot?: string } = {},
   deps: FolderInventoryDeps = {},
 ): Promise<FolderGenerationInventory> {
-  const rows = await buildFolderInventoryUnion(state, context, deps);
+  const evidence = await readFolderSourceEvidence(deps);
+  const rows = await buildFolderInventoryUnion(state, context, deps, evidence);
   const discoverableBindings: FolderGenerationInventory["discoverableBindings"] = [];
   const skipped: FolderGenerationInventory["skipped"] = [];
   for (const row of rows) {
     if (row.bindingConfig !== undefined) {
       discoverableBindings.push({ root: row.root, binding: row.bindingConfig });
-    } else {
+    } else if (row.binding !== undefined || row.registry !== undefined || row.desired !== undefined || row.catalog !== undefined) {
       const reason = !row.exists && row.observationError === undefined
         ? "the folder does not exist"
         : row.binding !== undefined && "unreadable" in row.binding
@@ -188,5 +190,10 @@ export async function observeFolderGeneration(
       skipped.push({ root: row.root, reason });
     }
   }
-  return { revision: state.revision, discoverableBindings, skipped };
+  return {
+    revision: state.revision,
+    discoverableBindings,
+    skipped,
+    ...(evidence.unavailable.length === 0 ? {} : { evidenceUnavailable: evidence.unavailable }),
+  };
 }

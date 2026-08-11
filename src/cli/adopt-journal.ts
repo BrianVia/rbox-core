@@ -148,6 +148,17 @@ export interface AdoptGitRepo {
   reason?: string;
 }
 
+/** Catalog policy pinned before adoption begins its first sync. Optional so
+ * journals written by older binaries remain resumable. */
+export interface JournalPinnedFolderPolicy {
+  generation: string;
+  syncGit: boolean;
+  git: { incremental: boolean };
+  respectGitignore: boolean;
+  noDrift: boolean;
+  trash: { days: number; maxBytes: number };
+}
+
 export interface AdoptJournal {
   version: typeof ADOPT_VERSION;
   journalId: string;
@@ -164,6 +175,7 @@ export interface AdoptJournal {
     respectGitignore: boolean;
     name?: string;
   };
+  pinnedFolderPolicy?: JournalPinnedFolderPolicy;
   phase: AdoptPhase;
   resumePhase?: Exclude<AdoptPhase, "paused" | "complete" | "aborted">;
   pauseReasons: string[];
@@ -294,6 +306,7 @@ function validJournal(value: unknown): value is AdoptJournal {
     return true;
   };
   const workspace = j.workspace;
+  const pinned = j.pinnedFolderPolicy;
   const baseline = j.baseline;
   const cache = j.cache;
   const finish = j.finishSync;
@@ -306,6 +319,16 @@ function validJournal(value: unknown): value is AdoptJournal {
     && string(workspace.projectId) && string(workspace.remoteUrl) && string(workspace.deviceId)
     && typeof workspace.syncGit === "boolean" && typeof workspace.respectGitignore === "boolean"
     && (workspace.name === undefined || string(workspace.name))
+    && (pinned === undefined || object(pinned)
+      && Object.keys(pinned).length === 6
+      && ["generation", "syncGit", "git", "respectGitignore", "noDrift", "trash"].every((key) => Object.hasOwn(pinned, key))
+      && hex(pinned.generation, 64)
+      && typeof pinned.syncGit === "boolean"
+      && object(pinned.git) && Object.keys(pinned.git).length === 1 && typeof pinned.git.incremental === "boolean"
+      && typeof pinned.respectGitignore === "boolean" && typeof pinned.noDrift === "boolean"
+      && object(pinned.trash) && Object.keys(pinned.trash).length === 2
+      && Number.isSafeInteger(pinned.trash.days) && pinned.trash.days >= 0 && pinned.trash.days <= 365
+      && Number.isSafeInteger(pinned.trash.maxBytes) && pinned.trash.maxBytes >= 0 && pinned.trash.maxBytes <= 1099511627776)
     && ["retaining", "baseline", "git", "overlay", "invalidating", "aborting", "paused", "complete", "aborted"].includes(j.phase ?? "")
     && (j.resumePhase === undefined || ["retaining", "baseline", "git", "overlay", "invalidating", "aborting"].includes(j.resumePhase))
     && Array.isArray(j.pauseReasons) && j.pauseReasons.every(string)

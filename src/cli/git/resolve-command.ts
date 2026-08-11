@@ -67,6 +67,8 @@ import { hasGitResolutionIncoming, sanitizeTerminalText } from "../status-view.j
 import { preliminaryResolutionReport, resolutionBindingIdentity, type ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
 import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, thisComputer, thisComputersVersion, type GitResolveShow } from "./resolve-presentation.js";
 import { assertCommandAllowedOnScopedBinding, ScopedBindingRefusal, type ScopeHaltCondition } from "../scope/binding-scope.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "../folder-inventory.js";
 
 type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 
@@ -382,8 +384,11 @@ function localMachine(deps: GitResolveDeps): string | undefined {
 }
 
 async function defaultBuild(root: string): Promise<ResolveEnvironment> {
+  const state = await ensureFolderAuthority({ currentRoot: root });
+  const admission = await observeFolderAdmission(root, state);
+  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
   const built = await buildAuthedRemote(root);
-  return { cfg: built.cfg, store: built.remote.blobStore(), remote: built.remote };
+  return { cfg: applyFolderPolicy(built.cfg, admission.policy), store: built.remote.blobStore(), remote: built.remote };
 }
 
 async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined, state: SyncState): Promise<{ state: SyncState; error?: string }> {

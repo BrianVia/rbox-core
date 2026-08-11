@@ -95,6 +95,7 @@ interface SafetyInternals {
   };
   reloadWorkspaceConfigIfChanged(): Promise<void>;
   folderOperationBoundary(): Promise<boolean>;
+  activitySnapshot(): { halt?: { reason: string; typedReason?: { kind: string } } };
   folderAdmissionHaltReason?: string;
   folderMatcherRebuildPending: boolean;
   folderPolicyRecyclePending: boolean;
@@ -262,7 +263,7 @@ test.skipIf(process.platform !== "linux")("design 175: fallback and dir snapshot
   }
 });
 
-function makeDaemon(root: string, opts: { pullOnly?: boolean } = {}): SafetyInternals {
+function makeDaemon(root: string, opts: { pullOnly?: boolean; log?: (message: string) => void } = {}): SafetyInternals {
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
   return new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as SafetyInternals;
 }
@@ -532,6 +533,92 @@ test("workspace stat reload parks a rebound binding before the boot cfg can run"
   }
 });
 
+test("folder admission halt surfaces, retries a transient workspace read, and logs state changes", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-admission-recover-")));
+  const logs: string[] = [];
+  const daemon = makeDaemon(root, { log: (message) => logs.push(message) });
+  const file = path.join(root, ".rbox", "workspace.json");
+  const binding = JSON.stringify({
+    remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root,
+    remoteUrl: "https://example.invalid", token: "",
+  });
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, binding);
+    writeFolderCatalog(root, false);
+    expect(await daemon.folderOperationBoundary()).toBe(true);
+
+    fs.writeFileSync(file, `{${" ".repeat(binding.length - 1)}`);
+    const failedToken = fs.statSync(file);
+    expect(await daemon.folderOperationBoundary()).toBe(false);
+    expect(daemon.activitySnapshot().halt).toMatchObject({ typedReason: { kind: "folder-admission" } });
+
+    fs.writeFileSync(file, binding);
+    fs.utimesSync(file, failedToken.atime, failedToken.mtime);
+    expect(await daemon.folderOperationBoundary()).toBe(true);
+    expect(daemon.activitySnapshot().halt).toBeUndefined();
+    expect(logs.filter((line) => line.startsWith("sync halted:"))).toHaveLength(1);
+    expect(logs.filter((line) => line === "sync resumed: folder admission recovered")).toHaveLength(1);
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("folder admission retries and clears a duplicate binding halt without stat changes", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-admission-duplicate-")));
+  const duplicate = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-admission-duplicate-")));
+  const daemon = makeDaemon(root);
+  const binding = (observedRoot: string) => ({
+    remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: observedRoot,
+    remoteUrl: "https://example.invalid", token: "",
+  });
+  try {
+    for (const observedRoot of [root, duplicate]) {
+      fs.mkdirSync(path.join(observedRoot, ".rbox"), { recursive: true });
+      fs.writeFileSync(path.join(observedRoot, ".rbox", "workspace.json"), JSON.stringify(binding(observedRoot)));
+    }
+    const file = folderCatalogPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      schemaVersion: 1,
+      globalOptions: {},
+      folders: [
+        { name: "Primary", path: root },
+        { name: "Duplicate", path: duplicate },
+      ],
+    }));
+    expect(await daemon.folderOperationBoundary()).toBe(false);
+    expect(daemon.folderAdmissionHaltReason).toContain("same workspace and device binding");
+
+    fs.rmSync(path.join(duplicate, ".rbox", "workspace.json"));
+    expect(await daemon.folderOperationBoundary()).toBe(true);
+    expect(daemon.folderAdmissionHaltReason).toBeUndefined();
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(duplicate, { recursive: true, force: true });
+  }
+});
+
+test("rootPath-less legacy workspace binding is admitted at its observed root", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-admission-rootless-")));
+  const daemon = makeDaemon(root);
+  try {
+    fs.mkdirSync(path.join(root, ".rbox"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+      remoteWorkspaceId: "w", projectId: "root", deviceId: "d",
+      remoteUrl: "https://example.invalid", token: "",
+    }));
+    writeFolderCatalog(root, false);
+    expect(await daemon.folderOperationBoundary()).toBe(true);
+    expect(daemon.folderAdmissionHaltReason).toBeUndefined();
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Git-policy recycle uses an uncached unpruned scan and acknowledges only after cache save", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root);
@@ -594,7 +681,13 @@ test("an empty Git-policy recycle durably replaces stale on-disk hashcache entri
 
     expect(await daemon.acknowledgeFolderPolicyRecycle()).toBe(true);
     expect(daemon.folderPolicyRecyclePending).toBe(false);
-    expect(JSON.parse(fs.readFileSync(cacheFile, "utf8"))).toEqual({ version: 2, entries: {} });
+    expect(JSON.parse(fs.readFileSync(cacheFile, "utf8"))).toEqual({
+      version: 2,
+      entries: {},
+      // The recycle stamps the applied Git policy so a restart can detect a
+      // policy edit made while the daemon was stopped (design 231 §7.3).
+      gitPolicy: { syncGit: false, incremental: true },
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

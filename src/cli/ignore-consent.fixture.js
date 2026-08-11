@@ -43,6 +43,7 @@ mock.module("./sync/policy.js", () => ({ assertNoUnevaluatedPurgeDeletes: () => 
 mock.module("./folder-authority.js", () => ({ ensureFolderAuthority: async () => ({ kind: "authoritative" }) }));
 mock.module("./folder-inventory.js", () => ({
   observeFolderAdmission: async () => ({ kind: "admitted", generation: "fixture", policy: { respectGitignore: false } }),
+  runtimeRefusal: (admission) => new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`),
 }));
 mock.module("./folder-config.js", () => ({ setFolderOptions: async () => {} }));
 

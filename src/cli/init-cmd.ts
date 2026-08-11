@@ -36,7 +36,7 @@ import {
 } from "./reset-consent.js";
 import { consumeAdoptConsent, mintHeadlessAdoptConsent, mintInteractiveAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
 import { inventoryAdoptionSource, rootHasAdoptableContent } from "./adopt-inventory.js";
-import { continueAdoption, startAdoption } from "./adopt-lifecycle.js";
+import { continueAdoption, pinAdoptionFolderPolicy, startAdoption } from "./adopt-lifecycle.js";
 import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
@@ -45,6 +45,7 @@ import { recordBindingScope, rememberBinding } from "./binding-registry.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { recordFolder, setFolderOptions, type FolderOptions, type FolderOptionsPatch } from "./folder-config.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -527,6 +528,17 @@ async function executeInitPlan(
       };
       if (Object.keys(explicitPatch).length > 0) await setFolderOptions(plan.root, explicitPatch);
     }
+    const admittedState = await ensureFolderAuthority({ currentRoot: plan.root });
+    const firstSyncAdmission = await observeFolderAdmission(plan.root, admittedState);
+    if (firstSyncAdmission.kind !== "admitted") throw runtimeRefusal(firstSyncAdmission);
+    if (adoptionJournal) {
+      await pinAdoptionFolderPolicy(
+        adoptionJournal,
+        firstSyncAdmission.generation,
+        firstSyncAdmission.policy,
+        syncMutex,
+      );
+    }
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
     process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
@@ -540,7 +552,9 @@ async function executeInitPlan(
       process.exitCode = 1;
       return undefined;
     }
-    const { cfg: authed, deps } = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
+    const built = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
+    const authed = applyFolderPolicy(built.cfg, firstSyncAdmission.policy);
+    const { deps } = built;
     deps.syncMutex = syncMutex;
     let pendingGitSummary: GitPushPlan | undefined;
     deps.onGitLog = (line, pushPlan) => {

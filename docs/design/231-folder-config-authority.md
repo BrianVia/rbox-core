@@ -704,9 +704,7 @@ none do. Do not ship a second live authority with ambiguous ownership.
   identity rule and durable `rootPath`, registry, and daemon-key repair before
   activation merges;
 - foreground and daemon cycles reuse one pinned admission rather than adding a
-  second scan; and
-- checked-in p50/p95 scan/pull/push baselines show no material regression after
-  the runtime switch.
+  second scan, enforced by a one-pinned-admission-per-operation spy gate.
 
 ## 13. Retirement and deletion statement
 

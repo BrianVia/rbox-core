@@ -17,7 +17,7 @@
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
 import { inspectFolderCatalog } from "./folder-config.js";
-import { listFolderInventory, type FolderInventoryRow } from "./folder-inventory.js";
+import { listFolderInventory, type FolderAdmission, type FolderInventoryRow } from "./folder-inventory.js";
 import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
@@ -68,7 +68,9 @@ export interface MachineTriageDeps {
   now?: () => number;
 }
 
-export type ConfiguredButUnboundFolder = Pick<FolderInventoryRow, "root" | "catalog" | "admission">;
+export type ConfiguredButUnboundFolder = Pick<FolderInventoryRow, "root" | "catalog"> & {
+  admission: Exclude<FolderAdmission, { kind: "admitted" }>;
+};
 
 export interface MachineAggregate {
   triage: MachineTriage;
@@ -135,18 +137,24 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
 
 export async function collectMachineAggregate(deps: MachineTriageDeps = {}): Promise<MachineAggregate> {
   const state = await inspectFolderCatalog();
-  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state).catch(() => ({ rows: [] }));
+  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state).catch((error) => {
+    console.error(`rbox doctor: folder inventory unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return { rows: [] };
+  });
   const configuredButUnbound = inventory.rows
     .filter((row) => row.catalog !== undefined
       && row.registry === undefined
       && row.desired === undefined
       && row.admission.kind !== "admitted")
-    .map((row) => ({ root: row.root, catalog: row.catalog, admission: row.admission }));
+    .map((row) => ({
+      root: row.root,
+      catalog: row.catalog,
+      admission: row.admission as Exclude<FolderAdmission, { kind: "admitted" }>,
+    }));
   // Machine JSON v1 is registry-shaped and closed. Catalog/current-root-only
   // evidence belongs to the folder-config surface, not this compatibility view.
   const rows = deps.readBindingRegistry === undefined
     ? inventory.rows
-      .filter((row) => row.registry !== undefined || row.desired !== undefined)
       .flatMap((row) => row.registry === undefined ? [] : [row.registry])
     : await deps.readBindingRegistry().catch(() => []);
   const now = (deps.now ?? Date.now)();
@@ -250,7 +258,7 @@ function appendConfiguredButUnbound(
   lines.push(style.bold("configured but not bound"));
   for (const row of rows) {
     lines.push(`${style.sym.warn} ${style.bold(row.catalog?.name ?? path.basename(row.root))} ${style.dim(row.root)}`);
-    lines.push(`    ${row.admission.kind}: ${row.admission.kind === "admitted" ? "not present in the machine registry" : row.admission.reason}`);
+    lines.push(`    ${row.admission.kind}: ${row.admission.reason}`);
   }
   lines.push(`    ${style.dim("run:")} rbox config`);
 }

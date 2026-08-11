@@ -8,10 +8,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   readPersistedEntries,
+  readPersistedEntriesStrict,
   type BindingRegistryEntry,
   type BindingRegistryRow,
 } from "./binding-registry.js";
-import { readDesiredDaemonRows, type DesiredStateRow } from "./autostart/desired-state.js";
+import { readDesiredDaemonRows, readDesiredDaemonRowsStrict, type DesiredStateRow } from "./autostart/desired-state.js";
 import type {
   FolderCatalogState,
   ResolvedFolderCatalogEntry,
@@ -53,6 +54,12 @@ export interface FolderUnionDeps {
   loadConfigIfPresent?: typeof loadConfigIfPresent;
   stat?: typeof fs.stat;
   realpath?: typeof fs.realpath;
+}
+
+export interface FolderSourceEvidence {
+  desiredRows: DesiredStateRow[];
+  persistedEntries: BindingRegistryEntry[];
+  unavailable: string[];
 }
 
 function errorText(error: unknown): string {
@@ -163,11 +170,10 @@ export async function buildFolderInventoryUnion(
   state: FolderCatalogState,
   context: { currentRoot?: string } = {},
   deps: FolderUnionDeps = {},
+  sourceEvidence?: FolderSourceEvidence,
 ): Promise<FolderUnionRow[]> {
-  const [desiredRows, persistedEntries] = await Promise.all([
-    (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)().catch(() => []),
-    (deps.readPersistedEntries ?? readPersistedEntries)().catch(() => []),
-  ]);
+  const evidence = sourceEvidence ?? await readFolderSourceEvidence(deps);
+  const { desiredRows, persistedEntries } = evidence;
   const currentRoot = context.currentRoot === undefined ? undefined : path.resolve(context.currentRoot);
   const byRoot = new Map<string, {
     catalog?: ResolvedFolderCatalogEntry;
@@ -208,4 +214,19 @@ export async function buildFolderInventoryUnion(
   }));
   attachOverlaps(rows);
   return rows;
+}
+
+export async function readFolderSourceEvidence(deps: FolderUnionDeps = {}): Promise<FolderSourceEvidence> {
+  const [desired, persisted] = await Promise.allSettled([
+    (deps.readDesiredDaemonRows ?? readDesiredDaemonRowsStrict)(),
+    (deps.readPersistedEntries ?? readPersistedEntriesStrict)(),
+  ]);
+  return {
+    desiredRows: desired.status === "fulfilled" ? desired.value : [],
+    persistedEntries: persisted.status === "fulfilled" ? persisted.value : [],
+    unavailable: [
+      ...(desired.status === "rejected" ? [errorText(desired.reason)] : []),
+      ...(persisted.status === "rejected" ? [errorText(persisted.reason)] : []),
+    ],
+  };
 }

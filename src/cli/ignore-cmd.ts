@@ -14,14 +14,14 @@ import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
 import { assertNoUnevaluatedPurgeDeletes } from "./sync/policy.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { setFolderOptions } from "./folder-config.js";
-import { observeFolderAdmission } from "./folder-inventory.js";
+import { observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 
 const RBOXIGNORE = ".rboxignore";
 
 async function admittedPolicy(root: string) {
   const state = await ensureFolderAuthority({ currentRoot: root });
   const admission = await observeFolderAdmission(root, state);
-  if (admission.kind !== "admitted") throw new Error(admission.reason);
+  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
   return admission.policy;
 }
 

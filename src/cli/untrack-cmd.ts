@@ -71,10 +71,11 @@ export async function untrack(opts: UntrackOptions, deps: UntrackDeps = {}): Pro
   }
 
   let catalogState = await inspectFolderCatalog();
-  if (earlyRboxStat !== undefined && catalogState.kind !== "authoritative") {
+  const damagedCatalog = catalogState.kind === "damaged";
+  if (damagedCatalog) {
+    process.stderr.write(`warning: rbox folder configuration is damaged; untracking the explicit workspace root and leaving its catalog entry for \`rbox config regenerate\`\n`);
+  } else if (earlyRboxStat !== undefined && catalogState.kind !== "authoritative") {
     catalogState = await ensureFolderAuthority({ currentRoot: root });
-  } else if (catalogState.kind === "damaged") {
-    await ensureFolderAuthority({ currentRoot: root });
   }
   // Capture compatibility evidence before deleting either exact-root locator.
   // This snapshot controls only the already-gone UX; the final strict forget is
@@ -122,7 +123,7 @@ export async function untrack(opts: UntrackOptions, deps: UntrackDeps = {}): Pro
     await step("binding-removed");
     await removeDaemonRuntime(root);
     await step("runtime-removed");
-    if (catalogKnows) await forgetFolder(root);
+    if (catalogKnows && !damagedCatalog) await forgetFolder(root);
     await step("catalog-forgotten");
     await forgetBinding(root);
     await step("registry-forgotten");
@@ -138,7 +139,7 @@ export async function untrack(opts: UntrackOptions, deps: UntrackDeps = {}): Pro
   // leaves nothing orphaned outside the workspace.
   await removeDaemonRuntime(root);
   await step("runtime-removed");
-  await forgetFolder(root);
+  if (!damagedCatalog) await forgetFolder(root);
   await step("catalog-forgotten");
   // Design 211: drop the durable binding record so the aggregate views stop
   // listing this root at all (rather than listing it as a stale binding).

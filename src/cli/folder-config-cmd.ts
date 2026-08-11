@@ -11,12 +11,14 @@ import {
   publishFolderRegeneration,
   recordFolder,
   resolveFolderPolicy,
+  snapshotPreCatalogPolicy,
 } from "./folder-config.js";
 import { listFolderInventory, observeFolderGeneration, type FolderInventoryRow } from "./folder-inventory.js";
 import { emitJson } from "./json.js";
 import { folderCatalogPath, homeDir } from "./rbox-paths.js";
 import { style } from "./style.js";
 import { projectFolderConfigJson } from "./folder-config-json.js";
+import { loadConfigIfPresent } from "./workspace-config.js";
 
 const REGENERATION_ATTEMPTS = 3;
 
@@ -84,7 +86,8 @@ async function add(rawPath: string, write: (line: string) => void): Promise<void
       throw new Error(`cannot add ${root}: it physically overlaps ${target.overlap.of} (${target.overlap.kind}); existing configured overlaps remain supported`);
     }
   }
-  await recordFolder(root);
+  const binding = await loadConfigIfPresent(root);
+  await recordFolder(root, binding === undefined ? {} : { options: snapshotPreCatalogPolicy(binding) });
   write(`${style.sym.ok} ${existing ? "already configured" : "added"} ${root}`);
 }
 
@@ -109,6 +112,10 @@ async function regenerate(options: FolderConfigCommandOptions, deps: FolderConfi
       write("Affected entries:");
       for (const entry of attempt.loss.entries) write(`  ${entry.name}: ${entry.path}`);
     }
+    if (attempt.skipped.length > 0) {
+      write("Bindings that will be omitted:");
+      for (const skipped of attempt.skipped) write(`  skipped ${skipped.root}: ${skipped.reason}`);
+    }
     const accepted = options.yes || await (deps.confirm ?? interactiveConfirm)("Replace the current rbox folder configuration?");
     if (!accepted) {
       write("Regeneration cancelled — nothing changed.");
@@ -120,7 +127,6 @@ async function regenerate(options: FolderConfigCommandOptions, deps: FolderConfi
       continue;
     }
     write(`${style.sym.ok} regenerated ${folderCatalogPath()}`);
-    for (const skipped of result.skipped) write(`  skipped ${skipped.root}: ${skipped.reason}`);
     return;
   }
   throw new Error("rbox folder configuration kept changing during regeneration; stop concurrent edits and retry");

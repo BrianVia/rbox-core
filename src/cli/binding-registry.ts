@@ -76,26 +76,33 @@ function validEntry(value: unknown): value is BindingRegistryEntry {
     && (e.scope === undefined || (Array.isArray(e.scope) && e.scope.every((p) => typeof p === "string")));
 }
 
-/** The persisted half only. A corrupt or absent file reads as empty: the registry
- * is never allowed to be the reason a command fails. */
-export async function readPersistedEntries(): Promise<BindingRegistryEntry[]> {
+/** Strict evidence read used only by folder-authority activation. An absent file
+ * is empty; unreadable or malformed evidence is named instead of erased. */
+export async function readPersistedEntriesStrict(): Promise<BindingRegistryEntry[]> {
   let raw: string;
   try {
     raw = await fsp.readFile(bindingRegistryPath(), "utf8");
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error(`cannot read ${bindingRegistryPath()}: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
     const parsed = JSON.parse(raw) as Partial<BindingRegistryFileV1>;
-    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.entries)) return [];
+    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.entries)) throw new Error("invalid schema");
     const byRoot = new Map<string, BindingRegistryEntry>();
     for (const entry of parsed.entries) {
-      if (validEntry(entry)) byRoot.set(path.resolve(entry.root), { ...entry, root: path.resolve(entry.root) });
+      if (!validEntry(entry)) throw new Error("invalid entry");
+      byRoot.set(path.resolve(entry.root), { ...entry, root: path.resolve(entry.root) });
     }
     return [...byRoot.values()];
-  } catch {
-    return [];
+  } catch (error) {
+    throw new Error(`cannot read ${bindingRegistryPath()}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/** The compatibility/diagnostic read remains tolerant by contract. */
+export async function readPersistedEntries(): Promise<BindingRegistryEntry[]> {
+  return readPersistedEntriesStrict().catch(() => []);
 }
 
 async function writeEntries(entries: BindingRegistryEntry[]): Promise<void> {

@@ -303,10 +303,10 @@ export function resolveFolderPolicy(globalOptions: FolderOptions, folderOptions:
 /** Materialize the exact effective pre-catalog binding policy for generation. */
 export function snapshotPreCatalogPolicy(binding: WorkspaceConfig): FolderOptions {
   return {
-    syncGit: binding.syncGit ?? false,
-    git: { incremental: binding.git?.incremental ?? true },
-    respectGitignore: binding.respectGitignore ?? false,
-    noDrift: binding.noDrift ?? false,
+    syncGit: binding.syncGit === true,
+    git: { incremental: binding.git?.incremental === false ? false : true },
+    respectGitignore: binding.respectGitignore === true,
+    noDrift: binding.noDrift === true,
     trash: trashConfig(binding),
   };
 }
