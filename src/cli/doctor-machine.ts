@@ -212,7 +212,7 @@ const needsAttention = (workspace: MachineWorkspaceSummary): boolean =>
 export function renderMachineTriage(triage: MachineTriage): string[] {
   if (triage.workspaces.length === 0) {
     return [
-      `${style.bold("rbox doctor")} — no workspaces on this machine`,
+      `${style.bold("rbox doctor")} — no synced folders on this machine`,
       "",
       "rbox is not syncing anything here yet.",
       `${style.dim("run:")} rbox setup`,
@@ -220,7 +220,7 @@ export function renderMachineTriage(triage: MachineTriage): string[] {
   }
   const count = triage.workspaces.length;
   const lines = [
-    `${style.bold("rbox doctor")} — ${count} workspace${count === 1 ? "" : "s"} on this machine`,
+    `${style.bold("rbox doctor")} — ${count} synced folder${count === 1 ? "" : "s"} on this machine`,
     "",
   ];
   for (const workspace of triage.workspaces) {
@@ -286,14 +286,14 @@ function padCells(rows: string[][]): string[] {
 export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()): string[] {
   if (triage.workspaces.length === 0) {
     return [
-      `${style.bold("rbox status")} — no workspaces on this machine`,
+      `${style.bold("rbox status")} — no synced folders on this machine`,
       "",
       "rbox is not syncing anything here yet.",
       `${style.dim("run:")} rbox`,
     ];
   }
   const count = triage.workspaces.length;
-  const header = ["WORKSPACE", "ROOT", "BINDING", "SYNC", "LAST SYNC", "PENDING", "PROBLEM"];
+  const header = ["NAME", "FOLDER", "BINDING", "SYNC", "LAST SYNC", "PENDING", "PROBLEM"];
   const body = triage.workspaces.map((workspace) => [
     workspace.name,
     workspace.root,
@@ -306,7 +306,7 @@ export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()
   const [head, ...rest] = padCells([header, ...body]);
   const problems = triage.workspaces.filter(needsAttention).length;
   return [
-    `${style.bold("rbox status --all")} — ${count} workspace${count === 1 ? "" : "s"} on this machine`,
+    `${style.bold("rbox status --all")} — ${count} synced folder${count === 1 ? "" : "s"} on this machine`,
     "",
     // Every mark is exactly one visible character, so two spaces keep the
     // header aligned with the marked body rows in both colored and plain output.

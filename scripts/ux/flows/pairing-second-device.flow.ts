@@ -23,7 +23,7 @@ export default defineFlow({
     { on: "b", typeVar: "TOKEN" },
     { on: "b", keys: ["Enter"] },
     { on: "b", waitFor: /encryption enrolled/, timeout: 60 },
-    { on: "b", waitFor: /What do you want to track here\?/, timeout: 60 },
-    { on: "b", assertScreen: [/Create a new rbox workspace from a folder on this machine/, /Sync a workspace already in your rbox account/] },
+    { on: "b", waitFor: /Which folder do you want to sync\?/, timeout: 60 },
+    { on: "b", assertScreen: [/Sync ~\/rbox \(recommended\)/, /Sync another folder on this machine/, /Sync a folder from another machine/] },
   ],
 });

@@ -15,7 +15,7 @@ export default defineFlow({
     {
       on: "a",
       assertScreen: [
-        /Sync now[\s\S]*Set up a new workspace[\s\S]*Pair another device[\s\S]*View usage[\s\S]*View logs[\s\S]*Exit/,
+        /Sync now[\s\S]*Add another synced folder[\s\S]*Pair another device[\s\S]*View usage[\s\S]*View logs[\s\S]*Exit/,
       ],
       assertNotScreen: [/Pause syncing/, /Nothing, I'm good/, /Start syncing/],
     },

@@ -48,9 +48,9 @@ export const SCENARIO_PLAN = Object.freeze([
   "check Docker without mutating account state",
   "read DEV Clerk/platform keys from dev-keys.local.secret",
   "mint and grant a disposable DEV account",
-  "machine A: rbox setup via web-approved device code; initialize encryption and workspace",
+  "machine A: rbox setup via web-approved device code; initialize encryption and a synced folder",
   "machine A: choose Set up another machine now and capture its pairing token",
-  "machine B: rbox setup via that pairing token and join A's workspace",
+  "machine B: rbox setup via that pairing token and join A's synced folder",
   "write a unique file on A; require byte-identical content on B and healthy daemons",
   "stop daemons; burn account and require account_inaccessible",
   "destroy the UX run and require no container/volume residue",
@@ -182,15 +182,15 @@ export async function setupMachineA(
   await h.keys(runId, "a", session, ["n", "Enter"]); // never write plaintext kits in test containers
   await waitForScreen(h, runId, "a", session, /Have you saved this recovery phrase somewhere safe\?/);
   await h.keys(runId, "a", session, ["y", "Enter"]); // confirmation defaults No
-  await waitForScreen(h, runId, "a", session, /What do you want to track here\?/);
-  await h.keys(runId, "a", session, ["Enter"]); // create workspace
-  await waitForScreen(h, runId, "a", session, /Which directory should rbox sync\?/);
+  await waitForScreen(h, runId, "a", session, /Which folder do you want to sync\?/);
+  await h.keys(runId, "a", session, ["Down", "Enter"]); // custom local folder
+  await waitForScreen(h, runId, "a", session, /Which folder should rbox sync\?/);
   await h.keys(runId, "a", session, ["Enter"]); // machine A HOME
-  await waitForScreen(h, runId, "a", session, /Workspace name \(Enter accepts,[\s\S]*for none\)/);
+  await waitForScreen(h, runId, "a", session, /Display name \(Enter accepts,[\s\S]*for none\)/);
   await h.keys(runId, "a", session, ["dev-e2e", "Enter"]);
   await waitForScreen(h, runId, "a", session, /How should rbox handle gitignored files\?/);
   await h.keys(runId, "a", session, ["Enter"]);
-  await waitForScreen(h, runId, "a", session, /Keep this workspace syncing in the background\?/, 180);
+  await waitForScreen(h, runId, "a", session, /Keep this folder syncing in the background\?/, 180);
   await h.keys(runId, "a", session, ["Down", "Enter"]); // daemon now, no autostart
   await waitForScreen(h, runId, "a", session, /Set up another machine now/, 180);
   await h.keys(runId, "a", session, ["Enter"]); // validation #19 inline pair action
@@ -207,13 +207,13 @@ export async function setupMachineB(h: RegressionHarness, runId: string, session
   await waitForScreen(h, runId, "b", session, /Paste pairing token/);
   await h.pasteBuffer(runId, "b", session, pairToken);
   await h.keys(runId, "b", session, ["Enter"]);
-  await waitForScreen(h, runId, "b", session, /What do you want to track here\?/, 180);
-  await h.keys(runId, "b", session, ["Down", "Enter"]); // existing workspace
-  await waitForScreen(h, runId, "b", session, /Pick an existing workspace to sync/);
+  await waitForScreen(h, runId, "b", session, /Which folder do you want to sync\?/, 180);
+  await h.keys(runId, "b", session, ["Down", "Down", "Enter"]); // folder from another machine
+  await waitForScreen(h, runId, "b", session, /Pick a folder to sync from another machine/);
   await h.keys(runId, "b", session, ["Enter"]); // sole disposable workspace
-  await waitForScreen(h, runId, "b", session, /Which directory should rbox sync\?/);
+  await waitForScreen(h, runId, "b", session, /Which folder should rbox sync\?/);
   await h.keys(runId, "b", session, ["Enter"]); // machine B HOME
-  await waitForScreen(h, runId, "b", session, /Keep this workspace syncing in the background\?/, 180);
+  await waitForScreen(h, runId, "b", session, /Keep this folder syncing in the background\?/, 180);
   await h.keys(runId, "b", session, ["Down", "Enter"]); // daemon now, no autostart
   await waitForScreen(h, runId, "b", session, /Set up another machine now/, 180);
   await h.keys(runId, "b", session, ["Down", "Enter"]); // exit

@@ -200,7 +200,7 @@ export async function promptWorkspacePick(opts: {
 
   if (outcome.kind === "failed") {
     if (opts.mode === "setup") {
-      writeStderr("can't list workspaces right now\n");
+      writeStderr("can't list synced folders right now\n");
       const pick = await setupManualEntry(promptInput);
       return pick ? { kind: "picked", pick } : { kind: "back" };
     }
@@ -208,7 +208,7 @@ export async function promptWorkspacePick(opts: {
   }
   if (outcome.kind === "empty") {
     if (opts.mode === "setup") {
-      writeStderr("no workspaces on this account yet\n");
+      writeStderr("no synced folders on this account yet\n");
       return { kind: "empty-account" };
     }
     return legacyManualEntry(promptInput);
@@ -220,12 +220,12 @@ export async function promptWorkspacePick(opts: {
   let chosen: string;
   if (pickerMode(sorted.length) === "select") {
     chosen = await promptSelect<string>({
-      message: "Pick an existing workspace to sync",
+      message: opts.mode === "setup" ? "Pick a folder to sync from another machine" : "Pick an existing workspace to sync",
       choices: [...choices, MANUAL_CHOICE],
     });
   } else {
     chosen = await promptSearch<string>({
-      message: "Search existing workspaces to sync (type to filter)",
+      message: opts.mode === "setup" ? "Search synced folders (type to filter)" : "Search existing workspaces to sync (type to filter)",
       source: (term) => [...filterWorkspaceChoices(choices, term), MANUAL_CHOICE],
     });
   }

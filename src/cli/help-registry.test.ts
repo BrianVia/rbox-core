@@ -168,7 +168,7 @@ test("essential screen matches the founder-approved top-level help", () => {
 
 GET STARTED
   rbox                   set up rbox, or pick what to do in this folder
-  rbox status [PATH]     show one workspace, or all when outside one
+  rbox status [PATH]     show one synced folder, or all when outside one
 
 SYNC
   rbox sync [PATH]       sync once
@@ -187,7 +187,7 @@ MORE
   rbox <command> --help  flags and details for one command
   rbox help --all        the full command reference
 
-PATH names any folder inside a workspace; it selects that whole workspace.
+PATH names any location inside a synced folder; it selects that whole folder.
 Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C).`);
 });
 

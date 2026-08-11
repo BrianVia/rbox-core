@@ -41,7 +41,7 @@ function count(actions: Action[], kind: Action["kind"]): number {
 
 export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: RecoverOptions = {}, deps: RecoverDeps = {}): Promise<void> {
   const root = await (deps.findRoot ?? findRoot)(pathArg ?? process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
+  if (!root) throw new Error("Not inside a synced folder. Run `rbox setup` to get started, or `rbox track <path>` to sync a folder.");
   // Design 212 §3.1b layer 2 (r3 finding 2): refuse BEFORE any manifest read. The
   // late `pushManifest` chokepoint would stop the publication but only after chain
   // repair had already applied a historical manifest to disk, stranding this copy on

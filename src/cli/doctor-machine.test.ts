@@ -152,7 +152,7 @@ test("a live daemon with a fresh record gets its plain-English line and a cd-int
   expect(second!.command).toBe(`cd ${stuck} && rbox doctor`);
 
   const rendered = renderMachineTriage(triage).join("\n");
-  expect(rendered).toContain("2 workspaces on this machine");
+  expect(rendered).toContain("2 synced folders on this machine");
   expect(rendered).not.toContain("has never started background sync is not listed here");
 });
 

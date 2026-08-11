@@ -1,4 +1,5 @@
 import os from "node:os";
+import path from "node:path";
 import { rboxBanner } from "./wordmark.js";
 import { startDaemonForUser, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { fetchAccountSummary } from "./account-cmd.js";
@@ -23,8 +24,18 @@ export type UntrackedMenuAction = WorkspaceKind | "nothing";
 type FrontDoorChoice<V> = { name: string; value: V; description?: string };
 type SelectPrompt = <V>(cfg: { message: string; choices: ReadonlyArray<FrontDoorChoice<V>> }) => Promise<V>;
 
+export function additionalFolderSetupPaths(currentRoot: string, recommendedRoot: string): {
+  excludedRoot: string;
+  newFolderDefault: string | null;
+} {
+  return {
+    excludedRoot: currentRoot,
+    newFolderDefault: path.resolve(recommendedRoot) === path.resolve(currentRoot) ? null : recommendedRoot,
+  };
+}
+
 const FRONT_DOOR_TRAILING_CHOICES = [
-  { name: "Set up a new workspace", value: "setup", description: "rbox setup" },
+  { name: "Add another synced folder", value: "setup", description: "rbox setup" },
   { name: "Pair another device", value: "pair", description: "rbox pair" },
   { name: "View usage", value: "usage", description: "rbox usage" },
   { name: "View logs", value: "logs", description: "rbox logs" },
@@ -135,8 +146,15 @@ export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Prom
   if (action === "stop") return (deps.pauseSyncing ?? stopDaemonAndRecordDesired)(root);
   if (action === "start") return (deps.startSyncing ?? startDaemonForUser)(root);
   if (action === "setup") return (deps.setUpWorkspace ?? (async (cwd) => {
-    const { runSetup } = await import("./setup-cmd.js");
-    await runSetup({ cwd, defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: "new" });
+    const { defaultSyncFolder, runSetup } = await import("./setup-cmd.js");
+    const recommended = defaultSyncFolder();
+    await runSetup({
+      cwd,
+      defaultRemote: DEFAULT_REMOTE,
+      flags: {},
+      preselectedWorkspaceKind: "new",
+      ...additionalFolderSetupPaths(cwd, recommended),
+    });
   }))(root);
   if (action === "pair") return (deps.pairAnotherDevice ?? (async () => {
     const { pairCreate } = await import("./auth-cmd.js");
@@ -150,8 +168,8 @@ export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Prom
 
 export const UNTRACKED_MENU_CHOICES = (cwd: string) =>
   [
-    { name: "Track this directory", value: "new", description: `create a new workspace from ${collapseHome(cwd, os.homedir())}` },
-    { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced here" },
+    { name: "Sync this folder", value: "new", description: collapseHome(cwd, os.homedir()) },
+    { name: "Sync a folder from another machine", value: "existing", description: "pick one you've already synced" },
     { name: "Nothing, I'm good", value: "nothing" },
   ] as const satisfies ReadonlyArray<FrontDoorChoice<UntrackedMenuAction>>;
 
@@ -167,8 +185,8 @@ export async function runUntrackedMenu(cwd: string, accountId: string, deps: Unt
   writeStderr(rboxBanner());
   writeStderr(
     identity
-      ? `\n${e.green("✓")}  Signed in as ${e.cyan(identityText(identity.email, identity.signInMethod)!)}. This directory isn't tracked yet.\n\n`
-      : `\n${e.green("✓")}  Signed in and enrolled (${e.cyan(accountId)}). This directory isn't tracked yet.\n\n`
+      ? `\n${e.green("✓")}  Signed in as ${e.cyan(identityText(identity.email, identity.signInMethod)!)}. This folder isn't syncing yet.\n\n`
+      : `\n${e.green("✓")}  Signed in and enrolled (${e.cyan(accountId)}). This folder isn't syncing yet.\n\n`
   );
   const action = await promptCancelable<UntrackedMenuAction>(deps.promptSelect ?? promptSelect, {
     message: "What would you like to do?",

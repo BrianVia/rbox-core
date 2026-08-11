@@ -7,18 +7,18 @@ export default defineFlow({
   steps: [
     { on: "a", guest: "printf 'healthy fixture\\n' > README.md" },
     { on: "a", tui: "setup" },
-    { on: "a", waitFor: /What do you want to track here\?/ },
-    { on: "a", keys: ["Enter"] },
-    { on: "a", waitFor: /Which directory should rbox sync\?/ },
+    { on: "a", waitFor: /Which folder do you want to sync\?/ },
+    { on: "a", keys: ["Down", "Enter"] },
+    { on: "a", waitFor: /Which folder should rbox sync\?/ },
     { on: "a", assertScreen: [/Enter = this directory · type to filter · Tab completes/, /use this directory/] },
     { on: "a", keys: ["Enter"] },
-    { on: "a", waitFor: /Workspace name \(Enter accepts,[\s\S]*for none\)/ },
+    { on: "a", waitFor: /Display name \(Enter accepts,[\s\S]*for none\)/ },
     // Name the workspace "a" explicitly: the harness workspace IS $HOME, so
     // accepting the default name would collapseHome() to "~", not "a".
     { on: "a", keys: ["a", "Enter"] },
     { on: "a", waitFor: /How should rbox handle gitignored files\?/ },
     { on: "a", keys: ["Enter"] },
-    { on: "a", waitFor: /Keep this workspace syncing in the background\?/, timeout: 120 },
+    { on: "a", waitFor: /Keep this folder syncing in the background\?/, timeout: 120 },
     { on: "a", keys: ["Down", "Enter"] },
     { on: "a", waitFor: /Set up another machine now/, timeout: 120 },
     { on: "a", keys: ["Down", "Enter"] },

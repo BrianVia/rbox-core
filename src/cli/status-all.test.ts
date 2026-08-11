@@ -85,10 +85,11 @@ test("status --all lists a track-only workspace the daemon records never knew ab
 
   await run("status", "--all");
   const printed = logs.join("\n");
-  expect(printed).toContain("1 workspace on this machine");
+  expect(printed).toContain("1 synced folder on this machine");
   expect(printed).toContain("Papers");
   expect(printed).toContain(root);
-  expect(printed).toContain("WORKSPACE");
+  expect(printed).toContain("NAME");
+  expect(printed).toContain("FOLDER");
 });
 
 test("status --all reports a vanished root as a stale binding rather than dropping it", async () => {
@@ -138,7 +139,7 @@ test("doctor --all works from anywhere and uses the findings renderer", async ()
   await run("doctor", "--all");
   const printed = logs.join("\n");
   expect(printed).toContain("rbox doctor");
-  expect(printed).toContain("1 workspace on this machine");
+  expect(printed).toContain("1 synced folder on this machine");
   expect(printed).toContain("rbox start");
 });
 
@@ -198,5 +199,5 @@ test("--all rejects the single-workspace detail flags rather than ignoring them"
 });
 
 test("untrack of an unknown, unbound path still refuses", async () => {
-  await expect(run("untrack", path.join(outside, "nowhere"), "--force")).rejects.toThrow(/Not inside an rbox workspace/);
+  await expect(run("untrack", path.join(outside, "nowhere"), "--force")).rejects.toThrow(/Not inside a synced folder/);
 });
