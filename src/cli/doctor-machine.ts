@@ -16,6 +16,7 @@
  */
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
+import { inspectFolderCatalog } from "./folder-config.js";
 import { listFolderInventory } from "./folder-inventory.js";
 import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
@@ -125,7 +126,8 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
 }
 
 export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
-  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(undefined, {
+  const state = await inspectFolderCatalog();
+  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state, {
     ...(deps.readBindingRegistry === undefined ? {} : { readBindingRegistry: deps.readBindingRegistry }),
   }).catch(() => ({ rows: [] }));
   const rows = inventory.rows;

@@ -102,7 +102,12 @@ export async function fsyncDirectory(dir: string): Promise<void> {
 /** Create a plain-directory chain without following a symlink at any existing
  * component. Returns the directories created by this call for durability
  * publication by {@link fsyncCreatedDirectoryAncestors}. */
-export async function ensureDirectoryChain(abs: string, description = "directory"): Promise<Set<string>> {
+export async function ensureDirectoryChain(
+  abs: string,
+  description = "directory",
+  onCreated?: (directory: string) => void | Promise<void>,
+  includeRacedForDurability = false,
+): Promise<Set<string>> {
   const missing: string[] = [];
   let probe = path.resolve(abs);
   for (;;) {
@@ -123,10 +128,18 @@ export async function ensureDirectoryChain(abs: string, description = "directory
     try {
       await fs.mkdir(dir, { mode: 0o700 });
       created.add(dir);
+      await onCreated?.(dir);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const stat = await fs.lstat(dir);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe ${description}: ${dir}`);
+      if (includeRacedForDurability) {
+        // Catalog publication opts into this stronger result: a concurrent
+        // creator may crash before fsyncing its parent, so the race loser also
+        // carries the path through its durability walk. Default callers retain
+        // the historical "created by this call" return contract.
+        created.add(dir);
+      }
     }
   }
   return created;
@@ -134,11 +147,16 @@ export async function ensureDirectoryChain(abs: string, description = "directory
 
 /** Publish each newly-created child entry bottom-up through the first ancestor
  * that predated {@link ensureDirectoryChain}. */
-export async function fsyncCreatedDirectoryAncestors(dir: string, created: ReadonlySet<string>): Promise<void> {
+export async function fsyncCreatedDirectoryAncestors(
+  dir: string,
+  created: ReadonlySet<string>,
+  onSynced?: (directory: string) => void | Promise<void>,
+): Promise<void> {
   let child = path.resolve(dir);
   while (created.has(child)) {
     const parent = path.dirname(child);
     await fsyncDirectory(parent);
+    await onSynced?.(parent);
     child = parent;
   }
 }
