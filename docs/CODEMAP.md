@@ -62,6 +62,7 @@ requires an explicit ownership/layering decision.
 ```
 src/cli/folder-config-codec.ts — dormant design-231 FolderCatalog pure codec: owns closed bounded config validation, lexical home-path normalization, exact duplicate validation, fieldwise effective-policy resolution, generation pinning, and pure caller-seeded candidate construction. Never: filesystem I/O, activation-marker validation, authority-state inspection, durable publication, binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
 src/cli/folder-config.ts — dormant design-231 FolderCatalog publication and single import surface: owns activation-marker validation, authority-state inspection, and globally locked config-before-marker durable publication with best-effort stale-edit detection; re-exports the pure codec Interface. Never: config schema or policy decisions, binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
+src/cli/folder-inventory.ts — design-231 read-only folder observation composition root: owns joining catalog state, per-root bindings, and compatibility-registry enumeration into admission and inventory snapshots while preserving legacy registry order and fields. Never: healing, registry/config writes, remote identity mutation, daemon transitions, scope policy, or sync orchestration.
 ```
 
 ## `src/cli/sync/` — sync drivers (pull-then-push cycle)

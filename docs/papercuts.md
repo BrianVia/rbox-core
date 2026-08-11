@@ -529,3 +529,13 @@ behind-origin count; loudly warn when behind.
 - 2026-07-31: papercuts appended in the primary checkout were silently reverted (file-plane sync echo? #535-adjacent) before commit — append+commit papercuts in ONE step on synced checkouts.
 - 2026-08-02: Max (paying) wanted to abandon a workspace and start over; there is NO self-serve remote workspace delete (no CLI command, no dashboard button — only adminPurgeWorkspace in the admin routes). Worse, `rbox untrack` prints "manage or delete the workspace from the dashboard", pointing users at a surface that doesn't exist for them. Known-deferred (`--purge-remote` comment in untrack-cmd.ts), but now field-hit: fix the untrack copy now, prioritize the workspace-delete backend design.
 - 2026-08-02: Max expected a `.rbox.conf`-style config to inspect/edit what the daemon syncs; nothing user-visible answers "what workspaces does this machine have and how do I forget one" except `rbox status --all` + untrack. Workspace lifecycle management (list/delete/rename) is a product gap, in his words: "Dropbox just gave you a folder".
+
+## 2026-08-11 — test files that set HOME without restoring it
+
+`login-device-fsm.test.ts` leaked `process.env.HOME` into later files in its
+shard process and broke `setup-cmd.test.ts`'s `~/rbox` collapse assertion when
+PR 630's new test file reshuffled shard composition (fixed in that PR). Same
+latent bug class in `credentials.test.ts`, `key-cmd.test.ts`,
+`uninstall-cmd.test.ts`, `credential-policy.test.ts` — each sets
+`process.env.HOME` with no restore. Sweep candidate: a shared test helper that
+scopes HOME/RBOX_HOME mutation, or a global afterEach guard.

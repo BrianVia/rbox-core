@@ -27,6 +27,7 @@ const TOKEN = "recovered-device-token";
 let root: string;
 let originalFetch: typeof fetch;
 let originalLog: typeof console.log;
+const originalHome = process.env.HOME;
 
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-login-fsm-"));
@@ -43,6 +44,8 @@ afterEach(async () => {
   console.log = originalLog;
   _setSpawner();
   delete process.env.RBOX_HOME;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
   await fs.rm(root, { recursive: true, force: true });
 });
 

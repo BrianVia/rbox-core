@@ -135,9 +135,12 @@ publication seal.
 The Interface separates bounded one-root admission from machine inventory:
 
 ```ts
-observeFolderAdmission(root: string, snapshot?: FolderCatalogSnapshot): Promise<FolderAdmission>
-listFolderInventory(snapshot?: FolderCatalogSnapshot): Promise<FolderInventorySnapshot>
+observeFolderAdmission(root: string, state?: FolderCatalogState): Promise<FolderAdmission>
+listFolderInventory(state?: FolderCatalogState): Promise<FolderInventorySnapshot>
 ```
+
+The optional input is the inspected catalog state, never a bare snapshot, so
+reusing an observation cannot fabricate catalog authority.
 
 `src/cli/folder-config-migration.ts` composes strict legacy observations into a pure
 candidate and invokes `publishInitialFolderCatalog`. This prevents
