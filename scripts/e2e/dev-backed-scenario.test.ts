@@ -35,7 +35,7 @@ test("approval and pairing values are extracted from real UI shapes", () => {
   expect(extractUserCode("visit https://app.rbox.to/cli-login?code=ABCD-EFGH now")).toBe("ABCD-EFGH");
   expect(() => extractUserCode("https://app.rbox.to/cli-login?code=bad")).toThrow(/user code/);
   const token = `rbox-pair_${"a".repeat(16)}.${Buffer.alloc(32, 7).toString("base64url")}`;
-  expect(extractPairingToken(`Pairing token (valid ~10 min, single use):\n${token}\n`)).toBe(token);
+  expect(extractPairingToken(`rbox connect ${token}\n`)).toBe(token);
 });
 
 describe("device approval boundary", () => {
@@ -102,13 +102,13 @@ test("machine A driver pins device approval, immediate genesis, workspace, daemo
     "Set up encryption on this first machine now?",
     "Save a recovery kit (writes the phrase in PLAINTEXT to ~)?",
     "Have you saved this recovery phrase somewhere safe?",
-    "What do you want to track here?",
-    "Which directory should rbox sync?",
-    'Workspace name (Enter accepts, "-" for none)',
+    "Which folder do you want to sync?",
+    "Which folder should rbox sync?",
+    'Display name (Enter accepts, "-" for none)',
     "How should rbox handle gitignored files?",
-    "Keep this workspace syncing in the background?",
+    "Keep this folder syncing in the background?",
     "Set up another machine now",
-    `Pairing token (valid ~10 min, single use):\n\n${token}`,
+    `Pairing command (valid ~10 min, single use):\n\nrbox connect ${token}`,
   ];
   const events: string[] = [];
   const h = tuiHarness(screens, events);
@@ -121,7 +121,7 @@ test("machine A driver pins device approval, immediate genesis, workspace, daemo
   expect(events).toEqual([
     "start:a", "keys:a:Enter", "keys:a:Enter",
     `approve:${DEV_API}:web-secret:ABCD-EFGH`, "keys:approve:",
-    "keys:a:Enter", "keys:a:n+Enter", "keys:a:y+Enter", "keys:a:Enter", "keys:a:Enter",
+    "keys:a:Enter", "keys:a:n+Enter", "keys:a:y+Enter", "keys:a:Down+Enter", "keys:a:Enter",
     "keys:a:dev-e2e+Enter", "keys:a:Enter", "keys:a:Down+Enter", "keys:a:Enter",
   ]);
 });
@@ -132,10 +132,10 @@ test("machine B driver pastes the bearer through tmux and joins the existing wor
     "Are you new here, or do you already have an rbox account?",
     "How do you want to authorize this machine?",
     "Paste pairing token",
-    "What do you want to track here?",
-    "Pick an existing workspace to sync",
-    "Which directory should rbox sync?",
-    "Keep this workspace syncing in the background?",
+    "Which folder do you want to sync?",
+    "Pick a folder to sync from another machine",
+    "Which folder should rbox sync?",
+    "Keep this folder syncing in the background?",
     "Set up another machine now",
     "To pair more devices later",
   ];
@@ -143,7 +143,7 @@ test("machine B driver pastes the bearer through tmux and joins the existing wor
   await setupMachineB(tuiHarness(screens, events), "run-b", "session-b", token);
   expect(events).toEqual([
     "start:b", "keys:b:Down+Enter", "keys:b:Down+Enter", `paste:b:${token}`,
-    "keys:b:Enter", "keys:b:Down+Enter", "keys:b:Enter", "keys:b:Enter",
+    "keys:b:Enter", "keys:b:Down+Down+Enter", "keys:b:Enter", "keys:b:Enter",
     "keys:b:Down+Enter", "keys:b:Down+Enter",
   ]);
 });
