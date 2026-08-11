@@ -60,7 +60,8 @@ requires an explicit ownership/layering decision.
 ### Cross-CLI authority primitives
 
 ```
-src/cli/folder-config.ts — dormant design-231 FolderCatalog authority: closed bounded config/activation codecs, lexical home-path normalization, exact duplicate validation, fieldwise effective-policy resolution, generation pinning, pure caller-seeded candidate construction, authority-state inspection, and globally locked config-before-marker durable publication with best-effort stale-edit detection. Never: binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
+src/cli/folder-config-codec.ts — dormant design-231 FolderCatalog pure codec: owns closed bounded config validation, lexical home-path normalization, exact duplicate validation, fieldwise effective-policy resolution, generation pinning, and pure caller-seeded candidate construction. Never: filesystem I/O, activation-marker validation, authority-state inspection, durable publication, binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
+src/cli/folder-config.ts — dormant design-231 FolderCatalog publication and single import surface: owns activation-marker validation, authority-state inspection, and globally locked config-before-marker durable publication with best-effort stale-edit detection; re-exports the pure codec Interface. Never: config schema or policy decisions, binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
 ```
 
 ## `src/cli/sync/` — sync drivers (pull-then-push cycle)
