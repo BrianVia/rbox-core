@@ -100,6 +100,18 @@ Statuses used below:
 | Status / fix | **CONFIRMED — FIXED** on `chore/flake-006`. An inspection-window disappearance or replacement now raises `MarkerTurnoverError`, and the fence observer (`inspectHeldFence`) treats it as "look again" — the same disposition `readMarkerNoFollow` already gives "lock changed during inspection" in `src/engine/git/lockfile.ts`. Owners of a marker keep failing closed by not catching it. |
 | Proof | [2026-07-28 failure](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90167390189) and [green same-SHA rerun](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90193788407), exact SHA `7ce9e01adf04c9b673e7ad148755dea1da213140`. Root-caused by reproducing the exact `ENOENT` stack under 8-way load (1 loss in 240 contended pairs; 0 in 240 after the fix). Regression test `a fence released inside the inspection window is a retry, not a lost writer` drives the interleaving through the `marker-observe-before-open` seam: red with the fix stashed, green with it; 10× isolation of the file green (47 tests, 4.59–4.71 s). |
 
+### FLAKE-007 — onboarding rig sha_mismatch under one overwritten Bun canary
+
+| Field | Record |
+|---|---|
+| Test | `onboard-smoke` — `[A] init --new` initial push, `blob PUT failed: 400 {"error":"sha_mismatch"}` |
+| File | CI job `compiled TUI · onboarding rig` (rig driver runs `bun-version: "canary"`; the rbox binary itself is built on 1.3.14) |
+| First / last seen | 2026-08-10 / 2026-08-10 |
+| Failure | Main run for #626 merge ([run 31402717470](https://github.com/BrianVia/rbox-core/actions/runs/31402717470) attempt 1), SHA `321bf7599`: first blob PUT rejected by the dev API with `sha_mismatch` at 0% upload. |
+| Root cause | Environment, not code: the failing attempt ran Bun canary `1.4.0-canary.1+827475e21`; the same repo content passed the identical job on the PR ~15 h earlier under canary `52bf09cb1` and on the same-SHA rerun under canary `9fcdea80b`. The bad canary lived inside a ~15 h window and the `canary` tag is overwritten in place, so `827475e21` is no longer downloadable and cannot be bisected. Local rig on Bun 1.3.14 (same SHA) passed end-to-end; full engine suite under `9fcdea80b` passed 871/871. |
+| Status / fix | **CONFIRMED — NOTE-ONLY** (environment drift, no repo change possible). Disposition for recurrences: a red canary-driver rig job with a green same-SHA history is first re-run against the *current* canary before any code investigation; record the failing `bun --revision` from the job log immediately — it is unrecoverable once the tag moves. |
+| Proof | Failed attempt-1 log (canary `827475e21`), [green same-SHA rerun](https://github.com/BrianVia/rbox-core/actions/runs/31402717470) (canary `9fcdea80b`), green PR-run 2026-08-09 23:57 (canary `52bf09cb1`), green local rig on 1.3.14, exact SHA `321bf75991ceedd1d95a20108d6e7a580b5ed4ab`. |
+
 ## Same-class audit candidates
 
 These are the actionable occurrences found by the `src/**/*.test.ts` and
