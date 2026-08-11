@@ -273,7 +273,16 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       // named root is the remedy `status --all` prints for that row (design 211).
       const registered = explicit !== undefined
         && await (await import("./binding-registry.js")).isRegisteredRoot(explicit);
-      const resolved = registered ? explicit : await findRoot(explicit ?? process.cwd());
+      let configured = false;
+      if (explicit !== undefined) {
+        const catalog = await import("./folder-config.js");
+        const state = await catalog.inspectFolderCatalog();
+        const snapshot = state.kind === "damaged"
+          ? await catalog.readFolderCatalog()
+          : state.kind === "authoritative" ? state.snapshot : undefined;
+        configured = snapshot?.folders.some((folder) => folder.normalizedPath === explicit) === true;
+      }
+      const resolved = registered || configured ? explicit : await findRoot(explicit ?? process.cwd());
       if (resolved === undefined) throw workspaceRequiredError();
       const root = resolved;
       const { untrack } = await import("./untrack-cmd.js");

@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import type { FileEntry, IgnoreMatcher, Manifest } from "../engine/index.js";
 import { listIgnoreRules } from "./ignore-cmd.js";
+import { folderCatalogPath } from "./rbox-paths.js";
+import { serializeFolderCatalog, setFolderOptions } from "./folder-config.js";
 import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError } from "./sync/policy.js";
 import { preparePublishCandidate, type GitCapturePort, type PublishPolicy } from "./sync/publish-candidate.js";
 
@@ -12,11 +14,25 @@ afterEach(() => { console.log = originalLog; });
 
 test("bare ignore collapses builtins while --list prints every rule", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ignore-list-"));
+  const rboxHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ignore-home-"));
+  const priorRboxHome = process.env.RBOX_HOME;
+  process.env.RBOX_HOME = rboxHome;
   await fs.mkdir(path.join(root, ".rbox"));
-  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), "{}");
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_ignore",
+    deviceId: "dev_ignore",
+    respectGitignore: true,
+  }));
+  await fs.mkdir(path.dirname(folderCatalogPath()), { recursive: true });
+  await fs.writeFile(folderCatalogPath(), serializeFolderCatalog({
+    schemaVersion: 1,
+    globalOptions: {},
+    folders: [{ name: "Ignore test", path: root, options: { respectGitignore: false } }],
+  }));
   await fs.writeFile(path.join(root, ".gitignore"), "generated/**\n");
   await fs.writeFile(path.join(root, ".rboxignore"), "dist/**\n");
   const logs: string[] = [];
+  const bindingBefore = await fs.readFile(path.join(root, ".rbox", "workspace.json"), "utf8");
   console.log = (...args: unknown[]) => void logs.push(args.map(String).join(" "));
   try {
     await listIgnoreRules(root);
@@ -27,13 +43,17 @@ test("bare ignore collapses builtins while --list prints every rule", async () =
     expect(summary).toContain("[.rboxignore] dist/**");
     expect(summary).not.toContain("[builtin] node_modules");
     logs.length = 0;
-    await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({ respectGitignore: true }));
+    await setFolderOptions(root, { respectGitignore: true });
+    expect(await fs.readFile(path.join(root, ".rbox", "workspace.json"), "utf8")).toBe(bindingBefore);
     await listIgnoreRules(root, { full: true });
     expect(logs.join("\n")).toContain("respectGitignore: on");
     expect(logs.join("\n")).toContain("[.gitignore ACTIVE] generated/**");
     expect(logs.join("\n")).toContain("[builtin] node_modules");
   } finally {
+    if (priorRboxHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = priorRboxHome;
     await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(rboxHome, { recursive: true, force: true });
   }
 });
 

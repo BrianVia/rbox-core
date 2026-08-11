@@ -22,7 +22,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { readDesiredDaemonRows } from "./autostart-cmd.js";
+import { readDesiredDaemonRows } from "./autostart/desired-state.js";
 import { currentWorkspaceId } from "./daemon/runtime-state.js";
 import { bindingRegistryDir, bindingRegistryPath } from "./rbox-paths.js";
 import { RBOX_DIR } from "./workspace-config.js";

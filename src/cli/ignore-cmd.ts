@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { buildIgnoreMatcher, effectiveIgnoreRules, HashCache, scanManifest } from "../engine/index.js";
-import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
+import { loadState, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { confirmDestructive } from "./prompt.js";
 import { localFileObservationForScan, makeDeferErrnoReporter, pushManifest } from "./sync.js";
@@ -12,8 +12,18 @@ import { savePathWarnings } from "./path-warnings.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
 import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
 import { assertNoUnevaluatedPurgeDeletes } from "./sync/policy.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { setFolderOptions } from "./folder-config.js";
+import { observeFolderAdmission } from "./folder-inventory.js";
 
 const RBOXIGNORE = ".rboxignore";
+
+async function admittedPolicy(root: string) {
+  const state = await ensureFolderAuthority({ currentRoot: root });
+  const admission = await observeFolderAdmission(root, state);
+  if (admission.kind !== "admitted") throw new Error(admission.reason);
+  return admission.policy;
+}
 
 /** Append a pattern to `.rboxignore` (synced, shared across machines), de-duped. */
 export async function addIgnorePattern(root: string, pattern: string): Promise<void> {
@@ -41,8 +51,7 @@ export async function addIgnorePattern(root: string, pattern: string): Promise<v
 
 /** Print the ignore rule set, labeled by source and current activity, in precedence order. */
 export async function listIgnoreRules(root: string, opts: { full?: boolean } = {}): Promise<void> {
-  const cfg = await loadConfig(root);
-  const respectGitignore = cfg.respectGitignore === true;
+  const respectGitignore = (await admittedPolicy(root)).respectGitignore;
   const rules = effectiveIgnoreRules(root);
   console.log(`respectGitignore: ${respectGitignore ? "on" : "off"}`);
   console.log(`ignore rules (precedence: builtin → .gitignore → .rboxignore):`);
@@ -63,8 +72,8 @@ export async function listIgnoreRules(root: string, opts: { full?: boolean } = {
 export async function setRespectGitignore(root: string, raw: string | undefined): Promise<void> {
   const value = parseOnOff(raw);
   if (value === undefined) throw new Error("usage: rbox ignore --respect-gitignore <on|off>");
-  const cfg = await loadConfig(root);
-  await saveConfig(root, { ...cfg, respectGitignore: value });
+  await admittedPolicy(root);
+  await setFolderOptions(root, { respectGitignore: value });
   console.log(`respectGitignore: ${value ? "on" : "off"}`);
   if (value) {
     console.log(`already-synced ignored files are carried forward. Run \`rbox ignore --purge\` to delete those stale copies explicitly.`);
@@ -73,8 +82,9 @@ export async function setRespectGitignore(root: string, raw: string | undefined)
 
 export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMassDelete?: boolean } = {}): Promise<void> {
   await assertCommandAllowedOnScopedBinding(root, "purge");
+  const folderPolicy = await admittedPolicy(root);
   const { cfg, deps } = await buildAuthedRemote(root);
-  const preview = await computePurgeCandidate(root, cfg);
+  const preview = await computePurgeCandidate(root, cfg, folderPolicy.respectGitignore);
   if (preview.purged.length === 0) {
     console.log("purge dry-run: nothing to delete.");
     return;
@@ -97,8 +107,11 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
 
   await withWorkspaceSyncMutex(root, async (syncMutex) => {
     // The preview is presentation only. Recompute the final deletion set and
-    // manifest after confirmation while holding the operation mutex.
-    const final = await computePurgeCandidate(root, cfg);
+    // manifest under a freshly pinned admission after confirmation while
+    // holding the operation mutex. A catalog edit during the prompt therefore
+    // applies to the final scan as one coherent policy, never halfway through.
+    const finalPolicy = await admittedPolicy(root);
+    const final = await computePurgeCandidate(root, cfg, finalPolicy.respectGitignore);
     if (final.purged.length === 0) {
       console.log("purge made no remote change (the confirmed paths changed before the lock was acquired)");
       return;
@@ -122,10 +135,14 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
   });
 }
 
-async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeof buildAuthedRemote>>["cfg"]): Promise<{ local: Awaited<ReturnType<typeof scanManifest>>; purged: string[]; observationComplete: boolean }> {
+async function computePurgeCandidate(
+  root: string,
+  cfg: Awaited<ReturnType<typeof buildAuthedRemote>>["cfg"],
+  respectGitignore: boolean,
+): Promise<{ local: Awaited<ReturnType<typeof scanManifest>>; purged: string[]; observationComplete: boolean }> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
-    respectGitignore: cfg.respectGitignore === true,
+    respectGitignore,
     forceTrackedEvaluation: true,
     protectTrackedPaths: true,
     knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),

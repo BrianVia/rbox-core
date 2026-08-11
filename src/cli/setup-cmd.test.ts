@@ -173,9 +173,9 @@ test("Step 2 → runInit flags: a create carries the prompted name to the server
   expect(f).toMatchObject({ new: "true", name: "Conductor Workspaces", "no-interactive": "true" });
 });
 
-test("Step 2 → runInit flags: respectGitignore is forwarded only when true and only for creates", () => {
+test("Step 2 → runInit flags: a create answer is explicit for both values and joins omit it", () => {
   expect(workspaceFlags({ kind: "new", root: "/code/app" })["respect-gitignore"]).toBeUndefined();
-  expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: false })["respect-gitignore"]).toBeUndefined();
+  expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: false })["respect-gitignore"]).toBe("false");
   expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: true })).toMatchObject({ "respect-gitignore": "true" });
   expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
 });
@@ -499,6 +499,15 @@ function baseCreateDeps(root: string, overrides: Partial<StepWorkspaceTestDeps> 
     createWorkspace: async () => "ws_created",
     continueInit: async () => ({ workspaceId: "ws_created", deviceId: "dev", root }),
     writeStderr: () => undefined,
+    ensureFolderAuthority: async () => ({
+      kind: "authoritative",
+      revision: "test-revision",
+      snapshot: {
+        catalog: { schemaVersion: 1, globalOptions: {}, folders: [] },
+        generation: "test-generation",
+        folders: [],
+      },
+    }) as never,
     ...overrides,
   };
 }

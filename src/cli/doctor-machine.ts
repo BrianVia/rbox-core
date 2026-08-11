@@ -61,6 +61,7 @@ export interface MachineTriage {
 }
 
 export interface MachineTriageDeps {
+  /** Retained test/compatibility seam; production enumeration uses FolderInventory. */
   readBindingRegistry?: typeof readBindingRegistry;
   listFolderInventory?: typeof listFolderInventory;
   observeDaemon?: typeof observeDaemon;
@@ -127,10 +128,14 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
 
 export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
   const state = await inspectFolderCatalog();
-  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state, {
-    ...(deps.readBindingRegistry === undefined ? {} : { readBindingRegistry: deps.readBindingRegistry }),
-  }).catch(() => ({ rows: [] }));
-  const rows = inventory.rows;
+  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(state).catch(() => ({ rows: [] }));
+  // Machine JSON v1 is registry-shaped and closed. Catalog/current-root-only
+  // evidence belongs to the folder-config surface, not this compatibility view.
+  const rows = deps.readBindingRegistry === undefined
+    ? inventory.rows
+      .filter((row) => row.registry !== undefined || row.desired !== undefined)
+      .flatMap((row) => row.registry === undefined ? [] : [row.registry])
+    : await deps.readBindingRegistry().catch(() => []);
   const now = (deps.now ?? Date.now)();
   const observe = deps.observeDaemon ?? observeDaemon;
 

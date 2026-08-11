@@ -23,6 +23,8 @@ import { loadState } from "./sync-state-store.js";
 import { resolveBindingScope, type BindingScope } from "./scope/binding-scope.js";
 import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import type { ScopeTransactionDeps } from "./scope/scope-transaction.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder, setFolderOptions, type FolderOptions } from "./folder-config.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -90,6 +92,10 @@ export async function track(
   if (includes.length > 0 && flags.workspace === undefined) {
     throw new Error("--include chooses folders of an existing workspace — use it with --workspace <id>");
   }
+  // Do this after cheap argument validation but before a create call or binding
+  // write: a missing catalog with existing bindings requires regeneration.
+  const folderAuthority = await ensureFolderAuthority({ currentRoot: root });
+  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === root);
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
   const { credentialsForStrictFlow, loadCredentials } = await import("./credentials.js");
@@ -198,6 +204,12 @@ export async function track(
     ...(creds?.accountId ? { accountId: creds.accountId } : {}),
     ...(cfg.scope ? { scope: cfg.scope } : {}),
   });
+  const catalogOptions: FolderOptions = {
+    syncGit: cfg.syncGit === true,
+    respectGitignore: cfg.respectGitignore === true,
+  };
+  await recordFolder(root, { options: catalogOptions });
+  if (folderAlreadyListed) await setFolderOptions(root, catalogOptions);
   if (includes.length === 0) return { cfg, root };
   const control = await import("./daemon-control.js");
   const daemonRunning = deps.scopeDeps?.daemonRunning

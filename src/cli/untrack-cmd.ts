@@ -20,11 +20,13 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { RBOX_DIR } from "./config.js";
+import { RBOX_DIR } from "./workspace-config.js";
 import { forceKill, isDaemonRunning, removeDaemonRuntime, stopDaemon, waitForExit } from "./daemon-control.js";
 import { style } from "./style.js";
 import { loadAdoptJournal } from "./adopt-journal.js";
 import { forgetBinding, isRegisteredRoot } from "./binding-registry.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { forgetFolder, inspectFolderCatalog, type FolderCatalogState } from "./folder-config.js";
 
 const STOP_TIMEOUT_MS = 5000;
 const KILL_TIMEOUT_MS = 2000;
@@ -36,8 +38,21 @@ export interface UntrackOptions {
   confirm?: () => Promise<boolean>;
 }
 
-export async function untrack(opts: UntrackOptions): Promise<void> {
+export type UntrackStep = "daemon-stopped" | "binding-removed" | "runtime-removed" | "catalog-forgotten" | "registry-forgotten";
+
+export interface UntrackDeps {
+  /** Crash-injection/ordering observation seam; production callers omit it. */
+  onStep?: (step: UntrackStep) => void | Promise<void>;
+}
+
+function catalogLists(state: FolderCatalogState, root: string): boolean {
+  return state.kind === "authoritative"
+    && state.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(root));
+}
+
+export async function untrack(opts: UntrackOptions, deps: UntrackDeps = {}): Promise<void> {
   const { root, force } = opts;
+  const step = async (completed: UntrackStep): Promise<void> => deps.onStep?.(completed);
 
   // Preserve untrack's established, specific refusal for a swapped workspace
   // binding before the adoption-journal reader performs its broader control-path
@@ -54,6 +69,17 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
   if (await loadAdoptJournal(root)) {
     throw new Error("retained adoption data can be removed only with `rbox adopt clean`; untrack refused");
   }
+
+  let catalogState = await inspectFolderCatalog();
+  if (earlyRboxStat !== undefined && catalogState.kind !== "authoritative") {
+    catalogState = await ensureFolderAuthority({ currentRoot: root });
+  } else if (catalogState.kind === "damaged") {
+    await ensureFolderAuthority({ currentRoot: root });
+  }
+  // Capture compatibility evidence before deleting either exact-root locator.
+  // This snapshot controls only the already-gone UX; the final strict forget is
+  // unconditional so a concurrent best-effort registry writer cannot survive.
+  const registryKnows = await isRegisteredRoot(root);
 
   if (!force && opts.confirm) {
     const ok = await opts.confirm();
@@ -80,6 +106,7 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
       }
     }
   }
+  await step("daemon-stopped");
 
   // 2. Remove the binding, but only after proving the path is exactly <root>/.rbox
   //    and not a symlink (defeats a swapped/symlinked `.rbox` pointing elsewhere).
@@ -90,22 +117,33 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
     // hand) but the local registry still lists it. This is the ONLY way to clear
     // the `missing` rows `rbox status --all` / `doctor --all` report, so untrack
     // forgets the entry instead of dead-ending on "nothing to untrack".
-    const known = await isRegisteredRoot(root);
-    await forgetBinding(root);
+    const catalogKnows = catalogLists(catalogState, root);
+    const known = registryKnows || catalogKnows;
+    await step("binding-removed");
     await removeDaemonRuntime(root);
+    await step("runtime-removed");
+    if (catalogKnows) await forgetFolder(root);
+    await step("catalog-forgotten");
+    await forgetBinding(root);
+    await step("registry-forgotten");
     if (!known) throw new Error(`no rbox binding at ${rboxPath} — nothing to untrack`);
     console.log(`${style.sym.ok} forgot ${root}`);
     console.log(style.dim("  its rbox binding was already gone; this machine no longer lists it."));
     return;
   }
   await removeRboxDir(root, rboxPath);
+  await step("binding-removed");
 
   // The daemon's pid/log live globally under ~/.rbox — remove them too so untrack
   // leaves nothing orphaned outside the workspace.
   await removeDaemonRuntime(root);
+  await step("runtime-removed");
+  await forgetFolder(root);
+  await step("catalog-forgotten");
   // Design 211: drop the durable binding record so the aggregate views stop
   // listing this root at all (rather than listing it as a stale binding).
   await forgetBinding(root);
+  await step("registry-forgotten");
 
   console.log(`${style.sym.ok} untracked ${root}`);
   console.log(style.dim("  local files are untouched."));

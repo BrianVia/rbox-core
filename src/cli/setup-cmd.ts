@@ -60,6 +60,8 @@ import {
   type ResetConsentWitness,
 } from "./reset-consent.js";
 import { homeDir } from "./rbox-paths.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { resolveFolderPolicy } from "./folder-config.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -72,7 +74,9 @@ export function workspaceFlags(plan: { kind: "new" | "join"; root: string; works
   // exists, first-writer-wins). Manual-id entry has no name, so the flag is simply
   // absent and status falls back to the id.
   if (plan.name) flags.name = plan.name;
-  if (plan.kind === "new" && plan.respectGitignore === true) flags["respect-gitignore"] = "true";
+  if (plan.kind === "new" && plan.respectGitignore !== undefined) {
+    flags["respect-gitignore"] = plan.respectGitignore ? "true" : "false";
+  }
   return flags;
 }
 
@@ -659,6 +663,7 @@ interface StepWorkspaceDeps {
   continueInit?: typeof continueInitWithPrecreatedWorkspace;
   writeStderr?: (text: string) => void;
   defaultFolder?: () => string;
+  ensureFolderAuthority?: typeof ensureFolderAuthority;
 }
 
 /** Step 2 · Folder. Only explicit pre-init navigation returns `menu`. */
@@ -693,6 +698,7 @@ export async function stepWorkspace(
   const continueInit = deps.continueInit ?? continueInitWithPrecreatedWorkspace;
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   const recommendedFolder = deps.defaultFolder ?? defaultSyncFolder;
+  const ensureAuthority = deps.ensureFolderAuthority ?? ensureFolderAuthority;
 
   // One typed observation governs this workspace step; degradation must stop
   // before directory creation, mutex publication, or a remote mutation.
@@ -900,10 +906,13 @@ export async function stepWorkspace(
       );
       if (ans) name = ans;
 
+      const catalog = await ensureAuthority({ currentRoot: dir });
+      const inheritedRespectGitignore = resolveFolderPolicy(catalog.snapshot.catalog.globalOptions, {}).respectGitignore;
       const respectGitignore =
         (await select<"false" | "true">({
           message: "How should rbox handle gitignored files?",
           choices: SETUP_GITIGNORE_CHOICES,
+          default: inheritedRespectGitignore ? "true" : "false",
         })) === "true";
 
       if (!creds) throw new Error("login did not produce a credential — aborting setup");

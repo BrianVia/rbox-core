@@ -296,6 +296,22 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
   }
 }
 
+interface EphemeralExportPolicy {
+  syncGit: true;
+  git: { incremental: true };
+  respectGitignore: false;
+  noDrift: false;
+  trash: { days: 0; maxBytes: 2147483648 };
+}
+
+const EPHEMERAL_EXPORT_POLICY: EphemeralExportPolicy = {
+  syncGit: true,
+  git: { incremental: true },
+  respectGitignore: false,
+  noDrift: false,
+  trash: { days: 0, maxBytes: 2147483648 },
+};
+
 async function defaultPullWorkspace(
   stagingRoot: string,
   target: { workspaceId: string; projectId: string },
@@ -310,8 +326,7 @@ async function defaultPullWorkspace(
     rootPath: stagingRoot,
     remoteUrl: creds.remoteUrl,
     token: "",
-    syncGit: true,
-    trash: { days: 0 },
+    ...EPHEMERAL_EXPORT_POLICY,
   };
   await saveConfig(stagingRoot, synthetic);
   const { cfg, deps } = await buildAuthedRemote(stagingRoot);

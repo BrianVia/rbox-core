@@ -1,32 +1,34 @@
-/**
- * Read-only folder inventory (design 231 activation).
- *
- * This Module joins caller-pinned catalog state to binding observations without
- * healing either source. Stage C retains compatibility-registry enumeration;
- * Stage D expands that observation into the complete source union.
- */
-import fs from "node:fs/promises";
+/** Read-only FolderInventory classifier and public facade (design 231 §3.2). */
 import path from "node:path";
-import {
-  readBindingRegistry,
-  type BindingRegistryRow,
-  type ReadRegistryDeps,
-} from "./binding-registry.js";
-import {
-  type FolderCatalogState,
-  type ResolvedFolderPolicy,
+import type { BindingRegistryRow } from "./binding-registry.js";
+import type { DesiredStateRow } from "./autostart/desired-state.js";
+import type {
+  FolderCatalogState,
+  ResolvedFolderCatalogEntry,
+  ResolvedFolderPolicy,
 } from "./folder-config.js";
 import type { FolderGenerationInventory } from "./folder-catalog-generate.js";
 import {
-  loadConfigIfPresent,
-  type WorkspaceConfig,
-} from "./workspace-config.js";
+  buildFolderInventoryUnion,
+  observeFolderRoot,
+  type FolderBindingObservation,
+  type FolderOverlap,
+  type FolderUnionDeps,
+  type FolderUnionRow,
+} from "./folder-inventory-union.js";
 
 export type FolderAdmission =
   | { kind: "admitted"; generation: string; policy: ResolvedFolderPolicy }
   | { kind: "unbound" | "missing" | "detached" | "damaged"; reason: string };
 
-export interface FolderInventoryRow extends BindingRegistryRow {
+export interface FolderInventoryRow {
+  root: string;
+  catalog?: ResolvedFolderCatalogEntry;
+  registry?: BindingRegistryRow;
+  desired?: DesiredStateRow;
+  binding?: FolderBindingObservation;
+  isCurrentRoot: boolean;
+  overlap?: FolderOverlap;
   admission: FolderAdmission;
 }
 
@@ -36,51 +38,41 @@ export interface FolderInventorySnapshot {
   rows: FolderInventoryRow[];
 }
 
-export interface FolderInventoryDeps extends ReadRegistryDeps {
-  readBindingRegistry?: typeof readBindingRegistry;
-  loadConfigIfPresent?: typeof loadConfigIfPresent;
-}
+export type FolderInventoryDeps = FolderUnionDeps;
 
-async function rootExists(root: string): Promise<boolean> {
-  try {
-    await fs.stat(root);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function observeAgainstState(
-  root: string,
-  state: FolderCatalogState,
-  deps: FolderInventoryDeps,
-): Promise<FolderAdmission> {
+function classify(row: Pick<FolderUnionRow, "catalog" | "binding" | "bindingConfig" | "exists" | "observationError">, state: FolderCatalogState): FolderAdmission {
   if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
-
-  const absoluteRoot = path.resolve(root);
-  const entry = state.kind === "authoritative"
-    ? state.snapshot.folders.find((folder) => folder.normalizedPath === absoluteRoot)
-    : undefined;
-
-  let binding: WorkspaceConfig | undefined;
-  try {
-    binding = await (deps.loadConfigIfPresent ?? loadConfigIfPresent)(absoluteRoot);
-  } catch (error) {
-    return { kind: "damaged", reason: error instanceof Error ? error.message : String(error) };
+  if (!row.exists) {
+    return row.observationError === undefined
+      ? { kind: "missing", reason: "the folder does not exist" }
+      : { kind: "unbound", reason: row.observationError };
   }
-  if (binding === undefined) {
-    return await rootExists(absoluteRoot)
-      ? { kind: "unbound", reason: "the folder has no rbox binding" }
-      : { kind: "missing", reason: "the folder does not exist" };
+  if (row.bindingConfig === undefined) {
+    const reason = row.binding !== undefined && "unreadable" in row.binding
+      ? row.binding.unreadable
+      : "the folder has no rbox binding";
+    return { kind: "unbound", reason };
   }
-
   if (state.kind === "absent") {
     return { kind: "damaged", reason: "rbox folder configuration is absent; run `rbox config regenerate`" };
   }
-  if (entry === undefined) {
-    return { kind: "detached", reason: "the bound folder is not listed in the authoritative folder configuration" };
+  if (row.catalog === undefined) {
+    return { kind: "detached", reason: "the bound folder is not listed in the authoritative folder configuration; run `rbox config add`" };
   }
-  return { kind: "admitted", generation: state.snapshot.generation, policy: entry.policy };
+  return { kind: "admitted", generation: state.snapshot.generation, policy: row.catalog.policy };
+}
+
+function publicRow(row: FolderUnionRow, state: FolderCatalogState): FolderInventoryRow {
+  return {
+    root: row.root,
+    ...(row.catalog === undefined ? {} : { catalog: row.catalog }),
+    ...(row.registry === undefined ? {} : { registry: row.registry }),
+    ...(row.desired === undefined ? {} : { desired: row.desired }),
+    ...(row.binding === undefined ? {} : { binding: row.binding }),
+    isCurrentRoot: row.isCurrentRoot,
+    ...(row.overlap === undefined ? {} : { overlap: row.overlap }),
+    admission: classify(row, state),
+  };
 }
 
 export async function observeFolderAdmission(
@@ -88,53 +80,46 @@ export async function observeFolderAdmission(
   state: FolderCatalogState,
   deps: FolderInventoryDeps = {},
 ): Promise<FolderAdmission> {
-  return observeAgainstState(root, state, deps);
+  if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
+  const absolute = path.resolve(root);
+  const observed = await observeFolderRoot(absolute, deps);
+  const catalog = state.kind === "authoritative"
+    ? state.snapshot.folders.find((entry) => entry.normalizedPath === absolute)
+    : undefined;
+  return classify({ ...observed, ...(catalog === undefined ? {} : { catalog }) }, state);
 }
 
 export async function listFolderInventory(
   state: FolderCatalogState,
+  context: { currentRoot?: string } = {},
   deps: FolderInventoryDeps = {},
 ): Promise<FolderInventorySnapshot> {
-  const registryDeps: ReadRegistryDeps = {
-    ...(deps.readDesiredDaemonRows === undefined ? {} : { readDesiredDaemonRows: deps.readDesiredDaemonRows }),
-    ...(deps.readBoundWorkspaceId === undefined ? {} : { readBoundWorkspaceId: deps.readBoundWorkspaceId }),
-  };
-  const rows = await (deps.readBindingRegistry ?? readBindingRegistry)(registryDeps);
+  const rows = await buildFolderInventoryUnion(state, context, deps);
   return {
     catalogState: state.kind,
     revision: state.revision,
-    rows: await Promise.all(rows.map(async (row) => ({
-      ...row,
-      admission: await observeAgainstState(row.root, state, deps),
-    }))),
+    rows: rows.map((row) => publicRow(row, state)),
   };
 }
 
-/** Minimal Stage-C generation observation; Stage D expands the source union. */
 export async function observeFolderGeneration(
   state: FolderCatalogState,
   context: { currentRoot?: string } = {},
   deps: FolderInventoryDeps = {},
 ): Promise<FolderGenerationInventory> {
-  const registryDeps: ReadRegistryDeps = {
-    ...(deps.readDesiredDaemonRows === undefined ? {} : { readDesiredDaemonRows: deps.readDesiredDaemonRows }),
-    ...(deps.readBoundWorkspaceId === undefined ? {} : { readBoundWorkspaceId: deps.readBoundWorkspaceId }),
-  };
-  const rows = await (deps.readBindingRegistry ?? readBindingRegistry)(registryDeps);
-  const roots = new Set(rows.map((row) => path.resolve(row.root)));
-  if (context.currentRoot !== undefined) roots.add(path.resolve(context.currentRoot));
+  const rows = await buildFolderInventoryUnion(state, context, deps);
   const discoverableBindings: FolderGenerationInventory["discoverableBindings"] = [];
   const skipped: FolderGenerationInventory["skipped"] = [];
-  for (const root of [...roots].sort()) {
-    try {
-      const binding = await (deps.loadConfigIfPresent ?? loadConfigIfPresent)(root);
-      if (binding === undefined) {
-        skipped.push({ root, reason: await rootExists(root) ? "the folder has no rbox binding" : "the folder does not exist" });
-      } else {
-        discoverableBindings.push({ root, binding });
-      }
-    } catch (error) {
-      skipped.push({ root, reason: error instanceof Error ? error.message : String(error) });
+  for (const row of rows) {
+    if (row.bindingConfig !== undefined) {
+      discoverableBindings.push({ root: row.root, binding: row.bindingConfig });
+    } else {
+      const reason = !row.exists && row.observationError === undefined
+        ? "the folder does not exist"
+        : row.binding !== undefined && "unreadable" in row.binding
+          ? row.binding.unreadable
+          : row.observationError ?? "the folder has no rbox binding";
+      skipped.push({ root: row.root, reason });
     }
   }
   return { revision: state.revision, discoverableBindings, skipped };

@@ -43,6 +43,8 @@ import type { AdoptJournal } from "./adopt-journal.js";
 import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
 import { recordBindingScope, rememberBinding } from "./binding-registry.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder, setFolderOptions, type FolderOptions, type FolderOptionsPatch } from "./folder-config.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -375,6 +377,10 @@ async function executeInitPlan(
   },
   continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
+  // Authority must exist before remote or binding effects. Initializing after
+  // saveConfig would misclassify this command's new binding as pre-catalog data.
+  const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root });
+  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(plan.root));
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
   if (plan.auth === "bootstrap-login") {
@@ -507,6 +513,20 @@ async function executeInitPlan(
     // binding whose witness never landed must fail loudly at bind time, not silently
     // become publish-capable later.
     await recordBindingScope(plan.root, cfg.remoteWorkspaceId, cfg.scope);
+    const catalogOptions: FolderOptions = {
+      ...(!opts.guidedSetup || plan.syncGitExplicit === true ? { syncGit: plan.syncGit } : {}),
+      ...(!opts.guidedSetup || plan.respectGitignoreExplicit === true ? { respectGitignore: plan.respectGitignore } : {}),
+    };
+    await recordFolder(plan.root, {
+      ...(Object.keys(catalogOptions).length === 0 ? {} : { options: catalogOptions }),
+    });
+    if (folderAlreadyListed) {
+      const explicitPatch: FolderOptionsPatch = {
+        ...(plan.syncGitExplicit === true ? { syncGit: plan.syncGit } : {}),
+        ...(plan.respectGitignoreExplicit === true ? { respectGitignore: plan.respectGitignore } : {}),
+      };
+      if (Object.keys(explicitPatch).length > 0) await setFolderOptions(plan.root, explicitPatch);
+    }
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
     process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
