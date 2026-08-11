@@ -57,6 +57,12 @@ All six modules are pinned in `apps/api/tsconfig.json`'s `include` as shared
 wire-protocol code, not a layering violation. Any Worker import beyond this list
 requires an explicit ownership/layering decision.
 
+### Cross-CLI authority primitives
+
+```
+src/cli/folder-config.ts — dormant design-231 FolderCatalog authority: closed bounded config/activation codecs, lexical home-path normalization, exact duplicate validation, fieldwise effective-policy resolution, generation pinning, pure caller-seeded candidate construction, authority-state inspection, and globally locked config-before-marker durable publication with best-effort stale-edit detection. Never: binding/remote identity, registry or daemon discovery, scope, migration gathering, compatibility projection, sync orchestration, or CLI activation.
+```
+
 ## `src/cli/sync/` — sync drivers (pull-then-push cycle)
 
 ```
