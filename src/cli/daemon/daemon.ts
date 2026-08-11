@@ -32,6 +32,14 @@ import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./
 import { MassDeleteGuardError, PushConflictExhaustedError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import {
+  applyFolderPolicy,
+  folderPolicyFields,
+  observeFolderAdmission,
+  runtimeRefusal,
+} from "../folder-inventory.js";
+import { folderCatalogPath } from "../rbox-paths.js";
 import { E2eeRemote } from "../e2ee-remote.js";
 import { beginReport, loadMetrics, metricsEnabled, saveMetrics, type SyncMetrics } from "../metrics.js";
 import {
@@ -170,6 +178,27 @@ const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
 const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 export const GIT_BUSY_RETRY_DELAYS_MS = [2_000, 8_000] as const;
+
+interface ReloadStatToken { mtimeMs: number; size: number }
+
+async function reloadStatToken(file: string): Promise<ReloadStatToken | null> {
+  const stat = await fs.stat(file).catch(() => undefined);
+  return stat ? { mtimeMs: stat.mtimeMs, size: stat.size } : null;
+}
+
+function sameReloadStatToken(a: ReloadStatToken | null | undefined, b: ReloadStatToken | null): boolean {
+  return a !== undefined && (a === null
+    ? b === null
+    : b !== null && a.mtimeMs === b.mtimeMs && a.size === b.size);
+}
+
+function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceConfig): boolean {
+  return boot.schema === loaded.schema
+    && boot.remoteWorkspaceId === loaded.remoteWorkspaceId
+    && boot.projectId === loaded.projectId
+    && boot.deviceId === loaded.deviceId
+    && path.resolve(boot.rootPath) === path.resolve(loaded.rootPath);
+}
 
 export interface GitBusyRetryClock {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -464,7 +493,12 @@ export class RboxDaemon {
    *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
    *  a process-global module mock (which leaks across test files). */
   private startWatcherFn: typeof startWatcher = startWatcher;
-  private workspaceConfigStat?: { mtimeMs: number; size: number };
+  private workspaceConfigStat?: ReloadStatToken | null;
+  private folderCatalogStat?: ReloadStatToken | null;
+  private folderAdmissionHaltReason?: string;
+  private folderMatcherRebuildPending = false;
+  private folderPolicyRecyclePending = false;
+  private folderPolicyRecycleFailure?: string;
   private observedAdoptCacheGeneration = 0;
 
   /** Sole owner of the wakeup queue, the recovery episode, mutex backoff/starvation,
@@ -1498,9 +1532,11 @@ export class RboxDaemon {
     if (!await this.refreshScopeAuthority()) return false;
     if (!await this.resetOperationBoundary(syncMutex)) return false;
     if (this.stopped) return false;
+    if (!await this.folderOperationBoundary()) return false;
     await this.recoverOwnedLocksAtBoundary();
     if (this.stopped) return false;
     await this.adoptionCacheGenerationBoundary();
+    if (!await this.acknowledgeFolderPolicyRecycle()) return false;
     const binding = this.syncBase ?? await this.loadSyncBase();
     const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
     if (!bindingMatches) {
@@ -2664,7 +2700,6 @@ export class RboxDaemon {
   }
 
   private async doFullScan(): Promise<ScanCoverage> {
-    await this.reloadWorkspaceConfigIfChanged();
     if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
@@ -2683,7 +2718,6 @@ export class RboxDaemon {
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
   private async doDeepScan(): Promise<ScanCoverage> {
-    await this.reloadWorkspaceConfigIfChanged();
     // Design 206 §1 serial gate: hygiene installs `syncBase` directly and the pump
     // binding prefers it over a reload, so a pull-only daemon could otherwise deep-scan
     // under a stale matcher indefinitely. Runs BEFORE errorGen capture, audit creation,
@@ -2953,25 +2987,113 @@ export class RboxDaemon {
   }
 
   private async reloadWorkspaceConfigIfChanged(): Promise<void> {
-    const file = path.join(this.root, ".rbox", "workspace.json");
-    const st = await fs.stat(file).catch(() => undefined);
-    if (!st) return;
-    const token = { mtimeMs: st.mtimeMs, size: st.size };
-    if (this.workspaceConfigStat && this.workspaceConfigStat.mtimeMs === token.mtimeMs && this.workspaceConfigStat.size === token.size) return;
-    this.workspaceConfigStat = token;
-    const loaded = await loadConfig(this.root);
-    const wasRespecting = this.cfg.respectGitignore === true;
-    // Take ONLY the field this reload exists for. Rebuilding cfg from `loaded`
-    // clobbers the RUNTIME-ATTACHED fields buildAuthedRemote layered on at boot
-    // (`encrypted: true`, `kek`, the credential `remoteUrl` override) — none of
-    // which live in workspace.json. That shipped in v0.9.2 and killed every
-    // daemon push with "E2EE required" minutes after start (first reload tick),
-    // live on 2026-07-07. cfg stays the boot object; only the hot-reloadable
-    // setting moves.
-    this.cfg = { ...this.cfg, respectGitignore: loaded.respectGitignore };
-    this.rebuildMatcher(await this.loadSyncBase());
-    if (wasRespecting !== (this.cfg.respectGitignore === true)) {
-      this.log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
+    const workspaceFile = path.join(this.root, ".rbox", "workspace.json");
+    const [workspaceToken, catalogToken] = await Promise.all([
+      reloadStatToken(workspaceFile),
+      reloadStatToken(folderCatalogPath()),
+    ]);
+    const workspaceChanged = !sameReloadStatToken(this.workspaceConfigStat, workspaceToken);
+    const catalogChanged = !sameReloadStatToken(this.folderCatalogStat, catalogToken);
+    if (!workspaceChanged && !catalogChanged) return;
+    this.workspaceConfigStat = workspaceToken;
+    this.folderCatalogStat = catalogToken;
+
+    try {
+      if (workspaceChanged && workspaceToken !== null) {
+        const loadedBinding = await loadConfig(this.root);
+        if (!sameWorkspaceBindingIdentity(this.cfg, loadedBinding)) {
+          this.setFolderAdmissionHalt("daemon binding changed while idle (workspace config identity mismatch) — stopping before mutation");
+          return;
+        }
+      }
+      const state = await ensureFolderAuthority({ currentRoot: this.root });
+      const admission = await observeFolderAdmission(this.root, state);
+      if (admission.kind !== "admitted") {
+        this.setFolderAdmissionHalt(runtimeRefusal(admission).message);
+        return;
+      }
+      const loaded = folderPolicyFields(admission.policy);
+      const wasRespecting = this.cfg.respectGitignore === true;
+      const needsRecycle = this.cfg.syncGit !== loaded.syncGit
+        || this.cfg.git?.incremental !== loaded.git?.incremental;
+      const safeFieldsOnly = {
+        ...loaded,
+        git: { ...this.cfg.git, incremental: loaded.git?.incremental },
+      };
+      // Take ONLY the field this reload exists for. Rebuilding cfg from `loaded`
+      // clobbers the RUNTIME-ATTACHED fields buildAuthedRemote layered on at boot
+      // (`encrypted: true`, `kek`, the credential `remoteUrl` override) — none of
+      // which live in workspace.json. That shipped in v0.9.2 and killed every
+      // daemon push with "E2EE required" minutes after start (first reload tick),
+      // live on 2026-07-07. cfg stays the boot object; only the hot-reloadable
+      // setting moves.
+      this.cfg = { ...this.cfg, ...safeFieldsOnly };
+      if (wasRespecting !== (this.cfg.respectGitignore === true)) {
+        this.folderMatcherRebuildPending = true;
+        try {
+          this.rebuildMatcher(await this.loadSyncBase());
+          this.folderMatcherRebuildPending = false;
+          this.log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          this.log(`folder config matcher rebuild deferred: ${reason}`);
+        }
+      }
+      if (needsRecycle) {
+        this.folderPolicyRecyclePending = true;
+        this.log("folder config reloaded: Git policy changed; uncached rescan required");
+      }
+      this.folderAdmissionHaltReason = undefined;
+    } catch (error) {
+      this.setFolderAdmissionHalt(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private setFolderAdmissionHalt(reason: string): void {
+    if (this.folderAdmissionHaltReason !== reason) this.log(`sync halted: ${reason}`);
+    this.folderAdmissionHaltReason = reason;
+  }
+
+  private async folderOperationBoundary(): Promise<boolean> {
+    await this.reloadWorkspaceConfigIfChanged();
+    return this.folderAdmissionHaltReason === undefined;
+  }
+
+  /** Git policy changes invalidate resident scan hints. The boundary owns one
+   * uncached, unpruned scan and clears the recycle flag only after its cache is
+   * durable, so a failed acknowledgement is retried before any operation. */
+  private async acknowledgeFolderPolicyRecycle(): Promise<boolean> {
+    if (!this.folderPolicyRecyclePending && !this.folderMatcherRebuildPending) return true;
+    try {
+      if (this.folderMatcherRebuildPending) {
+        this.rebuildMatcher(this.syncBase ?? await this.loadSyncBase());
+        this.folderMatcherRebuildPending = false;
+      }
+      if (this.folderPolicyRecyclePending) {
+        const fresh = new HashCache();
+        const scanned = await this.localObserver.observe({
+          kind: "scan",
+          cache: fresh,
+          previous: this.local.manifest,
+          scanKind: "deep scan",
+          mode: "unpruned",
+        });
+        if (scanned.deferredPaths.size > 0) {
+          throw new Error("folder policy recycle full scan deferred; policy acknowledgement remains blocked");
+        }
+        this.cache = fresh;
+        this.pruneCache();
+        await this.cache.replace(this.root);
+        this.folderPolicyRecyclePending = false;
+        this.log("folder config Git policy acknowledged after uncached rescan");
+      }
+      this.folderPolicyRecycleFailure = undefined;
+      return true;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (this.folderPolicyRecycleFailure !== reason) this.log(`sync halted: ${reason}`);
+      this.folderPolicyRecycleFailure = reason;
+      return false;
     }
   }
 
@@ -3362,6 +3484,17 @@ export function createDaemonShutdownHandler(deps: {
 }
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
+export async function buildAdmittedDaemonRuntime(
+  root: string,
+  warningSink?: (line: string) => void,
+): Promise<Awaited<ReturnType<typeof buildAuthedRemote>>> {
+  const state = await ensureFolderAuthority({ currentRoot: root });
+  const admission = await observeFolderAdmission(root, state);
+  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+  const { cfg, deps, remote } = await buildAuthedRemote(root, Date.now, warningSink);
+  return { cfg: applyFolderPolicy(cfg, admission.policy), deps, remote };
+}
+
 export async function runDaemon(root: string): Promise<void> {
   const logger = new RotatingDaemonLogger(root, () => new Date(), fsSync);
   const bootId = logger.bootId;
@@ -3376,7 +3509,7 @@ export async function runDaemon(root: string): Promise<void> {
     finish,
   });
   try {
-    const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
+    const { cfg, deps } = await buildAdmittedDaemonRuntime(root, logger.log); // E2EE transport + injected KEK
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
       // Transport only — `refreshScopeAuthority` is what actually decides, and can

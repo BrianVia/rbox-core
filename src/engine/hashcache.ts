@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic } from "./fsutil.js";
+import { fsyncDirectory, writeFileAtomic } from "./fsutil.js";
 
 /**
  * Persistent (mtime,size,ctime)->sha cache. The point is performance: re-hashing an
@@ -122,6 +122,17 @@ export class HashCache {
     const abs = path.join(root, CACHE_REL);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await writeFileAtomic(abs, JSON.stringify(this.toJSON()), opts);
+    this.dirty = false;
+  }
+
+  /** Durably replace the complete cache even when this instance is empty/clean.
+   * Used when a caller must invalidate an older on-disk cache before it can
+   * acknowledge an uncached observation boundary. */
+  async replace(root: string, opts: { beforeRename?: () => boolean | Promise<boolean> } = {}): Promise<void> {
+    const abs = path.join(root, CACHE_REL);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await writeFileAtomic(abs, JSON.stringify(this.toJSON()), opts);
+    await fsyncDirectory(path.dirname(abs));
     this.dirty = false;
   }
 }

@@ -5,6 +5,19 @@ const mutex = { root: ROOT, incarnation: "fixture", released: false };
 let trace = [];
 let policy;
 let failPull = false;
+let admission = {
+  kind: "admitted",
+  generation: "catalog-1",
+  policy: {
+    syncGit: false,
+    git: { incremental: false },
+    respectGitignore: true,
+    noDrift: true,
+    trash: { days: 7, maxBytes: 99 },
+  },
+};
+let authorityCalls = 0;
+let admissionCalls = 0;
 
 mock.module("./sync-mutex.js", () => ({
   withWorkspaceSyncMutex: async (root, run) => {
@@ -22,8 +35,42 @@ mock.module("./e2ee-client.js", () => ({
   buildAuthedRemote: async (root, _now, warningSink) => {
     if (root !== ROOT || typeof warningSink !== "function") throw new Error("observer wiring lost");
     trace.push("remote:built");
-    return { cfg: { noDrift: false }, deps: {} };
+    return {
+      cfg: {
+        noDrift: false,
+        encrypted: true,
+        kek: Buffer.alloc(32, 7),
+        remoteUrl: "https://credential.invalid",
+        token: "runtime-token",
+      },
+      deps: {},
+    };
   },
+}));
+
+mock.module("./folder-authority.js", () => ({
+  ensureFolderAuthority: async () => {
+    authorityCalls++;
+    trace.push("authority:pinned");
+    return { kind: "authoritative", revision: "catalog-1" };
+  },
+}));
+
+mock.module("./folder-inventory.js", () => ({
+  observeFolderAdmission: async () => {
+    admissionCalls++;
+    trace.push("admission:pinned");
+    return admission;
+  },
+  applyFolderPolicy: (cfg, next) => ({
+    ...cfg,
+    syncGit: next.syncGit,
+    git: { ...cfg.git, incremental: next.git.incremental },
+    respectGitignore: next.respectGitignore,
+    noDrift: next.noDrift,
+    trash: { ...next.trash },
+  }),
+  runtimeRefusal: (refusal) => new Error(`refused:${refusal.kind}:${refusal.reason}`),
 }));
 
 mock.module("./metrics.js", () => ({
@@ -45,26 +92,43 @@ function capture(kind, deps) {
   if (deps.massDeleteHint !== undefined) policy.hint = deps.massDeleteHint;
 }
 
+function captureCfg(cfg) {
+  policy.cfg = {
+    syncGit: cfg.syncGit,
+    incremental: cfg.git?.incremental,
+    respectGitignore: cfg.respectGitignore,
+    noDrift: cfg.noDrift,
+    trash: cfg.trash,
+    encrypted: cfg.encrypted,
+    kekByte: cfg.kek?.[0],
+    remoteUrl: cfg.remoteUrl,
+    token: cfg.token,
+  };
+}
+
 mock.module("./sync/pull.js", () => ({
-  pull: async (_root, _cfg, deps) => {
+  pull: async (_root, cfg, deps) => {
     if (failPull) {
       trace.push("execute:pull:failed");
       throw new Error("pull failed");
     }
+    captureCfg(cfg);
     capture("pull", deps);
     return [];
   },
 }));
 
 mock.module("./sync/push.js", () => ({
-  push: async (_root, _cfg, deps) => {
+  push: async (_root, cfg, deps) => {
+    captureCfg(cfg);
     capture("push", deps);
     return { sequence: 7, committed: true, caseCollisions: [] };
   },
 }));
 
 mock.module("./sync/sync.js", () => ({
-  sync: async (_root, _cfg, deps) => {
+  sync: async (_root, cfg, deps) => {
+    captureCfg(cfg);
     capture("sync", deps);
     return {
       pulled: [],
@@ -105,7 +169,7 @@ for (const [label, operation] of operations) {
     ? { ...observer, massDeleteHint: "SYNC_HINT" }
     : observer;
   await runtime.run(operation, runObserver, async (outcome, cfg) => {
-    if (cfg.noDrift !== false) throw new Error("completion context lost");
+    if (cfg.noDrift !== true) throw new Error("completion context lost");
     if (outcome.kind !== operation.kind) throw new Error("outcome kind mismatch");
     if (operation.kind === "sync" && outcome.mode !== operation.mode) throw new Error("outcome mode mismatch");
     trace.push("complete");
@@ -120,5 +184,23 @@ try {
 } catch (error) {
   if (!(error instanceof Error) || error.message !== "pull failed") throw error;
 }
+const failedTrace = trace;
 
-process.stdout.write(JSON.stringify({ runs, failedTrace: trace }));
+trace = [];
+failPull = false;
+admission = { kind: "detached", reason: "run `rbox config add`" };
+let refusal;
+try {
+  await runtime.run({ kind: "pull", massDelete: "guarded" }, observer);
+} catch (error) {
+  refusal = error instanceof Error ? error.message : String(error);
+}
+
+process.stdout.write(JSON.stringify({
+  runs,
+  failedTrace,
+  refusalTrace: trace,
+  refusal,
+  authorityCalls,
+  admissionCalls,
+}));

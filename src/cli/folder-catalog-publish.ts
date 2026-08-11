@@ -17,7 +17,7 @@ import codecInternals, {
   type FolderCatalogSnapshot,
   type FolderCatalogState,
 } from "./folder-config-codec.js";
-import { folderCatalogLockPath, folderCatalogPath, rboxDir } from "./rbox-paths.js";
+import { folderCatalogDir, folderCatalogLockPath, folderCatalogPath, rboxDir } from "./rbox-paths.js";
 
 export type FolderCatalogPublicationStep =
   | "before-write"
@@ -190,6 +190,10 @@ export async function readFolderCatalog(): Promise<FolderCatalogSnapshot> {
 }
 
 async function catalogLock(options: FolderCatalogPublicationOptions): Promise<OwnedLock> {
+  // A fresh machine (or fresh test catalog dir) has no catalog directory yet;
+  // the lock file lives inside it, so the chain must exist before acquisition.
+  const created = await ensureDirectoryChain(folderCatalogDir(), "rbox config directory");
+  await fsyncCreatedDirectoryAncestors(folderCatalogDir(), created);
   const deadline = Date.now() + (options.lockWaitMs ?? 10_000);
   for (;;) {
     const acquired = await acquireLock(folderCatalogLockPath(), options.lock);

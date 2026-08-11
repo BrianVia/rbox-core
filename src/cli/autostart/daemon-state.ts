@@ -11,6 +11,8 @@ import {
 import { assertBindingUsable, resolveBindingScope } from "../scope/binding-scope.js";
 import { withScopeTransitionLock } from "../scope/scope-lock.js";
 import type { DaemonMode } from "../daemon/ambient-status.js";
+import { requireFolderAdmission } from "./folder-admission-gate.js";
+import type { FolderAdmission } from "../folder-inventory.js";
 import {
   desiredContext,
   desiredMode,
@@ -20,6 +22,7 @@ import {
   mutateDesiredRecord,
   readDesiredRecord,
   resolveStartMode,
+  resumeDesiredIdentity,
   sameDesiredGeneration,
   withDesiredRecordLock,
   type DaemonMaintenance,
@@ -35,8 +38,8 @@ export interface StartStopDeps extends DesiredDeps {
   modeWitnessPollMs?: number;
   /** Resume-only generation guard; never supplied by an interactive start. */
   resumeExpected?: DesiredDaemonState;
-  /** Already account/workspace-validated desired identity for boot/upgrade resume. */
   trustedDesiredIdentity?: DesiredDaemonState;
+  trustedFolderAdmission?: Extract<FolderAdmission, { kind: "admitted" }>;
 }
 
 class StaleDesiredResumeError extends Error {}
@@ -61,27 +64,13 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
   // record says, what flags were passed, or how the record was corrupted.
   const seal = await resolveBindingScope(abs);
   assertBindingUsable(seal);
+  const identity = deps.trustedDesiredIdentity === undefined
+    ? await desiredContext(abs, "running", deps)
+    : resumeDesiredIdentity(abs, deps.trustedDesiredIdentity);
+  if (deps.trustedFolderAdmission === undefined) await requireFolderAdmission(abs);
   const requested = seal.kind === "scoped"
     ? { mode: "pull-only" as const, intent: "explicit" as const, explicit: true }
     : resolveStartMode(previous, deps);
-  const identity = deps.trustedDesiredIdentity === undefined
-    ? await desiredContext(abs, "running", deps)
-    : {
-        rootPath: abs,
-        state: "running" as const,
-        accountId: deps.trustedDesiredIdentity.accountId,
-        workspaceId: deps.trustedDesiredIdentity.workspaceId,
-        at: deps.trustedDesiredIdentity.at,
-        ...(deps.trustedDesiredIdentity.pullOnly === true ? { pullOnly: true } : {}),
-        ...(deps.trustedDesiredIdentity.pendingModeIntent === undefined
-          ? {}
-          : { pendingModeIntent: deps.trustedDesiredIdentity.pendingModeIntent }),
-        // Carried, not dropped: the obligation outlives the start attempt and is
-        // consumed only once the daemon is confirmed up.
-        ...(deps.trustedDesiredIdentity.maintenance === undefined
-          ? {}
-          : { maintenance: deps.trustedDesiredIdentity.maintenance }),
-      };
   const fresh = (state: DesiredDaemonStateValue): DesiredDaemonState => ({
     ...identity,
     state,
@@ -231,12 +220,13 @@ export async function startDaemonAndRecordDesired(root: string, deps: StartStopD
  * very act of starting.
  */
 export async function startDaemonForUser(root: string, deps: StartStopDeps = {}): Promise<void> {
-  await withScopeTransitionLock(path.resolve(root), () => startDaemonAndRecordDesiredImpl(root, deps), deps.lockWaitMs);
+  const abs = path.resolve(root);
+  await withScopeTransitionLock(abs, () => startDaemonAndRecordDesiredImpl(abs, deps), deps.lockWaitMs);
 }
 
 export async function resumeDesiredDaemon(
   expected: DesiredDaemonState,
-  deps: Pick<StartStopDeps, "startDaemon" | "modeWitnessTimeoutMs" | "modeWitnessPollMs"> = {},
+  deps: Pick<StartStopDeps, "startDaemon" | "modeWitnessTimeoutMs" | "modeWitnessPollMs" | "trustedFolderAdmission"> = {},
 ): Promise<boolean> {
   return startDaemonAndRecordDesiredImpl(expected.rootPath, {
     ...deps,

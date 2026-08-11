@@ -17,7 +17,7 @@ import {
   snapshotPreCatalogPolicy,
   type FolderCatalog,
 } from "./folder-config.js";
-import { folderCatalogPath } from "./rbox-paths.js";
+import { folderCatalogLockPath, folderCatalogPath } from "./rbox-paths.js";
 import type { WorkspaceConfig } from "./workspace-config.js";
 
 const originalHome = process.env.HOME;
@@ -64,6 +64,21 @@ function binding(over: Partial<WorkspaceConfig> = {}): WorkspaceConfig {
 }
 
 describe("closed bounded folder catalog codec", () => {
+  test("test preload isolates catalog and lock unless RBOX_HOME is explicit", async () => {
+    const { base, home } = await isolate();
+    delete process.env.RBOX_HOME;
+    const isolated = process.env.RBOX_TEST_FOLDER_CATALOG_DIR;
+    expect(isolated).toBeTruthy();
+    expect(folderCatalogPath()).toBe(path.join(isolated!, "config.json"));
+    expect(folderCatalogLockPath()).toBe(path.join(isolated!, "config.lock"));
+    expect(folderCatalogPath().startsWith(`${home}${path.sep}`)).toBe(false);
+
+    const explicit = path.join(base, "explicit-rbox-home");
+    process.env.RBOX_HOME = explicit;
+    expect(folderCatalogPath()).toBe(path.join(explicit, ".rbox", "config.json"));
+    expect(folderCatalogLockPath()).toBe(path.join(explicit, ".rbox", "config.lock"));
+  });
+
   test("preserves valid spelling and resolves nested options fieldwise", async () => {
     const { home } = await isolate();
     const value = catalog({

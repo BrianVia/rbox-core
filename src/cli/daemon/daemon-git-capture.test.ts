@@ -12,6 +12,7 @@ import type { CommitResult, SyncRemote } from "../remote.js";
 import { GIT_BUSY_RETRY_DELAYS_MS, RboxDaemon, gitCaptureSampleForProvenance, type GitBusyRetryClock } from "./daemon.js";
 import { GitRefWatchRegistry, type GitRefWatchHandle, type GitRefWatchMode } from "./git-ref-watch.js";
 import { createSignalDebouncer, type GitSignalBatch } from "./watcher.js";
+import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const exec = promisify(execFile);
 const GIT_ENV = {
@@ -176,6 +177,7 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
     };
     await git(root, "init", "-qb", "main");
     await git(root, "commit", "--allow-empty", "-qm", "baseline");
+    await prepareDaemonFolderAdmission(root, cfg);
     const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
       bootId: `episode-${variant}`,
       gitBusyRetryClock: clock,

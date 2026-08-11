@@ -124,6 +124,21 @@ export async function desiredContext(root: string, state: DesiredDaemonStateValu
   };
 }
 
+/** Preserve the durable identity and outstanding obligations of a validated
+ * boot/upgrade row while rebasing its root onto the caller's normalized path. */
+export function resumeDesiredIdentity(root: string, desired: DesiredDaemonState): DesiredDaemonState {
+  return {
+    rootPath: root,
+    state: "running",
+    accountId: desired.accountId,
+    workspaceId: desired.workspaceId,
+    at: desired.at,
+    ...(desired.pullOnly === true ? { pullOnly: true } : {}),
+    ...(desired.pendingModeIntent === undefined ? {} : { pendingModeIntent: desired.pendingModeIntent }),
+    ...(desired.maintenance === undefined ? {} : { maintenance: desired.maintenance }),
+  };
+}
+
 async function writeDesiredRecord(record: DesiredDaemonState): Promise<void> {
   const p = desiredStatePath(record.rootPath);
   await fs.mkdir(path.dirname(p), { recursive: true, mode: 0o700 });

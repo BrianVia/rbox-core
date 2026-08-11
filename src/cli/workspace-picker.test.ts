@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { ensureFolderAuthority } from "./folder-authority.js";
 import { promptMissing } from "./init-cmd.js";
 import { track } from "./track-cmd.js";
 import {
@@ -219,6 +220,10 @@ test("setup picker: listed manual escape uses the same two-blank navigation", as
 });
 
 test("legacy picker bit-identity matrix drives both init and track callers", async () => {
+  const previousRboxHome = process.env.RBOX_HOME;
+  const catalogHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-picker-home-"));
+  process.env.RBOX_HOME = catalogHome;
+  await ensureFolderAuthority();
   const cases = [
     { name: "no-token", token: undefined, outcome: undefined },
     { name: "fetch-failure", token: "tok", outcome: { kind: "failed" } as const },
@@ -226,65 +231,71 @@ test("legacy picker bit-identity matrix drives both init and track callers", asy
     { name: "nonempty-manual-escape", token: "tok", outcome: { kind: "listed", rows: [ws({ workspaceId: "ws_listed" })] } as const, manual: true },
   ];
 
-  for (const c of cases) {
-    let initPrompts = 0;
-    const initWrites: string[] = [];
-    const initPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
-      ...opts,
-      deps: {
-        ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
-        ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
-        promptInput: (async () => { initPrompts++; return ""; }) as never,
-        writeStderr: (text) => void initWrites.push(text),
-      },
-    })) as never;
-    const gathered = await promptMissing(
-      { project: "root", root: "/tmp/init-root", name: "-", "respect-gitignore": "true" },
-      "/tmp",
-      {
-        creds: c.token ? { token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" } : undefined,
-        defaultRemote: "https://api.test",
-        promptSelect: (async () => "join") as never,
-        promptWorkspacePick: initPicker,
-      }
-    );
-    expect(gathered.workspace, `init:${c.name}`).toBeUndefined();
-    expect(initPrompts, `init:${c.name}`).toBe(1);
-    expect(initWrites.join(""), `init:${c.name}`).not.toContain("can't list");
+  try {
+    for (const c of cases) {
+      let initPrompts = 0;
+      const initWrites: string[] = [];
+      const initPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
+        ...opts,
+        deps: {
+          ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
+          ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
+          promptInput: (async () => { initPrompts++; return ""; }) as never,
+          writeStderr: (text) => void initWrites.push(text),
+        },
+      })) as never;
+      const gathered = await promptMissing(
+        { project: "root", root: "/tmp/init-root", name: "-", "respect-gitignore": "true" },
+        "/tmp",
+        {
+          creds: c.token ? { token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" } : undefined,
+          defaultRemote: "https://api.test",
+          promptSelect: (async () => "join") as never,
+          promptWorkspacePick: initPicker,
+        }
+      );
+      expect(gathered.workspace, `init:${c.name}`).toBeUndefined();
+      expect(initPrompts, `init:${c.name}`).toBe(1);
+      expect(initWrites.join(""), `init:${c.name}`).not.toContain("can't list");
 
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-picker-"));
-    let trackPrompts = 0;
-    let creates = 0;
-    const trackWrites: string[] = [];
-    const trackPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
-      ...opts,
-      deps: {
-        ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
-        ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
-        promptInput: (async () => { trackPrompts++; return ""; }) as never,
-        writeStderr: (text) => void trackWrites.push(text),
-      },
-    })) as never;
-    try {
-      const result = await track(root, {}, "https://api.test", {
-        loadCredentials: (async () => ({
-          state: "valid" as const,
-          source: "disk" as const,
-          credentials: { v: 1 as const, token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" },
-          legacy: false,
-          extensions: {},
-        })) as never,
-        isInteractive: () => true,
-        promptSelect: (async () => "existing") as never,
-        promptWorkspacePick: trackPicker,
-        createRemoteWorkspace: async () => { creates++; return "ws_created"; },
-      });
-      expect(result.cfg.remoteWorkspaceId, `track:${c.name}`).toBe("ws_created");
-      expect(creates, `track:${c.name}`).toBe(1);
-      expect(trackPrompts, `track:${c.name}`).toBe(1);
-      expect(trackWrites.join(""), `track:${c.name}`).not.toContain("can't list");
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-picker-"));
+      let trackPrompts = 0;
+      let creates = 0;
+      const trackWrites: string[] = [];
+      const trackPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
+        ...opts,
+        deps: {
+          ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
+          ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
+          promptInput: (async () => { trackPrompts++; return ""; }) as never,
+          writeStderr: (text) => void trackWrites.push(text),
+        },
+      })) as never;
+      try {
+        const result = await track(root, {}, "https://api.test", {
+          loadCredentials: (async () => ({
+            state: "valid" as const,
+            source: "disk" as const,
+            credentials: { v: 1 as const, token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" },
+            legacy: false,
+            extensions: {},
+          })) as never,
+          isInteractive: () => true,
+          promptSelect: (async () => "existing") as never,
+          promptWorkspacePick: trackPicker,
+          createRemoteWorkspace: async () => { creates++; return "ws_created"; },
+        });
+        expect(result.cfg.remoteWorkspaceId, `track:${c.name}`).toBe("ws_created");
+        expect(creates, `track:${c.name}`).toBe(1);
+        expect(trackPrompts, `track:${c.name}`).toBe(1);
+        expect(trackWrites.join(""), `track:${c.name}`).not.toContain("can't list");
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
     }
+  } finally {
+    if (previousRboxHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = previousRboxHome;
+    await fs.rm(catalogHome, { recursive: true, force: true });
   }
 });

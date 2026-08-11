@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { restartDaemonsAfterUpgrade, restartStaleDaemonsIfAny } from "./upgrade-cmd.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder } from "./folder-config.js";
 import { workspaceKey } from "./rbox-paths.js";
 import type { DesiredStateRow } from "./autostart-cmd.js";
 import { RBOX_VERSION } from "./version.js";
@@ -22,7 +24,19 @@ afterEach(async () => {
 });
 
 async function runtime(name: string, pid: number, options: { state?: "running" | "stopped"; pullOnly?: boolean; pendingModeIntent?: "pull-only" | "read-write"; desired?: boolean } = {}): Promise<{ root: string; key: string }> {
+  if (rows.length === 0) await ensureFolderAuthority();
   const root = path.join(home, name);
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    schema: "e2ee/v1",
+    remoteWorkspaceId: `ws-${name}`,
+    projectId: "root",
+    deviceId: "dev-upgrade",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+  }));
+  await recordFolder(root);
   const key = workspaceKey(root);
   const dir = path.join(home, ".rbox", "daemons", key);
   await fs.mkdir(dir, { recursive: true });
@@ -70,7 +84,7 @@ test("current binary restarts an older daemon in its pending pull-only mode befo
   });
   expect(actions).toEqual(["stop", "start:true:pending"]);
   expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
-  expect(logs[1]).toContain("restarted (pull-only)");
+  expect(logs.some((line) => line.includes("restarted (pull-only)"))).toBe(true);
   expect(logs.join("\n")).not.toContain("already up to date");
 });
 

@@ -9,6 +9,7 @@ import { reconnectDelayMs, RboxDaemon, type CursorClock } from "../daemon.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { WsHealthSample } from "../telemetry/contract.js";
+import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const ENV_KEYS = [
   "RBOX_DAEMON_WS_DISABLED",
@@ -157,6 +158,7 @@ async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
     rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: KEK,
     accountId: "acct_test", accountEpoch: 0, keyEpoch: 0,
   };
+  await prepareDaemonFolderAdmission(root, cfg);
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
     bootId: "boot-test",
     keyDeliveryFlight: null,

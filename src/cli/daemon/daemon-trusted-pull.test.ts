@@ -14,6 +14,7 @@ import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { RboxDaemon, type ScanCadenceClock } from "./daemon.js";
 import { gitReposMatcherKey, gitTopologyChanged } from "./manifest-update.js";
 import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js";
+import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 
@@ -124,6 +125,7 @@ beforeEach(async () => {
   delete process.env.RBOX_PULL_TRUST_WATCHER;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
+  await prepareDaemonFolderAdmission(root, testConfig());
 });
 afterEach(async () => {
   daemon?.retryQueue.stop();

@@ -4,6 +4,8 @@ import {
   type PhaseReport,
 } from "../engine/index.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 import { beginReport } from "./metrics.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { type SyncDeps } from "./sync/deps.js";
@@ -104,11 +106,15 @@ export class LocalRuntime {
       ? "pull"
       : operation.kind;
     return withWorkspaceSyncMutex(this.root, async (syncMutex) => {
-      const { cfg, deps: remoteDeps } = await buildAuthedRemote(
+      const { cfg: remoteCfg, deps: remoteDeps } = await buildAuthedRemote(
         this.root,
         Date.now,
         observer.warningSink,
       );
+      const state = await ensureFolderAuthority({ currentRoot: this.root });
+      const admission = await observeFolderAdmission(this.root, state);
+      if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+      const cfg = applyFolderPolicy(remoteCfg, admission.policy);
       const report = beginReport(reportKind);
       const deps: SyncDeps = {
         ...remoteDeps,

@@ -8,10 +8,12 @@ import {
   serializeFolderCatalog,
 } from "./folder-config.js";
 import {
+  applyFolderPolicy,
   listFolderInventory,
   observeFolderAdmission,
   observeFolderGeneration,
 } from "./folder-inventory.js";
+import type { WorkspaceConfig } from "./workspace-config.js";
 import { daemonRuntimeDir, folderCatalogPath } from "./rbox-paths.js";
 import { collectMachineTriage } from "./doctor-machine.js";
 
@@ -202,4 +204,47 @@ test("damaged state reports its exact reason without probing the binding", async
     loadConfigIfPresent: async () => { probes++; return undefined; },
   })).toEqual({ kind: "damaged", reason: "exact parse failure" });
   expect(probes).toBe(0);
+});
+
+test("folder policy overlays only safe fields and preserves runtime attachments", () => {
+  const kek = Buffer.alloc(32, 7);
+  const cfg = {
+    remoteWorkspaceId: "ws_runtime",
+    projectId: "root",
+    deviceId: "dev_runtime",
+    rootPath: scratch,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
+    encrypted: true,
+    kek,
+    accountId: "acct_runtime",
+    accountEpoch: 2,
+    keyEpoch: 9,
+    syncGit: true,
+    git: { incremental: true, runtimeSentinel: "keep" },
+  } as WorkspaceConfig & { git: { incremental?: boolean; runtimeSentinel: string } };
+  const result = applyFolderPolicy(cfg, {
+    syncGit: false,
+    git: { incremental: false },
+    respectGitignore: true,
+    noDrift: true,
+    trash: { days: 0, maxBytes: 0 },
+  }) as typeof cfg;
+
+  expect(result).toMatchObject({
+    syncGit: false,
+    git: { incremental: false, runtimeSentinel: "keep" },
+    respectGitignore: true,
+    noDrift: true,
+    trash: { days: 0, maxBytes: 0 },
+    encrypted: true,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
+    accountId: "acct_runtime",
+    accountEpoch: 2,
+    keyEpoch: 9,
+  });
+  expect(result.kek).toBe(kek);
+  expect(cfg.git.incremental).toBe(true);
+  expect(cfg.respectGitignore).toBeUndefined();
 });

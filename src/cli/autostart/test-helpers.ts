@@ -6,6 +6,8 @@ import {
   startDaemonAndRecordDesired,
   stopDaemonAndRecordDesired,
 } from "../autostart-cmd.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import { recordFolder } from "../folder-config.js";
 
 export let home: string;
 let roots: string[];
@@ -39,6 +41,7 @@ export async function workspace(workspaceId: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-auto-root-"));
   roots.push(root);
   await writeWorkspaceBinding(root, workspaceId);
+  await recordFolder(root);
   return root;
 }
 
@@ -62,6 +65,7 @@ export async function beforeEachAutostartTest() {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-auto-home-"));
   roots = [];
   process.env.RBOX_HOME = home;
+  await ensureFolderAuthority();
 }
 
 export async function afterEachAutostartTest() {

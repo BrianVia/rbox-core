@@ -5,6 +5,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { upgradeCmd } from "./upgrade-cmd.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder } from "./folder-config.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { RBOX_VERSION } from "./version.js";
 import type { DesiredStateRow } from "./autostart-cmd.js";
@@ -65,7 +67,19 @@ afterEach(async () => {
 });
 
 async function liveRuntime(name: string, pid: number, daemonVersion: string): Promise<void> {
+  if (rows.length === 0) await ensureFolderAuthority();
   const root = path.join(home, name);
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    schema: "e2ee/v1",
+    remoteWorkspaceId: `ws-${name}`,
+    projectId: "root",
+    deviceId: "dev-upgrade",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+  }));
+  await recordFolder(root);
   const key = workspaceKey(root);
   const dir = path.join(home, ".rbox", "daemons", key);
   await fs.mkdir(dir, { recursive: true });

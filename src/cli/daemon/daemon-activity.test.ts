@@ -13,6 +13,7 @@ import { CommitRejectedError, QuotaExceededError, type CommitOptions, type Commi
 import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
+import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import { observeDaemon } from "./observation.js";
 import { RBOX_VERSION } from "../version.js";
 
@@ -149,6 +150,7 @@ let daemons: DaemonInternals[];
 beforeEach(async () => {
   daemons = [];
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-activity-")));
+  await prepareDaemonFolderAdmission(root, testConfig());
 });
 afterEach(async () => {
   await Promise.all(daemons.map((daemon) => daemon.stop().catch(() => {})));
@@ -259,6 +261,7 @@ async function withIsolatedDaemonHome<T>(fn: (home: string) => Promise<T>): Prom
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
   process.env.RBOX_HOME = home;
   try {
+    await prepareDaemonFolderAdmission(root, testConfig());
     return await fn(home);
   } finally {
     if (oldHome === undefined) delete process.env.RBOX_HOME;

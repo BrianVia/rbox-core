@@ -1,9 +1,11 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { nextSafetyDelay, RboxDaemon } from "../daemon.js";
+import { folderCatalogPath } from "../rbox-paths.js";
 import type { GitSignalBatch } from "./watcher.js";
+import { HashCache } from "../../engine/index.js";
 
 // Design 49: the safety scan heals DROPPED watcher events, and drops happen under
 // churn — so quiet intervals back the scan off (60s → 5m cap) instead of
@@ -80,8 +82,25 @@ interface SafetyInternals {
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
   matcher: { ignores(path: string): boolean };
-  cfg: { respectGitignore?: boolean };
+  cfg: {
+    remoteWorkspaceId: string;
+    respectGitignore?: boolean;
+    encrypted?: boolean;
+    kek?: Buffer;
+    remoteUrl: string;
+    token: string;
+    accountId?: string;
+    accountEpoch?: number;
+    keyEpoch?: number;
+  };
   reloadWorkspaceConfigIfChanged(): Promise<void>;
+  folderOperationBoundary(): Promise<boolean>;
+  folderAdmissionHaltReason?: string;
+  folderMatcherRebuildPending: boolean;
+  folderPolicyRecyclePending: boolean;
+  localObserver: { observe(plan: unknown): Promise<{ deferredPaths: ReadonlySet<string> }> };
+  rebuildMatcher(state?: unknown): void;
+  acknowledgeFolderPolicyRecycle(): Promise<boolean>;
   gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
 }
@@ -248,6 +267,23 @@ function makeDaemon(root: string, opts: { pullOnly?: boolean } = {}): SafetyInte
   return new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as SafetyInternals;
 }
 
+function writeFolderCatalog(root: string, respectGitignore: boolean): string {
+  const file = folderCatalogPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    globalOptions: {
+      syncGit: true,
+      git: { incremental: true },
+      respectGitignore: false,
+      noDrift: false,
+      trash: { days: 30, maxBytes: 2147483648 },
+    },
+    folders: [{ name: "Safety", path: root, options: { respectGitignore } }],
+  }, null, respectGitignore ? 2 : 0));
+  return file;
+}
+
 test("watcher events mark churn AND pull a backed-off timer forward (codex R1)", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root);
@@ -387,16 +423,19 @@ test("design 72: safety tick reloads workspace.json and rebuilds the matcher", a
     fs.mkdirSync(path.join(root, "pkg"), { recursive: true });
     fs.writeFileSync(path.join(root, "pkg", ".gitignore"), "ignored.txt\n");
     fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify(cfg));
+    writeFolderCatalog(root, false);
 
     await daemon.reloadWorkspaceConfigIfChanged();
     expect(daemon.cfg.respectGitignore).toBe(false);
     expect(daemon.matcher.ignores("pkg/ignored.txt")).toBe(false);
+    expect(daemon.folderPolicyRecyclePending).toBe(true);
 
-    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify({ ...cfg, respectGitignore: true }, null, 2));
+    writeFolderCatalog(root, true);
     await daemon.reloadWorkspaceConfigIfChanged();
     expect(daemon.cfg.respectGitignore).toBe(true);
     expect(daemon.matcher.ignores("pkg/ignored.txt")).toBe(true);
   } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -408,6 +447,7 @@ test("v0.9.2 regression: reload preserves runtime-attached encrypted/kek/remoteU
   try {
     fs.mkdirSync(path.join(root, ".rbox"), { recursive: true });
     fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify(persisted));
+    writeFolderCatalog(root, false);
     // Simulate what buildAuthedRemote layers on at boot — none of it is persisted.
     daemon.cfg.encrypted = true;
     daemon.cfg.kek = Buffer.alloc(32, 7);
@@ -428,6 +468,133 @@ test("v0.9.2 regression: reload preserves runtime-attached encrypted/kek/remoteU
     expect(daemon.cfg.accountId).toBe("acct_runtime");
     expect(daemon.cfg.accountEpoch).toBe(2);
     expect(daemon.cfg.keyEpoch).toBe(9);
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("damaged folder catalog parks the operation boundary without throwing from reload", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  try {
+    fs.mkdirSync(path.join(root, ".rbox"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+      remoteWorkspaceId: "w",
+      projectId: "root",
+      deviceId: "d",
+      rootPath: root,
+      remoteUrl: "https://example.invalid",
+      token: "",
+    }));
+    fs.mkdirSync(path.dirname(folderCatalogPath()), { recursive: true });
+    fs.writeFileSync(folderCatalogPath(), "{ damaged");
+
+    await expect(daemon.reloadWorkspaceConfigIfChanged()).resolves.toBeUndefined();
+    expect(await daemon.folderOperationBoundary()).toBe(false);
+    expect(daemon.folderAdmissionHaltReason).toContain("Copy");
+    expect(daemon.folderAdmissionHaltReason).toContain("rbox config regenerate");
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace stat reload parks a rebound binding before the boot cfg can run", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  const file = path.join(root, ".rbox", "workspace.json");
+  const original = {
+    remoteWorkspaceId: "w",
+    projectId: "root",
+    deviceId: "d",
+    rootPath: root,
+    remoteUrl: "https://persisted.invalid",
+    token: "",
+  };
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(original));
+    writeFolderCatalog(root, false);
+    expect(await daemon.folderOperationBoundary()).toBe(true);
+
+    fs.writeFileSync(file, JSON.stringify({
+      ...original,
+      remoteWorkspaceId: "new-workspace-long",
+      deviceId: "new-device-long",
+    }, null, 2));
+    expect(await daemon.folderOperationBoundary()).toBe(false);
+    expect(daemon.folderAdmissionHaltReason).toContain("workspace config identity mismatch");
+    expect(daemon.cfg.remoteWorkspaceId).toBe("w");
+  } finally {
+    fs.rmSync(folderCatalogPath(), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Git-policy recycle uses an uncached unpruned scan and acknowledges only after cache save", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  const plans: Array<{ mode?: string; cache?: unknown }> = [];
+  let deferred = new Set<string>();
+  let rebuilds = 0;
+  daemon.localObserver = {
+    observe: async (plan) => {
+      plans.push(plan as { mode?: string; cache?: unknown });
+      return { deferredPaths: deferred };
+    },
+  };
+  daemon.rebuildMatcher = () => { rebuilds++; };
+  daemon.folderMatcherRebuildPending = false;
+  daemon.folderPolicyRecyclePending = true;
+  let releaseSave!: () => void;
+  const saveReleased = new Promise<void>((resolve) => { releaseSave = resolve; });
+  const save = spyOn(HashCache.prototype, "replace").mockImplementation(() => saveReleased);
+  try {
+    const acknowledging = daemon.acknowledgeFolderPolicyRecycle();
+    await Promise.resolve();
+    expect(daemon.folderPolicyRecyclePending).toBe(true);
+    expect(plans).toHaveLength(1);
+    expect(plans[0]?.mode).toBe("unpruned");
+    expect(plans[0]?.cache).toBeInstanceOf(HashCache);
+    expect(rebuilds).toBe(0);
+    releaseSave();
+    expect(await acknowledging).toBe(true);
+    expect(daemon.folderPolicyRecyclePending).toBe(false);
+
+    daemon.folderPolicyRecyclePending = true;
+    deferred = new Set(["still-writing"]);
+    expect(await daemon.acknowledgeFolderPolicyRecycle()).toBe(false);
+    expect(daemon.folderPolicyRecyclePending).toBe(true);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(rebuilds).toBe(0);
+  } finally {
+    save.mockRestore();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an empty Git-policy recycle durably replaces stale on-disk hashcache entries", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  const cacheFile = path.join(root, ".rbox", "state", "hashcache.json");
+  try {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      version: 2,
+      entries: {
+        "stale.txt": { mtimeMs: 1, size: 1, ctimeMs: 1, sha256: "a".repeat(64) },
+      },
+    }));
+    daemon.localObserver = {
+      observe: async () => ({ deferredPaths: new Set<string>() }),
+    };
+    daemon.folderMatcherRebuildPending = false;
+    daemon.folderPolicyRecyclePending = true;
+
+    expect(await daemon.acknowledgeFolderPolicyRecycle()).toBe(true);
+    expect(daemon.folderPolicyRecyclePending).toBe(false);
+    expect(JSON.parse(fs.readFileSync(cacheFile, "utf8"))).toEqual({ version: 2, entries: {} });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

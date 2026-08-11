@@ -8,6 +8,7 @@ import type {
   ResolvedFolderPolicy,
 } from "./folder-config.js";
 import type { FolderGenerationInventory } from "./folder-catalog-generate.js";
+import type { WorkspaceConfig } from "./workspace-config.js";
 import {
   buildFolderInventoryUnion,
   observeFolderRoot,
@@ -39,6 +40,34 @@ export interface FolderInventorySnapshot {
 }
 
 export type FolderInventoryDeps = FolderUnionDeps;
+
+/** The complete safe policy overlay. Runtime-only identity, credentials, E2EE
+ * material, scope, and every future non-policy field remain caller-owned. */
+export function folderPolicyFields(policy: ResolvedFolderPolicy): Pick<
+  WorkspaceConfig,
+  "syncGit" | "git" | "respectGitignore" | "noDrift" | "trash"
+> {
+  return {
+    syncGit: policy.syncGit,
+    git: { incremental: policy.git.incremental },
+    respectGitignore: policy.respectGitignore,
+    noDrift: policy.noDrift,
+    trash: { days: policy.trash.days, maxBytes: policy.trash.maxBytes },
+  };
+}
+
+export function applyFolderPolicy(cfg: WorkspaceConfig, policy: ResolvedFolderPolicy): WorkspaceConfig {
+  const safeFieldsOnly = folderPolicyFields(policy);
+  return {
+    ...cfg,
+    ...safeFieldsOnly,
+    git: { ...cfg.git, incremental: safeFieldsOnly.git?.incremental },
+  };
+}
+
+export function runtimeRefusal(admission: Exclude<FolderAdmission, { kind: "admitted" }>): Error {
+  return new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`);
+}
 
 function classify(row: Pick<FolderUnionRow, "catalog" | "binding" | "bindingConfig" | "exists" | "observationError">, state: FolderCatalogState): FolderAdmission {
   if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
