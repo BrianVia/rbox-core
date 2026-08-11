@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { adoptionStatus } from "./adopt-cmd.js";
+import { adoptCmd, adoptionStatus } from "./adopt-cmd.js";
 import { acknowledgeCacheGeneration, invalidateAdoptionCaches, readCacheGeneration } from "./adopt-cache.js";
 import {
   consumeAdoptConsent,
@@ -11,8 +11,9 @@ import {
   mintWizardAdoptConsent,
 } from "./adopt-consent.js";
 import { inventoryAdoptionSource } from "./adopt-inventory.js";
-import { abortAdoption, continueAdoption, refreshAdoptionContinuation, startAdoption } from "./adopt-lifecycle.js";
-import { adoptDisplacedDir, findAdoptRoot, inspectAdoptFence, loadAdoptJournal, saveAdoptJournal } from "./adopt-journal.js";
+import { abortAdoption, continueAdoption, pinAdoptionFolderPolicy, refreshAdoptionContinuation, startAdoption } from "./adopt-lifecycle.js";
+import { adoptDisplacedDir, adoptJournalPath, findAdoptRoot, inspectAdoptFence, loadAdoptJournal, saveAdoptJournal } from "./adopt-journal.js";
+import { saveConfig, syncStreamId } from "./config.js";
 import {
   acquireWorkspaceSyncMutex,
   acquireWorkspaceSyncMutexForAdopt,
@@ -234,7 +235,7 @@ describe("design 166 consent and lifecycle", () => {
   test("daemon generation boundary drops resident state and performs an unpruned scan before acknowledgement", async () => {
     const daemon = await fs.readFile(path.join(import.meta.dir, "daemon", "daemon.ts"), "utf8");
     const boundary = daemon.indexOf("private async adoptionCacheGenerationBoundary");
-    const fresh = daemon.indexOf("const fresh = new HashCache()", boundary);
+    const fresh = daemon.indexOf("const fresh = new HashCache(", boundary);
     const matcher = daemon.indexOf("this.rebuildMatcher", fresh);
     const scan = daemon.indexOf('"unpruned"', matcher);
     const acknowledge = daemon.indexOf("await acknowledgeCacheGeneration", scan);
@@ -253,5 +254,63 @@ describe("design 166 consent and lifecycle", () => {
     expect((await loadAdoptJournal(root))?.journalId).toBe(journal.journalId);
     expect((await adoptionStatus(root)).journalId).toBe(journal.journalId);
     await releaseWorkspaceSyncMutex(mutex);
+  });
+
+  test("pinned folder policy is optional, durable, and closed-codec validated", async () => {
+    const root = await sourceRoot();
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+    const journal = await start(root, mutex);
+    expect((await loadAdoptJournal(root))?.pinnedFolderPolicy).toBeUndefined();
+    await pinAdoptionFolderPolicy(journal, "a".repeat(64), {
+      syncGit: false,
+      git: { incremental: false },
+      respectGitignore: true,
+      noDrift: true,
+      trash: { days: 7, maxBytes: 1234 },
+    }, mutex);
+    expect((await loadAdoptJournal(root))?.pinnedFolderPolicy).toEqual({
+      generation: "a".repeat(64),
+      syncGit: false,
+      git: { incremental: false },
+      respectGitignore: true,
+      noDrift: true,
+      trash: { days: 7, maxBytes: 1234 },
+    });
+    const raw = JSON.parse(await fs.readFile(adoptJournalPath(root), "utf8"));
+    raw.pinnedFolderPolicy.extra = true;
+    await fs.writeFile(adoptJournalPath(root), JSON.stringify(raw));
+    await expect(loadAdoptJournal(root)).rejects.toThrow("invalid adoption journal schema");
+    await releaseWorkspaceSyncMutex(mutex);
+  });
+
+  test("resume with an existing binding refuses an absent catalog before authenticated sync", async () => {
+    const root = await sourceRoot();
+    const priorHome = process.env.RBOX_HOME;
+    const rboxHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-adopt-authority-"));
+    roots.push(rboxHome);
+    process.env.RBOX_HOME = rboxHome;
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+    const journal = await start(root, mutex);
+    const cfg = {
+      schema: "e2ee/v1" as const,
+      remoteWorkspaceId: journal.workspace.workspaceId,
+      projectId: journal.workspace.projectId,
+      deviceId: journal.workspace.deviceId,
+      rootPath: root,
+      remoteUrl: journal.workspace.remoteUrl,
+      token: "",
+      syncGit: journal.workspace.syncGit,
+      respectGitignore: journal.workspace.respectGitignore,
+    };
+    journal.workspace.stream = syncStreamId(cfg);
+    await saveConfig(root, cfg);
+    await saveAdoptJournal(root, journal);
+    await releaseWorkspaceSyncMutex(mutex);
+    try {
+      await expect(adoptCmd("resume", root)).rejects.toThrow("rbox config regenerate");
+    } finally {
+      if (priorHome === undefined) delete process.env.RBOX_HOME;
+      else process.env.RBOX_HOME = priorHome;
+    }
   });
 });

@@ -32,6 +32,7 @@ mock.module("../../engine/hash.js", () => ({
 const { HashCache, scanManifest } = await import("../../engine/index.js");
 const { encryptFileNameProbe } = await import("../../engine/e2ee/e2ee-e2e.helpers.js");
 const { RboxDaemon } = await import("../daemon.js");
+const { prepareDaemonFolderAdmission } = await import("./folder-admission.test-helper.js");
 type BlobStore = import("../../engine/index.js").BlobStore;
 type FileEntry = import("../../engine/index.js").FileEntry;
 type Manifest = import("../../engine/index.js").Manifest;
@@ -126,7 +127,9 @@ function testConfig(): WorkspaceConfig {
 test("a freshly pulled path deferred during the post-pull rescan carries the pulled entry — the chained push never publishes its deletion", async () => {
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "f.txt"), "one");
-  daemon = new RboxDaemon(root, testConfig(), { remote, backoff: async () => {} }, { bootId: "boot-defer" }) as unknown as DaemonInternals;
+  const cfg = testConfig();
+  await prepareDaemonFolderAdmission(root, cfg);
+  daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId: "boot-defer" }) as unknown as DaemonInternals;
   daemon.cache = new HashCache();
   daemon.local.head = await scanManifest(root); // pre-pull in-memory truth: f.txt only, no g.txt
   await daemon.loadSyncBase();

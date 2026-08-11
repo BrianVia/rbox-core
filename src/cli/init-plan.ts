@@ -84,8 +84,12 @@ export interface InitPlan {
   firstSync: "push" | "sync" | "pull" | "none";
   /** §28: git-sync defaults ON (git artifacts are E2EE-encrypted); --git false opts out. */
   syncGit: boolean;
+  /** Whether syncGit came from an explicit flag rather than the pre-catalog default. */
+  syncGitExplicit: boolean;
   /** Design 72 opt-in. Defaults false so new scripted workspaces keep current behavior. */
   respectGitignore: boolean;
+  /** Whether respectGitignore came from an explicit flag/prompt answer. */
+  respectGitignoreExplicit: boolean;
   /** Design 212: sync only these workspace folders on this machine. Present ⇒ the
    *  binding is structurally receive-only. Absent = the whole workspace. */
   scope?: string[];
@@ -205,7 +209,9 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
     remoteUrl,
     firstSync,
     syncGit: flags.git !== "false",
+    syncGitExplicit: flags.git !== undefined,
     respectGitignore: flags["respect-gitignore"] === "true",
+    respectGitignoreExplicit: flags["respect-gitignore"] !== undefined,
     ...(scope === undefined ? {} : { scope }),
   };
 }

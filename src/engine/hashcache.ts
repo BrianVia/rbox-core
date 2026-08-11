@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic } from "./fsutil.js";
+import { fsyncDirectory, writeFileAtomic } from "./fsutil.js";
 
 /**
  * Persistent (mtime,size,ctime)->sha cache. The point is performance: re-hashing an
@@ -24,8 +24,14 @@ export interface HashCacheEntry {
 
 export type HashCacheStatIdentity = Omit<HashCacheEntry, "sha256">;
 
+export interface HashCachePolicy {
+  syncGit: boolean;
+  incremental: boolean;
+}
+
 interface HashCacheFileV2 {
   version: 2;
+  gitPolicy?: HashCachePolicy;
   entries: Record<string, HashCacheEntry>;
 }
 
@@ -41,10 +47,12 @@ function isValidEntry(e: unknown): e is HashCacheEntry {
 
 export class HashCache {
   private readonly map: Map<string, HashCacheEntry>;
+  private readonly gitPolicy?: HashCachePolicy;
   private dirty = false;
 
-  constructor(entries?: Record<string, HashCacheEntry>) {
+  constructor(entries?: Record<string, HashCacheEntry>, gitPolicy?: HashCachePolicy) {
     this.map = new Map(entries ? Object.entries(entries) : []);
+    this.gitPolicy = gitPolicy === undefined ? undefined : { ...gitPolicy };
   }
 
   /** Cached sha iff (mtime,size,ctime) match — the re-hash skip. */
@@ -90,10 +98,14 @@ export class HashCache {
   }
 
   private toJSON(): HashCacheFileV2 {
-    return { version: 2, entries: Object.fromEntries(this.map) };
+    return {
+      version: 2,
+      ...(this.gitPolicy === undefined ? {} : { gitPolicy: this.gitPolicy }),
+      entries: Object.fromEntries(this.map),
+    };
   }
 
-  static async load(root: string): Promise<HashCache> {
+  static async load(root: string, expectedPolicy?: HashCachePolicy): Promise<HashCache> {
     try {
       const raw = await fs.readFile(path.join(root, CACHE_REL), "utf8");
       const parsed: unknown = JSON.parse(raw);
@@ -104,16 +116,27 @@ export class HashCache {
         typeof (parsed as { entries?: unknown }).entries !== "object" ||
         (parsed as { entries?: unknown }).entries === null ||
         Array.isArray((parsed as { entries?: unknown }).entries)
-      ) return new HashCache();
+      ) return new HashCache(undefined, expectedPolicy);
+      const recordedPolicy = (parsed as HashCacheFileV2).gitPolicy;
+      if (recordedPolicy !== undefined
+        && (typeof recordedPolicy.syncGit !== "boolean" || typeof recordedPolicy.incremental !== "boolean")) {
+        return new HashCache(undefined, expectedPolicy);
+      }
+      if (expectedPolicy !== undefined
+        && (recordedPolicy === undefined
+          || recordedPolicy.syncGit !== expectedPolicy.syncGit
+          || recordedPolicy.incremental !== expectedPolicy.incremental)) {
+        return new HashCache(undefined, expectedPolicy);
+      }
       const entries = (parsed as HashCacheFileV2).entries;
       // One malformed entry condemns the whole file — the cache is safe-to-discard
       // by contract, and a damaged sha must never flow into a manifest.
       for (const e of Object.values(entries)) {
-        if (!isValidEntry(e)) return new HashCache();
+        if (!isValidEntry(e)) return new HashCache(undefined, expectedPolicy);
       }
-      return new HashCache(entries);
+      return new HashCache(entries, expectedPolicy ?? recordedPolicy);
     } catch {
-      return new HashCache(); // missing OR corrupt cache → empty; only costs a re-hash
+      return new HashCache(undefined, expectedPolicy); // missing OR corrupt cache → empty; only costs a re-hash
     }
   }
 
@@ -122,6 +145,17 @@ export class HashCache {
     const abs = path.join(root, CACHE_REL);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await writeFileAtomic(abs, JSON.stringify(this.toJSON()), opts);
+    this.dirty = false;
+  }
+
+  /** Durably replace the complete cache even when this instance is empty/clean.
+   * Used when a caller must invalidate an older on-disk cache before it can
+   * acknowledge an uncached observation boundary. */
+  async replace(root: string, opts: { beforeRename?: () => boolean | Promise<boolean> } = {}): Promise<void> {
+    const abs = path.join(root, CACHE_REL);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await writeFileAtomic(abs, JSON.stringify(this.toJSON()), opts);
+    await fsyncDirectory(path.dirname(abs));
     this.dirty = false;
   }
 }

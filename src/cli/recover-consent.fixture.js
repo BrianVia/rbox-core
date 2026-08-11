@@ -2,10 +2,27 @@ import { mock } from "bun:test";
 
 const captures = [];
 
+const realEngine = await import("../engine/index.js");
 mock.module("../engine/index.js", () => ({
+  ...realEngine,
   ManifestChainError: class ManifestChainError extends Error {},
 }));
-mock.module("./config.js", () => ({ findRoot: async () => undefined, loadConfig: async () => ({}) }));
+const realConfig = await import("./config.js");
+mock.module("./config.js", () => ({
+  ...realConfig,
+  findRoot: async () => undefined,
+  loadConfig: async () => ({}),
+}));
+mock.module("./folder-authority.js", () => ({ ensureFolderAuthority: async () => ({ kind: "authoritative" }) }));
+mock.module("./folder-inventory.js", () => ({
+  observeFolderAdmission: async () => ({
+    kind: "admitted",
+    generation: "fixture",
+    policy: { syncGit: false, git: { incremental: true }, respectGitignore: false, noDrift: false, trash: { days: 30, maxBytes: 2147483648 } },
+  }),
+  runtimeRefusal: (admission) => new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`),
+  applyFolderPolicy: (cfg) => cfg,
+}));
 mock.module("./scope/binding-scope.js", () => ({ assertCommandAllowedOnScopedBinding: async () => {} }));
 mock.module("./credentials.js", () => ({
   loadCredentials: async () => ({}),

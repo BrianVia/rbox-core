@@ -36,13 +36,16 @@ import {
 } from "./reset-consent.js";
 import { consumeAdoptConsent, mintHeadlessAdoptConsent, mintInteractiveAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
 import { inventoryAdoptionSource, rootHasAdoptableContent } from "./adopt-inventory.js";
-import { continueAdoption, startAdoption } from "./adopt-lifecycle.js";
+import { continueAdoption, pinAdoptionFolderPolicy, startAdoption } from "./adopt-lifecycle.js";
 import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
 import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
 import { recordBindingScope, rememberBinding } from "./binding-registry.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder, setFolderOptions, type FolderOptions, type FolderOptionsPatch } from "./folder-config.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -375,6 +378,10 @@ async function executeInitPlan(
   },
   continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
+  // Authority must exist before remote or binding effects. Initializing after
+  // saveConfig would misclassify this command's new binding as pre-catalog data.
+  const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root });
+  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(plan.root));
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
   if (plan.auth === "bootstrap-login") {
@@ -507,6 +514,31 @@ async function executeInitPlan(
     // binding whose witness never landed must fail loudly at bind time, not silently
     // become publish-capable later.
     await recordBindingScope(plan.root, cfg.remoteWorkspaceId, cfg.scope);
+    const catalogOptions: FolderOptions = {
+      ...(!opts.guidedSetup || plan.syncGitExplicit === true ? { syncGit: plan.syncGit } : {}),
+      ...(!opts.guidedSetup || plan.respectGitignoreExplicit === true ? { respectGitignore: plan.respectGitignore } : {}),
+    };
+    await recordFolder(plan.root, {
+      ...(Object.keys(catalogOptions).length === 0 ? {} : { options: catalogOptions }),
+    });
+    if (folderAlreadyListed) {
+      const explicitPatch: FolderOptionsPatch = {
+        ...(plan.syncGitExplicit === true ? { syncGit: plan.syncGit } : {}),
+        ...(plan.respectGitignoreExplicit === true ? { respectGitignore: plan.respectGitignore } : {}),
+      };
+      if (Object.keys(explicitPatch).length > 0) await setFolderOptions(plan.root, explicitPatch);
+    }
+    const admittedState = await ensureFolderAuthority({ currentRoot: plan.root });
+    const firstSyncAdmission = await observeFolderAdmission(plan.root, admittedState);
+    if (firstSyncAdmission.kind !== "admitted") throw runtimeRefusal(firstSyncAdmission);
+    if (adoptionJournal) {
+      await pinAdoptionFolderPolicy(
+        adoptionJournal,
+        firstSyncAdmission.generation,
+        firstSyncAdmission.policy,
+        syncMutex,
+      );
+    }
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
     process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
@@ -520,7 +552,9 @@ async function executeInitPlan(
       process.exitCode = 1;
       return undefined;
     }
-    const { cfg: authed, deps } = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
+    const built = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
+    const authed = applyFolderPolicy(built.cfg, firstSyncAdmission.policy);
+    const { deps } = built;
     deps.syncMutex = syncMutex;
     let pendingGitSummary: GitPushPlan | undefined;
     deps.onGitLog = (line, pushPlan) => {
@@ -628,7 +662,9 @@ async function executeInitPlan(
           const completed = await continueAdoption(adoptionJournal, syncMutex, {
             establishBaseline: async () => { await sync(plan.root, authed, deps); },
             finishSync: async (journal) => {
-              deps.cache = new HashCache();
+              // Stamp the applied Git policy so the first daemon start reuses
+              // this cache instead of discarding it for a full re-hash.
+              deps.cache = new HashCache(undefined, { syncGit: authed.syncGit === true, incremental: authed.git?.incremental !== false });
               deps.dircache = new DirCache();
               deps.forceFullScan = true;
               result = await sync(plan.root, authed, deps);

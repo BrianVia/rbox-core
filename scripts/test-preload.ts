@@ -28,6 +28,10 @@ process.env.RBOX_TEST_HOST_IDENTITY_DIR = `/tmp/rbox-test-host-identity-${proces
 // their throwaway tmp roots in the developer's real registry. Honored ONLY when
 // RBOX_HOME is unset, so fixtures that redirect ~/.rbox still control it.
 process.env.RBOX_TEST_BINDING_REGISTRY_DIR = `/tmp/rbox-test-binding-registry-${process.pid}`;
+// Design 231's catalog is also host-global. Runtime admission makes many more
+// suites read it, so keep those tests away from the developer's real HOME too.
+// An explicit RBOX_HOME still wins for fixtures that exercise the real layout.
+process.env.RBOX_TEST_FOLDER_CATALOG_DIR = `/tmp/rbox-test-folder-catalog-${process.pid}`;
 // Flake registry: product-created repos appear mid-test, so repo config cannot
 // cover them; cleanGitEnv's process.env spread carries this to every git spawn.
 process.env.GIT_CONFIG_COUNT = "2";

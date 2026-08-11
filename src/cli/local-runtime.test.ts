@@ -20,9 +20,14 @@ test("LocalRuntime owns one lease and exposes only reachable foreground policies
       allowPull?: boolean;
       allowPush?: boolean;
       hint?: string;
+      cfg: ReturnType<typeof expectedCfg>;
       trace: string[];
     }>;
     failedTrace: string[];
+    refusalTrace: string[];
+    refusal: string;
+    authorityCalls: number;
+    admissionCalls: number;
   };
   expect(result.runs).toEqual([
     run("pull:guarded", "pull", "pull", false),
@@ -39,10 +44,22 @@ test("LocalRuntime owns one lease and exposes only reachable foreground policies
   expect(result.failedTrace).toEqual([
     "lease:acquired",
     "remote:built",
+    "authority:pinned",
+    "admission:pinned",
     "report:pull",
     "execute:pull:failed",
     "lease:released",
   ]);
+  expect(result.refusalTrace).toEqual([
+    "lease:acquired",
+    "remote:built",
+    "authority:pinned",
+    "admission:pinned",
+    "lease:released",
+  ]);
+  expect(result.refusal).toContain("rbox config add");
+  expect(result.authorityCalls).toBe(12);
+  expect(result.admissionCalls).toBe(12);
 });
 
 function run(
@@ -60,13 +77,30 @@ function run(
     ...(allowPull === undefined ? {} : { allowPull }),
     ...(allowPush === undefined ? {} : { allowPush }),
     ...(hint === undefined ? {} : { hint }),
+    cfg: expectedCfg(),
     trace: [
       "lease:acquired",
       "remote:built",
+      "authority:pinned",
+      "admission:pinned",
       `report:${report}`,
       `execute:${execute}`,
       "complete",
       "lease:released",
     ],
+  };
+}
+
+function expectedCfg() {
+  return {
+    syncGit: false,
+    incremental: false,
+    respectGitignore: true,
+    noDrift: true,
+    trash: { days: 7, maxBytes: 99 },
+    encrypted: true,
+    kekByte: 7,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
   };
 }

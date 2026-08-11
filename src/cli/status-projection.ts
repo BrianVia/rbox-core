@@ -17,6 +17,7 @@ import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import { RBOX_VERSION } from "./version.js";
 import { scopeProjectionFor } from "./scope/projection.js";
+import { applyFolderPolicy } from "./folder-inventory.js";
 import type {
   LocalGitDeferral,
   StatusCacheHint,
@@ -156,7 +157,9 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const observationNow = port.now();
   const workspaceObservation = await port.readWorkspaceObservation(root, { depth: "ambient", now: observationNow });
   const rawCfg = workspaceObservation.config;
-  const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
+  const admission = await port.readFolderAdmission?.(root);
+  const policyCfg = admission?.kind === "admitted" ? applyFolderPolicy(rawCfg, admission.policy) : rawCfg;
+  const cfg = { ...policyCfg, remoteUrl: creds?.remoteUrl ?? policyCfg.remoteUrl };
   const observedDaemon = workspaceObservation.daemon;
   const running = observedDaemon.running && !observedDaemon.stale;
   const daemonVersion = observedDaemon.version;

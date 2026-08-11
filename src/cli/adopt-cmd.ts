@@ -6,7 +6,7 @@ import { fsyncDirectory } from "../engine/fsutil.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { loadConfigIfPresent, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { acknowledgeCacheGeneration } from "./adopt-cache.js";
-import { abortAdoption, continueAdoption, refreshAdoptionContinuation } from "./adopt-lifecycle.js";
+import { abortAdoption, continueAdoption, pinAdoptionFolderPolicy, refreshAdoptionContinuation } from "./adopt-lifecycle.js";
 import {
   adoptDir,
   adoptStashDir,
@@ -17,6 +17,9 @@ import {
   type AdoptJournal,
 } from "./adopt-journal.js";
 import { rememberBinding } from "./binding-registry.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
+import { recordFolder, resolveFolderPolicy, snapshotPreCatalogPolicy, type ResolvedFolderPolicy } from "./folder-config.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 import { emitJson } from "./json.js";
 import { confirmDestructive } from "./prompt.js";
 import { acquireWorkspaceSyncMutexForAdopt, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
@@ -91,11 +94,32 @@ export async function adoptionStatus(root: string): Promise<AdoptStatusReport> {
   };
 }
 
-async function ensureJournalConfig(journal: AdoptJournal): Promise<void> {
+function journalPolicy(journal: AdoptJournal): ResolvedFolderPolicy {
+  if (journal.pinnedFolderPolicy) {
+    const pinned = journal.pinnedFolderPolicy;
+    return {
+      syncGit: pinned.syncGit,
+      git: { incremental: pinned.git.incremental },
+      respectGitignore: pinned.respectGitignore,
+      noDrift: pinned.noDrift,
+      trash: { days: pinned.trash.days, maxBytes: pinned.trash.maxBytes },
+    };
+  }
+  const legacyBinding = {
+    syncGit: journal.workspace.syncGit,
+    respectGitignore: journal.workspace.respectGitignore,
+  } as WorkspaceConfig;
+  return resolveFolderPolicy({}, snapshotPreCatalogPolicy(legacyBinding));
+}
+
+async function ensureJournalConfig(journal: AdoptJournal): Promise<{ generation: string; policy: ResolvedFolderPolicy }> {
+  let state = await ensureFolderAuthority({ currentRoot: journal.workspace.root });
   const current = await loadConfigIfPresent(journal.workspace.root);
   if (current) {
     if (syncStreamId(current) !== journal.workspace.stream) throw new Error("workspace config does not match adoption journal");
-    return;
+    const admission = await observeFolderAdmission(journal.workspace.root, state);
+    if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+    return { generation: admission.generation, policy: journalPolicy(journal) };
   }
   const cfg: WorkspaceConfig = {
     schema: "e2ee/v1",
@@ -115,6 +139,13 @@ async function ensureJournalConfig(journal: AdoptJournal): Promise<void> {
     remoteWorkspaceId: cfg.remoteWorkspaceId,
     ...(cfg.name ? { name: cfg.name } : {}),
   });
+  await recordFolder(journal.workspace.root, {
+    options: journalPolicy(journal),
+  });
+  state = await ensureFolderAuthority({ currentRoot: journal.workspace.root });
+  const admission = await observeFolderAdmission(journal.workspace.root, state);
+  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+  return { generation: admission.generation, policy: journalPolicy(journal) };
 }
 
 async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal> {
@@ -130,13 +161,20 @@ async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal
       repo.state = "pending";
       repo.reason = undefined;
     }
-    await ensureJournalConfig(journal);
-    const { cfg, deps } = await buildAuthedRemote(root);
+    const admission = await ensureJournalConfig(journal);
+    if (!journal.pinnedFolderPolicy) {
+      await pinAdoptionFolderPolicy(journal, admission.generation, admission.policy, mutex);
+    }
+    const built = await buildAuthedRemote(root);
+    const cfg = applyFolderPolicy(built.cfg, admission.policy);
+    const { deps } = built;
     deps.syncMutex = mutex;
     return continueAdoption(journal, mutex, {
       establishBaseline: async () => { await sync(root, cfg, deps); },
       finishSync: async (current) => {
-        deps.cache = new HashCache();
+        // Stamp the applied Git policy so the first daemon start reuses this
+        // cache instead of discarding it for a full re-hash.
+        deps.cache = new HashCache(undefined, { syncGit: cfg.syncGit === true, incremental: cfg.git?.incremental !== false });
         deps.dircache = new DirCache();
         deps.forceFullScan = true;
         await sync(root, cfg, deps);

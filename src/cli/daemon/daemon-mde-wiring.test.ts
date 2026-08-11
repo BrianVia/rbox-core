@@ -6,6 +6,7 @@ import { HashCache, scanManifest, type Manifest } from "../../engine/index.js";
 import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "../e2ee-fake-server.js";
 import { RboxDaemon } from "../daemon.js";
 import { push } from "../sync.js";
+import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const NOW = 1_900_000_000_000;
 const ACCOUNT_ID = "acct_daemon_mde";
@@ -45,6 +46,7 @@ test("daemon wires manifest attribution and publication through its log sink", a
   const sink = (line: string) => { lines.push(line); };
   const remote = remoteFor(server, secrets, ACCOUNT_ID, WORKSPACE_ID, NOW + 5_000, { warningSink: sink });
   const cfg = await cfgFor(root, secrets, remote, WORKSPACE_ID);
+  await prepareDaemonFolderAdmission(root, cfg);
   daemon = new RboxDaemon(
     root,
     cfg,
@@ -71,6 +73,7 @@ test("209/6 first daemon commit after a full boot scan emits one op for one real
   const sink = (line: string) => { lines.push(line); };
   const remote = remoteFor(server, secrets, ACCOUNT_ID, WORKSPACE_ID, NOW + 5_000, { warningSink: sink });
   const cfg = await cfgFor(root, secrets, remote, WORKSPACE_ID);
+  await prepareDaemonFolderAdmission(root, cfg);
   const partition = path.join(root, "partition");
   await fs.mkdir(partition);
   await Promise.all(Array.from({ length: 300 }, (_, index) =>

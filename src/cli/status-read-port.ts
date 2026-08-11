@@ -23,6 +23,8 @@ import { conflictSnapshotStatus, gitDivergenceCount, gitDivergenceFastRepoSource
 import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readUpdateCheckState } from "./update-check.js";
+import { inspectFolderCatalog } from "./folder-config.js";
+import { observeFolderAdmission } from "./folder-inventory.js";
 
 export interface StatusCmdDeps {
   now: () => number;
@@ -160,6 +162,7 @@ export function createStatusReadPort<M extends StatusMode>(mode: M, deps: Status
     readCredentials: deps.loadCredentials ?? loadCredentials,
     readPendingGenesis: async (accountId) => Boolean(await pendingGenesisState(accountId)),
     readWorkspaceObservation: deps.observeWorkspace,
+    readFolderAdmission: async (root) => observeFolderAdmission(root, await inspectFolderCatalog()),
     inspectResetJournal: inspectResetJournalSafety,
     readResetHaltHealth,
     readState: loadState,

@@ -22,7 +22,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { readDesiredDaemonRows } from "./autostart-cmd.js";
+import { readDesiredDaemonRows } from "./autostart/desired-state.js";
 import { currentWorkspaceId } from "./daemon/runtime-state.js";
 import { bindingRegistryDir, bindingRegistryPath } from "./rbox-paths.js";
 import { RBOX_DIR } from "./workspace-config.js";
@@ -76,26 +76,33 @@ function validEntry(value: unknown): value is BindingRegistryEntry {
     && (e.scope === undefined || (Array.isArray(e.scope) && e.scope.every((p) => typeof p === "string")));
 }
 
-/** The persisted half only. A corrupt or absent file reads as empty: the registry
- * is never allowed to be the reason a command fails. */
-export async function readPersistedEntries(): Promise<BindingRegistryEntry[]> {
+/** Strict evidence read used only by folder-authority activation. An absent file
+ * is empty; unreadable or malformed evidence is named instead of erased. */
+export async function readPersistedEntriesStrict(): Promise<BindingRegistryEntry[]> {
   let raw: string;
   try {
     raw = await fsp.readFile(bindingRegistryPath(), "utf8");
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error(`cannot read ${bindingRegistryPath()}: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
     const parsed = JSON.parse(raw) as Partial<BindingRegistryFileV1>;
-    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.entries)) return [];
+    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.entries)) throw new Error("invalid schema");
     const byRoot = new Map<string, BindingRegistryEntry>();
     for (const entry of parsed.entries) {
-      if (validEntry(entry)) byRoot.set(path.resolve(entry.root), { ...entry, root: path.resolve(entry.root) });
+      if (!validEntry(entry)) throw new Error("invalid entry");
+      byRoot.set(path.resolve(entry.root), { ...entry, root: path.resolve(entry.root) });
     }
     return [...byRoot.values()];
-  } catch {
-    return [];
+  } catch (error) {
+    throw new Error(`cannot read ${bindingRegistryPath()}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/** The compatibility/diagnostic read remains tolerant by contract. */
+export async function readPersistedEntries(): Promise<BindingRegistryEntry[]> {
+  return readPersistedEntriesStrict().catch(() => []);
 }
 
 async function writeEntries(entries: BindingRegistryEntry[]): Promise<void> {
@@ -291,6 +298,39 @@ export async function forgetBinding(root: string): Promise<boolean> {
     return next;
   });
   return removed;
+}
+
+/** Strict, crash-retryable root relocation for `rbox config repair`.
+ * Preserves the complete cached row and binding lifetime under the registry's
+ * existing global lock. Unlike rememberBinding, failures are never swallowed. */
+export async function relocateBinding(
+  oldRoot: string,
+  newRoot: string,
+  expectedWorkspaceId: string,
+): Promise<"moved" | "already-relocated" | "absent"> {
+  const oldAbs = path.resolve(oldRoot);
+  const newAbs = path.resolve(newRoot);
+  let result: "moved" | "already-relocated" | "absent" = "absent";
+  await mutate((entries) => {
+    const source = entries.find((entry) => entry.root === oldAbs);
+    const destination = entries.find((entry) => entry.root === newAbs);
+    if (source !== undefined && source.workspaceId !== expectedWorkspaceId) {
+      throw new Error(`workspace registry source ${oldAbs} belongs to a different workspace`);
+    }
+    if (destination !== undefined && destination.workspaceId !== expectedWorkspaceId) {
+      throw new Error(`workspace registry destination ${newAbs} belongs to a different workspace`);
+    }
+    if (source === undefined) {
+      result = destination === undefined ? "absent" : "already-relocated";
+      return undefined;
+    }
+    result = "moved";
+    return [
+      ...entries.filter((entry) => entry.root !== oldAbs && entry.root !== newAbs),
+      { ...source, root: newAbs },
+    ];
+  });
+  return result;
 }
 
 /** Is this root known to the registry at all (persisted or daemon-derived)? */

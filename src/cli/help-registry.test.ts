@@ -113,6 +113,18 @@ test("the public surface (derived from the registry) and KNOWN_TOP_LEVEL stay co
   for (const name of PUBLIC_COMMANDS) expect(KNOWN_TOP_LEVEL.has(firstWord(name))).toBe(true);
   expect(KNOWN_TOP_LEVEL.has("__daemon-run")).toBe(true); // internal, handled by the switch
   expect(KNOWN_TOP_LEVEL.has("__boot-resume")).toBe(true);
+  expect(KNOWN_TOP_LEVEL.has("config")).toBe(true);
+});
+
+test("draft rbox config help and every leaf stay marked for founder sign-off", () => {
+  const source = readFileSync(new URL("./help-registry.ts", import.meta.url), "utf8");
+  expect(source.match(/<!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->/g)).toHaveLength(4);
+  expect(helpFor("config")?.map((entry) => entry.name)).toEqual([
+    "config",
+    "config add",
+    "config regenerate",
+    "config repair",
+  ]);
 });
 
 test("every canonical registry head has one real lazy-dispatch or fast-path handler", () => {

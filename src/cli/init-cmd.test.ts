@@ -159,6 +159,34 @@ test("interactive new-workspace prompts define workspace, omit Project id, and r
   }
 });
 
+test("init plan retains explicit option provenance for true, false, and omission", () => {
+  const resolve = (flags: Record<string, string>) => resolveInitPlan({
+    flags: { workspace: "ws_existing", ...flags },
+    cwd: "/work",
+    creds: { deviceId: "dev_test", remoteUrl: "https://api.test" },
+    interactive: false,
+    defaultRemote: "https://api.test",
+  });
+  expect(resolve({})).toMatchObject({
+    syncGit: true,
+    syncGitExplicit: false,
+    respectGitignore: false,
+    respectGitignoreExplicit: false,
+  });
+  expect(resolve({ git: "false", "respect-gitignore": "true" })).toMatchObject({
+    syncGit: false,
+    syncGitExplicit: true,
+    respectGitignore: true,
+    respectGitignoreExplicit: true,
+  });
+  expect(resolve({ git: "true", "respect-gitignore": "false" })).toMatchObject({
+    syncGit: true,
+    syncGitExplicit: true,
+    respectGitignore: false,
+    respectGitignoreExplicit: true,
+  });
+});
+
 test("scripted init flags bypass the workspace definition", async () => {
   const writes: string[] = [];
   const oldWrite = process.stderr.write;
@@ -209,7 +237,9 @@ function plan(root: string, workspace: InitPlan["workspace"]): InitPlan {
     auth: "have",
     firstSync: "none",
     syncGit: true,
+    syncGitExplicit: false,
     respectGitignore: false,
+    respectGitignoreExplicit: false,
   };
 }
 

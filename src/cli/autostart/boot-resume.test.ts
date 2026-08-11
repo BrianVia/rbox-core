@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
+import path from "node:path";
 import {
   autostartCmd,
   bootResume,
   desiredStatePath,
   readDesiredDaemonRows,
   resumeDesiredDaemon,
+  startDaemonAndRecordDesired,
   stopDaemonAndRecordDesired,
 } from "../autostart-cmd.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import { forgetFolder, recordFolder } from "../folder-config.js";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
 import {
   absent,
@@ -40,6 +44,66 @@ test("__boot-resume starts matching running roots through an injected daemon sea
   });
 
   expect(started).toEqual([running]);
+});
+
+test("__boot-resume pins authority once and logs one skip for each non-admitted running row", async () => {
+  const admitted = await workspace("ws_boot_admitted");
+  const missing = await workspace("ws_boot_missing");
+  const detached = await workspace("ws_boot_detached");
+  const unbound = await workspace("ws_boot_unbound");
+  for (const root of [admitted, missing, detached, unbound]) await recordDesired(root, "running", "acct_boot");
+  await fs.rm(missing, { recursive: true, force: true });
+  await forgetFolder(detached);
+  await fs.rm(path.join(unbound, ".rbox", "workspace.json"));
+
+  let authorityCalls = 0;
+  const started: string[] = [];
+  const logs: string[] = [];
+  await bootResume({
+    loadCredentials: creds("acct_boot"),
+    ensureFolderAuthority: async (context) => {
+      authorityCalls++;
+      return ensureFolderAuthority(context);
+    },
+    startDaemon: async (root) => { started.push(root); return "started"; },
+    log: (line) => logs.push(line),
+  });
+
+  expect(authorityCalls).toBe(1);
+  expect(started).toEqual([admitted]);
+  expect(logs).toHaveLength(3);
+  expect(logs.some((line) => line.includes(missing) && line.includes("(missing:"))).toBe(true);
+  expect(logs.some((line) => line.includes(detached) && line.includes("(detached:") && line.includes("config add"))).toBe(true);
+  expect(logs.some((line) => line.includes(unbound) && line.includes("(unbound:"))).toBe(true);
+});
+
+test("a detached desired row keeps its prior mode and resumes after re-add", async () => {
+  const root = await workspace("ws_boot_readd");
+  await startDaemonAndRecordDesired(root, {
+    loadCredentials: creds("acct_boot"),
+    mode: "pull-only",
+    startDaemon: async () => "started",
+  });
+  await forgetFolder(root);
+  const skipped: string[] = [];
+  await bootResume({
+    loadCredentials: creds("acct_boot"),
+    startDaemon: async () => { throw new Error("detached row started"); },
+    log: (line) => skipped.push(line),
+  });
+  expect(skipped).toHaveLength(1);
+  expect(skipped[0]).toContain("detached");
+
+  await recordFolder(root);
+  let pullOnly: boolean | undefined;
+  await bootResume({
+    loadCredentials: creds("acct_boot"),
+    startDaemon: async (_root, options) => {
+      pullOnly = options.pullOnly;
+      return "started";
+    },
+  });
+  expect(pullOnly).toBe(true);
 });
 
 test("__boot-resume gives durable pending mode precedence and promotes it on a witnessed match", async () => {
@@ -130,4 +194,3 @@ test("credential degradation is actionable in status and starts zero boot-resume
   }
   expect(lines.join("\n")).toContain("credential-degraded");
 });
-

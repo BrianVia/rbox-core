@@ -1,16 +1,21 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { bindingRegistryPath, readBindingRegistry } from "./binding-registry.js";
-import { DEFAULT_FOLDER_POLICY, type FolderCatalogSnapshot } from "./folder-config.js";
-import { collectMachineTriage } from "./doctor-machine.js";
+import { bindingRegistryPath } from "./binding-registry.js";
 import {
+  inspectFolderCatalog,
+  serializeFolderCatalog,
+} from "./folder-config.js";
+import {
+  applyFolderPolicy,
   listFolderInventory,
   observeFolderAdmission,
-  type FolderInventorySnapshot,
+  observeFolderGeneration,
 } from "./folder-inventory.js";
-import { daemonRuntimeDir } from "./rbox-paths.js";
+import type { WorkspaceConfig } from "./workspace-config.js";
+import { daemonRuntimeDir, folderCatalogPath } from "./rbox-paths.js";
+import { collectMachineTriage } from "./doctor-machine.js";
 
 let home: string;
 let scratch: string;
@@ -33,210 +38,213 @@ afterEach(async () => {
   await fs.rm(scratch, { recursive: true, force: true });
 });
 
-async function bind(root: string, workspaceId: string, extra: object = {}): Promise<void> {
-  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
-  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+async function bind(root: string, workspaceId: string): Promise<string> {
+  const file = path.join(root, ".rbox", "workspace.json");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({
     remoteWorkspaceId: workspaceId,
     projectId: "root",
     deviceId: `dev_${workspaceId}`,
     rootPath: root,
     remoteUrl: "https://api.test",
     token: "",
-    ...extra,
   }));
+  return file;
 }
 
-async function desired(root: string, workspaceId: string): Promise<void> {
+async function desired(root: string, workspaceId: string): Promise<string> {
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
-  await fs.writeFile(path.join(daemonRuntimeDir(root), "desired.json"), JSON.stringify({
+  const file = path.join(daemonRuntimeDir(root), "desired.json");
+  await fs.writeFile(file, JSON.stringify({
     rootPath: root,
     state: "running",
     accountId: "acct_derived",
     workspaceId,
     at: "2026-08-11T10:00:00.000Z",
   }));
+  return file;
 }
 
-function registryProjection(row: object): object {
-  return Object.fromEntries(Object.entries(row).filter(([key]) => key !== "admission"));
+async function writeRegistry(entries: object[]): Promise<string> {
+  const file = bindingRegistryPath();
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({ schemaVersion: 1, entries }));
+  return file;
 }
 
-async function collectViaOldDirectRegistry(): ReturnType<typeof collectMachineTriage> {
-  const rows = await readBindingRegistry();
-  const legacyInventory: FolderInventorySnapshot = {
-    catalogState: "legacy",
-    rows: rows.map((row) => ({
-      ...row,
-      // The old path had no admission; collectMachineTriage only consumes the
-      // unchanged BindingRegistryRow projection.
-      admission: { kind: "damaged", reason: "not observed by the old direct registry path" },
-    })),
-  };
-  return collectMachineTriage({ listFolderInventory: async () => legacyInventory });
+async function writeCatalog(roots: string[]): Promise<string> {
+  const file = folderCatalogPath();
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, serializeFolderCatalog({
+    schemaVersion: 1,
+    globalOptions: {},
+    folders: roots.map((root, index) => ({ name: `Folder ${index + 1}`, path: root })),
+  }));
+  return file;
 }
 
-test("inventory is a differential read-only wrapper over every legacy registry row", async () => {
-  const bound = path.join(scratch, "bound");
+test("inventory unions all four sources without losing evidence and sorts normalized roots", async () => {
+  const all = path.join(scratch, "all");
+  const catalogOnly = path.join(scratch, "catalog-only");
   const missing = path.join(scratch, "missing");
-  const rebound = path.join(scratch, "rebound");
-  const derived = path.join(scratch, "derived");
-  await bind(bound, "ws_bound");
-  await bind(rebound, "ws_new");
-  await bind(derived, "ws_derived");
-  await desired(derived, "ws_derived");
+  const desiredOnly = path.join(scratch, "desired-only");
+  const registryOnly = path.join(scratch, "registry-only");
+  await bind(all, "ws_live");
+  await fs.mkdir(catalogOnly, { recursive: true });
+  await bind(desiredOnly, "ws_desired");
+  await bind(registryOnly, "ws_registry");
+  await desired(all, "ws_stale");
+  await desired(desiredOnly, "ws_desired");
+  await writeRegistry([
+    { root: all, workspaceId: "ws_stale", boundAt: "2026-08-01T00:00:00.000Z", lastSeenAt: "2026-08-01T00:00:00.000Z" },
+    { root: registryOnly, workspaceId: "ws_registry", boundAt: "2026-08-02T00:00:00.000Z", lastSeenAt: "2026-08-02T00:00:00.000Z" },
+  ]);
+  await writeCatalog([all, catalogOnly, missing]);
 
-  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
-  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
-    schemaVersion: 1,
-    entries: [
-      {
-        root: rebound,
-        workspaceId: "ws_old",
-        name: "Rebound",
-        accountId: "acct_old",
-        boundAt: "2026-08-09T10:00:00.000Z",
-        lastSeenAt: "2026-08-10T10:00:00.000Z",
-        scope: ["src"],
-      },
-      {
-        root: missing,
-        workspaceId: "ws_missing",
-        boundAt: "2026-08-07T10:00:00.000Z",
-        lastSeenAt: "2026-08-08T10:00:00.000Z",
-      },
-      {
-        root: bound,
-        workspaceId: "ws_bound",
-        name: "Bound",
-        boundAt: "2026-08-05T10:00:00.000Z",
-        lastSeenAt: "2026-08-06T10:00:00.000Z",
-      },
-    ],
-  }));
-
-  const expected = await readBindingRegistry();
-  const inventory = await listFolderInventory();
-  expect(inventory.catalogState).toBe("legacy");
-  expect(inventory.rows.map(registryProjection)).toEqual(expected);
-  expect(inventory.rows.map((row) => row.root)).toEqual(expected.map((row) => row.root));
-  expect(inventory.rows.find((row) => row.root === derived)?.derived).toBe(true);
-  expect(await collectMachineTriage()).toEqual(await collectViaOldDirectRegistry());
-
-  // Corrupt persisted evidence still degrades exactly as the registry does;
-  // the daemon-derived discovery half remains visible and no file is healed.
-  await fs.writeFile(bindingRegistryPath(), "{not json");
-  const corruptBytes = await fs.readFile(bindingRegistryPath(), "utf8");
-  const corruptExpected = await readBindingRegistry();
-  const corruptInventory = await listFolderInventory();
-  expect(corruptInventory.rows.map(registryProjection)).toEqual(corruptExpected);
-  expect(await fs.readFile(bindingRegistryPath(), "utf8")).toBe(corruptBytes);
+  const state = await inspectFolderCatalog();
+  const inventory = await listFolderInventory(state, { currentRoot: all });
+  expect(inventory.rows.map((row) => row.root)).toEqual([all, catalogOnly, desiredOnly, missing, registryOnly].sort());
+  const joined = inventory.rows.find((row) => row.root === all)!;
+  expect(joined).toMatchObject({
+    isCurrentRoot: true,
+    catalog: { normalizedPath: all },
+    registry: { workspaceId: "ws_stale", health: "rebound", currentWorkspaceId: "ws_live", derived: false },
+    desired: { desired: { workspaceId: "ws_stale" } },
+    binding: { workspaceId: "ws_live", deviceId: "dev_ws_live" },
+    admission: { kind: "admitted" },
+  });
+  expect(inventory.rows.find((row) => row.root === catalogOnly)?.admission.kind).toBe("unbound");
+  expect(inventory.rows.find((row) => row.root === missing)?.admission.kind).toBe("missing");
+  expect(inventory.rows.find((row) => row.root === desiredOnly)?.admission.kind).toBe("detached");
+  expect(inventory.rows.find((row) => row.root === registryOnly)?.admission.kind).toBe("detached");
 });
 
-test("one malformed legacy policy damages only its row and preserves machine triage", async () => {
-  const healthy = path.join(scratch, "healthy");
-  const malformed = path.join(scratch, "malformed");
-  await bind(healthy, "ws_healthy");
-  await bind(malformed, "ws_malformed", { noDrift: 1 });
-  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
-  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
-    schemaVersion: 1,
-    entries: [
-      {
-        root: healthy,
-        workspaceId: "ws_healthy",
-        boundAt: "2026-08-05T10:00:00.000Z",
-        lastSeenAt: "2026-08-06T10:00:00.000Z",
-      },
-      {
-        root: malformed,
-        workspaceId: "ws_malformed",
-        boundAt: "2026-08-07T10:00:00.000Z",
-        lastSeenAt: "2026-08-08T10:00:00.000Z",
-      },
-    ],
-  }));
-
-  const expected = await readBindingRegistry();
-  const inventory = await listFolderInventory();
-  expect(inventory.rows).toHaveLength(expected.length);
-  expect(inventory.rows.map(registryProjection)).toEqual(expected);
-  expect(inventory.rows.find((row) => row.root === malformed)?.admission).toMatchObject({
-    kind: "damaged",
-  });
-  expect(inventory.rows.find((row) => row.root === healthy)?.admission).toMatchObject({
-    kind: "legacy",
-  });
-  expect(await collectMachineTriage()).toEqual(await collectViaOldDirectRegistry());
+test("catalog membership plus a readable binding admits without registry evidence", async () => {
+  const root = path.join(scratch, "configured");
+  await bind(root, "ws_configured");
+  await writeCatalog([root]);
+  const state = await inspectFolderCatalog();
+  const row = (await listFolderInventory(state)).rows[0]!;
+  expect(row.registry).toBeUndefined();
+  expect(row.admission.kind).toBe("admitted");
 });
 
-test("legacy admission derives every policy field from persisted binding behavior", async () => {
-  const root = path.join(scratch, "policy");
-  await bind(root, "ws_policy", {
+test("machine JSON filters catalog-only rows without changing its closed schema", async () => {
+  const root = path.join(scratch, "catalog-only-machine");
+  await fs.mkdir(root, { recursive: true });
+  await writeCatalog([root]);
+  expect(await collectMachineTriage()).toEqual({ schemaVersion: 1, scope: "machine", workspaces: [] });
+});
+
+test("unreadable and dangling observations stay visible and are never generated", async () => {
+  const unreadable = path.join(scratch, "a-unreadable");
+  const dangling = path.join(scratch, "z-dangling");
+  await fs.mkdir(path.join(unreadable, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(unreadable, ".rbox", "workspace.json"), "{");
+  await writeRegistry([
+    { root: unreadable, workspaceId: "ws_bad", boundAt: "2026-08-01T00:00:00.000Z", lastSeenAt: "2026-08-01T00:00:00.000Z" },
+    { root: dangling, workspaceId: "ws_gone", boundAt: "2026-08-01T00:00:00.000Z", lastSeenAt: "2026-08-01T00:00:00.000Z" },
+  ]);
+  await writeCatalog([unreadable, dangling]);
+  const state = await inspectFolderCatalog();
+  const inventory = await listFolderInventory(state);
+  const bad = inventory.rows.find((row) => row.root === unreadable)!;
+  expect(bad.binding).toHaveProperty("unreadable");
+  expect(bad.admission.kind).toBe("unbound");
+  const generation = await observeFolderGeneration(state);
+  expect(generation.discoverableBindings).toEqual([]);
+  expect(generation.skipped.map((row) => row.root)).toEqual([unreadable, dangling]);
+});
+
+test("overlap annotations cover lexical ancestors and observable aliases", async () => {
+  const parent = path.join(scratch, "parent");
+  const child = path.join(parent, "child");
+  const alias = path.join(scratch, "alias");
+  await fs.mkdir(child, { recursive: true });
+  await fs.symlink(parent, alias);
+  await writeCatalog([parent, child, alias]);
+  const state = await inspectFolderCatalog();
+  const rows = (await listFolderInventory(state)).rows;
+  expect(rows.find((row) => row.root === parent)?.overlap).toEqual({ kind: "alias", of: alias });
+  expect(rows.find((row) => row.root === alias)?.overlap).toEqual({ kind: "alias", of: parent });
+  expect(rows.find((row) => row.root === child)?.overlap).toEqual({ kind: "descendant", of: parent });
+});
+
+test("all three inventory entry points are read-only over catalog, registry, desired, and binding bytes", async () => {
+  const root = path.join(scratch, "read-only");
+  const bindingFile = await bind(root, "ws_readonly");
+  const desiredFile = await desired(root, "ws_readonly");
+  const registryFile = await writeRegistry([
+    { root, workspaceId: "ws_readonly", boundAt: "2026-08-01T00:00:00.000Z", lastSeenAt: "2026-08-01T00:00:00.000Z" },
+  ]);
+  const catalogFile = await writeCatalog([root]);
+  const files = [bindingFile, desiredFile, registryFile, catalogFile];
+  const before = new Map(await Promise.all(files.map(async (file) => [file, await fs.readFile(file, "utf8")] as const)));
+  const writeFile = spyOn(fs, "writeFile");
+  const rename = spyOn(fs, "rename");
+  try {
+    const state = await inspectFolderCatalog();
+    await observeFolderAdmission(root, state);
+    await listFolderInventory(state, { currentRoot: root });
+    await observeFolderGeneration(state, { currentRoot: root });
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(rename).not.toHaveBeenCalled();
+    for (const file of files) expect(await fs.readFile(file, "utf8")).toBe(before.get(file));
+  } finally {
+    writeFile.mockRestore();
+    rename.mockRestore();
+  }
+});
+
+test("damaged state reports its exact reason without probing the binding", async () => {
+  const state = await inspectFolderCatalog();
+  const damaged = { kind: "damaged", reason: "exact parse failure", revision: state.revision } as const;
+  let probes = 0;
+  expect(await observeFolderAdmission(path.join(scratch, "any"), damaged, {
+    loadConfigIfPresent: async () => { probes++; return undefined; },
+  })).toEqual({ kind: "damaged", reason: "exact parse failure" });
+  expect(probes).toBe(0);
+});
+
+test("folder policy overlays only safe fields and preserves runtime attachments", () => {
+  const kek = Buffer.alloc(32, 7);
+  const cfg = {
+    remoteWorkspaceId: "ws_runtime",
+    projectId: "root",
+    deviceId: "dev_runtime",
+    rootPath: scratch,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
+    encrypted: true,
+    kek,
+    accountId: "acct_runtime",
+    accountEpoch: 2,
+    keyEpoch: 9,
     syncGit: true,
+    git: { incremental: true, runtimeSentinel: "keep" },
+  } as WorkspaceConfig & { git: { incremental?: boolean; runtimeSentinel: string } };
+  const result = applyFolderPolicy(cfg, {
+    syncGit: false,
     git: { incremental: false },
     respectGitignore: true,
     noDrift: true,
-    trash: { days: 12.9, maxBytes: Number.POSITIVE_INFINITY },
-  });
+    trash: { days: 0, maxBytes: 0 },
+  }) as typeof cfg;
 
-  expect(await observeFolderAdmission(root)).toEqual({
-    kind: "legacy",
-    policy: {
-      syncGit: true,
-      git: { incremental: false },
-      respectGitignore: true,
-      noDrift: true,
-      trash: { days: 12, maxBytes: 2 * 2 ** 30 },
-    },
+  expect(result).toMatchObject({
+    syncGit: false,
+    git: { incremental: false, runtimeSentinel: "keep" },
+    respectGitignore: true,
+    noDrift: true,
+    trash: { days: 0, maxBytes: 0 },
+    encrypted: true,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
+    accountId: "acct_runtime",
+    accountEpoch: 2,
+    keyEpoch: 9,
   });
-});
-
-test("damaged catalog state reports its exact reason", async () => {
-  expect(await observeFolderAdmission(path.join(scratch, "any"), undefined, {
-    inspectFolderCatalog: async () => ({
-      kind: "damaged",
-      authorityActivated: true,
-      reason: "config-authority.json exists but config.json is absent",
-    }),
-  })).toEqual({
-    kind: "damaged",
-    reason: "config-authority.json exists but config.json is absent",
-  });
-});
-
-test("authoritative admission distinguishes admitted, unbound, missing, and detached roots", async () => {
-  const admitted = path.join(scratch, "admitted");
-  const unbound = path.join(scratch, "unbound");
-  const missing = path.join(scratch, "missing");
-  const detached = path.join(scratch, "detached");
-  await bind(admitted, "ws_admitted");
-  await fs.mkdir(unbound, { recursive: true });
-  await bind(detached, "ws_detached");
-  const snapshot: FolderCatalogSnapshot = {
-    catalog: {
-      schemaVersion: 1,
-      globalOptions: {},
-      folders: [
-        { name: "Admitted", path: admitted },
-        { name: "Unbound", path: unbound },
-        { name: "Missing", path: missing },
-      ],
-    },
-    generation: "generation-1",
-    folders: [
-      { name: "Admitted", path: admitted, normalizedPath: admitted, policy: DEFAULT_FOLDER_POLICY },
-      { name: "Unbound", path: unbound, normalizedPath: unbound, policy: DEFAULT_FOLDER_POLICY },
-      { name: "Missing", path: missing, normalizedPath: missing, policy: DEFAULT_FOLDER_POLICY },
-    ],
-  };
-
-  const authoritative = { kind: "authoritative", snapshot, activatedAt: "2026-08-11T10:00:00.000Z" } as const;
-  expect(await observeFolderAdmission(admitted, authoritative)).toEqual({
-    kind: "admitted",
-    generation: "generation-1",
-    policy: DEFAULT_FOLDER_POLICY,
-  });
-  expect(await observeFolderAdmission(unbound, authoritative)).toMatchObject({ kind: "unbound" });
-  expect(await observeFolderAdmission(missing, authoritative)).toMatchObject({ kind: "missing" });
-  expect(await observeFolderAdmission(detached, authoritative)).toMatchObject({ kind: "detached" });
+  expect(result.kek).toBe(kek);
+  expect(cfg.git.incremental).toBe(true);
+  expect(cfg.respectGitignore).toBeUndefined();
 });

@@ -126,6 +126,37 @@ test("JSON-supported group usage errors emit JSON to stderr", () => {
   expect(JSON.parse(res.stderr)).toEqual({ error: "usage: rbox device <approve <user-code>|list|revoke <device-id>>" });
 });
 
+test("rbox config activates its own JSON v1 surface and keeps leaf flag scopes closed", () => {
+  const shown = run(["config", "--json"]);
+  expect(shown.status).toBe(0);
+  expect(JSON.parse(shown.stdout)).toEqual({
+    schemaVersion: 1,
+    catalogPath: path.join(home, ".rbox", "config.json"),
+    globalOptions: {
+      syncGit: true,
+      git: { incremental: true },
+      respectGitignore: false,
+      noDrift: false,
+      trash: { days: 30, maxBytes: 2147483648 },
+    },
+    folders: [],
+  });
+  expect(shown.stderr).toBe("");
+
+  const usage = run(["config", "bogus", "--json"]);
+  expect(usage.status).toBe(1);
+  expect(usage.stdout).toBe("");
+  expect(JSON.parse(usage.stderr)).toEqual({
+    error: "usage: rbox config [--json] | add <path> | regenerate [--yes] | repair <path>",
+  });
+
+  const leaf = run(["config", "add", cwd, "--json"]);
+  expect(leaf.status).toBe(0);
+  expect(leaf.stdout).toContain(`added ${cwd}`);
+  expect(() => JSON.parse(leaf.stdout)).toThrow();
+  expect(leaf.stderr).toBe("");
+});
+
 test("include is the only command token and preserves JSON usage errors", async () => {
   const root = await makeWorkspace();
   try {

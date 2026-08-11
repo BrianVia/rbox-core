@@ -12,6 +12,8 @@ import { ScopeProjection } from "./projection.js";
 import { readScopeFindings } from "./rule-authority.js";
 import { parseScopeFlag, scopeSplitsRepo, validateScopePrefixes, withinPrefix } from "./scope-record.js";
 import { resumeScopeIntent, runScopeTransition, type ScopeTransactionDeps } from "./scope-transaction.js";
+import { ensureFolderAuthority } from "../folder-authority.js";
+import { observeFolderAdmission, runtimeRefusal } from "../folder-inventory.js";
 
 export const SCOPE_USAGE = "usage: rbox include [add <folder>… | remove <folder>…] [--json]";
 
@@ -28,11 +30,14 @@ export async function scopeCmd(
   opts: { json?: boolean; quiet?: boolean } = {},
   deps: ScopeTransactionDeps = {},
 ): Promise<void> {
-  // Any invocation finishes an interrupted edit first — a half-applied scope must
-  // never be the state a user is asked to reason about.
-  await resumeScopeIntent(root, deps);
   if (sub === undefined) return showScope(root, opts);
   if (sub !== "add" && sub !== "remove") throw new Error(SCOPE_USAGE);
+  const folderState = await ensureFolderAuthority({ currentRoot: root });
+  const admission = await observeFolderAdmission(root, folderState);
+  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+  // Resuming is a physical mutation and therefore uses the same pinned
+  // admission as the requested edit. Bare display above remains read-only.
+  await resumeScopeIntent(root, deps);
   const requested = args.flatMap((arg) => parseScopeFlag(arg));
   if (requested.length === 0) throw new Error(SCOPE_USAGE);
   return editScope(root, sub, requested, opts, deps);

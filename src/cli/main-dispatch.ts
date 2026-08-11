@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs/promises";
 import { findRoot as findWorkspaceRoot } from "./config.js";
 import { rememberResolvedRoot } from "./binding-registry.js";
 import { runPullCommand, runPushCommand, runSyncCommand } from "./sync-cmd.js";
@@ -24,6 +25,14 @@ import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { refreshSystemLockIdentityLedger } from "../engine/git/lockfile.js";
+import { expandUserPath } from "./directory-picker.js";
+import { homeDir } from "./rbox-paths.js";
+
+async function canonicalUserPath(value: string): Promise<string> {
+  const lexical = path.resolve(expandUserPath(value, homeDir()));
+  return fs.realpath(lexical).catch((error: NodeJS.ErrnoException) =>
+    error.code === "ENOENT" ? lexical : Promise.reject(error));
+}
 
 /** Print per-command, essential, or full-reference help and nothing else. Stdout, exit 0. */
 function printHelp(cmd: string | undefined, positional: string[], fullReference = false): void {
@@ -122,15 +131,15 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
 /** #498: outside a workspace, `rbox doctor`/`rbox status` summarize every synced
  * folder on this machine instead of dead-ending on "Not inside an rbox workspace". */
 async function runMachineTriage(jsonMode: boolean, surface: "doctor" | "status" = "doctor"): Promise<void> {
-  const { collectMachineTriage, renderMachineStatusTable, renderMachineTriage } = await import("./doctor-machine.js");
-  const triage = await collectMachineTriage();
+  const { collectMachineAggregate, renderMachineStatusTable, renderMachineTriage } = await import("./doctor-machine.js");
+  const { triage, configuredButUnbound } = await collectMachineAggregate();
   if (jsonMode) {
     const { emitJson } = await import("./json.js");
     emitJson(triage);
     return;
   }
   const render = surface === "status" ? renderMachineStatusTable : renderMachineTriage;
-  for (const line of render(triage)) console.log(line);
+  for (const line of render(triage, configuredButUnbound)) console.log(line);
 }
 
 /** `--all` is an aggregate over every locally known workspace, so a PATH — which
@@ -259,13 +268,18 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       await adoptCmd(positional[0], positional[1] ?? process.cwd(), { json: jsonMode, yes: flags.yes === "true" });
       break;
     }
+    case "config": {
+      const { folderConfigCmd } = await import("./folder-config-cmd.js");
+      await folderConfigCmd(positional, { json: jsonMode, yes: flags.yes === "true" });
+      break;
+    }
     case "track": {
       const { track, printTrackResult } = await import("./track-cmd.js");
       printTrackResult(await track(positional[0], flags, DEFAULT_REMOTE));
       break;
     }
     case "untrack": {
-      const explicit = positional[0] === undefined ? undefined : path.resolve(positional[0]);
+      const explicit = positional[0] === undefined ? undefined : await canonicalUserPath(positional[0]);
       // An EXACT registry hit wins before any upward search. A root the registry
       // still lists but whose `.rbox/` binding is gone has no workspace to walk
       // up to, and walking up would untrack whichever ancestor happens to be a
@@ -273,7 +287,30 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       // named root is the remedy `status --all` prints for that row (design 211).
       const registered = explicit !== undefined
         && await (await import("./binding-registry.js")).isRegisteredRoot(explicit);
-      const resolved = registered ? explicit : await findRoot(explicit ?? process.cwd());
+      let configured = false;
+      let damaged = false;
+      if (explicit !== undefined) {
+        const catalog = await import("./folder-config.js");
+        const state = await catalog.inspectFolderCatalog();
+        damaged = state.kind === "damaged";
+        if (state.kind === "authoritative") {
+          for (const folder of state.snapshot.folders) {
+            if (await canonicalUserPath(folder.normalizedPath) === explicit) {
+              configured = true;
+              break;
+            }
+          }
+        }
+      }
+      let resolved: string | undefined;
+      if (registered || configured) {
+        resolved = explicit;
+      } else if (damaged && explicit !== undefined) {
+        const observed = await findRoot(explicit);
+        resolved = observed !== undefined && await canonicalUserPath(observed) === explicit ? explicit : undefined;
+      } else {
+        resolved = await findRoot(explicit ?? process.cwd());
+      }
       if (resolved === undefined) throw workspaceRequiredError();
       const root = resolved;
       const { untrack } = await import("./untrack-cmd.js");

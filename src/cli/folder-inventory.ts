@@ -1,141 +1,199 @@
-/**
- * Read-only folder inventory (design 231 slice 2).
- *
- * This Module joins catalog state to the existing binding registry without
- * healing either source. `detached` requires an authoritative catalog and is
- * therefore unreachable on every pre-cutover machine. `unbound`, `missing`,
- * and `damaged` remain reachable pre-cutover as per-root observations.
- */
-import fs from "node:fs/promises";
+/** Read-only FolderInventory classifier and public facade (design 231 §3.2). */
 import path from "node:path";
-import {
-  readBindingRegistry,
-  type BindingRegistryRow,
-  type ReadRegistryDeps,
-} from "./binding-registry.js";
-import {
-  inspectFolderCatalog,
-  resolveFolderPolicy,
-  type FolderCatalogState,
-  type ResolvedFolderPolicy,
+import type { BindingRegistryRow } from "./binding-registry.js";
+import type { DesiredStateRow } from "./autostart/desired-state.js";
+import type {
+  FolderCatalogState,
+  ResolvedFolderCatalogEntry,
+  ResolvedFolderPolicy,
 } from "./folder-config.js";
+import type { FolderGenerationInventory } from "./folder-catalog-generate.js";
+import type { WorkspaceConfig } from "./workspace-config.js";
 import {
-  loadConfigIfPresent,
-  trashConfig,
-  type WorkspaceConfig,
-} from "./workspace-config.js";
+  buildFolderInventoryUnion,
+  observeFolderRoot,
+  readFolderSourceEvidence,
+  type FolderBindingObservation,
+  type FolderOverlap,
+  type FolderUnionDeps,
+  type FolderUnionRow,
+} from "./folder-inventory-union.js";
 
 export type FolderAdmission =
   | { kind: "admitted"; generation: string; policy: ResolvedFolderPolicy }
-  | { kind: "legacy"; policy: ResolvedFolderPolicy }
-  | { kind: "unbound" | "missing" | "detached" | "damaged"; reason: string };
+  | { kind: "unbound" | "missing" | "detached" | "damaged" | "ambiguous"; reason: string };
 
-export interface FolderInventoryRow extends BindingRegistryRow {
+export interface FolderInventoryRow {
+  root: string;
+  catalog?: ResolvedFolderCatalogEntry;
+  registry?: BindingRegistryRow;
+  desired?: DesiredStateRow;
+  binding?: FolderBindingObservation;
+  isCurrentRoot: boolean;
+  overlap?: FolderOverlap;
   admission: FolderAdmission;
 }
 
 export interface FolderInventorySnapshot {
   catalogState: FolderCatalogState["kind"];
+  revision: FolderCatalogState["revision"];
   rows: FolderInventoryRow[];
 }
 
-export interface FolderInventoryDeps extends ReadRegistryDeps {
-  readBindingRegistry?: typeof readBindingRegistry;
-  inspectFolderCatalog?: typeof inspectFolderCatalog;
-  loadConfigIfPresent?: typeof loadConfigIfPresent;
+export type FolderInventoryDeps = FolderUnionDeps;
+
+/** The complete safe policy overlay. Runtime-only identity, credentials, E2EE
+ * material, scope, and every future non-policy field remain caller-owned. */
+export function folderPolicyFields(policy: ResolvedFolderPolicy): Pick<
+  WorkspaceConfig,
+  "syncGit" | "git" | "respectGitignore" | "noDrift" | "trash"
+> {
+  return {
+    syncGit: policy.syncGit,
+    git: { incremental: policy.git.incremental },
+    respectGitignore: policy.respectGitignore,
+    noDrift: policy.noDrift,
+    trash: { days: policy.trash.days, maxBytes: policy.trash.maxBytes },
+  };
 }
 
-function legacyPolicy(binding: WorkspaceConfig): ResolvedFolderPolicy {
-  const trash = trashConfig(binding);
-  // Every value comes from the legacy binding's persisted fields, with the
-  // historical effective default supplied when that field is absent:
-  // syncGit=false (legacy opt-in), git.incremental=true (schema-3 default),
-  // respectGitignore=false, noDrift=false, and trashConfig's independently
-  // normalized 30-day / 2-GiB defaults and legacy bounds.
-  return resolveFolderPolicy({}, {
-    syncGit: binding.syncGit ?? false,
-    git: { incremental: binding.git?.incremental ?? true },
-    respectGitignore: binding.respectGitignore ?? false,
-    noDrift: binding.noDrift ?? false,
-    trash,
-  });
+export function applyFolderPolicy(cfg: WorkspaceConfig, policy: ResolvedFolderPolicy): WorkspaceConfig {
+  const safeFieldsOnly = folderPolicyFields(policy);
+  return {
+    ...cfg,
+    ...safeFieldsOnly,
+    git: { ...cfg.git, incremental: safeFieldsOnly.git?.incremental },
+  };
 }
 
-async function rootExists(root: string): Promise<boolean> {
-  try {
-    await fs.stat(root);
-    return true;
-  } catch {
-    return false;
-  }
+export function runtimeRefusal(admission: Exclude<FolderAdmission, { kind: "admitted" }>): Error {
+  return new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`);
 }
 
-async function observeAgainstState(
-  root: string,
-  state: FolderCatalogState,
-  deps: FolderInventoryDeps,
-): Promise<FolderAdmission> {
+function classify(row: Pick<FolderUnionRow, "root" | "catalog" | "binding" | "bindingConfig" | "exists" | "observationError">, state: FolderCatalogState): FolderAdmission {
   if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
+  if (!row.exists) {
+    return row.observationError === undefined
+      ? { kind: "missing", reason: "the folder does not exist" }
+      : { kind: "unbound", reason: row.observationError };
+  }
+  if (row.bindingConfig === undefined) {
+    const reason = row.binding !== undefined && "unreadable" in row.binding
+      ? row.binding.unreadable
+      : "the folder has no rbox binding";
+    return { kind: "unbound", reason };
+  }
+  // loadConfig is a tolerant cast: pre-catalog records may omit rootPath even
+  // though the type requires it. A binding observed AT this root with no
+  // recorded path lives here; only a conflicting recorded path is ambiguous.
+  const recordedRoot = typeof row.bindingConfig.rootPath === "string"
+    ? path.resolve(row.bindingConfig.rootPath)
+    : row.root;
+  if (recordedRoot !== row.root) {
+    return {
+      kind: "ambiguous",
+      reason: `the binding still names ${recordedRoot}; if this folder moved here, run \`rbox config repair ${row.root}\``,
+    };
+  }
+  if (state.kind === "absent") {
+    return { kind: "damaged", reason: "rbox folder configuration is absent; run `rbox config regenerate`" };
+  }
+  if (row.catalog === undefined) {
+    return { kind: "detached", reason: "the bound folder is not listed in the authoritative folder configuration; run `rbox config add`" };
+  }
+  return { kind: "admitted", generation: state.snapshot.generation, policy: row.catalog.policy };
+}
 
-  const absoluteRoot = path.resolve(root);
-  const authoritative = state.kind === "authoritative" ? state.snapshot : undefined;
-  const entry = authoritative?.folders.find((folder) => folder.normalizedPath === absoluteRoot);
+function publicRow(row: FolderUnionRow, state: FolderCatalogState): FolderInventoryRow {
+  return {
+    root: row.root,
+    ...(row.catalog === undefined ? {} : { catalog: row.catalog }),
+    ...(row.registry === undefined ? {} : { registry: row.registry }),
+    ...(row.desired === undefined ? {} : { desired: row.desired }),
+    ...(row.binding === undefined ? {} : { binding: row.binding }),
+    isCurrentRoot: row.isCurrentRoot,
+    ...(row.overlap === undefined ? {} : { overlap: row.overlap }),
+    admission: classify(row, state),
+  };
+}
 
-  let binding: WorkspaceConfig | undefined;
-  try {
-    binding = await (deps.loadConfigIfPresent ?? loadConfigIfPresent)(absoluteRoot);
-  } catch (error) {
-    return { kind: "damaged", reason: error instanceof Error ? error.message : String(error) };
+function markDuplicateBindingIdentities(rows: FolderUnionRow[], projected: FolderInventoryRow[]): void {
+  const rootsByIdentity = new Map<string, string[]>();
+  for (const row of rows) {
+    if (row.bindingConfig === undefined) continue;
+    const key = `${row.bindingConfig.remoteWorkspaceId}\0${row.bindingConfig.deviceId}`;
+    const roots = rootsByIdentity.get(key) ?? [];
+    roots.push(row.root);
+    rootsByIdentity.set(key, roots);
   }
-  if (binding === undefined) {
-    return await rootExists(absoluteRoot)
-      ? { kind: "unbound", reason: "the folder has no rbox binding" }
-      : { kind: "missing", reason: "the folder does not exist" };
-  }
-
-  if (authoritative && entry === undefined) {
-    return { kind: "detached", reason: "the bound folder is not listed in the authoritative folder configuration" };
-  }
-  if (authoritative && entry) {
-    return { kind: "admitted", generation: authoritative.generation, policy: entry.policy };
-  }
-  // Candidate catalogs are deliberately dormant until their authority marker
-  // exists, so they retain the exact legacy policy path too.
-  try {
-    return { kind: "legacy", policy: legacyPolicy(binding) };
-  } catch (error) {
-    return { kind: "damaged", reason: error instanceof Error ? error.message : String(error) };
+  for (const roots of rootsByIdentity.values()) {
+    if (roots.length < 2) continue;
+    for (const root of roots) {
+      const row = projected.find((candidate) => candidate.root === root);
+      if (row !== undefined) {
+        row.admission = {
+          kind: "ambiguous",
+          reason: `the same workspace and device binding also exists at ${roots.find((candidate) => candidate !== root)}`,
+        };
+      }
+    }
   }
 }
 
 export async function observeFolderAdmission(
   root: string,
-  state?: FolderCatalogState,
+  state: FolderCatalogState,
   deps: FolderInventoryDeps = {},
 ): Promise<FolderAdmission> {
-  const observedState = state ?? await (deps.inspectFolderCatalog ?? inspectFolderCatalog)();
-  return observeAgainstState(root, observedState, deps);
+  if (state.kind === "damaged") return { kind: "damaged", reason: state.reason };
+  const absolute = path.resolve(root);
+  const rows = await buildFolderInventoryUnion(state, { currentRoot: absolute }, deps);
+  const projected = rows.map((row) => publicRow(row, state));
+  markDuplicateBindingIdentities(rows, projected);
+  return projected.find((row) => row.root === absolute)?.admission
+    ?? { kind: "missing", reason: "the folder does not exist" };
 }
 
 export async function listFolderInventory(
-  state?: FolderCatalogState,
+  state: FolderCatalogState,
+  context: { currentRoot?: string } = {},
   deps: FolderInventoryDeps = {},
 ): Promise<FolderInventorySnapshot> {
-  const registryDeps: ReadRegistryDeps = {
-    ...(deps.readDesiredDaemonRows === undefined ? {} : { readDesiredDaemonRows: deps.readDesiredDaemonRows }),
-    ...(deps.readBoundWorkspaceId === undefined ? {} : { readBoundWorkspaceId: deps.readBoundWorkspaceId }),
-  };
-  const [rows, observedState] = await Promise.all([
-    (deps.readBindingRegistry ?? readBindingRegistry)(registryDeps),
-    state === undefined
-      ? (deps.inspectFolderCatalog ?? inspectFolderCatalog)()
-      : Promise.resolve(state),
-  ]);
+  const rows = await buildFolderInventoryUnion(state, context, deps);
+  const projected = rows.map((row) => publicRow(row, state));
+  markDuplicateBindingIdentities(rows, projected);
   return {
-    catalogState: observedState.kind,
-    rows: await Promise.all(rows.map(async (row) => ({
-      ...row,
-      admission: await observeAgainstState(row.root, observedState, deps),
-    }))),
+    catalogState: state.kind,
+    revision: state.revision,
+    rows: projected,
+  };
+}
+
+export async function observeFolderGeneration(
+  state: FolderCatalogState,
+  context: { currentRoot?: string } = {},
+  deps: FolderInventoryDeps = {},
+): Promise<FolderGenerationInventory> {
+  const evidence = await readFolderSourceEvidence(deps);
+  const rows = await buildFolderInventoryUnion(state, context, deps, evidence);
+  const discoverableBindings: FolderGenerationInventory["discoverableBindings"] = [];
+  const skipped: FolderGenerationInventory["skipped"] = [];
+  for (const row of rows) {
+    if (row.bindingConfig !== undefined) {
+      discoverableBindings.push({ root: row.root, binding: row.bindingConfig });
+    } else if (row.binding !== undefined || row.registry !== undefined || row.desired !== undefined || row.catalog !== undefined) {
+      const reason = !row.exists && row.observationError === undefined
+        ? "the folder does not exist"
+        : row.binding !== undefined && "unreadable" in row.binding
+          ? row.binding.unreadable
+          : row.observationError ?? "the folder has no rbox binding";
+      skipped.push({ root: row.root, reason });
+    }
+  }
+  return {
+    revision: state.revision,
+    discoverableBindings,
+    skipped,
+    ...(evidence.unavailable.length === 0 ? {} : { evidenceUnavailable: evidence.unavailable }),
   };
 }

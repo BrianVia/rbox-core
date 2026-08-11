@@ -31,6 +31,7 @@ beforeEach(async () => {
   previousFetch = globalThis.fetch;
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-credential-policy-"));
   process.env.HOME = home;
+  process.env.RBOX_HOME = home;
   process.env.RBOX_TOKEN = "env-token";
   process.env.RBOX_API = "relative";
 });

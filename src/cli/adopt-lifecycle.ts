@@ -29,7 +29,9 @@ import {
   type AdoptJournal,
   type AdoptPhase,
   type AdoptRetainMove,
+  type JournalPinnedFolderPolicy,
 } from "./adopt-journal.js";
+import type { ResolvedFolderPolicy } from "./folder-config.js";
 import { abortFileOverlay, runFileOverlay } from "./adopt-overlay.js";
 
 export interface StartAdoptionInput {
@@ -49,6 +51,26 @@ export interface AdoptionHooks {
   establishBaseline(journal: AdoptJournal, mutex: WorkspaceSyncMutex): Promise<void>;
   finishSync(journal: AdoptJournal, mutex: WorkspaceSyncMutex): Promise<void>;
   gitDeps?: AdoptGitDeps;
+}
+
+export async function pinAdoptionFolderPolicy(
+  journal: AdoptJournal,
+  generation: string,
+  policy: ResolvedFolderPolicy,
+  mutex: WorkspaceSyncMutex,
+): Promise<JournalPinnedFolderPolicy> {
+  await assertHealthyOwnedSyncMutex(mutex, journal.workspace.root);
+  const pinned: JournalPinnedFolderPolicy = {
+    generation,
+    syncGit: policy.syncGit,
+    git: { incremental: policy.git.incremental },
+    respectGitignore: policy.respectGitignore,
+    noDrift: policy.noDrift,
+    trash: { days: policy.trash.days, maxBytes: policy.trash.maxBytes },
+  };
+  journal.pinnedFolderPolicy = pinned;
+  await saveAdoptJournal(journal.workspace.root, journal);
+  return pinned;
 }
 
 async function makeControlDirectories(root: string): Promise<void> {

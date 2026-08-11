@@ -54,10 +54,20 @@ export function bindingRegistryDir(): string {
 
 export const bindingRegistryPath = (): string => path.join(bindingRegistryDir(), "workspaces.json");
 
-/** Design 231 user-owned folder intent and its activation-only authority marker. */
-export const folderCatalogPath = (): string => path.join(rboxDir(), "config.json");
-export const folderCatalogAuthorityPath = (): string => path.join(rboxDir(), "config-authority.json");
-export const folderCatalogLockPath = (): string => path.join(rboxDir(), "config.lock");
+/**
+ * Test-only isolation for the user-owned folder catalog. Like the binding
+ * registry escape hatch above, an explicit RBOX_HOME remains authoritative.
+ */
+export function folderCatalogDir(): string {
+  if (!process.env.RBOX_HOME && process.env.RBOX_TEST_FOLDER_CATALOG_DIR) {
+    return process.env.RBOX_TEST_FOLDER_CATALOG_DIR;
+  }
+  return rboxDir();
+}
+
+/** Design 231 user-owned folder intent and its global mutation lock. */
+export const folderCatalogPath = (): string => path.join(folderCatalogDir(), "config.json");
+export const folderCatalogLockPath = (): string => path.join(folderCatalogDir(), "config.lock");
 
 const daemonHome = () => rboxDir();
 

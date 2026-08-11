@@ -1,11 +1,12 @@
 /**
- * Pure user-owned folder intent codecs and policy resolution (design 231,
- * dormant foundation). This module never performs filesystem I/O or observes
+ * Pure user-owned folder intent codecs and policy resolution (design 231).
+ * This module never performs filesystem I/O or observes
  * bindings, registries, daemon state, remote identity, scope, or sync state.
  */
 import crypto from "node:crypto";
 import path from "node:path";
 import { homeDir } from "./rbox-paths.js";
+import { trashConfig, type WorkspaceConfig } from "./workspace-config.js";
 
 export const FOLDER_CATALOG_MAX_BYTES = 1024 * 1024;
 export const FOLDER_CATALOG_MAX_FOLDERS = 1024;
@@ -62,27 +63,15 @@ export interface ResolvedFolderCatalogEntry extends FolderCatalogEntry {
   policy: ResolvedFolderPolicy;
 }
 
-export type FolderCandidateSeed = {
-  name: string;
-  path: string;
-  policy: { kind: "available"; options?: FolderOptions } | { kind: "unavailable"; reason: string };
-};
+declare const folderCatalogRevisionBrand: unique symbol;
 
-export interface FolderCatalogCandidate {
-  catalog: FolderCatalog;
-  bytes: string;
-  generation: string;
-  /** Exact observations the publication compare must still see. */
-  source: { configDigest: string | null; markerDigest: string | null };
-  origin: "generated" | "existing";
-  skippedUnavailable: Array<{ name: string; path: string; reason: string }>;
-}
+/** Opaque catalog freshness token. Callers may retain it and compare with `===`. */
+export type FolderCatalogRevision = string & { readonly [folderCatalogRevisionBrand]: true };
 
 export type FolderCatalogState =
-  | { kind: "legacy" }
-  | { kind: "candidate"; snapshot: FolderCatalogSnapshot; candidate: FolderCatalogCandidate }
-  | { kind: "authoritative"; snapshot: FolderCatalogSnapshot; activatedAt: string }
-  | { kind: "damaged"; authorityActivated: boolean; reason: string };
+  | { kind: "absent"; revision: FolderCatalogRevision }
+  | { kind: "authoritative"; snapshot: FolderCatalogSnapshot; revision: FolderCatalogRevision }
+  | { kind: "damaged"; reason: string; revision: FolderCatalogRevision };
 
 export class FolderCatalogError extends Error {
   constructor(message: string) {
@@ -98,7 +87,7 @@ export class FolderCatalogStaleEditError extends Error {
   }
 }
 
-function digest(bytes: string): string {
+function digest(bytes: string | Uint8Array): string {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
@@ -311,40 +300,33 @@ export function resolveFolderPolicy(globalOptions: FolderOptions, folderOptions:
   };
 }
 
-export function buildFolderCatalogCandidate(
-  seeds: readonly FolderCandidateSeed[],
-  globalOptions: FolderOptions = {},
-  options: { skipUnavailable?: boolean; home?: string } = {},
-): FolderCatalogCandidate {
-  const skippedUnavailable: FolderCatalogCandidate["skippedUnavailable"] = [];
-  const folders: FolderCatalogEntry[] = [];
-  for (const seed of seeds) {
-    if (seed.policy.kind === "unavailable") {
-      if (!options.skipUnavailable) {
-        throw new FolderCatalogError(
-          `cannot preserve policy for ${JSON.stringify(seed.path)}: ${seed.policy.reason}; restore it or explicitly skip unavailable folders`,
-        );
-      }
-      skippedUnavailable.push({ name: seed.name, path: seed.path, reason: seed.policy.reason });
-      continue;
-    }
-    folders.push({
-      name: seed.name,
-      path: collapseFolderPath(expandFolderPath(seed.path, options.home), options.home),
-      ...(seed.policy.options === undefined ? {} : { options: seed.policy.options }),
-    });
-  }
-  const catalog: FolderCatalog = { schemaVersion: 1, globalOptions, folders };
-  const bytes = serializeFolderCatalog(catalog, options.home);
+/** Materialize the exact effective pre-catalog binding policy for generation. */
+export function snapshotPreCatalogPolicy(binding: WorkspaceConfig): FolderOptions {
   return {
-    catalog: parseFolderCatalog(bytes, options.home),
-    bytes,
-    generation: digest(bytes),
-    source: { configDigest: null, markerDigest: null },
-    origin: "generated",
-    skippedUnavailable,
+    syncGit: binding.syncGit === true,
+    git: { incremental: binding.git?.incremental === false ? false : true },
+    respectGitignore: binding.respectGitignore === true,
+    noDrift: binding.noDrift === true,
+    trash: trashConfig(binding),
   };
 }
 
-/** Internal bridge for the publication half; not re-exported by the facade. */
-export default { digest, object, closed, required };
+function snapshot(bytes: string): FolderCatalogSnapshot {
+  const catalog = parseFolderCatalog(bytes);
+  return {
+    catalog,
+    generation: digest(bytes),
+    folders: catalog.folders.map((folder) => ({
+      ...folder,
+      normalizedPath: expandFolderPath(folder.path),
+      policy: resolveFolderPolicy(catalog.globalOptions, folder.options),
+    })),
+  };
+}
+
+/** Internal bridge for state inspection and publication; not re-exported by the facade. */
+export default {
+  revision: (value: string): FolderCatalogRevision => value as FolderCatalogRevision,
+  revisionForBytes: (bytes: string | Uint8Array): FolderCatalogRevision => digest(bytes) as FolderCatalogRevision,
+  snapshot,
+};

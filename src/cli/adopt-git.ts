@@ -347,7 +347,7 @@ export async function runGitAdoption(
   persist: () => Promise<void>,
   deps: AdoptGitDeps = {},
 ): Promise<void> {
-  if (!journal.workspace.syncGit) {
+  if (!(journal.pinnedFolderPolicy?.syncGit ?? journal.workspace.syncGit)) {
     journal.gitRepos = journal.sourceRepos.map((source) => ({ path: source.path, source, branches: [], retainedRefs: [], state: "parked", reason: "git sync disabled" }));
     await persist();
     return;

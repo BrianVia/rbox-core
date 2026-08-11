@@ -118,6 +118,15 @@ export const MUTATION_GUARDS: readonly MutationGuard[] = [
     reason:
       "The direct analogue of phase-receipt-phase-match, one phase later: it survived all six 5C matrices and all fourteen behavioural state-plane suites, including its own owning cleanup.test.ts, so the cleanup cursor could be driven from a non-M6 witness with nothing noticing.",
   },
+  {
+    id: "daemon-folder-policy-runtime-fields",
+    file: "cli/daemon/daemon.ts",
+    anchor: "this.cfg = { ...this.cfg,",
+    removed: "this.cfg = {",
+    test: "cli/daemon/daemon-safety.test.ts",
+    reason:
+      "Daemon folder-policy reload must overlay the boot config instead of rebuilding it; without the spread, runtime-only E2EE keys and credential overrides disappear exactly as they did in the v0.9.2 production regression.",
+  },
 ];
 
 const REPO = path.resolve(import.meta.dir, "..");

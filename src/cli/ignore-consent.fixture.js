@@ -40,6 +40,12 @@ mock.module("./path-warnings.js", () => ({ savePathWarnings: async () => {} }));
 mock.module("./sync-cmd.js", () => ({ summarizeCaseCollisions: () => {} }));
 mock.module("./scope/binding-scope.js", () => ({ assertCommandAllowedOnScopedBinding: async () => {} }));
 mock.module("./sync/policy.js", () => ({ assertNoUnevaluatedPurgeDeletes: () => {} }));
+mock.module("./folder-authority.js", () => ({ ensureFolderAuthority: async () => ({ kind: "authoritative" }) }));
+mock.module("./folder-inventory.js", () => ({
+  observeFolderAdmission: async () => ({ kind: "admitted", generation: "fixture", policy: { respectGitignore: false } }),
+  runtimeRefusal: (admission) => new Error(`rbox cannot run this folder (${admission.kind}): ${admission.reason}`),
+}));
+mock.module("./folder-config.js", () => ({ setFolderOptions: async () => {} }));
 
 const { purgeIgnored } = await import("./ignore-cmd.js");
 const originalLog = console.log;

@@ -6,6 +6,15 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Breaking: `~/.rbox/config.json` is now the authority for which local folders
+  rbox may sync and for their safe sync options.** Existing local bindings are
+  preserved, but a machine that has bindings and no catalog must explicitly run
+  `rbox config regenerate`; rbox will not guess after a missing or damaged
+  catalog. Use `rbox config` to inspect the result, `rbox config add <path>` to
+  admit a detached binding, and `rbox config repair <path>` after a proven local
+  folder move.
+
 ## [1.11.4] - 2026-07-31
 
 ### Fixed
