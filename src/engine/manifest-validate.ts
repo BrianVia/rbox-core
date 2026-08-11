@@ -351,7 +351,11 @@ function refHasCompressionFields(ref: unknown): boolean {
   return r?.comp !== undefined || r?.payloadSha !== undefined;
 }
 
-/** Keep compression schema derivation aligned with capture-side stamping. */
+/** Does this manifest carry ANY compression descriptor (file entry or git
+ *  section)? The single source of truth shared by the commit-side schema
+ *  stamper (sync.ts) and the schema-4 gates in this file — stamping and
+ *  validation MUST agree on the field set or a client could stamp a manifest
+ *  its own validator then rejects. */
 export function manifestRequiresSchema4(m: Pick<Manifest, "files" | "gitRepos">): boolean {
   return m.files.some((f) => f.comp !== undefined) || Object.values(m.gitRepos ?? {}).some(gitSectionRequiresSchema4);
 }

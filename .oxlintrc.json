@@ -11,6 +11,12 @@
         "types": {
           "Record<string, unknown>": {
             "message": "Define the actual object shape, accept unknown at an unvalidated boundary, or use a specific key/value domain."
+          },
+          "Record<string, any>": {
+            "message": "Same ban as Record<string, unknown>, and `any` also disables checking at every use site."
+          },
+          "Record<PropertyKey, unknown>": {
+            "message": "Same ban as Record<string, unknown> under a wider key domain."
           }
         }
       }

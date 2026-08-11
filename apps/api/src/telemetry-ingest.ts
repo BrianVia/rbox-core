@@ -205,7 +205,7 @@ function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClient
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "bad_number" };
     const allowed = new Set(field.keys);
     if (!hasOnlyKeys(raw, allowed)) return { ok: false, reason: "unknown_field" };
-    for (const key of SERVER_SYNC_PHASE_NAMES) {
+    for (const key of field.keys) {
       const item = raw[key];
       if (item === undefined) recordNumbers.push(0);
       else if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
