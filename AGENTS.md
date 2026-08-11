@@ -40,6 +40,21 @@ warning signal, not the goal: never split a cohesive deep Module into shallow
 pass-through files merely to stay below a threshold.
 <!-- primitive-first-architecture:end -->
 
+## Simple primitives, less code (always)
+
+- The best code is code we don't have to write. Before building any mechanism,
+  look for the boring, battle-tested primitive that already solves it (flock,
+  git's own index, atomic rename, one plain JSON file) — and prefer deleting
+  mechanism over adding it.
+- Build every piece from primitives a future reader can grok in one sitting:
+  obvious data shapes, one clear owner, no clever indirection. If a design
+  needs a new special case every review round, the plane is wrong — step out a
+  layer and find the stronger primitive underneath.
+- Complexity compounds into a house of cards; simplicity compounds into
+  velocity. When two designs both work, ship the one with fewer concepts, even
+  when it is slightly less optimal or less general.
+
+
 ## Development flow (anything non-trivial)
 
 Brian's preferred loop — follow it unless told otherwise:
