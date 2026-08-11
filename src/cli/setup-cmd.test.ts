@@ -759,7 +759,10 @@ test("existing-workspace rebind confirmation supplies a narrowed witness to runI
       {
         loadCredentials: validSetupCredentials,
         promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
-        promptPath: async () => root,
+        promptPath: async (prompt) => {
+          expect(prompt.message).toBe("Which folder should rbox sync?");
+          return root;
+        },
         loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
         promptConfirm: async () => true,
         runInit: async (_flags, initOpts) => {

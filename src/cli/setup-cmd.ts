@@ -719,7 +719,7 @@ export async function stepWorkspace(
     workspace = picked.pick.workspaceId;
     name = picked.pick.name;
 
-    const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
+    const dir = await askPath({ message: "Which folder should rbox sync?", default: opts.cwd, cwd: opts.cwd });
     writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
     let resetConsent: ResetConsentWitness | undefined;
     let adoptConsent: AdoptConsentWitness | undefined;
