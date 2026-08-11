@@ -16,6 +16,7 @@
  */
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
+import { listFolderInventory } from "./folder-inventory.js";
 import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
@@ -60,6 +61,7 @@ export interface MachineTriage {
 
 export interface MachineTriageDeps {
   readBindingRegistry?: typeof readBindingRegistry;
+  listFolderInventory?: typeof listFolderInventory;
   observeDaemon?: typeof observeDaemon;
   now?: () => number;
 }
@@ -123,7 +125,10 @@ function unreachable(row: BindingRegistryRow, summary: string, command?: string)
 }
 
 export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
-  const rows = await (deps.readBindingRegistry ?? readBindingRegistry)().catch(() => []);
+  const inventory = await (deps.listFolderInventory ?? listFolderInventory)(undefined, {
+    ...(deps.readBindingRegistry === undefined ? {} : { readBindingRegistry: deps.readBindingRegistry }),
+  }).catch(() => ({ rows: [] }));
+  const rows = inventory.rows;
   const now = (deps.now ?? Date.now)();
   const observe = deps.observeDaemon ?? observeDaemon;
 
