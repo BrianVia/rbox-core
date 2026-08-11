@@ -115,7 +115,7 @@ test("--json on a command without JSON support keeps human error output", () => 
   const res = run(["push", "--json"]);
   expect(res.status).toBe(1);
   expect(res.stdout).toBe("");
-  expect(res.stderr).toContain("rbox: Not inside an rbox workspace");
+  expect(res.stderr).toContain("rbox: Not inside a synced folder");
   expect(res.stderr).not.toContain('{"error"');
 });
 
@@ -204,4 +204,27 @@ test("git deferrals root discovery failures never emit success JSON", () => {
   expect(result.status).toBe(1);
   expect(result.stdout).toBe("");
   expect(JSON.parse(result.stderr).error).toContain("Not inside an rbox workspace");
+});
+
+test("folder-first human copy preserves every legacy workspace JSON error", () => {
+  const cases: Array<{ args: string[]; error: string }> = [
+    {
+      args: ["status", "/private/tmp", "--all", "--json"],
+      error: "--all covers every locally known workspace, so it cannot be combined with a path. Use `rbox status --all` or `rbox status /private/tmp`.",
+    },
+    {
+      args: ["migrate", "--json"],
+      error: "Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox migrate <path>.",
+    },
+    {
+      args: ["doctor", "--report", "--json"],
+      error: "Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox doctor <path>.",
+    },
+  ];
+  for (const { args, error } of cases) {
+    const result = run(args);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({ error });
+  }
 });

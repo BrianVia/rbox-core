@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   workspaceFlags,
+  defaultSyncFolder,
   authorizePath,
   stepHeader,
   resolveEnrollment,
@@ -116,13 +117,13 @@ test("fresh setup against a legacy server surfaces the exact terminal error and 
 });
 
 test("setup step header numbers fresh and enrolled flows", () => {
-  expect([stepHeader(1, 3, "Account"), stepHeader(2, 3, "Workspace"), stepHeader(3, 3, "Start syncing")]).toEqual([
+  expect([stepHeader(1, 3, "Account"), stepHeader(2, 3, "Folder"), stepHeader(3, 3, "Start syncing")]).toEqual([
     "Step 1 of 3 · Account",
-    "Step 2 of 3 · Workspace",
+    "Step 2 of 3 · Folder",
     "Step 3 of 3 · Start syncing",
   ]);
-  expect([stepHeader(1, 2, "Workspace"), stepHeader(2, 2, "Start syncing")]).toEqual([
-    "Step 1 of 2 · Workspace",
+  expect([stepHeader(1, 2, "Folder"), stepHeader(2, 2, "Start syncing")]).toEqual([
+    "Step 1 of 2 · Folder",
     "Step 2 of 2 · Start syncing",
   ]);
 });
@@ -179,11 +180,16 @@ test("Step 2 → runInit flags: respectGitignore is forwarded only when true and
   expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
 });
 
-test("Step 2 workspace choices distinguish a local folder from an existing rbox workspace", () => {
+test("Step 2 choices lead with the recommended folder and keep both escape hatches", () => {
   expect(WORKSPACE_KIND_CHOICES).toEqual([
-    { name: "Create a new rbox workspace from a folder on this machine", value: "new" },
     {
-      name: "Sync a workspace already in your rbox account",
+      name: "Sync ~/rbox (recommended)",
+      value: "default",
+      description: "create it if needed, then sync everything inside",
+    },
+    { name: "Sync another folder on this machine", value: "new" },
+    {
+      name: "Sync a folder from another machine",
       value: "existing",
       description: "choose one you've synced before",
     },
@@ -226,11 +232,11 @@ test("post-setup select wiring: ordered choices map to pair once or exit", () =>
   ]);
 });
 
-test("non-interactive setup completion keeps the existing static handoff and does not prompt", async () => {
+test("non-interactive setup completion shows the real local folder and keeps the static handoff", async () => {
   const writes: string[] = [];
   let prompts = 0;
   let pairs = 0;
-  await finishSetup("workspace-a", {
+  await finishSetup(path.join(os.homedir(), "rbox"), {
     interactive: () => false,
     select: (async () => { prompts++; return "pair"; }) as never,
     createPairingToken: async () => { pairs++; },
@@ -238,6 +244,8 @@ test("non-interactive setup completion keeps the existing static handoff and doe
   });
   const output = writes.join("");
   expect(output).toContain("✓  rbox is set up.");
+  expect(output).toContain("folder: ~/rbox");
+  expect(output).toContain("This folder is end-to-end encrypted");
   expect(output).toContain("Bring another machine online:");
   expect(output).toContain("rbox pair      (here — prints the command; press c to copy)");
   expect(output).toContain("rbox connect … (there — paste the displayed command)");
@@ -248,7 +256,7 @@ test("non-interactive setup completion keeps the existing static handoff and doe
 test("interactive setup completion catches pair failures and always prints the fallback note", async () => {
   const writes: string[] = [];
   let pairs = 0;
-  await finishSetup("workspace-a", {
+  await finishSetup("/work/folder-a", {
     interactive: () => true,
     select: (async () => "pair") as never,
     createPairingToken: async () => { pairs++; throw new Error("too many active pairing tokens"); },
@@ -494,6 +502,114 @@ function baseCreateDeps(root: string, overrides: Partial<StepWorkspaceTestDeps> 
     ...overrides,
   };
 }
+
+test("recommended setup uses ~/rbox directly when it already exists", async () => {
+  const root = defaultSyncFolder("/virtual/home");
+  let pathPrompts = 0;
+  let selects = 0;
+  const result = await stepWorkspace(
+    { cwd: "/cwd", defaultRemote: "https://api.test" },
+    { header: "Folder" },
+    baseCreateDeps(root, {
+      defaultFolder: () => root,
+      promptPath: async () => { pathPrompts++; return "/unexpected"; },
+      promptSelect: async () => selects++ === 0 ? "default" : "false",
+    })
+  );
+  expect(result).toEqual({ kind: "completed", outcome: { workspaceId: "ws_created", deviceId: "dev", root } });
+  expect(pathPrompts).toBe(0);
+});
+
+test("recommended setup creates a missing ~/rbox without a redundant confirmation", async () => {
+  const root = "/virtual/home/rbox";
+  let confirms = 0;
+  const made: string[] = [];
+  let selects = 0;
+  const result = await stepWorkspace(
+    { cwd: "/cwd", defaultRemote: "https://api.test" },
+    { header: "Folder" },
+    baseCreateDeps(root, {
+      defaultFolder: () => root,
+      promptSelect: async () => selects++ === 0 ? "default" : "false",
+      stat: async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      mkdir: async (candidate) => { made.push(String(candidate)); return undefined; },
+      promptConfirm: async () => { confirms++; return true; },
+    })
+  );
+  expect(result.kind).toBe("completed");
+  expect(made).toEqual([root]);
+  expect(confirms).toBe(0);
+});
+
+test("an unusable recommended root falls back to the editable custom-folder prompt", async () => {
+  for (const failure of ["file", "mkdir"] as const) {
+    const recommended = `/virtual/${failure}/rbox`;
+    const custom = `/custom/${failure}`;
+    let pathPrompts = 0;
+    let selects = 0;
+    const writes: string[] = [];
+    const result = await stepWorkspace(
+      { cwd: "/cwd", defaultRemote: "https://api.test" },
+      { header: "Folder" },
+      baseCreateDeps(custom, {
+        defaultFolder: () => recommended,
+        promptSelect: async () => selects++ === 0 ? "default" : "false",
+        promptPath: async () => { pathPrompts++; return custom; },
+        stat: async (candidate) => {
+          if (candidate === custom) return directoryStat;
+          if (failure === "file") return { isDirectory: () => false } as never;
+          throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        },
+        mkdir: async () => { throw new Error("cannot create recommended root"); },
+        writeStderr: (text) => void writes.push(text),
+      })
+    );
+    expect(result.kind).toBe("completed");
+    expect(pathPrompts).toBe(1);
+    expect(writes.join("")).toContain(failure === "file" ? "exists but is not a directory" : "cannot create recommended root");
+  }
+});
+
+test("add-another exclusion rejects the current root before any remote effect", async () => {
+  const current = "/already/syncing";
+  const other = "/another/folder";
+  const answers = [current, other];
+  const createdFrom: string[] = [];
+  const writes: string[] = [];
+  const result = await stepWorkspace(
+    { cwd: current, defaultRemote: "https://api.test" },
+    { preselectedKind: "new", header: "Folder", excludedRoot: current, newFolderDefault: null },
+    baseCreateDeps(other, {
+      promptPath: async () => answers.shift()!,
+      realpath: (async (value: string) => value) as typeof fs.realpath,
+      createWorkspace: async () => { createdFrom.push(answers.length === 0 ? other : current); return "ws_created"; },
+      writeStderr: (text) => void writes.push(text),
+    })
+  );
+  expect(result.kind).toBe("completed");
+  expect(createdFrom).toEqual([other]);
+  expect(writes.join("")).toContain("That folder is already syncing. Choose another folder.");
+});
+
+test("add-another exclusion rejects a symlink alias of the current physical folder", async () => {
+  const current = "/physical/current";
+  const alias = "/alias/current";
+  const other = "/another/folder";
+  const answers = [alias, other];
+  const created: string[] = [];
+  let candidate = "";
+  const result = await stepWorkspace(
+    { cwd: current, defaultRemote: "https://api.test" },
+    { preselectedKind: "new", header: "Folder", excludedRoot: current, newFolderDefault: null },
+    baseCreateDeps(other, {
+      promptPath: async () => { candidate = answers.shift()!; return candidate; },
+      realpath: (async (value: string) => value === alias ? current : value) as typeof fs.realpath,
+      createWorkspace: async () => { created.push(candidate); return "ws_created"; },
+    })
+  );
+  expect(result.kind).toBe("completed");
+  expect(created).toEqual([other]);
+});
 
 async function writeBoundSetupRoot(root: string): Promise<void> {
   await saveConfig(root, {
@@ -956,7 +1072,7 @@ test("known-id post-mint failure is terminal, names resume id, creates once, and
     expect(releases).toBe(1);
     expect(process.exitCode).toBe(1);
     expect(writes.join("")).toContain("workspace ws_X was created but local setup didn't finish: disk full");
-    expect(writes.join("")).toContain("Sync an existing workspace");
+    expect(writes.join("")).toContain("Sync a folder from another machine");
   } finally {
     process.exitCode = previousExit;
   }

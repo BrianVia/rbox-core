@@ -2,7 +2,7 @@
  * `rbox setup` (design 29) — the single, guided front door, and what bare `rbox`
  * runs in a TTY. A thin presentation layer over already-verified primitives
  * (`runInit`, `login`/`redeemPair`, `startDaemon`), arranged into the founder's
- * three-step arc: Account → Workspace → Start syncing. It replaces `menu-cmd.ts`'s
+ * three-step arc: Account → Folder → Start syncing. It replaces `menu-cmd.ts`'s
  * `runMenu`; the menu's "just authorize this machine" option is dropped (served
  * directly by `rbox login`).
  *
@@ -24,7 +24,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { GITIGNORE_CHOICES, WORKSPACE_DEFINITION, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
+import { GITIGNORE_CHOICES, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
 import { mintWizardAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
 import { rootHasAdoptableContent } from "./adopt-inventory.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
@@ -59,6 +59,7 @@ import {
   mintSetupExistingConsent,
   type ResetConsentWitness,
 } from "./reset-consent.js";
+import { homeDir } from "./rbox-paths.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -112,7 +113,14 @@ export function setupCompletionActions(choice: SetupCompletionChoice): { createP
 /** Loop Step 2 only for explicit pre-init navigation; consume preselection once. */
 export async function runWorkspaceStepLoop(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string; credentialResult?: CredentialLoadResult },
+  setupOpts: {
+    noSync?: boolean;
+    preselectedKind?: WorkspaceKind;
+    header: string;
+    credentialResult?: CredentialLoadResult;
+    excludedRoot?: string;
+    newFolderDefault?: string | null;
+  },
   runStep: typeof stepWorkspace = stepWorkspace
 ): Promise<{ workspaceId: string; workspaceName?: string; deviceId: string; root: string } | undefined> {
   let preselectedKind = setupOpts.preselectedKind;
@@ -130,14 +138,20 @@ const HR = "─".repeat(72);
 // ── the guided flow ───────────────────────────────────────────────────────────
 
 export type WorkspaceKind = "new" | "existing";
+export type FolderSetupChoice = "default" | WorkspaceKind;
+
+export const defaultSyncFolder = (home = homeDir()): string => path.join(home, "rbox");
+
+const SYNCED_FOLDER_DEFINITION = "rbox keeps one folder in sync; it can contain one repository, many repositories, or ordinary files.";
 
 /** Name rbox and distinguish a local folder from something already in the account.
  *  The original generic "new workspace" / "existing workspace" labels left first-time
  *  users unsure whether they were choosing an rbox concept or a directory on disk. */
 export const WORKSPACE_KIND_CHOICES = [
-  { name: "Create a new rbox workspace from a folder on this machine", value: "new" },
-  { name: "Sync a workspace already in your rbox account", value: "existing", description: "choose one you've synced before" },
-] as const satisfies ReadonlyArray<{ name: string; value: WorkspaceKind; description?: string }>;
+  { name: "Sync ~/rbox (recommended)", value: "default", description: "create it if needed, then sync everything inside" },
+  { name: "Sync another folder on this machine", value: "new" },
+  { name: "Sync a folder from another machine", value: "existing", description: "choose one you've synced before" },
+] as const satisfies ReadonlyArray<{ name: string; value: FolderSetupChoice; description?: string }>;
 
 /** Steady-state step header. The subscribe-gated path intentionally still says
  *  "of 3": step 3 (start syncing) exists but is deferred until `rbox subscribe`
@@ -169,6 +183,11 @@ export async function runSetup(opts: {
   /** The untracked menu is only reachable after `resolveBareRboxTarget` verifies
    * enrollment, so this path skips the welcome banner and account step. */
   viaUntrackedMenu?: boolean;
+  /** Used by the tracked-folder front door so “another” cannot select the
+   * already-bound root and enter the rebind flow. */
+  excludedRoot?: string;
+  /** `null` deliberately omits a default; `undefined` preserves cwd. */
+  newFolderDefault?: string | null;
 }): Promise<void> {
   const flags = opts.flags ?? {};
   if (flags.key && flags.key !== "true" && flags.key !== "-") {
@@ -238,26 +257,28 @@ export async function runSetup(opts: {
     credentialsForStrictFlow(workspaceCredentialResult);
   }
 
-  // Step 2 · Workspace — bind a directory + run the initial populate-sync.
+  // Step 2 · Folder — bind a directory + run the initial populate-sync.
   const shortFlow = accountSkipped;
   const outcome = await runWorkspaceStepLoop(opts, {
     noSync: syncDisabledUntilSubscribe,
     preselectedKind: opts.preselectedWorkspaceKind,
-    header: shortFlow ? stepHeader(1, 2, "Workspace") : stepHeader(2, 3, "Workspace"),
+    header: shortFlow ? stepHeader(1, 2, "Folder") : stepHeader(2, 3, "Folder"),
     credentialResult: workspaceCredentialResult,
+    excludedRoot: opts.excludedRoot,
+    newFolderDefault: opts.newFolderDefault,
   });
   if (!outcome) return;
 
   if (syncDisabledUntilSubscribe) {
     process.stderr.write(`${e.yellow("!")}  Sync is disabled until you run \`rbox subscribe\` and choose a plan.\n`);
-    await finishSetup(outcome.workspaceName || path.basename(outcome.root));
+    await finishSetup(outcome.root);
     return;
   }
 
   // Step 3 · Start syncing in the background.
   process.stderr.write(`\n${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))}\n`);
   const startChoice = await promptSelect<StartSyncChoice>({
-    message: "Keep this workspace syncing in the background?",
+    message: "Keep this folder syncing in the background?",
     choices: START_SYNC_CHOICES,
   });
   const actions = startSyncActions(startChoice);
@@ -290,7 +311,7 @@ export async function runSetup(opts: {
   //   }
   // }
 
-  await finishSetup(outcome.workspaceName || path.basename(outcome.root));
+  await finishSetup(outcome.root);
 }
 
 /** The enrolled account id, or undefined when signed out / not enrolled. */
@@ -629,6 +650,7 @@ interface StepWorkspaceDeps {
   loadRawState?: typeof loadRawState;
   stat?: typeof fs.stat;
   mkdir?: typeof fs.mkdir;
+  realpath?: typeof fs.realpath;
   acquireMutex?: typeof acquireWorkspaceSyncMutex;
   releaseMutex?: typeof releaseWorkspaceSyncMutex;
   isDegraded?: typeof workspaceSyncMutexDegraded;
@@ -636,12 +658,20 @@ interface StepWorkspaceDeps {
   runInit?: typeof runInit;
   continueInit?: typeof continueInitWithPrecreatedWorkspace;
   writeStderr?: (text: string) => void;
+  defaultFolder?: () => string;
 }
 
-/** Step 2 · Workspace. Only explicit pre-init navigation returns `menu`. */
+/** Step 2 · Folder. Only explicit pre-init navigation returns `menu`. */
 export async function stepWorkspace(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string; credentialResult?: CredentialLoadResult },
+  setupOpts: {
+    noSync?: boolean;
+    preselectedKind?: WorkspaceKind;
+    header: string;
+    credentialResult?: CredentialLoadResult;
+    excludedRoot?: string;
+    newFolderDefault?: string | null;
+  },
   deps: StepWorkspaceDeps = {}
 ): Promise<StepWorkspaceResult> {
   const select = deps.promptSelect ?? promptSelect;
@@ -654,6 +684,7 @@ export async function stepWorkspace(
   const readRawState = deps.loadRawState ?? loadRawState;
   const stat = deps.stat ?? fs.stat;
   const mkdir = deps.mkdir ?? fs.mkdir;
+  const realpath = deps.realpath ?? fs.realpath;
   const acquireMutex = deps.acquireMutex ?? acquireWorkspaceSyncMutex;
   const releaseMutex = deps.releaseMutex ?? releaseWorkspaceSyncMutex;
   const isDegraded = deps.isDegraded ?? workspaceSyncMutexDegraded;
@@ -661,6 +692,7 @@ export async function stepWorkspace(
   const executeInit = deps.runInit ?? runInit;
   const continueInit = deps.continueInit ?? continueInitWithPrecreatedWorkspace;
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  const recommendedFolder = deps.defaultFolder ?? defaultSyncFolder;
 
   // One typed observation governs this workspace step; degradation must stop
   // before directory creation, mutex publication, or a remote mutation.
@@ -668,11 +700,11 @@ export async function stepWorkspace(
   const creds = credentialsForStrictFlow(loadedCredentials);
 
   writeStderr(`\n${e.bold(setupOpts.header)}\n`);
-  writeStderr(`${e.dim(WORKSPACE_DEFINITION)}\n`);
+  writeStderr(`${e.dim(SYNCED_FOLDER_DEFINITION)}\n`);
   const choice =
     setupOpts.preselectedKind ??
-    (await select<WorkspaceKind>({
-      message: "What do you want to track here?",
+    (await select<FolderSetupChoice>({
+      message: "Which folder do you want to sync?",
       choices: WORKSPACE_KIND_CHOICES,
     }));
 
@@ -703,13 +735,13 @@ export async function stepWorkspace(
         const label = bound
           ? (bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId)
           : oldStream;
-        writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+        writeStderr(`${e.yellow("⚠")}  This folder is already connected to ${e.cyan(label)}.\n`);
         const rebind = await confirm({
-          message: `Rebind it to workspace ${workspace}? (files on disk are untouched; sync history starts fresh)`,
+          message: `Connect it to ${workspace} instead? (files on disk are untouched; sync history starts fresh)`,
           default: false,
         });
         if (!rebind) {
-          writeStderr(`${e.dim("keeping the existing workspace; no local sync state was changed.")}\n`);
+          writeStderr(`${e.dim("keeping the existing connection; no local sync state was changed.")}\n`);
           return { kind: "menu" };
         }
         resetConsent = mintSetupExistingConsent({
@@ -746,27 +778,57 @@ export async function stepWorkspace(
 
   // Create-new is a local retry loop until a usable, acknowledged, fenced root is
   // ready. Once createWorkspace runs, every branch is single-shot.
+  let useRecommendedRoot = choice === "default";
   for (;;) {
-    const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
+    const customDefault = setupOpts.newFolderDefault === undefined ? opts.cwd : setupOpts.newFolderDefault;
+    const dir = useRecommendedRoot
+      ? recommendedFolder()
+      : await askPath({
+          message: "Which folder should rbox sync?",
+          ...(customDefault === null ? {} : { default: customDefault }),
+          cwd: opts.cwd,
+        });
     writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
 
     try {
       const info = await stat(dir);
       if (!info.isDirectory()) {
         writeStderr(`${e.yellow(`${dir} exists but is not a directory`)}\n`);
+        useRecommendedRoot = false;
         continue;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+        useRecommendedRoot = false;
         continue;
       }
-      const create = await confirm({ message: `${dir} doesn't exist — create it?`, default: false });
-      if (!create) continue;
+      if (!useRecommendedRoot) {
+        const create = await confirm({ message: `${dir} doesn't exist — create it?`, default: false });
+        if (!create) continue;
+      }
       try {
         await mkdir(dir, { recursive: true });
       } catch (mkdirError) {
         writeStderr(`${e.yellow(mkdirError instanceof Error ? mkdirError.message : String(mkdirError))}\n`);
+        useRecommendedRoot = false;
+        continue;
+      }
+    }
+    // The recommended root is a one-shot setup choice. Any later local retry
+    // returns to the editable custom-folder prompt, matching the existing loop.
+    useRecommendedRoot = false;
+
+    if (setupOpts.excludedRoot) {
+      try {
+        const sameSpelling = path.resolve(dir) === path.resolve(setupOpts.excludedRoot);
+        const samePhysicalFolder = sameSpelling || path.resolve(await realpath(dir)) === path.resolve(await realpath(setupOpts.excludedRoot));
+        if (samePhysicalFolder) {
+          writeStderr(`${e.yellow("That folder is already syncing. Choose another folder.")}\n`);
+          continue;
+        }
+      } catch (error) {
+        writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
         continue;
       }
     }
@@ -786,15 +848,15 @@ export async function stepWorkspace(
       const label = bound
         ? (bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId)
         : oldStream;
-      writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+      writeStderr(`${e.yellow("⚠")}  This folder is already connected to ${e.cyan(label)}.\n`);
       const remoteUrl = creds?.remoteUrl ?? opts.defaultRemote;
       const rebind = await confirm({
-        message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
+        message: "Start it as a brand-new synced folder anyway? (files on disk are untouched; sync history starts fresh)",
         default: false,
       });
       if (!rebind) {
         writeStderr(
-          `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Sync an existing workspace".`)}\n`
+          `${e.dim(`keeping the existing connection. To sync it in the background run \`rbox start\`; to connect this folder to one from another machine, re-run setup and choose "Sync a folder from another machine".`)}\n`
         );
         return { kind: "menu" };
       }
@@ -832,9 +894,9 @@ export async function stepWorkspace(
       // Opt-in, server-visible workspace name — offered ONLY when creating (the row
       // is INSERTed once, first-writer-wins). Setup drives init via non-interactive
       // flags, so it owns this prompt. "-" keeps the label private.
-      writeStderr(`${e.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
+      writeStderr(`${e.dim("a display name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
       const ans = interpretWorkspaceNameAnswer(
-        await input({ message: `Workspace name (Enter accepts, "-" for none)`, default: collapseHome(dir, os.homedir()) })
+        await input({ message: `Display name (Enter accepts, "-" for none)`, default: collapseHome(dir, homeDir()) })
       );
       if (ans) name = ans;
 
@@ -893,7 +955,7 @@ export async function stepWorkspace(
       } catch (error) {
         writeStderr(
           `${e.yellow(`workspace ${workspaceId} was created but local setup didn't finish: ${error instanceof Error ? error.message : String(error)}. ` +
-            `Re-run rbox setup and choose 'Sync an existing workspace' → ${workspaceId}.`)}\n`
+            `Re-run rbox setup and choose 'Sync a folder from another machine' → ${workspaceId}.`)}\n`
         );
         process.exitCode = 1;
         return { kind: "terminal" };
@@ -914,13 +976,13 @@ interface FinishSetupDeps {
 const PAIR_LATER_NOTE = "To pair more devices later, run `rbox pair` on an already-paired machine.";
 
 /** Print the successful summary and offer exactly one post-setup action. */
-export async function finishSetup(workspaceName: string, deps: FinishSetupDeps = {}): Promise<void> {
+export async function finishSetup(root: string, deps: FinishSetupDeps = {}): Promise<void> {
   const interactive = (deps.interactive ?? isInteractive)();
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   writeStderr(`\n${HR}\n`);
   writeStderr(`${e.green("✓")}  ${e.bold("rbox is set up.")}\n`);
-  writeStderr(`     workspace: ${e.cyan(workspaceName)}     device: ${os.hostname()}\n`);
-  writeStderr(`     ${e.dim("This workspace is end-to-end encrypted — the server never sees your files.")}\n`);
+  writeStderr(`     folder: ${e.cyan(collapseHome(root, homeDir()))}     device: ${os.hostname()}\n`);
+  writeStderr(`     ${e.dim("This folder is end-to-end encrypted — the server never sees your files.")}\n`);
   writeStderr(`     ${e.dim("Tune what syncs with `rbox ignore` or .rboxignore.")}\n`);
 
   if (!interactive) {

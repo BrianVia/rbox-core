@@ -8,6 +8,7 @@ import {
   runFrontDoor,
   runUntrackedMenu,
   UNTRACKED_MENU_CHOICES,
+  additionalFolderSetupPaths,
   type FrontDoorAction,
   type UntrackedMenuAction,
 } from "./front-door.js";
@@ -233,7 +234,7 @@ test("front-door choices pin the founder order and complementary sync gate", () 
   expect(frontDoorChoices(false)).toEqual([
     { name: "Sync now", value: "sync", description: "rbox sync" },
     { name: "Start background syncing", value: "start", description: "rbox start" },
-    { name: "Set up a new workspace", value: "setup", description: "rbox setup" },
+    { name: "Add another synced folder", value: "setup", description: "rbox setup" },
     { name: "Pair another device", value: "pair", description: "rbox pair" },
     { name: "View usage", value: "usage", description: "rbox usage" },
     { name: "View logs", value: "logs", description: "rbox logs" },
@@ -319,7 +320,7 @@ for (const action of ["new", "existing", "nothing"] as const satisfies ReadonlyA
         return action;
       },
     });
-    expect(writes.join("")).toContain("Signed in and enrolled (acct_ab12cd34). This directory isn't tracked yet.");
+    expect(writes.join("")).toContain("Signed in and enrolled (acct_ab12cd34). This folder isn't syncing yet.");
     expect(writes.join("").endsWith("\n\n")).toBe(true);
     expect(result).toBe(action === "nothing" ? undefined : action);
   });
@@ -335,7 +336,7 @@ test("untracked menu renders cached email and method instead of the account id",
     },
     promptSelect: async () => "nothing",
   });
-  expect(writes.join("")).toContain("Signed in as owner@example.com (github). This directory isn't tracked yet.");
+  expect(writes.join("")).toContain("Signed in as owner@example.com (github). This folder isn't syncing yet.");
   expect(writes.join("")).not.toContain("acct_hidden");
 });
 
@@ -351,5 +352,16 @@ test("untracked menu exits cleanly on prompt abort", async () => {
 });
 
 test("untracked menu abbreviates the home directory in the track description", () => {
-  expect(UNTRACKED_MENU_CHOICES(path.join(os.homedir(), "code", "scratch"))[0]!.description).toBe("create a new workspace from ~/code/scratch");
+  expect(UNTRACKED_MENU_CHOICES(path.join(os.homedir(), "code", "scratch"))[0]!.description).toBe("~/code/scratch");
+});
+
+test("add-another setup never suggests the current root", () => {
+  expect(additionalFolderSetupPaths("/work/current", "/home/me/rbox")).toEqual({
+    excludedRoot: "/work/current",
+    newFolderDefault: "/home/me/rbox",
+  });
+  expect(additionalFolderSetupPaths("/home/me/rbox", "/home/me/rbox")).toEqual({
+    excludedRoot: "/home/me/rbox",
+    newFolderDefault: null,
+  });
 });

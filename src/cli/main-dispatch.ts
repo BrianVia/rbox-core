@@ -68,8 +68,20 @@ function printHelp(cmd: string | undefined, positional: string[], fullReference 
 //   }
 // }
 
+const LEGACY_WORKSPACE_REQUIRED = "Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.";
+// CLI-process presentation mode: keep existing JSON error bytes while the
+// versioned JSON surface still promises the legacy workspace vocabulary.
+let preserveWorkspaceJsonErrors = false;
+
+function workspaceCopy(human: string, legacy: string): string {
+  return preserveWorkspaceJsonErrors ? legacy : human;
+}
+
 function workspaceRequiredError(): Error {
-  return new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
+  return new Error(workspaceCopy(
+    "Not inside a synced folder. Run `rbox setup` to get started, or `rbox track <path>` to sync a folder.",
+    LEGACY_WORKSPACE_REQUIRED,
+  ));
 }
 
 /** `start` used to open the guided front door when it could not resolve a workspace
@@ -100,7 +112,10 @@ async function findRoot(start: string): Promise<string | undefined> {
 
 async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run from the workspace, or pass --path <dir>.");
+  if (!root) throw new Error(workspaceCopy(
+    "Not inside a synced folder. Run from the folder, or pass --path <dir>.",
+    "Not inside an rbox workspace. Run from the workspace, or pass --path <dir>.",
+  ));
   return root;
 }
 
@@ -122,7 +137,10 @@ async function runMachineTriage(jsonMode: boolean, surface: "doctor" | "status" 
  * selects exactly one — cannot mean anything alongside it (CLI-surface memo §3). */
 function assertAllWithoutPath(cmd: string, all: boolean, pathArg: string | undefined): void {
   if (all && pathArg !== undefined) {
-    throw new Error(`--all covers every locally known workspace, so it cannot be combined with a path. Use \`rbox ${cmd} --all\` or \`rbox ${cmd} ${pathArg}\`.`);
+    throw new Error(workspaceCopy(
+      `--all covers every locally known synced folder, so it cannot be combined with a path. Use \`rbox ${cmd} --all\` or \`rbox ${cmd} ${pathArg}\`.`,
+      `--all covers every locally known workspace, so it cannot be combined with a path. Use \`rbox ${cmd} --all\` or \`rbox ${cmd} ${pathArg}\`.`,
+    ));
   }
 }
 
@@ -204,6 +222,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
   }
 
   const jsonMode = rawJsonMode && commandSupportsFlag(cmd, positional, "--json");
+  preserveWorkspaceJsonErrors = jsonMode;
   setJsonErrorMode(jsonMode);
   if (rawJsonMode && !jsonMode) flags.json = "false";
 
@@ -404,7 +423,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         // --verbose and --git are single-workspace detail views; silently
         // ignoring them would report the wrong thing with a success exit code.
         if (flags.verbose === "true" || flags.git === "true") {
-          throw new Error("--all is the aggregate view; --verbose and --git report one workspace. Use `rbox status --all [--json]`.");
+          throw new Error(workspaceCopy(
+            "--all is the aggregate view; --verbose and --git report one synced folder. Use `rbox status --all [--json]`.",
+            "--all is the aggregate view; --verbose and --git report one workspace. Use `rbox status --all [--json]`.",
+          ));
         }
         await runMachineTriage(jsonMode, "status");
         break;
@@ -431,7 +453,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       // workspace's records.
       const root = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
       if (!root) {
-        throw new Error("Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox migrate <path>.");
+        throw new Error(workspaceCopy(
+          "Not inside a synced folder. Run from the folder, or pass its path: rbox migrate <path>.",
+          "Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox migrate <path>.",
+        ));
       }
       const { migrateCmd } = await import("./state-plane-cmd.js");
       const code = await migrateCmd(root, { json: jsonMode });
@@ -468,7 +493,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         // Support-report and reset-journal work is workspace-scoped; only the
         // plain triage read has a meaningful machine-wide answer.
         if (report || diagnostics || resetJournal || doctorPath !== undefined || flags.quarantine === "true" || flags.restore !== undefined) {
-          throw new Error("Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox doctor <path>.");
+          throw new Error(workspaceCopy(
+            "Not inside a synced folder. Run from the folder, or pass its path: rbox doctor <path>.",
+            "Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox doctor <path>.",
+          ));
         }
         await runMachineTriage(jsonMode);
         break;

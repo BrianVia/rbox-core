@@ -95,7 +95,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "setup",
     group: "GETTING STARTED",
-    summary: "guided onboarding: account → workspace → start syncing",
+    summary: "guided onboarding: account → folder → start syncing",
     usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
     flags: [
       { flag: "--workspace <name|id>", short: "-w", desc: "with RBOX_KEY, sync an existing workspace non-interactively (alias: -w)", takesValue: true },
@@ -135,10 +135,10 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "status",
     group: "GETTING STARTED",
-    summary: "workspace + background-sync state",
+    summary: "synced-folder + background-sync state",
     usage: "rbox status [path] [--all] [--json | --verbose | --git]",
     flags: [
-      { flag: "--all", desc: "show every locally known workspace (cannot be combined with a path)" },
+      { flag: "--all", desc: "show every locally known synced folder (cannot be combined with a path)" },
       { flag: "--json", desc: "print JSON" },
       { flag: "--verbose", desc: "print the complete legacy status detail" },
       { flag: "--git", desc: "show per-repository Git deferral detail" },
@@ -196,7 +196,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "start",
     group: "SYNCING",
-    summary: "start background sync for this workspace",
+    summary: "start background sync for this folder",
     usage: "rbox start [path] [--pull-only | --read-write]",
     flags: [
       { flag: "--pull-only", desc: "watch remote changes without pushing local changes" },
@@ -333,7 +333,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "track",
     group: "SYNCING",
-    summary: "bind a directory to a workspace (create/join; no first sync)",
+    summary: "set up a folder for syncing (create/join; no first sync)",
     usage: "rbox track [path] [--workspace <id>] [--include <folder>] [--respect-gitignore] [--new-device]",
     flags: [
       { flag: "--workspace <id>", short: "-w", desc: "join an existing workspace instead of creating one (alias: -w)", takesValue: true },
@@ -647,7 +647,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "explain what is stuck and how to fix it, in plain English",
     usage: "rbox doctor [reset-journal] [path] [--all] [--json | --report | --residue-bytes | --quarantine | --restore <bundle>]",
     flags: [
-      { flag: "--all", desc: "check every locally known workspace (cannot be combined with a path)" },
+      { flag: "--all", desc: "check every locally known synced folder (cannot be combined with a path)" },
       { flag: "--json", desc: "print the findings as JSON (outside a workspace, the all-workspaces summary)" },
       { flag: "--report", desc: "build and print the support report locally" },
       { flag: "--residue-bytes", desc: "measure known Git quarantine and conflict directories" },
@@ -848,7 +848,7 @@ const ESSENTIAL_HELP_GROUPS: { heading: string; entries: [string, string][] }[] 
     heading: "GET STARTED",
     entries: [
       ["rbox", "set up rbox, or pick what to do in this folder"],
-      ["rbox status [PATH]", "show one workspace, or all when outside one"],
+      ["rbox status [PATH]", "show one synced folder, or all when outside one"],
     ],
   },
   {
@@ -891,7 +891,7 @@ export function renderEssentialHelp(): string {
     for (const [command, summary] of entries) lines.push(`  ${command.padEnd(w)}  ${style.dim(summary)}`);
   }
   lines.push("");
-  lines.push(style.dim("PATH names any folder inside a workspace; it selects that whole workspace."));
+  lines.push(style.dim("PATH names any location inside a synced folder; it selects that whole folder."));
   lines.push(style.dim("Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C)."));
   return lines.join("\n");
 }

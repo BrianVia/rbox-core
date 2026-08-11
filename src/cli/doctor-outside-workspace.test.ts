@@ -67,7 +67,7 @@ test("doctor outside a workspace summarizes every synced folder instead of error
   process.argv = [process.execPath, "rbox", "doctor"];
   await main();
   const printed = logs.join("\n");
-  expect(printed).toContain("1 workspace on this machine");
+  expect(printed).toContain("1 synced folder on this machine");
   expect(printed).toContain(root);
   expect(printed).toContain(`cd ${root} && rbox start`);
 });
@@ -77,9 +77,10 @@ test("status outside a workspace shows the all-workspaces view (#498, design 211
   process.argv = [process.execPath, "rbox", "status"];
   await main();
   const printed = logs.join("\n");
-  expect(printed).toContain("1 workspace on this machine");
+  expect(printed).toContain("1 synced folder on this machine");
   expect(printed).toContain(root);
-  expect(printed).toContain("WORKSPACE");
+  expect(printed).toContain("NAME");
+  expect(printed).toContain("FOLDER");
 });
 
 test("doctor --json outside a workspace emits the machine-scoped payload", async () => {
@@ -132,10 +133,10 @@ test("the workspace root is an optional positional and --path is an equivalent a
   // A positional that is not a workspace fails loudly instead of silently
   // falling back to the machine summary.
   process.argv = [process.execPath, "rbox", "doctor", outside];
-  await expect(main()).rejects.toThrow("Not inside an rbox workspace");
+  await expect(main()).rejects.toThrow("Not inside a synced folder");
 });
 
 test("a support report still requires a workspace", async () => {
   process.argv = [process.execPath, "rbox", "doctor", "--report"];
-  await expect(main()).rejects.toThrow("Not inside an rbox workspace");
+  await expect(main()).rejects.toThrow("Not inside a synced folder");
 });

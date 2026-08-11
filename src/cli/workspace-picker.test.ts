@@ -174,7 +174,7 @@ test("setup picker: empty account returns empty-account with message and no manu
   });
   expect(result).toEqual({ kind: "empty-account" });
   expect(prompts).toBe(0);
-  expect(writes.join("")).toContain("no workspaces on this account yet");
+  expect(writes.join("")).toContain("no synced folders on this account yet");
 });
 
 test("setup picker: fetch failure warns, retains entered id, and blank-blank goes back", async () => {
@@ -199,7 +199,7 @@ test("setup picker: fetch failure warns, retains entered id, and blank-blank goe
     "Workspace id to sync (find it with `rbox list` on an enrolled machine)",
     "Enter a workspace id, or leave blank again to go back",
   ]);
-  expect(entered.writes.join("")).toContain("can't list workspaces right now");
+  expect(entered.writes.join("")).toContain("can't list synced folders right now");
   expect((await run(["", ""])).result).toEqual({ kind: "back" });
 });
 

@@ -1,7 +1,7 @@
 export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
   "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.";
 export const WORKSPACE_SYNC_NEXT_STEP =
-  'Run `rbox setup` and choose "Sync an existing workspace" to get your existing folder syncing here.';
+  'Run `rbox setup` and choose "Sync a folder from another machine" to get your existing folder syncing here.';
 const DEVICE_CODE_NOTE_HEADER = "note: device-code login authorized this machine, but encryption is not enrolled.";
 const DEVICE_CODE_ENROLL_STEP = "Run `rbox pair` on an enrolled machine or `rbox key recover`.";
 /** Wizard mode omits the workspace step (the wizard itself chains there — design
