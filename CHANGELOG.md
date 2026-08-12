@@ -6,7 +6,15 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0-beta.1] - 2026-08-11
+
 ### Changed
+- **Setup is folder-first (design 230):** the guided flow speaks "synced
+  folder" and offers three plain choices (sync `~/rbox`, sync another folder
+  here, sync a folder from another machine); workspace vocabulary remains in
+  internal records, flags, and JSON unchanged.
+- The 2.0 runtime line (U3 primitives, #623) ships from `main`; no wire or
+  storage format changed relative to v1.11.4.
 - **Breaking: `~/.rbox/config.json` is now the authority for which local folders
   rbox may sync and for their safe sync options.** Existing local bindings are
   preserved, but a machine that has bindings and no catalog must explicitly run

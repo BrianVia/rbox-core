@@ -1216,4 +1216,26 @@ Enforced: `src/cli/sync-git/base-composer.ts`; `src/cli/sync-state.ts`
 Proven: `src/cli/sync-git/base-composer.test.ts`; `src/cli/sync-state.test.ts`
 Since: 200
 
+### The folder catalog is the sole user authority for membership and safe options
+
+`~/.rbox/config.json` states are exactly absent | authoritative | damaged; a
+valid file is authoritative as-is, damage fails closed with the parse error,
+and absence with discoverable bindings refuses toward explicit
+`rbox config regenerate` — never silent generation over user data.
+
+Enforced: `src/cli/folder-catalog-publish.ts`; `src/cli/folder-authority.ts`
+Proven: `src/cli/folder-config.test.ts`; `src/cli/folder-authority.test.ts`
+Since: 231
+
+### One pinned admission per operation
+
+Every foreground sync operation and daemon cycle pins exactly one validated
+folder admission after acquiring the workspace mutex; policy never flips
+mid-operation, and a removed or damaged catalog stops work at the next
+boundary, never mid-apply.
+
+Enforced: `src/cli/local-runtime.ts`; `src/cli/daemon/daemon.ts`
+Proven: `src/cli/local-runtime.test.ts`; `src/cli/daemon/daemon-folder-policy.test.ts`
+Since: 231
+
 <!-- Audit completed read-only in 3m 20s; no files were written. -->

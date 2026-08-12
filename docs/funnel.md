@@ -1,6 +1,7 @@
 # Funnel — stranger → paying customer syncing across two devices
 
-Walkthrough of the acquisition funnel as **shipped** (v0.8.0, 2026-07-06), with
+Walkthrough of the acquisition funnel as shipped at **v0.8.0, 2026-07-06** (the CLI
+is now 2.0.0-beta.1 — re-verify before trusting any finding below), with
 friction findings. Verified against the live site (rbox.to), apps/web, and the
 CLI — not against docs or intentions. Update this file when a funnel step
 changes.
@@ -18,10 +19,11 @@ Visitor lands on rbox.to, reads, hits `#pricing`. The plan CTAs link to
 Signed-out root is a Clerk auth card (`apps/web/src/routes/+page.svelte`);
 email or OAuth. The layout owns the signed-in redirect → `/dashboard`.
 
-> ⚠️ **The `?plan=` deep link is dead.** Nothing in apps/web reads a `plan`
-> query param — Clerk sign-up plus the layout redirect drop it. A buyer who
-> clicked "Go Pro" lands on the generic dashboard and must rediscover the
-> upgrade cards themselves. See finding F1.
+> ✅ **FIXED (PR #87) — this finding is stale.** `apps/web/src/routes/+page.svelte`
+> now stashes the `plan`/`cadence` query params via `stashPlanIntent`
+> (`apps/web/src/lib/plan-intent.ts`, sessionStorage-backed) and strips them from
+> the URL, so a buyer who clicked "Go Pro" keeps their checkout intent through
+> the Clerk flow. Original finding F1 kept below for the record.
 
 ### 3. Pay (dashboard)
 
@@ -88,10 +90,10 @@ token on device 2), one Stripe checkout. That's genuinely competitive.
 
 | # | Severity | Finding |
 |---|---|---|
-| F1 | **High** | `app.rbox.to/?plan=solo\|pro` deep links from pricing CTAs are ignored by the app. A buyer with checkout intent gets a generic dashboard. Fix: stash `plan` through the Clerk flow (localStorage or Clerk redirect param) and auto-fire `startCheckout(plan)` on first authed load. |
+| F1 | ~~**High**~~ **FIXED (PR #87, `apps/web/src/lib/plan-intent.ts`)** | `app.rbox.to/?plan=solo\|pro` deep links from pricing CTAs are ignored by the app. A buyer with checkout intent gets a generic dashboard. Fix: stash `plan` through the Clerk flow (localStorage or Clerk redirect param) and auto-fire `startCheckout(plan)` on first authed load. |
 | F2 | Medium | No funnel ordering guidance. Marketing "Get started" → `#install` (CLI-first) while plan CTAs → app (account-first). Both work, but nothing tells the user "install first, pay whenever." A 4-line quickstart on the pricing section or /docs would remove the hesitation. |
 | F3 | Medium | The recovery-phrase moment is a one-time display with no dashboard recovery-status indicator. If the user loses it before enrolling device 2 and loses device 1, the account's data is gone (by design — but the funnel never warns them at the point where a second device would save them). Cheap fix: post-genesis nudge "enroll a second device or store this phrase — either one saves you." |
-| F4 | Low | Discovering `rbox pair` requires having read setup's copy. The dashboard **Devices** page could show "Add a device" with the two-command recipe, mirroring the CLI. |
+| F4 | Low (**needs re-check** — the Devices page now exists, `apps/web/src/routes/devices/+page.svelte`) | Discovering `rbox pair` requires having read setup's copy. The dashboard **Devices** page could show "Add a device" with the two-command recipe, mirroring the CLI. |
 | F5 | Low | CLI 402/quota errors (design 62) report usage and caps but the upgrade pointer to app.rbox.to/dashboard only appears in `rbox usage`. Consider appending the URL to the 402 message itself. |
 
 ## Marketing-site audit (rbox.to, live, 2026-07-06)

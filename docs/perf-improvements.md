@@ -489,7 +489,10 @@ clone for one line, env-tunable toward 128. §27 stays designed-but-unbuilt.
 - **§23** upload-receipts — SHIPPED, 5–6× push (the one real hot-path D1 win).
 - **§25** observability — SHIPPED (enabled every measurement here).
 - **§24** blobRef sidecar — SHIPPED, commit body O(1) (correctness/scaling, neutral latency).
-- **§26** batch-upload — NOT BUILT; upload-concurrency 32→64 (~25%) was the better lever.
+- **§26** batch-upload — was NOT BUILT at the time of this scorecard; **later re-measured and
+  SHIPPED under design 112** (`POST /v1/blob-batch/put|get`, `apps/api/src/routes/blob-batch.ts`,
+  client `src/cli/remote/blob-batch/`). Upload-concurrency 32→64 (~25%) was the better lever *then*;
+  the default is now 512 under batch mode (`src/cli/publish-pipeline/shared.ts`).
 - **§27** download-caps — DEFERRED; download-concurrency 32→64 (~14%) was the better lever.
 - **§22** umbrella.
 The recurring lesson, four times over: **measure, and the simple lever usually beats the complex

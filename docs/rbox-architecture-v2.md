@@ -2,6 +2,17 @@
 
 > **Status:** corrected design, supersedes `rbox-architecture.md` (the "CodeSync" draft).
 > This version reflects decisions made after an adversarial review. See the **Decision Log** below.
+>
+> **PARTLY SUPERSEDED (2026-08-11).** The frame below is still right — daemon +
+> watcher, a DO commit sequencer, manifest-as-blob, content-addressed R2,
+> conflict copies plus version history, device-code onboarding, account-scoped
+> quota. Three of its decisions were later reversed in the shipped system and
+> are marked **REVERSED** in the Decision Log: **D3** (presigned direct-to-R2),
+> **D5** (two encryption tiers), and the `rbox.yml` half of **D11**. It also
+> predates the local `~/.rbox/config.json` folder authority (design 231), which
+> is now the sole authority for which folders a machine syncs and their
+> options. For module-level truth read `docs/CODEMAP.md`; for user-facing file
+> semantics read `docs/usage.md`.
 
 rbox is a developer-aware, continuously-syncing "Dropbox for devs." It keeps your *working directory* mirrored across machines — including uncommitted git state — while treating dependencies, build output, and machine-local junk as regenerable local state rather than bytes to ship.
 
@@ -15,15 +26,15 @@ The name nods to rsync/rclone, but the architecture is **Dropbox-model** (centra
 |---|----------|-----------|
 | D1 | **Continuous daemon + file watcher is the product**, not manual `push`/`pull`. | The desired UX is "edit on A, it's already on B." That requires a long-running agent, not imperative commands. |
 | D2 | **Durable Object per workspace is core** (the commit sequencer), not an optional Phase 4 add-on. | Continuous sync needs a single point that serializes commits, assigns sequence, and detects conflicts. |
-| D3 | **Blobs upload directly to R2 via presigned URLs**; the Worker is never in the byte path. | A Worker can't `arrayBuffer()` a 500MB (or even 50MB-at-concurrency) file — 128MB memory ceiling. |
+| D3 | ~~**Blobs upload directly to R2 via presigned URLs**; the Worker is never in the byte path.~~ **REVERSED — never shipped.** Bytes stream *through* the Worker: `PUT /v1/blobs/:sha` (`apps/api/src/routes/blobs.ts`), which R2 verifies against the sha on write, plus Worker-mediated multipart over the 90 MiB `SINGLE_PUT_MAX`. There is no presigning anywhere in `apps/api`. The OOM concern was answered by *streaming* rather than by presigning. | A Worker can't `arrayBuffer()` a 500MB (or even 50MB-at-concurrency) file — 128MB memory ceiling. |
 | D4 | **Manifests are stored as content-addressed blobs in R2**, with a thin pointer row in D1. | Storing full file lists as D1 rows per commit explodes row count and blows batch limits. |
-| D5 | **Encryption: server-side at-rest by default, opt-in E2EE per workspace, `.env`/secrets forced to E2EE when synced.** | At-rest is free (R2 default). E2EE is the meaningful control but taxes onboarding + dedup, so it's opt-in. |
+| D5 | ~~**Encryption: server-side at-rest by default, opt-in E2EE per workspace, `.env`/secrets forced to E2EE when synced.**~~ **REVERSED — full E2EE is the only mode** (design 12). There are no tiers, no server-readable path, and no per-workspace choice; a binding without `schema: "e2ee/v1"` fails closed (`src/cli/workspace-config.ts`). Keys are an account master key with per-device asymmetric wraps, signed rosters and epochs (`src/engine/e2ee/`), not a per-workspace passphrase KEK. Everything below tagged "Tier 0" / "Tier 1" is dead. | At-rest is free (R2 default). E2EE is the meaningful control but taxes onboarding + dedup, so it's opt-in. |
 | D6 | **`.git` is mirrored as an atomic, all-or-nothing snapshot** taken when git is quiescent; never synced file-by-file. | File-by-file `.git` sync is a classic repo-corruption generator. |
 | D7 | **Conflicts → conflict copies + free version history.** Never lose data; retain last N versions via old blobs. | Content-addressing makes version history nearly free; conflict copies are the safe default for passive sync. |
 | D8 | **Headless onboarding via device authorization flow** (OAuth device code). | "Fire up a Docker container and sign in easily" = `gh auth login`-style code approval. |
 | D9 | **Single R2 bucket, tenant isolation enforced in D1/Worker authz**, not bucket-per-user. | R2 caps buckets in the low thousands; per-user buckets break dedup, ops, and don't improve the security boundary. |
 | D10 | **GC computes reachability from live manifests**; no per-commit ref-count increment. | v1's `blob_refs.ref_count` only ever incremented — it leaked forever and GC could never run. |
-| D11 | Global rename `codesync`/`.codesync` → `rbox`/`.rbox`; project config file is **`rbox.yml`**. | — |
+| D11 | Global rename `codesync`/`.codesync` → `rbox`/`.rbox` (**shipped**); ~~project config file is **`rbox.yml`**~~ (**REVERSED — never built**; `rbox.yml` appears nowhere in the codebase. Ignore rules come from the builtin list, `.gitignore` behind `respectGitignore`, and `.rboxignore`; user options live in `~/.rbox/config.json` per design 231). | — |
 
 ---
 
@@ -58,8 +69,8 @@ The wedge isn't sync. It's *knowing what not to sync, and how to rebuild the res
 ```
 
 - **Daemon** — long-running on each machine. Watches the workspace, debounces, diffs against last-synced manifest, uploads new blobs, commits manifests, and holds a WebSocket to the DO for live change events.
-- **Worker** — thin HTTP API: auth, validation, authz, presigned-URL minting, manifest pointer writes, enqueue jobs. Never handles blob bytes.
-- **WorkspaceSync DO** — single-threaded per workspace: assigns monotonic sequence, enforces the parent-manifest conflict check, broadcasts commits to connected daemons.
+- **Worker** — thin HTTP API: auth, validation, authz, manifest pointer writes, enqueue jobs. **Correction (2026-08-11):** it *does* handle blob bytes — it streams them to R2 (see D3). No presigned-URL minting exists.
+- **WorkspaceSync DO** — single-threaded per **(workspace, project)** pair, not per workspace (`apps/api/src/routes/sync.ts`): assigns monotonic sequence, enforces the parent-manifest conflict check, broadcasts commits to connected daemons.
 - **D1** — control plane (accounts, devices, manifest pointers, blob index, quota, audit).
 - **R2** — content-addressed blob bytes **and** serialized manifest snapshots.
 - **Queues** — async: lazy hash verification, GC, quota recompute, notifications.
@@ -73,7 +84,9 @@ One bucket. Isolation is logical, enforced on every access in the control plane.
 ```
 blobs/sha256/<ab>/<full-sha256>          # content (cipher or plain bytes)
 manifests/sha256/<ab>/<full-sha256>      # serialized manifest snapshots (also content-addressed)
-tmp/uploads/{accountId}/{uploadId}       # presigned upload landing zone, swept by GC
+tmp/uploads/{accountId}/{uploadId}       # NEVER BUILT — see D3; the real staging prefix is
+                                         # staging/<sha>/<uuid>, reclaimed by apps/api/src/staging-gc.ts
+packs/v1/<packId>                        # server-side small-blob packs (design 114), missing above
 ```
 
 Rules:
@@ -84,6 +97,14 @@ Rules:
 ---
 
 ## Encryption Model (D5)
+
+> **REVERSED (2026-08-11).** Full E2EE is the only mode (design 12). The Tier 0 /
+> Tier 1 split below never shipped: there is no server-readable tier, no
+> per-workspace opt-in, no Argon2 passphrase KEK, and no queue consumer that
+> re-hashes plaintext (the server never sees plaintext). Real model: an account
+> master key with per-device asymmetric wraps, signed rosters, key epochs
+> (`src/engine/e2ee/`), and a BIP39 recovery phrase. The `.env`/secrets
+> default-exclude list below is still accurate.
 
 Two tiers. Pick per workspace.
 
@@ -109,6 +130,16 @@ Client encrypts blob bytes **before** upload; the server only ever sees cipherte
 ---
 
 ## Blob Upload Protocol (D3 — the corrected flow)
+
+> **REVERSED (2026-08-11).** No presigning shipped. Real flow: `POST /v1/blobs/check`
+> (entitlement-scoped to the caller's account via `blob_refs`, not a global blob
+> lookup), then `PUT /v1/blobs/:sha` streamed through the Worker with R2
+> verifying the sha on write; over `SINGLE_PUT_MAX` (90 MiB, not ~100MB) it is
+> Worker-mediated multipart (`POST /v1/blobs/:sha/multipart`, `PUT …/part/:n`,
+> `POST …/complete`). Staging is `staging/<sha>/<uuid>` reclaimed by a dedicated
+> reclaimer, not `tmp/uploads/`. Small blobs are additionally batched
+> (`/v1/blob-batch/put|get`, design 112) and packed server-side (`packs/v1/`,
+> design 114). The resumable-session-token bullet is still accurate.
 
 The Worker mints URLs and verifies metadata; **bytes go straight to R2.**
 
@@ -171,7 +202,7 @@ CREATE TABLE manifests (
 
 - `manifest_files` (the per-file row table from v1) is **removed**. File lists live in the snapshot blob.
 - **Missing-blob check** is one batched query, not N round-trips: client sends the blob hash set; server runs `SELECT sha256 FROM blobs WHERE sha256 IN (?, ?, …)` in chunks of ~100. Client uploads the difference.
-- **Diffing** is client-side: each daemon caches its last-synced manifest locally (`.rbox/state/<project>.manifest.json`) and diffs the new scan against it to compute changed/added/deleted paths.
+- **Diffing** is client-side: each daemon caches its last-synced manifest locally (**stale (2026-08-11):** not a per-project JSON file — local sync state is the SQLite state plane, `.rbox/state/state.db` plus the `.rbox/state.json` authority marker, `src/cli/state-plane/`) and diffs the new scan against it to compute changed/added/deleted paths.
 
 ---
 
@@ -196,8 +227,8 @@ rbox link ~/code --workspace ws_abc123     # same workspace, different local roo
 
 ```
 loop:
-  1. watch filesystem (chokidar/native), debounce ~500ms of quiet
-  2. scan changed subtree → apply ignore rules (built-in + .gitignore + .rboxignore + rbox.yml)
+  1. watch filesystem (**`@parcel/watcher`**, not chokidar — native prune plus an authoritative JS matcher), debounce ~500ms of quiet
+  2. scan changed subtree → apply ignore rules (built-in + .gitignore behind `respectGitignore` + .rboxignore; **no rbox.yml — see D11**)
   3. for the project(s) touched: build candidate manifest (hash changed files only;
      reuse cached hashes where mtime+size unchanged)
   4. diff candidate vs last-synced manifest → {addedOrChanged blobs, deleted paths}
@@ -224,6 +255,14 @@ on DO broadcast {manifestId, sequence}:
 ---
 
 ## `.git` Atomic Mirroring (D6)
+
+> **SUPERSEDED (2026-08-11).** Git state does not sync as a hashed snapshot of
+> `.git` files swapped in from a temp directory. It syncs as `git bundle` /
+> incremental pack chains per repository (`src/engine/git/pins.ts`,
+> `src/cli/sync-git/`), applied through a fetch/transition pipeline with
+> deferrals, divergence handling and quarantine. There is no
+> `snapshotConsistent` field. The *goal* below — never ship a torn `.git` — is
+> what the bundle mechanism delivers.
 
 `.git` is mirrored so machine B is a true clone (branch, HEAD, uncommitted, stashes) — but it is **never synced file-by-file**.
 
@@ -258,7 +297,7 @@ Docker container (headless)            Worker                 User's browser
   │ ◄─ {device_code, user_code,         │                          │
   │     verification_uri, interval} ────│                          │
   │                                     │                          │
-  │  print:  "Go to rbox.dev/activate   │                          │
+  │  print:  "Go to rbox.to/activate    │                          │
   │           and enter  WXYZ-1234"      │ ───── user visits ──────►│
   │                                     │ ◄──── approves WXYZ-1234 ─│
   │ POST /v1/device/token (poll) ──────►│  pending… pending… ok     │
@@ -309,6 +348,13 @@ export default {
 
 ## Garbage Collection & Quota (D10 — fix the leak)
 
+> **PARTLY SUPERSEDED (2026-08-11).** Reachability-based GC shipped, but there is
+> no `.trash/` R2 soft-delete tier: server GC is mark → `deleting_at` intent
+> under a lease → direct R2 + D1 deletion (`apps/api/src/gc-*.ts`). The trash
+> tier that exists is local-only (`rbox trash`, design 50). There is also no
+> free plan — rbox is paid-only (design 86); real limits are in
+> `apps/api/src/plans.ts`.
+
 v1 only ever *incremented* `blob_refs.ref_count`, so it grew forever and nothing could be collected. v2 drops per-commit ref counting in favor of **reachability**:
 
 - A blob is **live** if it's referenced by any current head manifest OR any retained history/version entry, for that account.
@@ -323,14 +369,19 @@ v1 only ever *incremented* `blob_refs.ref_count`, so it grew forever and nothing
 2. **Never trust client paths.** Reject absolute paths, `..`, null bytes; normalize to POSIX relative. (kept)
 3. **R2 keys are content hashes, never user paths.** (kept)
 4. **Secrets excluded by default; opt-in sync is E2EE-only.** (D5)
-5. **Hard limits early:** free → 50MB/blob, 2GB/workspace, 100k files/manifest; pro → 500MB/blob. Manifest commits chunk D1 writes; never one mega-batch. (refined)
+5. **Hard limits early:** ~~free → 50MB/blob, 2GB/workspace, 100k files/manifest; pro → 500MB/blob~~ — **stale (2026-08-11): there is no free plan** (paid-only, design 86). Real limits are in `apps/api/src/plans.ts`: `none` (locked), Solo 50 GiB / 10 devices / 30d, Pro 250 GiB / 25 devices / 365d, Team 150 GiB / 100 devices / 90d. The per-manifest bound is a byte cap (`manifestBytes`), not a file count, and blob size is bounded by the 90 MiB single-PUT/multipart split rather than a plan tier. Manifest commits chunk D1 writes; never one mega-batch. (refined)
 6. **Audit log:** workspace/device/manifest/member/blob lifecycle events. (kept)
-7. **Synced `rbox.yml` runs no arbitrary shell by default.** `hydrate.commands` from a *synced* config are treated as untrusted: shown, never auto-run under a blanket `--yes` (esp. in CI). Detected commands (npm ci, etc.) are the trusted path. (new — matters once workspaces are shared)
+7. **MOOT (2026-08-11) — `rbox.yml` and the whole hydrate/deps surface were never built (design 51).** ~~Synced `rbox.yml` runs no arbitrary shell by default.~~ `hydrate.commands` from a *synced* config are treated as untrusted: shown, never auto-run under a blanket `--yes` (esp. in CI). Detected commands (npm ci, etc.) are the trusted path. (new — matters once workspaces are shared)
 8. **Auth the WebSocket upgrade** on the DO. (new)
 
 ---
 
 ## Build Plan (re-ordered around the real product)
+
+> **DONE (2026-08-11).** All five phases shipped; the product is at 2.0.0-beta.1.
+> E2EE was not a Phase 5 add-on — it is mandatory and shipped earlier. The
+> files-sdk buy-vs-build question is closed: the blob layer is hand-rolled
+> (`apps/api/src/blobs.ts`, `blob-pack.ts`).
 
 **Phase 1 — Sync engine, locally testable.**
 Build the manifest/diff/blob/atomic-apply engine so it can sync **two local paths** (or loopback) on one machine. No cloud yet — fast feedback loop on the genuinely hard part (diff, conflict copies, atomic writes, `.git` snapshotting). This is *not* a shipped local product; it's the testable core.
@@ -351,6 +402,14 @@ Tier-1 workspaces, `.env` opt-in, `rbox versions/restore`, workspace invites, ro
 ---
 
 ## CLI Surface (rbox)
+
+> **SUPERSEDED (2026-08-11).** `rbox link` and `rbox daemon …` are hidden
+> deprecated aliases that forward to `rbox track` and `rbox start|stop|logs`
+> (`src/cli/help-registry.ts:744-771`). `rbox hydrate` and `rbox detect` do not
+> exist — the whole deps group is commented out (design 51). The real command
+> set is `src/cli/main-dispatch.ts`; add at least `rbox config`, `rbox setup`,
+> `rbox adopt`, `rbox pair`/`connect`/`recover`, `rbox versions`/`restore`,
+> `rbox trash`, `rbox key`, `rbox git`, `rbox export`, `rbox usage`.
 
 ```bash
 rbox login                 # device-code flow

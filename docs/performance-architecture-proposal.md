@@ -1,7 +1,20 @@
 # rbox performance architecture proposal
 
-**Status:** Proposal  
+**Status:** Proposal — **partly shipped; re-scored 2026-08-11.**  
 **Date:** 2026-07-01  
+
+> **Status of each proposal as of 2026-08-11** (verified against code):
+> **SHIPPED** — C1 deep blob pipeline (`src/cli/publish-pipeline/`),
+> C5 small-blob packfiles (server-side, `apps/api/src/blob-pack.ts`,
+> `packs/v1/`, design 114), C6 local SQLite client state
+> (`src/cli/state-plane/`), Phase 0 client phase metrics
+> (`src/cli/remote/timings.ts` and siblings).
+> **STILL OPEN** — C2 parallel multipart (`src/cli/remote/multipart.ts` is still
+> a sequential `for` loop; design 101 never shipped), S1/C3 account backpressure
+> + adaptive pool (no 429/`Retry-After` handling client-side), S2/D5 D1 sharding
+> (`apps/api/src/db.ts` still returns one binding), C4 chunk sync, C7 pull
+> apply, C8 chain checkpoints, S3-S6.
+> **OVERTURNED** — the "do not build batch upload" non-goal; see that section.  
 **Goal:** Dropbox-class perceived performance, or better where rbox's end-to-end
 encryption and Cloudflare R2 architecture make that possible.
 
@@ -88,20 +101,31 @@ client disk IO, request fanout, and filesystem application.
 - [`apps/api/src/metrics.ts`](../apps/api/src/metrics.ts): privacy-safe server
   timing and D1/R2/DO span measurement.
 - [`apps/api/wrangler.jsonc`](../apps/api/wrangler.jsonc): current bindings:
-  one D1, R2 buckets, WorkspaceSync DO, Analytics Engine, queues, email. No
-  rate-limit bindings and no Smart Placement configuration today.
+  one D1, R2 buckets, WorkspaceSync DO, Analytics Engine, queues, email, and
+  **ten `ratelimits` bindings** (`RL_DEVICE_START` … `RL_KEY_DELIVERY_ACK`,
+  namespace ids 2001-2010 — registered in `AGENTS.md`). **Correction
+  (2026-08-11):** an earlier version of this line claimed there were no
+  rate-limit bindings, which undercut S1's premise that no limiter
+  infrastructure exists. No Smart Placement configuration today.
 
 ### Client-side modules
 
 - [`src/cli/sync.ts`](../src/cli/sync.ts): push/pull orchestration, encrypt
-  pool, upload pool, missingBlobs preflight, full pull scan.
+  pool, upload pool, missingBlobs preflight, full pull scan. **Moved since
+  (2026-08-11):** the fused encrypt→upload pipeline is now
+  `src/cli/publish-pipeline/` (C1, shipped) and recovery orchestration is
+  `src/cli/sync-recovery.ts`; `uploadConcurrency` lives in
+  `publish-pipeline/shared.ts`.
 - [`src/engine/crypto.ts`](../src/engine/crypto.ts): convergent AES-GCM
   encryption and decrypt verification. Current push hashes plaintext, encrypts
   to temp, then hashes ciphertext temp. Current pull decrypts from a ciphertext
   temp and then hashes plaintext.
-- [`src/cli/remote.ts`](../src/cli/remote.ts): HTTP transport, receipt capture,
-  streamed single PUT/GET, multipart client. Multipart uploads parts
-  sequentially. Non-2xx blob responses still become generic errors.
+- [`src/cli/remote.ts`](../src/cli/remote.ts): now a facade over the
+  `src/cli/remote/` directory — HTTP transport, receipt capture, streamed single
+  PUT/GET, multipart client. Multipart still uploads parts sequentially
+  (`remote/multipart.ts`; C2 remains open). **Correction (2026-08-11):** non-2xx
+  blob responses are *not* generic any more — `translateRemoteError`
+  (`remote/errors.ts`) is applied on the blob paths.
 - [`src/engine/apply.ts`](../src/engine/apply.ts): precondition-checked apply,
   bounded download/write pool, encrypted pull via ciphertext temp.
 - [`src/engine/manifest.ts`](../src/engine/manifest.ts) and
@@ -543,6 +567,10 @@ count and per-object overhead even after high concurrency.
 chunk sync, pack indexes, durable dirty queues, history checkpoints, and very
 large workspaces want indexed local state.
 
+**SHIPPED (2026-08-11)** as `src/cli/state-plane/` — `.rbox/state/state.db` on
+`bun:sqlite`, with schema/migration/backup modules. AGENTS.md now makes it the
+rule: internal state belongs in SQLite, JSON only for human-edited records.
+
 **Solution.**
 
 - Add a local SQLite store under `.rbox/state/`.
@@ -810,8 +838,11 @@ Target examples:
   serializes the hot path.
 - Do not reintroduce staging->canonical promote for normal small blob uploads.
   It was measured and lost.
-- Do not build batch upload without a new measurement showing request overhead
-  is dominant again.
+- ~~Do not build batch upload without a new measurement showing request overhead
+  is dominant again.~~ **OVERTURNED (2026-08-11):** design 112 took that new
+  measurement and batch upload shipped —  `POST /v1/blob-batch/put` and
+  `/v1/blob-batch/get` (`apps/api/src/routes/blob-batch.ts`, client
+  `src/cli/remote/blob-batch/`). The bar the non-goal set was met, not ignored.
 - Do not remove per-blob GET entitlement checks unless a measured pull bottleneck
   returns. The prior download-capability design remains deferred for a reason.
 - Do not optimize the web dashboard ahead of sync data-plane work.
