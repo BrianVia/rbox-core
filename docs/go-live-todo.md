@@ -1,3 +1,5 @@
+> STALE (2026-08-11): superseded by `docs/STATUS.md`; kept pending founder deletion decision. Frozen at 2026-06-29 and now self-contradicting — several unchecked items below are marked done earlier in this same file, and most of the rest shipped. The entries that still look genuinely open are cross-cutting prerequisite #3 (E2EE epoch rotation) and design 19 (device revocation). Note that design 20 (`RBOX_KEY`) shipped anyway, so the "do not GA before epoch rotation ships" gate below was passed, not met.
+
 # rbox — Go-Live TODO
 
 Status as of 2026-06-29. Test/sandbox billing + Clerk provisioning are **done**;

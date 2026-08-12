@@ -1,3 +1,5 @@
+> STALE (2026-08-11): untouched `sv create` scaffold output; superseded by `docs/DEPLOYMENTS.md` for how this app actually builds and ships. Kept pending founder deletion decision. It still names `apps/web-next`, a directory renamed to `apps/web` on 2026-06-29, and says nothing about Clerk, the `rbox-app` Pages project, or the `production`-branch deploy.
+
 # sv
 
 Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).

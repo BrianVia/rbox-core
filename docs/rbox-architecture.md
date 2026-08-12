@@ -1,3 +1,5 @@
+> STALE (2026-08-11): superseded by `rbox-architecture-v2.md` and `docs/CODEMAP.md`; kept pending founder deletion decision. This is the pre-rename "CodeSync" v1 draft — the product name, binary, CLI surface, HTTP routes, D1 schema, R2 layout, wrangler config, repo layout and local-state paths in it are all contradicted by the current code.
+
 # CodeSync Architecture
 
 ## Overview

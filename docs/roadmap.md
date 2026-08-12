@@ -1,3 +1,5 @@
+> STALE (2026-08-11): superseded by `docs/STATUS.md` and `docs/design/`; kept pending founder deletion decision. Frozen at "the initial commit (v1)"; the shipped product is 2.0.0-beta.1. Known-false claims include opt-in `syncGit` (now default true), opt-in encryption (full E2EE is the only mode), and the `rbox encrypt` / `key export|import` / `detect` / `hydrate` commands, none of which exist.
+
 # rbox Roadmap
 
 Status as of the initial commit (v1). What's working, what's stubbed, and what's next — in priority order. Design rationale lives in [`rbox-architecture-v2.md`](./rbox-architecture-v2.md) (decisions referenced as **D1–D11**); storage prior art in [`prior-art-files-sdk.md`](./prior-art-files-sdk.md); plans in [`pricing.md`](./pricing.md).
