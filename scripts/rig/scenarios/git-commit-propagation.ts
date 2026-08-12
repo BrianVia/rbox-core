@@ -56,7 +56,7 @@ import type { Recorder } from "./harness.js";
 import { provisionPair, startDaemons, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
-import { buildHopReport, renderHopReport, type PropagationClassification } from "../../propagation-report.js";
+import { buildHopReport, renderHopReport, type HopReport, type PropagationClassification } from "../../propagation-report.js";
 
 /** The seeded repo (present before the daemons start), a small repo created live, and the
  *  big repo that appears live. */
@@ -85,6 +85,9 @@ const BIG_REPO_TIMEOUT_MS = 300_000;
  *  tight bound — it sits under the 60s safety-scan floor so a scan-driven fall-through
  *  trips it, but far above any real fast-path latency even on a slow CI box. */
 const FAST_CEILING_MS = 30_000;
+/** Stop observing before the scenario's coarse ceiling; a missing joined hop is only
+ * INVALID after this bounded allowance for daemon-log writes to become readable. */
+const HOP_OBSERVATION_DEADLINE_MS = FAST_CEILING_MS - 1_000;
 /** Both guests are containers on one Docker host and therefore share its wall clock. */
 const RIG_CLOCK_SKEW_BOUND_MS = 5;
 
@@ -175,18 +178,59 @@ function lastIdx(lines: string[], re: RegExp): number {
   return -1;
 }
 
-/** Wait until B has logged both the original Git apply witness and the additive trace
- * completion. HEAD/file bytes can become visible before either buffered log write. */
-async function settledReceiverLogs(dev: Device, sinceMs: number, repo?: string): Promise<string> {
-  const applyRe = repo === undefined ? undefined : new RegExp(`git-sync (followed|applied) ${repo}`);
-  const exactTraceRe = /propagation_receive \{"v":1,"event":"apply_complete","adopted_sequence":\d+\}/;
+type HopObservation = {
+  aDelta: string;
+  bDelta: string;
+  hops: HopReport;
+  state: "present-at-initial-read" | "log-not-yet-flushed-at-initial-read" | "hop-truly-missing-after-deadline";
+  waitedMs: number;
+};
+
+/** Poll both logs until the sequence-joined report is complete, not merely until B has
+ * logged an apply for some sequence. Filesystem/HEAD witnesses can become visible before
+ * the joined sender trace or receiver apply-complete write is readable. */
+async function awaitHopObservation(
+  a: Device,
+  b: Device,
+  changeAt: number,
+  attempt: string,
+  classification: PropagationClassification,
+  witnessMatched: boolean,
+): Promise<HopObservation> {
+  type Snapshot = { aDelta: string; bDelta: string; hops: HopReport };
+  const remainingMs = Math.max(0, HOP_OBSERVATION_DEADLINE_MS - (Date.now() - changeAt));
   const out = await pollUntil({
-    probe: async () => linesSince(await readLogs(dev), sinceMs),
-    done: (delta) => (applyRe === undefined || applyRe.test(delta)) && exactTraceRe.test(delta),
-    timeoutMs: PROPAGATE_TIMEOUT_MS,
+    probe: async (): Promise<Snapshot> => {
+      const [aLog, bLog] = await Promise.all([readLogs(a), readLogs(b)]);
+      const aDelta = linesSince(aLog, changeAt);
+      const bDelta = linesSince(bLog, changeAt);
+      return {
+        aDelta,
+        bDelta,
+        hops: buildHopReport(aDelta, bDelta, {
+          attempt,
+          classification,
+          writeAt: changeAt,
+          clockSkewBoundMs: RIG_CLOCK_SKEW_BOUND_MS,
+          witnessMatched,
+        }),
+      };
+    },
+    done: (snapshot) => snapshot.hops.verdict !== "INVALID",
+    timeoutMs: remainingMs,
     intervalMs: 100,
   });
-  return out.value;
+  return {
+    ...out.value,
+    state: out.ok
+      ? out.attempts === 1 ? "present-at-initial-read" : "log-not-yet-flushed-at-initial-read"
+      : "hop-truly-missing-after-deadline",
+    waitedMs: out.elapsedMs,
+  };
+}
+
+function hopObservationDetail(observation: HopObservation): string {
+  return `correlation=${observation.hops.correlation} sequence=${observation.hops.sequence ?? "-"} verdict=${observation.hops.verdict} observation=${observation.state} waited=${observation.waitedMs}ms`;
 }
 
 /** True iff `aDelta` shows A capturing `repo` with NO `safety scan:` line before it
@@ -263,22 +307,11 @@ async function commitRound(
   rec.assert(`[${round}] B HEAD reached A's new commit`, out.ok,
     out.ok ? `${elapsedMs}ms → ${newHead.slice(0, 12)}` : `timeout ${elapsedMs}ms — B HEAD ${out.value.slice(0, 12) || "(none)"} ≠ A ${newHead.slice(0, 12)}`);
 
-  const [afterA, bDelta] = await Promise.all([
-    readLogs(ctx.a),
-    settledReceiverLogs(ctx.b, changeAt, repo),
-  ]);
-  const aDelta = linesSince(afterA, changeAt);
-  assertPropagation(rec, round, repo, aDelta, bDelta, elapsedMs);
-  const hops = buildHopReport(aDelta, bDelta, {
-    attempt: round,
-    classification,
-    writeAt: changeAt,
-    clockSkewBoundMs: RIG_CLOCK_SKEW_BOUND_MS,
-    witnessMatched: out.ok,
-  });
-  ctx.log(renderHopReport(hops).trimEnd());
-  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, hops.verdict === "PASS",
-    `correlation=${hops.correlation} sequence=${hops.sequence ?? "-"} verdict=${hops.verdict}`);
+  const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, classification, out.ok);
+  assertPropagation(rec, round, repo, observation.aDelta, observation.bDelta, elapsedMs);
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, observation.hops.verdict === "PASS",
+    hopObservationDetail(observation));
 
   const fsck = await ctx.b.exec(["git", "-C", repoDir, "fsck", "--strict", "--no-progress"], { allowFail: true });
   rec.assert(`[${round}] B repo fsck --strict clean`, fsck.exitCode === 0, `exit ${fsck.exitCode}`);
@@ -302,21 +335,12 @@ async function filePlaneRound(
     out.ok ? `${elapsedMs}ms` : `timeout ${elapsedMs}ms — B has ${JSON.stringify(out.value)?.slice(0, 40)}`);
   rec.assert(`[${round}] propagated under the fast ceiling`, out.ok && elapsedMs < FAST_CEILING_MS, `${elapsedMs}ms (ceiling ${FAST_CEILING_MS}ms)`);
 
-  const bDelta = await settledReceiverLogs(ctx.b, changeAt);
-  rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(bDelta),
-    /notify_latency_ms=\d+/.test(bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
-
-  const aDelta = linesSince(await readLogs(ctx.a), changeAt);
-  const hops = buildHopReport(aDelta, bDelta, {
-    attempt: round,
-    classification: "file",
-    writeAt: changeAt,
-    clockSkewBoundMs: RIG_CLOCK_SKEW_BOUND_MS,
-    witnessMatched: out.ok,
-  });
-  ctx.log(renderHopReport(hops).trimEnd());
-  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, hops.verdict === "PASS",
-    `correlation=${hops.correlation} sequence=${hops.sequence ?? "-"} verdict=${hops.verdict}`);
+  const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, "file", out.ok);
+  rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(observation.bDelta),
+    /notify_latency_ms=\d+/.test(observation.bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, observation.hops.verdict === "PASS",
+    hopObservationDetail(observation));
 
   if (expectDirty) {
     // File-plane change, not git: B's HEAD must NOT have moved (no phantom commit).
