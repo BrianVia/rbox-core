@@ -41,8 +41,12 @@ anything that surprises you is either a doc fix or the next PR.
 
 3. Install: `curl -fsSL https://rbox.to/install.sh | sh` — expect sha256
    verification and a version print.
-4. Run `rbox` → guided menu → **new workspace** → point it at
-   `~/funnel-test`.
+4. Run `rbox` → guided setup for a **synced folder** → point it at
+   `~/funnel-test`. (Onboarding is folder-first since design 230; a fresh
+   machine also auto-generates `~/.rbox/config.json`.)
+4b. Run `rbox config` and confirm `~/funnel-test` is listed with the options
+   you expect — this is the file that decides what this machine syncs
+   (design 231), and a paying stranger should be able to read it.
 5. Device-code login: it opens app.rbox.to — **sign UP with the alias
    here**. Checkpoint: this is where the account gets created; the site told
    you to sign up first, and you're proving it didn't need to.
