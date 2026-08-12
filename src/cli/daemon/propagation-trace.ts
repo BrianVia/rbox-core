@@ -10,6 +10,9 @@ export interface PropagationTrace {
   schedulerWantArmed(): void;
   operationBegin(): void;
   publishReceipt(sequence: number | undefined): void;
+  wsCommittedFrame(sequence: number): void;
+  pullDequeue(sequence: number | undefined, notifyLatencyMs: number): void;
+  applyComplete(sequence: number): void;
 }
 
 type TraceStage = "seen" | "armed" | "fired";
@@ -62,6 +65,15 @@ export function createPropagationTrace(log: (line: string) => void): Propagation
       const origin = Math.min(...Object.values(cycle.times));
       const ms = Object.fromEntries(Object.entries(cycle.times).map(([key, value]) => [key, Math.round((value - origin) * 10) / 10]));
       log(`propagation_trace ${JSON.stringify({ v: 1, cycle: cycle.id, backend, ms, sequence })}`);
+    },
+    wsCommittedFrame(sequence) {
+      log(`propagation_receive ${JSON.stringify({ v: 1, event: "ws_committed", sequence })}`);
+    },
+    pullDequeue(sequence, notifyLatencyMs) {
+      log(`propagation_receive ${JSON.stringify({ v: 1, event: "pull_dequeue", sequence, notify_latency_ms: notifyLatencyMs })}`);
+    },
+    applyComplete(sequence) {
+      log(`propagation_receive ${JSON.stringify({ v: 1, event: "apply_complete", adopted_sequence: sequence })}`);
     },
   };
 }

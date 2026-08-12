@@ -406,6 +406,8 @@ export class RboxDaemon {
   private cursorReplyResolve?: (head: number) => void;
   private backstopTimer?: ReturnType<typeof setTimeout>;
   private notifyPullPendingAt?: number;
+  /** Newest committed sequence covered by the pending notify pull. Observation only. */
+  private notifyPullPendingSequence?: number;
   private queuedCarrier: Carrier = "none";
   /** Retains a coalesced backstop beneath a higher-priority notify so a WS
    * generation change can discard only the stale WS provenance. */
@@ -1479,15 +1481,18 @@ export class RboxDaemon {
   ): Promise<void> {
     if (op === "pull") {
       const notifyPendingAt = this.notifyPullPendingAt;
+      const notifyPendingSequence = this.notifyPullPendingSequence;
       const notifyLatencyMs = notifyPendingAt !== undefined
         ? Math.min(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max, Math.max(0, Math.floor(this.now() - notifyPendingAt)))
         : undefined;
       this.notifyPullPendingAt = undefined;
+      this.notifyPullPendingSequence = undefined;
       // §6: the standalone metric event fires at dequeue — measured latency is recorded
       // even if the pull below fails (the pull-line token then simply never prints).
       if (notifyLatencyMs !== undefined) {
         this.observeNotifyLatency(notifyLatencyMs);
-        this.log(`notify_latency_ms=${notifyLatencyMs}`);
+        this.log(`notify_latency_ms=${notifyLatencyMs}${notifyPendingSequence === undefined ? "" : ` sequence=${notifyPendingSequence}`}`);
+        this.propagationTrace?.pullDequeue(notifyPendingSequence, notifyLatencyMs);
       }
       const catchUpGeneration = this.pendingCatchUpGeneration;
       this.pendingCatchUpGeneration = undefined;
@@ -2097,6 +2102,11 @@ export class RboxDaemon {
         };
       },
     });
+    const adoptedSequence = this.syncBase?.lastSyncedSequence;
+    if (adoptedSequence !== undefined) {
+      this.log(`pull apply complete ADOPTED sequence ${adoptedSequence}`);
+      this.propagationTrace?.applyComplete(adoptedSequence);
+    }
   }
 
   private readonly pullTransition = new ApplyRemoteWorkspaceTransition({
@@ -2610,6 +2620,7 @@ export class RboxDaemon {
     if (this.queuedCarrier !== "notify" && this.queuedCarrier !== "cursor") return;
     this.queuedCarrier = this.queuedBackstopPending ? "backstop" : "none";
     this.notifyPullPendingAt = undefined;
+    this.notifyPullPendingSequence = undefined;
   }
 
   private creditAppliedCarrier(carrier: Carrier): void {
@@ -3262,9 +3273,14 @@ export class RboxDaemon {
     try {
       const m = JSON.parse(data) as { type?: string; sequence?: unknown };
       if (m.type === "committed") {
+        const sequence = typeof m.sequence === "number" ? m.sequence : -1;
         if (this.ws) this.resetCursorSchedule(this.ws);
-        this.recordCommittedFrame(typeof m.sequence === "number" ? m.sequence : -1);
-        if (!this.wsReliabilityDisabled) this.notifyPullPendingAt ??= this.now();
+        this.recordCommittedFrame(sequence);
+        if (sequence >= 0) this.propagationTrace?.wsCommittedFrame(sequence);
+        if (!this.wsReliabilityDisabled) {
+          this.notifyPullPendingAt ??= this.now();
+          if (sequence >= 0) this.notifyPullPendingSequence = Math.max(this.notifyPullPendingSequence ?? 0, sequence);
+        }
         this.raiseQueuedCarrier("notify");
         this.request("pull");
         this.scheduleNextBackstop();

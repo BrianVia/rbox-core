@@ -234,8 +234,8 @@ export class Device {
   /** `rbox start` in `workDir` — spawns the detached background-sync daemon
    *  (design 45). Throws on nonzero exit (a daemon that won't start is a hard
    *  scenario failure). */
-  async daemonStart(workDir: string): Promise<RunResult> {
-    return this.rbox(["start"], { cwd: workDir });
+  async daemonStart(workDir: string, env?: Record<string, string>): Promise<RunResult> {
+    return this.rbox(["start"], { cwd: workDir, env });
   }
 
   /** `rbox stop` in `workDir` — SIGTERMs the daemon (graceful; never SIGKILL).
