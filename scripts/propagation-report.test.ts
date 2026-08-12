@@ -51,6 +51,27 @@ describe("propagation report", () => {
       .toMatchObject({ correlation: "unmatched", verdict: "INVALID" });
   });
 
+  test("joins the daemon's exact trace format when WS wins the publish-return race", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = [
+      // Same-sequence follow-up cycle: it is not the file-classified publication.
+      line("2026-07-12T10:00:03.900Z", 'propagation_trace {"v":1,"cycle":1,"backend":"parcel","ms":{"git_fired":0,"begin":10,"receipt":20},"sequence":7}'),
+      line("2026-07-12T10:00:04.100Z", 'propagation_trace {"v":1,"cycle":2,"backend":"parcel","ms":{"file_fired":1000,"begin":1500,"receipt":4100},"sequence":7}'),
+    ].join("\n");
+    const receiver = [
+      line("2026-07-12T10:00:04.000Z", 'propagation_receive {"v":1,"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:04.020Z", 'propagation_receive {"v":1,"event":"pull_dequeue","sequence":7,"notify_latency_ms":20}'),
+      line("2026-07-12T10:00:05.000Z", 'propagation_receive {"v":1,"event":"apply_complete","adopted_sequence":7}'),
+    ].join("\n");
+
+    expect(buildHopReport(origin, receiver, {
+      attempt: "publish-return-race",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    })).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
+  });
+
   test("prefers bounded sequence joins, falls back with batching, and reports staleness", () => {
     const origin = [
       "garbled",

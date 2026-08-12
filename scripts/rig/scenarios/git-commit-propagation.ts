@@ -175,6 +175,20 @@ function lastIdx(lines: string[], re: RegExp): number {
   return -1;
 }
 
+/** Wait until B has logged both the original Git apply witness and the additive trace
+ * completion. HEAD/file bytes can become visible before either buffered log write. */
+async function settledReceiverLogs(dev: Device, sinceMs: number, repo?: string): Promise<string> {
+  const applyRe = repo === undefined ? undefined : new RegExp(`git-sync (followed|applied) ${repo}`);
+  const exactTraceRe = /propagation_receive \{"v":1,"event":"apply_complete","adopted_sequence":\d+\}/;
+  const out = await pollUntil({
+    probe: async () => linesSince(await readLogs(dev), sinceMs),
+    done: (delta) => (applyRe === undefined || applyRe.test(delta)) && exactTraceRe.test(delta),
+    timeoutMs: PROPAGATE_TIMEOUT_MS,
+    intervalMs: 100,
+  });
+  return out.value;
+}
+
 /** True iff `aDelta` shows A capturing `repo` with NO `safety scan:` line before it
  *  (event-driven). Returns [captured, eventDriven]. */
 function captureShape(aDelta: string, repo: string): { captured: boolean; eventDriven: boolean; line: string } {
@@ -249,9 +263,11 @@ async function commitRound(
   rec.assert(`[${round}] B HEAD reached A's new commit`, out.ok,
     out.ok ? `${elapsedMs}ms → ${newHead.slice(0, 12)}` : `timeout ${elapsedMs}ms — B HEAD ${out.value.slice(0, 12) || "(none)"} ≠ A ${newHead.slice(0, 12)}`);
 
-  const [afterA, afterB] = await Promise.all([readLogs(ctx.a), readLogs(ctx.b)]);
+  const [afterA, bDelta] = await Promise.all([
+    readLogs(ctx.a),
+    settledReceiverLogs(ctx.b, changeAt, repo),
+  ]);
   const aDelta = linesSince(afterA, changeAt);
-  const bDelta = linesSince(afterB, changeAt);
   assertPropagation(rec, round, repo, aDelta, bDelta, elapsedMs);
   const hops = buildHopReport(aDelta, bDelta, {
     attempt: round,
@@ -286,7 +302,7 @@ async function filePlaneRound(
     out.ok ? `${elapsedMs}ms` : `timeout ${elapsedMs}ms — B has ${JSON.stringify(out.value)?.slice(0, 40)}`);
   rec.assert(`[${round}] propagated under the fast ceiling`, out.ok && elapsedMs < FAST_CEILING_MS, `${elapsedMs}ms (ceiling ${FAST_CEILING_MS}ms)`);
 
-  const bDelta = linesSince(await readLogs(ctx.b), changeAt);
+  const bDelta = await settledReceiverLogs(ctx.b, changeAt);
   rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(bDelta),
     /notify_latency_ms=\d+/.test(bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
 

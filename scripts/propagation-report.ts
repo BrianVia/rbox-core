@@ -100,12 +100,14 @@ export function buildHopReport(
   },
 ): HopReport {
   const budgetMs = options.budgetMs ?? PROPAGATION_BUDGET_MS;
-  const candidates = senderTraces(originLog).filter((trace) => trace.at >= options.writeAt);
+  const settleKey = `${options.classification}_fired` as const;
+  const candidates = senderTraces(originLog).filter((trace) =>
+    trace.at >= options.writeAt && Number.isFinite(trace.ms[settleKey]));
   const trace = candidates.length === 1 ? candidates[0] : undefined;
   const stamps: HopReport["stamps"] = { write: options.writeAt };
   if (trace) {
     const receiptOffset = trace.ms.receipt!;
-    const settleOffset = trace.ms[`${options.classification}_fired`];
+    const settleOffset = trace.ms[settleKey];
     if (Number.isFinite(settleOffset)) stamps.batcherSettle = trace.at - (receiptOffset - settleOffset!);
     if (Number.isFinite(trace.ms.begin)) stamps.pushBegin = trace.at - (receiptOffset - trace.ms.begin!);
     stamps.publishReceipt = trace.at;
@@ -126,9 +128,24 @@ export function buildHopReport(
   if (dequeue) stamps.pullDequeue = dequeue.at;
   if (apply) stamps.applyComplete = apply.at;
 
-  const ordered = [stamps.write, stamps.batcherSettle, stamps.pushBegin, stamps.publishReceipt, stamps.wsReceipt, stamps.pullDequeue, stamps.applyComplete];
-  const completeAndOrdered = ordered.every((at) => at !== undefined)
-    && ordered.every((at, index) => index === 0 || at! >= ordered[index - 1]!);
+  // The committed WS frame can reach either device before the publisher's HTTP call
+  // returns. Sequence is the cross-host join; ordering is meaningful only within each
+  // host's lane (plus both lanes beginning after the witnessed write).
+  const senderOrdered = stamps.write !== undefined
+    && stamps.batcherSettle !== undefined
+    && stamps.pushBegin !== undefined
+    && stamps.publishReceipt !== undefined
+    && stamps.write <= stamps.batcherSettle
+    && stamps.batcherSettle <= stamps.pushBegin
+    && stamps.pushBegin <= stamps.publishReceipt;
+  const receiverOrdered = stamps.write !== undefined
+    && stamps.wsReceipt !== undefined
+    && stamps.pullDequeue !== undefined
+    && stamps.applyComplete !== undefined
+    && stamps.write <= stamps.wsReceipt
+    && stamps.wsReceipt <= stamps.pullDequeue
+    && stamps.pullDequeue <= stamps.applyComplete;
+  const completeAndOrdered = senderOrdered && receiverOrdered;
   const witnessMatched = options.witnessMatched ?? true;
   let correlation: HopCorrelation = "unmatched";
   if (completeAndOrdered && witnessMatched && trace && apply) {
