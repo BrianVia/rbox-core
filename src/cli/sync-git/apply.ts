@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clearCheckoutJournal, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "../../engine/git/config-txn.js";
@@ -29,6 +30,9 @@ import {
 } from "./base-composer.js";
 import { asyncMemo } from "./async-memo.js";
 import { partialRefsStillMatch } from "./received-git-transition-commit.js";
+import { fingerprintHitProbe, loadGitDivergenceCache } from "./divergence-cache.js";
+import { gitFingerprintRun } from "./fingerprint.js";
+import { gitConfigHash } from "./config-lane.js";
 
 interface KeySnapshot<T> {
   present: boolean;
@@ -319,6 +323,8 @@ opts: {
     mutationBoundary?: MutationBoundary;
     /** Tests only: observes/injects the anchored empty-directory removal call. */
     sweepRmdir?: RepoSkeletonSweepOptions["rmdir"];
+    /** Tests only: observes repos admitted to the serialized apply work. */
+    onApplyQueued?: (relPath: string) => void;
     /** Design 212: the shared pre-probe scope projection. Present ⇒ only `IN` repos
      * are visited at all. Out-of-scope and boundary-crossing keys never reach key
      * construction, collision analysis, disk probing, journal recovery, or config —
@@ -379,6 +385,7 @@ opts: {
     `git-sync WARNING: receiver-equivalent Git repo keys all deferred: ${[...collidingRepoKeys].sort().join(", ")}`,
     glog,
   );
+  const runKind: GitApplyRunKind = Object.keys(baseRepos).length === 0 && Object.keys(pending).length === 0 ? "fresh" : "steady";
   if (opts.collectMetrics) {
     commonDirGroups = new Map();
     metrics = {
@@ -386,7 +393,7 @@ opts: {
       // a file-synced workspace receiving its first remote.gitRepos is fresh for
       // git purposes even at a nonzero baseline (sequence-keyed
       // classification would poison the Phase-1 gate data).
-      runKind: Object.keys(baseRepos).length === 0 && Object.keys(pending).length === 0 ? "fresh" : "steady",
+      runKind,
       repos: keys.length,
       commonDirGroups: 0,
       results: emptyGitApplyResults(),
@@ -1388,6 +1395,43 @@ opts: {
   const commonDirLocks = new Map<string, Promise<void>>();
   const indexes = new Map(keys.map((rel, i) => [rel, i]));
   let progressDone = 0;
+  // A steady delta normally names only a few repos. Prove the other repositories
+  // unchanged before pool admission so they do not serialize behind real apply
+  // work. Every uncertain state (missing/stale fingerprint, journal, sidecar,
+  // config work, or wire difference) deliberately remains on the old path.
+  const bypassed = new Set<string>();
+  if (runKind === "steady") {
+    const cache = await loadGitDivergenceCache(root);
+    const fingerprintRun = gitFingerprintRun("per-decision");
+    for (const rel of keys) {
+      const remoteSec = remote.gitRepos?.[rel];
+      const baseSec = baseRepos[rel];
+      const record = records[rel];
+      if (!remoteSec || !baseSec || !isDeepStrictEqual(remoteSec, baseSec)
+        || pending[rel] || removedMem[rel] !== undefined || needsRes[rel] !== undefined
+        || record?.partial || record?.attempt || record?.resolutionReceipt
+        || Object.keys(record?.deferrals ?? {}).length > 0
+        || await checkoutJournalPresent(root, rel)) continue;
+      const hit = await fingerprintHitProbe(fingerprintRun, root, rel, cache, undefined, !opts.disableConfigLane);
+      if (hit.status !== "hit" || hit.probe.busy || !hit.probe.preflightOk
+        || hit.probe.identityKey !== gitIdentityKey(baseSec)) continue;
+      if (!opts.disableConfigLane) {
+        if (remoteSec.config === undefined) {
+          if (record?.cfgSynced !== undefined) continue;
+        } else {
+          const hash = gitConfigHash(remoteSec.config);
+          if (record?.cfgApplied !== hash || hit.cachedLocalCfg?.hash !== hash) continue;
+        }
+      }
+      bypassed.add(rel);
+      applied[rel] = sanitizeGitSectionForPersistence(remoteSec);
+      if (metrics) {
+        metrics.results.unchanged += 1;
+        metrics.repoTimings.push({ index: indexes.get(rel)!, queueMs: 0, wallMs: 0, result: "unchanged" });
+      }
+      opts.onProgress?.(++progressDone, keys.length);
+    }
+  }
   // Shutdown latch. poolMap has no cancellation: a task that throws stops only
   // its own worker, and the siblings keep pulling repos while the caller has
   // already unwound — during shutdown that is ungated disk work (pack import,
@@ -1397,6 +1441,7 @@ opts: {
   let gateClosure: MutationGateClosedError | undefined;
   const runRepo = async (rel: string): Promise<void> => {
     if (gateClosure) return;
+    opts.onApplyQueued?.(rel);
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
     const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
@@ -1459,7 +1504,10 @@ opts: {
       opts.onProgress?.(++progressDone, keys.length);
     }
   };
-  await poolMap(nestedRepoChains(keys), gitApplyConcurrency(), async (chain) => {
+  const queuedChains = nestedRepoChains(keys)
+    .map((chain) => chain.filter((rel) => !bypassed.has(rel)))
+    .filter((chain) => chain.length > 0);
+  await poolMap(queuedChains, gitApplyConcurrency(), async (chain) => {
     for (const rel of chain) {
       try {
         await runRepo(rel);

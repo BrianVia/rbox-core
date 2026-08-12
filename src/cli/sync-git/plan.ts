@@ -138,6 +138,8 @@ export interface GitPlanOptions {
   afterJournalPreloop?: () => void | Promise<void>;
   /** Tests only: runs after read-only decisions and memo invalidation, before capture. */
   beforeCapturePool?: () => void | Promise<void>;
+  /** Tests only: observes the repos admitted to the serialized capture work. */
+  onCaptureQueued?: (relPath: string) => void;
   /** Tests only: observes the fresh repository context used by hygiene. */
   onHygieneCtx?: (relPath: string, ctx: RepoCtx | undefined) => void;
 }
@@ -1125,6 +1127,7 @@ async function planGitSectionsWithRetention(
   let readThrough: GitArtifactReadStore | undefined;
   const artifactStore = (): GitArtifactReadStore => (readThrough ??= planReadThroughStore(api.blobStore(), retained, glog));
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
+    options.onCaptureQueued?.(rel);
     try {
       const { section: sec, reason, pendingUploads } = await capturePlannedGitSection(
         root, rel, cfg, base[rel], api, kek, uploadsDir, mustCapture(rel), backoff,
