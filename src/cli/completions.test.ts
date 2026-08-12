@@ -40,7 +40,7 @@ test("known flags are completed from registry metadata", () => {
   expect(script).toContain("--allow-mass-delete[");
   expect(script).toContain("'deferrals:show deferred Git repos and copyable repair guidance'");
   expect(script).toContain("--brief[print a complete copyable diagnosis and repair brief]");
-  expect(script).toContain("'add:add a bound folder to this machine'\\''s configuration'");
+  expect(script).toContain("'add:add an existing synced folder to this machine'\\''s configuration'");
   expect(script).toContain("'regenerate:rebuild folder configuration from local bindings'");
   expect(script).toContain("'repair:finish rebinding a folder moved on this machine'");
   expect(script).toContain("--yes[replace the configuration without prompting (alias: -y)]");
