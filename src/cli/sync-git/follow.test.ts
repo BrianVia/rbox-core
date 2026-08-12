@@ -1734,6 +1734,45 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   expect(capabilityCalls).toBeGreaterThan(0);
 });
 
+test("held skip survives a higher-sequence transport recapture and retries a semantic change", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree,
+    "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  const saved = await landOutcome(state, first.outcome, 2);
+  const recaptured = {
+    ...incoming,
+    bundleSha: "a".repeat(64),
+    bundleEncSha: "b".repeat(64),
+    bundleCipherSize: incoming.bundleCipherSize + 1,
+  };
+  let followCalls = 0;
+  const skipped = await applyIncoming(saved, recaptured, matchingOracle, {
+    sourceGlobalSeq: 3,
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { followCalls++; return true; },
+  });
+  expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(followCalls).toBe(0);
+
+  const changed = await applyIncoming(saved, {
+    ...incoming,
+    head: incoming.refs["refs/heads/main"]!,
+  }, matchingOracle, {
+    sourceGlobalSeq: 4,
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { followCalls++; return true; },
+  });
+  expect(changed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(followCalls).toBeGreaterThan(0);
+});
+
 test("design 176: own composer-pending hold maps to its causal ref blocker and becomes skippable", async () => {
   await commit("main base\n", "main base");
   await git(sender, "branch", "topic");

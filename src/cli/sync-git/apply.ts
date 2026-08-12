@@ -1063,7 +1063,7 @@ opts: {
       const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
       const priorObservation = priorAttempt
         ? await observeHeldInputs({
-            root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
+            root, relPath: rel, incoming: remoteSec,
             record: records[rel], partial: effectivePartial,
             stateNonce: expectedStateNonce(state),
             effectiveBaseIndexProjection: records[rel]?.idxProj
@@ -1120,7 +1120,7 @@ opts: {
           return;
         }
         const observed = await observeHeldInputs({
-          root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
+          root, relPath: rel, incoming: remoteSec,
           record: priorRecord,
           ...((input.boundBase ?? applied[rel]) === undefined ? {} : { boundBase: input.boundBase ?? applied[rel] }),
           ...((input.boundOrigins ?? branchBaseOrigins[rel]) === undefined ? {} : { boundOrigins: input.boundOrigins ?? branchBaseOrigins[rel] }),

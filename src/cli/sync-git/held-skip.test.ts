@@ -15,6 +15,7 @@ import {
   gitOwnershipNoEscalateEnabled,
   heldAttemptFloorElapsed,
   heldAttemptMatches,
+  heldClassifierInputKey,
   heldBlockersAllowSkip,
   observeHeldInputs,
   readWorktreeRegistryDigest,
@@ -286,7 +287,7 @@ test("same indexSha with a changed incoming locator invalidates an attempt", asy
   const changedLocator = { ...baseSection, indexEncSha: "5".repeat(64), indexCipherSize: 11 };
   expect(gitIncomingKey(changedLocator)).toBe(gitIncomingKey(baseSection));
   const common = {
-    root, relPath: ".", incomingKey: gitIncomingKey(baseSection), stateNonce: "nonce",
+    root, relPath: ".", stateNonce: "nonce",
     effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: "v2:incoming", reflogPaths: [],
   };
   const before = await observeHeldInputs({ ...common, incoming: baseSection });
@@ -295,6 +296,23 @@ test("same indexSha with a changed incoming locator invalidates an attempt", asy
   const after = await observeHeldInputs({ ...common, incoming: changedLocator });
   expect(after).toBeDefined();
   expect(heldAttemptMatches(attempt, after!, Date.now() + 6_000)).toBe(false);
+});
+
+test("held classifier identity ignores bundle recapture but not semantic inputs", () => {
+  const baseSection = {
+    bundleSha: "1".repeat(64), bundleEncSha: "2".repeat(64), bundleCipherSize: 1,
+    head: "ref: refs/heads/main\n", refs: { "refs/heads/main": "3".repeat(40) }, refScope: "all" as const,
+  };
+  const recaptured = {
+    ...baseSection,
+    bundleSha: "4".repeat(64), bundleEncSha: "5".repeat(64), bundleCipherSize: 2,
+    packChain: [{
+      sha: "6".repeat(64), encSha: "7".repeat(64), cipherSize: 3,
+      tips: ["3".repeat(40)],
+    }],
+  };
+  expect(heldClassifierInputKey(recaptured)).toBe(heldClassifierInputKey(baseSection));
+  expect(heldClassifierInputKey({ ...recaptured, head: "3".repeat(40) })).not.toBe(heldClassifierInputKey(baseSection));
 });
 
 test("worktree removal changes the registry digest without changing refs, HEAD, or index", async () => {

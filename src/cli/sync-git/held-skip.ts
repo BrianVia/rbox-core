@@ -23,6 +23,7 @@ import {
   gitFingerprintRun,
   type GitFingerprint,
 } from "./fingerprint.js";
+import { gitIncomingKey } from "./shared.js";
 
 const HELD_SKIP_SAFETY_FLOOR_MS = 60 * 60 * 1000;
 
@@ -137,7 +138,6 @@ export interface HeldInputObservation {
 export interface ObserveHeldInputsOptions {
   root: string;
   relPath: string;
-  incomingKey: string;
   incoming: GitSection;
   record?: RepoRecord;
   /** Explicit post-composer values used when the completed outcome is not saved yet. */
@@ -168,6 +168,15 @@ export function incomingIndexArtifactDescriptor(incoming: GitSection): string {
     indexComp: incoming.indexComp ?? null,
     indexPayloadSha: incoming.indexPayloadSha ?? null,
   });
+}
+
+/** Classifier-input identity, deliberately independent of bundle recapture.
+ * gitIncomingKey already excludes ciphertext locators/metadata; blanking its
+ * plaintext bundle/chain inputs leaves exactly the section semantics consumed
+ * by held classification. Index transport remains bound separately by
+ * incomingIndexArtifactDescriptor. */
+export function heldClassifierInputKey(incoming: GitSection): string {
+  return gitIncomingKey({ ...incoming, bundleSha: "", packChain: undefined });
 }
 
 export async function readWorktreeRegistryDigest(repoDir: string): Promise<string | undefined> {
@@ -211,7 +220,10 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       opts.boundBase ?? opts.record?.base ?? null,
       opts.boundOrigins ?? opts.record?.branchBaseOrigins ?? null,
     ])));
-    const partialDisposition = canonicalString(opts.partial ?? null);
+    const incomingKey = heldClassifierInputKey(opts.incoming);
+    const partialDisposition = canonicalString(opts.partial
+      ? { ...opts.partial, incomingKey }
+      : null);
     const after = await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath, { includeIndexDependencies: true });
     const worktreeRegistryDigest = await readWorktreeRegistryDigest(ctx.repoDir);
     if (!after.dependenciesComplete || before.hash !== after.hash || before.diskCtx?.kind !== after.diskCtx?.kind
@@ -220,7 +232,7 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       || !worktreeRegistryDigest
       || worktreeRegistryBefore !== worktreeRegistryDigest) return undefined;
     return {
-      incomingKey: opts.incomingKey,
+      incomingKey,
       effectiveBaseIndexProjection: opts.effectiveBaseIndexProjection,
       effectiveIncomingIndexProjection: opts.effectiveIncomingIndexProjection,
       incomingIndexArtifactDescriptor: incomingIndexArtifactDescriptor(opts.incoming),
@@ -298,7 +310,6 @@ export async function rebindHeldAttemptsAfterSettlement(input: {
       ? await observeHeldInputs({
           root: input.root,
           relPath,
-          incomingKey: attempt.incomingKey,
           incoming,
           record,
           partial: record.partial,
