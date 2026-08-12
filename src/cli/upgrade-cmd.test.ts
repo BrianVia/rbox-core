@@ -8,6 +8,7 @@ import { upgradeCmd } from "./upgrade-cmd.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { recordFolder } from "./folder-config.js";
 import { workspaceKey } from "./rbox-paths.js";
+import { parseSemver } from "./semver.js";
 import { RBOX_VERSION } from "./version.js";
 import type { DesiredStateRow } from "./autostart-cmd.js";
 import type { Manifest as ReleaseManifest } from "./release-verify.js";
@@ -25,13 +26,13 @@ let poisonXdgConfigHome: string;
 const rows: DesiredStateRow[] = [];
 
 const nextVersion = (): string => {
-  const [major, minor, patch] = RBOX_VERSION.split(".").map(Number);
-  return `${major}.${minor}.${patch! + 1}`;
+  const { major, minor, patch } = parseSemver(RBOX_VERSION);
+  return `${major}.${minor}.${patch + 1}`;
 };
 
 const versionAfter = (offset: number): string => {
-  const [major, minor, patch] = RBOX_VERSION.split(".").map(Number);
-  return `${major}.${minor}.${patch! + offset}`;
+  const { major, minor, patch } = parseSemver(RBOX_VERSION);
+  return `${major}.${minor}.${patch + offset}`;
 };
 
 const artifact = (): string => `rbox-${process.platform === "darwin" ? "darwin" : "linux"}-${process.arch === "arm64" ? "arm64" : "x64"}`;

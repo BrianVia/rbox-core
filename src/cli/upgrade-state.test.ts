@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { upgradeCmd } from "./upgrade-cmd.js";
+import { parseSemver } from "./semver.js";
 import { RBOX_VERSION } from "./version.js";
 import type { Manifest as ReleaseManifest } from "./release-verify.js";
 
@@ -17,12 +18,12 @@ const originalHome = process.env.HOME;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 
 const nextVersion = (): string => {
-  const [major, minor, patch] = RBOX_VERSION.split(".").map(Number);
-  return `${major}.${minor}.${patch! + 1}`;
+  const { major, minor, patch } = parseSemver(RBOX_VERSION);
+  return `${major}.${minor}.${patch + 1}`;
 };
 const versionAfter = (offset: number): string => {
-  const [major, minor, patch] = RBOX_VERSION.split(".").map(Number);
-  return `${major}.${minor}.${patch! + offset}`;
+  const { major, minor, patch } = parseSemver(RBOX_VERSION);
+  return `${major}.${minor}.${patch + offset}`;
 };
 const artifact = (): string => `rbox-${process.platform === "darwin" ? "darwin" : "linux"}-${process.arch === "arm64" ? "arm64" : "x64"}`;
 
@@ -255,7 +256,8 @@ test("elevated and non-elevated contenders share the executable-scoped lock", as
 });
 
 test("a concurrent latest switch cannot escape the next upgrade lock", async () => {
-  const next = "2.0.0-beta.1";
+  // Always strictly newer than the checked-in version, prerelease or not.
+  const next = `${versionAfter(1)}-beta.1`;
   const nextBinary = Buffer.from("next-binary");
   let entered!: () => void;
   const downloadEntered = new Promise<void>((resolve) => { entered = resolve; });
