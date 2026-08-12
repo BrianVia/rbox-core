@@ -7,8 +7,8 @@ called out with its design doc.
 ## 1. Getting started
 
 ```bash
-rbox                 # no args: guided menu (new workspace / connect this machine / just log in)
-rbox setup           # same guided flow, named directly
+rbox                 # no args: guided menu (sync now / start background syncing / add another synced folder / pair another device / view usage / view logs)
+rbox setup           # guided setup for a synced folder, named directly
 ```
 
 Scriptable/CI equivalents (never prompt, never need a TTY):
@@ -35,8 +35,10 @@ and `130` means user cancel (Ctrl-C).
    device-code login (interactive-only; never started in CI).
 2. **Workspace.** Creates a new remote workspace, or adopts an existing
    workspace id you're joining (access is validated on first sync).
-3. **Local binding.** Writes `.rbox/workspace.json` — see §3. This is the one
-   file every tracked root has; nothing else is required for sync to work.
+3. **Local binding.** Writes `.rbox/workspace.json` — see §3. It also records
+   the folder in `~/.rbox/config.json`, the machine-wide authority for which
+   folders rbox may sync and with what options (design 231); a binding rbox
+   cannot find there is not admitted. See §3.
 4. **Rebind guard.** If this directory was already bound to a *different*
    workspace, the local sync baseline is reset (files on disk are untouched)
    rather than silently reconciling against a stream it doesn't belong to —
@@ -48,13 +50,69 @@ and `130` means user cancel (Ctrl-C).
 Nothing about `rbox init` currently writes `.rboxignore` or any `rbox.yml` —
 see §5 and §6.
 
-## 3. `.rbox/workspace.json` — per-device, never synced
+## 3. Config files — what owns what
 
-Every tracked root gets exactly one config file today:
-`.rbox/workspace.json` (`src/cli/config.ts`). It is **machine-local by
-design** — the file itself is never part of the synced manifest, and several
+Two files matter, and they own different things (design 231).
+
+### 3a. `~/.rbox/config.json` — the folder authority, per machine
+
+`~/.rbox/config.json` (`src/cli/folder-config-codec.ts`) is the **sole
+authority** for which folders this machine intends to sync and what options
+apply to them. It is meant to be read, and hand-edited, by you. It is never
+synced.
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "globalOptions": { "syncGit": true, "trash": { "days": 30 } },
+  "folders": [
+    { "name": "code", "path": "/Users/me/code" },
+    { "name": "notes", "path": "/Users/me/notes", "options": { "syncGit": false } }
+  ]
+}
+```
+
+Options resolve **field by field**: a folder's own value wins, then
+`globalOptions`, then the built-in default (`resolveFolderPolicy`,
+`src/cli/folder-config-codec.ts:282`). `false` and `0` are real values, never
+"inherit". The options it owns are `syncGit`, `git.incremental`,
+`respectGitignore`, `noDrift`, and `trash.days` / `trash.maxBytes`; built-in
+defaults are `syncGit: true`, `git.incremental: true`,
+`respectGitignore: false`, `noDrift: false`, `trash: 30 days / 2 GiB`
+(`DEFAULT_FOLDER_POLICY`).
+
+The file is in exactly one of three states:
+
+| State | What it means | What rbox does |
+|---|---|---|
+| **authoritative** | present and valid | normal operation |
+| **absent** | not there at all | a fresh machine generates one; a machine that already has bindings refuses and tells you to run `rbox config regenerate` |
+| **damaged** | present but unreadable/invalid | refuses everything and tells you to copy the file somewhere safe, then run `rbox config regenerate` |
+
+rbox never guesses its way past a missing or damaged catalog, and there is no
+migration command — `rbox config regenerate` is explicit and destructive: it
+rebuilds the list from discovered bindings and daemon state, replacing whatever
+was there.
+
+```bash
+rbox config                  # show the resolved folder list and options
+rbox config --json           # same, machine-readable (closed schema v1)
+rbox config add <path>       # admit a folder that is bound but not listed
+rbox config regenerate [--yes]  # DESTRUCTIVE: rebuild the file from discovered state
+rbox config repair <path>    # re-point a listed folder after a proven local move
+```
+
+`rbox init` and `rbox track` record the folder for you; `rbox untrack` removes
+it (`src/cli/track-cmd.ts:211`, `src/cli/untrack-cmd.ts:126`).
+
+### 3b. `.rbox/workspace.json` — the binding, per tracked root
+
+`.rbox/workspace.json` (`src/cli/workspace-config.ts`) holds the **binding**:
+which remote stream this root belongs to and as which device. It is
+**machine-local by design** — never part of the synced manifest, and several
 of its fields (`rootPath`, `deviceId`, and the runtime-only `token`/`kek`)
-would be actively wrong if copied to another machine.
+would be actively wrong if copied to another machine. It is *not* where your
+sync options live any more; §3a is.
 
 Fields worth knowing about as a user (not an exhaustive schema dump):
 
@@ -63,16 +121,29 @@ Fields worth knowing about as a user (not an exhaustive schema dump):
 | `remoteWorkspaceId` | which workspace this root syncs against |
 | `name` | optional, human-readable label, cached locally so `rbox status` doesn't need a server round-trip |
 | `projectId` | which project within the workspace (`"root"` today — single-project) |
-| `syncGit` | git-state sync (index/HEAD/stash), **on by default** (design 28 — the git-native sync this product is built around), `--git false` at `init`/`track` opts a device out. **Shape caveat:** a repo is *ineligible* for git-state capture if it is bare, shallow/partial, uses `reftable` ref storage, uses `objects/info/alternates`, is a submodule *superproject* (`.git/modules/`), or rewrites its graph locally (`info/grafts`) — its section is not published, and the reason is reported per-repo in `rbox logs`. A *primary* clone containing linked worktrees (`git worktree`) **is** eligible (design 68) — it is captured with `bundle --single-worktree --all`, and a branch currently checked out by a sibling worktree is held rather than moved underneath it. Worktree *checkouts* themselves (gitfile-pointer repos) are captured on their own **unless** their main clone is also tracked inside the same rbox root, in which case they are deliberately skipped and base-carried — their history already travels with the main clone's bundle (design 68 §3.3). Regular file sync is unaffected. |
-| `noDrift` | opt-out of dependency-drift nudges, **per device**, unset (nudges on) unless something writes it |
 | `encrypted` | always on — full E2EE (design 12) is the only supported mode |
 
-Both are decided **per device**, not project-wide — one machine opting out of
-git-state sync (`--git false`) doesn't force that on every other machine
-bound to the same workspace, and vice versa. `syncGit` is resolved once, at
-`init`/`track` time, and stored as a concrete value from then on — there's no
-"unset" state for it in practice, unlike `noDrift`, which really is left
-unset unless a device explicitly opts out.
+**On `syncGit`.** It is on by default (design 28 — the git-native sync this
+product is built around), and `--git false` at `init`/`track` opts this machine
+out by writing the override into `~/.rbox/config.json`. **Shape caveat:** a
+repo is *ineligible* for git-state capture if it is bare, shallow/partial, uses
+`reftable` ref storage, uses `objects/info/alternates`, is a submodule
+*superproject* (`.git/modules/`), or rewrites its graph locally
+(`info/grafts`) — its section is not published, and the reason is reported
+per-repo in `rbox logs`. A *primary* clone containing linked worktrees
+(`git worktree`) **is** eligible (design 68) — it is captured with
+`bundle --single-worktree --all`, and a branch currently checked out by a
+sibling worktree is held rather than moved underneath it. Worktree *checkouts*
+themselves (gitfile-pointer repos) are captured on their own **unless** their
+main clone is also tracked inside the same rbox root, in which case they are
+deliberately skipped and base-carried — their history already travels with the
+main clone's bundle (design 68 §3.3). Regular file sync is unaffected.
+
+Options are decided **per machine**, not project-wide — one machine opting out
+of git-state sync doesn't force that on every other machine bound to the same
+workspace, and vice versa. Every option is re-resolved from the catalog on each
+run, so "unset" is the normal state; editing `~/.rbox/config.json` takes effect
+without re-running `init` or `track`.
 
 ## 4. Tracking, syncing, status
 
@@ -80,6 +151,8 @@ unset unless a device explicitly opts out.
 rbox track ~/code/myapp                        # bind a directory (no first sync)
 rbox track ~/code/myapp --workspace ws_ab12cd34 # join an existing workspace instead
 rbox untrack [path] [--force]                  # stop syncing (local unbind; remote untouched)
+
+rbox config                                    # which folders this machine syncs, and how (§3a)
 
 rbox start [path]     # start background sync (daemon)
 rbox stop [path]
@@ -133,8 +206,10 @@ sync state. For single-file rollback, use `rbox restore <path>@<seq>`.
 every mode and applies before the later override layers described below. When you
 create a workspace through the interactive `rbox setup` or `rbox init --new` wizard,
 rbox also respects `.gitignore` by default, skipping gitignored untracked files.
-Scripted init keeps its compatibility default unless you pass
-`--respect-gitignore true`; existing workspaces keep their configured mode.
+Scripted init keeps its compatibility default unless you pass the valueless
+`--respect-gitignore` flag; existing workspaces keep their configured mode. To
+change it later, use `rbox ignore --respect-gitignore <on|off>` (that one *does*
+take a value) or edit `respectGitignore` in `~/.rbox/config.json`.
 
 **Precedence when `.gitignore` is enabled:** `BUILTIN_IGNORE` → `.gitignore` →
 `.rboxignore` (later rules win). `.rboxignore` can re-include an individual file an earlier rule
