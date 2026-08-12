@@ -5,6 +5,24 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-12: **v2.0.0-beta.1 LIVE on the next channel** (tag on
+af2168020 after fixing upgrade-test fixtures that choked on a prerelease
+checked-in version — parseSemver, not split-map). Propagation benchmarked on
+the blog repo (5 rounds): FM 32-115s; Mac 266s→171s after finding the Mac
+daemon in TERMINAL `trustState=fused` (FSEvents overflow storm during the 231
+upgrade blew design-104's one-way retrust fuse; restart resets; slow-Mac
+triage = check trustState FIRST). FOUNDER YARDSTICK SET: ≤10s end-to-end
+propagation, fully reactive (watch→push→DO→WS→trusted pull). Round-5 hop
+forensics: real work ~5s; waste = sender 60s pump pacing, notify queued behind
+108s in-flight pull (notify_latency_ms=94145), applying pulls still run ~60s
+scan/res over 31k files despite watcher trust, savvy-core AUTO_MERGE deferral
+taxes 37s git-apply per pull. QUEUED as one propagation/Mac-plane dev cycle:
+push-on-quiesce, delta-scoped pull apply, notify preemption, supervised
+watcher retrust (amends 104), FSEvents boot journal, savvy-core resolve +
+founder-requested git-resolve rig suite (two-VM astray-commit scenarios).
+Also: Mac daemon RSS 9.9GB flag; desktop rbox-core git deferral cleanup still
+pending founder go._
+
 _SESSION 2026-08-11 (later): **DESIGN 231 ACTIVATED — #632 merged; config.json
 is the live folder authority. Workstation upgraded and verified.** One atomic
 PR (7 staged commits, codex implemented / Fable folded): single-file authority
