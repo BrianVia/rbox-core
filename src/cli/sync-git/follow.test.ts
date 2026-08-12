@@ -1777,34 +1777,55 @@ test("design 176: own composer-pending hold maps to its causal ref blocker and b
   expect(followCalls).toBe(0);
 });
 
-for (const [label, expectedReason, prepare] of [
-  ["local-edits", "local-edits", async () => ({
+test("design 174 A: local-edits blockers never take held-skip", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const oracle = {
     proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
     reproveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
     receiptHash: () => undefined,
-  })],
-  ["local-operation", "local-operation", async (c1: string) => {
-    await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
-    return matchingOracle;
-  }],
-] as const) {
-  test(`design 174 A: ${label} blockers never take held-skip`, async () => {
-    const { c1, state, incoming } = await baseAndIncoming();
-    const oracle = await prepare(c1);
-    const first = await applyIncoming(state, incoming, oracle, { collectMetrics: true });
-    expect(first.outcome.deferrals?.repo?.apply?.reason).toBe(expectedReason);
-    expect(first.outcome.attempt?.repo).toBeDefined();
-    const saved = await landOutcome(state, first.outcome, 2);
-    let capabilityCalls = 0;
-    const retried = await applyIncoming(saved, incoming, oracle, {
-      collectMetrics: true,
-      heldNow: heldNowAfterRacyWindow,
-      capabilityProbe: async () => { capabilityCalls++; return true; },
-    });
-    expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
-    expect(capabilityCalls).toBeGreaterThan(0);
+  };
+  const first = await applyIncoming(state, incoming, oracle, { collectMetrics: true });
+  expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+  expect(first.outcome.attempt?.repo).toBeDefined();
+  const saved = await landOutcome(state, first.outcome, 2);
+  let capabilityCalls = 0;
+  const retried = await applyIncoming(saved, incoming, oracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
   });
-}
+  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+});
+
+test("unchanged AUTO_MERGE mismatch takes held-skip until its fingerprint changes", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const autoMerge = await git(receiver, "rev-parse", `${c1}^{tree}`);
+  await fs.writeFile(path.join(receiver, ".git", "AUTO_MERGE"), `${autoMerge}\n`);
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(first.outcome.attempt?.repo?.blockers).toContainEqual(expect.objectContaining({
+    provenance: "checkout", reason: "local-operation",
+  }));
+  const saved = await landOutcome(state, first.outcome, 2);
+  let capabilityCalls = 0;
+  const retried = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(capabilityCalls).toBe(0);
+
+  await fs.rm(path.join(receiver, ".git", "AUTO_MERGE"));
+  const changed = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(changed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+});
 
 test("design 176 v6: unchanged local-index hold is eligible for held-skip", async () => {
   const { state, incoming } = await baseAndIncoming();

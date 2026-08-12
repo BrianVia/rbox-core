@@ -27,6 +27,7 @@ const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commi
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
 const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
+const localOperation: TypedBlocker = { provenance: "checkout", reason: "local-operation" };
 const ownership: TypedBlocker = {
   provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/topic",
 };
@@ -35,7 +36,7 @@ test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
   expect(heldBlockersAllowSkip([localCommit, localStash])).toBe(true);
   expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
-  expect(heldBlockersAllowSkip([localCommit, localStash, localIndex])).toBe(true);
+  expect(heldBlockersAllowSkip([localCommit, localStash, localIndex, localOperation])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);
   expect(heldBlockersAllowSkip([ownership])).toBe(true);
   expect(heldBlockersAllowSkip([ownership], { RBOX_GIT_OWNERSHIP_HELD_SKIP: "0" })).toBe(false);
