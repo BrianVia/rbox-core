@@ -15,17 +15,23 @@ export const formatCommitTimings = (t: CommitTimings): string =>
 const formatServerTimings = (t: CommitTimings["serverTimings"]): string =>
   t ? ` srv${fmtDetailSeconds(t.totalMs)} env${fmtDetailSeconds(t.envelopeMs)} acct${fmtDetailSeconds(t.accountingMs)} ssc${fmtDetailSeconds(t.sidecarMs)} cm${fmtDetailSeconds(t.commitMs)} mir${fmtDetailSeconds(t.mirrorMs)} rsp${fmtDetailSeconds(t.responseMs)}` : "";
 export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}${typeof t.foldLinks === "number" ? ` f${t.foldLinks}` : ""}` : ""}`;
-/** Design 85 §6.1: the scan details carry an explicit residual (wall minus the
- *  five timed components — allocation, path construction, readlink, cache lookup,
- *  loop overhead) and the mid-write deferral count from the P-1 guard. */
-export type ScanDetails = ScanStats & { residualMs: number; midwriteDeferred: number };
+/** Design 232 §4.1: scanManifest owns the monotonic all-attempt wall and the
+ * fixed residual decomposition. The wall argument remains a compatibility
+ * fallback for synthetic/older ScanStats producers. */
+export type ScanDetails = ScanStats & { midwriteDeferred: number };
 export const scanDetailsOf = (s: ScanStats, wallMs: number, midwriteDeferred: number): ScanDetails => ({
   ...s,
-  residualMs: Math.max(0, wallMs - (s.readdirMs + s.statMs + s.matcherMs + s.hashMs + s.sortMs)),
+  residualMs: s.attemptCount > 0
+    ? s.residualMs
+    : Math.max(0, wallMs - (s.readdirMs + s.statMs + s.matcherMs + s.hashMs + s.sortMs)),
   midwriteDeferred,
 });
+const formatResidualBuckets = (s: ScanStats["residualBuckets"]): string =>
+  `rpre${fmtDetailSeconds(s.rulePrevalidationMs)} rpost${fmtDetailSeconds(s.rulePostvalidationMs)} rbuild${fmtDetailSeconds(s.ruleRebuildMs)} dir${fmtDetailSeconds(s.directoryMs)} path${fmtDetailSeconds(s.pathMs)} git${fmtDetailSeconds(s.gitDiscoveryMs)} sym${fmtDetailSeconds(s.symlinkMs)} obs${fmtDetailSeconds(s.observerMs)} ent${fmtDetailSeconds(s.entryMs)} ctl${fmtDetailSeconds(s.controlMs)} fin${fmtDetailSeconds(s.finalizationMs)}`;
+const formatAttempt = (attempt: ScanStats["attempts"][number], index: number): string =>
+  `a${index + 1}[${attempt.mode} wall${fmtDetailSeconds(attempt.scanWallMs)} rd${fmtDetailSeconds(attempt.readdirMs)} st${fmtDetailSeconds(attempt.statMs)} mt${fmtDetailSeconds(attempt.matcherMs)} h${fmtDetailSeconds(attempt.hashMs)} srt${fmtDetailSeconds(attempt.sortMs)} res${fmtDetailSeconds(attempt.residualMs)} ${formatResidualBuckets(attempt.residualBuckets)}]`;
 export const formatScanStats = (s: ScanDetails): string =>
-  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred} reuse${s.dirsReusedFromCache} dc:${s.dircacheOutcome}`;
+  `wall${fmtDetailSeconds(s.scanWallMs)} rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} ${formatResidualBuckets(s.residualBuckets)} attempts${s.attemptCount} ${s.attempts.map(formatAttempt).join(" ")} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred} reuse${s.dirsReusedFromCache} dc:${s.dircacheOutcome}`;
 /** mk=mkdir/cr=created, walk=dir components, uniq=dirs, ls=lstat, rn=rename,
  * stg=stages, pre=preflight, pool=write pool, sm/lg=count and bytes. */
 export const formatApplyStats = (s: ApplyStats): string =>

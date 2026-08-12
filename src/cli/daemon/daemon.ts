@@ -2361,6 +2361,7 @@ export class RboxDaemon {
         activePumpOp: this.activePumpOp,
         want: this.want,
         watcherDegraded: this.watcherDegraded,
+        trustState: this.trustState,
         ownershipLost: this.ownershipWindDownStarted,
         currentPath: this.activeProgressPath,
         repoRecords: this.syncBase ? projectedRepoRecords(this.syncBase) : undefined,

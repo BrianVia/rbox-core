@@ -103,7 +103,7 @@ test("PID and binding record formats use one explicit compatibility matrix", () 
 });
 
 test("one closed observation proves process, binding, boot, freshness, version, and mode", () => {
-  expect(observedDaemon()).toMatchObject({
+  expect(observedDaemon({ ambient: status({ watcherTrust: "fused" }) })).toMatchObject({
     ownership: "owned",
     running: true,
     pid: 42,
@@ -114,6 +114,7 @@ test("one closed observation proves process, binding, boot, freshness, version, 
     ambientTrust: "trusted",
     version: "2.0.0",
     mode: "read-write",
+    trustedAmbient: { watcherTrust: "fused" },
   });
 });
 
@@ -190,7 +191,7 @@ test("ambient trust rejects every unsupported incarnation and clock state", () =
     ["corrupt", { kind: "corrupt" }],
     ["ambient-boot-unbound", status({ bootId: undefined })],
     ["boot-mismatch", status({ bootId: "boot-old" })],
-    ["stale", status({ heartbeatAt: new Date(NOW - AMBIENT_STATUS_STALE_MS - 1).toISOString() })],
+    ["stale", status({ heartbeatAt: new Date(NOW - AMBIENT_STATUS_STALE_MS - 1).toISOString(), watcherTrust: "fused" })],
     ["future", status({ heartbeatAt: new Date(NOW + DAEMON_HEARTBEAT_FUTURE_SKEW_MS + 1).toISOString() })],
   ];
   for (const [trust, ambient] of rows) {

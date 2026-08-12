@@ -164,12 +164,16 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const running = observedDaemon.running && !observedDaemon.stale;
   const daemonVersion = observedDaemon.version;
   const daemonMode: DaemonMode | undefined = observedDaemon.mode;
+  // Trust visibility is admitted only through observation's live-incarnation,
+  // current-workspace, fresh-heartbeat ambient proof.
+  const watcherTrust = observedDaemon.trustedAmbient?.watcherTrust;
   const daemon: StatusDaemonProjection = {
     running,
     ...(observedDaemon.pid === undefined ? {} : { pid: observedDaemon.pid }),
     stale: observedDaemon.stale,
     version: daemonVersion,
     mode: daemonMode,
+    ...(watcherTrust === undefined ? {} : { watcherTrust }),
     versionSkew: daemonVersion !== undefined && daemonVersion !== RBOX_VERSION,
   };
   const common: StatusProjectionCommon = {

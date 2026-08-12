@@ -69,6 +69,7 @@ interface SafetyInternals {
   churnSinceSafety: boolean;
   watcherHealthy: boolean;
   trustState: "trusted" | "suspect" | "fused";
+  ambientStatusFrom(activity: { at: string }, settled: boolean, now: number): { watcherTrust?: "suspect" | "fused" };
   watcherErrorGeneration: number;
   lastTransientDropMs: number;
   recoveryHoldMs: number;
@@ -392,6 +393,7 @@ test("a transient post-init watcher error is suspect and recoverable with the fl
     await daemon.startLiveWatch();
     onError!(new Error("Events were dropped by the FSEvents client. File system must be re-scanned."));
     expect(daemon.trustState).toBe("suspect");
+    expect(daemon.ambientStatusFrom({ at: new Date().toISOString() }, true, Date.now()).watcherTrust).toBe("suspect");
     expect(daemon.watcherHealthy).toBe(false);
     daemon.lastTransientDropMs -= daemon.recoveryHoldMs;
     daemon.maybeClearWatcherDegradedAfterScan(daemon.watcherErrorGeneration, { coverage: "full-tree", errorGenAtStart: daemon.watcherErrorGeneration });

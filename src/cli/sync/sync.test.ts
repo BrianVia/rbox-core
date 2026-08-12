@@ -1792,6 +1792,8 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   // encrypt, wire on upload — each strictly positive for a real one-file push.
   expect(j.phases.scan!.plaintextBytes).toBe(Buffer.byteLength(content));
   expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "attemptCount",
+    "attempts",
     "dircacheOutcome",
     "dirsReusedFromCache",
     "dirsWalked",
@@ -1802,7 +1804,9 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
     "matcherMs",
     "midwriteDeferred",
     "readdirMs",
+    "residualBuckets",
     "residualMs",
+    "scanWallMs",
     "sortMs",
     "statMs",
   ]);
@@ -1844,6 +1848,8 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   expect(j.blobs).toBe(1); // one write action applied
   expect(Object.keys(j.phases.latest!.details ?? {}).sort()).toEqual(["decryptMs", "downloadMs", "encBytes", "parseMs"]);
   expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "attemptCount",
+    "attempts",
     "dircacheOutcome",
     "dirsReusedFromCache",
     "dirsWalked",
@@ -1854,7 +1860,9 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
     "matcherMs",
     "midwriteDeferred",
     "readdirMs",
+    "residualBuckets",
     "residualMs",
+    "scanWallMs",
     "sortMs",
     "statMs",
   ]);

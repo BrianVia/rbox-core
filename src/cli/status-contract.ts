@@ -5,7 +5,7 @@ import type { DaemonActivity } from "./activity.js";
 import type { AccountSummary } from "./account-cmd.js";
 import type { GitDeferral, SyncState, WorkspaceConfig } from "./config.js";
 import type { CredentialLoadResult, Credentials } from "./credentials.js";
-import type { DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonMode, WatcherTrust } from "./daemon/ambient-status.js";
 import type { AmbientWorkspaceObservation } from "./workspace-observation.js";
 import type { PathWarningsV1 } from "./path-warnings.js";
 import type { PopulateStatusV1 } from "./populate-status.js";
@@ -147,6 +147,7 @@ export interface StatusDaemonProjection {
   stale: boolean;
   version?: string;
   mode?: DaemonMode;
+  watcherTrust?: WatcherTrust;
   versionSkew: boolean;
 }
 
