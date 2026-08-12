@@ -20,14 +20,14 @@ its design doc. Updated 2026-06-29. Shipped work lives in `docs/learnings.md` +
 ## 🔴 P0 — next, server-side throughput (the big wins)
 | # | Item | Design | One-liner |
 |---|------|--------|-----------|
-| 1 | Upload receipts + commit-time batched accounting | [`design/23-upload-receipts.md`](design/23-upload-receipts.md) | PUT → ~R2-only; account once at commit. Kills ~5 D1 trips/blob. **Biggest win.** |
-| 2 | blobRefs → R2 sidecar | [`design/24-blobref-sidecar.md`](design/24-blobref-sidecar.md) | Move the ref list out of the signed commit body; unlocks 50k-file repos. |
+| 1 | Upload receipts + commit-time batched accounting **✅ SHIPPED (v0.2.0)** | [`design/23-upload-receipts.md`](design/23-upload-receipts.md) | PUT → ~R2-only; account once at commit. Kills ~5 D1 trips/blob. **Biggest win.** |
+| 2 | blobRefs → R2 sidecar **✅ SHIPPED** | [`design/24-blobref-sidecar.md`](design/24-blobref-sidecar.md) | Move the ref list out of the signed commit body; unlocks 50k-file repos. |
 | 3 | Server timing / observability **✅ SHIPPED** | [`design/25-server-observability.md`](design/25-server-observability.md) | Done (`babacb3`): `metrics.ts` (OpSpan + D1-binding proxy + `startOp`), instrumented request/commit/blob.*/multipart.*; → Analytics Engine. Live baseline: `blob.put` = **7 D1 calls, ~956ms (89% of its time)** — §23's target. Schema+SQL: [`observability-server-metrics.md`](observability-server-metrics.md). |
 
 ## 🟠 P1 — after P0 measurements
 | # | Item | Design | One-liner |
 |---|------|--------|-----------|
-| 4 | Small-blob batch upload endpoint | [`design/26-batch-upload.md`](design/26-batch-upload.md) | K tiny blobs per request → fewer HTTP/auth/Worker round-trips. Depends on #1. |
+| 4 | Small-blob batch upload endpoint **✅ SHIPPED (design 112, `/v1/blob-batch/put`)** | [`design/26-batch-upload.md`](design/26-batch-upload.md) | K tiny blobs per request → fewer HTTP/auth/Worker round-trips. Depends on #1. |
 | 5 | Short-lived download capabilities | [`design/27-download-capabilities.md`](design/27-download-capabilities.md) | Batch GET tokens so pull doesn't do a D1 entitlement read per blob. |
 | 6 | Account-hot metadata path | _stub below_ | If multi-tenant load appears: Account DO SQLite / sharded D1 for blob_refs+usage (D1 is single-threaded per DB). |
 
