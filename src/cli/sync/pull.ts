@@ -443,6 +443,7 @@ export async function applyPulledManifest(
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
   report.appendDetails("git-apply", { oracle: oracleMetrics }, formatPullOracleMetrics(oracleMetrics));
+  const casStepMs: Record<string, number> = {};
   let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
@@ -476,8 +477,18 @@ export async function applyPulledManifest(
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-  })), { mutationBoundary: deps.mutationBoundary });
+  })), {
+    mutationBoundary: deps.mutationBoundary,
+    observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
+  });
+  if (report.enabled) {
+    const casSummary = Object.entries(casStepMs).filter(([, ms]) => ms > 0)
+      .map(([step, ms]) => `${step}${(ms / 1000).toFixed(1)}`).join(" ");
+    report.appendDetails("state-save", { cas: casStepMs }, casSummary ? `cas ${casSummary}` : undefined);
+  }
+  const settleT0 = Date.now();
   savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
+  if (report.enabled) report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);
   try {
     deps.onGitDeferralsSaved?.(savedState);
   } catch {
