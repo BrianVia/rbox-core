@@ -203,7 +203,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "config add",
     group: "GETTING STARTED",
-    summary: "add a bound folder to this machine's configuration",
+    summary: "add an existing synced folder to this machine's configuration",
     usage: "rbox config add <path>",
   },
   // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
