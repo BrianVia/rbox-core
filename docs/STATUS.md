@@ -5,6 +5,16 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_ROUND-6 THREAD STATE (09:25Z): sender cycle-join fix landed (0424ad12f)
+but n=1 rerun shows write@09:20 never matched a publish; desktop
+propagation_trace shows the daemon pumping every ~3-4s (cycle 1083+ in 78min)
+REPUBLISHING sequence 1754 as no-op pushes — either session-churn-fed or a
+real busy-loop; ALSO possible K5 join over-strictness when sequences repeat.
+NEXT STINT: (1) read the 09:20-09:25 trace window + push logs to split
+busy-loop vs churn and find where the bench write's commit went; (2) loosen
+join if needed; (3) 30-attempt Monitor run; (4) Mac still unreachable —
+post-#637 traced build pending there._
+
 _ROUND-6 FIRST LIGHT (2026-08-12 ~08:12Z, desktop→FM, post-#637 traced
 daemons): END-TO-END 109s. Hops: settle→push-begin 44.7s; push op itself
 125.6s (git-plan sweep over ~100 repos — the real-fleet cost containers never
