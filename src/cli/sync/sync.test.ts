@@ -1844,7 +1844,7 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   await pull(root, cfg, { remote, backoff: noBackoff, report });
 
   const j = report.toJSON();
-  expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "scan", "state-load", "state-save"]);
+  expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "reconcile", "scan", "state-load", "state-save", "validate"]);
   expect(j.blobs).toBe(1); // one write action applied
   expect(Object.keys(j.phases.latest!.details ?? {}).sort()).toEqual(["decryptMs", "downloadMs", "encBytes", "parseMs"]);
   expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([

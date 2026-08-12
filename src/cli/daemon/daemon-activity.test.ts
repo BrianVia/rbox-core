@@ -936,6 +936,78 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("theirs");
 });
 
+test.serial("propagation tracing enables pull phases with metrics and telemetry off, while trace-off emits nothing", async () => {
+  const previousTrace = process.env.RBOX_TRACE_PROPAGATION;
+  const previousMetrics = process.env.RBOX_METRICS;
+  const previousTelemetry = process.env.RBOX_TELEMETRY;
+  process.env.RBOX_METRICS = "0";
+  process.env.RBOX_TELEMETRY = "0";
+  try {
+    process.env.RBOX_TRACE_PROPAGATION = "1";
+    const tracedLogs: string[] = [];
+    const tracedRemote = new MiniRemote();
+    tracedRemote.injectCommit([]);
+    const traced = await makeDaemon(tracedRemote, "trace-on", { log: (line) => tracedLogs.push(line) });
+    traced.want.pull = true;
+    await traced.pump();
+    const applyLine = tracedLogs.find((line) => line.startsWith("propagation_receive ") && line.includes('"event":"apply_complete"'))!;
+    const apply = JSON.parse(applyLine.slice("propagation_receive ".length)) as { phase_ms?: Record<string, number> };
+    expect(apply.phase_ms).toEqual(expect.objectContaining({
+      validate: expect.any(Number),
+      reconcile: expect.any(Number),
+      "git-apply": expect.any(Number),
+    }));
+
+    await traced.stop();
+    delete process.env.RBOX_TRACE_PROPAGATION;
+    const untracedLogs: string[] = [];
+    tracedRemote.injectCommit([]);
+    const untraced = await makeDaemon(tracedRemote, "trace-off", { log: (line) => untracedLogs.push(line) });
+    untraced.want.pull = true;
+    await untraced.pump();
+    expect(untracedLogs.filter((line) => line.startsWith("propagation_receive "))).toEqual([]);
+  } finally {
+    if (previousTrace === undefined) delete process.env.RBOX_TRACE_PROPAGATION; else process.env.RBOX_TRACE_PROPAGATION = previousTrace;
+    if (previousMetrics === undefined) delete process.env.RBOX_METRICS; else process.env.RBOX_METRICS = previousMetrics;
+    if (previousTelemetry === undefined) delete process.env.RBOX_TELEMETRY; else process.env.RBOX_TELEMETRY = previousTelemetry;
+  }
+});
+
+test.serial("push-conflict recovery adoption keeps the bare apply-complete record", async () => {
+  const previousTrace = process.env.RBOX_TRACE_PROPAGATION;
+  process.env.RBOX_TRACE_PROPAGATION = "1";
+  try {
+    const logs: string[] = [];
+    const remote = new MiniRemote();
+    const daemon = await makeDaemon(remote, "recovery-trace", { log: (line) => logs.push(line) });
+    await fs.writeFile(path.join(root, "a.txt"), "mine");
+    daemon.local.head = await scanManifest(root);
+    daemon.want.push = true;
+    await daemon.pump();
+
+    const current = (await remote.latest()).manifest.files;
+    remote.injectCommit([...current, await remote.seedEntry("b.txt", "theirs")]);
+    await fs.writeFile(path.join(root, "c.txt"), "more local work");
+    daemon.local.head = await scanManifest(root);
+    daemon.want.push = true;
+    await daemon.pump();
+
+    const records = logs
+      .filter((line) => line.startsWith("propagation_receive ") && line.includes('"event":"apply_complete"'))
+      .map((line) => JSON.parse(line.slice("propagation_receive ".length)) as {
+        v: number;
+        event: string;
+        adopted_sequence: number;
+        phase_ms?: Record<string, number>;
+      });
+    expect(records).toContainEqual({ v: 1, event: "apply_complete", adopted_sequence: 2 });
+    expect(records.some((record) => "phase_ms" in record)).toBe(false);
+  } finally {
+    if (previousTrace === undefined) delete process.env.RBOX_TRACE_PROPAGATION; else process.env.RBOX_TRACE_PROPAGATION = previousTrace;
+  }
+});
+
+
 // Design 46: the daemon renders the prompt sidecar (`shell.line`) alongside every
 // activity.json write, from the SAME record on the SAME ordered chain. The zsh prompt
 // hook just reads it, so these assertions guard the fields it depends on.

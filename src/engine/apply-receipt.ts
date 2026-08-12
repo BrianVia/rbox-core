@@ -26,6 +26,11 @@ export interface AppliedManifestOracle {
   receiptHash(rel: string): string | undefined;
 }
 
+export type PullOracleObservation =
+  | { kind: "prepare"; ms: number; entriesIndexed: number }
+  | { kind: "receipt-hash"; ms: number }
+  | { kind: "repo-proved" };
+
 export interface ReceiverEquivalence {
   caseAliases: boolean;
   unicodeAliases: boolean;
@@ -360,6 +365,7 @@ class ManifestOracle implements AppliedManifestOracle {
     private readonly scanDeferred: ReadonlySet<string>,
     private readonly dircache?: DirCache,
     private readonly preScanHashCache?: HashCache,
+    private readonly observer?: (observation: PullOracleObservation) => void,
   ) {}
 
   receiptHash(rel: string): string | undefined {
@@ -367,11 +373,12 @@ class ManifestOracle implements AppliedManifestOracle {
   }
 
   proveRepo(rel: string): Promise<OracleVerdict> {
-    return this.serial(rel, () => this.proveFresh(rel));
+    const proof = this.serial(rel, () => this.proveFresh(rel));
+    return this.observer ? proof.finally(() => this.observe({ kind: "repo-proved" })) : proof;
   }
 
   reproveRepo(rel: string): Promise<OracleVerdict> {
-    return this.serial(rel, async () => {
+    const proof = this.serial(rel, async () => {
       const prior = this.records.get(rel);
       if (!prior?.tokens || prior.verdict.kind !== "match") return this.proveFresh(rel);
       try {
@@ -384,6 +391,15 @@ class ManifestOracle implements AppliedManifestOracle {
         return this.settle(rel, verdict);
       }
     });
+    return this.observer ? proof.finally(() => this.observe({ kind: "repo-proved" })) : proof;
+  }
+
+  private observe(observation: PullOracleObservation): void {
+    try {
+      this.observer?.(observation);
+    } catch {
+      // Observation cannot affect receipt proof or pull correctness.
+    }
   }
 
   private serial(rel: string, run: () => Promise<OracleVerdict>): Promise<OracleVerdict> {
@@ -413,14 +429,32 @@ class ManifestOracle implements AppliedManifestOracle {
 
   private getPrepared(): NonNullable<ManifestOracle["prepared"]> {
     if (this.prepared) return this.prepared;
+    const startedAt = this.observer ? performance.now() : undefined;
     const source = this.source();
-    return this.prepared = {
+    const prepared = {
       expectedMap: indexByPath(source.expected),
       oracleMap: indexByPath(this.oracleManifest),
       preMap: indexByPath(source.preScan),
       touched: source.touched,
       ...(source.invalidWhy ? { invalidWhy: source.invalidWhy } : {}),
     };
+    this.prepared = prepared;
+    if (startedAt !== undefined) {
+      this.observe({
+        kind: "prepare",
+        ms: performance.now() - startedAt,
+        entriesIndexed: prepared.expectedMap.size + prepared.oracleMap.size + prepared.preMap.size,
+      });
+    }
+    return prepared;
+  }
+
+  private receipt(kind: "pull" | "state", rel: string, expected: FileEntry[], observed: FileEntry[]): string {
+    if (!this.observer) return canonicalReceipt(kind, rel, expected, observed);
+    const startedAt = performance.now();
+    const hash = canonicalReceipt(kind, rel, expected, observed);
+    this.observe({ kind: "receipt-hash", ms: performance.now() - startedAt });
+    return hash;
   }
 
   private project(rel: string, eq: ReceiverEquivalence): Projected | OracleVerdict {
@@ -503,7 +537,7 @@ class ManifestOracle implements AppliedManifestOracle {
       inventory.tokens.entries.set(actual.path, verified.token);
     }
 
-    const receiptHash = canonicalReceipt(this.kind, rel, projected.oracle, projected.expected);
+    const receiptHash = this.receipt(this.kind, rel, projected.oracle, projected.expected);
     this.records.set(rel, { verdict: semantic, receiptHash, tokens: semantic.kind === "match" ? inventory.tokens : undefined });
     return semantic;
   }
@@ -631,7 +665,7 @@ class ManifestOracle implements AppliedManifestOracle {
     if (verdict.kind === "indeterminate") {
       return this.settle(rel, verdict);
     }
-    const receiptHash = canonicalReceipt(this.kind, rel, projected.oracle, scanned.files);
+    const receiptHash = this.receipt(this.kind, rel, projected.oracle, scanned.files);
     this.records.set(rel, { verdict, receiptHash, tokens: verdict.kind === "match" ? scanned.tokens : undefined });
     return verdict;
   }
@@ -723,6 +757,7 @@ export function oracleFromPull(opts: {
   hashcache?: HashCache;
   root: string;
   scanDeferred: ReadonlySet<string>;
+  observer?: (observation: PullOracleObservation) => void;
 }): AppliedManifestOracle {
   const source = (): ReceiptSource => {
     const preApply = indexByPath(opts.preScan);
@@ -752,7 +787,7 @@ export function oracleFromPull(opts: {
       ...(invalidWhy ? { invalidWhy } : {}),
     };
   };
-  return new ManifestOracle("pull", opts.root, opts.matcher, source, opts.oracle, opts.scanDeferred, opts.dircache, opts.hashcache);
+  return new ManifestOracle("pull", opts.root, opts.matcher, source, opts.oracle, opts.scanDeferred, opts.dircache, opts.hashcache, opts.observer);
 }
 
 export function oracleFromState(opts: {

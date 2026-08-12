@@ -192,7 +192,14 @@ async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parce
   return d;
 }
 
-const pullLine = (): string | undefined => lines.find((l) => l.startsWith("pull local="));
+const pullLine = (): string | undefined => {
+  const found = lines.find((l) => l.startsWith("pull local="));
+  // CI-only forensics for the design-202 cluster: when the trusted log line is
+  // missing, dump the whole captured daemon log so the failing environment
+  // names the branch it actually took. Remove once the shard-5 failure is root-caused.
+  if (found === undefined) console.error(`FORENSIC pull-line-missing lines=${JSON.stringify(lines)}`);
+  return found;
+};
 
 // ── 1. P-matrix + 206 test 5 skip-cause matrix ────────────────────────────────
 test("design 202 P-matrix: every condition independently false drops the pull back to the scan path, naming its clause", async () => {

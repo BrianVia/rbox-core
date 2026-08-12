@@ -2070,7 +2070,7 @@ export class RboxDaemon {
       },
       open: () => {
         const metricsReport = beginReport("pull");
-        const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
+        const report = metricsReport ?? (telemetryEnabled() || this.propagationTrace ? PhaseReport.pull() : undefined);
         // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
         // onPullApplied carries BOTH the forensic log line and the status trail — wired
         // here and in doPush's deps so the pull inside push's 409 recovery is recorded
@@ -2084,10 +2084,10 @@ export class RboxDaemon {
           onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
           onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
           onPullApplied: (a) => this.recordPullApplied(a),
-          onPullAdopted: (adoptedSequence) => {
+          onPullAdopted: (adoptedSequence, phaseMs) => {
             this.creditAppliedCarrier(activeCarrier);
             activeCarrier = "none";
-            this.recordPullAdopted(adoptedSequence);
+            this.recordPullAdopted(adoptedSequence, phaseMs);
           },
           onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
           telemetry: this.telemetry,
@@ -2606,9 +2606,9 @@ export class RboxDaemon {
   }
 
   /** Durable remote-sequence adoption, including Git-ref-only pulls with no file actions. */
-  private recordPullAdopted(adoptedSequence: number): void {
+  private recordPullAdopted(adoptedSequence: number, phaseMs?: Record<string, number>): void {
     this.log(`pull apply complete ADOPTED sequence ${adoptedSequence}`);
-    this.propagationTrace?.applyComplete(adoptedSequence);
+    this.propagationTrace?.applyComplete(adoptedSequence, phaseMs);
   }
 
   private raiseQueuedCarrier(carrier: Carrier): void {
