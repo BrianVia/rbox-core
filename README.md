@@ -20,7 +20,7 @@ rbox setup
 
 `rbox setup` is the guided wizard: it signs this machine in (or creates an account), sets up encryption on the first machine, creates or joins a workspace, and offers to start background sync. Bare `rbox` (no args) opens the same menu.
 
-A **workspace** can be a single repository or a folder of many repositories, or just a folder — it's whatever directory rbox keeps in sync across your machines.
+A **synced folder** can be a single repository or a folder of many repositories, or just a folder — it's whatever directory rbox keeps in sync across your machines. Which folders this machine syncs, and with what options, is listed in `~/.rbox/config.json`; run `rbox config` to see it.
 
 Prefer flags for CI/scripting? `rbox init` is the headless form of `setup` (see [`docs/usage.md`](docs/usage.md)).
 
@@ -72,6 +72,7 @@ short and store it only where you would store a root-equivalent CI secret.
 - **Local trash tier.** Destructive pulls move files to a recoverable local trash (`rbox trash list|restore|empty`) instead of deleting outright.
 - **Autostart.** `rbox autostart enable` resumes background sync after a reboot or re-login.
 - **Local export.** `rbox export` decrypts workspaces locally and writes a directory or `.tar.gz`.
+- **One readable config file.** `~/.rbox/config.json` is the authority for which folders this machine syncs and their options — inspect it with `rbox config`, edit it by hand, or repair it with `rbox config add|regenerate|repair`.
 
 Run `rbox help` for the full command list, or [`docs/usage.md`](docs/usage.md) for the narrative guide.
 
@@ -106,7 +107,7 @@ The blob layer is content-addressed: a file's identity is `sha256(bytes)`, so de
 
 Two independent pipelines — don't conflate them:
 
-- **API (`apps/api`) → prod on merge that touches `apps/api/**`.** The control-plane Worker (`rbox-prod-api`, serving `api.rbox.to`) deploys via **Cloudflare's native GitHub integration (Workers Builds)** — *not* a GitHub Action. The build is **path-filtered** (configured in the Cloudflare Workers Builds settings, not in this repo): a merge to `main` triggers a prod build+deploy **only when it changes files under `apps/api/**`**; docs- or CLI-only merges are no-ops for prod. There is no separate deploy step and no approval gate: an `apps/api`-touching merge == prod deploy. Each such deploy **restarts the `WorkspaceSync` Durable Object**, so any DO change (or bug) is live on the next `apps/api` merge — and a restart mid-commit must be safe. That is exactly what design 91 guarantees: the head is DO-authoritative and fail-closed, so a restart can never regress it (worst case it serves `repair_required`, never a silent fork). The dev Worker (`rbox-dev-api`, its own D1/R2 and a *separate* `WorkspaceSync` namespace) builds from the same connection; keep `RBOX_API` pointed at prod for any real workspace — the two namespaces do not share a head.
+- **API (`apps/api`) → dev on merge to `main`, prod only on an explicit promotion.** A merge to `main` auto-deploys the **dev** Worker (`rbox-dev-api`) through the Cloudflare Workers Builds git integration. Production (`rbox-prod-api`, serving `api.rbox.to`) ships only when someone fast-forwards the `production` branch (`git push origin main:production`), which runs the test-gated `.github/workflows/deploy-api.yml`: typecheck + API tests, then D1 migrations, then deploy. The production Workers Builds integration is deliberately **disconnected** so a promotion cannot race it. Each prod deploy **restarts the `WorkspaceSync` Durable Object**, so any DO change (or bug) is live on the next promotion — and a restart mid-commit must be safe. That is exactly what design 91 guarantees: the head is DO-authoritative and fail-closed, so a restart can never regress it (worst case it serves `repair_required`, never a silent fork). The dev Worker has its own D1/R2 and a *separate* `WorkspaceSync` namespace; keep `RBOX_API` pointed at prod for any real workspace — the two namespaces do not share a head. Canonical detail: [`docs/DEPLOYMENTS.md`](docs/DEPLOYMENTS.md).
 - **CLI binaries → R2 on `v*` tag.** The `rbox` binaries are a separate GitHub Actions pipeline (`.github/workflows/release.yml`) triggered by pushing a `v*` tag; it signs the version manifest and publishes to the `rbox-releases` bucket, which `rbox upgrade` verifies. See [`docs/cicd-release-setup.md`](docs/cicd-release-setup.md).
 
 ## Docs
@@ -115,5 +116,6 @@ Two independent pipelines — don't conflate them:
 - [`docs/pricing.md`](docs/pricing.md) — plans
 - [`docs/development.md`](docs/development.md) — building, testing, and benchmarking rbox (contributors)
 - [`docs/diagnostics.md`](docs/diagnostics.md) — `rbox doctor` and the opt-in support-report flow
+- [`docs/DEPLOYMENTS.md`](docs/DEPLOYMENTS.md) — canonical record of how each surface ships
 - [`docs/design/`](docs/design/) — one spec per design
 - [`CHANGELOG.md`](CHANGELOG.md) — release highlights
