@@ -84,8 +84,19 @@ Brian's preferred loop — follow it unless told otherwise:
    `/thermo-nuclear-code-quality-review` to refresh the ranked refactor
    roadmap — it supersedes ad-hoc `/antislop-codebase` runs; act on the
    roadmap one decomposition cycle at a time.
-6. Merge only after all CI is green and no remaining issues are found.
-7. (Optional) release a new CLI build if the change warrants it
+6. Run `bun run lint:affected` (also wired into `.githooks/pre-commit`,
+   non-blocking) and address what it flags in the files you touched. The
+   vendored anti-slop oxlint plugin (`tools/oxlint/anti-slop/`,
+   `.oxlintrc.json`) runs repo-wide at `"warn"` — deliberately not `"error"`,
+   since the codebase currently carries ~3,900 pre-existing hits — but
+   `bun run lint` uses `--quiet` and hides warnings entirely so CI stays
+   green. `lint:affected` lints only the files changed vs `origin/main`
+   without `--quiet`, so its findings are the ones worth fixing now: this is
+   how the codebase improves incrementally instead of needing a dedicated
+   cleanup effort. Don't launder a warning away (unsafe cast, suppression
+   comment) just to silence it — fix the pattern or leave it for a real fix.
+7. Merge only after all CI is green and no remaining issues are found.
+8. (Optional) release a new CLI build if the change warrants it
    (`docs/DEPLOYMENTS.md` has the release flow).
 
 ## Module ownership map (docs/CODEMAP.md)

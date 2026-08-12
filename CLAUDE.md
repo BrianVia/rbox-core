@@ -66,9 +66,11 @@ Always in a worktree (`.claude/worktrees/<slug>`), never the primary checkout.
 Design doc in `docs/design/N-title.md` → codex adversarial review loop
 (`/arbitrage`) until Claude + GPT align → implement via `codex exec` →
 validate for real (fleet dev build or test rig) → `/simplify` (diff-scoped)
-→ merge on green CI → optional CLI release. Periodically (not per-cycle):
-codex `/thermo-nuclear-code-quality-review` refreshes the structural-refactor
-roadmap — supersedes `/antislop-codebase`. Full version in AGENTS.md.
+→ `bun run lint:affected` (anti-slop warnings on your diff; non-blocking,
+also runs in `.githooks/pre-commit`) → merge on green CI → optional CLI
+release. Periodically (not per-cycle): codex `/thermo-nuclear-code-quality-review`
+refreshes the structural-refactor roadmap — supersedes `/antislop-codebase`.
+Full version in AGENTS.md.
 
 ## Deployments
 

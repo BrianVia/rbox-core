@@ -12,6 +12,7 @@
     "dev:install": "bun scripts/dev-install.ts",
     "lint": "oxlint --quiet .",
     "lint:fix": "oxlint --quiet --fix .",
+    "lint:affected": "bun scripts/lint-affected.ts",
     "test": "bun test ./src/ ./scripts/gc-drain.test.ts ./scripts/mutation-gate.test.ts ./scripts/bench/migration-baseline.test.ts",
     "test:api": "cd apps/api && vitest run",
     "test:affected": "bun scripts/test-affected.ts",

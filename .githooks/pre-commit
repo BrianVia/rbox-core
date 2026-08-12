@@ -14,4 +14,11 @@ if [ -z "$bun_bin" ]; then
   exit 1
 fi
 
-exec "$bun_bin" run lint
+"$bun_bin" run lint
+
+# Non-blocking: surfaces anti-slop's "warn"-level findings on just the files
+# you're committing, without --quiet, so they stay visible for incremental
+# cleanup instead of drowning in the ~3,900 pre-existing repo-wide hits (see
+# .oxlintrc.json). Warnings never fail this hook; only oxlint's "error" rules
+# (still gated above) do.
+exec "$bun_bin" run lint:affected
