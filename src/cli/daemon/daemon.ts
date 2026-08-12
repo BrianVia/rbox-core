@@ -1791,7 +1791,8 @@ export class RboxDaemon {
         onGitReposDiscovered: async (repos) => { await this.gitDiscovery.observe({ kind: "plan", repos }); },
         onGitBusyDeferred: (repos) => { if (repos.length > 0) this.noteGitBusyDeferred(); },
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
-        onPullApplied: (a, adoptedSequence) => this.recordPullApplied(a, adoptedSequence), // design 45: the 409-recovery pull mutates the tree too
+        onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
+        onPullAdopted: (adoptedSequence) => this.recordPullAdopted(adoptedSequence),
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
         telemetry: this.telemetry,
         mutationBoundary: this.mutationGate,
@@ -2078,10 +2079,11 @@ export class RboxDaemon {
           onGitLog: this.log,
           onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
           onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
-          onPullApplied: (a, adoptedSequence) => {
+          onPullApplied: (a) => this.recordPullApplied(a),
+          onPullAdopted: (adoptedSequence) => {
             this.creditAppliedCarrier(activeCarrier);
             activeCarrier = "none";
-            this.recordPullApplied(a, adoptedSequence);
+            this.recordPullAdopted(adoptedSequence);
           },
           onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
           telemetry: this.telemetry,
@@ -2582,10 +2584,8 @@ export class RboxDaemon {
   /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
    *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
    *  is the record that answers "did sync change/delete my files?" after the fact. */
-  private recordPullApplied(actions: Action[], adoptedSequence: number): void {
+  private recordPullApplied(actions: Action[]): void {
     this.log(`pull applied: ${summarizeActions(actions)}`);
-    this.log(`pull apply complete ADOPTED sequence ${adoptedSequence}`);
-    this.propagationTrace?.applyComplete(adoptedSequence);
     let writes = 0;
     let deletes = 0;
     let conflicts = 0;
@@ -2599,6 +2599,12 @@ export class RboxDaemon {
     this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts: conflicts + this.typeFlipsSincePull };
     this.typeFlipsSincePull = 0;
     this.activityDirty = true;
+  }
+
+  /** Durable remote-sequence adoption, including Git-ref-only pulls with no file actions. */
+  private recordPullAdopted(adoptedSequence: number): void {
+    this.log(`pull apply complete ADOPTED sequence ${adoptedSequence}`);
+    this.propagationTrace?.applyComplete(adoptedSequence);
   }
 
   private raiseQueuedCarrier(carrier: Carrier): void {

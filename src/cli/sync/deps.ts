@@ -123,9 +123,11 @@ export interface SyncDeps {
   /** Fired by EVERY pull that applied actions to the local tree — including the pull
    *  inside pushManifest's 409 recovery, whose actions the retry loop discards
    *  (design 45: the daemon's forensic log and activity trail must record
-   *  every local-tree mutation, whichever path performed it). The callback receives
-   *  the sequence from the durable post-apply state; callers must not re-read it. */
-  onPullApplied?: (actions: Action[], adoptedSequence: number) => void;
+   *  every local-tree mutation, whichever path performed it). */
+  onPullApplied?: (actions: Action[]) => void;
+  /** Fired after a pull durably adopts a sequence newer than its pre-pull base.
+   *  Unlike onPullApplied, this includes Git-ref-only pulls with no file actions. */
+  onPullAdopted?: (adoptedSequence: number) => void;
   /** Daemon-only terminal-halt hint. Foreground `rbox push` / `rbox sync` leaves this
    *  unset so an explicit user sync always makes a real attempt. */
   blockedFingerprint?: string;
