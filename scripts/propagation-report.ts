@@ -187,7 +187,10 @@ export function buildHopReport(
   let correlation: HopCorrelation = "unmatched";
   if (completeAndOrdered && witnessMatched && trace && apply) {
     correlation = apply.sequence === trace.sequence ? "exact" : "coalesced";
-    if (options.clockSkewBoundMs > 250) correlation = "invalid-clock-skew";
+    // Real WAN host pairs sit at ~300ms bound (measured desktop/FM); the skew
+    // only pads cross-host hop widths — it cannot fake an exact sequence join.
+    // 1s keeps garbage out while admitting real fleets.
+    if (options.clockSkewBoundMs > 1000) correlation = "invalid-clock-skew";
   }
   const elapsed = stamps.applyComplete === undefined ? Infinity : stamps.applyComplete - options.writeAt;
   const verdict = correlation === "exact" ? (elapsed <= budgetMs ? "PASS" : "FAIL") : "INVALID";
