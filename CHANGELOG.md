@@ -6,6 +6,20 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0-beta.2] - 2026-08-12
+
+### Fixed
+- Background sync no longer re-rings its own doorbell: the Linux git watcher
+  ignores rbox's own bookkeeping clicks, ending a no-op push loop (~3s cycle).
+- A folder with unfinished git work (e.g. a paused merge on another machine)
+  now costs milliseconds per sync instead of ~9 seconds — rbox remembers the
+  stuck state instead of re-checking it from scratch every time.
+- Unchanged git repos skip the per-repo work queues on both push and pull.
+
+### Added
+- Propagation measurement rig: per-hop timing with exact sequence
+  correlation; `rbox status` now names a degraded file-watcher outright.
+
 ## [2.0.0-beta.1] - 2026-08-11
 
 ### Changed

@@ -1,6 +1,6 @@
 /** The checked-in package version. The release workflow's consistency gate reads
  *  the first quoted string in this file, so keep this literal first. */
-const CHECKED_IN_RBOX_VERSION = "2.0.0-beta.1";
+const CHECKED_IN_RBOX_VERSION = "2.0.0-beta.2";
 
 declare const __RBOX_DEV_VERSION__: string | undefined;
 
