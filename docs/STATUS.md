@@ -5,6 +5,16 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_DECISIONS 2026-08-12 (founder): (1) RBOX_KEY posture — NOTHING leaked;
+keep the feature, add the leak-consequence warning to user docs, and epoch
+rotation (e2ee-remote.ts:748 stub) is a REQUIRED pre-2.0-GA design. (2) Four
+wholly-stale docs DELETED (rbox-architecture.md v1 draft, roadmap.md,
+go-live-todo.md, apps/web/README.md) — go-live-todo's live finding (the
+RBOX_KEY gate) is captured here. (3) Desktop rbox-core cleanup approved:
+sweep 22 stale agent worktrees + run git resolve + chase config-txn
+parse-error. (4) #632 help copy approved with one tweak (bound→existing
+synced folder)._
+
 _SESSION 2026-08-12: **v2.0.0-beta.1 LIVE on the next channel** (tag on
 af2168020 after fixing upgrade-test fixtures that choked on a prerelease
 checked-in version — parseSemver, not split-map). Propagation benchmarked on
