@@ -5,6 +5,18 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_ECHO LOOP FIXED + FIELD-VERIFIED (2026-08-12): #638 merged — owned-ref
+boundary suppresses the daemon's own packed-refs.lock click during scratch
+pins; reconcile-on-exit keeps design-175 latency for real changes; regression
+pair + design note 233. Deployed desktop+FM (2.0.0-beta.1-dev+7617c03);
+verified: push rate ~100/5min → 4-6/5min. POST-FIX BENCH (n=1, exact
+sequence join WORKS): end-to-end 127s = settle→push-begin 93s (push queued
+behind ambient scans — sender-side priority is the new named target) + push
+op 10.6s (was 125s in loop era) + WS 1.1s + FM apply 22s (res buckets on FM
+log will name it). Clock-skew gate needs slack (250ms too tight for real
+hosts). NEXT: 30-attempt authoritative run, hop attributions, THEN gated-
+mechanism verdicts. Mac still off-network._
+
 _BUSY-LOOP HUNT STATE (09:30Z, evidence-complete, cause one step away):
 Desktop loop STOPS when session commits stop (windows track my activity); FM
 loops INDEFINITELY with zero user activity — the clean specimen. FM trace:
