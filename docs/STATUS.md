@@ -25,7 +25,13 @@ chose next-channel v2.0.0-beta.1 for 2.0-dev distribution (tag needs fresh
 explicit yes). OPEN for founder: help copy at FOUNDER-SIGN-OFF comments;
 ruling that `git resolve show-me` requires admission; release note re one-time
 hashcache discard on upgrade. Deferred: generation-vs-recordFolder/untrack
-race fixtures. NOTE: long-running background tasks (codex + bun) were being
+race fixtures. FOLLOW-UPS from post-upgrade fleet watch: (1) desktop rbox-core
+git-sync chronically deferred — 22 stale agent-* worktrees in the primary
+checkout (one holds adopt-journal-batching, clean, 1 unmerged superseded
+commit); sweep + rbox git resolve WITH founder go; (2) `config disabled:
+parse-error` latch in engine/git/config-txn.ts survives daemon restart on the
+same repo — likely real validator bug, hunt separately; (3) FM local bun is
+canary (crashed its self-built daemon) — pin to stable or guard dev-install. NOTE: long-running background tasks (codex + bun) were being
 externally killed all evening on this host — cause unfound, worked around
 with short dispatches + foreground runs._
 
