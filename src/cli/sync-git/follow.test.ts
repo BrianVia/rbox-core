@@ -1733,7 +1733,7 @@ test("unchanged allowlisted hold skips before fetch and prep; a ref move resumes
   fetchToFile.mockRestore();
   const trace = skipped.logs.filter((line) => line.startsWith("git-sync held-trace "));
   expect(trace).toHaveLength(1);
-  expect(trace[0]).toMatch(/repo="repo" storedAttempt=1 earlySkip=1 matchConsulted=1 mismatch=none blocker=/);
+  expect(trace[0]).toMatch(/repo="repo" storedAttempt=1 earlySkip=1 matchConsulted=1 mismatch=none earlyReason=none blocker=/);
   expect(trace[0]).toMatch(/ allMs=\d+$/);
   for (const field of ["fetchDecryptMs", "verifyMs", "importMs", "classifyMs", "supersessionProofMs", "otherMs"]) {
     expect(trace[0]).toMatch(new RegExp(`${field}=\\d+`));
@@ -1750,6 +1750,58 @@ test("unchanged allowlisted hold skips before fetch and prep; a ref move resumes
   });
   expect(resumed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
   expect(capabilityCalls).toBeGreaterThan(0);
+});
+
+test("legacy held attempt upgrades after one late match, then early-skips without fetch", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree,
+    "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+
+  const initial = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  const initialAttempt = initial.outcome.attempt?.repo;
+  expect(initialAttempt?.classifierInputKey).toBeDefined();
+  if (!initialAttempt) throw new Error("expected held attempt");
+  const legacy = await landOutcome(state, initial.outcome, 2);
+  const persistedAttempt = repoRecordsForState(legacy).repo?.attempt;
+  if (!persistedAttempt) throw new Error("expected persisted held attempt");
+  delete persistedAttempt.classifierInputKey;
+  await saveStateUnsafeLegacyOrTest(workspace, legacy);
+
+  process.env.RBOX_TRACE_HELD = "1";
+  const fetch = spyOn(store, "get");
+  const fetchToFile = spyOn(store, "getToFile");
+  let fullPathCalls = 0;
+  const upgraded = await applyIncoming(legacy, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    afterHeldSkipPrepass: () => { fullPathCalls++; },
+  });
+  expect(upgraded.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(fullPathCalls).toBe(1);
+  expect(upgraded.outcome.attempt?.repo?.classifierInputKey).toBeDefined();
+  expect(upgraded.logs.find((line) => line.startsWith("git-sync held-trace ")))
+    .toMatch(/earlySkip=0 .*mismatch=none earlyReason=legacy-classifier-key /);
+
+  const modern = await landOutcome(legacy, upgraded.outcome, 3);
+  fetch.mockClear();
+  fetchToFile.mockClear();
+  const skipped = await applyIncoming(modern, incoming, matchingOracle, {
+    sourceGlobalSeq: 4,
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    afterHeldSkipPrepass: () => { fullPathCalls++; },
+  });
+  expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(fullPathCalls).toBe(1);
+  expect(fetch).not.toHaveBeenCalled();
+  expect(fetchToFile).not.toHaveBeenCalled();
+  expect(skipped.logs.find((line) => line.startsWith("git-sync held-trace ")))
+    .toMatch(/earlySkip=1 .*mismatch=none earlyReason=none /);
+  fetch.mockRestore();
+  fetchToFile.mockRestore();
 });
 
 test("held skip survives a higher-sequence transport recapture and retries a semantic change", async () => {

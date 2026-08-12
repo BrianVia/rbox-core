@@ -22,7 +22,7 @@ import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { blockersAfterComposer, createHeldAttempt, earlyHeldAttemptMatches, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldAttemptMismatchField, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
+import { blockersAfterComposer, createHeldAttempt, earlyHeldAttemptDecision, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldAttemptMismatchField, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
   recordOriginLineage,
@@ -44,6 +44,7 @@ interface HeldTraceAttempt {
   earlySkip: boolean;
   matchConsulted: boolean;
   mismatch: string;
+  earlyReason: string;
   blocker: string;
   supersessionProofMs: number;
 }
@@ -1117,8 +1118,13 @@ opts: {
       const priorFloorElapsed = priorAttempt !== undefined && (heldNowMs === undefined
         ? heldAttemptFloorElapsed(priorAttempt)
         : heldAttemptFloorElapsed(priorAttempt, heldNowMs));
-      if (gitHeldSkipEnabled() && pend && priorAttempt && priorInputsMatch && !priorFloorElapsed
+      if (gitHeldSkipEnabled() && pend && priorAttempt && priorObservation && priorInputsMatch && !priorFloorElapsed
         && retainHeldRepo(rel, priorAttempt)) {
+        // A compatibility attempt can prove the late matcher while lacking the
+        // explicit key required by the cheap gate. Re-store the exact matched
+        // inputs so the next pull can skip before fetch/classification. Preserve
+        // `at`: migration must not reset the independent safety-floor clock.
+        attempt[rel] = createHeldAttempt(priorObservation, priorAttempt.blockers, priorAttempt.at);
         if (heldTrace) {
           const first = sortedTypedBlockers(priorAttempt.blockers)[0];
           heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
@@ -1486,6 +1492,7 @@ opts: {
       earlySkip: false,
       matchConsulted: false,
       mismatch: records[rel]?.attempt ? "not-consulted" : "none",
+      earlyReason: records[rel]?.attempt ? "not-consulted" : "no-attempt",
       blocker: "none",
       supersessionProofMs: 0,
     } : undefined;
@@ -1503,22 +1510,25 @@ opts: {
         startedAt = Date.now();
         const priorAttempt = pending[rel] && remoteSec ? records[rel]?.attempt : undefined;
         const heldNowMs = opts.heldNow?.();
-        if (gitHeldSkipEnabled() && priorAttempt
-          && await earlyHeldAttemptMatches({
-            root, relPath: rel, incoming: remoteSec!, attempt: priorAttempt,
-            ...(heldNowMs === undefined ? {} : { nowMs: heldNowMs }),
-          })
-          && retainHeldRepo(rel, priorAttempt)) {
+        const earlyDecision = gitHeldSkipEnabled() && priorAttempt
+          ? await earlyHeldAttemptDecision({
+              root, relPath: rel, incoming: remoteSec!, attempt: priorAttempt,
+              ...(heldNowMs === undefined ? {} : { nowMs: heldNowMs }),
+            })
+          : { matches: false, reason: priorAttempt ? "disabled" : "no-attempt" };
+        if (heldTrace) heldTrace.earlyReason = earlyDecision.reason;
+        if (earlyDecision.matches && priorAttempt && retainHeldRepo(rel, priorAttempt)) {
           if (heldTrace) {
             const first = sortedTypedBlockers(priorAttempt.blockers)[0];
             heldTrace.earlySkip = true;
             heldTrace.matchConsulted = true;
             heldTrace.mismatch = "none";
+            heldTrace.earlyReason = "none";
             heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
           }
           result = "skipped";
           return;
-        }
+        } else if (heldTrace && earlyDecision.matches) heldTrace.earlyReason = "retention-ineligible";
         const processed = await processRepo(rel, chainTimings, commonDirLock, heldTrace);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
@@ -1553,7 +1563,7 @@ opts: {
         if (heldTrace.blocker === "none" && result === "deferred" && deferral) heldTrace.blocker = `apply/${deferral.reason}`;
         const namedMs = chainTimings.fetchDecryptMs + chainTimings.bundleVerifyMs + chainTimings.gitImportMs
           + chainTimings.classifyMs + heldTrace.supersessionProofMs;
-        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(heldTrace.supersessionProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
+        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} earlyReason=${heldTrace.earlyReason} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(heldTrace.supersessionProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
       }
       if (metrics) {
         metrics.results[result] += 1;

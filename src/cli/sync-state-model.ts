@@ -229,6 +229,9 @@ export type TypedBlocker =
 /** Local-only held-follow observation. This is never projected onto a manifest. */
 export interface GitHeldAttempt {
   incomingKey: string;
+  /** Cheap-gate classifier identity. Optional only for compatibility with
+   * attempts written before the pre-fetch held-skip gate existed. */
+  classifierInputKey?: string;
   /** Exact effective semantic projections used by the persisted classifier;
    * null means the corresponding section has no index artifact. */
   effectiveBaseIndexProjection: string | null;

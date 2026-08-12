@@ -121,6 +121,7 @@ export function blockersAfterComposer(input: {
 
 export interface HeldInputObservation {
   incomingKey: string;
+  classifierInputKey: string;
   effectiveBaseIndexProjection: string | null;
   effectiveIncomingIndexProjection: string | null;
   incomingIndexArtifactDescriptor: string;
@@ -233,6 +234,7 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       || worktreeRegistryBefore !== worktreeRegistryDigest) return undefined;
     return {
       incomingKey,
+      classifierInputKey: incomingKey,
       effectiveBaseIndexProjection: opts.effectiveBaseIndexProjection,
       effectiveIncomingIndexProjection: opts.effectiveIncomingIndexProjection,
       incomingIndexArtifactDescriptor: incomingIndexArtifactDescriptor(opts.incoming),
@@ -277,9 +279,15 @@ export function heldAttemptMismatchField(
   if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return "at";
   if (observation.maxFingerprintTimestampMs >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) return "maxFingerprintTimestampMs";
   const { maxFingerprintTimestampMs: _max, ...observedInputs } = observation;
+  // Attempts written before the cheap pre-fetch gate have no explicit format
+  // marker. The authoritative late matcher remains their compatibility path;
+  // a successful match upgrades the durable attempt for the next pull.
+  const comparableObserved = typeof attempt.classifierInputKey === "string"
+    ? observedInputs
+    : (({ classifierInputKey: _classifierInputKey, ...legacyInputs }) => legacyInputs)(observedInputs);
   const storedInputs = attemptInputs(attempt);
-  const fields = Object.keys(observedInputs).sort() as Array<keyof typeof observedInputs>;
-  return fields.find((field) => canonicalString(storedInputs[field]) !== canonicalString(observedInputs[field]));
+  return Object.keys(comparableObserved).sort().find((field) =>
+    canonicalString(Reflect.get(storedInputs, field)) !== canonicalString(Reflect.get(comparableObserved, field)));
 }
 
 export function heldAttemptFloorElapsed(attempt: GitHeldAttempt, nowMs = Date.now()): boolean {
@@ -292,20 +300,28 @@ export function heldAttemptFloorElapsed(attempt: GitHeldAttempt, nowMs = Date.no
  * protocol state. Two independent fingerprints bracket the decision so an
  * incomplete, changing, or racy repository always falls through to the full
  * path and its authoritative late check. */
-export async function earlyHeldAttemptMatches(input: {
+export interface EarlyHeldAttemptDecision {
+  matches: boolean;
+  reason: string;
+}
+
+export async function earlyHeldAttemptDecision(input: {
   root: string;
   relPath: string;
   incoming: GitSection;
   attempt: GitHeldAttempt;
   nowMs?: number;
-}): Promise<boolean> {
+}): Promise<EarlyHeldAttemptDecision> {
   const nowMs = input.nowMs ?? Date.now();
   const writtenAt = Date.parse(input.attempt.at);
-  if (input.attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION
-    || typeof input.attempt.worktreeRegistryDigest !== "string"
-    || !Number.isFinite(writtenAt) || writtenAt > nowMs
-    || heldAttemptFloorElapsed(input.attempt, nowMs)
-    || heldClassifierInputKey(input.incoming) !== input.attempt.incomingKey) return false;
+  if (input.attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION) return { matches: false, reason: "fingerprint-version" };
+  if (typeof input.attempt.worktreeRegistryDigest !== "string") return { matches: false, reason: "worktree-registry" };
+  if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return { matches: false, reason: "attempt-time" };
+  if (heldAttemptFloorElapsed(input.attempt, nowMs)) return { matches: false, reason: "safety-floor" };
+  if (typeof input.attempt.classifierInputKey !== "string") return { matches: false, reason: "legacy-classifier-key" };
+  if (heldClassifierInputKey(input.incoming) !== input.attempt.classifierInputKey) {
+    return { matches: false, reason: "classifier-key" };
+  }
   try {
     const before = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
@@ -313,12 +329,15 @@ export async function earlyHeldAttemptMatches(input: {
     const after = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
     );
-    return before.dependenciesComplete && after.dependenciesComplete
-      && before.hash === after.hash
-      && after.hash === input.attempt.localFingerprint
-      && Math.max(before.maxTsMs, after.maxTsMs) < nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS;
+    if (!before.dependenciesComplete || !after.dependenciesComplete) return { matches: false, reason: "dependencies-incomplete" };
+    if (before.hash !== after.hash) return { matches: false, reason: "fingerprint-race" };
+    if (after.hash !== input.attempt.localFingerprint) return { matches: false, reason: "local-fingerprint" };
+    if (Math.max(before.maxTsMs, after.maxTsMs) >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) {
+      return { matches: false, reason: "racy-clean" };
+    }
+    return { matches: true, reason: "none" };
   } catch {
-    return false;
+    return { matches: false, reason: "observation-error" };
   }
 }
 
