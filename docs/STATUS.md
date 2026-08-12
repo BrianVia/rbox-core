@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_POST-FIX AFTERMATH (12:40Z): trust SELF-HEALED fleet-wide once the loop
+died (local=trusted both linux hosts) — every scan-heavy measurement was the
+loop's shadow. Fresh n=1: **e2e ~33s** (write 12:37:34.7 → FM adopted
+sequence 1786 at 12:38:08.1), sender 10.4s (push op 9.3s), FM pull 24s
+(reconcile still indexes full 119k manifests even trusted + git-apply queue
+over ~100 unchanged repos). LESSON: measure after every fix — 127s was stale
+within hours. BUILD ORDER (founder mantra applied): (1) fingerprint-gated
+git-plan queue FIRST (small, hits both sides); (2) re-measure; (3) minimal
+reconcile fast-path only if demanded (denominator = full base.files.length,
+O(1) — satisfies R1 mass-delete requirement cheaply; oracle threading is the
+deep part, build last or never); res fix deprioritized (untrusted/boot only).
+Bench collector still misses joins sometimes (cosmetic; logs authoritative).
+Task 17 carries the full plan._
+
 _ECHO LOOP FIXED + FIELD-VERIFIED (2026-08-12): #638 merged — owned-ref
 boundary suppresses the daemon's own packed-refs.lock click during scratch
 pins; reconcile-on-exit keeps design-175 latency for real changes; regression
