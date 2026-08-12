@@ -5,6 +5,25 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-12 (kernel): **232 KERNEL MERGED (#637).** Residual-bucket
+scan accounting (warm zero-hash overhead <3% amended gate, authoritative
+off-CI only — CI runs structure-only scaled fixture), watcherTrust ambient
+visibility, RBOX_TRACE_PROPAGATION seams, rig per-hop sequence-joined
+propagation verdict (report-only until n>=30), fleet SSH bench
+(scripts/bench/propagate.ts). Serial opus review DO-NOT-SHIP round folded:
+per-file hash/stat interleave RESTORED (batching had widened the mid-write
+window — the kernel's one behavioral sin, reverted), apply-complete emits on
+SEQUENCE ADOPTION (ref-only pulls correlate), suspect no longer escalates the
+brief headline, stale trace cycles reset. Rig: repeated zero-FAIL; full suite
+5,208/0. IN-CONTAINER propagation already ≤10s on all stimuli. NEXT: (1)
+thermo-nuclear sweep (founder-queued, task 15); (2) ROUND-6 fleet bench —
+dev-install the post-#637 build on all 3 hosts, then
+`bun scripts/bench/propagate.ts LOCAL:~/Development dfinitiv-macbook-pro:~/Development flat-meadow-prod-main-01:~/Development --attempts 30`
+— its per-hop numbers decide which gated 232 mechanisms get built (anything
+not demanded gets DELETED from the design). Background-task killer still at
+large: long codex/bun background runs die; workaround = foreground
+micro-dispatches <10min._
+
 _SESSION 2026-08-12 (cont): DESIGN 232 MERGED (#635, ALIGNED r3 —
 instruments-first kernel, all mechanisms evidence-gated on round-6 bench).
 Docs truth sweep MERGED (#633); four stale docs deleted; help copy tweak
