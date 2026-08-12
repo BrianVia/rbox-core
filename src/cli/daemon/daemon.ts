@@ -65,6 +65,7 @@ import { QuotaExceededError, RboxApi } from "../remote.js";
 import { envInt } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type SignalDebouncer, type Watcher } from "./watcher.js";
+import { createPropagationTrace } from "./propagation-trace.js";
 import { gitRefSideChannelEligible } from "./git-ref-watch.js";
 import { GitDiscoveryContinuity } from "./git-discovery-continuity.js";
 import {
@@ -550,6 +551,7 @@ export class RboxDaemon {
   private readonly cursorRandom: () => number;
   private readonly backstopMs: number;
   private readonly log: DaemonLogSink;
+  private readonly propagationTrace: ReturnType<typeof createPropagationTrace>;
   private readonly onStopped?: () => void;
   /** Independent account-key release worker. It never enters the workspace sync
    * mutex and shutdown only drains its own bounded in-flight request. */
@@ -581,6 +583,7 @@ export class RboxDaemon {
     } = {},
   ) {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
+    this.propagationTrace = createPropagationTrace(this.log);
     this.mutationGate = new ShutdownMutationGate(() => this.writeAmbientStatus());
     this.gitBusyRetryClock = opts.gitBusyRetryClock ?? {
       setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -842,7 +845,7 @@ export class RboxDaemon {
   private async startLiveWatch(): Promise<void> {
     this.scheduleSafetyScan();
     this.scheduleDeepScan();
-    const signalDebouncer = createSignalDebouncer((batch) => this.handleGitSignalBatch(batch), 400, 3000);
+    const signalDebouncer = createSignalDebouncer((batch) => this.handleGitSignalBatch(batch), 400, 3000, undefined, this.propagationTrace);
     this.gitSignalDebouncer = signalDebouncer;
     let initialGitRepos: readonly DiscoveredGitRepo[] = [];
     try {
@@ -867,6 +870,7 @@ export class RboxDaemon {
           },
           signalDebouncer,
           onInitialGitRepos: async (repos) => { initialGitRepos = repos; },
+          propagationTrace: this.propagationTrace,
           onError: (err) => {
             if (!retrustEnabled()) {
               // Design-104 flag OFF (default): today's body, verbatim — one backend
@@ -1138,7 +1142,9 @@ export class RboxDaemon {
   private requestPush(reason: "signal" | "candidate" | "scan" | "other" = "other"): void {
     if (!this.pullOnly) {
       this.pendingPushReasons[reason] = true;
+      const alreadyWanted = this.want.push;
       this.scheduler.request("push");
+      if (!alreadyWanted) this.propagationTrace?.schedulerWantArmed();
     }
   }
 
@@ -1595,6 +1601,7 @@ export class RboxDaemon {
   /** The dequeued operation's own bookkeeping, run before the scheduler publishes the
    *  active operation — the probe's halt record must render against an idle surface. */
   private beginPumpOperation(op: PumpOperation): void {
+    if (op === "push") this.propagationTrace?.operationBegin();
     if (op !== "recoveryProbe") return;
     const recoveryHalt = this.activity.halt!;
     this.probeHalt = recoveryHalt;
@@ -1766,7 +1773,7 @@ export class RboxDaemon {
     await this.applyPendingWatchEvents();
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
-    await this.publishTransition.publish(provenance, {
+    const receipt = await this.publishTransition.publish(provenance, {
       execute: (request) => classifyPublishOutcome(request, () => pushManifest(this.root, this.cfg, request.manifest, {
         ...this.e2ee,
         cache: this.cache,
@@ -1793,6 +1800,7 @@ export class RboxDaemon {
         // invisible steady-state cost is exactly what that design instruments).
       },
     });
+    this.propagationTrace?.publishReceipt(receipt.sequence);
   }
 
   private readonly publishTransition = new PublishLocalWorkspaceTransition({
