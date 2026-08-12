@@ -533,6 +533,7 @@ async function runPushAttempt(
             degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
             filesFirstDefer: plan.filesFirstDefer,
             onGitReposDiscovered: deps.onGitReposDiscovered,
+            ownedRefMutationBoundary: deps.ownedRefMutationBoundary,
             resolution: plan.resolution,
             resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
             beforeAbsenceWitness: deps.beforeAbsenceWitness,
