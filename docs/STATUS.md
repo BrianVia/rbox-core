@@ -5,6 +5,24 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_REGRESSION FOUND (2026-08-12 ~09:30Z, PRIORITY FOR NEXT STINT): **no-op
+push busy-loop on BOTH linux daemons since the 231-activation build went
+live.** Evidence: desktop daemon-2026-08-11.log has 12 pushes total (all
+post-upgrade ~23:40Z); daemon-2026-08-12.log has 7,003; FM 8,039. Cycle every
+~3-4s, files=0 blobs=0, each ~2-3s of git-plan work. Signature: sp1/sp2
+(sections pending) on every line; each host carries exactly one deferred repo
+"carrying pending verbatim" (desktop: Personal/rbox-core; FM:
+Dfinitiv/savvy-core). HYPOTHESIS: activation-era code re-arms push while a
+pending git section exists; push cannot supersede the deferred section; loop.
+Repro likely: any workspace with a standing git deferral on the post-#632
+build. Suspect surface: push completion → requestPush re-arm interaction with
+carried-pending sections (sync-git plan/publisher), NOT the trace (loop
+predates today's #637 by a full night). COST: CPU/battery/log spam on 2 hosts
++ defeats bench correlation. Mitigation candidates for next stint: bound
+re-arm when plan is no-op with unchanged pending fingerprint; or resolve the
+two standing deferrals to starve it (but the bug remains for any future
+deferral). Fix properly, add to design-234 fixtures._
+
 _ROUND-6 THREAD STATE (09:25Z): sender cycle-join fix landed (0424ad12f)
 but n=1 rerun shows write@09:20 never matched a publish; desktop
 propagation_trace shows the daemon pumping every ~3-4s (cycle 1083+ in 78min)
