@@ -1122,8 +1122,9 @@ opts: {
         && retainHeldRepo(rel, priorAttempt)) {
         // A compatibility attempt can prove the late matcher while lacking the
         // explicit key required by the cheap gate. Re-store the exact matched
-        // inputs so the next pull can skip before fetch/classification. Preserve
-        // `at`: migration must not reset the independent safety-floor clock.
+        // inputs so the primary state-save packet upgrades even a deferred repo;
+        // artifact settlement is not this transition's persistence owner.
+        // Preserve `at`: migration must not reset the independent safety-floor clock.
         attempt[rel] = createHeldAttempt(priorObservation, priorAttempt.blockers, priorAttempt.at);
         if (heldTrace) {
           const first = sortedTypedBlockers(priorAttempt.blockers)[0];

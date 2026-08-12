@@ -26,6 +26,7 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))));
 
 const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commits" };
+const localEdits: TypedBlocker = { provenance: "checkout", reason: "local-edits" };
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
 const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
@@ -36,7 +37,7 @@ const ownership: TypedBlocker = {
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
-  expect(heldBlockersAllowSkip([localCommit, localStash])).toBe(true);
+  expect(heldBlockersAllowSkip([localEdits, localCommit, localStash])).toBe(true);
   expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, localStash, localIndex, localOperation])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);

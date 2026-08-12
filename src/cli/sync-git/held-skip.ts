@@ -47,7 +47,8 @@ export function heldBlockersAllowSkip(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return blockers.length > 0 && blockers.every((blocker) =>
-    blocker.reason === "local-commits"
+    blocker.reason === "local-edits"
+      || blocker.reason === "local-commits"
       || blocker.reason === "local-stash"
       || blocker.reason === "local-index"
       || blocker.reason === "local-operation"
