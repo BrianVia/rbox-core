@@ -8,7 +8,7 @@
 _SESSION 2026-08-12 (cont): DESIGN 232 MERGED (#635, ALIGNED r3 —
 instruments-first kernel, all mechanisms evidence-gated on round-6 bench).
 Docs truth sweep MERGED (#633); four stale docs deleted; help copy tweak
-merged (#634). Desktop cleanup: 21/22 stale agent worktrees swept (2 dirty
+merged (#636; #634 was accidentally closed by premature branch deletion — cleanup now waits for API-confirmed MERGED). Desktop cleanup: 21/22 stale agent worktrees swept (2 dirty
 skipped: agent-ad2a9aee, ~/agent-work/526-republish). rbox git resolve
 keep-mine REFUSED on the live repo — "incoming-versus-local comparison could
 not complete; retry after Git state settles" while a session actively commits;
