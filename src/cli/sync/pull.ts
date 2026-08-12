@@ -472,6 +472,14 @@ export async function applyPulledManifest(
     // record must never fail a pull that is already durable.
     await saveScopeFindings(root, { ruleFileDivergence }).catch(() => undefined);
   }
+  if (savedState.lastSyncedSequence > state.lastSyncedSequence) {
+    try {
+      deps.onPullAdopted?.(savedState.lastSyncedSequence);
+    } catch {
+      // Observability only: a hook failure must never fail a pull that has already
+      // applied and saved — the daemon would misread it as a pull halt.
+    }
+  }
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);

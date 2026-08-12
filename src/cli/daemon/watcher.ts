@@ -16,6 +16,7 @@ import {
   type WatchEventKind,
 } from "../../engine/index.js";
 import { classifyRepoCandidate, type RepoCandidateWork } from "./git-ref-watch.js";
+import type { PropagationTrace } from "./propagation-trace.js";
 
 export interface Watcher {
   /** Backend that was actually selected and successfully started. */
@@ -44,6 +45,8 @@ export interface WatchOptions {
   signalDebouncer?: SignalDebouncer;
   /** Initial watcher-start discovery, awaited before readiness. */
   onInitialGitRepos?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  /** Optional local observation sink; never participates in watcher control flow. */
+  propagationTrace?: PropagationTrace;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -119,7 +122,12 @@ export interface GitSignalBatch {
  * for `debounceMs` of quiet. Identical semantics across both backends. Exported so the
  * coalescing invariant can be tested deterministically, independent of OS event timing.
  */
-export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounceMs: number, maxWaitMs: number): Batcher {
+export function createBatcher(
+  onSettle: (events: WatchEvent[]) => void,
+  debounceMs: number,
+  maxWaitMs: number,
+  trace?: PropagationTrace,
+): Batcher {
   const pending = new Map<string, WatchEventKind>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let firstEventAt = 0;
@@ -131,11 +139,13 @@ export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounce
     if (pending.size === 0) return;
     const events: WatchEvent[] = [...pending].map(([relPath, kind]) => ({ relPath, kind }));
     pending.clear();
+    trace?.debouncerFired("file");
     onSettle(events);
   };
 
   return {
     push(relPath, kind) {
+      trace?.debouncerArmed("file");
       pending.set(relPath, kind);
       const now = Date.now();
       if (firstEventAt === 0) firstEventAt = now;
@@ -155,7 +165,8 @@ export function createSignalDebouncer(
   onSignal: ((batch: GitSignalBatch) => void | Promise<void>) | undefined,
   debounceMs: number,
   maxWaitMs: number,
-  candidateCap = MAX_GIT_REPOS
+  candidateCap = MAX_GIT_REPOS,
+  trace?: PropagationTrace,
 ): SignalDebouncer {
   if (!Number.isInteger(candidateCap) || candidateCap < 1) throw new Error("candidateCap must be a positive integer");
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -183,11 +194,13 @@ export function createSignalDebouncer(
     other = false;
     discoverAll = false;
     candidates = new Map();
+    trace?.debouncerFired("git");
     void onSignal?.(batch);
   };
 
   return {
     push(reason, candidate) {
+      trace?.debouncerArmed("git");
       if (reason === "signal") signal = true;
       else if (reason === "candidate") candidateReason = true;
       else other = true;
@@ -224,6 +237,7 @@ export function createSignalDebouncer(
 
 function pushWatchEvent(batcher: Batcher, opts: WatchOptions, relPath: string, kind: WatchEventKind): void {
   const event = { relPath, kind };
+  opts.propagationTrace?.eventSeen("file");
   opts.onRawEvent?.(event);
   batcher.push(event.relPath, event.kind);
 }
@@ -312,7 +326,7 @@ async function startParcel(
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const wrapper = loadParcelWrapper();
-  const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
+  const batcher = createBatcher(onSettle, debounceMs, maxWaitMs, opts.propagationTrace);
   const signalDebouncer = opts.signalDebouncer;
   // @parcel/watcher reports event paths as REAL paths (symlinks resolved). If the
   // watched root has a symlinked component (e.g. macOS `/tmp` → `/private/tmp`),
@@ -345,6 +359,7 @@ async function startParcel(
 
         const candidate = classifyRepoCandidate(rel, ev.type);
         if (candidate) {
+          opts.propagationTrace?.eventSeen("git");
           signalDebouncer?.push("candidate", candidate);
           continue;
         }
@@ -353,6 +368,7 @@ async function startParcel(
         // and the authoritative sync matcher. A ref signal is routed through its
         // own seam and can therefore never become a file WatchEvent.
         if (isGitRefSignal(rel)) {
+          opts.propagationTrace?.eventSeen("git");
           signalDebouncer?.push("signal");
           continue;
         }
@@ -396,6 +412,8 @@ async function startParcel(
     throw e;
   }
 
+  opts.propagationTrace?.backendArmed("parcel");
+
   return {
     backend: "parcel",
     async close() {
@@ -416,7 +434,7 @@ function startChokidar(
 ): Watcher {
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
-  const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
+  const batcher = createBatcher(onSettle, debounceMs, maxWaitMs, opts.propagationTrace);
   const signalDebouncer = opts.signalDebouncer;
   const toRel = toRelFor(root);
 
@@ -446,11 +464,14 @@ function startChokidar(
       : "delete";
     const candidate = classifyRepoCandidate(rel, candidateKind);
     if (candidate) {
+      opts.propagationTrace?.eventSeen("git");
       signalDebouncer?.push("candidate", candidate);
       return;
     }
     pushWatchEvent(batcher, opts, rel, kind);
   });
+
+  opts.propagationTrace?.backendArmed("chokidar");
 
   return {
     backend: "chokidar",

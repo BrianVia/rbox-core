@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createScanStats, HashCache, PhaseReport, scanManifest, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
 import { RboxDaemon, scanStatsLine } from "./daemon.js";
+import { formatScanStats, scanDetailsOf } from "./sync/format.js";
 import { logDebugSummary, metricsEnabled } from "./metrics.js";
 import { createScanProbe, probeEligible, RACY_MARGIN_MS, type ScanProbeState } from "./scan-probe.js";
 import {
@@ -275,6 +276,22 @@ test("scan stats line is fixed-shape and path-free", () => {
   const line = scanStatsLine("safety scan", stats, 12, 0);
   expect(line).toBe("safety scan: files=0 dirs=2 wall=12ms readdir=0 stat=0 matcher=0 hash=0 sort=0 residual=12 cacheHits=0 hashed=0 deferred=0 dc:hit hits=7 walked=2");
   expect(line).not.toContain("DISTINCTIVE_PRIVATE_NAME");
+});
+
+test("sync scan report includes all-attempt residual buckets", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-scan-report-"));
+  try {
+    await fs.writeFile(path.join(root, "file"), "content");
+    const stats = createScanStats();
+    await scanManifest(root, undefined, undefined, undefined, undefined, stats);
+    const line = formatScanStats(scanDetailsOf(stats, 0, 0));
+    for (const field of ["wall", "rpre", "rpost", "rbuild", "dir", "path", "git", "sym", "obs", "ent", "ctl", "fin", "attempts1", "a1[off"]) {
+      expect(line).toContain(field);
+    }
+    expect(line).not.toContain(root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 describe("scan probe", () => {

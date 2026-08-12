@@ -179,12 +179,26 @@ test("JSON carries health for a detail projection and halt for a reset projectio
   const detailed = renderStatusJson(detail("json"));
   expect(detailed.health).toBe("ok");
   expect(detailed.halted).toBeUndefined();
+  expect(detailed.daemon.watcherTrust).toBeNull();
+
+  const fused = renderStatusJson(detail("json", { daemon: { ...base().daemon, watcherTrust: "fused" } }));
+  expect(fused.daemon.watcherTrust).toBe("fused");
 
   const halted = renderWorkspaceStatusSurface(halt("json"));
   if (halted.surface !== "json") throw new Error("unreachable");
   expect(halted.payload.halted).toBe(true);
   expect(halted.payload.reason).toBe("unreadable-journal");
   expect(halted.payload.health).toBeUndefined();
+});
+
+test("verbose watcher trust remains supplementary to stronger conditions", () => {
+  const projection = detail("verbose", {
+    daemon: { ...base().daemon, watcherTrust: "fused" },
+    activity: { at: AT, outOfStorage: { at: AT, kind: "storage" } },
+  });
+  const lines = renderStatusVerbose(projection);
+  expect(lines.some((line) => line.includes("watcher trust:") && line.includes("fused"))).toBe(true);
+  expect(lines.some((line) => line.includes("storage"))).toBe(true);
 });
 
 test("the shared Git line is suppressed in brief and added by Git detail", () => {

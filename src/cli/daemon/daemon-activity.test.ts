@@ -1429,6 +1429,41 @@ test("a throwing onPullApplied hook never fails a completed pull (codex R3)", as
   expect(await fs.readFile(path.join(root, "x.txt"), "utf8")).toBe("hi"); // …and applied
 });
 
+test("onPullAdopted observes sequence-only advances and suppresses unchanged heads", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([]);
+  const cfg: WorkspaceConfig = {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: "ws_act",
+    projectId: "root",
+    deviceId: "dev_act",
+    rootPath: root,
+    remoteUrl: "mem://",
+    token: "",
+    encrypted: true,
+    kek: KEK,
+    accountId: "acct_act",
+    accountEpoch: 0,
+    keyEpoch: 0,
+  };
+  const adopted: number[] = [];
+  const pullApplied: number[] = [];
+  const deps = {
+    remote,
+    backoff: async () => {},
+    onPullAdopted: (sequence: number) => adopted.push(sequence),
+    onPullApplied: () => pullApplied.push(1),
+  };
+
+  expect(await pull(root, cfg, deps)).toEqual([]);
+  expect(adopted).toEqual([1]);
+  expect(pullApplied).toEqual([]);
+
+  expect(await pull(root, cfg, deps)).toEqual([]);
+  expect(adopted).toEqual([1]);
+  expect(pullApplied).toEqual([]);
+});
+
 test("an idle pull + no-op push settles shell.line back to ok (codex R4)", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);

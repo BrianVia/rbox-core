@@ -56,6 +56,7 @@ import type { Recorder } from "./harness.js";
 import { provisionPair, startDaemons, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
+import { buildHopReport, renderHopReport, type HopReport, type PropagationClassification } from "../../propagation-report.js";
 
 /** The seeded repo (present before the daemons start), a small repo created live, and the
  *  big repo that appears live. */
@@ -84,6 +85,11 @@ const BIG_REPO_TIMEOUT_MS = 300_000;
  *  tight bound — it sits under the 60s safety-scan floor so a scan-driven fall-through
  *  trips it, but far above any real fast-path latency even on a slow CI box. */
 const FAST_CEILING_MS = 30_000;
+/** Stop observing before the scenario's coarse ceiling; a missing joined hop is only
+ * INVALID after this bounded allowance for daemon-log writes to become readable. */
+const HOP_OBSERVATION_DEADLINE_MS = FAST_CEILING_MS - 1_000;
+/** Both guests are containers on one Docker host and therefore share its wall clock. */
+const RIG_CLOCK_SKEW_BOUND_MS = 5;
 
 const HEAD_POLL_MS = 1000;
 const BIG_POLL_MS = 2000;
@@ -172,6 +178,67 @@ function lastIdx(lines: string[], re: RegExp): number {
   return -1;
 }
 
+type HopObservation = {
+  aDelta: string;
+  bDelta: string;
+  hops: HopReport;
+  state: "present-at-initial-read" | "log-not-yet-flushed-at-initial-read" | "hop-truly-missing-after-deadline";
+  waitedMs: number;
+};
+
+/** Poll both logs until the sequence-joined report is complete, not merely until B has
+ * logged an apply for some sequence. Filesystem/HEAD witnesses can become visible before
+ * the joined sender trace or receiver apply-complete write is readable. */
+async function awaitHopObservation(
+  a: Device,
+  b: Device,
+  changeAt: number,
+  attempt: string,
+  classification: PropagationClassification,
+  witnessMatched: boolean,
+): Promise<HopObservation> {
+  type Snapshot = { aDelta: string; bDelta: string; hops: HopReport };
+  const remainingMs = Math.max(0, HOP_OBSERVATION_DEADLINE_MS - (Date.now() - changeAt));
+  const out = await pollUntil({
+    probe: async (): Promise<Snapshot> => {
+      const [aLog, bLog] = await Promise.all([readLogs(a), readLogs(b)]);
+      const aDelta = linesSince(aLog, changeAt);
+      const bDelta = linesSince(bLog, changeAt);
+      return {
+        aDelta,
+        bDelta,
+        hops: buildHopReport(aDelta, bDelta, {
+          attempt,
+          classification,
+          writeAt: changeAt,
+          clockSkewBoundMs: RIG_CLOCK_SKEW_BOUND_MS,
+          witnessMatched,
+        }),
+      };
+    },
+    done: (snapshot) => snapshot.hops.verdict !== "INVALID",
+    timeoutMs: remainingMs,
+    intervalMs: 100,
+  });
+  return {
+    ...out.value,
+    state: out.ok
+      ? out.attempts === 1 ? "present-at-initial-read" : "log-not-yet-flushed-at-initial-read"
+      : "hop-truly-missing-after-deadline",
+    waitedMs: out.elapsedMs,
+  };
+}
+
+function hopObservationDetail(observation: HopObservation): string {
+  return `correlation=${observation.hops.correlation} sequence=${observation.hops.sequence ?? "-"} verdict=${observation.hops.verdict} observation=${observation.state} waited=${observation.waitedMs}ms`;
+}
+
+function exactHopWithin(report: HopReport, ceilingMs: number): boolean {
+  const { write, applyComplete } = report.stamps;
+  return report.correlation === "exact" && write !== undefined && applyComplete !== undefined
+    && applyComplete - write < ceilingMs;
+}
+
 /** True iff `aDelta` shows A capturing `repo` with NO `safety scan:` line before it
  *  (event-driven). Returns [captured, eventDriven]. */
 function captureShape(aDelta: string, repo: string): { captured: boolean; eventDriven: boolean; line: string } {
@@ -225,7 +292,15 @@ function assertPropagation(rec: Recorder, round: string, repo: string, aDelta: s
  * Run `makeChange` on A (which advances `repoDir`'s HEAD), wait for B's HEAD to catch up,
  * then assert event-driven propagation on the per-host log windows fenced at the change.
  */
-async function commitRound(ctx: RigCtx, rec: Recorder, round: string, repo: string, repoDir: string, makeChange: string): Promise<void> {
+async function commitRound(
+  ctx: RigCtx,
+  rec: Recorder,
+  round: string,
+  repo: string,
+  repoDir: string,
+  classification: PropagationClassification,
+  makeChange: string,
+): Promise<void> {
   // Wall-clock fence: everything the daemons log at/after this instant belongs to THIS
   // change's propagation (per-host lines are isolated by emit time, see linesSince).
   const changeAt = Date.now();
@@ -238,8 +313,11 @@ async function commitRound(ctx: RigCtx, rec: Recorder, round: string, repo: stri
   rec.assert(`[${round}] B HEAD reached A's new commit`, out.ok,
     out.ok ? `${elapsedMs}ms → ${newHead.slice(0, 12)}` : `timeout ${elapsedMs}ms — B HEAD ${out.value.slice(0, 12) || "(none)"} ≠ A ${newHead.slice(0, 12)}`);
 
-  const [afterA, afterB] = await Promise.all([readLogs(ctx.a), readLogs(ctx.b)]);
-  assertPropagation(rec, round, repo, linesSince(afterA, changeAt), linesSince(afterB, changeAt), elapsedMs);
+  const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, classification, out.ok);
+  assertPropagation(rec, round, repo, observation.aDelta, observation.bDelta, elapsedMs);
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\n10s verdict ${observation.hops.verdict} (report-only; n=1, authoritative at n>=30)\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within ${FAST_CEILING_MS / 1000}s coarse ceiling`, exactHopWithin(observation.hops, FAST_CEILING_MS),
+    hopObservationDetail(observation));
 
   const fsck = await ctx.b.exec(["git", "-C", repoDir, "fsck", "--strict", "--no-progress"], { allowFail: true });
   rec.assert(`[${round}] B repo fsck --strict clean`, fsck.exitCode === 0, `exit ${fsck.exitCode}`);
@@ -263,9 +341,12 @@ async function filePlaneRound(
     out.ok ? `${elapsedMs}ms` : `timeout ${elapsedMs}ms — B has ${JSON.stringify(out.value)?.slice(0, 40)}`);
   rec.assert(`[${round}] propagated under the fast ceiling`, out.ok && elapsedMs < FAST_CEILING_MS, `${elapsedMs}ms (ceiling ${FAST_CEILING_MS}ms)`);
 
-  const bDelta = linesSince(await readLogs(ctx.b), changeAt);
-  rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(bDelta),
-    /notify_latency_ms=\d+/.test(bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
+  const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, "file", out.ok);
+  rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(observation.bDelta),
+    /notify_latency_ms=\d+/.test(observation.bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\n10s verdict ${observation.hops.verdict} (report-only; n=1, authoritative at n>=30)\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within ${FAST_CEILING_MS / 1000}s coarse ceiling`, exactHopWithin(observation.hops, FAST_CEILING_MS),
+    hopObservationDetail(observation));
 
   if (expectDirty) {
     // File-plane change, not git: B's HEAD must NOT have moved (no phantom commit).
@@ -352,12 +433,13 @@ export const gitCommitPropagation: Scenario = {
       });
 
       // Daemons up on BOTH hosts — the live watch/notify propagation loop under test.
-      const modes = await startDaemons(ctx, rec);
+      const modes = await startDaemons(ctx, rec, { RBOX_TRACE_PROPAGATION: "1" });
       ctx.log(`  (watcher modes — A: ${modes.a}, B: ${modes.b})`);
+      ctx.log(`  clock-skew bound A↔B: ≤${RIG_CLOCK_SKEW_BOUND_MS}ms (shared Docker-host clock)`);
 
       // ── 1. working-tree commit (existing repo) — fast path fires with or without 172 ──
       await rec.step("[A→B] working-tree commit propagates fast", async () => {
-        await commitRound(ctx, rec, "working-tree", REPO, repoDir,
+        await commitRound(ctx, rec, "working-tree", REPO, repoDir, "file",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-04-01T00:00:00 +0000' GIT_COMMITTER_DATE='2026-04-01T00:00:00 +0000'
@@ -368,7 +450,7 @@ git ${IDENT} add tracked-r1.txt && git ${IDENT} commit -q -m 'working-tree commi
 
       // ── 2. empty commit (existing repo) — the design-172 event-driven case (.git only) ──
       await rec.step("[A→B] empty commit propagates fast (design 172)", async () => {
-        await commitRound(ctx, rec, "empty-commit", REPO, repoDir,
+        await commitRound(ctx, rec, "empty-commit", REPO, repoDir, "git",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-04-02T00:00:00 +0000' GIT_COMMITTER_DATE='2026-04-02T00:00:00 +0000'
@@ -391,7 +473,7 @@ git ${IDENT} commit --allow-empty -q -m 'design-172 empty commit'`);
       // Diagnostic setup: a handful of tiny files (NOT a big clone) so there is no inotify
       // burst. Its working-tree commit should be event-driven (the plain files fire events).
       await rec.step("[A→B] small new repo (post-daemon) working-tree commit propagates fast", async () => {
-        await commitRound(ctx, rec, "small-repo-worktree", SMALL_REPO, smallRepoDir,
+        await commitRound(ctx, rec, "small-repo-worktree", SMALL_REPO, smallRepoDir, "file",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-05-10T00:00:00 +0000' GIT_COMMITTER_DATE='2026-05-10T00:00:00 +0000'
@@ -404,7 +486,7 @@ git ${IDENT} add -A && git ${IDENT} commit -q -m 'first commit in a small post-d
 
       // ── 6. EMPTY commit in the small new repo — design 175 side-channel gate ──
       await rec.step("[A→B] small new repo empty commit propagates event-driven", async () => {
-        await commitRound(ctx, rec, "small-repo-empty", SMALL_REPO, smallRepoDir,
+        await commitRound(ctx, rec, "small-repo-empty", SMALL_REPO, smallRepoDir, "git",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-05-11T00:00:00 +0000' GIT_COMMITTER_DATE='2026-05-11T00:00:00 +0000'
@@ -442,7 +524,7 @@ git ${IDENT} commit --allow-empty -q -m 'empty commit in a small post-daemon rep
       // ── 8. working-tree commit in the big NEW repo — post-daemon-repo commit detection ──
       await rec.step("[A→B] big-repo working-tree commit propagates fast", async () => {
         if (!bigReady) { ctx.log("  (skip: big repo did not converge)"); return; }
-        await commitRound(ctx, rec, "big-repo-worktree", BIG_REPO, bigRepoDir,
+        await commitRound(ctx, rec, "big-repo-worktree", BIG_REPO, bigRepoDir, "file",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-05-01T00:00:00 +0000' GIT_COMMITTER_DATE='2026-05-01T00:00:00 +0000'
@@ -454,7 +536,7 @@ git ${IDENT} add rig-note.txt && git ${IDENT} commit -q -m 'working-tree commit 
       // ── 9. empty commit in the big NEW repo — design 175 atomic move-in gate ──
       await rec.step("[A→B] big-repo empty commit propagates event-driven", async () => {
         if (!bigReady) { ctx.log("  (skip: big repo did not converge)"); return; }
-        await commitRound(ctx, rec, "big-repo-empty", BIG_REPO, bigRepoDir,
+        await commitRound(ctx, rec, "big-repo-empty", BIG_REPO, bigRepoDir, "git",
           `set -e
 export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com' GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
 export GIT_AUTHOR_DATE='2026-05-02T00:00:00 +0000' GIT_COMMITTER_DATE='2026-05-02T00:00:00 +0000'

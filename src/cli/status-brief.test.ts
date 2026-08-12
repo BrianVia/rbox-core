@@ -144,6 +144,23 @@ test("plan/quota precedence and all quota copy are closed", () => {
   expect(aggregatePlanQuotaAttention(account(null), undefined)).toEqual({ kind: "none" });
 });
 
+test("suspect watcher trust stays supplementary while fused escalates", () => {
+  expect(lines(full({ watcherTrust: "suspect" })).slice(0, 2)).toEqual([
+    "Development · syncing normally",
+    "watcher trust suspect — pulls may scan while trust is rebuilt",
+  ]);
+  expect(lines(full({ watcherTrust: "fused" })).slice(0, 2)).toEqual([
+    "Development · sync needs attention",
+    "watcher trust fused — restart rbox to restore reactive pulls",
+  ]);
+  expect(lines(full({ watcherTrust: "fused", halt: { kind: "unknown" } }))).not.toContain(
+    "watcher trust fused — restart rbox to restore reactive pulls",
+  );
+  expect(lines(full({ watcherTrust: "fused", planQuota: { kind: "storage-limit" } }))).not.toContain(
+    "watcher trust fused — restart rbox to restore reactive pulls",
+  );
+});
+
 test("locking, version, git, trash, and update keep rows use exact copy", () => {
   const lockCases = [
     [{ status: "degraded-unlocked", reason: "identity-unavailable" }, "⚠ safe workspace locking is unavailable; Git config sync is off · rbox doctor"],
@@ -223,6 +240,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
   const blockers: Partial<Full>[] = [
     { halt: { kind: "unknown" } },
     { planQuota: { kind: "storage-limit" } },
+    { watcherTrust: "fused" },
     { daemonVersion: "1.7.17", daemonVersionSkew: true },
     { locking: { status: "starved", reason: "foreign" } },
   ];

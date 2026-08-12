@@ -1,4 +1,5 @@
 const MAX_LATENCY_MS = 10 * 60 * 1_000;
+export const PROPAGATION_BUDGET_MS = 10_000;
 
 type Publish = { at: number; sequence: number };
 type Apply = { at: number; sequence?: number; id: number };
@@ -15,12 +16,193 @@ export type PropagationReport = {
   hours: Hour[];
 };
 
+export type PropagationClassification = "file" | "git";
+export type HopCorrelation = "exact" | "coalesced" | "unmatched" | "invalid-clock-skew";
+
+export interface HopReport {
+  attempt: string;
+  classification: PropagationClassification;
+  sequence?: number;
+  correlation: HopCorrelation;
+  clockSkewBoundMs: number;
+  witnessMatched: boolean;
+  budgetMs: number;
+  verdict: "PASS" | "FAIL" | "INVALID";
+  stamps: {
+    write?: number;
+    batcherSettle?: number;
+    pushBegin?: number;
+    publishReceipt?: number;
+    wsReceipt?: number;
+    pullDequeue?: number;
+    applyComplete?: number;
+  };
+}
+
 function timestamped(line: string): { at: number; text: string } | undefined {
   const match = /^(\S+Z)\s+(.*)$/.exec(line);
   if (!match) return;
   const at = Date.parse(match[1]!);
   if (!Number.isFinite(at)) return;
   return { at, text: match[2]! };
+}
+
+function jsonAfter<T>(text: string, prefix: string): T | undefined {
+  if (!text.startsWith(prefix)) return;
+  try { return JSON.parse(text.slice(prefix.length)) as T; } catch { return; }
+}
+
+type SenderTrace = {
+  at: number;
+  sequence: number;
+  ms: Partial<Record<"file_fired" | "git_fired" | "begin" | "receipt", number>>;
+};
+
+type ReceiverStamp = { at: number; event: "ws_committed" | "pull_dequeue" | "apply_complete"; sequence: number };
+
+function receiverChain(receiver: ReceiverStamp[], sequence: number): {
+  wsReceipt?: ReceiverStamp;
+  dequeue?: ReceiverStamp;
+  apply?: ReceiverStamp;
+} {
+  const ws = receiver.filter((stamp) => stamp.event === "ws_committed" && stamp.sequence === sequence);
+  const wsReceipt = ws.length === 1 ? ws[0] : undefined;
+  const dequeue = wsReceipt
+    ? receiver.find((stamp) => stamp.event === "pull_dequeue" && stamp.sequence >= sequence && stamp.at >= wsReceipt.at)
+    : undefined;
+  const apply = dequeue
+    ? receiver.find((stamp) => stamp.event === "apply_complete" && stamp.sequence >= sequence && stamp.at >= dequeue.at)
+    : undefined;
+  return { wsReceipt, dequeue, apply };
+}
+
+function senderTraces(log: string): SenderTrace[] {
+  const traces: SenderTrace[] = [];
+  for (const line of log.split(/\r?\n/)) {
+    const parsed = timestamped(line);
+    if (!parsed) continue;
+    const body = jsonAfter<{ sequence?: unknown; ms?: SenderTrace["ms"] }>(parsed.text, "propagation_trace ");
+    if (!body || !Number.isSafeInteger(body.sequence) || !body.ms || !Number.isFinite(body.ms.receipt)) continue;
+    traces.push({ at: parsed.at, sequence: body.sequence as number, ms: body.ms });
+  }
+  return traces;
+}
+
+function receiverStamps(log: string): ReceiverStamp[] {
+  const stamps: ReceiverStamp[] = [];
+  for (const line of log.split(/\r?\n/)) {
+    const parsed = timestamped(line);
+    if (!parsed) continue;
+    const body = jsonAfter<{ event?: unknown; sequence?: unknown; adopted_sequence?: unknown }>(parsed.text, "propagation_receive ");
+    if (!body || (body.event !== "ws_committed" && body.event !== "pull_dequeue" && body.event !== "apply_complete")) continue;
+    const raw = body.event === "apply_complete" ? body.adopted_sequence : body.sequence;
+    if (Number.isSafeInteger(raw)) stamps.push({ at: parsed.at, event: body.event, sequence: raw as number });
+  }
+  return stamps;
+}
+
+/** Build one fail-closed, sequence-joined attempt. Log timestamps are wall-clock stamps;
+ * sender trace offsets reconstruct its earlier monotonic stages from receipt time. */
+export function buildHopReport(
+  originLog: string,
+  receiverLog: string,
+  options: {
+    attempt: string;
+    classification: PropagationClassification;
+    writeAt: number;
+    clockSkewBoundMs: number;
+    witnessMatched?: boolean;
+    budgetMs?: number;
+  },
+): HopReport {
+  const budgetMs = options.budgetMs ?? PROPAGATION_BUDGET_MS;
+  const settleKey = `${options.classification}_fired` as const;
+  const candidates = senderTraces(originLog).filter((trace) =>
+    trace.at >= options.writeAt && Number.isFinite(trace.ms[settleKey]));
+  const receiver = receiverStamps(receiverLog);
+  // A second push can legitimately land in the attempt window. When exactly one
+  // candidate has a complete same-sequence receiver chain, that cross-host join is
+  // stronger than window cardinality; ambiguity still fails closed.
+  const exactCandidates = candidates.filter((candidate) => {
+    const chain = receiverChain(receiver, candidate.sequence);
+    return chain.apply?.sequence === candidate.sequence;
+  });
+  const trace = candidates.length === 1
+    ? candidates[0]
+    : exactCandidates.length === 1 ? exactCandidates[0] : undefined;
+  const stamps: HopReport["stamps"] = { write: options.writeAt };
+  if (trace) {
+    const receiptOffset = trace.ms.receipt!;
+    const settleOffset = trace.ms[settleKey];
+    if (Number.isFinite(settleOffset)) stamps.batcherSettle = trace.at - (receiptOffset - settleOffset!);
+    if (Number.isFinite(trace.ms.begin)) stamps.pushBegin = trace.at - (receiptOffset - trace.ms.begin!);
+    stamps.publishReceipt = trace.at;
+  }
+  const { wsReceipt, dequeue, apply } = trace
+    ? receiverChain(receiver, trace.sequence)
+    : {};
+  if (wsReceipt) stamps.wsReceipt = wsReceipt.at;
+  if (dequeue) stamps.pullDequeue = dequeue.at;
+  if (apply) stamps.applyComplete = apply.at;
+
+  // The committed WS frame can reach either device before the publisher's HTTP call
+  // returns. Sequence is the cross-host join; ordering is meaningful only within each
+  // host's lane (plus both lanes beginning after the witnessed write).
+  const senderOrdered = stamps.write !== undefined
+    && stamps.batcherSettle !== undefined
+    && stamps.pushBegin !== undefined
+    && stamps.publishReceipt !== undefined
+    && stamps.write <= stamps.batcherSettle
+    && stamps.batcherSettle <= stamps.pushBegin
+    && stamps.pushBegin <= stamps.publishReceipt;
+  const receiverOrdered = stamps.write !== undefined
+    && stamps.wsReceipt !== undefined
+    && stamps.pullDequeue !== undefined
+    && stamps.applyComplete !== undefined
+    && stamps.write <= stamps.wsReceipt
+    && stamps.wsReceipt <= stamps.pullDequeue
+    && stamps.pullDequeue <= stamps.applyComplete;
+  const completeAndOrdered = senderOrdered && receiverOrdered;
+  const witnessMatched = options.witnessMatched ?? true;
+  let correlation: HopCorrelation = "unmatched";
+  if (completeAndOrdered && witnessMatched && trace && apply) {
+    correlation = apply.sequence === trace.sequence ? "exact" : "coalesced";
+    if (options.clockSkewBoundMs > 250) correlation = "invalid-clock-skew";
+  }
+  const elapsed = stamps.applyComplete === undefined ? Infinity : stamps.applyComplete - options.writeAt;
+  const verdict = correlation === "exact" ? (elapsed <= budgetMs ? "PASS" : "FAIL") : "INVALID";
+  return {
+    attempt: options.attempt,
+    classification: options.classification,
+    ...(trace ? { sequence: trace.sequence } : {}),
+    correlation,
+    clockSkewBoundMs: options.clockSkewBoundMs,
+    witnessMatched,
+    budgetMs,
+    verdict,
+    stamps,
+  };
+}
+
+export function renderHopReport(report: HopReport): string {
+  const rows: Array<[string, number | undefined, number | undefined]> = [
+    ["write → batcher settle", report.stamps.write, report.stamps.batcherSettle],
+    ["batcher settle → push begin", report.stamps.batcherSettle, report.stamps.pushBegin],
+    ["push begin → publish receipt", report.stamps.pushBegin, report.stamps.publishReceipt],
+    ["write → matching WS receipt", report.stamps.write, report.stamps.wsReceipt],
+    ["matching WS receipt → pull dequeue", report.stamps.wsReceipt, report.stamps.pullDequeue],
+    ["pull dequeue → apply complete", report.stamps.pullDequeue, report.stamps.applyComplete],
+    ["END TO END", report.stamps.write, report.stamps.applyComplete],
+  ];
+  const lines = [
+    `propagation attempt=${report.attempt} class=${report.classification} sequence=${report.sequence ?? "-"} correlation=${report.correlation}`,
+    `clock_skew_bound_ms ${report.clockSkewBoundMs}`,
+    "| hop | from (UTC) | to (UTC) | ms |",
+    "| --- | --- | --- | ---: |",
+    ...rows.map(([label, from, to]) => `| ${label} | ${from === undefined ? "-" : new Date(from).toISOString()} | ${to === undefined ? "-" : new Date(to).toISOString()} | ${from === undefined || to === undefined ? "-" : Math.max(0, Math.round((to - from) * 10) / 10)} |`),
+    `budget <=${report.budgetMs}ms ${report.verdict}`,
+  ];
+  return `${lines.join("\n")}\n`;
 }
 
 function sequenceFromReceiver(text: string): number | undefined {
@@ -50,7 +232,10 @@ export function parseReceiver(log: string): Apply[] {
     const parsed = timestamped(line);
     if (!parsed) continue;
     const observedSequence = sequenceFromReceiver(parsed.text);
-    if (/\bpull applied:/.test(parsed.text)) {
+    if (/\bpull apply complete ADOPTED sequence\b/i.test(parsed.text)) {
+      events.push({ at: parsed.at, sequence: observedSequence, id: events.length });
+      pendingSequence = undefined;
+    } else if (/\bpull applied:/.test(parsed.text)) {
       events.push({ at: parsed.at, sequence: observedSequence ?? pendingSequence, id: events.length });
       pendingSequence = undefined;
     } else if (observedSequence !== undefined) {
@@ -146,7 +331,7 @@ export function parseArgs(args: string[]): { originPath: string; receiverPath: s
 }
 
 async function main(): Promise<void> {
-  const { originPath, receiverPath, sinceHours } = parseArgs(Bun.argv.slice(2));
+  const { originPath, receiverPath, sinceHours } = parseArgs(process.argv.slice(2));
   const [originLog, receiverLog] = await Promise.all([Bun.file(originPath).text(), Bun.file(receiverPath).text()]);
   process.stdout.write(renderReport(buildReport(originLog, receiverLog, { sinceHours })));
 }

@@ -74,12 +74,13 @@ ahead of its measurement. Every proposed mechanism now sits behind a number.
 
 #### Existing harness owns orchestration and reporting
 
-There is no new `scripts/bench/propagate.ts`. Extend/extract
-`scripts/rig/scenarios/git-commit-propagation.ts`, which already owns the
-two-host lifecycle, stimuli, convergence witnesses, and event-driven path
-assertions. Reuse/extend `scripts/propagation-report.ts` as the sole parser and
-report owner. The daemon, watcher, scheduler, sync engine, and API remain the
-real path; the rig and report are Adapters and must not reconstruct it.
+**Founder-cycle amendment (2026-08-12):** `scripts/bench/propagate.ts` exists
+as a thin fleet SSH driver. It reuses the rig/report parsers and owns only
+remote stimulus, clock sampling, witness polling, and log retrieval;
+`scripts/rig/scenarios/git-commit-propagation.ts` still owns the two-host rig
+lifecycle and path assertions, while `scripts/propagation-report.ts` remains
+the sole correlation/report owner. The daemon, watcher, scheduler, sync
+engine, and API remain the real path; these Adapters must not reconstruct it.
 
 Each backend run (`parcel-linux`, `parcel-darwin`, `chokidar`) contains two
 isolated attempts after both daemons and the repository/ref registry are armed:
@@ -174,10 +175,18 @@ before a full fallback:
 
 The report emits the same fixed fields for each attempt plus an all-attempt
 sum; zero-work fields are zero, never omitted, and no path/repository label is
-admitted. `scanWallMs` spans all attempts and finalization. Accounting closes
-when `abs(scanWallMs − sum(buckets)) ≤ max(2ms × attemptCount, 5% ×
-scanWallMs)` on every measured scan, with at least 30 measured scans in each of
-pruned-success and pruned-invalidated→full-fallback fixtures after five warmups.
+admitted. `scanWallMs` spans all attempts and finalization. Bucket sums close
+by construction through `controlMs`; the non-tautological coverage gate is the
+aggregate `sum(controlMs) / sum(scanWallMs) ≤ 6%` (~5% target, with headroom for
+timer/scheduler noise) across at least 30 measured scans in each of
+pruned-success and pruned-invalidated→full-fallback after five warmups.
+
+**Round-6 schema note:** `statMs`, `readdirMs`, and `hashMs` changed semantics
+from the round-5 writeup when timing became exclusive and concurrent phases
+were partitioned (`readdirMs` includes enumeration/conversion, `statMs`
+includes metadata/cache and post-hash stability work, and `hashMs` excludes
+that post-hash stat time). Round-6 results must name this schema break and must
+not present those three fields as directly comparable round-5 deltas.
 
 Instrumentation overhead uses a paired incremental A/B run, not a comparison
 to historical logs: sink-absent and sink-present trials of the same executable
@@ -186,7 +195,10 @@ and reset cache snapshot, for at least 30 pairs per fixture after warmup. The
 absent case retains only the single outer monotonic wall stamp; installing the
 sink enables the buckets. The report publishes every pair and
 `sum(enabledWall − disabledWall) / sum(disabledWall)`; that overhead must
-remain <2%. The existing dircache benchmark must also be non-regressing.
+remain <2%. The authoritative fixture is the 10k-file-class, warm-hashcache,
+`dc:hit`, zero-hashing regime observed in round 5; cold rehash remains a
+secondary measurement and cannot stand in for that gate. The existing
+dircache benchmark must also be non-regressing.
 
 ### 4.2 Kernel B — make degraded trust VISIBLE
 

@@ -268,6 +268,36 @@ test("trusted local observation skips the hashcache and the manifest scan", asyn
   expect(calls).not.toContain("scanManifest");
 });
 
+test("watcher trust projects only from trusted ambient", async () => {
+  const activity = trustedActivity();
+  const admitted = ownedWorkspaceObservation(activity);
+  admitted.daemon.ambient = {
+    kind: "ok",
+    status: {
+      schemaVersion: 1,
+      bootId: "boot-1",
+      state: "synced",
+      heartbeatAt: AT,
+      sequence: 7,
+      lastSyncedAt: AT,
+      watcherTrust: "fused",
+    },
+  };
+  Object.assign(admitted.daemon, { ambientTrust: "trusted", trustedAmbient: admitted.daemon.ambient.status });
+  const { port } = readPort("brief", { readWorkspaceObservation: async () => admitted });
+  const projected = await projectWorkspaceStatusDetail(ROOT, { mode: "brief" }, port, {
+    refresh: async (_cfg, next) => refreshed(next),
+  });
+  expect(projected.daemon.watcherTrust).toBe("fused");
+
+  const rejected = { ...admitted, daemon: { ...admitted.daemon, ambientTrust: "stale" as const, trustedAmbient: undefined } };
+  const { port: stalePort } = readPort("brief", { readWorkspaceObservation: async () => rejected });
+  const staleProjection = await projectWorkspaceStatusDetail(ROOT, { mode: "brief" }, stalePort, {
+    refresh: async (_cfg, next) => refreshed(next),
+  });
+  expect(staleProjection.daemon.watcherTrust).toBeUndefined();
+});
+
 test("an unowned mixed-format daemon cannot make rejected activity renderable", async () => {
   const { port, countOf } = readPort("brief", {
     readWorkspaceObservation: async () => ({

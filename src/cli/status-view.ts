@@ -19,6 +19,7 @@ import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import type { CheckoutTransactionCapability } from "../engine/index.js";
 import type { LockingHealth } from "./sync-mutex.js";
+import type { WatcherTrust } from "./daemon/ambient-status.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
 export interface StatusSnapshot {
@@ -129,6 +130,7 @@ export type BriefStatusSnapshot =
       halt?: BriefHaltReason;
       recovery?: { nextProbeAt?: string; running?: true };
       planQuota: PlanQuotaAttention;
+      watcherTrust?: WatcherTrust;
       daemonVersion?: string;
       cliVersion: string;
       daemonVersionSkew: boolean;
@@ -643,6 +645,7 @@ export function headlineBlocked(snapshot: BriefStatusSnapshot): boolean {
   if (snapshot.kind === "reset-halt") return true;
   return snapshot.halt !== undefined
     || snapshot.planQuota.kind !== "none"
+    || snapshot.watcherTrust === "fused"
     || snapshot.daemonVersionSkew
     || snapshot.locking.status !== "ok";
 }
@@ -663,6 +666,12 @@ function planQuotaLine(attention: PlanQuotaAttention): string | undefined {
     case "workspace-limit": return "⛔ workspace limit reached · rbox usage · rbox subscribe";
     case "none": return undefined;
   }
+}
+
+export function watcherTrustLine(trust: WatcherTrust): string {
+  return trust === "suspect"
+    ? "watcher trust suspect — pulls may scan while trust is rebuilt"
+    : "watcher trust fused — restart rbox to restore reactive pulls";
 }
 
 function lockingAttentionLine(locking: LockingHealth): string | undefined {
@@ -727,6 +736,9 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   if (snapshot.halt) lines.push(briefHaltLine(snapshot.halt));
   const quota = planQuotaLine(snapshot.planQuota);
   if (quota) lines.push(quota);
+  // Halt/quota suppress watcher detail. Fused also escalates the headline;
+  // suspect remains a supplementary line under an otherwise-normal headline.
+  if (!snapshot.halt && !quota && snapshot.watcherTrust) lines.push(watcherTrustLine(snapshot.watcherTrust));
   if (snapshot.daemonStale) {
     lines.push("⚠ background sync is attached to a previous workspace · rbox start");
   } else if (!snapshot.daemonRunning) {

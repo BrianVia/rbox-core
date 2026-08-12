@@ -230,6 +230,24 @@ test("state projection table follows design-88 precedence and operation shape", 
   });
 });
 
+test("watcher trust is independent visibility derived from trustState", () => {
+  const base = { activity: { at: freshAt }, settled: true, now: NOW };
+  expect(projectAmbientDaemonStatus({ ...base, trustState: "trusted" })).not.toHaveProperty("watcherTrust");
+  expect(projectAmbientDaemonStatus({ ...base, trustState: "suspect" })).toMatchObject({
+    state: "synced",
+    watcherTrust: "suspect",
+  });
+  expect(projectAmbientDaemonStatus({ ...base, trustState: "fused", watcherDegraded: true })).toMatchObject({
+    state: "attention",
+    attentionReason: "watcher-degraded",
+    watcherTrust: "fused",
+  });
+  expect(pausedAmbientDaemonStatus(NOW, projectAmbientDaemonStatus({ ...base, trustState: "fused" }))).toMatchObject({
+    state: "paused",
+    watcherTrust: "fused",
+  });
+});
+
 test("deferral projection and reader round-trip expose bounded repo details", async () => {
   const projected = projectAmbientDaemonStatus({
     activity: { at: freshAt },
@@ -360,6 +378,18 @@ test("ambient reader retains optional daemon identity fields and accepts older r
 
   await writeStatus({ daemonVersion: undefined, mode: undefined, bootId: undefined });
   expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
+});
+
+test("ambient reader accepts old watcher-trust absence and rejects malformed trust", async () => {
+  await writeStatus({ watcherTrust: undefined });
+  expect(readAmbientDaemonStatusRecord(root)).toMatchObject({ kind: "ok", status: { state: "synced" } });
+
+  await writeStatus({ watcherTrust: "fused" });
+  expect(readAmbientDaemonStatusRecord(root)).toMatchObject({ kind: "ok", status: { watcherTrust: "fused" } });
+  expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("✓");
+
+  await writeStatus({ watcherTrust: "trusted" as "fused" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
 });
 
 test("ambient reader rejects malformed daemonVersion records", async () => {

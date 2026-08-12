@@ -16,6 +16,7 @@ import {
   renderGitDeferralLine,
   strandedIgnoredLine,
   trashLine,
+  watcherTrustLine,
   type BriefHaltReason,
   type BriefStatusSnapshot,
 } from "./status-view.js";
@@ -34,7 +35,7 @@ type ResetHaltJsonPayload = {
   workspace: { id: string; name: string | null; root: string };
   halted: true;
   reason: HaltProjection["reason"];
-  daemon: { running: boolean; pid: number | null };
+  daemon: { running: boolean; pid: number | null; watcherTrust: "suspect" | "fused" | null };
   credential: ReturnType<typeof credentialStatusJson>;
 };
 
@@ -96,7 +97,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
         workspace: { id: workspace.id, name: workspace.name ?? null, root: workspace.root },
         halted: true,
         reason: projection.reason,
-        daemon: { running: daemon.running, pid: daemon.pid ?? null },
+        daemon: { running: daemon.running, pid: daemon.pid ?? null, watcherTrust: daemon.watcherTrust ?? null },
         credential: credentialStatusJson(credentials),
       },
     };
@@ -119,6 +120,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
   lines.push(`  ${style.dim("background sync:")} ${daemon.stale
     ? style.yellow(`running but bound to a previous workspace (pid ${daemon.pid})`)
     : daemon.running ? style.green(`${runningDaemonLabel(daemon.version, daemon.mode)} (pid ${daemon.pid})`) : style.yellow("stopped")}`);
+  if (daemon.watcherTrust) lines.push(`  ${style.dim("watcher trust:")} ${style.yellow(watcherTrustLine(daemon.watcherTrust).replace("watcher trust ", ""))}`);
   return { surface: "lines", lines, daemonRunning };
 }
 
@@ -135,6 +137,7 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
       mode: daemon.mode ?? null,
       cliVersion: RBOX_VERSION,
       versionSkew: daemon.versionSkew,
+      watcherTrust: daemon.watcherTrust ?? null,
     },
     locking: {
       status: locking.status,
@@ -243,6 +246,7 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
         ? { recovery: { running: true as const } }
         : {}),
     planQuota,
+    ...(daemon.watcherTrust === undefined ? {} : { watcherTrust: daemon.watcherTrust }),
     daemonVersion: daemon.version,
     cliVersion: RBOX_VERSION,
     daemonVersionSkew: daemon.versionSkew,
@@ -329,6 +333,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
   if (crypto.state === "disabled") lines.push(`  ${style.dim("crypto workers:")} ${style.yellow(`disabled — ${crypto.reason}`)}`);
   for (const trail of lastSyncLines(activity, now)) lines.push(`  ${style.dim(trail)}`);
   lines.push(`  ${style.dim("background sync:")} ${daemonLine(daemon, populate?.pid)}`);
+  if (daemon.watcherTrust) lines.push(`  ${style.dim("watcher trust:")} ${style.yellow(watcherTrustLine(daemon.watcherTrust).replace("watcher trust ", ""))}`);
   if (daemon.versionSkew) {
     lines.push(`  ${style.yellow(`daemon is running v${daemon.version} but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`)}`);
   }

@@ -2,11 +2,96 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildReport, parseArgs, parseReceiver, renderReport } from "./propagation-report.js";
+import { buildHopReport, buildReport, parseArgs, parseReceiver, renderHopReport, renderReport } from "./propagation-report.js";
 
 const line = (at: string, message: string) => `${at} ${message}`;
 
 describe("propagation report", () => {
+  test("renders exact sequence-joined per-hop stamps and the 10s verdict", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = line("2026-07-12T10:00:03.000Z", 'propagation_trace {"v":1,"cycle":1,"backend":"parcel","ms":{"file_fired":1000,"begin":1500,"receipt":3000},"sequence":7}');
+    const receiver = [
+      line("2026-07-12T10:00:04.000Z", 'propagation_receive {"v":1,"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:04.200Z", 'propagation_receive {"v":1,"event":"pull_dequeue","sequence":7,"notify_latency_ms":200}'),
+      line("2026-07-12T10:00:05.000Z", 'propagation_receive {"v":1,"event":"apply_complete","adopted_sequence":7}'),
+    ].join("\n");
+    const report = buildHopReport(origin, receiver, {
+      attempt: "ordinary-write",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    });
+    expect(report).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
+    expect(report.stamps).toEqual({
+      write: writeAt,
+      batcherSettle: writeAt + 1_000,
+      pushBegin: writeAt + 1_500,
+      publishReceipt: writeAt + 3_000,
+      wsReceipt: writeAt + 4_000,
+      pullDequeue: writeAt + 4_200,
+      applyComplete: writeAt + 5_000,
+    });
+    const rendered = renderHopReport(report);
+    expect(rendered).toContain("| END TO END | 2026-07-12T10:00:00.000Z | 2026-07-12T10:00:05.000Z | 5000 |");
+    expect(rendered).toContain("budget <=10000ms PASS\n");
+    expect(rendered).toContain("clock_skew_bound_ms 5\n");
+  });
+
+  test("classifies a later adopted sequence as coalesced and fails closed on duplicate WS stamps", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = line("2026-07-12T10:00:01.000Z", 'propagation_trace {"ms":{"git_fired":100,"begin":200,"receipt":500},"sequence":7}');
+    const receiver = [
+      line("2026-07-12T10:00:02.000Z", 'propagation_receive {"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:02.100Z", 'propagation_receive {"event":"pull_dequeue","sequence":8}'),
+      line("2026-07-12T10:00:03.000Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":8}'),
+    ].join("\n");
+    const options = { attempt: "ref-only", classification: "git" as const, writeAt, clockSkewBoundMs: 5 };
+    expect(buildHopReport(origin, receiver, options)).toMatchObject({ correlation: "coalesced", verdict: "INVALID" });
+    expect(buildHopReport(origin, `${receiver}\n${line("2026-07-12T10:00:02.050Z", 'propagation_receive {"event":"ws_committed","sequence":7}')}`, options))
+      .toMatchObject({ correlation: "unmatched", verdict: "INVALID" });
+  });
+
+  test("joins the daemon's exact trace format when WS wins the publish-return race", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = [
+      // Same-sequence follow-up cycle: it is not the file-classified publication.
+      line("2026-07-12T10:00:03.900Z", 'propagation_trace {"v":1,"cycle":1,"backend":"parcel","ms":{"git_fired":0,"begin":10,"receipt":20},"sequence":7}'),
+      line("2026-07-12T10:00:04.100Z", 'propagation_trace {"v":1,"cycle":2,"backend":"parcel","ms":{"file_fired":1000,"begin":1500,"receipt":4100},"sequence":7}'),
+    ].join("\n");
+    const receiver = [
+      line("2026-07-12T10:00:04.000Z", 'propagation_receive {"v":1,"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:04.020Z", 'propagation_receive {"v":1,"event":"pull_dequeue","sequence":7,"notify_latency_ms":20}'),
+      line("2026-07-12T10:00:05.000Z", 'propagation_receive {"v":1,"event":"apply_complete","adopted_sequence":7}'),
+    ].join("\n");
+
+    expect(buildHopReport(origin, receiver, {
+      attempt: "publish-return-race",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    })).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
+  });
+
+  test("prefers the sole exact sequence join when two sender pushes share the window", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = [
+      line("2026-07-12T10:00:01.000Z", 'propagation_trace {"ms":{"file_fired":100,"begin":200,"receipt":500},"sequence":7}'),
+      line("2026-07-12T10:00:02.000Z", 'propagation_trace {"ms":{"file_fired":1100,"begin":1200,"receipt":1500},"sequence":8}'),
+    ].join("\n");
+    const receiver = [
+      line("2026-07-12T10:00:02.100Z", 'propagation_receive {"event":"ws_committed","sequence":8}'),
+      line("2026-07-12T10:00:02.200Z", 'propagation_receive {"event":"pull_dequeue","sequence":8}'),
+      line("2026-07-12T10:00:03.000Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":8}'),
+    ].join("\n");
+
+    expect(buildHopReport(origin, receiver, {
+      attempt: "two-push-window",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    })).toMatchObject({ sequence: 8, correlation: "exact", verdict: "PASS" });
+  });
+
   test("prefers bounded sequence joins, falls back with batching, and reports staleness", () => {
     const origin = [
       "garbled",
