@@ -42,7 +42,12 @@ export function createPropagationTrace(log: (line: string) => void): Propagation
 
   return {
     backendArmed(value) { backend = value; },
-    eventSeen(classification) { note(classification, "seen"); },
+    eventSeen(classification) {
+      // A write arriving before this cycle reaches the scheduler supersedes the
+      // older pending origin; once waiting, further writes coalesce into it.
+      if (!waiting) pending = newCycle();
+      note(classification, "seen");
+    },
     debouncerArmed(classification) { note(classification, "armed"); },
     debouncerFired(classification) { note(classification, "fired"); },
     schedulerWantArmed() {

@@ -133,6 +133,48 @@ export class ScanAccounting {
     }
   }
 
+  /** Partition one concurrent async phase into exclusive wall-time buckets.
+   *  `secondary` is measured as the union of its in-flight operations, so
+   *  concurrent workers never make the buckets add up to more than phase wall. */
+  async partitionedAsync<T>(
+    primary: PrimaryTimingBucket,
+    secondary: PrimaryTimingBucket,
+    fn: (measureSecondary: <U>(work: () => Promise<U>) => Promise<U>) => Promise<T>,
+  ): Promise<T> {
+    const startedAt = performance.now();
+    const observerAtStart = this.nestedObserverMs;
+    let lastBoundary = startedAt;
+    let secondaryInFlight = 0;
+    let primaryMs = 0;
+    let secondaryMs = 0;
+    const measureSecondary = async <U>(work: () => Promise<U>): Promise<U> => {
+      if (secondaryInFlight++ === 0) {
+        const boundary = performance.now();
+        primaryMs += boundary - lastBoundary;
+        lastBoundary = boundary;
+      }
+      try {
+        return await work();
+      } finally {
+        if (--secondaryInFlight === 0) {
+          const boundary = performance.now();
+          secondaryMs += boundary - lastBoundary;
+          lastBoundary = boundary;
+        }
+      }
+    };
+    try {
+      return await fn(measureSecondary);
+    } finally {
+      const endedAt = performance.now();
+      if (secondaryInFlight > 0) secondaryMs += endedAt - lastBoundary;
+      else primaryMs += endedAt - lastBoundary;
+      primaryMs = Math.max(0, primaryMs - (this.nestedObserverMs - observerAtStart));
+      this.add(primary, primaryMs);
+      this.add(secondary, secondaryMs);
+    }
+  }
+
   observe<T>(fn: () => T): T {
     const startedAt = performance.now();
     try {

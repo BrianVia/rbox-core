@@ -474,7 +474,7 @@ export async function applyPulledManifest(
   }
   if (actions.length > 0) {
     try {
-      deps.onPullApplied?.(actions);
+      deps.onPullApplied?.(actions, savedState.lastSyncedSequence);
     } catch {
       // Observability only: a hook failure must never fail a pull that has already
       // applied and saved — the daemon would misread it as a pull halt.

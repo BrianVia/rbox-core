@@ -645,7 +645,7 @@ export function headlineBlocked(snapshot: BriefStatusSnapshot): boolean {
   if (snapshot.kind === "reset-halt") return true;
   return snapshot.halt !== undefined
     || snapshot.planQuota.kind !== "none"
-    || snapshot.watcherTrust !== undefined
+    || snapshot.watcherTrust === "fused"
     || snapshot.daemonVersionSkew
     || snapshot.locking.status !== "ok";
 }
@@ -736,8 +736,8 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   if (snapshot.halt) lines.push(briefHaltLine(snapshot.halt));
   const quota = planQuotaLine(snapshot.planQuota);
   if (quota) lines.push(quota);
-  // Primary-attention precedence is halt > quota > watcher trust. Brief keeps
-  // one primary condition; verbose/JSON retain trust as supplementary evidence.
+  // Halt/quota suppress watcher detail. Fused also escalates the headline;
+  // suspect remains a supplementary line under an otherwise-normal headline.
   if (!snapshot.halt && !quota && snapshot.watcherTrust) lines.push(watcherTrustLine(snapshot.watcherTrust));
   if (snapshot.daemonStale) {
     lines.push("⚠ background sync is attached to a previous workspace · rbox start");

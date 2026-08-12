@@ -144,9 +144,9 @@ test("plan/quota precedence and all quota copy are closed", () => {
   expect(aggregatePlanQuotaAttention(account(null), undefined)).toEqual({ kind: "none" });
 });
 
-test("watcher trust is primary only below halt and quota", () => {
+test("suspect watcher trust stays supplementary while fused escalates", () => {
   expect(lines(full({ watcherTrust: "suspect" })).slice(0, 2)).toEqual([
-    "Development · sync needs attention",
+    "Development · syncing normally",
     "watcher trust suspect — pulls may scan while trust is rebuilt",
   ]);
   expect(lines(full({ watcherTrust: "fused" })).slice(0, 2)).toEqual([

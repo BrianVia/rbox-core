@@ -642,12 +642,10 @@ async function finishHashes(ctx: WalkCtx, pending: PendingHash[], out: FileEntry
   const onDeferErrno = ctx.onDeferErrno && ctx.accounting
     ? (code: string) => ctx.accounting!.observe(() => ctx.onDeferErrno!(code))
     : ctx.onDeferErrno;
-  const hashed = ctx.accounting
-    ? await ctx.accounting.async("hashMs", () => hashPending(pending, ctx.deferred, onDeferErrno))
-    : await hashPending(pending, ctx.deferred, onDeferErrno);
   const stable = ctx.accounting
-    ? await ctx.accounting.async("statMs", () => statHashed(hashed, ctx.deferred))
-    : await statHashed(hashed, ctx.deferred);
+    ? await ctx.accounting.partitionedAsync("hashMs", "statMs", (measurePostStat) =>
+        hashPending(pending, ctx.deferred, onDeferErrno, measurePostStat))
+    : await hashPending(pending, ctx.deferred, onDeferErrno);
   const recordCache = () => {
     if (!ctx.cache) return;
     for (const result of stable) ctx.cache.record(result.pending.childRel, {
@@ -686,51 +684,43 @@ function timedMatcher(accounting: ScanAccounting, fn: () => boolean): boolean {
   return accounting.sync("matcherMs", fn);
 }
 
-interface HashedPending {
+interface StableHash {
   pending: PendingHash;
   sha256: string;
-}
-
-interface StableHash extends HashedPending {
   post: Stats;
 }
 
-/** Hash the deferred cache-miss files with bounded concurrency. */
-async function hashPending(pending: PendingHash[], deferred?: Set<string>, onDeferErrno?: (code: string) => void): Promise<HashedPending[]> {
-  const hashed: Array<HashedPending | undefined> = new Array(pending.length);
+/** Hash cache misses with bounded concurrency, then immediately re-stat each
+ *  file in the same worker so the stability window is only that file's hash. */
+async function hashPending(
+  pending: PendingHash[],
+  deferred?: Set<string>,
+  onDeferErrno?: (code: string) => void,
+  measurePostStat?: <T>(work: () => Promise<T>) => Promise<T>,
+): Promise<StableHash[]> {
+  const stable: Array<StableHash | undefined> = new Array(pending.length);
   let i = 0;
   const worker = async () => {
     for (let idx = i++; idx < pending.length; idx = i++) {
       const p = pending[idx]!;
+      let sha256: string;
       try {
-        hashed[idx] = { pending: p, sha256: await hashFile(p.abs, p.st.size) };
+        sha256 = await hashFile(p.abs, p.st.size);
       } catch (e) {
         if (!isDeferrableFileError(e)) throw e;
         deferred?.add(p.childRel);
         onDeferErrno?.(e.code!);
+        continue;
       }
+      const readPostStat = () => fs.lstat(p.abs).catch(() => undefined);
+      const post = measurePostStat ? await measurePostStat(readPostStat) : await readPostStat();
+      if (!post || !statsStableAcrossHash(p.st, post)) {
+        deferred?.add(p.childRel);
+        continue;
+      }
+      stable[idx] = { pending: p, sha256, post };
     }
   };
   await Promise.all(Array.from({ length: Math.min(HASH_CONCURRENCY, pending.length) }, worker));
-  return hashed.filter((result): result is HashedPending => result !== undefined);
-}
-
-/** Post-hash metadata is a distinct bounded phase so concurrent worker overlap
- * cannot double-count it into the regular-file read/hash bucket. */
-async function statHashed(hashed: HashedPending[], deferred?: Set<string>): Promise<StableHash[]> {
-  const stable: Array<StableHash | undefined> = new Array(hashed.length);
-  let i = 0;
-  const worker = async () => {
-    for (let idx = i++; idx < hashed.length; idx = i++) {
-      const result = hashed[idx]!;
-      const post = await fs.lstat(result.pending.abs).catch(() => undefined);
-      if (!post || !statsStableAcrossHash(result.pending.st, post)) {
-        deferred?.add(result.pending.childRel);
-        continue;
-      }
-      stable[idx] = { ...result, post };
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(HASH_CONCURRENCY, hashed.length) }, worker));
   return stable.filter((result): result is StableHash => result !== undefined);
 }
