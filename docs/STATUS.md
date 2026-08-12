@@ -5,6 +5,18 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-08-12 (cont): DESIGN 232 MERGED (#635, ALIGNED r3 —
+instruments-first kernel, all mechanisms evidence-gated on round-6 bench).
+Docs truth sweep MERGED (#633); four stale docs deleted; help copy tweak
+merged (#634). Desktop cleanup: 21/22 stale agent worktrees swept (2 dirty
+skipped: agent-ad2a9aee, ~/agent-work/526-republish). rbox git resolve
+keep-mine REFUSED on the live repo — "incoming-versus-local comparison could
+not complete; retry after Git state settles" while a session actively commits;
+guidance text loops back to preview. Recorded as the motivating fixture for
+design 234 (git-resolve rig). The config-step pause (git config parse-error,
+latched since 07-29) still stands — same 234/parse-error hunt. Next session:
+implement 232 kernel slice 1 (bench + tracing), then round-6 numbers._
+
 _DECISIONS 2026-08-12 (founder): (1) RBOX_KEY posture — non-issue; keep the
 feature as-is, existing README caveat suffices, NO rotation requirement now
 (founder: don't overcomplicate). (2) Four
