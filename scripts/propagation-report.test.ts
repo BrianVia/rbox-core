@@ -72,7 +72,7 @@ describe("propagation report", () => {
     })).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
   });
 
-  test("prefers the sole exact sequence join when two sender pushes share the window", () => {
+  test("pins the first post-write publication instead of a later exact receiver join", () => {
     const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
     const origin = [
       line("2026-07-12T10:00:01.000Z", 'propagation_trace {"ms":{"file_fired":100,"begin":200,"receipt":500},"sequence":7}'),
@@ -89,7 +89,30 @@ describe("propagation report", () => {
       classification: "file",
       writeAt,
       clockSkewBoundMs: 5,
-    })).toMatchObject({ sequence: 8, correlation: "exact", verdict: "PASS" });
+    })).toMatchObject({ sequence: 7, correlation: "unmatched", verdict: "INVALID" });
+  });
+
+  test("skips a neighboring cycle whose reconstructed settle predates the write", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = [
+      line("2026-07-12T10:00:02.000Z", 'propagation_trace {"cycle":1,"ms":{"file_fired":1000,"begin":9000,"receipt":10000},"sequence":7}'),
+      line("2026-07-12T10:00:04.000Z", 'propagation_trace {"cycle":2,"ms":{"file_fired":1000,"begin":1500,"receipt":3000},"sequence":7}'),
+      line("2026-07-12T10:00:03.000Z", 'propagation_trace {"cycle":3,"ms":{"file_fired":1000,"begin":1500,"receipt":2000},"sequence":8}'),
+    ].join("\n");
+    const receiver = [
+      line("2026-07-12T10:00:04.100Z", 'propagation_receive {"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:04.200Z", 'propagation_receive {"event":"pull_dequeue","sequence":7}'),
+      line("2026-07-12T10:00:05.000Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":7}'),
+    ].join("\n");
+
+    const report = buildHopReport(origin, receiver, {
+      attempt: "neighbor-cycle",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    });
+    expect(report).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
+    expect(report.stamps.batcherSettle).toBe(writeAt + 2_000);
   });
 
   test("prefers bounded sequence joins, falls back with batching, and reports staleness", () => {

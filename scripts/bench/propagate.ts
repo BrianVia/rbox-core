@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { buildHopReport, renderHopReport, type HopReport, type PropagationClassification } from "../propagation-report.js";
+import { buildHopReport, renderHopReport, senderTraceForAttempt, type HopReport, type PropagationClassification } from "../propagation-report.js";
 
 const BENCH_DIR = "rbox-propagation-bench";
 const SAMPLE_COUNT = 5;
@@ -124,27 +124,6 @@ async function pollUntilDeadline<T>(deadlineAt: number, probe: () => Promise<T>,
     if (done(value) || Date.now() >= deadlineAt) return value;
     await Bun.sleep(Math.min(HOP_POLL_INTERVAL_MS, deadlineAt - Date.now()));
   }
-}
-
-function senderTraceForAttempt(log: string, classification: PropagationClassification, writeAt: number): string | undefined {
-  const settleKey = `${classification}_fired`;
-  return log.split(/\r?\n/).find((line) => {
-    const match = /^(\S+Z)\s+propagation_trace (.*)$/.exec(line);
-    if (!match) return false;
-    const receiptAt = Date.parse(match[1]!);
-    if (!Number.isFinite(receiptAt) || receiptAt < writeAt) return false;
-    try {
-      const trace = JSON.parse(match[2]!) as {
-        sequence?: unknown;
-        ms?: Partial<Record<"file_fired" | "git_fired" | "receipt", number>>;
-      };
-      return Number.isSafeInteger(trace.sequence)
-        && Number.isFinite(trace.ms?.[settleKey])
-        && Number.isFinite(trace.ms?.receipt);
-    } catch {
-      return false;
-    }
-  });
 }
 
 function elapsedMs(report: HopReport): number | undefined {

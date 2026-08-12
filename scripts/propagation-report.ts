@@ -1,4 +1,5 @@
 const MAX_LATENCY_MS = 10 * 60 * 1_000;
+const SENDER_CLOCK_GUARD_MS = 250;
 export const PROPAGATION_BUDGET_MS = 10_000;
 
 type Publish = { at: number; sequence: number };
@@ -54,6 +55,7 @@ function jsonAfter<T>(text: string, prefix: string): T | undefined {
 
 type SenderTrace = {
   at: number;
+  line: string;
   sequence: number;
   ms: Partial<Record<"file_fired" | "git_fired" | "begin" | "receipt", number>>;
 };
@@ -83,9 +85,37 @@ function senderTraces(log: string): SenderTrace[] {
     if (!parsed) continue;
     const body = jsonAfter<{ sequence?: unknown; ms?: SenderTrace["ms"] }>(parsed.text, "propagation_trace ");
     if (!body || !Number.isSafeInteger(body.sequence) || !body.ms || !Number.isFinite(body.ms.receipt)) continue;
-    traces.push({ at: parsed.at, sequence: body.sequence as number, ms: body.ms });
+    traces.push({ at: parsed.at, line, sequence: body.sequence as number, ms: body.ms });
   }
   return traces;
+}
+
+/** Select the causally attributable cycle for an attempt. The first receipt after
+ * the write fixes the published sequence; later cycles may describe that same
+ * publication, but neighboring publications may not steal the attempt. */
+export function senderTraceForAttempt(
+  log: string,
+  classification: PropagationClassification,
+  writeAt: number,
+): string | undefined {
+  const traces = senderTraces(log);
+  const firstPublished = traces
+    .filter((trace) => trace.at >= writeAt)
+    .sort((a, b) => a.at - b.at)[0];
+  if (!firstPublished) return;
+  const settleKey = `${classification}_fired` as const;
+  const candidates = traces.flatMap((trace) => {
+    const settleOffset = trace.ms[settleKey];
+    if (trace.at < writeAt || trace.sequence !== firstPublished.sequence || !Number.isFinite(settleOffset)) return [];
+    const settleAt = trace.at - (trace.ms.receipt! - settleOffset!);
+    return settleAt >= writeAt - SENDER_CLOCK_GUARD_MS ? [{ trace, settleAt }] : [];
+  });
+  candidates.sort((a, b) => {
+    const aGuarded = a.settleAt < writeAt;
+    const bGuarded = b.settleAt < writeAt;
+    return Number(aGuarded) - Number(bGuarded) || a.settleAt - b.settleAt || a.trace.at - b.trace.at;
+  });
+  return candidates[0]?.trace.line;
 }
 
 function receiverStamps(log: string): ReceiverStamp[] {
@@ -117,19 +147,9 @@ export function buildHopReport(
 ): HopReport {
   const budgetMs = options.budgetMs ?? PROPAGATION_BUDGET_MS;
   const settleKey = `${options.classification}_fired` as const;
-  const candidates = senderTraces(originLog).filter((trace) =>
-    trace.at >= options.writeAt && Number.isFinite(trace.ms[settleKey]));
+  const selectedTrace = senderTraceForAttempt(originLog, options.classification, options.writeAt);
+  const trace = selectedTrace ? senderTraces(selectedTrace)[0] : undefined;
   const receiver = receiverStamps(receiverLog);
-  // A second push can legitimately land in the attempt window. When exactly one
-  // candidate has a complete same-sequence receiver chain, that cross-host join is
-  // stronger than window cardinality; ambiguity still fails closed.
-  const exactCandidates = candidates.filter((candidate) => {
-    const chain = receiverChain(receiver, candidate.sequence);
-    return chain.apply?.sequence === candidate.sequence;
-  });
-  const trace = candidates.length === 1
-    ? candidates[0]
-    : exactCandidates.length === 1 ? exactCandidates[0] : undefined;
   const stamps: HopReport["stamps"] = { write: options.writeAt };
   if (trace) {
     const receiptOffset = trace.ms.receipt!;
