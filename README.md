@@ -60,6 +60,9 @@ curl -fsSL https://rbox.to/agent.sh | sh -s -- --workspace <workspace> --pull-on
 
 `RBOX_KEY` carries account decryption authority in this beta, so keep expiries
 short and store it only where you would store a root-equivalent CI secret.
+If it ever leaks, rbox v1 cannot cryptographically revoke it — recovery means
+resetting the account's encryption and re-syncing. Key rotation is a required
+design before 2.0 GA.
 
 ## What it does
 
