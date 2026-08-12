@@ -27,6 +27,41 @@ describe("PhaseReport", () => {
     expect(j.phases.upload).toMatchObject({ count: 5, wireBytes: 150, ms: 0 });
   });
 
+  test("gaps attribute wall time between phases, keyed by their neighbors", async () => {
+    const r = PhaseReport.pull();
+    await r.phase("state-load", async () => {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await r.phase("apply", async () => {});
+    const j = r.toJSON();
+    expect(j.gaps["state-load→apply"]).toBeGreaterThanOrEqual(20);
+    // The pre-first-phase gap keys off `start`; near-zero gaps may be absent entirely.
+    for (const key of Object.keys(j.gaps)) expect(key).toMatch(/^(start|[a-z-]+)→[a-z-]+$/);
+    expect(j.tailMs).toBeGreaterThanOrEqual(0);
+    // Consecutive gap hits accumulate under one key.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await r.phase("apply", async () => {});
+    expect(r.toJSON().gaps["apply→apply"]).toBeGreaterThanOrEqual(20);
+  });
+
+  test("a phaseless report emits zero gaps and zero tail", () => {
+    const r = PhaseReport.pull();
+    const j = r.toJSON();
+    expect(j.gaps).toEqual({});
+    expect(j.tailMs).toBe(0);
+  });
+
+  test("gaps ≥100ms surface on the summary line; smaller ones stay off it", async () => {
+    const r = PhaseReport.pull();
+    await r.phase("state-load", async () => {});
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await r.phase("apply", async () => {});
+    expect(r.summaryLine()).toContain("gaps state-load→apply");
+    const quiet = PhaseReport.pull();
+    await quiet.phase("state-load", async () => {});
+    await quiet.phase("apply", async () => {});
+    expect(quiet.summaryLine()).not.toContain("gaps state-load→apply");
+  });
+
   test("phase() returns fn's value and runs it exactly once", async () => {
     const r = PhaseReport.pull();
     let calls = 0;

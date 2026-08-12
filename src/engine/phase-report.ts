@@ -102,6 +102,11 @@ export interface PhaseReportJson {
   blobs: number;
   peakRssBytes: number;
   phases: Partial<Record<PhaseName, PhaseTotals>>;
+  /** Wall time between phases, keyed `<prev>→<next>` (`start` before the first phase).
+   *  `tailMs` is the still-open gap since the last phase ended, measured at toJSON time.
+   *  Gaps are how unwrapped work stays visible without guessing where to put wrappers. */
+  gaps: Record<string, number>;
+  tailMs: number;
 }
 
 function zeroTotals(): PhaseTotals {
@@ -116,12 +121,16 @@ export class PhaseReport {
   private readonly startedAt: number;
   private readonly phases = new Map<PhaseName, PhaseTotals>();
   private readonly phaseSummaries = new Map<PhaseName, string>();
+  private readonly gaps = new Map<string, number>();
+  private lastBoundaryAt: number;
+  private lastPhase = "start";
   private peakRss = 0;
 
   private constructor(op: "push" | "pull" | "sync", enabled: boolean) {
     this.op = op;
     this.enabled = enabled;
     this.startedAt = Date.now();
+    this.lastBoundaryAt = this.startedAt;
     this.sampleRss();
   }
 
@@ -162,10 +171,17 @@ export class PhaseReport {
   async phase<T>(name: PhaseName, fn: () => Promise<T>): Promise<T> {
     if (!this.enabled) return fn();
     const t0 = Date.now();
+    const gap = t0 - this.lastBoundaryAt;
+    if (gap > 0) {
+      const key = `${this.lastPhase}→${name}`;
+      this.gaps.set(key, (this.gaps.get(key) ?? 0) + gap);
+    }
     try {
       return await fn();
     } finally {
-      this.bump(name, Date.now() - t0);
+      this.lastBoundaryAt = Date.now();
+      this.lastPhase = name;
+      this.bump(name, this.lastBoundaryAt - t0);
       this.sampleRss();
     }
   }
@@ -235,6 +251,8 @@ export class PhaseReport {
       blobs: this.blobs,
       peakRssBytes: this.peakRss,
       phases,
+      gaps: Object.fromEntries(this.gaps),
+      tailMs: this.phases.size > 0 ? Date.now() - this.lastBoundaryAt : 0,
     };
   }
 
@@ -256,8 +274,15 @@ export class PhaseReport {
       parts.push(`${name} ${fmtMs(t.ms)}${detail ? ` ${detail}` : ""}`);
     }
     const wallMs = Date.now() - this.startedAt;
+    // Gaps ≥100ms keep unwrapped work visible on the greppable line without noise.
+    const gapParts = [...this.gaps.entries()]
+      .filter(([, ms]) => ms >= 100)
+      .map(([key, ms]) => `${key} ${fmtMs(ms)}`);
+    const tailMs = this.phases.size > 0 ? Date.now() - this.lastBoundaryAt : 0;
+    if (tailMs >= 100) gapParts.push(`${this.lastPhase}→end ${fmtMs(tailMs)}`);
+    const gapSection = gapParts.length > 0 ? ` | gaps ${gapParts.join(" ")}` : "";
     const head = `rbox ${this.op} files=${this.files} blobs=${this.blobs} ct=${fmtBytes(ct)} wire=${fmtBytes(wire)} changed=${fmtBytes(changed)} ${fmtMs(wallMs)}`;
-    return `${head} | ${parts.join(" ")} | rss ${fmtBytes(this.peakRss)}`;
+    return `${head} | ${parts.join(" ")}${gapSection} | rss ${fmtBytes(this.peakRss)}`;
   }
 }
 

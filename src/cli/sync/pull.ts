@@ -494,9 +494,13 @@ export async function applyPulledManifest(
     // carrier in it, and losing that is a behavior change, not a telemetry gap).
     let phaseMs: Record<string, number> | undefined;
     try {
-      phaseMs = report.enabled
-        ? Object.fromEntries(Object.entries(report.toJSON().phases).map(([name, totals]) => [name, totals.ms]))
-        : undefined;
+      if (report.enabled) {
+        const snapshot = report.toJSON();
+        phaseMs = {
+          ...Object.fromEntries(Object.entries(snapshot.phases).map(([name, totals]) => [name, totals.ms])),
+          ...Object.fromEntries(Object.entries(snapshot.gaps).map(([key, ms]) => [`gap:${key}`, ms])),
+        };
+      }
     } catch (error) {
       deps.warningSink?.(`pull phase snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
     }
