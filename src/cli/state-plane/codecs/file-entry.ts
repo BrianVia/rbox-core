@@ -12,6 +12,7 @@ export const FILE_ENTRY_KEYS = [
 export const MAX_CANONICAL_VALUE_BYTES = 4 * 1024 * 1024;
 export const MAX_RETAINED_VALUE_BYTES = 16 * 1024 * 1024;
 const HEX64 = /^[0-9a-f]{64}$/;
+const COMMON_FILE_KEYS = new Set(["path", "sha256", "size", "mode", "mtimeMs", "type"]);
 
 export interface EncodedFileEntry {
   entryId: string;
@@ -50,6 +51,55 @@ function nonnegativeInteger(value: unknown, field: string): asserts value is num
 
 export function encodeFileEntry(input: FileEntry): EncodedFileEntry {
   const value = input;
+  const admitted = admitFileEntry(value);
+  const fingerprint = createHash("sha256").update(admitted.canonical).digest("hex");
+  // entry_id is an independent, domain-separated identity. A collision in the
+  // non-unique exact_fingerprint lookup must still reach exact row comparison.
+  const entryId = randomBytes(16).toString("hex");
+  return {
+    entryId,
+    exactFingerprint: fingerprint,
+    path: value.path,
+    pathOrder: utf16beOrderKey(value.path),
+    sha256: admitted.sha256,
+    size: value.size,
+    mode: value.mode,
+    mtimeMs: value.mtimeMs,
+    kind: value.type,
+    symlinkTarget: value.symlinkTarget ?? null,
+    encSha: admitted.encSha,
+    comp: value.comp ?? null,
+    payloadSha: admitted.payloadSha,
+    cipherSize: value.cipherSize ?? null,
+    extrasCjson: admitted.extrasCjson,
+    canonicalBytes: admitted.canonicalBytes,
+    retainedEstimate: admitted.retainedEstimate,
+    canonical: admitted.canonical,
+  };
+}
+
+interface AdmittedFileEntry {
+  sha256: Buffer;
+  encSha: Buffer | null;
+  payloadSha: Buffer | null;
+  extrasCjson: string | null;
+  canonicalBytes: number;
+  retainedEstimate: number;
+  canonical: string;
+}
+
+export function encodeFileEntryForStage(input: FileEntry): Pick<EncodedFileEntry,
+  "path" | "pathOrder" | "canonical" | "retainedEstimate"> {
+  const admitted = admitFileEntry(input);
+  return {
+    path: input.path,
+    pathOrder: utf16beOrderKey(input.path),
+    canonical: admitted.canonical,
+    retainedEstimate: admitted.retainedEstimate,
+  };
+}
+
+function admitFileEntry(value: FileEntry): AdmittedFileEntry {
   assertPath(value.path);
   nonnegativeInteger(value.size, "size");
   if (!Number.isInteger(value.mode) || value.mode < 0 || value.mode > 0o7777) throw new TypeError("mode out of range");
@@ -65,36 +115,37 @@ export function encodeFileEntry(input: FileEntry): EncodedFileEntry {
     throw new TypeError("comp, payloadSha, and cipherSize must be jointly present");
   }
   if (value.cipherSize !== undefined) nonnegativeInteger(value.cipherSize, "cipherSize");
-  const canonical = canonicalJson(value);
+  const commonFile = value.type === "file" && value.symlinkTarget === undefined && value.encSha === undefined
+    && value.comp === undefined && value.payloadSha === undefined && value.cipherSize === undefined
+    && Object.keys(value).every((key) => COMMON_FILE_KEYS.has(key));
+  const canonical = commonFile
+    ? JSON.stringify({
+        mode: value.mode, mtimeMs: value.mtimeMs, path: value.path,
+        sha256: value.sha256, size: value.size, type: "file",
+      })
+    : canonicalJson(value);
   const canonicalBytes = Buffer.byteLength(canonical);
-  const retained = retainedEstimate(value);
+  const retained = commonFile ? commonFileRetained(value.path, value.sha256) : retainedEstimate(value);
   if (canonicalBytes > MAX_CANONICAL_VALUE_BYTES || retained > MAX_RETAINED_VALUE_BYTES) {
     throw new FileEntryOversizeError(value.path, canonicalBytes, retained);
   }
-  const fingerprint = createHash("sha256").update(canonical).digest("hex");
-  // entry_id is an independent, domain-separated identity. A collision in the
-  // non-unique exact_fingerprint lookup must still reach exact row comparison.
-  const entryId = randomBytes(16).toString("hex");
   return {
-    entryId,
-    exactFingerprint: fingerprint,
-    path: value.path,
-    pathOrder: utf16beOrderKey(value.path),
     sha256: hex(value.sha256, "sha256")!,
-    size: value.size,
-    mode: value.mode,
-    mtimeMs: value.mtimeMs,
-    kind: value.type,
-    symlinkTarget: value.symlinkTarget ?? null,
     encSha: hex(value.encSha, "encSha", true),
-    comp: value.comp ?? null,
     payloadSha: hex(value.payloadSha, "payloadSha", true),
-    cipherSize: value.cipherSize ?? null,
-    extrasCjson: extrasOf(value, FILE_ENTRY_KEYS),
+    extrasCjson: commonFile ? null : extrasOf(value, FILE_ENTRY_KEYS),
     canonicalBytes,
     retainedEstimate: retained,
     canonical,
   };
+}
+
+function commonFileRetained(path: string, sha256: string): number {
+  const keys = ["mode", "mtimeMs", "path", "sha256", "size", "type"];
+  const keyBytes = keys.reduce((total, key) => total + 56 + key.length * 2, 0);
+  const stringBytes = [path, sha256, "file"]
+    .reduce((total, value) => total + 56 + value.length * 2, 0);
+  return Math.ceil((64 + keys.length * 96 + keyBytes + 6 * 32 + stringBytes) / 4096) * 4096;
 }
 
 export interface FileEntryRow {
@@ -119,8 +170,27 @@ export function decodeFileEntry(row: FileEntryRow): FileEntry {
     ...(row.payload_sha === null ? {} : { payloadSha: Buffer.from(row.payload_sha).toString("hex") }),
     ...(row.cipher_size === null ? {} : { cipherSize: row.cipher_size }),
   } as unknown as FileEntry;
-  const encoded = encodeFileEntry(entry);
-  if (encoded.canonicalBytes !== row.canonical_bytes || encoded.retainedEstimate !== row.retained_estimate) {
+  const commonFile = row.kind === "file" && row.symlink_target === null && row.enc_sha === null
+    && row.comp === null && row.payload_sha === null && row.cipher_size === null && row.extras_cjson === null;
+  let canonicalBytes: number;
+  let retained: number;
+  if (commonFile) {
+    assertPath(row.path);
+    if (row.sha256.byteLength !== 32) throw new TypeError("sha256 must be lowercase hex64");
+    nonnegativeInteger(row.size, "size");
+    if (!Number.isInteger(row.mode) || row.mode < 0 || row.mode > 0o7777) throw new TypeError("mode out of range");
+    if (typeof row.mtime_ms !== "number" || !Number.isFinite(row.mtime_ms)) throw new TypeError("mtimeMs must be finite");
+    canonicalBytes = Buffer.byteLength(JSON.stringify({
+      mode: row.mode, mtimeMs: row.mtime_ms, path: row.path,
+      sha256: entry.sha256, size: row.size, type: "file",
+    }));
+    retained = commonFileRetained(row.path, entry.sha256);
+  } else {
+    const admitted = admitFileEntry(entry);
+    canonicalBytes = admitted.canonicalBytes;
+    retained = admitted.retainedEstimate;
+  }
+  if (canonicalBytes !== row.canonical_bytes || retained !== row.retained_estimate) {
     throw new Error(`structural corruption in FileEntry ${row.path}`);
   }
   return entry;

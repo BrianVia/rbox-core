@@ -224,9 +224,15 @@ class SqliteSealedStage implements SealedStageReader {
   }
 
   streamFiles(visit: (encoded: EncodedFileEntry) => void): number {
-    return streamRows<{ entry_cjson: string }>(
-      this.accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
-      [this.ref.stageId], (row) => visit(encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry)));
+    return streamRows<{ path: string; entry_cjson: string }>(
+      this.accessor.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
+      [this.ref.stageId], (row) => {
+        const encoded = encodeFileEntry(JSON.parse(row.entry_cjson) as FileEntry);
+        if (encoded.path !== row.path || encoded.canonical !== row.entry_cjson) {
+          throw new StageChangedError(this.ref.stageId, `stage row ${row.path} is not canonical`);
+        }
+        visit(encoded);
+      });
   }
 
   close(): void {
