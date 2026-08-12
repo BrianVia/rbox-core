@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_BUSY-LOOP HUNT STATE (09:30Z, evidence-complete, cause one step away):
+Desktop loop STOPS when session commits stop (windows track my activity); FM
+loops INDEFINITELY with zero user activity — the clean specimen. FM trace:
+git_armed:0 git_fired:~740ms EVERY cycle — the cycle's own work trips the
+linux git-ref fs.watch channel, arming the next cycle. inotifywait on
+savvy-core/.git during a live window: ZERO events — the writer is NOT the
+deferred repo's .git. NEXT MOVE (fresh context): wide inotifywait across all
+FM watched ref roots + the git-ref-watch floor/continuity files
+(git-discovery-continuity.ts, linux-only) for ONE cycle; the path that fires
+names the fix. Note: Mac (darwin, no fs.watch channel) does NOT loop —
+channel-specific. HOLDING ACTION: none taken — loop is CPU/log burn only,
+data safe, both daemons otherwise healthy; do NOT leave FM like this longer
+than a day._
+
 _REGRESSION FOUND (2026-08-12 ~09:30Z, PRIORITY FOR NEXT STINT): **no-op
 push busy-loop on BOTH linux daemons since the 231-activation build went
 live.** Evidence: desktop daemon-2026-08-11.log has 12 pushes total (all
