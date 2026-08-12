@@ -4026,6 +4026,31 @@ test("design 83: plan cache misses changed git state and keeps other repos on th
   }, false);
 }, 120_000);
 
+test("steady plan queues only one changed repo while retaining all 100 repo counts", async () => {
+  for (let i = 0; i < 100; i++) {
+    const rel = `queue-${i.toString().padStart(3, "0")}`;
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", rel, "initial");
+  }
+  await push(rootA, cfgA, depsA);
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  await markDivergenceCacheTrusted(rootA);
+  await commitFile(path.join(rootA, "queue-042"), "changed.txt", "changed", "changed");
+
+  const queued: string[] = [];
+  const plan = await planGitSections(
+    rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA),
+    undefined, noBackoff, { onCaptureQueued: (rel) => queued.push(rel) },
+  );
+
+  expect(queued).toEqual(["queue-042"]);
+  expect(plan.gitPlanStats?.repos).toBe(100);
+  expect(plan.captured).toEqual(["queue-042"]);
+  expect(plan.carried).toHaveLength(99);
+  expect(formatGitPushLine(plan)).toContain("captured 1 (queue-042) · carried 99");
+}, 120_000);
+
 test("design 174 B: a ref reset between maybe-probe and capture fails final candidate proof and carries P", async () => {
   const rel = "supersede-race";
   const repo = path.join(rootA, rel);

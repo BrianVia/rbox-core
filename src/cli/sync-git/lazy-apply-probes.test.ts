@@ -26,8 +26,10 @@ import { collectRepoResidue } from "../doctor-cmd.js";
 import type { SyncRemote } from "../remote.js";
 import { pull } from "../sync.js";
 import { applyGitSections } from "./apply.js";
+import { formatGitApplyMetrics } from "./apply.js";
 import { checkoutJournalBinding } from "./follow.js";
 import { gitIncomingKey } from "./shared.js";
+import { GIT_FINGERPRINT_VERSION, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -197,6 +199,53 @@ test("203.1: warm unchanged multi-repo apply issues zero git spawns", async () =
   expect(run.commands).toEqual([]);
   expect(run.value.gitRepos).toEqual(sections);
 });
+
+test("steady delta queues only its named repo while metrics retain all 100 repos", async () => {
+  const sections: Record<string, GitSection> = {};
+  const cacheRepos: Record<string, {
+    fingerprint: string;
+    writtenAtMs: number;
+    identityKey: string;
+    kind: "dir";
+    probe: { busy: false; preflightOk: true; preflightKind: "dir"; identityKey: string };
+  }> = {};
+  for (let i = 0; i < 100; i++) {
+    const rel = `repo-${i.toString().padStart(3, "0")}`;
+    await initRepo(rel);
+    const section = await capture(rel);
+    sections[rel] = section;
+    const fingerprint = await gitFingerprint(gitFingerprintRun("per-decision"), root, rel);
+    const identityKey = gitIdentityKey(section);
+    cacheRepos[rel] = {
+      fingerprint: fingerprint.hash,
+      writtenAtMs: Date.now() + 10_000,
+      identityKey,
+      kind: "dir",
+      probe: { busy: false, preflightOk: true, preflightKind: "dir", identityKey },
+    };
+  }
+  await fs.writeFile(path.join(root, ".rbox", "state", "git-divergence.json"), JSON.stringify({
+    version: GIT_FINGERPRINT_VERSION,
+    repos: cacheRepos,
+  }));
+  const remote = { ...sections, "repo-042": { ...sections["repo-042"]!, config: { "rbox.test": ["named-delta"] } } };
+  const queued: string[] = [];
+  const outcome = await applyGitSections(
+    root, cfg(), stateWith(sections), manifest(remote), store,
+    buildIgnoreMatcher(root), () => {}, {
+      disableConfigLane: true,
+      collectMetrics: true,
+      onApplyQueued: (rel) => queued.push(rel),
+    },
+  );
+
+  expect(queued).toEqual(["repo-042"]);
+  expect(outcome.gitApplyMetrics?.repos).toBe(100);
+  expect(outcome.gitApplyMetrics?.results.unchanged).toBe(100);
+  expect(outcome.gitApplyMetrics?.repoTimings).toHaveLength(100);
+  expect(formatGitApplyMetrics(outcome.gitApplyMetrics!)).toContain("mode=steady repos=100");
+  expect(formatGitApplyMetrics(outcome.gitApplyMetrics!)).toContain("unchanged=100");
+}, 120_000);
 
 test("203.3: state-keyed identity demanders stay lazy but preserve their outcomes", async () => {
   await initRepo("r");
