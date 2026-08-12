@@ -72,6 +72,26 @@ describe("propagation report", () => {
     })).toMatchObject({ sequence: 7, correlation: "exact", verdict: "PASS" });
   });
 
+  test("prefers the sole exact sequence join when two sender pushes share the window", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = [
+      line("2026-07-12T10:00:01.000Z", 'propagation_trace {"ms":{"file_fired":100,"begin":200,"receipt":500},"sequence":7}'),
+      line("2026-07-12T10:00:02.000Z", 'propagation_trace {"ms":{"file_fired":1100,"begin":1200,"receipt":1500},"sequence":8}'),
+    ].join("\n");
+    const receiver = [
+      line("2026-07-12T10:00:02.100Z", 'propagation_receive {"event":"ws_committed","sequence":8}'),
+      line("2026-07-12T10:00:02.200Z", 'propagation_receive {"event":"pull_dequeue","sequence":8}'),
+      line("2026-07-12T10:00:03.000Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":8}'),
+    ].join("\n");
+
+    expect(buildHopReport(origin, receiver, {
+      attempt: "two-push-window",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    })).toMatchObject({ sequence: 8, correlation: "exact", verdict: "PASS" });
+  });
+
   test("prefers bounded sequence joins, falls back with batching, and reports staleness", () => {
     const origin = [
       "garbled",

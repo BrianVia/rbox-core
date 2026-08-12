@@ -60,6 +60,22 @@ type SenderTrace = {
 
 type ReceiverStamp = { at: number; event: "ws_committed" | "pull_dequeue" | "apply_complete"; sequence: number };
 
+function receiverChain(receiver: ReceiverStamp[], sequence: number): {
+  wsReceipt?: ReceiverStamp;
+  dequeue?: ReceiverStamp;
+  apply?: ReceiverStamp;
+} {
+  const ws = receiver.filter((stamp) => stamp.event === "ws_committed" && stamp.sequence === sequence);
+  const wsReceipt = ws.length === 1 ? ws[0] : undefined;
+  const dequeue = wsReceipt
+    ? receiver.find((stamp) => stamp.event === "pull_dequeue" && stamp.sequence >= sequence && stamp.at >= wsReceipt.at)
+    : undefined;
+  const apply = dequeue
+    ? receiver.find((stamp) => stamp.event === "apply_complete" && stamp.sequence >= sequence && stamp.at >= dequeue.at)
+    : undefined;
+  return { wsReceipt, dequeue, apply };
+}
+
 function senderTraces(log: string): SenderTrace[] {
   const traces: SenderTrace[] = [];
   for (const line of log.split(/\r?\n/)) {
@@ -103,7 +119,17 @@ export function buildHopReport(
   const settleKey = `${options.classification}_fired` as const;
   const candidates = senderTraces(originLog).filter((trace) =>
     trace.at >= options.writeAt && Number.isFinite(trace.ms[settleKey]));
-  const trace = candidates.length === 1 ? candidates[0] : undefined;
+  const receiver = receiverStamps(receiverLog);
+  // A second push can legitimately land in the attempt window. When exactly one
+  // candidate has a complete same-sequence receiver chain, that cross-host join is
+  // stronger than window cardinality; ambiguity still fails closed.
+  const exactCandidates = candidates.filter((candidate) => {
+    const chain = receiverChain(receiver, candidate.sequence);
+    return chain.apply?.sequence === candidate.sequence;
+  });
+  const trace = candidates.length === 1
+    ? candidates[0]
+    : exactCandidates.length === 1 ? exactCandidates[0] : undefined;
   const stamps: HopReport["stamps"] = { write: options.writeAt };
   if (trace) {
     const receiptOffset = trace.ms.receipt!;
@@ -112,18 +138,9 @@ export function buildHopReport(
     if (Number.isFinite(trace.ms.begin)) stamps.pushBegin = trace.at - (receiptOffset - trace.ms.begin!);
     stamps.publishReceipt = trace.at;
   }
-
-  const receiver = receiverStamps(receiverLog);
-  const ws = trace ? receiver.filter((stamp) => stamp.event === "ws_committed" && stamp.sequence === trace.sequence) : [];
-  const wsReceipt = ws.length === 1 ? ws[0] : undefined;
-  const dequeues = trace && wsReceipt
-    ? receiver.filter((stamp) => stamp.event === "pull_dequeue" && stamp.sequence >= trace.sequence && stamp.at >= wsReceipt.at)
-    : [];
-  const dequeue = dequeues[0];
-  const applies = trace && dequeue
-    ? receiver.filter((stamp) => stamp.event === "apply_complete" && stamp.sequence >= trace.sequence && stamp.at >= dequeue.at)
-    : [];
-  const apply = applies[0];
+  const { wsReceipt, dequeue, apply } = trace
+    ? receiverChain(receiver, trace.sequence)
+    : {};
   if (wsReceipt) stamps.wsReceipt = wsReceipt.at;
   if (dequeue) stamps.pullDequeue = dequeue.at;
   if (apply) stamps.applyComplete = apply.at;

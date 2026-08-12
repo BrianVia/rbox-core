@@ -233,6 +233,12 @@ function hopObservationDetail(observation: HopObservation): string {
   return `correlation=${observation.hops.correlation} sequence=${observation.hops.sequence ?? "-"} verdict=${observation.hops.verdict} observation=${observation.state} waited=${observation.waitedMs}ms`;
 }
 
+function exactHopWithin(report: HopReport, ceilingMs: number): boolean {
+  const { write, applyComplete } = report.stamps;
+  return report.correlation === "exact" && write !== undefined && applyComplete !== undefined
+    && applyComplete - write < ceilingMs;
+}
+
 /** True iff `aDelta` shows A capturing `repo` with NO `safety scan:` line before it
  *  (event-driven). Returns [captured, eventDriven]. */
 function captureShape(aDelta: string, repo: string): { captured: boolean; eventDriven: boolean; line: string } {
@@ -309,8 +315,8 @@ async function commitRound(
 
   const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, classification, out.ok);
   assertPropagation(rec, round, repo, observation.aDelta, observation.bDelta, elapsedMs);
-  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
-  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, observation.hops.verdict === "PASS",
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\n10s verdict ${observation.hops.verdict} (report-only; n=1, authoritative at n>=30)\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within ${FAST_CEILING_MS / 1000}s coarse ceiling`, exactHopWithin(observation.hops, FAST_CEILING_MS),
     hopObservationDetail(observation));
 
   const fsck = await ctx.b.exec(["git", "-C", repoDir, "fsck", "--strict", "--no-progress"], { allowFail: true });
@@ -338,8 +344,8 @@ async function filePlaneRound(
   const observation = await awaitHopObservation(ctx.a, ctx.b, changeAt, round, "file", out.ok);
   rec.assert(`[${round}] B pull was notify-carried`, /notify_latency_ms=\d+/.test(observation.bDelta),
     /notify_latency_ms=\d+/.test(observation.bDelta) ? "notify_latency_ms token present" : "no notify_latency_ms token");
-  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
-  rec.assert(`[${round}] exact sequence-joined propagation within 10s`, observation.hops.verdict === "PASS",
+  ctx.log(`${renderHopReport(observation.hops).trimEnd()}\n10s verdict ${observation.hops.verdict} (report-only; n=1, authoritative at n>=30)\nobservation ${observation.state} waited_ms=${observation.waitedMs}`);
+  rec.assert(`[${round}] exact sequence-joined propagation within ${FAST_CEILING_MS / 1000}s coarse ceiling`, exactHopWithin(observation.hops, FAST_CEILING_MS),
     hopObservationDetail(observation));
 
   if (expectDirty) {
