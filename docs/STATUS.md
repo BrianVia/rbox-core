@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SHIPPED v2.0.0-beta.2 to next channel (2026-08-12): #641 held-skip stack —
+four field-tested layers (semantic key excl. transport identity; RBOX_TRACE_HELD
+diagnostic; skip decision hoisted BEFORE fetch/classify; legacy-attempt upgrade
++ blocker-plane retention). FIELD PROOF: savvy-core 9,381ms → 8ms per pull.
+LESSON (cost 3 dud fixes): green tests lied because the harness bypassed the
+real applyPulledManifest disk path — red-first against live-shaped fixtures is
+now the rule for this plane. GitHub Releases panel now gets an entry per tag
+(beta.2 + backfilled beta.1); automating that in release.yml is a follow-up.
+Fleet: FM on the stack (c870922 dev), desktop updated post-release; echo-loop
+dead; trust healthy. REMAINING to ≤10s: sender push op ~9-10s (commit 3.3s +
+pipeline), receiver reconcile-over-119k (~10s) = task 17's fast-path; then
+30-attempt acceptance. Also queued: thermo sweep (15), Mac reinstall when
+reachable, GH-release automation._
+
 _ROUND-6 VERDICTS (2026-08-12, 9 exact samples, founder called shape early):
 e2e median ~32s (31.0-35.5 band, one 93s tail from a single heavy push
 cycle). Hops: sender WAIT ~0.3s (dead — was 93s); push op median ~9.9s
