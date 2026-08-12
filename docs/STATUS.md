@@ -5,6 +5,17 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_ROUND-6 FIRST LIGHT (2026-08-12 ~08:12Z, desktop→FM, post-#637 traced
+daemons): END-TO-END 109s. Hops: settle→push-begin 44.7s; push op itself
+125.6s (git-plan sweep over ~100 repos — the real-fleet cost containers never
+see); WS receipt→dequeue 253ms (spine is PERFECT); dequeue→apply 23.6s.
+VERDICT SHAPE: budget is eaten INSIDE ops (sender push duration + receiver
+apply), not scheduling/notify — res/git-plan per-repo cost is where ≤10s
+lives; notify fast-lane heading for deletion per the knife. Remaining: sender
+cycle-join exactness fix (matched a neighbor cycle's settle), 30-attempt
+authoritative run, Mac (unreachable ~08:00Z, needs post-#637 build + traced
+restart when back). Bench sender-await fix committed on main._
+
 _SESSION 2026-08-12 (kernel): **232 KERNEL MERGED (#637).** Residual-bucket
 scan accounting (warm zero-hash overhead <3% amended gate, authoritative
 off-CI only — CI runs structure-only scaled fixture), watcherTrust ambient
