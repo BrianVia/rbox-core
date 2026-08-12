@@ -5,9 +5,9 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_DECISIONS 2026-08-12 (founder): (1) RBOX_KEY posture — NOTHING leaked;
-keep the feature, add the leak-consequence warning to user docs, and epoch
-rotation (e2ee-remote.ts:748 stub) is a REQUIRED pre-2.0-GA design. (2) Four
+_DECISIONS 2026-08-12 (founder): (1) RBOX_KEY posture — non-issue; keep the
+feature as-is, existing README caveat suffices, NO rotation requirement now
+(founder: don't overcomplicate). (2) Four
 wholly-stale docs DELETED (rbox-architecture.md v1 draft, roadmap.md,
 go-live-todo.md, apps/web/README.md) — go-live-todo's live finding (the
 RBOX_KEY gate) is captured here. (3) Desktop rbox-core cleanup approved:
