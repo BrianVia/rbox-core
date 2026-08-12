@@ -5,8 +5,10 @@ import {
   GIT_REF_SIGNAL_TAIL_TABLE,
   gitRefStorage,
   isGitRefSignalTail,
+  readSyncableRefSurface,
   repoCtxFromDisk,
   type DiscoveredGitRepo,
+  type OwnedRefMutationLease,
   type RepoCtx,
 } from "../../engine/index.js";
 import { gitRepoCap } from "../sync-git/shared.js";
@@ -109,6 +111,7 @@ export interface GitRefWatchRegistryOptions {
   resolveRepo?: (repoDir: string) => Promise<RepoCtx | undefined>;
   refStorage?: (repoDir: string) => Promise<string | undefined>;
   realpath?: (target: string) => Promise<string>;
+  readRefSurface?: (repoDir: string) => Promise<string | undefined>;
   watch?: (target: string, mode: GitRefWatchMode, listener: (eventType: string, filename: string | Buffer | null) => void) => GitRefWatchHandle;
   clock?: GitRefWatchClock;
   /** Target/lock callbacks only. Structure and null/root events only re-arm. */
@@ -175,6 +178,12 @@ interface RunBuild {
   pendingRetryKeys: Set<string>;
 }
 
+interface OwnedRefMutationState {
+  depth: number;
+  repoDir: string;
+  before: string | undefined;
+}
+
 const DEFAULT_NAMESPACE_DIR_BUDGET = 512;
 const DEFAULT_NAMESPACE_ENTRY_BUDGET = 8192;
 
@@ -204,6 +213,7 @@ export class GitRefWatchRegistry {
   readonly #resolveRepo: NonNullable<GitRefWatchRegistryOptions["resolveRepo"]>;
   readonly #refStorage: NonNullable<GitRefWatchRegistryOptions["refStorage"]>;
   readonly #realpath: NonNullable<GitRefWatchRegistryOptions["realpath"]>;
+  readonly #readRefSurface: NonNullable<GitRefWatchRegistryOptions["readRefSurface"]>;
   readonly #watch: NonNullable<GitRefWatchRegistryOptions["watch"]>;
   readonly #clock: GitRefWatchClock;
   readonly #onSignal?: () => void;
@@ -228,6 +238,8 @@ export class GitRefWatchRegistry {
   #waiters: Array<{ generation: number; resolve: () => void }> = [];
   #floorRequired = false;
   #overCapComposition = "";
+  #ownedRefMutations = new Map<string, OwnedRefMutationState>();
+  #ownedRefMutationQueue = Promise.resolve();
 
   constructor(opts: GitRefWatchRegistryOptions) {
     this.#root = path.resolve(opts.root);
@@ -240,6 +252,7 @@ export class GitRefWatchRegistry {
     this.#resolveRepo = opts.resolveRepo ?? repoCtxFromDisk;
     this.#refStorage = opts.refStorage ?? gitRefStorage;
     this.#realpath = opts.realpath ?? ((target) => fsp.realpath(target));
+    this.#readRefSurface = opts.readRefSurface ?? readSyncableRefSurface;
     this.#watch = opts.watch ?? defaultWatch;
     this.#clock = opts.clock ?? SYSTEM_CLOCK;
     this.#onSignal = opts.onSignal;
@@ -266,6 +279,37 @@ export class GitRefWatchRegistry {
   /** Wait for the currently requested reconcile generation (test/diagnostic seam). */
   async idle(): Promise<void> {
     while (this.#pump) await this.#pump;
+  }
+
+  /** Bracket one refs/rbox-wip update-ref command. The successful command owns
+   * the exclusive lock; the registry owns attribution and reconciliation. */
+  enterOwnedRefMutation(repoDir: string): Promise<OwnedRefMutationLease | undefined> {
+    return this.#serializeOwnedRefMutation(async () => {
+      if (this.#closed || this.#readerDead) return undefined;
+      const ctx = await this.#resolveRepo(repoDir).catch(() => undefined);
+      if (!ctx || this.#closed || this.#readerDead) return undefined;
+      const [rootReal, commonDir] = await Promise.all([
+        this.#rootReal ? Promise.resolve(this.#rootReal) : this.#realpath(this.#root).catch(() => undefined),
+        this.#realpath(ctx.commonDir).catch(() => undefined),
+      ]);
+      if (!rootReal || !commonDir || !within(rootReal, commonDir) || this.#closed || this.#readerDead) return undefined;
+      this.#rootReal ??= rootReal;
+      const current = this.#ownedRefMutations.get(commonDir);
+      if (current) current.depth++;
+      else this.#ownedRefMutations.set(commonDir, {
+        depth: 1,
+        repoDir,
+        before: await this.#readRefSurface(repoDir).catch(() => undefined),
+      });
+      let finished = false;
+      return {
+        finish: async () => {
+          if (finished) return;
+          finished = true;
+          await this.#serializeOwnedRefMutation(() => this.#finishOwnedRefMutation(commonDir)).catch(() => {});
+        },
+      };
+    }).catch(() => undefined);
   }
 
   /** Additive initial/plan/candidate discovery input. Never shrinks ownership. */
@@ -358,10 +402,31 @@ export class GitRefWatchRegistry {
     this.#clearRetryTimer();
     const handles = [...this.#active.values()].map((target) => target.handle);
     this.#active.clear();
+    this.#ownedRefMutations.clear();
     this.#resolveWaiters(Number.POSITIVE_INFINITY);
     await Promise.all(handles.map(closeHandle));
     if (this.#pump) await this.#pump;
     await Promise.all(this.#closingHandles);
+  }
+
+  #serializeOwnedRefMutation<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.#ownedRefMutationQueue.then(task, task);
+    this.#ownedRefMutationQueue = result.then(() => {}, () => {});
+    return result;
+  }
+
+  async #finishOwnedRefMutation(commonDir: string): Promise<void> {
+    const state = this.#ownedRefMutations.get(commonDir);
+    if (!state || this.#closed || this.#readerDead) return;
+    if (--state.depth > 0) return;
+    const lockPath = path.join(commonDir, "packed-refs.lock");
+    const lockedBefore = await pathPresence(lockPath);
+    const after = await this.#readRefSurface(state.repoDir).catch(() => undefined);
+    const lockedAfter = await pathPresence(lockPath);
+    this.#ownedRefMutations.delete(commonDir);
+    if (state.before === undefined || after === undefined || state.before !== after || lockedBefore !== false || lockedAfter !== false) {
+      this.#onSignal?.();
+    }
   }
 
   #requestReconcile(): Promise<void> {
@@ -766,6 +831,8 @@ export class GitRefWatchRegistry {
             this.#dirtyTarget(desired.key);
             return;
           }
+          if (eventClass === "lockPreSignal" && contributor.role === "commonDir"
+            && tail === "packed-refs.lock" && this.#ownedRefMutations.has(desired.canonicalRoot)) continue;
           if (eventClass === "target" || eventClass === "lockPreSignal") signal = true;
         }
         if (signal) this.#onSignal?.();
@@ -871,6 +938,15 @@ async function closeHandle(handle: GitRefWatchHandle): Promise<void> {
 
 async function closeDir(handle: { close(): void | Promise<void> }): Promise<void> {
   try { await handle.close(); } catch { /* admission is best-effort; read fault already pins */ }
+}
+
+async function pathPresence(target: string): Promise<boolean | undefined> {
+  try {
+    await fsp.lstat(target);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;
+  }
 }
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);

@@ -30,34 +30,58 @@ export interface ScratchPins {
   refs: string[];
 }
 
+/** Optional daemon observation boundary for rbox-owned scratch-ref mutations.
+ * Foreground capture has no observer and deliberately omits it. */
+export interface OwnedRefMutationBoundary {
+  enterOwnedRefMutation(repoDir: string): Promise<OwnedRefMutationLease | undefined>;
+}
+
+export interface OwnedRefMutationLease {
+  /** Idempotent; observation failure must never turn a successful capture into a failure. */
+  finish(): Promise<void>;
+}
+
+async function ownedUpdateRef(
+  repoDir: string,
+  args: string[],
+  boundary?: OwnedRefMutationBoundary,
+): Promise<void> {
+  const lease = await boundary?.enterOwnedRefMutation(repoDir).catch(() => undefined);
+  try {
+    await git(repoDir, ["update-ref", ...args]);
+  } finally {
+    await lease?.finish().catch(() => {});
+  }
+}
+
 /** Pin every commit the section will reference under a CAPTURE-UNIQUE namespace
  *  `refs/rbox-wip/<epochMs>-<rand>/<n>`: linked worktrees share one ref store, so a
  *  single global scratch ref would race under concurrent sibling captures [v2, B2]. */
-export async function createScratchPins(repoDir: string, shas: string[]): Promise<ScratchPins> {
+export async function createScratchPins(repoDir: string, shas: string[], boundary?: OwnedRefMutationBoundary): Promise<ScratchPins> {
   const ns = `${WIP_NS}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const refs: string[] = [];
   try {
     let n = 0;
     for (const sha of shas) {
       const ref = `${ns}/${n++}`;
-      await git(repoDir, ["update-ref", ref, sha]);
+      await ownedUpdateRef(repoDir, [ref, sha], boundary);
       refs.push(ref);
     }
   } catch (e) {
-    await deleteScratchPins(repoDir, { refs });
+    await deleteScratchPins(repoDir, { refs }, boundary);
     throw e;
   }
   return { refs };
 }
 
-export async function deleteScratchPins(repoDir: string, pins: ScratchPins): Promise<void> {
-  for (const ref of pins.refs) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+export async function deleteScratchPins(repoDir: string, pins: ScratchPins, boundary?: OwnedRefMutationBoundary): Promise<void> {
+  for (const ref of pins.refs) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
 }
 
 /** Prune stale scratch refs left by CRASHED runs — AGE-GUARDED [v3]: only entries whose
  *  `<epochMs>-<rand>` id is older than 1h are deleted. A blind prune in a SHARED gitdir
  *  would delete a concurrent sibling capture's live pins. */
-export async function pruneStaleScratchRefs(repoDir: string, ns: string): Promise<void> {
+export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundary?: OwnedRefMutationBoundary): Promise<void> {
   const out = await git(repoDir, ["for-each-ref", "--format=%(refname)", ns]).catch(() => "");
   const cutoff = Date.now() - SCRATCH_MAX_AGE_MS;
   for (const ref of out.split("\n").filter(Boolean)) {
@@ -65,12 +89,12 @@ export async function pruneStaleScratchRefs(repoDir: string, ns: string): Promis
       // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
       // the namespaced refs below and old clients only ever ran on unshared root repos, so
       // deleting it blindly is safe (and matches the old cleanup).
-      await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
       continue;
     }
     const id = ref.slice(ns.length + 1).split("/")[0] ?? "";
     const epoch = Number.parseInt(id, 10);
-    if (Number.isFinite(epoch) && epoch < cutoff) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    if (Number.isFinite(epoch) && epoch < cutoff) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
   }
 }
 
