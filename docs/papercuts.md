@@ -539,3 +539,10 @@ latent bug class in `credentials.test.ts`, `key-cmd.test.ts`,
 `uninstall-cmd.test.ts`, `credential-policy.test.ts` — each sets
 `process.env.HOME` with no restore. Sweep candidate: a shared test helper that
 scopes HOME/RBOX_HOME mutation, or a global afterEach guard.
+
+## 2026-08-11 — flat-meadow's bun is canary; its self-built daemon crashed
+
+FM's local `bun` is 1.4.0-canary; a dev binary built there embedded it and the
+daemon crashed (stack in daemon-2026-08-11 logs). Worked around by scp'ing the
+desktop's stable-bun build. Follow-up: pin FM's bun to stable, or make
+dev-install refuse/warn when the host bun is a canary.

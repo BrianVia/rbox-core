@@ -17,8 +17,10 @@ corrupt-binding add, policy-stamped caches) → shipped. Validation: 5,197/0
 full suite, regress 11/11, docker rig e2e, all on final tree. FLEET TRIAL:
 via-desktop DONE (snapshot ~/rbox-pre-231-snapshot-20260811-194119.tar.gz;
 regenerate clean, ghost /tmp row skipped by name, sync + daemon green on
-1.11.4-dev+59c2552). NEXT: MacBook after workstation soak, flat-meadow last,
-each with pre-upgrade tar of ~/.rbox + per-folder .rbox. Release: founder
+1.11.4-dev+59c2552). FLEET TRIAL COMPLETE same evening: MacBook + flat-meadow also upgraded,
+regenerated, and syncing (FM cleared a 17k-file backlog; its old daemon had
+crashed under a canary-bun self-build — papercut logged, shipped the
+desktop's stable-bun binary instead). Snapshots on all three hosts. Release: founder
 chose next-channel v2.0.0-beta.1 for 2.0-dev distribution (tag needs fresh
 explicit yes). OPEN for founder: help copy at FOUNDER-SIGN-OFF comments;
 ruling that `git resolve show-me` requires admission; release note re one-time
