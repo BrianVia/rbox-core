@@ -7,6 +7,7 @@ import {
   type Action,
   type CaseFoldCollisionGroup,
   type DiscoveredGitRepo,
+  type OwnedRefMutationBoundary,
   type ScanStats,
 } from "../../engine/index.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
@@ -35,6 +36,8 @@ type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWri
 export interface SyncDeps {
   /** Daemon-only synchronous shutdown gate. Foreground operations omit it. */
   mutationBoundary?: MutationBoundary;
+  /** Optional daemon ref-observation boundary. Foreground operations omit it. */
+  ownedRefMutationBoundary?: OwnedRefMutationBoundary;
   /** Best-effort daemon-owned product telemetry. Record implementations must never throw. */
   telemetry?: TelemetryRecorder;
   /** Held once by the named top-level owner. Nested pull/push/retry operations

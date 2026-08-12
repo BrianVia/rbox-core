@@ -5,7 +5,7 @@ import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
 import { clearIndexResolveUndo, encryptGitArtifact, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type PendingGitUpload, type RepoCtx, repoCtx } from "./shared.js";
 import { hasInProgressOpState, readAllRefsStrict, readOpStateSnapshot, readScopedRefs } from "./refs.js";
-import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
+import { type OwnedRefMutationBoundary, type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOfPath } from "./identity.js";
 import { hashFile } from "../hash.js";
 
@@ -100,6 +100,9 @@ export interface GitCaptureOptions {
    *  caller but the push planner) the artifacts are uploaded inline exactly as
    *  before, so a caller that reads them straight back out of `store` still can. */
   uploads?: GitCaptureUploadCollector;
+  /** Daemon-only observation boundary for refs/rbox-wip create/delete. It is
+   * advisory: implementations must never make capture depend on observation. */
+  ownedRefMutationBoundary?: OwnedRefMutationBoundary;
   /** Synchronous keep-mine hardening: pin the recorded snapshot and prove the
    * live repository still equals it before returning a publish candidate. */
   resolution?: boolean;
@@ -258,7 +261,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
   let pins: ScratchPins | undefined;
   try {
     // Age-guarded prune of scratch refs left by prior crashed captures (shared-store safe).
-    await pruneStaleScratchRefs(repoDir, WIP_NS);
+    await pruneStaleScratchRefs(repoDir, WIP_NS, opts.ownedRefMutationBoundary);
 
     // 1. Stage index + op-state immediately (atomic single-file snapshots) — from the
     //    RESOLVED gitdir (pointer repos: `.git/worktrees/<n>/…`), never `repoDir/.git`.
@@ -308,7 +311,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       for (const oid of await stagedIndexObjectOids(repoDir, stagedIndex)) pinShas.add(oid);
     }
     if (opts.resolution) for (const oid of Object.values(refs)) pinShas.add(oid);
-    pins = await createScratchPins(repoDir, [...pinShas]);
+    pins = await createScratchPins(repoDir, [...pinShas], opts.ownedRefMutationBoundary);
     const bundlePath = path.join(tmpDir, "repo.bundle");
     await opts.testHooks?.afterScratchPins?.({ tmpDir, bundlePath, refs: pins.refs });
     let dirAllArgs: string[] | undefined;
@@ -421,7 +424,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     }
     return section;
   } finally {
-    if (pins) await deleteScratchPins(repoDir, pins);
+    if (pins) await deleteScratchPins(repoDir, pins, opts.ownedRefMutationBoundary);
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 }

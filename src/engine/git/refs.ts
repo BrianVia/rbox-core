@@ -35,6 +35,14 @@ export async function readAllRefsStrict(repoDir: string): Promise<StrictRefRead>
   };
 }
 
+/** Stable opaque identity for the committed ref surface rbox syncs. Internal
+ * refs/rbox-* scratch names are excluded by parseAllRefs/isSyncableRef. */
+export async function readSyncableRefSurface(repoDir: string): Promise<string | undefined> {
+  const result = await readAllRefsStrict(repoDir);
+  if (result.status === "unreadable") return undefined;
+  return JSON.stringify(Object.entries(result.refs).sort(([a], [b]) => a.localeCompare(b)));
+}
+
 /** Pointer-repo (scoped) refs: ONLY `refs/heads/<current-branch>` — the shared store's
  *  other branches/tags/stash belong to the main clone. Detached HEAD → {}. */
 export async function readScopedRefs(repoDir: string, head: string): Promise<Record<string, string>> {

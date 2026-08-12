@@ -1,8 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { GIT_REF_SIGNAL_TAIL_TABLE, isGitRefSignal } from "../../engine/index.js";
+import { promisify } from "node:util";
+import { captureGitState, GIT_REF_SIGNAL_TAIL_TABLE, isGitRefSignal, type BlobStore, type OwnedRefMutationBoundary } from "../../engine/index.js";
 import {
   GitRefWatchRegistry,
   classifyRefEvent,
@@ -13,6 +15,33 @@ import {
   type GitRefWatchMode,
 } from "./git-ref-watch.js";
 import { createSignalDebouncer, type GitSignalBatch } from "./watcher.js";
+
+const exec = promisify(execFile);
+const GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox ref watch",
+  GIT_AUTHOR_EMAIL: "rbox-ref-watch@local",
+  GIT_COMMITTER_NAME: "rbox ref watch",
+  GIT_COMMITTER_EMAIL: "rbox-ref-watch@local",
+};
+const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: GIT_ENV }).then(({ stdout }) => stdout.toString().trim());
+
+function memoryBlobStore(): BlobStore {
+  const blobs = new Map<string, Buffer>();
+  return {
+    has: async (sha) => blobs.has(sha),
+    put: async (sha, bytes) => { blobs.set(sha, Buffer.from(bytes)); },
+    get: async (sha) => {
+      const bytes = blobs.get(sha);
+      if (!bytes) throw new Error(`missing blob ${sha}`);
+      return bytes;
+    },
+  };
+}
+
+const settleWatch = () => new Promise((resolve) => setTimeout(resolve, 300));
 
 test("side-channel construction is Linux Parcel-only", () => {
   expect(gitRefSideChannelEligible("linux", undefined)).toBe(false);
@@ -837,3 +866,83 @@ test("classifyRefEvent tolerates non-string tails", () => {
   expect(classifyRefEvent("gitDir", null as never)).toBe("none");
   expect(classifyRefEvent("refsRoot", 7 as never)).toBe("none");
 });
+
+test.skipIf(process.platform !== "linux")(
+  "real Linux registry: forced pending capture with ORIG_HEAD has no scratch-ref follow-up signal",
+  async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-owned-ref-quiet-")));
+    await runGit(root, "init", "-qb", "main");
+    await runGit(root, "commit", "--allow-empty", "-qm", "baseline");
+    const head = await runGit(root, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(root, ".git", "ORIG_HEAD"), `${head}\n`);
+    let signals = 0;
+    const registry = new GitRefWatchRegistry({ root, onSignal: () => { signals++; } });
+    try {
+      await registry.upsert([{ relPath: ".", kind: "dir" }]);
+      // This is the exact forced-capture primitive used for a pending section;
+      // ORIG_HEAD guarantees at least one scratch pin even on a clean worktree.
+      expect(await captureGitState(root, memoryBlobStore(), Buffer.alloc(32, 23), {
+        ownedRefMutationBoundary: registry,
+      })).toBeDefined();
+      await settleWatch();
+      expect(signals).toBe(0);
+    } finally {
+      await registry.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);
+
+test.skipIf(process.platform !== "linux")(
+  "real Linux registry: external packed-ref transaction during an active capture boundary survives reconcile",
+  async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-owned-ref-race-")));
+    await runGit(root, "init", "-qb", "main");
+    await runGit(root, "commit", "--allow-empty", "-qm", "baseline");
+    const head = await runGit(root, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(root, ".git", "ORIG_HEAD"), `${head}\n`);
+    await runGit(root, "pack-refs", "--all");
+    const tree = await runGit(root, "rev-parse", "HEAD^{tree}");
+    const externalOid = await runGit(root, "commit-tree", tree, "-p", head, "-m", "external packed ref");
+    let signals = 0;
+    const registry = new GitRefWatchRegistry({ root, onSignal: () => { signals++; } });
+    let injected = false;
+    const boundary: OwnedRefMutationBoundary = {
+      enterOwnedRefMutation: async (repoDir) => {
+        const lease = await registry.enterOwnedRefMutation(repoDir);
+        if (!lease) return undefined;
+        return {
+          finish: async () => {
+            if (!injected) {
+              injected = true;
+              const packed = path.join(root, ".git", "packed-refs");
+              const lock = `${packed}.lock`;
+              const prior = fs.readFileSync(packed, "utf8");
+              fs.writeFileSync(lock, `${prior}${prior.endsWith("\n") ? "" : "\n"}${externalOid} refs/tags/external-race\n`);
+              await lease.finish();
+              // Reconcile must signal while the ambiguous external lock is still
+              // present; do not rely on Bun delivering the final target callback.
+              expect(signals).toBeGreaterThan(0);
+              fs.renameSync(lock, packed);
+              return;
+            }
+            await lease.finish();
+          },
+        };
+      },
+    };
+    try {
+      await registry.upsert([{ relPath: ".", kind: "dir" }]);
+      expect(await captureGitState(root, memoryBlobStore(), Buffer.alloc(32, 29), {
+        ownedRefMutationBoundary: boundary,
+      })).toBeDefined();
+      expect(injected).toBe(true);
+      expect(signals).toBeGreaterThan(0);
+    } finally {
+      await registry.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);

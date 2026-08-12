@@ -4,6 +4,7 @@ export {
   gitRefStorage,
   gitIdentity,
   captureGitState,
+  readSyncableRefSurface,
   normalizeSymbolicHeadCasing,
   decideDirBundleAllArgs,
   gitCaptureScratchRoot,
@@ -116,6 +117,8 @@ export {
   type ProtocolLockClass,
   type ProtocolLockTraceEvent,
   type RepositoryProtocolFenceRequest,
+  type OwnedRefMutationBoundary,
+  type OwnedRefMutationLease,
 } from "./git-state.js";
 export { discoverGitRepos, discoverGitReposUnder, type DiscoveredGitRepo } from "./git-discover.js";
 export {

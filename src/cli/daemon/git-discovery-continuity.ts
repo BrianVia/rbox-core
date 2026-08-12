@@ -1,4 +1,4 @@
-import type { DiscoveredGitRepo } from "../../engine/index.js";
+import type { DiscoveredGitRepo, OwnedRefMutationLease } from "../../engine/index.js";
 import { errCode } from "./logger.js";
 import {
   GitRefWatchRegistry,
@@ -21,6 +21,7 @@ import {
 export interface GitRefRegistryPort {
   /** The registry's own bounded claim on the safety floor. */
   readonly floorRequired: boolean;
+  enterOwnedRefMutation(repoDir: string): Promise<OwnedRefMutationLease | undefined>;
   /** Input horizon captured before a walk starts; a later snapshot may only
    * shrink ownership that has not been re-armed since. */
   beginSnapshot(): number;
@@ -121,6 +122,10 @@ export class GitDiscoveryContinuity {
   get authoritativeRepos(): readonly DiscoveredGitRepo[] { return this.authoritative; }
   get hasAuthoritativeSnapshot(): boolean { return this.authoritativeSnapshotTaken; }
   get refBackendAttached(): boolean { return this.registry !== undefined; }
+
+  enterOwnedRefMutation(repoDir: string): Promise<OwnedRefMutationLease | undefined> {
+    return this.registry?.enterOwnedRefMutation(repoDir) ?? Promise.resolve(undefined);
+  }
 
   /** Adopt the Linux ref side channel for a watcher session. The caller decides
    * eligibility from the backend the watcher actually selected. */

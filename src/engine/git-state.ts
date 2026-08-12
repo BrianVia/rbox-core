@@ -20,6 +20,8 @@ export {
   sweepStaleGitCaptureDirs,
   GitCaptureDeferredError,
 } from "./git/capture.js";
+export { readSyncableRefSurface } from "./git/refs.js";
+export type { OwnedRefMutationBoundary, OwnedRefMutationLease } from "./git/pins.js";
 export { applyGitState, type ApplyGitResult, type ApplyBranchTransitionInput, type ApplyBranchTransitionResult, type ApplyBranchTransitionAdapter } from "./git/apply.js";
 export { quarantineAndWipeGitState, preserveGitConflict } from "./git/quarantine.js";
 export { assertGitTargetWithinRoot } from "./git/containment.js";

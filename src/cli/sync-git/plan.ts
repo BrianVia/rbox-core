@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type OwnedRefMutationBoundary, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { git, type GitArtifactReadStore, type PendingGitUpload } from "../../engine/git/shared.js";
 import { makeGitCaptureDir } from "../../engine/git/capture.js";
@@ -120,6 +120,8 @@ export interface GitPlanOptions {
   now?: () => Date;
   /** Awaited daemon registry observer; errors are observability-only. */
   onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  /** Daemon-only observation boundary for owned scratch-ref mutations. */
+  ownedRefMutationBoundary?: OwnedRefMutationBoundary;
   /** Deterministic test seam for a ref race after B's provisional pre-probe. */
   afterPendingPreProbe?: (relPath: string) => void | Promise<void>;
   /** Deterministic test seam after capture and immediately before Step-D reads. */
@@ -1128,7 +1130,7 @@ async function planGitSectionsWithRetention(
         root, rel, cfg, base[rel], api, kek, uploadsDir, mustCapture(rel), backoff,
         (abs) => noteRepoBytes(rel, abs), resolutionCandidates.has(rel),
         resolutionCandidates.has(rel) ? options.resolutionCaptureTestHooks : undefined,
-        retainDir,
+        retainDir, options.ownedRefMutationBoundary,
       );
       if (sec) {
         pendingUploadsByRepo.set(rel, pendingUploads ?? []);

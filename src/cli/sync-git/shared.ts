@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection, type OwnedRefMutationBoundary } from "../../engine/index.js";
 import type { GitCaptureOptions, GitCaptureUploadCollector } from "../../engine/git/capture.js";
 import { headBranchOf, type PendingGitUpload } from "../../engine/git/shared.js";
 import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
@@ -279,6 +279,7 @@ export async function capturePlannedGitSection(
   resolution = false,
   testHooks?: ResolutionCaptureTestHooks,
   retainDir?: string,
+  ownedRefMutationBoundary?: OwnedRefMutationBoundary,
 ): Promise<{ section?: GitSection; reason?: string; pendingUploads?: PendingGitUpload[] }> {
   const repoDir = repoDirOf(root, rel);
   const capture = async (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) => {
@@ -291,6 +292,7 @@ export async function capturePlannedGitSection(
       onBytes,
       resolution,
       testHooks,
+      ownedRefMutationBoundary,
       ...(uploads ? { uploads } : {}),
       ...opts,
     });

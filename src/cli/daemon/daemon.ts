@@ -941,7 +941,10 @@ export class RboxDaemon {
         await this.gitDiscovery.attachRefBackend({
           root: this.root,
           initial: initialGitRepos,
-          onSignal: () => signalDebouncer.push("signal"),
+          onSignal: () => {
+            this.propagationTrace?.eventSeen("git");
+            signalDebouncer.push("signal");
+          },
           onArmed: () => signalDebouncer.push("other"),
           onLog: this.log,
         });
@@ -1789,6 +1792,7 @@ export class RboxDaemon {
         onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
         onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
         onGitReposDiscovered: async (repos) => { await this.gitDiscovery.observe({ kind: "plan", repos }); },
+        ownedRefMutationBoundary: this.gitDiscovery,
         onGitBusyDeferred: (repos) => { if (repos.length > 0) this.noteGitBusyDeferred(); },
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
