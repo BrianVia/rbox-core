@@ -5,6 +5,27 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_STATE-PLANE REGRESSION FOUND + HALF-FIXED (2026-08-12 evening): the "~10s
+reconcile/oracle" receiver mystery decomposed. Designs 202/203/204 had receive
+at ~4.5s in July; the 2.0 SQLite state plane regressed it (~22x slower save
+than legacy JSON: 5.8s vs 0.26s at 119k, measured). #644 (MERGED) recovered
+half by constant factors (insert-time digesting — digest values unchanged,
+RBOX_STATE_VERIFY_STAGE=1 restores forensics — batched inserts, faster codec):
+steady save 5.4s→2.3s, load 1.3s→0.37s; field-verified on FM (state-save
+0.9s). #643 (design 235 Phase A, ALIGNED r4) MERGED: per-stage pull timers +
+phase_ms on apply_complete + report table. FIRST FIELD TABLES: validate 0.3s /
+reconcile 0.2s are INNOCENT; ~6s/pull residual (unwrapped code between
+phases) is the top bucket, and FM services multiple folder BINDINGS serially
+per cycle (12s each → the 22s round-6 apply spans). #645 (open): #643's
+snapshot ran inside the adoption callback's try/catch — a failure silently
+suppressed onPullAdopted (carrier credit = behavior); fix degrades to bare +
+warningSink, field-verified on FM. Design 235 doc: mechanisms NOT ratified
+(232 knife); §5 holds 9 binding constraints for Phase B; next evidence step =
+wrap the residual + weigh binding serialization. Bench:
+scripts/bench/state-plane.ts. CI was an infra-flake day (see papercuts).
+Fleet on dc8419e dev builds; Mac BACK ONLINE (SSH PATH fixed via ~/.zshenv);
+FM has transient ResetMemoryAdmission refusals (papercut)._
+
 _SHIPPED v2.0.0-beta.2 to next channel (2026-08-12): #641 held-skip stack —
 four field-tested layers (semantic key excl. transport identity; RBOX_TRACE_HELD
 diagnostic; skip decision hoisted BEFORE fetch/classify; legacy-attempt upgrade
