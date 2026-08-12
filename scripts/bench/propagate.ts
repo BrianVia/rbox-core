@@ -5,6 +5,8 @@ const BENCH_DIR = "rbox-propagation-bench";
 const SAMPLE_COUNT = 5;
 const AUTHORITATIVE_SAMPLE_COUNT = 30;
 export const WITNESS_POLL_DEADLINE_SECONDS = 180;
+export const HOP_OBSERVATION_DEADLINE_MS = 240_000;
+const HOP_POLL_INTERVAL_MS = 1_000;
 
 export interface HostSpec { host: string; workspace: string; local: boolean }
 interface Sample { low: number; high: number; midpoint: number }
@@ -116,6 +118,35 @@ async function logs(spec: HostSpec): Promise<string> {
   return onHost(spec, `NO_COLOR=1 TERM=dumb rbox logs "$1" --limit 10000\n`, [spec.workspace]);
 }
 
+async function pollUntilDeadline<T>(deadlineAt: number, probe: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
+  while (true) {
+    const value = await probe();
+    if (done(value) || Date.now() >= deadlineAt) return value;
+    await Bun.sleep(Math.min(HOP_POLL_INTERVAL_MS, deadlineAt - Date.now()));
+  }
+}
+
+function senderTraceForAttempt(log: string, classification: PropagationClassification, writeAt: number): string | undefined {
+  const settleKey = `${classification}_fired`;
+  return log.split(/\r?\n/).find((line) => {
+    const match = /^(\S+Z)\s+propagation_trace (.*)$/.exec(line);
+    if (!match) return false;
+    const receiptAt = Date.parse(match[1]!);
+    if (!Number.isFinite(receiptAt) || receiptAt < writeAt) return false;
+    try {
+      const trace = JSON.parse(match[2]!) as {
+        sequence?: unknown;
+        ms?: Partial<Record<"file_fired" | "git_fired" | "receipt", number>>;
+      };
+      return Number.isSafeInteger(trace.sequence)
+        && Number.isFinite(trace.ms?.[settleKey])
+        && Number.isFinite(trace.ms?.receipt);
+    } catch {
+      return false;
+    }
+  });
+}
+
 function elapsedMs(report: HopReport): number | undefined {
   const { write, applyComplete } = report.stamps;
   return write === undefined || applyComplete === undefined ? undefined : applyComplete - write;
@@ -183,10 +214,28 @@ async function main(): Promise<void> {
     const [writeText, result = ""] = mutation.trimEnd().split("\n");
     const writeAt = Number(writeText);
     if (!Number.isFinite(writeAt)) throw new Error(`${sender.host}: invalid write timestamp`);
+    const observationDeadlineAt = writeAt - pre[0]!.offset + HOP_OBSERVATION_DEADLINE_MS;
     const expected = refOnly ? result.trim() : content;
     const matched = await Promise.all(receivers.map((receiver) => waitForWitness(receiver, relative, expected, refOnly)));
-    await Bun.sleep(250);
-    const [originLog, ...receiverLogs] = await Promise.all([logs(sender), ...receivers.map(logs)]);
+    const senderObservation = await pollUntilDeadline(
+      observationDeadlineAt,
+      async () => {
+        const log = await logs(sender);
+        return { log, trace: senderTraceForAttempt(log, classification, writeAt) };
+      },
+      (observation) => observation.trace !== undefined,
+    );
+    const originLog = senderObservation.trace ?? senderObservation.log;
+    const receiverLogs = await pollUntilDeadline(
+      observationDeadlineAt,
+      () => Promise.all(receivers.map(logs)),
+      (snapshots) => snapshots.every((receiverLog) => buildHopReport(originLog, receiverLog, {
+        attempt: id,
+        classification,
+        writeAt,
+        clockSkewBoundMs: 0,
+      }).stamps.applyComplete !== undefined),
+    );
     const post = await Promise.all([clockWindow(sender), ...receivers.map(clockWindow)]);
     for (let receiverIndex = 0; receiverIndex < receivers.length; receiverIndex++) {
       const receiver = receivers[receiverIndex]!;
