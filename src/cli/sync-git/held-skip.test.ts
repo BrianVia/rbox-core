@@ -15,6 +15,8 @@ import {
   gitOwnershipNoEscalateEnabled,
   heldAttemptFloorElapsed,
   heldAttemptMatches,
+  heldAttemptMismatchField,
+  heldClassifierInputKey,
   heldBlockersAllowSkip,
   observeHeldInputs,
   readWorktreeRegistryDigest,
@@ -24,6 +26,7 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))));
 
 const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commits" };
+const localEdits: TypedBlocker = { provenance: "checkout", reason: "local-edits" };
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
 const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
@@ -34,7 +37,7 @@ const ownership: TypedBlocker = {
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
-  expect(heldBlockersAllowSkip([localCommit, localStash])).toBe(true);
+  expect(heldBlockersAllowSkip([localEdits, localCommit, localStash])).toBe(true);
   expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, localStash, localIndex, localOperation])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);
@@ -257,6 +260,11 @@ test("attempt matching binds nonce/version and the one-hour floor", () => {
   expect(heldAttemptMatches(legacyAttempt, observation, now)).toBe(false);
   expect(heldAttemptMatches(attempt, { ...observation, worktreeRegistryDigest: "changed" }, now)).toBe(false);
   expect(heldAttemptMatches({ ...attempt, fingerprintVersion: "old" }, observation, now)).toBe(false);
+  expect(heldAttemptMismatchField({ ...attempt, fingerprintVersion: "old", stateNonce: "other" }, observation, now))
+    .toBe("fingerprintVersion");
+  expect(heldAttemptMismatchField({ ...attempt, stateNonce: "other" }, observation, now)).toBe("stateNonce");
+  expect(heldAttemptMismatchField(legacyAttempt, observation, now)).toBe("worktreeRegistryDigest");
+  expect(heldAttemptMismatchField(attempt, observation, now)).toBeUndefined();
   expect(heldAttemptFloorElapsed(attempt, now)).toBe(false);
   expect(heldAttemptFloorElapsed({ ...attempt, at: new Date(now - 3_600_001).toISOString() }, now)).toBe(true);
 });
@@ -286,7 +294,7 @@ test("same indexSha with a changed incoming locator invalidates an attempt", asy
   const changedLocator = { ...baseSection, indexEncSha: "5".repeat(64), indexCipherSize: 11 };
   expect(gitIncomingKey(changedLocator)).toBe(gitIncomingKey(baseSection));
   const common = {
-    root, relPath: ".", incomingKey: gitIncomingKey(baseSection), stateNonce: "nonce",
+    root, relPath: ".", stateNonce: "nonce",
     effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: "v2:incoming", reflogPaths: [],
   };
   const before = await observeHeldInputs({ ...common, incoming: baseSection });
@@ -295,6 +303,23 @@ test("same indexSha with a changed incoming locator invalidates an attempt", asy
   const after = await observeHeldInputs({ ...common, incoming: changedLocator });
   expect(after).toBeDefined();
   expect(heldAttemptMatches(attempt, after!, Date.now() + 6_000)).toBe(false);
+});
+
+test("held classifier identity ignores bundle recapture but not semantic inputs", () => {
+  const baseSection = {
+    bundleSha: "1".repeat(64), bundleEncSha: "2".repeat(64), bundleCipherSize: 1,
+    head: "ref: refs/heads/main\n", refs: { "refs/heads/main": "3".repeat(40) }, refScope: "all" as const,
+  };
+  const recaptured = {
+    ...baseSection,
+    bundleSha: "4".repeat(64), bundleEncSha: "5".repeat(64), bundleCipherSize: 2,
+    packChain: [{
+      sha: "6".repeat(64), encSha: "7".repeat(64), cipherSize: 3,
+      tips: ["3".repeat(40)],
+    }],
+  };
+  expect(heldClassifierInputKey(recaptured)).toBe(heldClassifierInputKey(baseSection));
+  expect(heldClassifierInputKey({ ...recaptured, head: "3".repeat(40) })).not.toBe(heldClassifierInputKey(baseSection));
 });
 
 test("worktree removal changes the registry digest without changing refs, HEAD, or index", async () => {

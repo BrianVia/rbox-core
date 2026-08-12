@@ -22,7 +22,7 @@ import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
+import { blockersAfterComposer, createHeldAttempt, earlyHeldAttemptDecision, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldAttemptMismatchField, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
   recordOriginLineage,
@@ -37,6 +37,16 @@ import { gitConfigHash } from "./config-lane.js";
 interface KeySnapshot<T> {
   present: boolean;
   value: T | undefined;
+}
+
+interface HeldTraceAttempt {
+  storedAttempt: boolean;
+  earlySkip: boolean;
+  matchConsulted: boolean;
+  mismatch: string;
+  earlyReason: string;
+  blocker: string;
+  supersessionProofMs: number;
 }
 
 function snapshotKey<T>(record: Record<string, T>, key: string): KeySnapshot<T> {
@@ -444,6 +454,20 @@ opts: {
   const clearAttempt = (rel: string): void => {
     attempt[rel] = null;
   };
+  /** Preserve the exact sidecar transition shared by the early optimization and
+   * the authoritative post-protocol held check. */
+  const retainHeldRepo = (rel: string, priorAttempt: GitHeldAttempt): boolean => {
+    if (!heldBlockersAllowSkip(priorAttempt.blockers)) return false;
+    const standingApply = currentDeferral(rel, "apply");
+    const priorOwnershipOnly = ownershipBlockersArePerRefOnly(priorAttempt.blockers);
+    if (!standingApply && !(gitOwnershipNoEscalateEnabled() && priorOwnershipOnly)) return false;
+    if (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly) {
+      clearDeferral(rel, "apply");
+    } else if (standingApply) {
+      setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
+    }
+    return true;
+  };
   const markCheckpointReproof = (rel: string): void => {
     const transition = deferrals[rel];
     const apply = transition && transition !== null ? transition.apply : undefined;
@@ -480,6 +504,7 @@ opts: {
     rel: string,
     chainTimings: GitChainTimings | undefined,
     commonDirLock: HeldChainLock,
+    heldTrace?: HeldTraceAttempt,
   ): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
@@ -1027,11 +1052,14 @@ opts: {
           ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
         }),
       };
+      const settlementStartedAt = performance.now();
       const settlement = await settleStandingBranchProof({
         identity: { relPath: rel, incomingKey: incomingKey! },
         state, record: records[rel], serializedBase: baseSec, incomingRefScope: remoteSec.refScope,
         protocol: preparedProtocol.protocol, retryBudget: 8,
-      }, standingProofEffects);
+      }, standingProofEffects).finally(() => {
+        if (heldTrace) heldTrace.supersessionProofMs += performance.now() - settlementStartedAt;
+      });
       state = settlement.carry.state;
       if (settlement.carry.recoveredRecord) installRecoveredRecord(rel, settlement.carry.recoveredRecord);
       baseSec = baseRepos[rel];
@@ -1063,7 +1091,7 @@ opts: {
       const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
       const priorObservation = priorAttempt
         ? await observeHeldInputs({
-            root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
+            root, relPath: rel, incoming: remoteSec,
             record: records[rel], partial: effectivePartial,
             stateNonce: expectedStateNonce(state),
             effectiveBaseIndexProjection: records[rel]?.idxProj
@@ -1075,26 +1103,32 @@ opts: {
             reflogPaths: priorAttempt.reflogs.map((entry) => entry.path),
           })
         : undefined;
-      const priorInputsMatch = priorAttempt !== undefined && priorObservation !== undefined
-        && (heldNowMs === undefined
+      let priorInputsMatch = false;
+      if (priorAttempt && priorObservation) {
+        if (heldTrace) {
+          heldTrace.matchConsulted = true;
+          heldTrace.mismatch = heldAttemptMismatchField(priorAttempt, priorObservation, heldNowMs)?.toString() ?? "none";
+        }
+        priorInputsMatch = heldNowMs === undefined
           ? heldAttemptMatches(priorAttempt, priorObservation)
-          : heldAttemptMatches(priorAttempt, priorObservation, heldNowMs));
+          : heldAttemptMatches(priorAttempt, priorObservation, heldNowMs);
+      } else if (heldTrace && priorAttempt) {
+        heldTrace.mismatch = "observation-unavailable";
+      }
       const priorFloorElapsed = priorAttempt !== undefined && (heldNowMs === undefined
         ? heldAttemptFloorElapsed(priorAttempt)
         : heldAttemptFloorElapsed(priorAttempt, heldNowMs));
-      const standingApply = currentDeferral(rel, "apply");
-      const priorOwnershipOnly = priorAttempt !== undefined
-        && ownershipBlockersArePerRefOnly(priorAttempt.blockers);
-      if (gitHeldSkipEnabled() && pend && priorAttempt && priorInputsMatch && !priorFloorElapsed
-        && heldBlockersAllowSkip(priorAttempt.blockers)
-        && (standingApply || (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly))) {
-        // Sidecar-only ordered refresh: pending, partial, BASE, and attempt remain exact.
-        if (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly) {
-          clearDeferral(rel, "apply");
-        } else if (standingApply) {
-          setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
-        } else {
-          clearDeferral(rel, "apply");
+      if (gitHeldSkipEnabled() && pend && priorAttempt && priorObservation && priorInputsMatch && !priorFloorElapsed
+        && retainHeldRepo(rel, priorAttempt)) {
+        // A compatibility attempt can prove the late matcher while lacking the
+        // explicit key required by the cheap gate. Re-store the exact matched
+        // inputs so the primary state-save packet upgrades even a deferred repo;
+        // artifact settlement is not this transition's persistence owner.
+        // Preserve `at`: migration must not reset the independent safety-floor clock.
+        attempt[rel] = createHeldAttempt(priorObservation, priorAttempt.blockers, priorAttempt.at);
+        if (heldTrace) {
+          const first = sortedTypedBlockers(priorAttempt.blockers)[0];
+          heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
         }
         return { result: "skipped", commonDirGroup };
       }
@@ -1120,7 +1154,7 @@ opts: {
           return;
         }
         const observed = await observeHeldInputs({
-          root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
+          root, relPath: rel, incoming: remoteSec,
           record: priorRecord,
           ...((input.boundBase ?? applied[rel]) === undefined ? {} : { boundBase: input.boundBase ?? applied[rel] }),
           ...((input.boundOrigins ?? branchBaseOrigins[rel]) === undefined ? {} : { boundOrigins: input.boundOrigins ?? branchBaseOrigins[rel] }),
@@ -1271,6 +1305,10 @@ opts: {
         return legacyConflict(follow.reason, follow);
       }
       if (follow.status === "defer") {
+        if (heldTrace) {
+          const first = sortedTypedBlockers(follow.blockers)[0];
+          heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : follow.reason;
+        }
         if (checkpointReproof && follow.reason !== "unsupported") {
           pending[rel] = remoteSec;
           partial[rel] = partialFrom(follow, true);
@@ -1449,7 +1487,17 @@ opts: {
     let startedAt = Date.now();
     let result: GitApplyRepoResult = "deferred";
     let commonDirGroup: number | undefined;
-    const chainTimings = metrics ? zeroGitChainTimings() : undefined;
+    const traceHeld = process.env.RBOX_TRACE_HELD === "1" && pending[rel] !== undefined;
+    const heldTrace: HeldTraceAttempt | undefined = traceHeld ? {
+      storedAttempt: records[rel]?.attempt !== undefined,
+      earlySkip: false,
+      matchConsulted: false,
+      mismatch: records[rel]?.attempt ? "not-consulted" : "none",
+      earlyReason: records[rel]?.attempt ? "not-consulted" : "no-attempt",
+      blocker: "none",
+      supersessionProofMs: 0,
+    } : undefined;
+    const chainTimings = metrics || traceHeld ? zeroGitChainTimings() : undefined;
     try {
       if (collidingRepoKeys.has(rel)) {
         if (remoteSec) pending[rel] = remoteSec;
@@ -1461,7 +1509,28 @@ opts: {
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async (commonDirLock) => {
         startedAt = Date.now();
-        const processed = await processRepo(rel, chainTimings, commonDirLock);
+        const priorAttempt = pending[rel] && remoteSec ? records[rel]?.attempt : undefined;
+        const heldNowMs = opts.heldNow?.();
+        const earlyDecision = gitHeldSkipEnabled() && priorAttempt
+          ? await earlyHeldAttemptDecision({
+              root, relPath: rel, incoming: remoteSec!, attempt: priorAttempt,
+              ...(heldNowMs === undefined ? {} : { nowMs: heldNowMs }),
+            })
+          : { matches: false, reason: priorAttempt ? "disabled" : "no-attempt" };
+        if (heldTrace) heldTrace.earlyReason = earlyDecision.reason;
+        if (earlyDecision.matches && priorAttempt && retainHeldRepo(rel, priorAttempt)) {
+          if (heldTrace) {
+            const first = sortedTypedBlockers(priorAttempt.blockers)[0];
+            heldTrace.earlySkip = true;
+            heldTrace.matchConsulted = true;
+            heldTrace.mismatch = "none";
+            heldTrace.earlyReason = "none";
+            heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
+          }
+          result = "skipped";
+          return;
+        } else if (heldTrace && earlyDecision.matches) heldTrace.earlyReason = "retention-ineligible";
+        const processed = await processRepo(rel, chainTimings, commonDirLock, heldTrace);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });
@@ -1488,9 +1557,16 @@ opts: {
       glog(`git-sync deferred ${rel}: ${errMsg(e)}`);
       result = "deferred";
     } finally {
+      const wallMs = Date.now() - startedAt;
+      if (chainTimings) finalizeGitChainTimings(chainTimings, wallMs);
+      if (heldTrace && chainTimings) {
+        const deferral = currentDeferral(rel, "apply");
+        if (heldTrace.blocker === "none" && result === "deferred" && deferral) heldTrace.blocker = `apply/${deferral.reason}`;
+        const namedMs = chainTimings.fetchDecryptMs + chainTimings.bundleVerifyMs + chainTimings.gitImportMs
+          + chainTimings.classifyMs + heldTrace.supersessionProofMs;
+        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} earlyReason=${heldTrace.earlyReason} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(heldTrace.supersessionProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
+      }
       if (metrics) {
-        const wallMs = Date.now() - startedAt;
-        if (chainTimings) finalizeGitChainTimings(chainTimings, wallMs);
         metrics.results[result] += 1;
         metrics.repoTimings.push({
           index: i,

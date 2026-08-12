@@ -144,6 +144,7 @@ export const GIT_PARTIAL_FIELD_COVERAGE = {
 
 export const GIT_HELD_ATTEMPT_FIELD_COVERAGE = {
   incomingKey: true,
+  classifierInputKey: true,
   effectiveBaseIndexProjection: true,
   effectiveIncomingIndexProjection: true,
   incomingIndexArtifactDescriptor: true,
