@@ -15,6 +15,7 @@ import {
   gitOwnershipNoEscalateEnabled,
   heldAttemptFloorElapsed,
   heldAttemptMatches,
+  heldAttemptMismatchField,
   heldClassifierInputKey,
   heldBlockersAllowSkip,
   observeHeldInputs,
@@ -258,6 +259,11 @@ test("attempt matching binds nonce/version and the one-hour floor", () => {
   expect(heldAttemptMatches(legacyAttempt, observation, now)).toBe(false);
   expect(heldAttemptMatches(attempt, { ...observation, worktreeRegistryDigest: "changed" }, now)).toBe(false);
   expect(heldAttemptMatches({ ...attempt, fingerprintVersion: "old" }, observation, now)).toBe(false);
+  expect(heldAttemptMismatchField({ ...attempt, fingerprintVersion: "old", stateNonce: "other" }, observation, now))
+    .toBe("fingerprintVersion");
+  expect(heldAttemptMismatchField({ ...attempt, stateNonce: "other" }, observation, now)).toBe("stateNonce");
+  expect(heldAttemptMismatchField(legacyAttempt, observation, now)).toBe("worktreeRegistryDigest");
+  expect(heldAttemptMismatchField(attempt, observation, now)).toBeUndefined();
   expect(heldAttemptFloorElapsed(attempt, now)).toBe(false);
   expect(heldAttemptFloorElapsed({ ...attempt, at: new Date(now - 3_600_001).toISOString() }, now)).toBe(true);
 });

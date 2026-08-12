@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -66,11 +66,13 @@ let receiver: string;
 let store: LocalBlobStore;
 let cfg: WorkspaceConfig;
 let priorGitFollow: string | undefined;
+let priorTraceHeld: string | undefined;
 let materializedSection: GitSection | undefined;
 let materializedState: SyncState | undefined;
 
 beforeEach(async () => {
   priorGitFollow = process.env.RBOX_GIT_FOLLOW;
+  priorTraceHeld = process.env.RBOX_TRACE_HELD;
   materializedSection = undefined;
   materializedState = undefined;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-"));
@@ -102,6 +104,8 @@ beforeEach(async () => {
 afterEach(async () => {
   if (priorGitFollow === undefined) delete process.env.RBOX_GIT_FOLLOW;
   else process.env.RBOX_GIT_FOLLOW = priorGitFollow;
+  if (priorTraceHeld === undefined) delete process.env.RBOX_TRACE_HELD;
+  else process.env.RBOX_TRACE_HELD = priorTraceHeld;
   resetCheckoutCapabilityProbeCacheForTests();
   setReceiverEquivalenceProbeForTests(undefined);
   setGitSpawnObserver(undefined);
@@ -1684,7 +1688,7 @@ test("disposition: receiver-only non-current branch is held while checkout follo
   expect(await git(receiver, "rev-parse", "refs/heads/local-side")).toBe(local);
 });
 
-test("design 174 A: unchanged allowlisted hold skips only after the mandatory prepass; a ref move resumes follow", async () => {
+test("unchanged allowlisted hold skips before fetch and prep; a ref move resumes follow", async () => {
   const { state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
   const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held side"])
@@ -1699,16 +1703,19 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   let exceptionHookCalled = false;
   const exceptional = await applyIncoming(
     saved,
-    { ...incoming, config: { "remote.origin.url": [] } },
+    { ...incoming, head: incoming.refs["refs/heads/main"]! },
     matchingOracle,
     { heldNow: heldNowAfterRacyWindow, afterHeldSkipPrepass: () => { exceptionHookCalled = true; throw new Error("injected outer apply exception"); } },
   );
   expect(exceptionHookCalled).toBe(true);
-  expect(exceptional.outcome.gitPendingRemote?.repo?.config).toBeUndefined();
+  expect(exceptional.outcome.gitPendingRemote?.repo?.head).toBe(incoming.refs["refs/heads/main"]!);
 
   let capabilityCalls = 0;
   let pinCalls = 0;
   const ordering: string[] = [];
+  process.env.RBOX_TRACE_HELD = "1";
+  const fetch = spyOn(store, "get");
+  const fetchToFile = spyOn(store, "getToFile");
   const skipped = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
     heldNow: heldNowAfterRacyWindow,
@@ -1719,7 +1726,18 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
   expect(capabilityCalls).toBe(0);
   expect(pinCalls).toBe(0);
-  expect(ordering).toEqual(["prepass"]);
+  expect(ordering).toEqual([]);
+  expect(fetch).not.toHaveBeenCalled();
+  expect(fetchToFile).not.toHaveBeenCalled();
+  fetch.mockRestore();
+  fetchToFile.mockRestore();
+  const trace = skipped.logs.filter((line) => line.startsWith("git-sync held-trace "));
+  expect(trace).toHaveLength(1);
+  expect(trace[0]).toMatch(/repo="repo" storedAttempt=1 earlySkip=1 matchConsulted=1 mismatch=none blocker=/);
+  expect(trace[0]).toMatch(/ allMs=\d+$/);
+  for (const field of ["fetchDecryptMs", "verifyMs", "importMs", "classifyMs", "supersessionProofMs", "otherMs"]) {
+    expect(trace[0]).toMatch(new RegExp(`${field}=\\d+`));
+  }
   expect(skipped.outcome.gitRepos?.repo).toEqual(saved.lastSyncedManifest.gitRepos?.repo);
   expect(skipped.outcome.attempt?.repo).toBeUndefined();
 

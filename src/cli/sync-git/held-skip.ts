@@ -261,18 +261,65 @@ export function heldAttemptMatches(
   observation: HeldInputObservation,
   nowMs = Date.now(),
 ): boolean {
-  if (attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION) return false;
-  if (typeof attempt.worktreeRegistryDigest !== "string") return false;
+  return heldAttemptMismatchField(attempt, observation, nowMs) === undefined;
+}
+
+/** Temporary RBOX_TRACE_HELD diagnostic: preserve matcher semantics while
+ * naming the first gate/input that rejects a stored attempt. */
+export function heldAttemptMismatchField(
+  attempt: GitHeldAttempt,
+  observation: HeldInputObservation,
+  nowMs = Date.now(),
+): string | undefined {
+  if (attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION) return "fingerprintVersion";
+  if (typeof attempt.worktreeRegistryDigest !== "string") return "worktreeRegistryDigest";
   const writtenAt = Date.parse(attempt.at);
-  if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return false;
-  if (observation.maxFingerprintTimestampMs >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) return false;
+  if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return "at";
+  if (observation.maxFingerprintTimestampMs >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) return "maxFingerprintTimestampMs";
   const { maxFingerprintTimestampMs: _max, ...observedInputs } = observation;
-  return canonicalString(attemptInputs(attempt)) === canonicalString(observedInputs);
+  const storedInputs = attemptInputs(attempt);
+  const fields = Object.keys(observedInputs).sort() as Array<keyof typeof observedInputs>;
+  return fields.find((field) => canonicalString(storedInputs[field]) !== canonicalString(observedInputs[field]));
 }
 
 export function heldAttemptFloorElapsed(attempt: GitHeldAttempt, nowMs = Date.now()): boolean {
   const at = Date.parse(attempt.at);
   return !Number.isFinite(at) || nowMs - at > HELD_SKIP_SAFETY_FLOOR_MS;
+}
+
+/** Cheap receiver admission check for a completed held episode. This deliberately
+ * knows nothing about bundles, indexes, classifier projections, or follow
+ * protocol state. Two independent fingerprints bracket the decision so an
+ * incomplete, changing, or racy repository always falls through to the full
+ * path and its authoritative late check. */
+export async function earlyHeldAttemptMatches(input: {
+  root: string;
+  relPath: string;
+  incoming: GitSection;
+  attempt: GitHeldAttempt;
+  nowMs?: number;
+}): Promise<boolean> {
+  const nowMs = input.nowMs ?? Date.now();
+  const writtenAt = Date.parse(input.attempt.at);
+  if (input.attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION
+    || typeof input.attempt.worktreeRegistryDigest !== "string"
+    || !Number.isFinite(writtenAt) || writtenAt > nowMs
+    || heldAttemptFloorElapsed(input.attempt, nowMs)
+    || heldClassifierInputKey(input.incoming) !== input.attempt.incomingKey) return false;
+  try {
+    const before = await gitFingerprint(
+      gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
+    );
+    const after = await gitFingerprint(
+      gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
+    );
+    return before.dependenciesComplete && after.dependenciesComplete
+      && before.hash === after.hash
+      && after.hash === input.attempt.localFingerprint
+      && Math.max(before.maxTsMs, after.maxTsMs) < nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS;
+  } catch {
+    return false;
+  }
 }
 
 export function createHeldAttempt(
