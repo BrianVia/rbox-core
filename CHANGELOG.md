@@ -6,6 +6,8 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0-beta.1] - 2026-08-11
+
 ### Changed
 - **Breaking: `~/.rbox/config.json` is now the authority for which local folders
   rbox may sync and for their safe sync options.** Existing local bindings are
