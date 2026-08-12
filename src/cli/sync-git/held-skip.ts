@@ -49,6 +49,7 @@ export function heldBlockersAllowSkip(
     blocker.reason === "local-commits"
       || blocker.reason === "local-stash"
       || blocker.reason === "local-index"
+      || blocker.reason === "local-operation"
       || blocker.reason === "deletion-pending"
       || (blocker.reason === "worktree-ownership" && gitOwnershipHeldSkipEnabled(env)));
 }
