@@ -12,7 +12,7 @@ export interface PropagationTrace {
   publishReceipt(sequence: number | undefined): void;
   wsCommittedFrame(sequence: number): void;
   pullDequeue(sequence: number | undefined, notifyLatencyMs: number): void;
-  applyComplete(sequence: number): void;
+  applyComplete(sequence: number, phaseMs?: Record<string, number>): void;
 }
 
 type TraceStage = "seen" | "armed" | "fired";
@@ -77,8 +77,14 @@ export function createPropagationTrace(log: (line: string) => void): Propagation
     pullDequeue(sequence, notifyLatencyMs) {
       log(`propagation_receive ${JSON.stringify({ v: 1, event: "pull_dequeue", sequence, notify_latency_ms: notifyLatencyMs })}`);
     },
-    applyComplete(sequence) {
-      log(`propagation_receive ${JSON.stringify({ v: 1, event: "apply_complete", adopted_sequence: sequence })}`);
+    applyComplete(sequence, phaseMs) {
+      const record: { v: 1; event: "apply_complete"; adopted_sequence: number; phase_ms?: Record<string, number> } = {
+        v: 1,
+        event: "apply_complete",
+        adopted_sequence: sequence,
+      };
+      if (phaseMs) record.phase_ms = phaseMs;
+      log(`propagation_receive ${JSON.stringify(record)}`);
     },
   };
 }

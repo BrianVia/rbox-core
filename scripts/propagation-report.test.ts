@@ -35,6 +35,34 @@ describe("propagation report", () => {
     expect(rendered).toContain("| END TO END | 2026-07-12T10:00:00.000Z | 2026-07-12T10:00:05.000Z | 5000 |");
     expect(rendered).toContain("budget <=10000ms PASS\n");
     expect(rendered).toContain("clock_skew_bound_ms 5\n");
+    expect(rendered).not.toContain("receiver stage");
+  });
+
+  test("carries only the exact-joined apply phases and closes receiver residual arithmetic", () => {
+    const writeAt = Date.parse("2026-07-12T10:00:00.000Z");
+    const origin = line("2026-07-12T10:00:01.000Z", 'propagation_trace {"ms":{"file_fired":100,"begin":200,"receipt":500},"sequence":7}');
+    const receiver = [
+      line("2026-07-12T10:00:02.000Z", 'propagation_receive {"event":"ws_committed","sequence":7}'),
+      line("2026-07-12T10:00:02.200Z", 'propagation_receive {"event":"pull_dequeue","sequence":7}'),
+      line("2026-07-12T10:00:02.900Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":6,"phase_ms":{"wrong":999}}'),
+      line("2026-07-12T10:00:03.000Z", 'propagation_receive {"event":"apply_complete","adopted_sequence":7,"phase_ms":{"validate":50.5,"reconcile":149.5,"git-apply":300}}'),
+    ].join("\n");
+
+    const report = buildHopReport(origin, receiver, {
+      attempt: "receiver-phases",
+      classification: "file",
+      writeAt,
+      clockSkewBoundMs: 5,
+    });
+    expect(report.phaseMs).toEqual({ validate: 50.5, reconcile: 149.5, "git-apply": 300 });
+    const rendered = renderHopReport(report);
+    expect(rendered).toContain("| receiver stage | ms |");
+    expect(rendered).toContain("| validate | 50.5 |");
+    expect(rendered).toContain("| unattributed_ms | 300 |");
+
+    const values = [...rendered.matchAll(/^\| (?:validate|reconcile|git-apply|unattributed_ms) \| ([\d.-]+) \|$/gm)]
+      .map((match) => Number(match[1]));
+    expect(values.reduce((sum, value) => sum + value, 0)).toBe(800);
   });
 
   test("classifies a later adopted sequence as coalesced and fails closed on duplicate WS stamps", () => {

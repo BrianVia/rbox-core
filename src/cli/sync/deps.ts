@@ -130,7 +130,7 @@ export interface SyncDeps {
   onPullApplied?: (actions: Action[]) => void;
   /** Fired after a pull durably adopts a sequence newer than its pre-pull base.
    *  Unlike onPullApplied, this includes Git-ref-only pulls with no file actions. */
-  onPullAdopted?: (adoptedSequence: number) => void;
+  onPullAdopted?: (adoptedSequence: number, phaseMs?: Record<string, number>) => void;
   /** Daemon-only terminal-halt hint. Foreground `rbox push` / `rbox sync` leaves this
    *  unset so an explicit user sync always makes a real attempt. */
   blockedFingerprint?: string;

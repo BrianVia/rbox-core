@@ -118,6 +118,33 @@ test("oracle construction does not iterate manifests or create dircache state", 
   }
 });
 
+test("pull oracle observer attributes lazy preparation, receipt hashing, and every proof", async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, "repo/a.txt"), "a");
+  const fixture = await scanFixture(root);
+  const observations: Array<{ kind: string; ms?: number; entriesIndexed?: number }> = [];
+  const oracle = oracleFromPull({
+    preScan: fixture.preScan,
+    actions: [],
+    oracle: fixture.preScan,
+    matcher: fixture.matcher,
+    dircache: fixture.dircache,
+    hashcache: fixture.hashcache,
+    root,
+    scanDeferred: fixture.deferred,
+    observer: (observation) => observations.push(observation),
+  });
+
+  expect(observations).toEqual([]);
+  expect((await oracle.proveRepo("repo")).kind).toBe("match");
+  expect((await oracle.reproveRepo("repo")).kind).toBe("match");
+  expect(observations.filter((observation) => observation.kind === "prepare")).toHaveLength(1);
+  expect(observations.find((observation) => observation.kind === "prepare")).toMatchObject({ entriesIndexed: 3 });
+  expect(observations.filter((observation) => observation.kind === "receipt-hash")).toHaveLength(1);
+  expect(observations.filter((observation) => observation.kind === "repo-proved")).toHaveLength(2);
+  expect(observations.every((observation) => observation.ms === undefined || observation.ms >= 0)).toBe(true);
+});
+
 test("action-touched same-size mtime-restored edits are content-hashed", async () => {
   const root = await tmp();
   const abs = path.join(root, "repo/file.txt");

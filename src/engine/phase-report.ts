@@ -28,6 +28,8 @@
 export type PhaseName =
   | "latest"
   | "state-load"
+  | "validate"
+  | "reconcile"
   | "scan"
   | "git-plan"
   | "address"
@@ -46,6 +48,8 @@ export type PhaseName =
 export const PHASE_ORDER: readonly PhaseName[] = [
   "latest",
   "state-load",
+  "validate",
+  "reconcile",
   "scan",
   "git-plan",
   "address",

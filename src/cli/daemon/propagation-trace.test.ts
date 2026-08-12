@@ -27,3 +27,22 @@ test("a new write replaces an unclaimed pending propagation cycle", () => {
     else process.env.RBOX_TRACE_PROPAGATION = previous;
   }
 });
+
+test("apply completion preserves the bare record and optionally carries phase milliseconds", () => {
+  const previous = process.env.RBOX_TRACE_PROPAGATION;
+  process.env.RBOX_TRACE_PROPAGATION = "1";
+  try {
+    const lines: string[] = [];
+    const trace = createPropagationTrace((line) => lines.push(line))!;
+    trace.applyComplete(7);
+    trace.applyComplete(8, { validate: 1.25, reconcile: 2, "git-apply": 3.5 });
+
+    expect(lines).toEqual([
+      'propagation_receive {"v":1,"event":"apply_complete","adopted_sequence":7}',
+      'propagation_receive {"v":1,"event":"apply_complete","adopted_sequence":8,"phase_ms":{"validate":1.25,"reconcile":2,"git-apply":3.5}}',
+    ]);
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_TRACE_PROPAGATION;
+    else process.env.RBOX_TRACE_PROPAGATION = previous;
+  }
+});

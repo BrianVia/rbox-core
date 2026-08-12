@@ -115,10 +115,12 @@ describe("PhaseReport", () => {
   test("toJSON emits phases in stable order regardless of record order", () => {
     const r = PhaseReport.pull();
     r.record("git-apply", { count: 1 });
+    r.record("reconcile", { count: 1 });
+    r.record("validate", { count: 1 });
     r.record("apply", { count: 1 });
     r.record("download", { count: 1 });
     r.record("decrypt", { count: 1 });
-    expect(Object.keys(r.toJSON().phases)).toEqual(["download", "decrypt", "apply", "git-apply"]);
+    expect(Object.keys(r.toJSON().phases)).toEqual(["validate", "reconcile", "download", "decrypt", "apply", "git-apply"]);
   });
 });
 

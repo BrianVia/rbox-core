@@ -29,6 +29,7 @@ export interface HopReport {
   witnessMatched: boolean;
   budgetMs: number;
   verdict: "PASS" | "FAIL" | "INVALID";
+  phaseMs?: Record<string, number>;
   stamps: {
     write?: number;
     batcherSettle?: number;
@@ -60,7 +61,7 @@ type SenderTrace = {
   ms: Partial<Record<"file_fired" | "git_fired" | "begin" | "receipt", number>>;
 };
 
-type ReceiverStamp = { at: number; event: "ws_committed" | "pull_dequeue" | "apply_complete"; sequence: number };
+type ReceiverStamp = { at: number; event: "ws_committed" | "pull_dequeue" | "apply_complete"; sequence: number; phase_ms?: Record<string, number> };
 
 function receiverChain(receiver: ReceiverStamp[], sequence: number): {
   wsReceipt?: ReceiverStamp;
@@ -123,10 +124,14 @@ function receiverStamps(log: string): ReceiverStamp[] {
   for (const line of log.split(/\r?\n/)) {
     const parsed = timestamped(line);
     if (!parsed) continue;
-    const body = jsonAfter<{ event?: unknown; sequence?: unknown; adopted_sequence?: unknown }>(parsed.text, "propagation_receive ");
+    const body = jsonAfter<{ event?: unknown; sequence?: unknown; adopted_sequence?: unknown; phase_ms?: Record<string, number> }>(parsed.text, "propagation_receive ");
     if (!body || (body.event !== "ws_committed" && body.event !== "pull_dequeue" && body.event !== "apply_complete")) continue;
     const raw = body.event === "apply_complete" ? body.adopted_sequence : body.sequence;
-    if (Number.isSafeInteger(raw)) stamps.push({ at: parsed.at, event: body.event, sequence: raw as number });
+    if (Number.isSafeInteger(raw)) {
+      const stamp: ReceiverStamp = { at: parsed.at, event: body.event, sequence: raw as number };
+      if (body.event === "apply_complete" && body.phase_ms) stamp.phase_ms = body.phase_ms;
+      stamps.push(stamp);
+    }
   }
   return stamps;
 }
@@ -194,7 +199,7 @@ export function buildHopReport(
   }
   const elapsed = stamps.applyComplete === undefined ? Infinity : stamps.applyComplete - options.writeAt;
   const verdict = correlation === "exact" ? (elapsed <= budgetMs ? "PASS" : "FAIL") : "INVALID";
-  return {
+  const report: HopReport = {
     attempt: options.attempt,
     classification: options.classification,
     ...(trace ? { sequence: trace.sequence } : {}),
@@ -205,6 +210,8 @@ export function buildHopReport(
     verdict,
     stamps,
   };
+  if (apply?.phase_ms) report.phaseMs = apply.phase_ms;
+  return report;
 }
 
 export function renderHopReport(report: HopReport): string {
@@ -223,8 +230,21 @@ export function renderHopReport(report: HopReport): string {
     "| hop | from (UTC) | to (UTC) | ms |",
     "| --- | --- | --- | ---: |",
     ...rows.map(([label, from, to]) => `| ${label} | ${from === undefined ? "-" : new Date(from).toISOString()} | ${to === undefined ? "-" : new Date(to).toISOString()} | ${from === undefined || to === undefined ? "-" : Math.max(0, Math.round((to - from) * 10) / 10)} |`),
-    `budget <=${report.budgetMs}ms ${report.verdict}`,
   ];
+  if (report.phaseMs) {
+    const phaseTotal = Object.values(report.phaseMs).reduce((sum, ms) => sum + ms, 0);
+    const receiverWall = report.stamps.pullDequeue === undefined || report.stamps.applyComplete === undefined
+      ? NaN
+      : report.stamps.applyComplete - report.stamps.pullDequeue;
+    const displayMs = (ms: number): number => Math.round(ms * 10) / 10;
+    lines.push(
+      "| receiver stage | ms |",
+      "| --- | ---: |",
+      ...Object.entries(report.phaseMs).map(([phase, ms]) => `| ${phase} | ${displayMs(ms)} |`),
+      `| unattributed_ms | ${displayMs(receiverWall - phaseTotal)} |`,
+    );
+  }
+  lines.push(`budget <=${report.budgetMs}ms ${report.verdict}`);
   return `${lines.join("\n")}\n`;
 }
 

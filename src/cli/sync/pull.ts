@@ -33,7 +33,7 @@ import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
-import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
+import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
 
 export async function scanManifestForPushResult(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<{ manifest: Manifest; observationComplete: boolean }> {
@@ -229,7 +229,7 @@ export async function applyPulledManifest(
   deps = withReportScanStats(deps, report);
   const { sequence, manifest: remote, manifestMeta } = input;
 
-  const v = validateManifest(remote);
+  const v = await report.phase("validate", async () => validateManifest(remote));
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
   let state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
@@ -299,11 +299,14 @@ export async function applyPulledManifest(
   // Design 212 §3.2: the remote git topology is classified IN / STRADDLE / OOS and
   // every manifest is projected onto this binding's folders BEFORE reconcile, blob
   // fetch, or apply. On an unscoped binding this returns the same manifests.
-  const scoped = await prepareScopedPull(root, state, local, remote);
-  const authority = applyScopedRuleAuthority(
-    reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, new Date().toISOString()),
-    scoped,
-  );
+  const { scoped, authority } = await report.phase("reconcile", async () => {
+    const scoped = await prepareScopedPull(root, state, local, remote);
+    const authority = applyScopedRuleAuthority(
+      reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, new Date().toISOString()),
+      scoped,
+    );
+    return { scoped, authority };
+  });
   const all = authority.actions;
   const ruleFileDivergence = authority.diverged;
   const projection = scoped.projection;
@@ -395,6 +398,17 @@ export async function applyPulledManifest(
   }
   await report.phase("cache-save", () => Promise.all([save(), dircacheSave()]).then(() => undefined));
 
+  const oracleMetrics: PullOracleMetrics = { prepareMs: 0, receiptHashMs: 0, entriesIndexed: 0, reposProved: 0 };
+  const oracleObserver = report.enabled ? (observation: Parameters<NonNullable<Parameters<typeof oracleFromPull>[0]["observer"]>>[0]) => {
+    if (observation.kind === "prepare") {
+      oracleMetrics.prepareMs += observation.ms;
+      oracleMetrics.entriesIndexed += observation.entriesIndexed;
+    } else if (observation.kind === "receipt-hash") {
+      oracleMetrics.receiptHashMs += observation.ms;
+    } else {
+      oracleMetrics.reposProved++;
+    }
+  } : undefined;
   const oracle = oracleFromPull({
     preScan: local,
     actions,
@@ -404,6 +418,7 @@ export async function applyPulledManifest(
     hashcache: cache,
     root,
     scanDeferred,
+    observer: oracleObserver,
   });
 
   // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
@@ -427,6 +442,7 @@ export async function applyPulledManifest(
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
+  report.appendDetails("git-apply", { oracle: oracleMetrics }, formatPullOracleMetrics(oracleMetrics));
   let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
@@ -474,7 +490,10 @@ export async function applyPulledManifest(
   }
   if (savedState.lastSyncedSequence > state.lastSyncedSequence) {
     try {
-      deps.onPullAdopted?.(savedState.lastSyncedSequence);
+      const phaseMs = report.enabled
+        ? Object.fromEntries(Object.entries(report.toJSON().phases).map(([name, totals]) => [name, totals.ms]))
+        : undefined;
+      deps.onPullAdopted?.(savedState.lastSyncedSequence, phaseMs);
     } catch {
       // Observability only: a hook failure must never fail a pull that has already
       // applied and saved — the daemon would misread it as a pull halt.

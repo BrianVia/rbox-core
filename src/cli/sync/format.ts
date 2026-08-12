@@ -1,6 +1,13 @@
 import { type ApplyStats, type ScanStats } from "../../engine/index.js";
 import { type CommitTimings, type LatestTimings } from "../remote.js";
 
+export interface PullOracleMetrics {
+  prepareMs: number;
+  receiptHashMs: number;
+  entriesIndexed: number;
+  reposProved: number;
+}
+
 const fmtDetailSeconds = (ms: number): string => (ms / 1000).toFixed(1);
 const fmtDetailBytes = (n: number): string => {
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)}GB`;
@@ -36,3 +43,5 @@ export const formatScanStats = (s: ScanDetails): string =>
  * stg=stages, pre=preflight, pool=write pool, sm/lg=count and bytes. */
 export const formatApplyStats = (s: ApplyStats): string =>
   `mk${s.mkdirCalls}/cr${s.mkdirCreated} walk${s.dirComponentWalks} uniq${s.uniqueDirs} ls${s.lstatCalls} rn${s.renameCalls} stg${s.stageCalls} pre${fmtDetailSeconds(s.preflightMs)}s pool${fmtDetailSeconds(s.writePoolMs)}s sm${s.smallCount}n/${fmtDetailBytes(s.smallBytes)} lg${s.largeCount}n/${fmtDetailBytes(s.largeBytes)}`;
+export const formatPullOracleMetrics = (m: PullOracleMetrics): string =>
+  `oracle prep${fmtDetailSeconds(m.prepareMs)} hash${fmtDetailSeconds(m.receiptHashMs)} indexed${m.entriesIndexed} proved${m.reposProved}`;
