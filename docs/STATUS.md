@@ -5,6 +5,22 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_ROUND-6 VERDICTS (2026-08-12, 9 exact samples, founder called shape early):
+e2e median ~32s (31.0-35.5 band, one 93s tail from a single heavy push
+cycle). Hops: sender WAIT ~0.3s (dead — was 93s); push op median ~9.9s
+(pipeline: git-plan 1.1 + upload 1.0 + commit 3.3 + state-save 0.8 + ~3s
+inter-phase); FM apply flat ~22.4s regardless of delta (scan 0.0s — trusted
+view perfect; git-apply 9.6s DESPITE queue-gating — find why repos still
+enter; ~10s unaccounted = reconcile/oracle over 119k, dissect from full pull
+line). GATED-MECHANISM RULINGS per the knife: notify fast-lane DEAD; sender
+priority DEAD; res fix deprioritized (trusted scans are 0); drop-attribution
+stays telemetry-only; DELTA-SCOPED APPLY (reconcile fast-path) EARNED —
+receiver budget is founder-set: cost scales with delta size, never workspace.
+BUILD NEXT: (1) dissect FM's 22s from the full pull phase line → reconcile
+fast-path PR + git-apply queue-entry cause; (2) sender pipeline trim (commit
+3.3s + overhead) — target push op ~4-5s; together ≈ e2e under 10s for small
+deltas. Then thermo sweep (task 15) + Mac when reachable._
+
 _POST-FIX AFTERMATH (12:40Z): trust SELF-HEALED fleet-wide once the loop
 died (local=trusted both linux hosts) — every scan-heavy measurement was the
 loop's shadow. Fresh n=1: **e2e ~33s** (write 12:37:34.7 → FM adopted
