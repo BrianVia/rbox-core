@@ -489,10 +489,18 @@ export async function applyPulledManifest(
     await saveScopeFindings(root, { ruleFileDivergence }).catch(() => undefined);
   }
   if (savedState.lastSyncedSequence > state.lastSyncedSequence) {
+    // The phase snapshot is observability only — a failure there must degrade to a
+    // bare adoption, never suppress the callback (the daemon credits the applied
+    // carrier in it, and losing that is a behavior change, not a telemetry gap).
+    let phaseMs: Record<string, number> | undefined;
     try {
-      const phaseMs = report.enabled
+      phaseMs = report.enabled
         ? Object.fromEntries(Object.entries(report.toJSON().phases).map(([name, totals]) => [name, totals.ms]))
         : undefined;
+    } catch (error) {
+      deps.warningSink?.(`pull phase snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
       deps.onPullAdopted?.(savedState.lastSyncedSequence, phaseMs);
     } catch {
       // Observability only: a hook failure must never fail a pull that has already
