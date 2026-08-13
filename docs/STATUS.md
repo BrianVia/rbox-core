@@ -5,6 +5,33 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_LATE-EVENING ADDENDUM (2026-08-13, fleet now on **e71eda7**, 15 PRs total):
+**savvy-core fleet convergence CLOSED** — final wedge was 3 stale worktree
+node_modules SYMLINKS on FM (synced Jul 28, pre-design-224; deletion never
+propagated; oracle counted them as extras forever). Removed → carried 103,
+savvy out of the deferral list first time ever (evidence on #659; only
+Personal/blog remains, the commit-graph issue). Root-caused via out-of-band
+oracle probe because follow-classify.ts:138 DISCARDS the mismatch sample
+(papercut logged — cheap fix queued on #659). **#681 merged**: bare
+`node_modules` builtin matches every entry type at any depth (.git
+precedent). **Ignore purge executed** (founder-authorized, full scope):
+53,165 grandfathered ignored-but-synced paths deleted from the plane, seq
+2209, manifest 120k→67k; zero dir-named stragglers remain plane-wide; FM
+adopted in ~15min. **#682 merged** (design 243 r3): git-plan cost
+instrumentation — 12 exclusive buckets + state_lineage_ms/matcher_ms spans;
+r1's whole-plan reuse gate REFUTED by 2-reviewer wave (plan loop is impure:
+crash recovery, 90-day hygiene, cache maintenance) and recorded as rejected
+in the design doc. Also: candidate_projection_ms renders SECONDS and spans
+the whole candidate transition — prior "projection exonerated" read was
+wrong. NEW FIELD BUG (evidence on #661): Mac daemon spent 45+min at 120%
+CPU / RSS 22.7GB in a zero-backoff push conflict-retry loop ("next probe in
+0s") after the purge advanced the sequence under its 93 pending uploads;
+op lane starved, backstop pulls never ran; 3s sample = 1826/1826 frames one
+JS stack (/tmp/rbox-hotloop-sample.txt on Mac). Restarted onto e71eda7 =
+fuse-acceptance boot 3. Flake sighting logged (credentials fence-timeout,
+3rd distinct test in that file). Desktop's synced-conflict litter (38
+.conflict.* files) swept from rbox-core checkout._
+
 _MARATHON DAY CLOSED (2026-08-13 evening): **11 PRs merged** (#643-#657
 range), fleet fully deployed on d44e267. SHIPPED: fossil-litter class dead
 (#650, field-verified); Darwin bulk scan default-on (#651); Linux walk 5.25x
