@@ -271,7 +271,7 @@ interface ParcelWrapper {
   subscribe(
     dir: string,
     fn: (err: Error | null, events: ParcelEvent[]) => void,
-    opts: { ignore?: string[] }
+    opts: { ignore?: string[]; backend?: "fs-events" | "inotify" }
   ): Promise<ParcelSubscription>;
 }
 
@@ -397,7 +397,10 @@ async function startParcel(
     },
     // Coarse native prune (volume optimization): hard-prune dirs + their subtrees,
     // MINUS any the user could re-include under — those fall through to the JS matcher.
-    { ignore: nativePruneGlobs(root) }
+    {
+      ignore: nativePruneGlobs(root),
+      backend: process.platform === "darwin" ? "fs-events" : "inotify",
+    }
   );
 
   try {
