@@ -516,3 +516,17 @@ removed; the redacted result is retained at
   write earlier in `start()` and this test drives pull trust. If it recurs,
   suspect that interaction first and reproduce under shard ordering
   (`bun test --shard`), not the file alone.
+
+## SUSPECTED (proof pending): credentials fresh-main contention fence timeout
+
+- 2026-08-13, PR #682 (instrumentation-only diff — plan/push timing buckets;
+  touches neither `credentials.ts` nor daemon fencing), `tests · shard 6/6`
+  attempt 1: `(fail) fresh main contention and a live exact-incarnation fence
+  fail closed without reaping [15001.53ms]` — the 15s test ceiling, i.e. a
+  stall, not an assertion. Attempt 2 (same SHA): pass. Locally: file alone
+  49/49 green in 4.6s.
+- Same file as FLAKE-002/FLAKE-006 (`src/cli/credentials.test.ts`), third
+  distinct test to flake there — all contention/fence handshakes. If it
+  recurs, reproduce under shard ordering (the file's contention tests share
+  real lock files; a co-scheduled shard neighbor holding the fence is the
+  first suspect), and check whether the design-242 leak classes cover it.
