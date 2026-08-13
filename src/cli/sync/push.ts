@@ -504,13 +504,17 @@ async function runPushAttempt(
   const report = deps.report ?? PhaseReport.disabled("push");
   let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const candidateProjectionT0 = performance.now();
+  const stateLineageT0 = performance.now();
   state = await ensureCapableStateLineage(root, state);
+  const stateLineageMs = performance.now() - stateLineageT0;
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
   const appliedSequence = state.lastSyncedSequence;
   const appliedBase = state.lastSyncedManifest;
+  const matcherT0 = performance.now();
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
+  const matcherMs = performance.now() - matcherT0;
   const scannedFilePaths = attemptState.rawScannedFilePaths;
 
   // Every Git-plane effect the candidate transition may order. `execute` is the
@@ -668,6 +672,8 @@ async function runPushAttempt(
     },
   );
   const candidateProjectionMs = performance.now() - candidateProjectionT0;
+  report.appendDetails("git-plan", { state_lineage_ms: stateLineageMs }, formatPushSpan("state_lineage_ms", stateLineageMs));
+  report.appendDetails("git-plan", { matcher_ms: matcherMs }, formatPushSpan("matcher_ms", matcherMs));
   report.appendDetails("git-plan", { candidate_projection_ms: candidateProjectionMs }, formatPushSpan("candidate_projection_ms", candidateProjectionMs));
   const publication = sealed.publication;
   local = sealed.candidate;
