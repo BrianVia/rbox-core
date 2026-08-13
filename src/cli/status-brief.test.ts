@@ -151,13 +151,13 @@ test("suspect watcher trust stays supplementary while fused escalates", () => {
   ]);
   expect(lines(full({ watcherTrust: "fused" })).slice(0, 2)).toEqual([
     "Development · sync needs attention",
-    "watcher trust fused — restart rbox to restore reactive pulls",
+    "watcher reliability reduced — syncing continues by scan; restarting rbox restores reactive sync.",
   ]);
   expect(lines(full({ watcherTrust: "fused", halt: { kind: "unknown" } }))).not.toContain(
-    "watcher trust fused — restart rbox to restore reactive pulls",
+    "watcher reliability reduced — syncing continues by scan; restarting rbox restores reactive sync.",
   );
   expect(lines(full({ watcherTrust: "fused", planQuota: { kind: "storage-limit" } }))).not.toContain(
-    "watcher trust fused — restart rbox to restore reactive pulls",
+    "watcher reliability reduced — syncing continues by scan; restarting rbox restores reactive sync.",
   );
 });
 

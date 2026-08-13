@@ -105,6 +105,7 @@ import {
   nextSafetyDelay,
   POLL_BACKSTOP_DEFAULT_MS,
   reconnectDelayMs,
+  recordWatcherDropEpisode,
   RETRUST_DROP_WINDOW_MS,
   RETRUST_FUSE_DROPS,
   RETRUST_HOLD_MAX_MS,
@@ -453,7 +454,9 @@ export class RboxDaemon {
   private watcherHealthy = true;
   private trustState: TrustState = "trusted";
   private lastTrustedErrorGeneration = 0;
+  /** First drops of overflow episodes in the strict rolling fuse window. */
   private transientDropTimestamps: number[] = [];
+  private transientEpisodeFirstMs: number | undefined;
   private lastTransientDropMs = 0;
   private recoveryHoldMs = 0;
   private watcherLivenessSinceDrop = false;
@@ -907,10 +910,15 @@ export class RboxDaemon {
               this.log(`watcher error (fatal): ${err.message} — permanent un-trust`);
               this.setTrustState("fused", "fatal error");
             } else {
-              const now = Date.now();
-              this.transientDropTimestamps = this.transientDropTimestamps.filter((ts) => ts > now - RETRUST_DROP_WINDOW_MS);
-              this.transientDropTimestamps.push(now);
+              const now = this.readMonotonicMs();
+              const episodes = recordWatcherDropEpisode({
+                currentFirstMs: this.transientEpisodeFirstMs,
+                startsMs: this.transientDropTimestamps,
+              }, now);
+              this.transientEpisodeFirstMs = episodes.currentFirstMs;
+              this.transientDropTimestamps = [...episodes.startsMs];
               this.lastTransientDropMs = now;
+              this.logTransientDropDiagnostic(now);
               const d = this.transientDropTimestamps.length;
               if (d >= RETRUST_FUSE_DROPS) {
                 this.log(`watcher trust FUSED: ${d} transient drops within ${RETRUST_DROP_WINDOW_MS}ms — reverting to permanent un-trust (safety-scan-only)`);
@@ -2321,7 +2329,7 @@ export class RboxDaemon {
     if (this.trustState !== "suspect") return;
     this.hasCleanUnprunedScanThisEpisode = true; // P2 episode evidence
     if (this.watcherErrorGeneration > this.lastTrustedErrorGeneration
-      && Date.now() - this.lastTransientDropMs >= this.recoveryHoldMs) {
+      && this.readMonotonicMs() - this.lastTransientDropMs >= this.recoveryHoldMs) {
       this.lastTrustedErrorGeneration = this.watcherErrorGeneration;
       this.setTrustState("trusted", `re-trusted after clean full-tree scan (errorGen=${this.watcherErrorGeneration})`);
       this.watcherDegraded = false;
@@ -2646,6 +2654,15 @@ export class RboxDaemon {
     const raw = this.monotonicNow();
     if (Number.isFinite(raw)) this.monotonicLastMs = Math.max(this.monotonicLastMs, raw);
     return this.monotonicLastMs;
+  }
+
+  /** One post-callback sample per transient drop. This is supporting evidence:
+   * it cannot reconstruct event-loop starvation that happened before the error. */
+  private logTransientDropDiagnostic(atMs: number): void {
+    setTimeout(() => {
+      const lagMs = Math.max(0, this.readMonotonicMs() - atMs);
+      this.log(`watcher transient drop diagnostic: monotonicMs=${Math.floor(atMs)} eventLoopLagMs=${Math.floor(lagMs)}`);
+    }, 0);
   }
 
   private accrueWsConnectedUntil(now: number): void {
