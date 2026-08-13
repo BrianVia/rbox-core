@@ -5,6 +5,44 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_RECEIVER SOLVED + SAVVY-CORE UNWEDGED (2026-08-13 overnight). LATEST
+NUMBERS (FM, traced): pull wall **8.4s** (was 14-24s; round-6 apply span was
+22s), cas acquire **0.1s** (was 7.7s), state-save 0.9s, unattributed ~0.3s —
+every receiver second is now named by the merged timer stack (#643 phase
+timers → #646 automatic gap accounting → #648 CAS step timers). Remaining to
+the founder ≤10s e2e: the SENDER (~10s push op; Mac pushes also show a
+state-load→git-plan ~3.3s gap — same gap instrument works there).
+ROOT-CAUSE CHAIN (all evidence in docs/papercuts.md + issue #647 + task #22):
+FM's savvy-core carried a 411-491-ref partial that was RE-AUTHORED every pull
+from the remote section (local surgery of partial/pending insufficient by
+design), costing 501 state-CAS locks × full-journal-rewrite+fsync each =
+7.5s/pull. Unwedge sequence that finally worked: state surgery via the
+store's own APIs (loadRawState + applyStateSavePacket, script pattern in
+[[state-surgery-over-front-doors]] memory) marking the repo repoAbsent +
+parking FM's .git OUTSIDE the workspace (~/savvy-core-git-final-20260813) →
+fresh-join semantics → tax dead. FM savvy-core is currently GIT-LESS (files
+sync fine); re-adopt it via the planned `rbox git reset` command, NOT by hand.
+MUST-DO QUEUE (tasks #20/#22 + issue #647 hold the detail):
+1. `rbox git reset <repo>` — productize tonight's surgery (founder: "we
+   can't expect others to do this"). Task #22.
+2. #647: take-theirs self-invalidates at the locked boundary (token echo
+   proof in the issue) + resolve must quiesce the daemon itself.
+3. Task #20: concluded-op litter self-heal in the deferral classifier
+   (AUTO_MERGE, REBASE_HEAD, per-WORKTREE — three litter finds tonight) +
+   probe must NAME the offending worktree/file.
+4. Carried-unchanged partial must not re-prove/re-lock per pull (held-skip
+   semantic-key pattern) + batch the per-lock journal fsyncs — kills this
+   tax class even while a repo IS wedged.
+5. Full-bundle fallback for connectivity-failed receivers + commit-graph
+   poisoning self-heal (both hit tonight; detail now surfaces in refusals
+   via #648).
+6. Mac: fuse-loop (4x/night, RSS 8-10GB, un-timestamped crash line) — task
+   #22; case-folded branch dirs (brianvia vs BrianVia) broke BASE pre-state
+   proofs on linux FM — design-234 rig fixture.
+Cross-refs: design 235 (Phase B constraints §5), memory
+state-surgery-over-front-doors + git-resolve-needs-real-rig-suite, PR #648
+(step timers + refusal detail), #649 MERGED (auto GitHub Releases)._
+
 _STATE-PLANE REGRESSION FOUND + HALF-FIXED (2026-08-12 evening): the "~10s
 reconcile/oracle" receiver mystery decomposed. Designs 202/203/204 had receive
 at ~4.5s in July; the 2.0 SQLite state plane regressed it (~22x slower save
