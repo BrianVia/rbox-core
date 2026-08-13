@@ -5,6 +5,23 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_E2E RE-MEASURED POST-FIXES (2026-08-13 13:00Z, 3 serial trials desktop→fleet):
+median **13.1s** (was ~32s round-6; FM 11.8s, Mac 14.4s). Receiver is no longer
+the bottleneck: publish→file-visible 1.6-1.7s FM / 4.2-4.3s Mac. Slowest hop =
+sender push ~10s on an 89-byte change (commit 3.3s, git-plan 1.3s, upload 1.0s,
+state-save 0.8s) — task #17's remaining half. Reverse Mac→fleet was 50s because
+a 33s git-apply-heavy pull held the push lane (Mac watcher fused AGAIN within
+2h of restart, RSS 10.5GB — task #22). Also: desktop daemon lost
+RBOX_TRACE_PROPAGATION on its 11:34 self-restart, so scripts/bench/propagate.ts
+correlation is INVALID until a restart with the env set. Savvy-core converged
+fleet-wide (first-ever successful keep-mine, seq 2065); FM has a benign stale
+pending lane to take-theirs in a quiet moment (same signature as blog's).
+Task #21 verified IN SOURCE: parcel-watcher checkpoint-resume is real journal
+replay on macOS (GO with fail-closed harness), disguised full scan on Linux
+(NO-GO); Darwin bulk-walk ALREADY BUILT (design 107, RBOX_SCAN_BULK=1, 42%
+faster, needs its parity gate to default on); watcher passes only globs so
+FSEvents gets zero kernel-level exclusions (free fix, helps live watcher)._
+
 _RECEIVER SOLVED + SAVVY-CORE UNWEDGED (2026-08-13 overnight). LATEST
 NUMBERS (FM, traced): pull wall **8.4s** (was 14-24s; round-6 apply span was
 22s), cas acquire **0.1s** (was 7.7s), state-save 0.9s, unattributed ~0.3s —
