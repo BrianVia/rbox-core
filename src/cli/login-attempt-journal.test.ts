@@ -37,14 +37,17 @@ const RESTART_IDENTITY: LockIdentitySource = {
 };
 
 let root: string;
+let savedRboxHome: string | undefined;
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-login-attempt-"));
   process.env.RBOX_HOME = root;
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(root, { recursive: true, force: true });
 });
 

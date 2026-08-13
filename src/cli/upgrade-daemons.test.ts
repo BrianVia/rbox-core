@@ -10,16 +10,19 @@ import type { DesiredStateRow } from "./autostart-cmd.js";
 import { RBOX_VERSION } from "./version.js";
 
 let home: string;
+let savedRboxHome: string | undefined;
 const rows: DesiredStateRow[] = [];
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-upgrade-daemons-"));
   process.env.RBOX_HOME = home;
   rows.length = 0;
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(home, { recursive: true, force: true });
 });
 

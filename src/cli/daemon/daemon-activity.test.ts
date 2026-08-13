@@ -13,7 +13,7 @@ import { CommitRejectedError, QuotaExceededError, type CommitOptions, type Commi
 import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
-import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import { observeDaemon } from "./observation.js";
 import { RBOX_VERSION } from "../version.js";
 
@@ -154,7 +154,11 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await Promise.all(daemons.map((daemon) => daemon.stop().catch(() => {})));
-  await fs.rm(root, { recursive: true, force: true });
+  try {
+    await releaseDaemonFolderAdmission(root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 function testConfig(overrides: Partial<WorkspaceConfig> = {}): WorkspaceConfig {
@@ -259,14 +263,21 @@ async function makeCommittedRepo(rel = "repo"): Promise<string> {
 async function withIsolatedDaemonHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const oldHome = process.env.RBOX_HOME;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
+  const firstOwnedDaemon = daemons.length;
   process.env.RBOX_HOME = home;
   try {
     await prepareDaemonFolderAdmission(root, testConfig());
     return await fn(home);
   } finally {
-    if (oldHome === undefined) delete process.env.RBOX_HOME;
-    else process.env.RBOX_HOME = oldHome;
-    await fs.rm(home, { recursive: true, force: true });
+    const ownedDaemons = daemons.splice(firstOwnedDaemon);
+    await Promise.allSettled(ownedDaemons.map((daemon) => daemon.stop()));
+    try {
+      await releaseDaemonFolderAdmission(root);
+    } finally {
+      if (oldHome === undefined) delete process.env.RBOX_HOME;
+      else process.env.RBOX_HOME = oldHome;
+      await fs.rm(home, { recursive: true, force: true });
+    }
   }
 }
 

@@ -1,25 +1,25 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getuid } from "node:process";
+import { hashFile, realHashFileForTests, overrideHashFileForTests } from "./hash.js";
+import { applyWatchEvents, scanManifest } from "./manifest.js";
+import { buildIgnoreMatcher } from "./ignore.js";
 
 const faults = new Map<string, string>();
-mock.module("./hash.js", () => ({
-  hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
-  hashFile: async (abs: string): Promise<string> => {
+let resetHashFile: (() => void) | undefined;
+
+beforeEach(() => {
+  resetHashFile = overrideHashFileForTests(async (abs: string, size?: number): Promise<string> => {
     const code = faults.get(path.basename(abs));
     if (code) {
       faults.delete(path.basename(abs));
       throw Object.assign(new Error("injected hash fault"), { code });
     }
-    return createHash("sha256").update(await fs.readFile(abs)).digest("hex");
-  },
-}));
-
-const { applyWatchEvents, scanManifest } = await import("./manifest.js");
-const { buildIgnoreMatcher } = await import("./ignore.js");
+    return realHashFileForTests(abs, size);
+  });
+});
 const asRoot = typeof getuid === "function" && getuid() === 0;
 
 let root: string;
@@ -27,6 +27,8 @@ beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-scan-fault-"));
 });
 afterEach(async () => {
+  resetHashFile?.();
+  resetHashFile = undefined;
   faults.clear();
   await fs.chmod(path.join(root, "blocked.bin"), 0o600).catch(() => undefined);
   await fs.chmod(path.join(root, "locked"), 0o700).catch(() => undefined);
@@ -45,6 +47,18 @@ test("a deferrable per-file hash fault does not abort the scan", async () => {
   expect(deferred).toEqual(new Set(["unreadable.txt"]));
   expect(manifest.files.map((entry) => entry.path)).toEqual(["normal.txt"]);
   expect(errnos).toEqual(["EACCES"]);
+});
+
+test("a stale hash override reset cannot clear a newer fixture override", async () => {
+  const staleReset = resetHashFile!;
+  const sameOverride = async () => "newer";
+  const supersededReset = overrideHashFileForTests(sameOverride);
+  const currentReset = overrideHashFileForTests(sameOverride);
+  staleReset();
+  supersededReset();
+  expect(await hashFile(path.join(root, "does-not-need-to-exist"))).toBe("newer");
+  currentReset();
+  resetHashFile = undefined;
 });
 
 test("a non-deferrable per-file hash fault still fails the scan loudly", async () => {

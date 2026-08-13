@@ -27,9 +27,10 @@ const TOKEN = "recovered-device-token";
 let root: string;
 let originalFetch: typeof fetch;
 let originalLog: typeof console.log;
-const originalHome = process.env.HOME;
+let savedHomeEnv: Record<string, string | undefined>;
 
 beforeEach(async () => {
+  savedHomeEnv = Object.fromEntries(["HOME", "RBOX_HOME"].map((key) => [key, process.env[key]]));
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-login-fsm-"));
   process.env.RBOX_HOME = root;
   process.env.HOME = root;
@@ -43,9 +44,10 @@ afterEach(async () => {
   globalThis.fetch = originalFetch;
   console.log = originalLog;
   _setSpawner();
-  delete process.env.RBOX_HOME;
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  for (const [key, value] of Object.entries(savedHomeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(root, { recursive: true, force: true });
 });
 

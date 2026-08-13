@@ -41,8 +41,10 @@ const ONE_PASSWORD_ARTIFACT = {
 
 let tmp: string;
 let restoreWriteHook: (() => void) | undefined;
+let savedRboxHome: string | undefined;
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-kit-"));
   process.env.RBOX_HOME = tmp;
 });
@@ -50,7 +52,8 @@ beforeEach(async () => {
 afterEach(async () => {
   restoreWriteHook?.();
   restoreWriteHook = undefined;
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(tmp, { recursive: true, force: true });
 });
 

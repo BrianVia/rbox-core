@@ -71,7 +71,7 @@ let home: string;
 const origLog = console.log;
 const origFetch = globalThis.fetch;
 const origSetTimeout = globalThis.setTimeout;
-const origHome = process.env.HOME;
+let savedHomeEnv: Record<string, string | undefined>;
 
 test("pairing command is built only from the exact client-requested token id", () => {
   const secret = Buffer.alloc(32, 7);
@@ -215,6 +215,7 @@ test("key recover requires login before reading the recovery phrase", async () =
 });
 
 beforeEach(async () => {
+  savedHomeEnv = Object.fromEntries(["HOME", "RBOX_HOME"].map((key) => [key, process.env[key]]));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-auth-home-"));
   process.env.RBOX_HOME = home;
   process.env.HOME = home;
@@ -227,9 +228,10 @@ afterEach(async () => {
   globalThis.fetch = origFetch;
   globalThis.setTimeout = origSetTimeout;
   _setSpawner();
-  delete process.env.RBOX_HOME;
-  if (origHome === undefined) delete process.env.HOME;
-  else process.env.HOME = origHome;
+  for (const [key, value] of Object.entries(savedHomeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(home, { recursive: true, force: true });
 });
 

@@ -8,9 +8,11 @@ import { daemonCrashLogPath, daemonDatedLogPath } from "./rbox-paths.js";
 let root: string;
 let home: string;
 let out: string[];
+let savedRboxHome: string | undefined;
 const origWrite = process.stdout.write.bind(process.stdout);
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-logs-"));
   // Redirect the global ~/.rbox to a throwaway dir so the daemon's runtime files
   // land somewhere we can inspect and clean up (RBOX_HOME is the shared override).
@@ -26,7 +28,8 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   process.stdout.write = origWrite;
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(root, { recursive: true, force: true });
   await fs.rm(home, { recursive: true, force: true });
 });

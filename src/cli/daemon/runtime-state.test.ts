@@ -13,8 +13,10 @@ import {
 
 let home: string;
 let root: string;
+let savedRboxHome: string | undefined;
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   home = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-runtime-state-"));
   process.env.RBOX_HOME = home;
   root = path.join(home, "workspace");
@@ -22,7 +24,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fsp.rm(home, { recursive: true, force: true });
 });
 

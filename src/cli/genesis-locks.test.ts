@@ -12,14 +12,17 @@ import {
 
 const ACCOUNT = "acct_0123456789abcdef";
 let home: string;
+let savedRboxHome: string | undefined;
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-genesis-locks-"));
   process.env.RBOX_HOME = home;
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(home, { recursive: true, force: true });
 });
 

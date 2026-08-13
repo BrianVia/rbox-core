@@ -9,7 +9,7 @@ import { reconnectDelayMs, RboxDaemon, type CursorClock } from "../daemon.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { WsHealthSample } from "../telemetry/contract.js";
-import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const ENV_KEYS = [
   "RBOX_DAEMON_WS_DISABLED",
@@ -133,17 +133,21 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const daemon of daemons.splice(0)) {
+  await Promise.allSettled(daemons.splice(0).map(async (daemon) => {
     daemon.clearPongDeadline();
     daemon.clearBackstop();
     await daemon.stop();
+  }));
+  try {
+    await releaseDaemonFolderAdmission(root);
+  } finally {
+    for (const key of ENV_KEYS) {
+      const value = savedEnv[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
   }
-  for (const key of ENV_KEYS) {
-    const value = savedEnv[key];
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
-  await fs.rm(root, { recursive: true, force: true });
 });
 
 async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {

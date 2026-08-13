@@ -52,6 +52,7 @@ interface Internals {
   deepTimer?: ReturnType<typeof setInterval>;
   openDriftAudits: Set<unknown>;
   runDriftAuditNow(audit?: unknown): Promise<void>;
+  stop(): Promise<void>;
 }
 
 test("watcher re-trust defaults ON with the env unset; =0 disables", () => {
@@ -75,9 +76,7 @@ function daemonHarness(opts: { monotonicNow?: () => number; log?: (line: string)
     daemon,
     error: (message = DROP) => onError!(new Error(message)),
     close: async () => {
-      if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
-      if (daemon.deepTimer) clearInterval(daemon.deepTimer);
-      await daemon.watcher?.close();
+      await daemon.stop();
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
@@ -299,6 +298,7 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-retrust-e2e-")));
   const logs: string[] = [];
   const oldLog = console.log;
+  let daemon: { stop(): Promise<void> } | undefined;
   console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
   try {
     fs.writeFileSync(path.join(root, "drift.txt"), "old");
@@ -310,7 +310,9 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
       startLiveWatch(): Promise<void>; doDeepScan(): Promise<unknown>; runDriftAuditNow(): Promise<void>;
       maybeClearWatcherDegradedAfterScan(g: number, c: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
       safetyTimer?: ReturnType<typeof setTimeout>; deepTimer?: ReturnType<typeof setInterval>;
+      stop(): Promise<void>;
     };
+    daemon = d;
     let onError: ((e: Error) => void) | undefined;
     d.startWatcherFn = (_r, _m, _cb, o) => { onError = o?.onError; return Promise.resolve({ backend: "parcel", close: async () => {} }); };
     d.cache = await HashCache.load(root);
@@ -339,6 +341,7 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
     expect(line).toContain("confirmed=0");
   } finally {
     console.log = oldLog;
+    await daemon?.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

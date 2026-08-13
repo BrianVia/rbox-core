@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
@@ -78,11 +78,18 @@ const sidecarShaOf = (manifest: Manifest): string => {
 // all three manifest-encoding switches are DEFAULT-ON, so an inherited value from
 // the operator's shell or a leaked assignment in a sibling test silently selects a
 // different arm. Force-delete before every test; each test opts in explicitly.
+const MDE_ENV_KEYS = ["RBOX_MDE_DELTA", "RBOX_MDE_SNAPSHOT", "RBOX_MDE_FAST_PULL", "RBOX_MTIME_NORMALIZE"] as const;
+let savedMdeEnv: Record<string, string | undefined>;
 beforeEach(() => {
-  delete process.env.RBOX_MDE_DELTA;
-  delete process.env.RBOX_MDE_SNAPSHOT;
-  delete process.env.RBOX_MDE_FAST_PULL;
-  delete process.env.RBOX_MTIME_NORMALIZE;
+  savedMdeEnv = Object.fromEntries(MDE_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of MDE_ENV_KEYS) delete process.env[key];
+});
+afterEach(() => {
+  for (const key of MDE_ENV_KEYS) {
+    const value = savedMdeEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 test("latest timing formatter appends the non-sensitive fold token", () => {

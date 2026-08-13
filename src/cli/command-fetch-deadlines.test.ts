@@ -18,9 +18,9 @@ import { runUpdateCheckIfDue } from "./update-check.js";
 
 const origFetch = globalThis.fetch;
 const origLog = console.log;
-const origHome = process.env.RBOX_HOME;
 let observed: (AbortSignal | undefined | null)[] = [];
 let home: string;
+let savedEnv: Record<string, string | undefined>;
 
 /** A server that accepts the connection and then says nothing, ever. The ONLY way this
  *  promise settles is the caller's own abort signal — i.e. the deadline under test. */
@@ -51,6 +51,7 @@ function recording(body: (url: string) => unknown): void {
 }
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries(["RBOX_HOME", "RBOX_TOKEN", "RBOX_API", "RBOX_DEVICE_ID"].map((key) => [key, process.env[key]]));
   observed = [];
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fetch-deadline-"));
   process.env.RBOX_HOME = home;
@@ -63,11 +64,10 @@ beforeEach(async () => {
 afterEach(async () => {
   globalThis.fetch = origFetch;
   console.log = origLog;
-  if (origHome === undefined) delete process.env.RBOX_HOME;
-  else process.env.RBOX_HOME = origHome;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_API;
-  delete process.env.RBOX_DEVICE_ID;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(home, { recursive: true, force: true });
 });
 

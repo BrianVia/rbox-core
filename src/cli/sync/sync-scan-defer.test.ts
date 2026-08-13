@@ -1,8 +1,12 @@
-import { test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { test, expect, beforeEach, afterEach } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { realHashFileForTests, overrideHashFileForTests } from "../../engine/hash.js";
+import { push, pull } from "../sync.js";
+import { loadState, syncStreamId } from "../config.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 // A scan-deferred path (mutated between the walk's stat and its deferred hash,
 // design 85 P-1) must ride `deferManifest` into the commit: the BASE entry is
@@ -10,22 +14,18 @@ import { createHash } from "node:crypto";
 // a deletion. The hash mock injects the mutation deterministically at hash time.
 type Mutation = (abs: string) => Promise<void>;
 const mutations = new Map<string, Mutation>(); // basename → one-shot mutation
+let resetHashFile: (() => void) | undefined;
 
-mock.module("../../engine/hash.js", () => ({
-  hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
-  hashFile: async (abs: string): Promise<string> => {
+function installHashFaults(): void {
+  resetHashFile = overrideHashFileForTests(async (abs: string, size?: number): Promise<string> => {
     const run = mutations.get(path.basename(abs));
     if (run) {
       mutations.delete(path.basename(abs));
       await run(abs);
     }
-    return createHash("sha256").update(await fs.readFile(abs)).digest("hex");
-  },
-}));
-
-const { push, pull } = await import("../sync.js");
-const { loadState, syncStreamId } = await import("../config.js");
-const { encryptFileNameProbe } = await import("../../engine/e2ee/e2ee-e2e.helpers.js");
+    return realHashFileForTests(abs, size);
+  });
+}
 type SyncDeps = import("../sync.js").SyncDeps;
 type WorkspaceConfig = import("../config.js").WorkspaceConfig;
 type CommitResult = import("../remote.js").CommitResult;
@@ -97,6 +97,7 @@ const noBackoff = async () => {};
 const deps = (remote: SyncRemote): SyncDeps => ({ remote, backoff: noBackoff });
 
 beforeEach(async () => {
+  installHashFaults();
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-scan-defer-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   cfg = {
@@ -114,6 +115,8 @@ beforeEach(async () => {
   };
 });
 afterEach(async () => {
+  resetHashFile?.();
+  resetHashFile = undefined;
   mutations.clear();
   await fs.rm(root, { recursive: true, force: true });
 });

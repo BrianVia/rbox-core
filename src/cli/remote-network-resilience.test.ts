@@ -26,6 +26,7 @@ const resp = (status: number, body: unknown): Response =>
 
 const origFetch = globalThis.fetch;
 const origAbortSignalTimeout = AbortSignal.timeout;
+let savedNetRetries: string | undefined;
 const SHA = "b".repeat(64);
 const BIG = 100 * 1024 * 1024; // > SINGLE_PUT_MAX (90 MiB) → multipart
 const api = () => new RboxApi("https://api.test", "tok", "ws_1", "proj_1");
@@ -80,9 +81,12 @@ function transientAfterPartialBody(bytes: Uint8Array): Response {
 
 // Speed: collapse the retry backoff so these run instantly.
 beforeEach(() => {
+  savedNetRetries = process.env.RBOX_NET_RETRIES;
   process.env.RBOX_NET_RETRIES = "2";
 });
 afterEach(() => {
+  if (savedNetRetries === undefined) delete process.env.RBOX_NET_RETRIES;
+  else process.env.RBOX_NET_RETRIES = savedNetRetries;
   globalThis.fetch = origFetch;
   (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origAbortSignalTimeout;
 });

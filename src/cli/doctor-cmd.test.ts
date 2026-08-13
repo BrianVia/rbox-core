@@ -31,11 +31,11 @@ import { observeWorkspace, type LocalWorkspaceObservation } from "./workspace-ob
 
 let home: string;
 let logs: string[];
+let savedEnv: Record<string, string | undefined>;
 const origLog = console.log;
 const origFetch = globalThis.fetch;
 const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
-const originalHome = process.env.HOME;
 
 function contextObservation(
   root: string,
@@ -108,6 +108,9 @@ const emptyWorktrees = {
 };
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries([
+    "RBOX_HOME", "HOME", "RBOX_DIAGNOSTICS", "RBOX_TOKEN", "RBOX_DEVICE_ID", "RBOX_API",
+  ].map((key) => [key, process.env[key]]));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-home-"));
   process.env.RBOX_HOME = home;
   process.env.HOME = home;
@@ -121,13 +124,10 @@ afterEach(async () => {
   globalThis.fetch = origFetch;
   if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
   else delete (process.stdin as { isTTY?: boolean }).isTTY;
-  delete process.env.RBOX_HOME;
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
-  delete process.env.RBOX_DIAGNOSTICS;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_DEVICE_ID;
-  delete process.env.RBOX_API;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   process.exitCode = 0;
   await fs.rm(home, { recursive: true, force: true });
 });

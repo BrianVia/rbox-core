@@ -1,8 +1,13 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { realHashFileForTests, overrideHashFileForTests } from "../../engine/hash.js";
+import { HashCache, scanManifest } from "../../engine/index.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
+import { RboxDaemon } from "../daemon.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 // Design 85 P-1 regression: a path that churns during the
 // POST-pull rescan must carry the post-pull BASE entry, never the pre-pull
@@ -13,10 +18,10 @@ import { createHash } from "node:crypto";
 // the hash reads the freshly PULLED content, i.e. exactly during the post-pull
 // rescan (the pull's own pre-apply scan sees the old content and is left alone).
 let mutateWhenContent: { base: string; content: string; mutation: (abs: string) => Promise<void> } | undefined;
+let resetHashFile: (() => void) | undefined;
 
-mock.module("../../engine/hash.js", () => ({
-  hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
-  hashFile: async (abs: string): Promise<string> => {
+function installHashFaults(): void {
+  resetHashFile = overrideHashFileForTests(async (abs: string, size?: number): Promise<string> => {
     const bytes = await fs.readFile(abs);
     const arm = mutateWhenContent;
     // Exact-basename guard: apply verifies the downloaded blob at a TMP path with
@@ -25,14 +30,9 @@ mock.module("../../engine/hash.js", () => ({
       mutateWhenContent = undefined;
       await arm.mutation(abs);
     }
-    return createHash("sha256").update(await fs.readFile(abs)).digest("hex");
-  },
-}));
-
-const { HashCache, scanManifest } = await import("../../engine/index.js");
-const { encryptFileNameProbe } = await import("../../engine/e2ee/e2ee-e2e.helpers.js");
-const { RboxDaemon } = await import("../daemon.js");
-const { prepareDaemonFolderAdmission } = await import("./folder-admission.test-helper.js");
+    return realHashFileForTests(abs, size);
+  });
+}
 type BlobStore = import("../../engine/index.js").BlobStore;
 type FileEntry = import("../../engine/index.js").FileEntry;
 type Manifest = import("../../engine/index.js").Manifest;
@@ -92,19 +92,27 @@ interface DaemonInternals {
   retryQueue: { stop(): void };
   pump(): Promise<void>;
   loadSyncBase(): Promise<unknown>;
+  stop(): Promise<void>;
 }
 
 let root: string;
 let daemon: DaemonInternals | undefined;
 
 beforeEach(async () => {
+  installHashFaults();
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-scan-defer-")));
 });
 afterEach(async () => {
   mutateWhenContent = undefined;
-  daemon?.retryQueue.stop();
+  resetHashFile?.();
+  resetHashFile = undefined;
+  await daemon?.stop().catch(() => {});
   daemon = undefined;
-  await fs.rm(root, { recursive: true, force: true });
+  try {
+    await releaseDaemonFolderAdmission(root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 function testConfig(): WorkspaceConfig {

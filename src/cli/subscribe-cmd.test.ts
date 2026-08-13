@@ -8,6 +8,7 @@ import { subscribe, billingPortal } from "./subscribe-cmd.js";
 
 const origFetch = globalThis.fetch;
 const origLog = console.log;
+let savedEnv: Record<string, string | undefined>;
 let calls: { url: string; init?: RequestInit }[] = [];
 let logs: string[] = [];
 
@@ -25,6 +26,7 @@ function stub(responder: (url: string) => { status: number; body?: unknown }): v
 }
 
 beforeEach(() => {
+  savedEnv = Object.fromEntries(["RBOX_TOKEN", "RBOX_API", "RBOX_DEVICE_ID"].map((key) => [key, process.env[key]]));
   calls = [];
   logs = [];
   console.log = (...m: unknown[]) => void logs.push(m.map(String).join(" "));
@@ -35,9 +37,10 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = origFetch;
   console.log = origLog;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_API;
-  delete process.env.RBOX_DEVICE_ID;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("rbox subscribe", () => {

@@ -8,9 +8,9 @@ import {saveDevice,saveMasterKey} from "./e2ee-keystore.js";
 import {genesisPaths,publishGenesisEnrollmentWitness} from "./genesis-durable.js";
 import {startGenesisQuarantine} from "./genesis-quarantine.js";
 
-const ACCOUNT="acct_3131313131313131";let home:string,priorHome:string|undefined;
-beforeEach(async()=>{priorHome=process.env.HOME;home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-enrollment-witness-"));process.env.HOME=home;process.env.RBOX_HOME=home;});
-afterEach(async()=>{if(priorHome===undefined)delete process.env.HOME;else process.env.HOME=priorHome;delete process.env.RBOX_HOME;await fs.rm(home,{recursive:true,force:true});});
+const ACCOUNT="acct_3131313131313131";let home:string,savedHomeEnv:Record<string,string|undefined>;
+beforeEach(async()=>{savedHomeEnv=Object.fromEntries(["HOME","RBOX_HOME"].map(key=>[key,process.env[key]]));home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-enrollment-witness-"));process.env.HOME=home;process.env.RBOX_HOME=home;});
+afterEach(async()=>{for(const[key,value]of Object.entries(savedHomeEnv)){if(value===undefined)delete process.env[key];else process.env[key]=value;}await fs.rm(home,{recursive:true,force:true});});
 const expectAbsent=async()=>expect(fs.access(genesisPaths(ACCOUNT).enrolledWitness)).rejects.toThrow();
 
 describe("design 180 local enrollment witness invalidation",()=>{

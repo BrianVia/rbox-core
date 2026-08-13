@@ -12,7 +12,7 @@ const STREAM_THRESHOLD = 1024 * 1024; // 1 MiB
  * tens of thousands of files pathologically slow. Large files stream so we never
  * buffer the whole thing. `size` lets the caller skip a stat to choose the path.
  */
-export async function hashFile(absPath: string, size?: number): Promise<string> {
+async function hashFileReal(absPath: string, size?: number): Promise<string> {
   if (size === undefined || size <= STREAM_THRESHOLD) {
     try {
       return hashBytes(await readFile(absPath));
@@ -27,6 +27,27 @@ export async function hashFile(absPath: string, size?: number): Promise<string> 
       .on("error", reject)
       .on("end", () => resolve(h.digest("hex")));
   });
+}
+
+export type HashFile = typeof hashFileReal;
+export const realHashFileForTests: HashFile = hashFileReal;
+let hashFileGeneration = 0;
+
+/** Test-only physical-effect seam. The reset handle is generation-safe: an old
+ * fixture can never clear a newer fixture's override. */
+export let hashFile: HashFile = hashFileReal;
+export function overrideHashFileForTests(override: HashFile): () => void {
+  const generation = ++hashFileGeneration;
+  hashFile = override;
+  let installed = true;
+  return () => {
+    if (!installed) return;
+    installed = false;
+    if (hashFileGeneration === generation) {
+      hashFileGeneration++;
+      hashFile = hashFileReal;
+    }
+  };
 }
 
 export function hashBytes(bytes: Uint8Array | Buffer): string {

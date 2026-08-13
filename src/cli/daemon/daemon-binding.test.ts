@@ -21,13 +21,16 @@ import type { FileEntry } from "../../engine/types.js";
 
 let home: string;
 let root: string;
+let savedRboxHome: string | undefined;
 beforeAll(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-bind-home-"));
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-bind-root-"));
   process.env.RBOX_HOME = home; // daemon runtime dirs land under the temp home
 });
 afterAll(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(home, { recursive: true, force: true });
   await fs.rm(root, { recursive: true, force: true });
 });

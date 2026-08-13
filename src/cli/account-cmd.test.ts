@@ -21,6 +21,7 @@ const origStdout = process.stdout.write.bind(process.stdout);
 let calls: { url: string; init?: RequestInit }[] = [];
 let logs: string[] = [];
 let home: string;
+let savedEnv: Record<string, string | undefined>;
 
 async function captureStdout(fn: () => Promise<void>): Promise<string> {
   const out: string[] = [];
@@ -50,6 +51,9 @@ function stub(responder: (url: string) => { status: number; body?: unknown }): v
 }
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries([
+    "RBOX_HOME", "RBOX_TOKEN", "RBOX_API", "RBOX_DEVICE_ID",
+  ].map((key) => [key, process.env[key]]));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-account-cmd-"));
   process.env.RBOX_HOME = home;
   calls = [];
@@ -65,10 +69,10 @@ afterEach(async () => {
   (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origAbortSignalTimeout;
   console.log = origLog;
   process.stdout.write = origStdout;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_API;
-  delete process.env.RBOX_DEVICE_ID;
-  delete process.env.RBOX_HOME;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(home, { recursive: true, force: true });
 });
 

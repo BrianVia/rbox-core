@@ -1,24 +1,29 @@
-import { afterAll, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
-import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher } from "./ignore.js";
+import { realHashFileForTests, overrideHashFileForTests } from "./hash.js";
+import { applyWatchEvents, scanManifest } from "./manifest.js";
 
 type Mutation = (abs: string) => Promise<void>;
 let mutation: Mutation | undefined;
+let resetHashFile: (() => void) | undefined;
 
-mock.module("./hash.js", () => ({
-  hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
-  hashFile: async (abs: string): Promise<string> => {
+beforeEach(() => {
+  resetHashFile = overrideHashFileForTests(async (abs: string, size?: number): Promise<string> => {
     const run = mutation;
     mutation = undefined;
     if (run) await run(abs);
-    return createHash("sha256").update(await fs.readFile(abs)).digest("hex");
-  },
-}));
+    return realHashFileForTests(abs, size);
+  });
+});
 
-const { applyWatchEvents, scanManifest } = await import("./manifest.js");
+afterEach(() => {
+  mutation = undefined;
+  resetHashFile?.();
+  resetHashFile = undefined;
+});
 
 const roots: string[] = [];
 afterAll(async () => {

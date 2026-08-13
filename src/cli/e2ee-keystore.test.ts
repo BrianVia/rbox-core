@@ -6,12 +6,15 @@ import { enrolledDeviceId, forgetRecoveryKey, hasDevice, loadDevice, loadRecover
 import { bootstrapAccount, generateWorkspaceKek, toB64url } from "../engine/e2ee/index.js";
 
 let tmp: string;
+let savedRboxHome: string | undefined;
 beforeAll(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ks-"));
   process.env.RBOX_HOME = tmp;
 });
 afterAll(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
