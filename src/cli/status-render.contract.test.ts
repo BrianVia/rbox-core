@@ -197,7 +197,8 @@ test("verbose watcher trust remains supplementary to stronger conditions", () =>
     activity: { at: AT, outOfStorage: { at: AT, kind: "storage" } },
   });
   const lines = renderStatusVerbose(projection);
-  expect(lines.some((line) => line.includes("watcher trust:") && line.includes("fused"))).toBe(true);
+  // Design 237 §4.3: the fused copy is cause-neutral and no longer says "fused".
+  expect(lines.some((line) => line.includes("watcher trust:") && line.includes("reliability reduced"))).toBe(true);
   expect(lines.some((line) => line.includes("storage"))).toBe(true);
 });
 
