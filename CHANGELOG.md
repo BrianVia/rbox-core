@@ -15,6 +15,9 @@ All notable changes to rbox are recorded here. The format follows
 - Leftover `AUTO_MERGE`, `MERGE_MSG`, and `REBASE_HEAD` files from concluded
   Git operations no longer strand followers; real in-progress markers still
   defer, and linked-worktree diagnostics name the responsible worktree.
+- Watcher overflow protection now counts first-drop-anchored 5-second episodes,
+  rather than counting every callback in an operating-system overflow burst;
+  `RBOX_WATCHER_RETRUST_M` therefore measures episodes, not callbacks.
 
 ## [2.0.0-beta.2] - 2026-08-12
 

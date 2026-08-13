@@ -36,6 +36,14 @@ describe("isTransientNetworkError — real Bun fault shapes", () => {
     expect(isTransientNetworkError(Object.assign(new Error("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused" }))).toBe(true);
   });
 
+  test("Bun FailedToOpenSocket is transient only by exact code, including a wrapped cause", () => {
+    const fault = Object.assign(new Error("socket open failed"), { code: "FailedToOpenSocket" });
+    expect(isTransientNetworkError(fault)).toBe(true);
+    expect(isTransientNetworkError(Object.assign(new Error("outer failure"), { cause: fault }))).toBe(true);
+    expect(isTransientNetworkError(new Error("FailedToOpenSocket"))).toBe(false);
+    expect(isTransientNetworkError(new Error("malformed URL caused FailedToOpenSocket"))).toBe(false);
+  });
+
   test("our request-deadline abort (DOMException TimeoutError) is transient", () => {
     expect(isTransientNetworkError(new DOMException("The operation timed out.", "TimeoutError"))).toBe(true);
   });

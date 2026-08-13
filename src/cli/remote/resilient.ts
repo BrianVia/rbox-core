@@ -46,6 +46,7 @@ const TRANSIENT_CODES = new Set([
   "EADDRNOTAVAIL",
   "ConnectionRefused",
   "ConnectionClosed",
+  "FailedToOpenSocket",
   "ERR_SOCKET_CONNECTION_CLOSED",
   "UND_ERR_SOCKET",
   "UND_ERR_CONNECT_TIMEOUT",

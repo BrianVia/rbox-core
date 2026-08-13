@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BUILTIN_IGNORE, buildIgnoreMatcher, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneGlobs } from "./ignore.js";
+import { BUILTIN_IGNORE, buildIgnoreMatcher, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneCoverageComplete, nativePruneGlobs } from "./ignore.js";
 import { applyWatchEvents, scanManifest } from "./manifest.js";
 
 const exec = promisify(execFile);
@@ -158,6 +158,19 @@ describe("nativePruneGlobs — coarse native watcher prune, negation-aware (desi
       expect(prunes(g, "node_modules")).toBe(true);
     } finally {
       await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("semantic coverage rejects root and nested ALWAYS_NATIVE_PRUNE re-inclusions", async () => {
+    for (const rule of ["!node_modules/", "!src/node_modules/", "!src/node_modules/keep.js"]) {
+      const d = await mkroot(`${rule}\n`);
+      try {
+        const admission = nativePruneGlobs(d);
+        expect(prunes(admission, "node_modules")).toBe(true);
+        expect(nativePruneCoverageComplete(d, admission, buildIgnoreMatcher(d))).toBe(false);
+      } finally {
+        await fs.rm(d, { recursive: true, force: true });
+      }
     }
   });
 

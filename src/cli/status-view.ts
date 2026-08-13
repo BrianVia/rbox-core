@@ -671,7 +671,7 @@ function planQuotaLine(attention: PlanQuotaAttention): string | undefined {
 export function watcherTrustLine(trust: WatcherTrust): string {
   return trust === "suspect"
     ? "watcher trust suspect — pulls may scan while trust is rebuilt"
-    : "watcher trust fused — restart rbox to restore reactive pulls";
+    : "watcher reliability reduced — syncing continues by scan; restarting rbox restores reactive sync.";
 }
 
 function lockingAttentionLine(locking: LockingHealth): string | undefined {

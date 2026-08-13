@@ -8,6 +8,9 @@ const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (
 export const retrustEnabled = () => process.env.RBOX_WATCHER_RETRUST !== "0";
 // Soak-tunable (design 104 §Constants): W / M / K, floored at 1 (envInt clamps).
 export const RETRUST_DROP_WINDOW_MS = envInt("RBOX_WATCHER_RETRUST_W_MS", 10 * 60_000, 1, Number.MAX_SAFE_INTEGER);
+export const RETRUST_EPISODE_COALESCE_MS = 5_000;
+// M keeps its design-104 name/env surface, but design 237 deliberately changes
+// its unit from raw error callbacks to first-drop-anchored overflow episodes.
 export const RETRUST_FUSE_DROPS = envInt("RBOX_WATCHER_RETRUST_M", 6, 1, Number.MAX_SAFE_INTEGER);
 export const RETRUST_HOLD_MAX_MS = SAFETY_SYNC_MAX_MS;
 export const RETRUST_MIN_QUIET_TICKS = envInt("RBOX_WATCHER_RETRUST_K", 3, 1, Number.MAX_SAFE_INTEGER);
@@ -80,6 +83,28 @@ export const worseTrust = (a: TrustState, b: TrustState): TrustState => {
 export function classifyWatcherError(message: string): "transient" | "fatal" {
   const m = message.toLowerCase();
   return m.includes("were dropped") || m.includes("must be re-scanned") ? "transient" : "fatal";
+}
+
+export interface WatcherDropEpisodes {
+  /** First drop of the current half-open coalescing interval. */
+  currentFirstMs?: number;
+  /** First drop of each episode still inside the strict rolling window. */
+  startsMs: readonly number[];
+}
+
+/** Pure design-237 episode arithmetic. `now` is supplied by the daemon's clamped
+ * monotonic clock, so wall-clock jumps cannot stretch or collapse an episode. */
+export function recordWatcherDropEpisode(
+  state: WatcherDropEpisodes,
+  now: number,
+  coalesceMs = RETRUST_EPISODE_COALESCE_MS,
+  windowMs = RETRUST_DROP_WINDOW_MS,
+): WatcherDropEpisodes & { started: boolean } {
+  const startsMs = state.startsMs.filter((ts) => ts > now - windowMs);
+  const first = state.currentFirstMs;
+  const inCurrent = first !== undefined && now >= first && now < first + coalesceMs;
+  if (inCurrent) return { currentFirstMs: first, startsMs, started: false };
+  return { currentFirstMs: now, startsMs: [...startsMs, now], started: true };
 }
 
 export interface Wants {

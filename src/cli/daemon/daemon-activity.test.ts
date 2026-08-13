@@ -2040,8 +2040,9 @@ test("stop during slow watcher admission closes the late watcher and starts no l
 
     const starting = daemon.start();
     await watcherEntered.promise;
-    await daemon.stop();
+    const stopping = daemon.stop();
     releaseWatcher.resolve();
+    await stopping;
     await starting;
     expect(watcherClosed).toBe(true);
     expect(daemon.watcher).toBeUndefined();

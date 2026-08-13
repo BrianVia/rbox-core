@@ -131,14 +131,32 @@ export class GitDiscoveryContinuity {
    * eligibility from the backend the watcher actually selected. */
   async attachRefBackend(input: RefBackendAttachment): Promise<void> {
     const create = this.effects.createRefBackend ?? ((options) => new GitRefWatchRegistry(options));
-    this.registry = create({
+    const previous = this.registry;
+    const candidate = create({
       root: input.root,
       onSignal: input.onSignal,
       onArmed: () => input.onArmed(),
       onFloorChange: () => this.refreshFloor("registry"),
       onLog: input.onLog,
     });
-    await this.registry.upsert(input.initial);
+    if (previous) await previous.close();
+    this.registry = candidate;
+    this.backendFallbackPending = false;
+    try {
+      await candidate.upsert(input.initial);
+    } catch (error) {
+      await candidate.close().catch(() => {});
+      if (this.registry === candidate) this.registry = undefined;
+      throw error;
+    }
+  }
+
+  /** Close the old session's registry without claiming watcher startup failed. */
+  async detachRefBackend(): Promise<void> {
+    const previous = this.registry;
+    this.registry = undefined;
+    await previous?.close();
+    this.refreshFloor("backend-detached");
   }
 
   /** Linux without an eligible ref backend: this owner's claim is the only pin
@@ -159,7 +177,7 @@ export class GitDiscoveryContinuity {
   }
 
   close(): Promise<void> {
-    return this.registry?.close() ?? Promise.resolve();
+    return this.detachRefBackend();
   }
 
   /** Seal the registry horizon a walk is about to run under. Capturing it before

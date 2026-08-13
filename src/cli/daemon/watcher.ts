@@ -47,6 +47,10 @@ export interface WatchOptions {
   onInitialGitRepos?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
   /** Optional local observation sink; never participates in watcher control flow. */
   propagationTrace?: PropagationTrace;
+  /** Exact Parcel native admission chosen by the session owner. */
+  parcelAdmission?: readonly string[];
+  /** Native subscribe resolved. Parcel-only; fires before Git discovery settles. */
+  onArm?: () => void;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -398,12 +402,13 @@ async function startParcel(
     // Coarse native prune (volume optimization): hard-prune dirs + their subtrees,
     // MINUS any the user could re-include under — those fall through to the JS matcher.
     {
-      ignore: nativePruneGlobs(root),
+      ignore: [...(opts.parcelAdmission ?? nativePruneGlobs(root))],
       backend: process.platform === "darwin" ? "fs-events" : "inotify",
     }
   );
 
   try {
+    opts.onArm?.();
     await initialGitReposPromise;
   } catch (e) {
     // Preserve the sequential-walk failure semantics: a discovery failure fails
