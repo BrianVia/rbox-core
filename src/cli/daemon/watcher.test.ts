@@ -118,6 +118,21 @@ async function waitFor(pred: () => boolean, timeoutMs = 12000): Promise<boolean>
 const has = (evs: WatchEvent[], relPath: string, kind?: string) =>
   evs.some((e) => e.relPath === relPath && (kind === undefined || e.kind === kind));
 
+test("Parcel pins the native backend for the host platform", async () => {
+  const child = Bun.spawn([process.execPath, "test", path.join(import.meta.dir, "watcher-backend.fixture.test.ts")], {
+    env: { ...process.env, RBOX_WATCHER_BACKEND_FIXTURE: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect(exitCode).toBe(0);
+  expect(`${stdout}\n${stderr}`).toContain("1 pass");
+});
+
 wtest("delivers a file create as an `add` event with the POSIX-relative path", async () => {
   const root = tmpRoot();
   const { settled } = await watch(root);
