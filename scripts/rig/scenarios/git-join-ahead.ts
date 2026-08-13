@@ -9,13 +9,18 @@ import type { Device } from "../lib/device.js";
 import { createRecorder, errMsg } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
-import { finalizeReport } from "./types.js";
+import { finalizeReport, parsePairToken } from "./types.js";
 import type { SyncState } from "../../../src/cli/sync-state-model.js";
 
 const REPO = "repo";
 const MIXED = "mixed";
 const BEHIND = "behind";
 const A_ONLY = `${REPO}/a-only-untracked.txt`;
+/** A SECOND device identity inside guest B: `RBOX_HOME` relocates credentials,
+ *  keystore and binding registry, so `connect` here enrolls a distinct device
+ *  (design 231 §7.4: multiple devices may legitimately bind the same folder). */
+const SECOND_DEVICE_HOME = "/work/second-device";
+const SECOND_DEVICE_ENV = { RBOX_HOME: SECOND_DEVICE_HOME };
 
 interface RepoRecordView { pending?: unknown; partial?: unknown; deferrals?: { apply?: unknown } }
 interface SyncStateView {
@@ -79,8 +84,8 @@ async function conflictSiblings(device: Device): Promise<string> {
   return (await device.exec(["sh", "-c", `find '${GUEST.workDir}' -path '${GUEST.workDir}/.rbox' -prune -o -name '*.conflict*' -print 2>/dev/null | LC_ALL=C sort`])).stdout.trim();
 }
 
-async function adoptionStatus(device: Device, root: string = GUEST.workDir): Promise<AdoptionStatus> {
-  const result = await device.rbox(["adopt", "status", root, "--json"], { cwd: root });
+async function adoptionStatus(device: Device, root: string = GUEST.workDir, env?: Record<string, string>): Promise<AdoptionStatus> {
+  const result = await device.rbox(["adopt", "status", root, "--json"], { cwd: root, env });
   return JSON.parse(result.stdout) as AdoptionStatus;
 }
 
@@ -206,10 +211,12 @@ printf 'behind local addition\n' > '${repoPath(BEHIND)}/b-local.txt'`]);
       await rec.step("linked-worktree source is refused; its ordinary main clone adopts separately", async () => {
         const ordinaryRoot = `${GUEST.workDir}-ordinary-source`;
         const linkedRoot = `${GUEST.workDir}-linked-source`;
+        const sameDeviceRoot = `${GUEST.workDir}-same-device-source`;
         await ctx.b.exec(["sh", "-c", `set -eu
-rm -rf '${ordinaryRoot}' '${linkedRoot}'
-mkdir -p '${ordinaryRoot}' '${linkedRoot}'
+rm -rf '${ordinaryRoot}' '${linkedRoot}' '${sameDeviceRoot}' '${SECOND_DEVICE_HOME}'
+mkdir -p '${ordinaryRoot}' '${linkedRoot}' '${sameDeviceRoot}' '${SECOND_DEVICE_HOME}'
 git clone -q '${repoPath(REPO)}' '${ordinaryRoot}/${REPO}'
+git clone -q '${repoPath(REPO)}' '${sameDeviceRoot}/${REPO}'
 git -C '${ordinaryRoot}/${REPO}' worktree add -q -B linked-source '${linkedRoot}/${REPO}'`]);
         const linkedHead = (await ctx.b.exec(["git", "-C", `${linkedRoot}/${REPO}`, "rev-parse", "HEAD"])).stdout.trim();
         const refused = await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--adopt", "--remote", ctx.apiUrl], { cwd: linkedRoot, allowFail: true });
@@ -218,9 +225,19 @@ git -C '${ordinaryRoot}/${REPO}' worktree add -q -B linked-source '${linkedRoot}
         rec.assert("linked source HEAD is unchanged", (await ctx.b.exec(["git", "-C", `${linkedRoot}/${REPO}`, "rev-parse", "HEAD"])).stdout.trim() === linkedHead);
         rec.assert("linked source published no journal", (await ctx.b.exec(["test", "-f", `${linkedRoot}/.rbox/adopt/journal.json`], { allowFail: true })).exitCode !== 0);
 
-        const ordinary = await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--adopt", "--remote", ctx.apiUrl], { cwd: ordinaryRoot, allowFail: true });
+        // Design 231 §7.4: the SAME (workspace, device) pair at a second root is an
+        // ambiguous copy, whatever the source shape — B is already bound at /work/ws.
+        const duplicate = await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--adopt", "--remote", ctx.apiUrl], { cwd: sameDeviceRoot, allowFail: true });
+        rec.assert("same-device second-root invocation refused", duplicate.exitCode !== 0, `${duplicate.stdout}\n${duplicate.stderr}`.slice(0, 600));
+        rec.assert("ambiguous-binding refusal message is exact", `${duplicate.stdout}\n${duplicate.stderr}`.includes(`the same workspace and device binding also exists at ${GUEST.workDir}`), `${duplicate.stdout}\n${duplicate.stderr}`.slice(0, 600));
+
+        // A DIFFERENT device may bind the same remote workspace, so the ordinary
+        // clone adopts under a second identity enrolled in the same guest.
+        const pairToken = parsePairToken((await ctx.a.rbox(["pair"])).stdout);
+        await ctx.b.rbox(["connect", pairToken, "--remote", ctx.apiUrl], { env: SECOND_DEVICE_ENV, redact: [pairToken] });
+        const ordinary = await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--adopt", "--remote", ctx.apiUrl], { cwd: ordinaryRoot, env: SECOND_DEVICE_ENV, allowFail: true });
         rec.assert("self-contained main-clone invocation adopts normally", ordinary.exitCode === 0, `${ordinary.stdout}\n${ordinary.stderr}`.slice(0, 600));
-        if (ordinary.exitCode === 0) rec.assert("ordinary source adoption completes", (await adoptionStatus(ctx.b, ordinaryRoot)).phase === "complete");
+        if (ordinary.exitCode === 0) rec.assert("ordinary source adoption completes", (await adoptionStatus(ctx.b, ordinaryRoot, SECOND_DEVICE_ENV)).phase === "complete");
       });
 
       await teardownAccount(ctx, rec);
