@@ -7,11 +7,10 @@
  * reported a clean tree and no operation in progress, so the refusal named a
  * state the user could neither finish nor abort — unactionable by construction.
  *
- * The fix reclassifies MERGE_MSG and AUTO_MERGE as `breadcrumb` in
+ * The fix reclassifies MERGE_MSG, AUTO_MERGE, and REBASE_HEAD as `breadcrumb` in
  * OP_STATE_CLASSIFICATION so `hasInProgressOpState` matches git's own
  * `wt_status_get_state` definition (MERGE_HEAD / CHERRY_PICK_HEAD /
- * REVERT_HEAD / rebase-merge / rebase-apply / sequencer). REBASE_HEAD stays
- * in-progress.
+ * REVERT_HEAD / rebase-merge / rebase-apply / sequencer).
  *
  * The scenario proves BOTH directions on one wedge:
  *
@@ -51,6 +50,9 @@ import { finalizeReport } from "./types.js";
 const REPO = "repo-stale-opstate";
 const repoPath = `${GUEST.workDir}/${REPO}`;
 const gitDir = `${repoPath}/.git`;
+const LINKED_REPO = `${REPO}-linked`;
+const linkedRepoPath = `${GUEST.workDir}/${LINKED_REPO}`;
+const PREVIOUS_FINGERPRINT_VERSION = "1a6868ddc0f4ec0b09cf50df11e3584fbfdd24aa3677569897a081b47f231baa";
 /** Guest-local holding pens for git's own op-state bytes, captured mid-merge. */
 const FOSSIL = "/tmp/rig-stale-merge-msg";
 const FOSSIL_AUTO = "/tmp/rig-stale-auto-merge";
@@ -136,9 +138,9 @@ interface ResolveJson {
   sequence?: number;
 }
 
-async function readRecord(device: Device): Promise<RepoRecordView | undefined> {
+async function readRecord(device: Device, rel = REPO): Promise<RepoRecordView | undefined> {
   const raw = JSON.parse(await device.readFile(`${GUEST.workDir}/.rbox/state.json`)) as SyncStateView & { syncState?: SyncStateView };
-  return (raw.repoRecords ? raw : raw.syncState ?? raw).repoRecords?.[REPO];
+  return (raw.repoRecords ? raw : raw.syncState ?? raw).repoRecords?.[rel];
 }
 
 async function git(device: Device, args: string[], allowFail = false) {
@@ -147,6 +149,11 @@ async function git(device: Device, args: string[], allowFail = false) {
 
 async function head(device: Device): Promise<string> {
   const r = await git(device, ["rev-parse", "HEAD"], true);
+  return r.exitCode === 0 ? r.stdout.trim() : "";
+}
+
+async function headAt(device: Device, dir: string): Promise<string> {
+  const r = await device.exec(["git", "-C", dir, "rev-parse", "HEAD"], { allowFail: true });
   return r.exitCode === 0 ? r.stdout.trim() : "";
 }
 
@@ -227,6 +234,43 @@ export const gitStaleOpstate: Scenario = {
       const headX = await head(ctx.a);
       rec.assert("baseline: B materialized A's merged history", (await head(ctx.b)) === headX,
         `A=${headX.slice(0, 12)} B=${(await head(ctx.b)).slice(0, 12)}`);
+
+      // ── Linked-worktree REBASE_HEAD + upgrade convergence ────────────────
+      await rec.step("[A] publish a detached linked-worktree lane", async () => {
+        await git(ctx.a, ["worktree", "add", "--detach", linkedRepoPath, "HEAD"]);
+        await ctx.a.rbox(["push"], { cwd: GUEST.workDir, env: { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY } });
+        await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
+      });
+      await rec.step("[B] advance the detached linked-worktree lane", async () => {
+        await ctx.b.exec(["sh", "-c", detScript(`cd '${linkedRepoPath}'\nprintf 'linked advance\\n' > linked.txt\nD 2026-02-20; git add linked.txt && git commit -q -m 'linked advance'`)]);
+        await ctx.b.rbox(["push"], { cwd: GUEST.workDir, env: { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY } });
+      });
+      const linkedGitDir = (await ctx.a.exec(["git", "-C", linkedRepoPath, "rev-parse", "--absolute-git-dir"])).stdout.trim();
+      await rec.step("[A] persist the old-table REBASE_HEAD wedge", async () => {
+        await ctx.a.writeFile(`${linkedGitDir}/REBASE_HEAD`, `${await headAt(ctx.a, linkedRepoPath)}\n`);
+        await ctx.a.mkdirp(`${linkedGitDir}/rebase-merge`);
+        await ctx.a.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY }, allowFail: true });
+      });
+      rec.assert("linked worktree: corroborated rebase state creates a durable local-operation attempt",
+        (await readRecord(ctx.a, LINKED_REPO))?.deferrals?.apply?.reason === "local-operation",
+        JSON.stringify(await readRecord(ctx.a, LINKED_REPO)));
+      await rec.step("[A] conclude the operation but retain REBASE_HEAD and a schema-7 attempt", async () => {
+        await ctx.a.exec(["rmdir", `${linkedGitDir}/rebase-merge`]);
+        const statePath = `${GUEST.workDir}/.rbox/state.json`;
+        const script = `const p=${JSON.stringify(statePath)};const s=JSON.parse(await Bun.file(p).text());const m=s.repoRecords?s:s.syncState;if(!m?.repoRecords?.[${JSON.stringify(LINKED_REPO)}]?.attempt)throw new Error('linked held attempt missing');m.repoRecords[${JSON.stringify(LINKED_REPO)}].attempt.fingerprintVersion=${JSON.stringify(PREVIOUS_FINGERPRINT_VERSION)};await Bun.write(p,JSON.stringify(s));`;
+        await ctx.a.exec(["bun", "-e", script]);
+      });
+      const rebaseHeadBeforeUpgrade = await ctx.a.readFile(`${linkedGitDir}/REBASE_HEAD`);
+      await rec.step("[A] schema-8 binary misses the old held skip and self-heals", async () => {
+        await ctx.a.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
+      });
+      rec.assert("upgrade: REBASE_HEAD was untouched between old attempt and schema-8 pull",
+        rebaseHeadBeforeUpgrade.trim() !== "", JSON.stringify(rebaseHeadBeforeUpgrade.trim()));
+      rec.assert("upgrade: linked lane converged and the concluded-op fossil was conformed away",
+        (await readRecord(ctx.a, LINKED_REPO))?.pending === undefined
+          && (await headAt(ctx.a, linkedRepoPath)) === (await headAt(ctx.b, linkedRepoPath))
+          && !await present(ctx.a, `${linkedGitDir}/REBASE_HEAD`),
+        JSON.stringify(await readRecord(ctx.a, LINKED_REPO)));
 
       // ── Divergence: both sides changed, A's history subsumes the section B
       //    publishes (the shape keep-mine exists to resolve). ────────────────

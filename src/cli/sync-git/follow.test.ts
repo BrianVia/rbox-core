@@ -25,6 +25,7 @@ import {
   type Manifest,
 } from "../../engine/index.js";
 import { keepPinRef, readKeepPinOrigins } from "../../engine/git/keep-pins.js";
+import { hasInProgressOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { repoCtx } from "../../engine/git/shared.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
@@ -34,6 +35,7 @@ import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections } from "./apply.js";
 import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
 import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
+import { opStateDetailToken } from "./follow-classify.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
 import { GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -247,6 +249,39 @@ async function applyIncoming(state: SyncState, incoming: GitSection, oracle: App
     ...extra,
   });
   return { outcome, logs };
+}
+
+async function convertReceiverToLinkedWorktree(): Promise<Awaited<ReturnType<typeof repoCtx>>> {
+  const primary = path.join(tmp, "receiver-primary");
+  await fs.rename(receiver, primary);
+  await git(primary, "checkout", "-q", "--detach");
+  await git(primary, "worktree", "add", "-q", receiver, "main");
+  return repoCtx(receiver);
+}
+
+async function rebaseClassifierState(repoDir: string): Promise<boolean> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) throw new Error("rebase fixture context missing");
+  const snapshot = await readOpStateSnapshot(ctx.gitDir, async (file) => hashBytes(await fs.readFile(file)));
+  return hasInProgressOpState(snapshot);
+}
+
+async function initConflictingRebase(repoDir: string): Promise<void> {
+  await fs.mkdir(repoDir, { recursive: true });
+  await git(repoDir, "init", "-qb", "main");
+  await git(repoDir, "config", "user.email", "follow@example.invalid");
+  await git(repoDir, "config", "user.name", "follow");
+  await fs.writeFile(path.join(repoDir, "conflict.txt"), "base\n");
+  await git(repoDir, "add", "conflict.txt");
+  await git(repoDir, "commit", "-qm", "base");
+  await git(repoDir, "checkout", "-qb", "topic");
+  await fs.writeFile(path.join(repoDir, "conflict.txt"), "topic\n");
+  await git(repoDir, "commit", "-qam", "topic");
+  await git(repoDir, "checkout", "-q", "main");
+  await fs.writeFile(path.join(repoDir, "conflict.txt"), "main\n");
+  await git(repoDir, "commit", "-qam", "main");
+  await git(repoDir, "checkout", "-q", "topic");
+  await gitExec(["-C", repoDir, "rebase", "main"]).catch(() => undefined);
 }
 
 async function landOutcome(state: SyncState, outcome: Awaited<ReturnType<typeof applyGitSections>>, sourceGlobalSeq: number): Promise<SyncState> {
@@ -657,25 +692,112 @@ const inProgressFiles = OP_STATE_FILES.filter((rel) => OP_STATE_CLASSIFICATION[r
 test("design 126 classification map covers every op-state root exactly", () => {
   expect(Object.keys(OP_STATE_CLASSIFICATION).sort()).toEqual([...OP_STATE_FILES, ...OP_STATE_DIRS].sort());
   // Pinned by NAME, not by count: in-progress is exactly git's own wt_status set.
-  // MERGE_MSG/AUTO_MERGE are breadcrumbs (fossils of concluded operations) —
-  // classifying them in-progress stranded a customer repo for seven days.
-  expect(inProgressFiles).toEqual(["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]);
+  // MERGE_MSG/AUTO_MERGE/REBASE_HEAD are breadcrumbs (fossils of concluded
+  // operations) — classifying them in-progress has stranded customer repos.
+  expect(inProgressFiles).toEqual(["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]);
   expect(OP_STATE_FILES.filter((rel) => OP_STATE_CLASSIFICATION[rel] === "breadcrumb"))
-    .toEqual(["ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE"]);
+    .toEqual(["REBASE_HEAD", "ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE"]);
   expect(OP_STATE_DIRS.every((dir) => OP_STATE_CLASSIFICATION[dir] === "in-progress")).toBe(true);
 });
 
-// The ORIG_HEAD waiver's act preserves the discarded value as a recovery ref, so
-// it is ORIG_HEAD-only. Reclassifying MERGE_MSG/AUTO_MERGE as breadcrumbs changed
-// the in-progress PREDICATE, not this lane: a mismatch at either still defers, and
-// must say which root actually differs rather than blaming ORIG_HEAD.
-test("a MERGE_MSG mismatch still defers, with its own truthful detail", async () => {
-  const { state, incoming } = await breadcrumbBaseAndIncoming();
+test("a MERGE_MSG mismatch follows and checkout conformance removes the fossil", async () => {
+  const { c2, state, incoming } = await breadcrumbBaseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${c2}\n`);
   await fs.writeFile(path.join(receiver, ".git", "MERGE_MSG"), "receiver-only draft\n");
   const applied = await applyIncoming(state, incoming, matchingOracle);
-  expect(applied.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
-  expect(applied.logs.some((line) => line.includes("operation state differs at MERGE_MSG"))).toBe(true);
+  expect(applied.outcome.deferrals?.repo?.apply).toBeUndefined();
+  await expect(fs.access(path.join(receiver, ".git", "MERGE_MSG"))).rejects.toThrow();
   expect(applied.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("op-state detail tokens are segment-built and never expose absolute gitdirs", () => {
+  const commonDir = "/private/customer/repo/.git";
+  expect(opStateDetailToken({
+    repoDir: "/private/customer/linked",
+    kind: "pointer",
+    gitDir: path.join(commonDir, "worktrees", "linked-name"),
+    commonDir,
+  }, "REBASE_HEAD")).toBe("worktrees/linked-name/REBASE_HEAD");
+  expect(opStateDetailToken({
+    repoDir: "/private/customer/repo",
+    kind: "dir",
+    gitDir: commonDir,
+    commonDir,
+  }, "AUTO_MERGE")).toBe("AUTO_MERGE");
+});
+
+test("stale REBASE_HEAD in a linked worktree follows", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const ctx = await convertReceiverToLinkedWorktree();
+  if (!ctx) throw new Error("linked receiver context missing");
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await fs.writeFile(path.join(ctx.gitDir, "REBASE_HEAD"), `${c1}\n`);
+
+  const applied = await applyIncoming(state, incoming);
+
+  expect(applied.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(applied.logs).toContain("git-sync followed repo");
+  await expect(fs.access(path.join(ctx.gitDir, "REBASE_HEAD"))).rejects.toThrow();
+});
+
+test("linked-worktree fossil plus real MERGE_HEAD defers and names both roots", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const ctx = await convertReceiverToLinkedWorktree();
+  if (!ctx) throw new Error("linked receiver context missing");
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await fs.writeFile(path.join(ctx.gitDir, "REBASE_HEAD"), `${c1}\n`);
+  await fs.writeFile(path.join(ctx.gitDir, "MERGE_HEAD"), `${c1}\n`);
+  const tokenPrefix = `worktrees/${path.basename(ctx.gitDir)}/`;
+
+  const applied = await applyIncoming(state, incoming);
+  const evidence = [
+    ...applied.logs,
+    ...((applied.outcome.attempt?.repo?.blockers ?? []).map((blocker) => blocker.detail ?? "")),
+  ].join("\n");
+
+  expect(applied.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(evidence).toContain(`${tokenPrefix}REBASE_HEAD`);
+  expect(evidence).toContain(`${tokenPrefix}MERGE_HEAD`);
+  expect(evidence).not.toContain(ctx.commonDir);
+});
+
+test("real-git REBASE_HEAD lifecycle follows Git resumability", async () => {
+  const quitRepo = path.join(tmp, "rebase-quit");
+  await initConflictingRebase(quitRepo);
+  expect(await rebaseClassifierState(quitRepo)).toBe(true);
+  await git(quitRepo, "rebase", "--quit");
+  await expect(fs.access(path.join(quitRepo, ".git", "REBASE_HEAD"))).resolves.toBeNull();
+  expect(await rebaseClassifierState(quitRepo)).toBe(false);
+
+  const abortRepo = path.join(tmp, "rebase-abort");
+  await initConflictingRebase(abortRepo);
+  expect(await rebaseClassifierState(abortRepo)).toBe(true);
+  await git(abortRepo, "rebase", "--abort");
+  expect(await rebaseClassifierState(abortRepo)).toBe(false);
+
+  const editRepo = path.join(tmp, "rebase-edit");
+  await fs.mkdir(editRepo, { recursive: true });
+  await git(editRepo, "init", "-qb", "main");
+  await git(editRepo, "config", "user.email", "follow@example.invalid");
+  await git(editRepo, "config", "user.name", "follow");
+  await fs.writeFile(path.join(editRepo, "base.txt"), "base\n");
+  await git(editRepo, "add", "base.txt");
+  await git(editRepo, "commit", "-qm", "base");
+  await git(editRepo, "checkout", "-qb", "topic");
+  await fs.writeFile(path.join(editRepo, "topic.txt"), "topic\n");
+  await git(editRepo, "add", "topic.txt");
+  await git(editRepo, "commit", "-qm", "topic");
+  await git(editRepo, "checkout", "-q", "main");
+  await fs.writeFile(path.join(editRepo, "main.txt"), "main\n");
+  await git(editRepo, "add", "main.txt");
+  await git(editRepo, "commit", "-qm", "main");
+  await git(editRepo, "checkout", "-q", "topic");
+  await exec("git", ["-C", editRepo, "rebase", "-i", "main"], {
+    env: { ...TEST_GIT_ENV, GIT_SEQUENCE_EDITOR: "sed -i '1s/^pick /edit /'" },
+  });
+  expect(await rebaseClassifierState(editRepo)).toBe(true);
+  await exec("git", ["-C", editRepo, "rebase", "--continue"], { env: { ...TEST_GIT_ENV, GIT_EDITOR: "true" } });
+  expect(await rebaseClassifierState(editRepo)).toBe(false);
 });
 
 test("design 126 worktree discriminator is primary or a stable per-gitdir hash", async () => {
@@ -921,6 +1043,52 @@ test("design 126 boundary mismatch first appearing after the initial proof is ne
   expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
 });
 
+test("ORIG_HEAD preservation cannot authorize a boundary where its mismatch disappeared", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming({ incomingAbsent: true });
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => {
+      if (point === "after-index-lock") fsSync.unlinkSync(path.join(receiver, ".git", "ORIG_HEAD"));
+    },
+  });
+
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("a real merge starting at the checkout boundary vetoes a fossil waiver", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const sideWorktree = path.join(tmp, "boundary-conflict-worktree");
+  await git(receiver, "branch", "boundary-conflict", c1);
+  await git(receiver, "worktree", "add", "-q", sideWorktree, "boundary-conflict");
+  await fs.writeFile(path.join(sideWorktree, "tracked.txt"), "boundary conflict\n");
+  await git(sideWorktree, "commit", "-qam", "boundary conflict");
+  const boundaryConflictOid = await git(sideWorktree, "rev-parse", "HEAD");
+  await git(receiver, "worktree", "remove", sideWorktree);
+  await git(receiver, "branch", "-D", "boundary-conflict");
+  await fs.writeFile(path.join(receiver, ".git", "AUTO_MERGE"), `${await git(receiver, "rev-parse", `${c1}^{tree}`)}\n`);
+  let boundaryMergeError = "";
+
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => {
+      if (point !== "after-journal-write") return;
+      try {
+        execFileSync("git", ["-C", receiver, "merge", "--no-edit", "--autostash", boundaryConflictOid], {
+          env: TEST_GIT_ENV,
+          stdio: "ignore",
+        });
+      } catch (error) {
+        // A conflict exit is the real in-progress state this fixture needs.
+        boundaryMergeError = String((error as { stderr?: Buffer }).stderr ?? error);
+      }
+    },
+  });
+
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBeDefined();
+  const mergeHeadPresent = await fs.access(path.join(receiver, ".git", "MERGE_HEAD")).then(() => true, () => false);
+  if (!mergeHeadPresent) throw new Error(`boundary merge did not start: ${boundaryMergeError}`);
+  expect(result.logs.some((line) => line.includes("MERGE_HEAD"))).toBe(true);
+});
+
 test("design 126 pipeline: unrelated manual waivedReasons do not unlock a breadcrumb mismatch", async () => {
   const { state, incoming } = await breadcrumbBaseAndIncoming();
   const ctx = await repoCtx(receiver);
@@ -953,6 +1121,38 @@ test("design 126 pipeline: unrelated manual waivedReasons do not unlock a breadc
   expect(result.reason).toBe("local-operation");
   expect(result.detail).toContain("operation state differs at ORIG_HEAD");
   expect(logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("manual take-theirs with a stale AUTO_MERGE still applies", async () => {
+  const { c1, state, incoming } = await baseAndIncoming("detached");
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  await fs.writeFile(path.join(ctx.gitDir, "AUTO_MERGE"), `${await git(receiver, "rev-parse", `${c1}^{tree}`)}\n`);
+  const result = await followDivergedRepo({
+    workspaceRoot: workspace,
+    relPath: "repo",
+    ctx,
+    base: state.repoRecords!.repo!.base,
+    incoming,
+    store,
+    kek: KEK,
+    oracle: matchingOracle,
+    record: state.repoRecords!.repo,
+    binding: await checkoutJournalBinding(state.stream, state.stateNonce!, ctx),
+    followEnabled: true,
+    capabilityProbe: async () => true,
+    log: () => {},
+    makeIntended: () => ({ record: { sourceSeq: 2, base: incoming }, expectedRepoGen: 1, relPath: "repo" }),
+    manualResolution: {
+      snapshotId: "manual-fossil",
+      waivedReasons: ["local-operation"],
+      protectedOids: [],
+      secondProof: async () => true,
+    },
+  });
+
+  expect(result.status).toBe("followed");
+  await expect(fs.access(path.join(ctx.gitDir, "AUTO_MERGE"))).rejects.toThrow();
 });
 
 test("design 126 crash recovery clears the journal-owned ORIG_HEAD.lock after a mid-op-state death", async () => {
@@ -2005,33 +2205,14 @@ test("local-edits held-skip requires its standing apply deferral", async () => {
   expect(capabilityCalls).toBe(0);
 });
 
-test("unchanged AUTO_MERGE mismatch takes held-skip until its fingerprint changes", async () => {
+test("stale AUTO_MERGE mismatch follows and checkout conformance removes the fossil", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const autoMerge = await git(receiver, "rev-parse", `${c1}^{tree}`);
   await fs.writeFile(path.join(receiver, ".git", "AUTO_MERGE"), `${autoMerge}\n`);
   const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
-  expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
-  expect(first.outcome.attempt?.repo?.blockers).toContainEqual(expect.objectContaining({
-    provenance: "checkout", reason: "local-operation",
-  }));
-  const saved = await landOutcome(state, first.outcome, 2);
-  let capabilityCalls = 0;
-  const retried = await applyIncoming(saved, incoming, matchingOracle, {
-    collectMetrics: true,
-    heldNow: heldNowAfterRacyWindow,
-    capabilityProbe: async () => { capabilityCalls++; return true; },
-  });
-  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(1);
-  expect(capabilityCalls).toBe(0);
-
-  await fs.rm(path.join(receiver, ".git", "AUTO_MERGE"));
-  const changed = await applyIncoming(saved, incoming, matchingOracle, {
-    collectMetrics: true,
-    heldNow: heldNowAfterRacyWindow,
-    capabilityProbe: async () => { capabilityCalls++; return true; },
-  });
-  expect(changed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
-  expect(capabilityCalls).toBeGreaterThan(0);
+  expect(first.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(first.logs).toContain("git-sync followed repo");
+  await expect(fs.access(path.join(receiver, ".git", "AUTO_MERGE"))).rejects.toThrow();
 });
 
 test("design 176 v6: unchanged local-index hold is eligible for held-skip", async () => {

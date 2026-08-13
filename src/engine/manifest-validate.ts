@@ -287,13 +287,13 @@ export type OpStateClassification = "breadcrumb" | "in-progress";
  * and even foresaw the AUTO_MERGE-after-squash false-defer. Nothing is lost:
  * every real operation that writes them also writes a marker above.
  *
- * REBASE_HEAD stays in-progress. Git does not consult it for status either, but
- * unlike the two above it is not left by a concluded operation (git unlinks it
- * on both finish and abort), so it is not a fossil class; design 126 gated its
- * re-review on an actual field strand, and none has been observed. */
+ * REBASE_HEAD is also a breadcrumb. Design 126 deferred that classification
+ * until field evidence existed; a concluded linked-worktree rebase has now
+ * left it behind. Git's resumability authority is the rebase directory, not
+ * this file, so every live rebase still has an in-progress marker above. */
 export const OP_STATE_CLASSIFICATION = {
   MERGE_HEAD: "in-progress",
-  REBASE_HEAD: "in-progress",
+  REBASE_HEAD: "breadcrumb",
   CHERRY_PICK_HEAD: "in-progress",
   REVERT_HEAD: "in-progress",
   ORIG_HEAD: "breadcrumb",
