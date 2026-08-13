@@ -552,3 +552,12 @@ dev-install refuse/warn when the host bun is a canary.
 - 2026-08-12: checking out a branch in a SYNCED repo checkout (FM rbox-core) propagates the branch to every host via git-state sync (correct product behavior) — and the settling echo clobbered uncommitted docs edits on the desktop (known class). Lesson: never flip branches in a fleet-synced checkout for a build experiment; build from a local worktree instead.
 - 2026-08-12: FM services the Development workspace as MULTIPLE folder bindings, each paying the full pull machinery serially per cycle (12s each → 22s+ apply spans in round-6). The per-binding pull tables (design 235 Phase A) now expose this; binding serialization is a named Phase-B consideration.
 - 2026-08-13: shard-5 flake CAUGHT by the forensic dump: `FORENSIC pull-line-missing lines=[]` — the harness daemon's pump is a silent NO-OP in the failing cluster (zero log lines, not a wrong branch). Co-failures are the design-206 watcher-FUSE tests, so the lead is a module-level/global latch (fuse/matcher-provenance/halt) leaking across tests under CI interleaving and making later pulls refuse silently. Local repros stay green (5x). Next: find the module-level state the 206 fuse tests mutate without restore.
+
+## pull-attribution differential test: second flake dimension (2026-08-13)
+
+`receiver attribution is observation-only through the live state load/save
+path` failed on PR #651 shard 2 (actions/error/disk toEqual mismatch), passes
+locally on the same commit. Same test family as the stateMtimeMs 1ms race
+masked in #648 — the differential harness appears to have more than one
+timing-sensitive field. If it flakes a third time, stop masking fields and
+make the differential compare a canonicalized projection instead.
