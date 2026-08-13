@@ -891,7 +891,8 @@ test("review M3: typed mass-delete episode identity survives changing count text
 
 test("a committed push records the last-sync trail; a no-op push does not", async () => {
   const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
+  const logs: string[] = [];
+  const daemon = await makeDaemon(remote, "push-residuals", { log: (line) => logs.push(line) });
   await fs.writeFile(path.join(root, "a.txt"), "hello");
   daemon.local.head = await scanManifest(root);
 
@@ -901,6 +902,11 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   const after = await loadActivity(root);
   expect(after?.lastPush).toEqual({ at: expect.any(String), files: 1, sequence: 1 });
   expect(after?.active).toBeUndefined(); // live progress never outlives its op
+  const pushSummary = logs.find((line) => line.startsWith("rbox push "))!;
+  expect(pushSummary).toContain("prologue_ms=");
+  expect(pushSummary).toContain("settle_ms=");
+  expect(pushSummary).toContain("candidate_projection_ms=");
+  expect(pushSummary).toContain("delta_base_ms=");
 
   daemon.want.push = true; // steady state: no changes → no-op → trail unchanged
   await daemon.pump();

@@ -31,6 +31,7 @@ export const SERVER_SYNC_PHASE_NAMES = [
   "latest", "state-load", "scan", "git-plan", "address", "encrypt", "missing", "upload",
   "commit", "download", "decrypt", "apply", "git-apply", "cache-save", "state-save",
 ] as const;
+const SERVER_SYNC_PHASE_GAP_ENDPOINTS = new Set<string>(["start", "validate", "reconcile", ...SERVER_SYNC_PHASE_NAMES]);
 
 /** Runtime duplicate of the client contract. A test imports both copies and prevents drift.
  * Field declaration order IS the positional AE doubles order and feeds normalizeSample
@@ -98,6 +99,8 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
     optionalNumbers: [
       { field: "gitApplyMaxRepoMs", ...MS },
       { field: "gitApplySkippedHeld", ...COUNT },
+      { field: "prologue_ms", ...MS },
+      { field: "settle_ms", ...MS },
     ],
     enums: [{ field: "op", values: ["pull", "push"] }],
     numericRecords: [{ field: "phases", keys: SERVER_SYNC_PHASE_NAMES, domain: MS }],
@@ -145,7 +148,7 @@ const ALLOWED_SAMPLE_KEYS = new Map<ClientTelemetryKind, ReadonlySet<string>>(
 );
 
 export interface NormalizedClientMetric {
-  readonly index: `client.${ClientTelemetryKind}` | "client.telemetry.drops";
+  readonly index: `client.${ClientTelemetryKind}` | "client.sync_phase.gap" | "client.telemetry.drops";
   readonly blobs: readonly string[];
   readonly doubles: readonly number[];
 }
@@ -175,7 +178,15 @@ function corpusBucket(fileCount: number): (typeof SERVER_CORPUS_BUCKETS)[number]
   return SERVER_CORPUS_BUCKETS.find((entry) => entry.maxFileCount === null || fileCount <= entry.maxFileCount)!.bucket;
 }
 
-function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClientMetric } | { ok: false; reason: DropReason } {
+function syncPhaseGapKey(key: string): boolean {
+  if (key === "tailMs") return true;
+  if (!key.startsWith("gap:")) return false;
+  const [from, to, extra] = key.slice(4).split("→");
+  return extra === undefined && from !== undefined && to !== undefined
+    && SERVER_SYNC_PHASE_GAP_ENDPOINTS.has(from) && SERVER_SYNC_PHASE_GAP_ENDPOINTS.has(to);
+}
+
+function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClientMetric; extras?: readonly NormalizedClientMetric[] } | { ok: false; reason: DropReason } {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || typeof value.kind !== "string"
     || !isClientTelemetryKind(value.kind)) {
@@ -200,11 +211,18 @@ function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClient
     canonicalEnums.push(canonical);
   }
   const recordNumbers: number[] = [];
+  const syncPhaseGaps: NormalizedClientMetric[] = [];
   for (const field of schema.numericRecords ?? []) {
     const raw = sample[field.field];
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "bad_number" };
     const allowed = new Set(field.keys);
-    if (!hasOnlyKeys(raw, allowed)) return { ok: false, reason: "unknown_field" };
+    const extraEntries = Object.entries(raw).filter(([key]) => !allowed.has(key));
+    if (extraEntries.length > 0 && (kind !== "sync_phase" || sample.op !== "push" || field.field !== "phases")) return { ok: false, reason: "unknown_field" };
+    for (const [key, item] of extraEntries) {
+      if (!syncPhaseGapKey(key)) return { ok: false, reason: "unknown_field" };
+      if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
+      syncPhaseGaps.push({ index: "client.sync_phase.gap", blobs: [String(sample.op), key], doubles: [item] });
+    }
     for (const key of field.keys) {
       const item = raw[key];
       if (item === undefined) recordNumbers.push(0);
@@ -238,7 +256,7 @@ function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClient
       index: "client.sync_phase",
       blobs: canonicalEnums,
       doubles: [...wireNumbers, ...recordNumbers, ...optionalNumbers],
-    } };
+    }, extras: syncPhaseGaps };
   }
   return { ok: true, metric: { index: `client.${kind}`, blobs: canonicalEnums, doubles: wireNumbers } };
 }
@@ -297,6 +315,7 @@ export async function ingestTelemetry(req: Request, env: Env, p: Principal): Pro
       continue;
     }
     emitClientMetric(env, normalized.metric);
+    for (const metric of normalized.extras ?? []) emitClientMetric(env, metric);
     accepted++;
   }
   for (const [reason, count] of reasons) emitDrop(env, reason, count);

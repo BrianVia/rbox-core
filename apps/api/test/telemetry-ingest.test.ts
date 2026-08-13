@@ -98,7 +98,7 @@ describe("POST /v1/telemetry", () => {
       { kind: "safety_event", eventType: "scan_fault", count: 3 },
       { kind: "git_capture", signalPushes: 5, candidatePushes: 6, scanPushes: 7 },
       { kind: "ws_health", windowMs: 120_000, wsConnectedMs: 110_000, wsReconnects: 1, wsHalfOpenDetected: 2, backstopAttempts: 3, backstopAppliedPulls: 4, cursorAppliedPulls: 0, notifyAppliedPulls: 5, notifyLatencyCount: 6, notifyLatencySumMs: 7_000, notifyLatencyMaxMs: 2_000 },
-      { kind: "sync_phase", op: "pull", wallMs: 99, phases: { latest: 3, "git-apply": 8 }, gitApplyMaxRepoMs: 7, gitApplySkippedHeld: 2 },
+      { kind: "sync_phase", op: "push", wallMs: 99, phases: { latest: 3, "git-apply": 8, "gap:state-load→git-plan": 9, tailMs: 10 }, gitApplyMaxRepoMs: 7, gitApplySkippedHeld: 2, prologue_ms: 11, settle_ms: 12 },
     ] }), testEnv(points), devicePrincipal(a));
     expect(res.status).toBe(202);
     expect(await res.json()).toEqual({ accepted: 8, dropped: 0 });
@@ -110,7 +110,9 @@ describe("POST /v1/telemetry", () => {
       { indexes: ["client.safety_event"], blobs: ["client.safety_event", "scan_fault"], doubles: [3] },
       { indexes: ["client.git_capture"], blobs: ["client.git_capture"], doubles: [5, 6, 7] },
       { indexes: ["client.ws_health"], blobs: ["client.ws_health"], doubles: [120_000, 110_000, 1, 2, 3, 4, 0, 5, 6, 7_000, 2_000] },
-      { indexes: ["client.sync_phase"], blobs: ["client.sync_phase", "pull"], doubles: [99, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 7, 2] },
+      { indexes: ["client.sync_phase"], blobs: ["client.sync_phase", "push"], doubles: [99, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 7, 2, 11, 12] },
+      { indexes: ["client.sync_phase.gap"], blobs: ["client.sync_phase.gap", "push", "gap:state-load→git-plan"], doubles: [9] },
+      { indexes: ["client.sync_phase.gap"], blobs: ["client.sync_phase.gap", "push", "tailMs"], doubles: [10] },
     ]);
   });
 

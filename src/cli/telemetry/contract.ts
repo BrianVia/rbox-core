@@ -94,6 +94,8 @@ export const TELEMETRY_SAMPLE_SCHEMAS = {
     optionalNumbers: {
       gitApplyMaxRepoMs: MS_DOMAIN,
       gitApplySkippedHeld: COUNT_DOMAIN,
+      prologue_ms: MS_DOMAIN,
+      settle_ms: MS_DOMAIN,
     },
     enums: { op: SYNC_PHASE_OPS },
     numericRecords: { phases: { keys: SYNC_PHASE_NAMES, domain: MS_DOMAIN } },
@@ -161,6 +163,8 @@ export interface SyncPhaseSample {
   phases: Record<string, number>;
   gitApplyMaxRepoMs?: number;
   gitApplySkippedHeld?: number;
+  prologue_ms?: number;
+  settle_ms?: number;
 }
 export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | GitCaptureSample | WsHealthSample | SyncPhaseSample;
 export interface TelemetryEnvelope { v: 1; samples: TelemetrySample[] }
