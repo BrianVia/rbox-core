@@ -278,3 +278,28 @@ policy.ts; the watcher-session replace operation is the single owner of
 subscription lifecycle (shared by boot and re-arm — possibly a small new
 module, one owner either way); the attempt witness is in-memory only (a
 restart resets it — correct: restart re-arms by definition).
+
+## 8. Implementation-review amendments (diff review r1, both accepted)
+
+- **Condition 9 runs twice**: post-arm AND once more immediately before
+  publication (re-read disk, recompute F′). After publication the existing
+  `downgradeWatcherIfBackendStale` guard is active again (state no longer
+  fused), so a debounced ignore-event that rebuilds later re-fuses — the
+  batcher window is closed from both sides.
+- **Semantic coverage check in recertification**: F′===F is not enough when
+  the matcher requires coverage the backend structurally cannot deliver
+  (ALWAYS_NATIVE_PRUNE re-inclusion, e.g. `!node_modules/`). Recertification
+  must verify the matcher's required coverage is a subset of the native
+  admission; a structural conflict makes the fuse TERMINAL for this daemon
+  lifetime (correct: no subscription can repair it) with the restart-copy
+  status line.
+- Kill-switch disable synchronously cancels timer + live attempt via an
+  explicit disable hook (not sampling alone).
+- Test hardening: real `.rboxignore` mutation for recert tests; fatal path
+  through the daemon classifier (not direct calls); a real stale-scan race.
+- **Amendment withdrawn (serial confirm r2, simplicity ruling)**: the
+  kill-switch "synchronous disable hook" was engineering for an impossible
+  state — a process environment cannot change after spawn, so there is no
+  enabled→disabled runtime transition to own. The flag is restart-scoped;
+  per-decision sampling (schedule/fire/publish) is the complete contract.
+  The hook and its tests are deleted.

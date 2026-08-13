@@ -118,6 +118,25 @@ async function waitFor(pred: () => boolean, timeoutMs = 12000): Promise<boolean>
 const has = (evs: WatchEvent[], relPath: string, kind?: string) =>
   evs.some((e) => e.relPath === relPath && (kind === undefined || e.kind === kind));
 
+wtest("Parcel reports native arm before awaiting initial Git discovery", async () => {
+  const root = tmpRoot();
+  let release!: () => void;
+  const discoveryBlocked = new Promise<void>((resolve) => { release = resolve; });
+  let armed = false;
+  let returned = false;
+  const starting = startWatcher(root, buildIgnoreMatcher(root), () => {}, {
+    onInitialGitRepos: () => discoveryBlocked,
+    onArm: () => { armed = true; },
+  }).then((watcher) => { returned = true; return watcher; });
+  try {
+    expect(await waitFor(() => armed)).toBe(true);
+    expect(returned).toBe(false);
+  } finally {
+    release();
+  }
+  active = await starting;
+});
+
 wtest("delivers a file create as an `add` event with the POSIX-relative path", async () => {
   const root = tmpRoot();
   const { settled } = await watch(root);

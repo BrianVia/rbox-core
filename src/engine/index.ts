@@ -164,6 +164,7 @@ export {
   isGitRefSignal,
   isGitRefSignalTail,
   nativePruneGlobs,
+  nativePruneCoverageComplete,
   buildIgnoreMatcher,
   effectiveIgnoreRules,
   isIgnoreRuleFile,

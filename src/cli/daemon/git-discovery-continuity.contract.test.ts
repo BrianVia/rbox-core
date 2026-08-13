@@ -324,6 +324,31 @@ test("attaching the ref backend arms the watcher's own start-up discoveries", as
   expect(h.pins).toBe(0);
 });
 
+test("replacement closes the old ref registry before the candidate is armed", async () => {
+  const old = fakeRegistry();
+  const candidate = fakeRegistry();
+  let created = 0;
+  const originalUpsert = candidate.upsert.bind(candidate);
+  candidate.upsert = async (repos) => {
+    expect(old.closed).toBe(true);
+    await originalUpsert(repos);
+  };
+  const continuity = new GitDiscoveryContinuity({
+    platform: "linux",
+    createRefBackend: () => created++ === 0 ? old : candidate,
+    discoverAll: async () => [],
+    discoverUnder: async () => [],
+    pinSafetyFloor: () => {},
+    log: () => {},
+  });
+  const attach = (initial: readonly DiscoveredGitRepo[]) => continuity.attachRefBackend({
+    root: "/workspace", initial, onSignal: () => {}, onArmed: () => {}, onLog: () => {},
+  });
+  await attach([]);
+  await attach([dir("new")]);
+  expect(candidate.calls).toEqual([{ kind: "upsert", repos: ["new"] }]);
+});
+
 test("an abandoned ref backend closes and hands the floor back to the fallback claim", async () => {
   const h = harness();
   await h.continuity.abandonRefBackend();
