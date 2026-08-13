@@ -5,7 +5,13 @@ import path from "node:path";
 import { HashCache, scanManifest } from "../engine/index.js";
 import { classifyWatcherError, nextSafetyDelay, RboxDaemon } from "./daemon.js";
 import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate } from "./daemon/drift-audit.js";
-import { retrustEnabled } from "./daemon/policy.js";
+import {
+  recordWatcherDropEpisode,
+  RETRUST_DROP_WINDOW_MS,
+  RETRUST_EPISODE_COALESCE_MS,
+  retrustEnabled,
+  type WatcherDropEpisodes,
+} from "./daemon/policy.js";
 
 const FLOOR = 60_000;
 const CAP = 300_000;
@@ -55,10 +61,10 @@ test("watcher re-trust defaults ON with the env unset; =0 disables", () => {
   expect(retrustEnabled()).toBe(false);
 });
 
-function daemonHarness(): { daemon: Internals; error(err?: string): void; close(): Promise<void> } {
+function daemonHarness(opts: { monotonicNow?: () => number; log?: (line: string) => void } = {}): { daemon: Internals; error(err?: string): void; close(): Promise<void> } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-retrust-")));
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  const daemon = new RboxDaemon(root, cfg as never, {} as never) as unknown as Internals;
+  const daemon = new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as Internals;
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     onError = opts?.onError;
@@ -100,34 +106,100 @@ test("re-trust requires stable advanced full-tree coverage after the hold", asyn
   } finally { await h.close(); }
 });
 
-test("fuse arithmetic handles M, M-1, and the rolling-window boundary", async () => {
-  const h = daemonHarness();
+function replayEpisodes(drops: readonly number[]): WatcherDropEpisodes {
+  return drops.reduce<WatcherDropEpisodes>(
+    (state, now) => recordWatcherDropEpisode(state, now),
+    { startsMs: [] },
+  );
+}
+
+test("episode arithmetic is first-drop anchored with exact half-open boundaries", () => {
+  expect(replayEpisodes([0, 4_900, 9_800]).startsMs).toEqual([0, 9_800]);
+  expect(replayEpisodes([0, RETRUST_EPISODE_COALESCE_MS - 1, RETRUST_EPISODE_COALESCE_MS]).startsMs)
+    .toEqual([0, RETRUST_EPISODE_COALESCE_MS]);
+
+  const atWindow = recordWatcherDropEpisode(
+    { currentFirstMs: 0, startsMs: [0, 1] },
+    RETRUST_DROP_WINDOW_MS,
+  );
+  expect(atWindow.startsMs).toEqual([1, RETRUST_DROP_WINDOW_MS]);
+});
+
+test("six spaced episodes fuse, while a rapid burst is one episode and its hold is reachable", async () => {
+  let now = 0;
+  const h = daemonHarness({ monotonicNow: () => now });
   try {
     await h.daemon.startLiveWatch();
-    for (let i = 0; i < 5; i++) h.error();
+    for (let i = 0; i < 6; i++) h.error();
     expect(h.daemon.trustState).toBe("suspect");
-    h.daemon.lastTransientDropMs -= h.daemon.recoveryHoldMs;
-    h.daemon.maybeClearWatcherDegradedAfterScan(5, { coverage: "full-tree", errorGenAtStart: 5 });
-    expect(h.daemon.trustState).toBe("trusted");
-    h.error();
-    expect(h.daemon.trustState).toBe("fused");
+    expect(h.daemon.transientDropTimestamps).toEqual([0]);
+    now += h.daemon.recoveryHoldMs;
     h.daemon.maybeClearWatcherDegradedAfterScan(6, { coverage: "full-tree", errorGenAtStart: 6 });
-    expect(h.daemon.trustState).toBe("fused");
+    expect(h.daemon.trustState).toBe("trusted");
   } finally { await h.close(); }
 
-  // ±5s (not ±1ms): the daemon reads its own Date.now() inside error(), so a
-  // 1ms-inside-the-window entry ages out whenever the two clock reads straddle a
-  // millisecond — the offset must exceed scheduling jitter to be deterministic.
-  for (const offset of [-5_000, 0, 5_000]) {
-    const b = daemonHarness();
-    try {
-      await b.daemon.startLiveWatch();
-      const now = Date.now();
-      b.daemon.transientDropTimestamps = Array(5).fill(now - 600_000 + offset);
-      b.error();
-      expect(b.daemon.trustState).toBe(offset > 0 ? "fused" : "suspect");
-    } finally { await b.close(); }
+  now = 0;
+  const spaced = daemonHarness({ monotonicNow: () => now });
+  try {
+    await spaced.daemon.startLiveWatch();
+    for (let i = 0; i < 6; i++) {
+      spaced.error();
+      now += RETRUST_EPISODE_COALESCE_MS;
+    }
+    expect(spaced.daemon.trustState).toBe("fused");
+    spaced.daemon.maybeClearWatcherDegradedAfterScan(6, { coverage: "full-tree", errorGenAtStart: 6 });
+    expect(spaced.daemon.trustState).toBe("fused");
+  } finally { await spaced.close(); }
+});
+
+test("a continuous high-rate storm still reaches six episodes within about 30 seconds", () => {
+  const starts = replayEpisodes(Array.from({ length: 26 }, (_, i) => i * 1_000)).startsMs;
+  expect(starts).toEqual([0, 5_000, 10_000, 15_000, 20_000, 25_000]);
+});
+
+test("field timeline replay mechanically prevents all eleven historical fuses", () => {
+  const fixture = fs.readFileSync(path.join(import.meta.dir, "..", "..", "docs", "design", "data", "237-mac-drop-timeline-20260811-13.txt"), "utf8");
+  const boots: Array<{ callbacks: number[]; fuses: number }> = [];
+  let boot: { callbacks: number[]; fuses: number } | undefined;
+  let previous: { kind: "error" | "drop" | "fuse"; at: number } | undefined;
+  for (const line of fixture.trim().split("\n")) {
+    const at = Date.parse(line.slice(0, 24));
+    if (line.includes("daemon boot")) {
+      boot = { callbacks: [], fuses: 0 };
+      boots.push(boot);
+      previous = undefined;
+    } else if (boot && line.includes("watcher error (transient")) {
+      boot.callbacks.push(at);
+      previous = { kind: "error", at };
+    } else if (boot && line.includes("retrust drop")) {
+      // Replay grammar: a same-timestamp error+drop pair is one callback.
+      if (previous?.kind !== "error" || previous.at !== at) boot.callbacks.push(at);
+      previous = { kind: "drop", at };
+    } else if (boot && line.includes("watcher trust FUSED")) {
+      // Replay grammar: the FUSED line is the sixth callback; no drop line exists.
+      boot.callbacks.push(at);
+      boot.fuses++;
+      previous = { kind: "fuse", at };
+    }
   }
+  expect(boots.map(({ callbacks }) => replayEpisodes(callbacks).startsMs.length))
+    .toEqual([4, 4, 3, 3, 2, 3, 4, 3, 3, 3, 2]);
+  expect(boots.reduce((sum, item) => sum + item.fuses, 0)).toBe(11);
+  const prevented = boots.filter(({ callbacks, fuses }) => fuses > 0 && replayEpisodes(callbacks).startsMs.length < 6).length;
+  expect(prevented).toBe(11);
+});
+
+test("transient-drop diagnostics use the clamped monotonic clock and sample post-error lag", async () => {
+  let now = 10;
+  const lines: string[] = [];
+  const h = daemonHarness({ monotonicNow: () => now, log: (line) => lines.push(line) });
+  try {
+    await h.daemon.startLiveWatch();
+    h.error();
+    now = 17;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(lines).toContain("watcher transient drop diagnostic: monotonicMs=10 eventLoopLagMs=7");
+  } finally { await h.close(); }
 });
 
 test("originUntrusted is omitted when false and survives to a subsequent healthy audit", async () => {
@@ -182,7 +254,8 @@ test("P2 cadence requires suspect liveness and clean coverage, and resets on chu
   try {
     await h.daemon.startLiveWatch();
     h.error();
-    h.daemon.lastTransientDropMs = Date.now(); // keep suspect while clean coverage records P2 evidence
+    // No monotonic time has elapsed: clean coverage records P2 evidence but the
+    // recovery hold still keeps the watcher suspect.
     h.daemon.maybeClearWatcherDegradedAfterScan(1, { coverage: "full-tree", errorGenAtStart: 1 });
     for (let i = 0; i < 3; i++) h.daemon.advanceSafetyCadenceForTick();
     expect(h.daemon.safetyDelay).toBe(FLOOR); // no callback since the drop
@@ -252,7 +325,7 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
     await d.runDriftAuditNow();                 // → contaminated survivor persisted
     expect((await loadDriftAudit(root)).pending[0]!.originUntrusted).toBe(true);
 
-    d.lastTransientDropMs = Date.now() - d.recoveryHoldMs; // hold elapsed
+    d.lastTransientDropMs -= d.recoveryHoldMs; // monotonic hold elapsed
     d.maybeClearWatcherDegradedAfterScan(1, { coverage: "full-tree", errorGenAtStart: 1 }); // re-trust; errorGen stays 1
     expect(d.trustState).toBe("trusted");
     expect(d.watcherHealthy).toBe(true);

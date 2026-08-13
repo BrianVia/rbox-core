@@ -1,0 +1,91 @@
+2026-08-11T23:52:18.975Z daemon boot bootId=2d4c5b685f3952ba8f3225c0d564cfaf pid=56215
+2026-08-11T23:53:09.394Z watcher error (transient overflow)
+2026-08-11T23:53:09.394Z retrust drop
+2026-08-11T23:53:10.627Z retrust drop
+2026-08-11T23:53:17.334Z retrust drop
+2026-08-11T23:55:02.860Z retrust drop
+2026-08-11T23:55:05.049Z retrust drop
+2026-08-11T23:56:13.053Z watcher trust FUSED
+2026-08-12T01:37:10.957Z daemon boot bootId=caa7837c60eaa41343168f568dbdfcd5 pid=2978
+2026-08-12T01:38:03.876Z watcher error (transient overflow)
+2026-08-12T01:38:03.876Z retrust drop
+2026-08-12T01:38:05.774Z retrust drop
+2026-08-12T01:40:01.230Z retrust drop
+2026-08-12T01:40:03.014Z retrust drop
+2026-08-12T01:40:07.917Z retrust drop
+2026-08-12T01:42:01.702Z watcher trust FUSED
+2026-08-12T11:21:19.156Z daemon boot bootId=d2cfe7d7fd968daf15a09bca3bc55c0a pid=1159
+2026-08-12T11:23:48.713Z watcher error (transient overflow)
+2026-08-12T11:23:48.713Z retrust drop
+2026-08-12T11:23:49.466Z retrust drop
+2026-08-12T11:26:04.438Z retrust drop
+2026-08-12T11:26:05.283Z retrust drop
+2026-08-12T11:28:02.437Z retrust drop
+2026-08-12T11:28:03.350Z watcher trust FUSED
+2026-08-12T19:08:04.628Z daemon boot bootId=dbb8ccb38266ed4ebb3015bcb2972d12 pid=68022
+2026-08-12T19:08:54.856Z watcher error (transient overflow)
+2026-08-12T19:08:54.856Z retrust drop
+2026-08-12T19:08:55.798Z retrust drop
+2026-08-12T19:10:46.584Z retrust drop
+2026-08-12T19:10:48.571Z retrust drop
+2026-08-12T19:13:05.586Z retrust drop
+2026-08-12T19:13:06.579Z watcher trust FUSED
+2026-08-12T21:13:33.910Z daemon boot bootId=9699b8668d80da8b3e8363000a5e70a8 pid=24330
+2026-08-12T21:14:02.965Z watcher error (transient overflow)
+2026-08-12T21:14:02.965Z retrust drop
+2026-08-12T21:14:03.851Z retrust drop
+2026-08-12T21:32:41.734Z retrust drop
+2026-08-12T21:32:42.247Z retrust drop
+2026-08-12T21:32:43.295Z retrust drop
+2026-08-12T21:32:44.100Z retrust drop
+2026-08-12T21:33:10.518Z retrust drop
+2026-08-12T21:33:11.654Z watcher trust FUSED
+2026-08-12T21:33:13.512Z daemon boot bootId=5430f832d7872cb2f9c8c45539902b74 pid=34739
+2026-08-12T21:33:51.894Z watcher error (transient overflow)
+2026-08-12T21:33:51.894Z retrust drop
+2026-08-12T21:53:01.057Z retrust drop
+2026-08-12T21:53:01.568Z retrust drop
+2026-08-12T21:53:02.562Z retrust drop
+2026-08-12T21:53:06.409Z retrust drop
+2026-08-12T21:53:07.793Z retrust drop
+2026-08-12T21:53:30.571Z watcher trust FUSED
+2026-08-12T22:11:00.655Z daemon boot bootId=38e0a44b7c9fbcec902940ddbdfe6039 pid=70007
+2026-08-12T22:11:51.594Z watcher error (transient overflow)
+2026-08-12T22:11:51.594Z retrust drop
+2026-08-12T22:11:53.442Z retrust drop
+2026-08-12T22:13:42.472Z retrust drop
+2026-08-12T22:13:43.423Z retrust drop
+2026-08-12T22:16:06.229Z retrust drop
+2026-08-12T22:17:59.275Z watcher trust FUSED
+2026-08-12T23:39:35.181Z daemon boot bootId=3b3c34a4fb64902323e5f7a025ff856d pid=96655
+2026-08-12T23:40:20.877Z watcher error (transient overflow)
+2026-08-12T23:40:20.878Z retrust drop
+2026-08-12T23:40:21.781Z retrust drop
+2026-08-12T23:42:14.768Z retrust drop
+2026-08-12T23:42:15.624Z retrust drop
+2026-08-12T23:44:16.400Z retrust drop
+2026-08-12T23:44:17.201Z watcher trust FUSED
+2026-08-12T23:58:17.626Z daemon boot bootId=439c59e8d0cbd7aaaee17bed49a22c24 pid=29767
+2026-08-12T23:59:03.178Z watcher error (transient overflow)
+2026-08-12T23:59:03.178Z retrust drop
+2026-08-12T23:59:04.018Z retrust drop
+2026-08-13T00:00:39.954Z retrust drop
+2026-08-13T00:00:42.552Z retrust drop
+2026-08-13T00:00:43.800Z retrust drop
+2026-08-13T00:00:45.376Z watcher trust FUSED
+2026-08-13T01:02:17.880Z daemon boot bootId=25c5a7ac4e991dd0e2044a9d4bc7a466 pid=57347
+2026-08-13T01:03:08.300Z watcher error (transient overflow)
+2026-08-13T01:03:08.300Z retrust drop
+2026-08-13T01:03:09.215Z retrust drop
+2026-08-13T01:05:33.936Z retrust drop
+2026-08-13T01:05:34.956Z retrust drop
+2026-08-13T01:07:18.975Z retrust drop
+2026-08-13T01:07:19.959Z watcher trust FUSED
+2026-08-13T11:34:39.018Z daemon boot bootId=2518dcc23c324835dd7aa3dcffaad17f pid=81239
+2026-08-13T11:35:00.813Z watcher error (transient overflow)
+2026-08-13T11:35:00.813Z retrust drop
+2026-08-13T11:35:02.001Z retrust drop
+2026-08-13T11:35:02.875Z retrust drop
+2026-08-13T11:36:50.026Z retrust drop
+2026-08-13T11:36:51.084Z retrust drop
+2026-08-13T11:36:51.874Z watcher trust FUSED
