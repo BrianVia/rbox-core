@@ -18,7 +18,7 @@ import { createScanProbe, loadScanProbe, saveScanProbe } from "../scan-probe.js"
 import { GC_FENCE_RETRY_MS } from "./policy.js";
 import { errCode } from "./logger.js";
 import type { ManifestUpdate } from "./manifest-update.js";
-import type { LineageSnapshot, LocalAuthorityPort, LocalObservationCommitIntent } from "./local-observation-transition.js";
+import type { LineageSnapshot, LocalAuthorityPort, LocalObservationCommitIntent, LocalObservationCommitOutcome } from "./local-observation-transition.js";
 import { sealLocalObservationIdentity } from "./local-observation-transition.js";
 import type {
   CurrentGitTopologyObservation,
@@ -192,6 +192,8 @@ export interface ScanObservationReceipt extends LocalObservationReceiptBase {
   readonly freshManifest: Manifest;
   /** What `MaintainGitDiscoveryContinuity` derived from this same walk. */
   readonly topology: CurrentGitTopologyReceipt;
+  /** Only `advanced` installed this observation into LOCAL authority. */
+  readonly commitDisposition: LocalObservationCommitOutcome;
 }
 
 export interface WatchBatchObservationReceipt extends LocalObservationReceiptBase {
@@ -257,7 +259,7 @@ export class LocalWorkspaceObserver {
     payload: Omit<LocalObservationCommitIntent, "identity">,
     observationId: string,
     lineage: LineageSnapshot,
-  ): void {
+  ): LocalObservationCommitOutcome {
     const receipt = this.effects.authority.commitObservation({
       ...payload,
       identity: sealLocalObservationIdentity(observationId, lineage, payload),
@@ -265,6 +267,7 @@ export class LocalWorkspaceObserver {
     if (receipt.outcome !== "advanced") {
       this.effects.log(`local observation ${observationId} not committed: ${receipt.outcome}`);
     }
+    return receipt.outcome;
   }
 
   /** Install a coherent full-scan result. A path that changed under its deferred
@@ -312,7 +315,7 @@ export class LocalWorkspaceObserver {
       observedUnderMatcherGeneration: observedUnder,
       completeness: (deferred.size === 0 ? "complete" : "deferred") as "complete" | "deferred",
     };
-    this.commit(payload, observationId, lineage);
+    const commitDisposition = this.commit(payload, observationId, lineage);
     if (deferred.size > 0) this.retries.scheduleWriteFinish(deferred);
     if (probe) {
       const summary = probe.summary();
@@ -335,6 +338,7 @@ export class LocalWorkspaceObserver {
       coverage,
       freshManifest: fresh,
       topology,
+      commitDisposition,
       retriesArmed: [...deferred],
       retriesPending: [],
     };

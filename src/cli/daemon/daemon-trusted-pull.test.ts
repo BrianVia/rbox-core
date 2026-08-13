@@ -12,8 +12,12 @@ import { createHash } from "node:crypto";
 import { HashCache, nativePruneGlobs, scanManifest, type BlobStore, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { RboxDaemon, type ScanCadenceClock } from "./daemon.js";
+import type { WatcherAttemptWitness, WatcherRearmClock } from "./watcher-session-supervisor.js";
+import type { ScanGenerationPlan, ScanObservationReceipt } from "./local-workspace-observer.js";
+import type { LocalObservationCommitIntent, LocalObservationCommitReceipt, UnsettledDirective } from "./local-observation-transition.js";
 import { gitReposMatcherKey, gitTopologyChanged } from "./manifest-update.js";
 import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js";
+import { watcherTrustLine } from "../status-view.js";
 import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
@@ -82,6 +86,7 @@ interface DaemonInternals {
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
+  pumpRun: Promise<void>;
   retryQueue: { stop(): void; scheduleWriteFinish(paths: Set<string>): void };
   pendingEvents: { relPath: string; kind: string }[];
   /** LOCAL authority (`CommitLocalObservation`), driven directly for fixture setup. */
@@ -103,7 +108,12 @@ interface DaemonInternals {
   gitDiscovery: { registry?: unknown };
   openDriftAudits: Set<{ candidates: unknown[]; timer?: ReturnType<typeof setTimeout> }>;
   activity: { halt?: { op: string; message?: string } };
-  startWatcherFn: (root: string, matcher: IgnoreMatcher, onSettle: unknown, opts: unknown) => Promise<{ backend: "parcel" | "chokidar"; close(): Promise<void> }>;
+  startWatcherFn: typeof import("./watcher.js").startWatcher;
+  watcherSessions: {
+    rearmTimer?: { fn: () => void; ms: number };
+    activeAttempt?: WatcherAttemptWitness;
+    drainReplacement(): Promise<void>;
+  };
   pump(): Promise<void>;
   doDeepScan(): Promise<unknown>;
   doFullScan(): Promise<unknown>;
@@ -112,7 +122,7 @@ interface DaemonInternals {
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
   buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult>;
   localObserver: {
-    observe(plan: { kind: "scan"; cache: HashCache; previous: Manifest; mode: "pruned" | "unpruned" }): Promise<{ deferredPaths: ReadonlySet<string>; coverage: string }>;
+    observe(plan: ScanGenerationPlan): Promise<ScanObservationReceipt>;
   };
 }
 
@@ -124,6 +134,7 @@ let savedGitApplyLazy: string | undefined;
 beforeEach(async () => {
   // Tests pin default-ON behavior; an ambient kill-switch run must not leak in.
   delete process.env.RBOX_PULL_TRUST_WATCHER;
+  delete process.env.RBOX_WATCHER_RETRUST;
   savedGitApplyLazy = process.env.RBOX_GIT_APPLY_LAZY;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
@@ -134,6 +145,7 @@ afterEach(async () => {
   for (const audit of daemon?.openDriftAudits ?? []) if (audit.timer) clearTimeout(audit.timer);
   daemon = undefined;
   delete process.env.RBOX_PULL_TRUST_WATCHER;
+  delete process.env.RBOX_WATCHER_RETRUST;
   if (savedGitApplyLazy === undefined) delete process.env.RBOX_GIT_APPLY_LAZY;
   else process.env.RBOX_GIT_APPLY_LAZY = savedGitApplyLazy;
   await fs.rm(root, { recursive: true, force: true });
@@ -156,7 +168,7 @@ function testConfig(): WorkspaceConfig {
   };
 }
 
-function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceClock } = {}): DaemonInternals {
+function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceClock; watcherRearmClock?: WatcherRearmClock } = {}): DaemonInternals {
   const d = new RboxDaemon(root, testConfig(), { remote, backoff: async () => {} }, {
     bootId: "boot-trust",
     log: (line: string) => lines.push(line),
@@ -174,8 +186,8 @@ function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceCl
  *  The fixture watcher is PARCEL (design 206 §3b/r4-F3): on chokidar every matcher
  *  rebuild fuses watcher trust, so the healing claims these tests pin can only be
  *  stated for the fleet's default backend. The chokidar fuse has its own test. */
-async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parcel"): Promise<DaemonInternals> {
-  const d = makeDaemon(remote);
+async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parcel", opts: { watcherRearmClock?: WatcherRearmClock } = {}): Promise<DaemonInternals> {
+  const d = makeDaemon(remote, opts);
   d.local.head = await scanManifest(root);
   const base = await d.loadSyncBase();
   d.want.push = true;
@@ -652,12 +664,25 @@ test("design 206: the watcher receives a facade that tracks rebuilds, not the ma
 });
 
 // ── 206 test 8b: backend-input downgrade (parcel) ──────────────────────────────
-const DOWNGRADE_LINE = "watcher downgraded: ignore-rule change alters native watch coverage — pulls scan until restart";
+const DOWNGRADE_LINE = "watcher downgraded: ignore-rule change alters native watch coverage — pulls scan pending supervised re-arm";
 
-test("design 206 §3b: a rebuild that changes the native prune globs fuses watcher trust for the daemon lifetime", async () => {
+test("design 237: a native-coverage fuse recovers through the same witnessed Parcel re-arm loop", async () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
-  const d = await armed(remote);
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(remote, "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
   // `!dist/keep.txt` re-includes under a hard-pruned dir, so `dist` LEAVES the native
   // set — the live subscription's globs no longer match the matcher.
   await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
@@ -665,24 +690,279 @@ test("design 206 §3b: a rebuild that changes the native prune globs fuses watch
 
   expect(lines).toContain(DOWNGRADE_LINE);
   expect(d.trustState).toBe("fused");
+  expect(d.watcher?.backend).toBe("parcel");
+  expect(timer?.ms).toBe(120_000);
 
   lines.length = 0;
   d.want.pull = true;
   await d.pump();
   expect(pullLine()).toBe("pull local=scan skip=p1-watcher");
 
-  await d.doFullScan(); // a clean full-workspace scan must NOT re-trust a fuse
+  await d.doFullScan(); // a pre-arm scan is not testimony
   expect(d.trustState).toBe("fused");
-  lines.length = 0;
-  d.want.pull = true;
-  await d.pump();
-  expect(pullLine()).toBe("pull local=scan skip=p1-watcher");
+  const fireRearm = timer!.fn;
+  timer = undefined;
+  fireRearm();
+  await d.watcherSessions.drainReplacement();
+  expect(d.watcherSessions.activeAttempt).toBeDefined();
+  await d.pumpRun;
+  expect(d.trustState).toBe("trusted");
+});
+
+test("design 237 r4: post-arm recertification reads a real `.rboxignore` mutation", async () => {
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    fsSync.writeFileSync(path.join(root, ".rboxignore"), "!build/keep.txt\n");
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+
+  expect(d.trustState).toBe("fused");
+  expect(d.watcherSessions.activeAttempt).toBeUndefined();
+  expect(timer?.ms).toBe(240_000);
+});
+
+test("design 237 r4: daemon kill-switch transition synchronously cancels recovery", async () => {
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+  expect(timer?.ms).toBe(120_000);
+
+});
+
+test("design 237 r4: publication recertifies real disk authority after the scan", async () => {
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  const observe = d.localObserver.observe.bind(d.localObserver);
+  let scanFinished!: () => void;
+  let release!: () => void;
+  const finished = new Promise<void>((resolve) => { scanFinished = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let hold = true;
+  d.localObserver.observe = async (plan) => {
+    const result = await observe(plan);
+    if (hold) {
+      hold = false;
+      scanFinished();
+      await blocked;
+    }
+    return result;
+  };
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+  await finished;
+  await fs.writeFile(path.join(root, ".rboxignore"), "!build/keep.txt\n");
+  release();
+  await d.pumpRun;
+
+  expect(d.trustState).toBe("fused");
+  expect(timer?.ms).toBe(240_000);
+});
+
+test("design 237 r4: daemon-classified fatal error makes a real stale scan inert while a newer attempt wins", async () => {
+  let timer: { fn: () => void; ms: number } | undefined;
+  let candidateCallbacks: { onArm?: () => void; onError?: (error: Error) => void } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    candidateCallbacks = opts as typeof candidateCallbacks;
+    candidateCallbacks?.onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  const observe = d.localObserver.observe.bind(d.localObserver);
+  let firstScanFinished!: () => void;
+  let releaseFirst!: () => void;
+  const firstFinished = new Promise<void>((resolve) => { firstScanFinished = resolve; });
+  const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let first = true;
+  d.localObserver.observe = async (plan) => {
+    const result = await observe(plan);
+    if (first) {
+      first = false;
+      firstScanFinished();
+      await firstBlocked;
+    }
+    return result;
+  };
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+  await firstFinished;
+  const firstAttempt = d.watcherSessions.activeAttempt;
+  candidateCallbacks!.onError!(new Error("permission denied"));
+  expect(d.watcherSessions.activeAttempt).toBeUndefined();
+  expect(timer?.ms).toBe(240_000);
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+  expect(d.watcherSessions.activeAttempt).toBeDefined();
+  expect(d.watcherSessions.activeAttempt).not.toBe(firstAttempt);
+  releaseFirst();
+  await d.pumpRun;
+
+  expect(d.trustState).toBe("trusted");
+  expect(lines.some((line) => line.includes("stale scan inert"))).toBe(true);
+});
+
+test("design 237 r4: a real observer-flow refused commit cannot publish watcher trust", async () => {
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  const authority = d.local as typeof d.local & {
+    commitObservation(intent: LocalObservationCommitIntent): LocalObservationCommitReceipt;
+    commitPatch(next: Manifest, update: ManifestUpdate & { kind: "partial" }, unsettled: UnsettledDirective): void;
+  };
+  const commitObservation = authority.commitObservation.bind(authority);
+  let race = true;
+  authority.commitObservation = (intent) => {
+    if (race) {
+      race = false;
+      authority.commitPatch(authority.head, { kind: "partial", source: "pull-applied", paths: new Set() }, { add: [] });
+    }
+    return commitObservation(intent);
+  };
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+  await d.pumpRun;
+
+  expect(lines.some((line) => line.includes("not committed: stale-revision"))).toBe(true);
+  expect(d.trustState).toBe("fused");
+  expect(timer?.ms).toBe(240_000);
+});
+
+test("design 237: watcher replacement never re-arms boot-owned safety or deep timers", async () => {
+  let safetyArms = 0;
+  let deepArms = 0;
+  let rearm: { fn: () => void } | undefined;
+  let starts = 0;
+  const d = makeDaemon(new MiniRemote(), {
+    scanCadenceClock: {
+      setTimeout: () => ++safetyArms,
+      clearTimeout: () => {},
+      setInterval: () => ++deepArms,
+      clearInterval: () => {},
+    },
+    watcherRearmClock: {
+      setTimeout: (fn) => {
+        rearm = { fn };
+        return { cancel: () => { rearm = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    const callbacks = opts as { onArm?: () => void; onError?: (error: Error) => void };
+    if (starts++ === 0) callbacks.onError?.(new Error("fatal during boot subscribe"));
+    callbacks.onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await d.startLiveWatch();
+  expect([safetyArms, deepArms]).toEqual([1, 1]);
+  expect(d.trustState).toBe("fused");
+  rearm!.fn();
+  await d.watcherSessions.drainReplacement();
+  await d.pumpRun;
+  expect([safetyArms, deepArms]).toEqual([1, 1]);
+});
+
+test("design 237: a thrown witnessed scan advances watcher backoff without a daemon halt", async () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(new MiniRemote(), "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+  d.localObserver.observe = async () => { throw new Error("injected recovery scan failure"); };
+
+  timer!.fn();
+  await d.watcherSessions.drainReplacement();
+  await d.pumpRun;
+
+  expect(d.activity.halt).toBeUndefined();
+  expect(d.trustState).toBe("fused");
+  expect(timer?.ms).toBe(240_000);
 });
 
 test("design 206 §3b: matcher coverage expanding into an ALWAYS_NATIVE_PRUNE dir downgrades even though the globs are unchanged", async () => {
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
-  const d = await armed(remote);
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(remote, "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
   const globsBefore = d.watcherNativePruneKey;
   await fs.writeFile(path.join(root, ".rboxignore"), "!node_modules/\n");
   d.rebuildMatcher(await d.loadSyncBase());
@@ -690,6 +970,13 @@ test("design 206 §3b: matcher coverage expanding into an ALWAYS_NATIVE_PRUNE di
   expect(nativePruneGlobs(root).join("\n")).toBe(globsBefore); // the r4 false negative
   expect(lines).toContain(DOWNGRADE_LINE);
   expect(d.trustState).toBe("fused");
+  const fireTerminalRearm = timer!.fn;
+  timer = undefined;
+  fireTerminalRearm();
+  await d.watcherSessions.drainReplacement();
+  expect(d.watcherSessions.activeAttempt).toBeUndefined();
+  expect(timer).toBeUndefined();
+  expect(watcherTrustLine("fused")).toContain("restarting rbox restores reactive sync");
 });
 
 test("design 206 §3b: a rebuild that leaves the backend inputs alone does NOT downgrade", async () => {
@@ -720,6 +1007,7 @@ test("design 206 §3b: on chokidar ANY rebuild downgrades — its watch admissio
 
   expect(lines).toContain(DOWNGRADE_LINE);
   expect(d.trustState).toBe("fused");
+  expect(d.watcherSessions.rearmTimer).toBeUndefined();
 });
 
 // ── 206 test 8c: the observation-op boundary guard ────────────────────────────

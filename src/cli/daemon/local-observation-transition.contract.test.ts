@@ -382,9 +382,11 @@ test("an observation whose commit is refused leaves LOCAL exactly as it was", as
     } }),
   });
 
-  await h.observer.observe({ kind: "scan", cache: new HashCache(), previous: authority.manifest, mode: "unpruned" });
+  const receipt = await h.observer.observe({ kind: "scan", cache: new HashCache(), previous: authority.manifest, mode: "unpruned" });
 
   expect(h.outcomes).toEqual(["stale-revision"]);
+  expect(receipt.completeness).toBe("complete");
+  expect(receipt.commitDisposition).toBe("stale-revision");
   expect(authority.manifest.files.map((f) => f.path)).toEqual(["a.txt", "c.txt"]);
   expect(authority.fullWorkspaceSinceSeed).toBe(false);
 });

@@ -243,6 +243,33 @@ export function nativePruneGlobs(root: string): string[] {
 }
 
 /**
+ * Whether every directory excluded by the native watcher is also excluded by the
+ * authoritative matcher. A false result means the matcher requires events from a
+ * subtree the native subscription can never deliver; no scan can make that
+ * subscription safe to trust.
+ */
+export function nativePruneCoverageComplete(
+  root: string,
+  admission: readonly string[],
+  matcher: IgnoreMatcher,
+): boolean {
+  const reenteredDirs = effectiveIgnoreRules(root)
+    .filter((rule) => rule.pattern.startsWith("!") && !rule.pattern.startsWith("!!"))
+    .map((rule) => rule.pattern.slice(1).replace(/^\/+/, "").replace(/\/+$/, ""));
+  return HARD_PRUNE_DIRS.every((dir) => {
+    const nativelyPruned = admission.includes(`**/${dir}`) && admission.includes(`**/${dir}/**`);
+    if (!nativelyPruned) return true;
+    // Hard exclusions are outside matcher policy: no user rule can require their
+    // contents. For overridable directories, native globs match at every depth,
+    // so any path-aware negation is a conflict even when the root instance stays
+    // ignored (for example `!src/node_modules/keep.js`).
+    if (isHardExcluded(`${dir}/`)) return true;
+    const reentered = reenteredDirs.some((negation) => negationReenters(negation, dir));
+    return !reentered && (matcher.prunes?.(`${dir}/`) ?? matcher.ignores(`${dir}/`));
+  });
+}
+
+/**
  * Could a `!negation` (leading `!` and surrounding slashes already stripped by the caller)
  * re-include the directory `d` such that we must NOT native-prune it? PATH-AWARE: a
  * negation only re-enters `d` if it is anchored to that specific directory —
@@ -259,7 +286,7 @@ export function nativePruneGlobs(root: string): string[] {
  */
 function negationReenters(neg: string, d: string): boolean {
   if (neg.length === 0) return false;
-  return neg === d || neg.startsWith(`${d}/`) || neg.includes(`/${d}/`);
+  return neg === d || neg.startsWith(`${d}/`) || neg.includes(`/${d}/`) || neg.endsWith(`/${d}`);
 }
 
 export interface IgnoreMatcher {
