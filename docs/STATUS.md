@@ -5,6 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_MARATHON DAY CLOSED (2026-08-13 evening): **11 PRs merged** (#643-#657
+range), fleet fully deployed on d44e267. SHIPPED: fossil-litter class dead
+(#650, field-verified); Darwin bulk scan default-on (#651); Linux walk 5.25x
++ watchman-hijack pin (#652); attribution differential canonicalized (#653);
+daemon pump-join REAL bug fixed (#654 — awaited pumps resumed before queued
+pulls ran; found chasing a "flake"); #641 held-skip convergence regression
+fixed ISOLATED, 8ms skip preserved (#656, design 241, bisected via rig
+oracle in 6 probes); watcher fuse fix BOTH slices (#657, design 237: episode
+coalescing 11/11 historical fuses prevented in replay + supervised re-arm
+with 9-condition witness gate; 5 design rounds + 3 impl rounds).
+ACCEPTANCE CLOCKS RUNNING: Mac boot-fuse watch (5 boots, target 0 fuses;
+boot 1 = the 19:0xZ deploy restart); Mac RSS <8GB/24h; FM pending lanes
+(savvy-core/blog) did NOT self-clear in 8min post-#656 — carry shape may
+need a publish jolt or is a sibling bug (task #22 watches; quiet-moment
+take-theirs is the fallback). OPEN: task #25 git-join-ahead rig regression
+(binding ambiguity, PASS Jul-31 → FAIL now, bisect recipe in scratchpad
+pattern); shard state-leak fix in flight (worktree shard-leak, codex,
+founder-ordered proper fix); rig 6/7 green (join-ahead only). OPS NOTES:
+mass branch deletion (281→14, recovery map ~/rbox-branch-cleanup-recovery-
+20260813.txt) starved GitHub event delivery — fuse-episodes branch never got
+CI, re-minted as fuse-episodes-ci (papercut). Sender pipeline (~10s push)
+remains task #17's last mile to ≤10s e2e._
+
 _E2E RE-MEASURED POST-FIXES (2026-08-13 13:00Z, 3 serial trials desktop→fleet):
 median **13.1s** (was ~32s round-6; FM 11.8s, Mac 14.4s). Receiver is no longer
 the bottleneck: publish→file-visible 1.6-1.7s FM / 4.2-4.3s Mac. Slowest hop =
