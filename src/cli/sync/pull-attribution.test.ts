@@ -1,11 +1,20 @@
 import { afterEach, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { PhaseReport, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
+import {
+  PhaseReport,
+  scanManifest,
+  type Action,
+  type BlobStore,
+  type DirCacheFile,
+  type FileEntry,
+  type HashCacheEntry,
+  type Manifest,
+  type RuleFileRecord,
+} from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
-import { applyPulledManifest, push, type SyncDeps, type TrustedLocalView } from "../sync.js";
+import { applyPulledManifest, MassDeleteGuardError, push, type SyncDeps, TrustedViewRefusalError, type TrustedLocalView } from "../sync.js";
 import type { WorkspaceConfig } from "../config.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
@@ -95,32 +104,25 @@ async function makeRoot(prefix: string): Promise<string> {
   return root;
 }
 
-async function snapshot(root: string): Promise<Record<string, string>> {
-  const out: Record<string, string> = {};
+type DiskEntry =
+  | { kind: "directory" }
+  | { kind: "symlink"; target: string }
+  | { kind: "file"; mode: number; bytes: string };
+
+async function snapshot(root: string): Promise<Record<string, DiskEntry>> {
+  const out: Record<string, DiskEntry> = {};
   const walk = async (dir: string): Promise<void> => {
     for (const entry of (await fs.readdir(path.join(root, dir), { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const rel = dir ? `${dir}/${entry.name}` : entry.name;
       const abs = path.join(root, rel);
       if (entry.isDirectory()) {
-        out[`${rel}/`] = "dir";
+        out[`${rel}/`] = { kind: "directory" };
         await walk(rel);
       } else if (entry.isSymbolicLink()) {
-        out[rel] = `link:${await fs.readlink(abs)}`;
+        out[rel] = { kind: "symlink", target: await fs.readlink(abs) };
       } else {
         const bytes = await fs.readFile(abs);
-        if (rel === ".rbox/state/last-writer.json") {
-          const witness = JSON.parse(bytes.toString("utf8")) as LastWriterWitness;
-          // The witness binds the copied state's new physical inode. Compare every
-          // durable field except that necessarily root-specific filesystem identity —
-          // and the write-time mtime, which differs by clock ticks between the
-          // parallel on/off runs (1ms flake seen on CI shard 2, 2026-08-13).
-          delete witness.stateDev;
-          delete witness.stateIno;
-          delete (witness as { stateMtimeMs?: number }).stateMtimeMs;
-          out[rel] = JSON.stringify(witness);
-        } else {
-          out[rel] = `${(await fs.stat(abs)).mode & 0o777}:${createHash("sha256").update(bytes).digest("hex")}:${bytes.toString("base64")}`;
-        }
+        out[rel] = { kind: "file", mode: (await fs.stat(abs)).mode & 0o777, bytes: bytes.toString("base64") };
       }
     }
   };
@@ -145,15 +147,101 @@ async function run(root: string, remote: DifferentialRemote, enabled: boolean, s
   const trustedView: TrustedLocalView | undefined = scenario === "trusted-view"
     ? { manifest: await scanManifest(root), deferred: new Set() }
     : undefined;
-  let actions: unknown;
-  let error: { name: string; message: string } | undefined;
+  let actions: Action[] | undefined;
+  let error:
+    | { name: "MassDeleteGuardError"; message: string; op: "pull" | "push" }
+    | { name: "TrustedViewRefusalError"; message: string; reason: "mass-delete" }
+    | { name: string; message: string }
+    | undefined;
   try {
     actions = await applyPulledManifest(root, config(root), deps, remote, await remote.latest(), trustedView);
   } catch (caught) {
     const value = caught as Error;
-    error = { name: value.constructor.name, message: value.message };
+    // Error.stack is run/location-specific. Capture every semantic field owned
+    // by the typed errors this matrix expects, not merely their display text.
+    error = value instanceof MassDeleteGuardError
+      ? { name: value.name, message: value.message, op: value.op }
+      : value instanceof TrustedViewRefusalError
+        ? { name: value.name, message: value.message, reason: value.reason }
+        : { name: value.constructor.name, message: value.message };
   }
   return { actions, error, adopted, disk: await snapshot(root), report: report.toJSON() };
+}
+
+type ComparedOutcome = Pick<Awaited<ReturnType<typeof run>>, "actions" | "error" | "disk">;
+
+function withoutLocalObservedMtime(entry: FileEntry | undefined): Omit<FileEntry, "mtimeMs"> | undefined {
+  if (!entry) return undefined;
+  // FileEntry.mtimeMs is explicitly a receiver-local scan fast-path hint, not
+  // content identity. Separate copied roots can observe different mtimes.
+  const { mtimeMs: _observedMtimeMs, ...content } = entry;
+  return content;
+}
+
+function canonicalAction(action: Action) {
+  if (action.kind === "write") {
+    // entry is the shared remote input and stays exact. expectedLocal is a scan
+    // observation of each copied root, so only its mtime hint may differ.
+    return { ...action, expectedLocal: withoutLocalObservedMtime(action.expectedLocal) };
+  }
+  if (action.kind === "delete") {
+    return { ...action, expectedLocal: withoutLocalObservedMtime(action.expectedLocal) };
+  }
+  return action;
+}
+
+function canonicalJsonDiskFile(rel: string, bytes: string): unknown | undefined {
+  const decoded = Buffer.from(bytes, "base64").toString("utf8");
+  if (rel === ".rbox/state/last-writer.json") {
+    const witness = JSON.parse(decoded) as LastWriterWitness;
+    // writtenAtMs is the wall-clock publication instant. stateMtimeMs, stateDev,
+    // and stateIno bind that publication to this copy's physical file. All four
+    // legitimately differ between independent on/off roots; body hash and size do not.
+    const { writtenAtMs: _writtenAtMs, stateMtimeMs: _stateMtimeMs, stateDev: _stateDev, stateIno: _stateIno, ...durable } = witness;
+    return durable;
+  }
+  if (rel === ".rbox/state/hashcache.json") {
+    const cache = JSON.parse(decoded) as { version: number; gitPolicy?: unknown; entries: Record<string, HashCacheEntry> };
+    // Cache mtime/ctime pairs are receiver-local stat fingerprints. Entries are
+    // recorded from a concurrent hash batch, so their JSON member order is not
+    // meaningful; sorted reconstruction makes that explicit.
+    const entries = Object.fromEntries(Object.entries(cache.entries).sort(([a], [b]) => a.localeCompare(b)).map(([entryPath, entry]) => {
+      const { mtimeMs: _mtimeMs, ctimeMs: _ctimeMs, ...stable } = entry;
+      return [entryPath, stable];
+    }));
+    return { ...cache, entries };
+  }
+  if (rel === ".rbox/state/dircache.json") {
+    const cache = JSON.parse(decoded) as DirCacheFile;
+    // Scan headers and directory/rule mtime/ctime pairs describe when this root
+    // was observed, not its contents. readdir inventory order is filesystem- and
+    // scheduler-dependent, so map keys, rule records, and child records are sorted.
+    const ruleFiles = cache.ruleFiles.map((rule): Omit<RuleFileRecord, "mtimeMs" | "ctimeMs"> => {
+      if ("absent" in rule) return rule;
+      const { mtimeMs: _mtimeMs, ctimeMs: _ctimeMs, ...stable } = rule;
+      return stable;
+    }).sort((a, b) => a.relPath.localeCompare(b.relPath));
+    const entries = Object.fromEntries(Object.entries(cache.entries).sort(([a], [b]) => a.localeCompare(b)).map(([entryPath, entry]) => {
+      const { mtimeMs: _mtimeMs, ctimeMs: _ctimeMs, children } = entry;
+      return [entryPath, { children: [...children].sort((a, b) => a.name.localeCompare(b.name) || a.type.localeCompare(b.type)) }];
+    }));
+    const { lastScanStartMs: _lastScanStartMs, lastUnprunedScanAtMs: _lastUnprunedScanAtMs, ...stable } = cache;
+    return { ...stable, ruleFiles, entries };
+  }
+  return undefined;
+}
+
+function canonicalOutcome(outcome: ComparedOutcome) {
+  const disk = Object.fromEntries(Object.entries(outcome.disk).sort(([a], [b]) => a.localeCompare(b)).map(([rel, entry]) => {
+    if (entry.kind !== "file") return [rel, entry];
+    const json = canonicalJsonDiskFile(rel, entry.bytes);
+    return [rel, json === undefined ? entry : { kind: "file", mode: entry.mode, json }];
+  }));
+  return {
+    actions: outcome.actions?.map(canonicalAction),
+    error: outcome.error,
+    disk,
+  };
 }
 
 test("receiver attribution is observation-only through the live state load/save path", async () => {
@@ -177,20 +265,12 @@ test("receiver attribution is observation-only through the live state load/save 
       fs.cp(seed, offRoot, { recursive: true, force: true }),
       fs.cp(seed, onRoot, { recursive: true, force: true }),
     ]);
-    const realDateNow = Date.now;
-    Date.now = () => 1_786_565_400_000;
-    let off: Awaited<ReturnType<typeof run>>;
-    let on: Awaited<ReturnType<typeof run>>;
-    try {
-      [off, on] = await Promise.all([
-        run(offRoot, remote, false, scenario),
-        run(onRoot, remote, true, scenario),
-      ]);
-    } finally {
-      Date.now = realDateNow;
-    }
+    const [off, on] = await Promise.all([
+      run(offRoot, remote, false, scenario),
+      run(onRoot, remote, true, scenario),
+    ]);
 
-    expect({ actions: on.actions, error: on.error, disk: on.disk }).toEqual({ actions: off.actions, error: off.error, disk: off.disk });
+    expect(canonicalOutcome(on)).toEqual(canonicalOutcome(off));
     if (scenario === "success") {
       expect(on.adopted?.phaseMs).toEqual(expect.objectContaining({ validate: expect.any(Number), reconcile: expect.any(Number), "git-apply": expect.any(Number) }));
       expect(off.adopted?.phaseMs).toBeUndefined();
