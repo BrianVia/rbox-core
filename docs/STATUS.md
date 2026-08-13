@@ -5,7 +5,33 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_LATE-EVENING ADDENDUM (2026-08-13, fleet now on **e71eda7**, 15 PRs total):
+_NIGHT CAP (2026-08-13, fleet now on **26a4de7**, 17 PRs total): **#683 echo
+ring + conflict loop FIXED (#685, design 244)** — root cause was NOT the
+hypothesized zero-backoff: the desktop published EMPTY sequences forever
+(pending git section → divergence "indeterminate" → post-pull re-arm on
+`!== "none"` → publish ops=0 → pull own sequence → repeat), and the Mac lost
+every 409 race against that churn while each losing push op burned 6 full
+git-plans+pulls (MAX_ATTEMPTS off-by-one) with ≤3s sleeps; "next probe in 0s"
+was a starved-probe display. Fix: status.ts splits pending-carry (permanent,
+suppressed) from transient indeterminacy (still re-arms — review M2
+PRESERVED); recovery episode survives a committed-but-unresolved push;
+sync-owned 120s elapsed surrender on the internal 409 loop, checked
+top-of-loop; b2 instrumentation names any flag-armed empty plan (suspect:
+un-ACKed config authorship, `shouldPublishGitConfig` compares base not
+advertised — follow-up fix site). Process: 2-lane root-cause (opus +
+codex, both refuted my initial theories), codex CHANGES-REQUIRED round
+folded, serial confirm ALIGNED zero findings. FIELD: last ops=0 publish was
+pre-fix; Mac `syncing normally`, pending drained, first publish in hours
+(seq 2227), RSS ~15GB (unmasked from the loop — #664 watch continues,
+boot 4). Overnight idle window = final ring proof; b2 line not yet fired.
+**#684 merged** (#659 partial): mismatch deferrals now name the differing
+paths. **docs/2.0-RELEASE-CHECKLIST.md started** (founder ask): RboxBar
+bundling (NOT in release.yml today), #668 next-installer SPA bug, #667
+fossil decision, Max/Ryan skew note, rig+regress+RSS gates. Mac ignore
+counter 88,888→35,723 post-purge-adoption, not yet zero — re-check after
+catch-up settles._
+
+_LATE-EVENING ADDENDUM (2026-08-13, fleet was on **e71eda7**, 15 PRs total):
 **savvy-core fleet convergence CLOSED** — final wedge was 3 stale worktree
 node_modules SYMLINKS on FM (synced Jul 28, pre-design-224; deletion never
 propagated; oracle counted them as extras forever). Removed → carried 103,
