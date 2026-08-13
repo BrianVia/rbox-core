@@ -119,10 +119,12 @@ interface DaemonInternals {
 let root: string;
 let lines: string[];
 let daemon: DaemonInternals | undefined;
+let savedGitApplyLazy: string | undefined;
 
 beforeEach(async () => {
   // Tests pin default-ON behavior; an ambient kill-switch run must not leak in.
   delete process.env.RBOX_PULL_TRUST_WATCHER;
+  savedGitApplyLazy = process.env.RBOX_GIT_APPLY_LAZY;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
   await prepareDaemonFolderAdmission(root, testConfig());
@@ -132,6 +134,8 @@ afterEach(async () => {
   for (const audit of daemon?.openDriftAudits ?? []) if (audit.timer) clearTimeout(audit.timer);
   daemon = undefined;
   delete process.env.RBOX_PULL_TRUST_WATCHER;
+  if (savedGitApplyLazy === undefined) delete process.env.RBOX_GIT_APPLY_LAZY;
+  else process.env.RBOX_GIT_APPLY_LAZY = savedGitApplyLazy;
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -192,14 +196,7 @@ async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parce
   return d;
 }
 
-const pullLine = (): string | undefined => {
-  const found = lines.find((l) => l.startsWith("pull local="));
-  // CI-only forensics for the design-202 cluster: when the trusted log line is
-  // missing, dump the whole captured daemon log so the failing environment
-  // names the branch it actually took. Remove once the shard-5 failure is root-caused.
-  if (found === undefined) console.error(`FORENSIC pull-line-missing lines=${JSON.stringify(lines)}`);
-  return found;
-};
+const pullLine = (): string | undefined => lines.find((l) => l.startsWith("pull local="));
 
 // ── 1. P-matrix + 206 test 5 skip-cause matrix ────────────────────────────────
 test("design 202 P-matrix: every condition independently false drops the pull back to the scan path, naming its clause", async () => {

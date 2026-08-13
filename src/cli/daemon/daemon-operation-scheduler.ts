@@ -315,7 +315,8 @@ export class DaemonOperationScheduler {
 
   /** Single-flight: a second caller joins the loop already in flight. */
   service(executor: DaemonOperationExecutor): Promise<void> {
-    if (this.pumping || this.ports.isStopped()) return Promise.resolve();
+    if (this.ports.isStopped()) return Promise.resolve();
+    if (this.pumping) return this.pumpRun;
     this.pumping = true;
     const run = this.serviceLoop(executor);
     this.pumpRun = run;
