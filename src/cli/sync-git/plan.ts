@@ -93,10 +93,17 @@ export interface GitPlanStats {
   carried: number;
   captured: number;
   totalMs: number;
+  setupMs: number;
   discoverMs: number;
+  removalPruneMs: number;
   journalPreloopMs: number;
+  carryMs: number;
   fingerprintMs: number;
+  captureMs: number;
+  projectionMs: number;
+  finalizeMs: number;
   hygieneMs: number;
+  divergenceCacheMs: number;
   otherMs: number;
 }
 
@@ -212,10 +219,17 @@ async function planGitSectionsWithRetention(
   // pre-204 probe order and does not consume the scoped memo.
   const gitPlanLazy = process.env.RBOX_GIT_PLAN_LAZY !== "0";
   const timings = {
+    setupMs: 0,
     discoverMs: 0,
+    removalPruneMs: 0,
     journalPreloopMs: 0,
+    carryMs: 0,
     fingerprintMs: 0,
+    captureMs: 0,
+    projectionMs: 0,
+    finalizeMs: 0,
     hygieneMs: 0,
+    divergenceCacheMs: 0,
   };
   const measure = async <T>(key: keyof typeof timings, fn: () => Promise<T>): Promise<T> => {
     const startedAt = performance.now();
@@ -426,6 +440,7 @@ async function planGitSectionsWithRetention(
       gitPlanStats,
     };
   };
+  timings.setupMs = performance.now() - planStartedAt;
   // Design 108 §3.2/§3.1: genesis files-first defer — attach nothing this commit. On a
   // genuine genesis (parentSequence 0, fresh state) base/pending/needsRes/removed are
   // empty, so plan() yields gitRepos=undefined, changed=false, sidecars absent — git is
@@ -442,6 +457,7 @@ async function planGitSectionsWithRetention(
     return { ...plan(), ...(discovered.length > 0 ? { filesFirstDeferred: true } : {}) };
   }
   if (!cfg.syncGit) {
+    const carryStartedAt = performance.now();
     // Opt-out: out stays empty → any base entries read as removal (the opt-out
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving
     // pending entry would otherwise re-trigger the per-repo base restore every push
@@ -454,6 +470,7 @@ async function planGitSectionsWithRetention(
     for (const k of Object.keys(pending)) delete pending[k];
     for (const k of Object.keys(needsRes)) delete needsRes[k];
     for (const k of Object.keys(removedMem)) delete removedMem[k];
+    timings.carryMs += performance.now() - carryStartedAt;
     return plan();
   }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
@@ -469,11 +486,13 @@ async function planGitSectionsWithRetention(
   // §9: removal memories are pruned ONLY when the local `.git` genuinely disappears —
   // never on mere discovery absence (an ignored-but-present leftover is undiscoverable
   // yet must keep its resurrection guard for when it is unignored).
-  for (const rel of Object.keys(removedMem)) {
-    if (kindByPath.has(rel)) continue;
-    const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
-    if (!dotGit) delete removedMem[rel];
-  }
+  await measure("removalPruneMs", async () => {
+    for (const rel of Object.keys(removedMem)) {
+      if (kindByPath.has(rel)) continue;
+      const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
+      if (!dotGit) delete removedMem[rel];
+    }
+  });
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
   const recoveryBlocked = new Map<string, string>();
@@ -555,6 +574,8 @@ async function planGitSectionsWithRetention(
     }
   });
   await options.afterJournalPreloop?.();
+  const carryStartedAt = performance.now();
+  const carryFingerprintStartedAt = timings.fingerprintMs;
   for (const rel of keys) captureObserved.add(rel);
   stats.repos = keys.length;
   // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
@@ -1093,11 +1114,13 @@ async function planGitSectionsWithRetention(
   // or any later mutation/proof stage.
   preCaptureCtx.clear();
   await options.beforeCapturePool?.();
+  timings.carryMs += performance.now() - carryStartedAt - (timings.fingerprintMs - carryFingerprintStartedAt);
 
   // Changed repos: bounded-concurrency capture. Any per-repo failure defers THAT repo
   // (base carry) — the push itself always proceeds (PR #38 churn discipline). Progress
   // is a monotonic completed-count (captures run concurrently, so a settle counter is
   // the only truthful "done") with the just-settled repo's name as the display detail.
+  const captureStartedAt = performance.now();
   const repoCount = toCapture.length;
   let captureDone = 0;
   let gitBytesDone = 0;
@@ -1310,6 +1333,8 @@ async function planGitSectionsWithRetention(
       );
   }
 
+  timings.captureMs += performance.now() - captureStartedAt;
+  const projectionStartedAt = performance.now();
   const normalized = normalizeCurrentOutgoing();
   for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
   finalizedOutgoing = normalized.sections;
@@ -1327,6 +1352,8 @@ async function planGitSectionsWithRetention(
       "deletion-pending",
     );
   }
+  timings.projectionMs += performance.now() - projectionStartedAt;
+  const finalizeStartedAt = performance.now();
   // Design 226 flush point 1. Every revert that can reach a repo in NEITHER candidate
   // set — unreadable, absence-witness, tombstone-exactness — has now run, so these
   // sections are final and their bytes are owed. Bounds retained disk without narrowing
@@ -1417,6 +1444,7 @@ async function planGitSectionsWithRetention(
   // whose bytes are missing (the repos past commitAbsentBranchVerification/pinDisplaced
   // cannot be reverted, and the set is not statically known at this point).
   await flushPending(captured);
+  timings.finalizeMs += performance.now() - finalizeStartedAt;
 
   // Design 174 D: independently bounded scratch-ref hygiene. Only an exact
   // stable carry or a successful final capture qualifies; an unconditional P,
@@ -1457,6 +1485,8 @@ async function planGitSectionsWithRetention(
   // Refresh captured entries only after every capture-side cleanup, including
   // conflict-ref pruning above. A per-repo fingerprint run avoids reusing the
   // full-plan common-dir memo that predates capture scratch refs.
+  const divergenceCacheStartedAt = performance.now();
+  const divergenceCacheFingerprintStartedAt = timings.fingerprintMs;
   const refreshOrder = [...postCleanupCacheRefresh].sort();
   for (const rel of refreshOrder) {
     cache.repos.delete(rel);
@@ -1494,6 +1524,8 @@ async function planGitSectionsWithRetention(
     }
   }
   await saveGitDivergenceCache(root, cache).catch(() => {});
+  timings.divergenceCacheMs += performance.now() - divergenceCacheStartedAt
+    - (timings.fingerprintMs - divergenceCacheFingerprintStartedAt);
 
   return plan();
 }
@@ -1517,8 +1549,11 @@ export function formatGitPlanStats(stats: GitPlanStats): string {
   return (
     `hit${stats.fpHits}m${stats.fpMisses}u${stats.fpUntrusted} pps${stats.pointerPreSkips}` +
     ` sp${stats.spawnedRepos} prc${stats.parentRelCached}` +
-    ` ms[t${ms(stats.totalMs)} d${ms(stats.discoverMs)} j${ms(stats.journalPreloopMs)}` +
-    ` f${ms(stats.fingerprintMs)} h${ms(stats.hygieneMs)} o${ms(stats.otherMs)}]`
+    ` ms[t${ms(stats.totalMs)} s${ms(stats.setupMs)} d${ms(stats.discoverMs)}` +
+    ` rm${ms(stats.removalPruneMs)} j${ms(stats.journalPreloopMs)} cy${ms(stats.carryMs)}` +
+    ` f${ms(stats.fingerprintMs)} cp${ms(stats.captureMs)} pr${ms(stats.projectionMs)}` +
+    ` fn${ms(stats.finalizeMs)} h${ms(stats.hygieneMs)} dc${ms(stats.divergenceCacheMs)}` +
+    ` o${ms(stats.otherMs)}]`
   );
 }
 

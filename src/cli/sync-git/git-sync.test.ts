@@ -3590,21 +3590,31 @@ test("design 204 C2: pre-capture ctx memo is cleared before a dir-to-pointer fli
   expect(observed.some(({ rel: seen, kind }) => seen === rel && kind === "pointer")).toBe(true);
 }, 60_000);
 
-test("design 204 C5: timing buckets are finite, bounded, nonnegative, and summarized", async () => {
+test("design 243: timing buckets are an exclusive partition and are summarized", async () => {
   const repo = path.join(rootA, "lazy-timings");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "base", "c1");
   process.env.RBOX_GIT_PLAN_LAZY = "1";
   const plan = await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   const stats = plan.gitPlanStats!;
-  for (const key of ["discoverMs", "journalPreloopMs", "fingerprintMs", "hygieneMs", "otherMs"] as const) {
+  const topLevelKeys = [
+    "setupMs", "discoverMs", "removalPruneMs", "journalPreloopMs", "carryMs",
+    "fingerprintMs", "captureMs", "projectionMs", "finalizeMs", "hygieneMs",
+    "divergenceCacheMs",
+  ] as const;
+  for (const key of [...topLevelKeys, "otherMs"] as const) {
     expect(Number.isFinite(stats[key])).toBe(true);
     expect(stats[key]).toBeGreaterThanOrEqual(0);
     expect(stats[key]).toBeLessThanOrEqual(stats.totalMs);
   }
+  const namedMs = topLevelKeys.reduce((sum, key) => sum + stats[key], 0);
+  expect(namedMs).toBeLessThanOrEqual(stats.totalMs);
+  expect(stats.otherMs).toBeCloseTo(stats.totalMs - namedMs, 8);
   const summary = formatGitPlanStats(stats);
   expect(summary).toContain("ms[t");
-  for (const marker of [" d", " j", " f", " h", " o"]) expect(summary).toContain(marker);
+  for (const marker of [" s", " d", " rm", " j", " cy", " f", " cp", " pr", " fn", " h", " dc", " o"]) {
+    expect(summary).toContain(marker);
+  }
 }, 60_000);
 
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
