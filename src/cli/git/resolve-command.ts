@@ -1074,7 +1074,11 @@ export async function gitResolveCmd(
         const fresh = await buildSnapshot({ root, rel, ctx, state: freshState, record: freshRecord, incoming: freshIncoming, store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: now() });
         emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed at the locked checkout boundary; confirm the fresh snapshot", current: fresh.public }, json, deps, root);
       } else {
-        emit({ status: "refused", verb, repo: rel, code: follow.reason, message: refusalMessage(follow.reason) }, json, deps, root);
+        // The deferral's own detail names the actual failure (e.g. WHICH blob
+        // failed to fetch/verify); the canned per-code text alone has cost
+        // hours of field archaeology. Surface both.
+        const detail = (follow as { detail?: string }).detail;
+        emit({ status: "refused", verb, repo: rel, code: follow.reason, message: detail ? `${refusalMessage(follow.reason)}: ${detail}` : refusalMessage(follow.reason) }, json, deps, root);
       }
       return 1;
     }
