@@ -16,7 +16,12 @@ export const BUILTIN_IGNORE: string[] = [
   // machine (git state transfers via git-sync snapshots, never as raw files).
   ".git",
   ".rbox/",
-  "node_modules/",
+  // No trailing slash for the same reason as `.git`: pnpm/worktree setups create
+  // SYMLINKS named `node_modules` (observed 2026-08-13: three worktree symlinks
+  // synced to the fleet and wedged a receiver — issue #659). A trailing slash
+  // matches only real directories; the bare name matches any entry type at any
+  // depth. No plausible user content shares this name.
+  "node_modules",
   ".venv/",
   "venv/",
   "dist/",
