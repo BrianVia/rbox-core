@@ -22,9 +22,9 @@ import type { DaemonObservation } from "./daemon/observation.js";
 const origFetch = globalThis.fetch;
 const origStdout = process.stdout.write.bind(process.stdout);
 const origStderr = process.stderr.write.bind(process.stderr);
-const origHome = process.env.HOME;
 
 let tmp: string;
+let savedEnv: Record<string, string | undefined>;
 const STATUS_NOW = Date.parse("2026-07-04T12:00:00Z");
 
 function stoppedDaemon(): DaemonObservation {
@@ -165,6 +165,9 @@ function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<Daem
 }
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries([
+    "RBOX_TOKEN", "RBOX_API", "RBOX_DEVICE_ID", "RBOX_ACCOUNT_ID", "RBOX_HOME", "HOME",
+  ].map((key) => [key, process.env[key]]));
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-json-output-"));
   process.env.RBOX_HOME = path.join(tmp, "home");
   process.env.HOME = path.join(tmp, "home");
@@ -182,13 +185,10 @@ afterEach(async () => {
   process.stderr.write = origStderr;
   setJsonErrorMode(false);
   process.exitCode = 0;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_API;
-  delete process.env.RBOX_DEVICE_ID;
-  delete process.env.RBOX_ACCOUNT_ID;
-  delete process.env.RBOX_HOME;
-  if (origHome === undefined) delete process.env.HOME;
-  else process.env.HOME = origHome;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(tmp, { recursive: true, force: true });
 });
 

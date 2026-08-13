@@ -28,7 +28,7 @@ const BOOT = "boot-live";
 
 let home: string;
 let root: string;
-const originalHome = process.env.HOME;
+let savedHomeEnv: Record<string, string | undefined>;
 const origFetch = globalThis.fetch;
 
 const healthyChecks = (): DoctorChecks => ({
@@ -163,6 +163,7 @@ async function writeDaemonRecords(opts: {
 }
 
 beforeEach(async () => {
+  savedHomeEnv = Object.fromEntries(["HOME", "RBOX_HOME"].map((key) => [key, process.env[key]]));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-triage-home-"));
   process.env.RBOX_HOME = home;
   process.env.HOME = home;
@@ -173,9 +174,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
   globalThis.fetch = origFetch;
-  delete process.env.RBOX_HOME;
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  for (const [key, value] of Object.entries(savedHomeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   process.exitCode = 0;
   await fs.rm(home, { recursive: true, force: true });
   await fs.rm(root, { recursive: true, force: true });

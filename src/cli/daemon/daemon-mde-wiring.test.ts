@@ -6,7 +6,7 @@ import { HashCache, scanManifest, type Manifest } from "../../engine/index.js";
 import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "../e2ee-fake-server.js";
 import { RboxDaemon } from "../daemon.js";
 import { push } from "../sync.js";
-import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const NOW = 1_900_000_000_000;
 const ACCOUNT_ID = "acct_daemon_mde";
@@ -24,8 +24,15 @@ interface DaemonInternals {
 
 let root: string;
 let daemon: DaemonInternals | undefined;
+let savedEnv: Record<string, string | undefined>;
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries([
+    "RBOX_MDE_DELTA",
+    "RBOX_MDE_SNAPSHOT",
+    "RBOX_MDE_FAST_PULL",
+    "RBOX_MTIME_NORMALIZE",
+  ].map((key) => [key, process.env[key]]));
   delete process.env.RBOX_MDE_DELTA;
   delete process.env.RBOX_MDE_SNAPSHOT;
   delete process.env.RBOX_MDE_FAST_PULL;
@@ -36,7 +43,15 @@ beforeEach(async () => {
 afterEach(async () => {
   await daemon?.stop().catch(() => {});
   daemon = undefined;
-  await fs.rm(root, { recursive: true, force: true });
+  try {
+    await releaseDaemonFolderAdmission(root);
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("daemon wires manifest attribution and publication through its log sink", async () => {

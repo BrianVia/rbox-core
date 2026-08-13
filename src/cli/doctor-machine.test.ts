@@ -14,9 +14,10 @@ const BOOT = "boot-live";
 
 let home: string;
 let scratch: string;
-const originalHome = process.env.HOME;
+let savedHomeEnv: Record<string, string | undefined>;
 
 beforeEach(async () => {
+  savedHomeEnv = Object.fromEntries(["HOME", "RBOX_HOME"].map((key) => [key, process.env[key]]));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-machine-home-"));
   scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-machine-roots-"));
   process.env.RBOX_HOME = home;
@@ -24,9 +25,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  for (const [key, value] of Object.entries(savedHomeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(home, { recursive: true, force: true });
   await fs.rm(scratch, { recursive: true, force: true });
 });

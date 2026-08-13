@@ -13,8 +13,8 @@ import {
   type GenesisJournal,type HardenedWriteOptions
 } from "./genesis-durable.js";
 
-const ACCOUNT="acct_0123456789abcdef";let home:string;
-beforeEach(async()=>{home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-genesis-durable-"));process.env.RBOX_HOME=home;});afterEach(async()=>{delete process.env.RBOX_HOME;await fs.rm(home,{recursive:true,force:true});});
+const ACCOUNT="acct_0123456789abcdef";let home:string;let savedRboxHome:string|undefined;
+beforeEach(async()=>{savedRboxHome=process.env.RBOX_HOME;home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-genesis-durable-"));process.env.RBOX_HOME=home;});afterEach(async()=>{if(savedRboxHome===undefined)delete process.env.RBOX_HOME;else process.env.RBOX_HOME=savedRboxHome;await fs.rm(home,{recursive:true,force:true});});
 async function journal():Promise<GenesisJournal>{const requestBody='{"recoveryWrap":"\\u0061","recoveryWrapId":"wrap-id","genesisRoster":"roster","genesisKeyState":"state","device":{"deviceId":"dev_a","sigPubKey":"sig","encPubKey":"enc","mkWrap":"mk-wrap"}}';return{version:1,accountId:ACCOUNT,deviceId:"dev_a",startedAt:"2026-07-22T12:00:00.000Z",phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:false,completionHolds:["recovery-kit-staging"],completionReceipts:{}};}
 
 describe("design 180 durable genesis artifacts",()=>{

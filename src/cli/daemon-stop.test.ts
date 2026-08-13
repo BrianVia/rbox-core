@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +9,16 @@ import { RBOX_VERSION } from "./version.js";
 
 let home: string;
 let root: string;
+let savedRboxHome: string | undefined;
 const stableStartToken = async () => "process-start";
+const ambientRboxHome = process.env.RBOX_HOME;
+
+afterAll(() => {
+  expect(process.env.RBOX_HOME).toBe(ambientRboxHome);
+});
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-stop-daemon-"));
   process.env.RBOX_HOME = home;
   root = path.join(home, "workspace");
@@ -20,7 +27,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fs.rm(home, { recursive: true, force: true });
 });
 

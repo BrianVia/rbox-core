@@ -12,7 +12,7 @@ import type { CommitResult, SyncRemote } from "../remote.js";
 import { GIT_BUSY_RETRY_DELAYS_MS, RboxDaemon, gitCaptureSampleForProvenance, type GitBusyRetryClock } from "./daemon.js";
 import { GitRefWatchRegistry, type GitRefWatchHandle, type GitRefWatchMode } from "./git-ref-watch.js";
 import { createSignalDebouncer, type GitSignalBatch } from "./watcher.js";
-import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const exec = promisify(execFile);
 const GIT_ENV = {
@@ -282,9 +282,15 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
       expect(daemon.want.push).toBe(false);
     } finally {
       debouncer.dispose();
-      await registry.close();
-      if (!daemon.stopped) await daemon.stop().catch(() => {});
-      await fsp.rm(root, { recursive: true, force: true });
+      await Promise.allSettled([
+        registry.close(),
+        daemon.stopped ? Promise.resolve() : daemon.stop(),
+      ]);
+      try {
+        await releaseDaemonFolderAdmission(root);
+      } finally {
+        await fsp.rm(root, { recursive: true, force: true });
+      }
     }
   };
 

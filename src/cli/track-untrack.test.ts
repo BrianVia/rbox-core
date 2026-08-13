@@ -15,9 +15,10 @@ let home: string;
 let logs: string[];
 const origLog = console.log;
 const origFetch = globalThis.fetch;
-const origHome = process.env.HOME;
+let savedEnv: Record<string, string | undefined>;
 
 beforeEach(async () => {
+  savedEnv = Object.fromEntries(["HOME", "RBOX_HOME", "RBOX_TOKEN", "RBOX_DEVICE_ID"].map((key) => [key, process.env[key]]));
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-"));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-home-"));
   process.env.HOME = home; // isolate credentials loaded by track
@@ -28,11 +29,10 @@ beforeEach(async () => {
 afterEach(async () => {
   console.log = origLog;
   globalThis.fetch = origFetch;
-  delete process.env.RBOX_TOKEN;
-  delete process.env.RBOX_DEVICE_ID;
-  delete process.env.RBOX_HOME;
-  if (origHome === undefined) delete process.env.HOME;
-  else process.env.HOME = origHome;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(dir, { recursive: true, force: true });
   await fs.rm(home, { recursive: true, force: true });
 });

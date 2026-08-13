@@ -2,6 +2,7 @@ import { saveConfig, type WorkspaceConfig } from "../config.js";
 import {
   initializeFolderCatalog,
   inspectFolderCatalog,
+  forgetFolder,
   recordFolder,
   snapshotPreCatalogPolicy,
 } from "../folder-config.js";
@@ -26,4 +27,10 @@ export async function prepareDaemonFolderAdmission(root: string, cfg: WorkspaceC
   }
   await saveConfig(root, cfg);
   await recordFolder(root, { options: snapshotPreCatalogPolicy(cfg) });
+}
+
+/** Release the exact catalog entry created by prepareDaemonFolderAdmission.
+ * Call only after every daemon using this root has stopped. */
+export async function releaseDaemonFolderAdmission(root: string): Promise<void> {
+  await forgetFolder(root);
 }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -18,7 +18,7 @@ import type { LocalObservationCommitIntent, LocalObservationCommitReceipt, Unset
 import { gitReposMatcherKey, gitTopologyChanged } from "./manifest-update.js";
 import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js";
 import { watcherTrustLine } from "../status-view.js";
-import { prepareDaemonFolderAdmission } from "./folder-admission.test-helper.js";
+import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 
@@ -121,6 +121,7 @@ interface DaemonInternals {
   loadSyncBase(): Promise<SyncState>;
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
   buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult>;
+  stop(): Promise<void>;
   localObserver: {
     observe(plan: ScanGenerationPlan): Promise<ScanObservationReceipt>;
   };
@@ -129,26 +130,42 @@ interface DaemonInternals {
 let root: string;
 let lines: string[];
 let daemon: DaemonInternals | undefined;
-let savedGitApplyLazy: string | undefined;
+let savedEnv = {
+  RBOX_PULL_TRUST_WATCHER: process.env.RBOX_PULL_TRUST_WATCHER,
+  RBOX_WATCHER_RETRUST: process.env.RBOX_WATCHER_RETRUST,
+  RBOX_GIT_APPLY_LAZY: process.env.RBOX_GIT_APPLY_LAZY,
+};
+const ambientWatcherRetrust = process.env.RBOX_WATCHER_RETRUST;
+
+afterAll(() => {
+  expect(process.env.RBOX_WATCHER_RETRUST).toBe(ambientWatcherRetrust);
+});
 
 beforeEach(async () => {
   // Tests pin default-ON behavior; an ambient kill-switch run must not leak in.
+  savedEnv = {
+    RBOX_PULL_TRUST_WATCHER: process.env.RBOX_PULL_TRUST_WATCHER,
+    RBOX_WATCHER_RETRUST: process.env.RBOX_WATCHER_RETRUST,
+    RBOX_GIT_APPLY_LAZY: process.env.RBOX_GIT_APPLY_LAZY,
+  };
   delete process.env.RBOX_PULL_TRUST_WATCHER;
   delete process.env.RBOX_WATCHER_RETRUST;
-  savedGitApplyLazy = process.env.RBOX_GIT_APPLY_LAZY;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
   await prepareDaemonFolderAdmission(root, testConfig());
 });
 afterEach(async () => {
-  daemon?.retryQueue.stop();
-  for (const audit of daemon?.openDriftAudits ?? []) if (audit.timer) clearTimeout(audit.timer);
+  await daemon?.stop().catch(() => {});
   daemon = undefined;
-  delete process.env.RBOX_PULL_TRUST_WATCHER;
-  delete process.env.RBOX_WATCHER_RETRUST;
-  if (savedGitApplyLazy === undefined) delete process.env.RBOX_GIT_APPLY_LAZY;
-  else process.env.RBOX_GIT_APPLY_LAZY = savedGitApplyLazy;
-  await fs.rm(root, { recursive: true, force: true });
+  try {
+    await releaseDaemonFolderAdmission(root);
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 function testConfig(): WorkspaceConfig {

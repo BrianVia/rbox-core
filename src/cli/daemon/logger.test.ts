@@ -9,15 +9,18 @@ import { parseDaemonDatedLogBasename, parseDaemonLogRetentionDays, RotatingDaemo
 
 let root: string;
 let home: string;
+let savedRboxHome: string | undefined;
 
 beforeEach(async () => {
+  savedRboxHome = process.env.RBOX_HOME;
   root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-logger-"));
   home = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-logger-home-"));
   process.env.RBOX_HOME = home;
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_HOME;
+  if (savedRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = savedRboxHome;
   await fsp.rm(root, { recursive: true, force: true });
   await fsp.rm(home, { recursive: true, force: true });
 });
