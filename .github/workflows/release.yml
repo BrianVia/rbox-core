@@ -161,6 +161,11 @@ jobs:
     needs: smoke
     runs-on: ubuntu-latest
     environment: release
+    # contents: write ONLY for the GitHub Release step below; R2 publication
+    # and signing are untouched by this grant.
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -183,6 +188,27 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --upload-only
+      - name: GitHub Release (notes + binaries)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NOTES=/tmp/release-notes.md
+          if [[ "$TAG" == *-* ]]; then
+            FLAGS=(--prerelease)
+            printf 'Prerelease on the opt-in `next` channel.\n\nInstall: `curl -fsSL https://rbox.to/next/install.sh | sh` or `rbox upgrade --channel next`.\n' > "$NOTES"
+          else
+            FLAGS=()
+            # Extract this version's CHANGELOG section (between its heading and the next one).
+            awk -v ver="${TAG#v}" 'BEGIN{on=0} /^## \[/{ if (on) exit; if (index($0, "[" ver "]")) { on=1; next } } on' CHANGELOG.md > "$NOTES"
+            test -s "$NOTES" || { echo "::error::CHANGELOG.md has no section for ${TAG#v}"; exit 1; }
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/rbox-* --clobber
+            gh release edit "$TAG" --notes-file "$NOTES"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES" "${FLAGS[@]}" dist/rbox-*
+          fi
       - name: Rebuild the public changelog page
         if: ${{ !contains(github.ref_name, '-') }}
         env:
