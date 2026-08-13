@@ -6,6 +6,11 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Leftover `AUTO_MERGE`, `MERGE_MSG`, and `REBASE_HEAD` files from concluded
+  Git operations no longer strand followers; real in-progress markers still
+  defer, and linked-worktree diagnostics name the responsible worktree.
+
 ## [2.0.0-beta.2] - 2026-08-12
 
 ### Fixed

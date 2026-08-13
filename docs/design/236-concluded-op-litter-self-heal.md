@@ -100,14 +100,23 @@ c) **Locked-boundary proof** (`src/cli/sync-git/follow.ts:992-999`): today
    ORIG_HEAD ∈ its mismatches ⇔ `origHeadPreservation` exists. No fossil
    value/set comparison between initial and boundary classification
    (r5 step-out cut): the waiver decision never reads fossil VALUES — only
-   whether corroborated in-progress markers exist — and any real git
-   operation starting mid-flight creates those markers first (the
-   in-progress set is exactly git's `wt_status_get_state` inputs), which
-   fails `breadcrumbWaived` at the boundary. ORIG_HEAD alone needs value
-   stability, and its preservation lock already provides it. The boundary
-   failure detail names the actual rels instead of the current hard-coded
-   "differs at ORIG_HEAD" (:993 lies today whenever the mismatch was
-   MERGE_MSG — small truthfulness fix riding along).
+   whether corroborated in-progress markers exist. A real git operation
+   starting mid-flight creates an in-progress marker, which (a) vetoes
+   `breadcrumbWaived` at the boundary whenever any breadcrumb activity is
+   in play, and (b) otherwise defers through the mismatch loop exactly as
+   on the initial classification. ORIG_HEAD alone needs value stability,
+   and its preservation lock already provides it.
+   **Scope note (impl review, codex):** an in-progress marker whose value
+   EQUALS base's or incoming's op-state entry produces no mismatch and
+   commits — on the boundary AND on the initial classification, today on
+   main, unchanged by this design. That is the op-state plane's deliberate
+   base/incoming diff semantics (the follow conforms op-state to incoming
+   anyway); whether presence-regardless-of-value should defer is a
+   pre-existing question, tracked with the git-resolve rig-suite design
+   candidate, NOT silently changed here.
+   The boundary failure detail names the actual rels instead of the
+   current hard-coded "differs at ORIG_HEAD" (:993 lies today whenever the
+   mismatch was MERGE_MSG — small truthfulness fix riding along).
 
 Net predicate, one sentence: **a repo defers for `local-operation` iff a
 marker git itself would treat as in-progress is present; fossils alone never

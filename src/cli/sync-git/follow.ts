@@ -64,7 +64,7 @@ import { loadContentEquivalenceCache } from "./content-equivalence-cache.js";
 import { checkoutJournalBinding } from "./follow-journal.js";
 import { candidateIndexCollision, deriveBaseIndexProjection, expectedHead, indexArtifact, stageIncoming } from "./follow-staging.js";
 import { readLive } from "./follow-live.js";
-import { classifyCheckout, firstReason } from "./follow-classify.js";
+import { classifyCheckout, firstReason, opStateDetailToken } from "./follow-classify.js";
 import { appliedTerminalOid, effectiveRefs, ensureStashReflog, selectCheckoutSelfRootWitness } from "./follow-ref-witness.js";
 import {
   blockerForReason,
@@ -743,13 +743,18 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     let origHeadPreservation: OrigHeadPreservation | undefined;
     if (first.breadcrumbWaived) {
       try {
-        const mismatch = first.breadcrumbMismatches.length === 1 ? first.breadcrumbMismatches[0] : undefined;
-        const origHeadMismatch = mismatch?.rel === "ORIG_HEAD" ? { ...mismatch, rel: "ORIG_HEAD" as const } : undefined;
-        if (!origHeadMismatch) throw new Error("unexpected breadcrumb waiver shape");
-        origHeadPreservation = await preserveOrigHead(opts, origHeadMismatch);
+        const origHeadMismatches = first.breadcrumbMismatches.filter((mismatch) => mismatch.rel === "ORIG_HEAD");
+        if (origHeadMismatches.length > 1) throw new Error("unexpected breadcrumb waiver shape");
+        const origHeadMismatch = origHeadMismatches[0];
+        if (origHeadMismatch) {
+          origHeadPreservation = await preserveOrigHead(opts, { ...origHeadMismatch, rel: "ORIG_HEAD" });
+        }
+        if ((origHeadMismatch !== undefined) !== (origHeadPreservation !== undefined)) {
+          throw new Error("unexpected breadcrumb waiver shape");
+        }
       } catch (error) {
         opts.log?.(origHeadPreservationFailureLine(opts.relPath, error));
-        return deferResult(progress, "local-operation", "operation state differs at ORIG_HEAD");
+        return deferResult(progress, "local-operation", `operation state differs at ${opStateDetailToken(opts.ctx, "ORIG_HEAD")}`);
       }
     }
 
@@ -989,13 +994,18 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           ownershipContext: boundaryOwnershipContext,
         }));
         if (!proof.safe) boundaryFailure = proof;
-        if (!opts.manualResolution && proof.breadcrumbMismatches.length > 0 && !origHeadPreservation) {
-          noteBoundaryFailure("local-operation", "operation state differs at ORIG_HEAD");
-          return false;
-        }
-        if (origHeadPreservation && (!proof.breadcrumbWaived || proof.breadcrumbMismatches.length !== 1 || proof.breadcrumbMismatches[0]?.rel !== "ORIG_HEAD")) {
-          noteBoundaryFailure("local-operation", "operation state differs at ORIG_HEAD");
-          return false;
+        if (!opts.manualResolution && (first.breadcrumbWaived || proof.breadcrumbMismatches.length > 0 || origHeadPreservation)) {
+          const boundaryHasOrigHead = proof.breadcrumbMismatches.some((mismatch) => mismatch.rel === "ORIG_HEAD");
+          if (!proof.breadcrumbWaived || boundaryHasOrigHead !== (origHeadPreservation !== undefined)) {
+            if (proof.safe) {
+              const rels = [...new Set([
+                ...first.breadcrumbMismatches.map((mismatch) => mismatch.rel),
+                ...proof.breadcrumbMismatches.map((mismatch) => mismatch.rel),
+              ])];
+              noteBoundaryFailure("local-operation", `operation state differs at ${rels.map((rel) => opStateDetailToken(opts.ctx, rel)).join(", ")}`);
+            }
+            return false;
+          }
         }
         if (!sameIncarnation) { noteBoundaryFailure("unreadable", "repository incarnation changed at checkout boundary"); return false; }
         if (!live) { noteBoundaryFailure("unreadable", "git metadata became unreadable"); return false; }

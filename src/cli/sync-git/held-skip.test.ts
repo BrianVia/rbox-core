@@ -3,9 +3,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { git } from "../../engine/git/shared.js";
-import { gitPreflight } from "../../engine/index.js";
+import { gitPreflight, hashBytes } from "../../engine/index.js";
 import type { GitHeldAttempt, TypedBlocker } from "../config.js";
-import { GIT_FINGERPRINT_VERSION } from "./fingerprint.js";
+import { GIT_FINGERPRINT_SCHEMA_VERSION, GIT_FINGERPRINT_VERSION } from "./fingerprint.js";
+import {
+  MAX_GIT_CONFIG_KEYS,
+  MAX_GIT_CONFIG_KEY_BYTES,
+  MAX_GIT_CONFIG_SERIALIZED_BYTES,
+  MAX_GIT_CONFIG_VALUE_BYTES,
+} from "../../engine/git/config-sync.js";
 import { gitIncomingKey } from "./shared.js";
 import {
   blockersAfterComposer,
@@ -20,6 +26,7 @@ import {
   heldBlockersAllowSkip,
   observeHeldInputs,
   readWorktreeRegistryDigest,
+  earlyHeldAttemptDecision,
 } from "./held-skip.js";
 
 const roots: string[] = [];
@@ -34,6 +41,40 @@ const localOperation: TypedBlocker = { provenance: "checkout", reason: "local-op
 const ownership: TypedBlocker = {
   provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/topic",
 };
+
+test("previous fingerprint epoch misses held-skip with fingerprint-version", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-held-epoch-"));
+  roots.push(root);
+  await git(root, ["init", "-q"]);
+  const previousVersion = hashBytes(Buffer.from(JSON.stringify({
+    schema: GIT_FINGERPRINT_SCHEMA_VERSION - 1,
+    configWireBounds: [MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_VALUE_BYTES],
+  })));
+  const decision = await earlyHeldAttemptDecision({
+    root,
+    relPath: ".",
+    incoming: { bundleSha: "1".repeat(64), bundleEncSha: "2".repeat(64), bundleCipherSize: 1, head: "ref: refs/heads/main\n", refs: {}, refScope: "all" },
+    attempt: {
+      incomingKey: "incoming",
+      localFingerprint: "fp",
+      fingerprintVersion: previousVersion,
+      effectiveBaseIndexProjection: null,
+      effectiveIncomingIndexProjection: null,
+      incomingIndexArtifactDescriptor: "null",
+      worktreeRegistryDigest: "worktrees",
+      maxFingerprintTimestampMs: 0,
+      reflogs: [],
+      repoIdentity: "repo",
+      stateNonce: "nonce",
+      baseOriginsHash: "base",
+      partialDisposition: "null",
+      classifierInputKey: "classifier",
+      blockers: [localOperation],
+      at: new Date().toISOString(),
+    },
+  });
+  expect(decision).toEqual({ matches: false, reason: "fingerprint-version" });
+});
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);

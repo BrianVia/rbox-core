@@ -7,9 +7,11 @@
  * call sites are in this module — `classifyCheckoutOwnership`'s default `prove`
  * and the timed override `classifyCheckout` passes it — and neither changes the
  * number of git subprocesses spawned. Moved verbatim out of follow.ts. */
+import path from "node:path";
 import {
   enumerateStashReflogOids,
   partitionOwnedByIncoming,
+  type RepoCtx,
   type OwnershipProofContext,
 } from "../../engine/index.js";
 import { OP_STATE_CLASSIFICATION } from "../../engine/manifest-validate.js";
@@ -49,6 +51,13 @@ export function firstReason(reasons: ReadonlySet<GitDeferralReason>): GitDeferra
 export interface CheckoutOwnershipClassification {
   reasons: GitDeferralReason[];
   details: string[];
+}
+
+export function opStateDetailToken(ctx: RepoCtx, rel: string): string {
+  const linkedWorktreesDir = path.join(ctx.commonDir, "worktrees");
+  return path.dirname(ctx.gitDir) === linkedWorktreesDir
+    ? `worktrees/${path.basename(ctx.gitDir)}/${rel}`
+    : rel;
 }
 
 /**
@@ -158,19 +167,11 @@ export async function classifyCheckout(args: {
       const value = live.opState[rel] ?? null;
       if (value !== (baseOp[rel] ?? null) && value !== (incomingOp[rel] ?? null)) {
         const root = opStateRootOf(rel);
-        // The WAIVER is ORIG_HEAD-only: its act preserves the discarded value as a
-        // recovery ref (preserveOrigHead), which only makes sense for a commit-valued
-        // breadcrumb, and both the act and the boundary recheck already refuse any
-        // other shape. Classification governs the in-progress PREDICATE (does git
-        // consider an operation active); it does not by itself make a root waivable.
-        // Naming ORIG_HEAD here keeps a MERGE_MSG/AUTO_MERGE mismatch deferring with
-        // its own truthful detail instead of reaching the act and being reported as
-        // an ORIG_HEAD difference.
-        if (root === "ORIG_HEAD") {
+        if (OP_STATE_CLASSIFICATION[root] === "breadcrumb") {
           breadcrumbMismatches.push({ rel: root, live: value, base: baseOp[rel] ?? null, incoming: incomingOp[rel] ?? null });
         } else {
           reasons.add("local-operation");
-          details.push(`operation state differs at ${rel}`);
+          details.push(`operation state differs at ${opStateDetailToken(args.opts.ctx, rel)}`);
         }
       }
     }
@@ -212,7 +213,9 @@ export async function classifyCheckout(args: {
   if (breadcrumbMismatches.length > 0 && !breadcrumbWaived) {
     logVetoOnce(args.opts.workspaceRoot, args.opts.relPath, breadcrumbVetoGate ?? "indeterminate", args.opts.log);
     reasons.add("local-operation");
-    for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
+    for (const mismatch of breadcrumbMismatches) {
+      details.push(`operation state differs at ${opStateDetailToken(args.opts.ctx, mismatch.rel)}`);
+    }
   }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
   // Undefined here means the set is empty, never "no rank for this reason":

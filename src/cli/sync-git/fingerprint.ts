@@ -5,7 +5,9 @@ import { OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js
 import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "../../engine/git/config-sync.js";
 import { git } from "../../engine/git/shared.js";
 import { repoDirOf } from "./shared.js";
-export const GIT_FINGERPRINT_SCHEMA_VERSION = 7;
+// Classifier semantics participate in the schema because held decisions must
+// be reprobed when an unchanged on-disk marker changes meaning.
+export const GIT_FINGERPRINT_SCHEMA_VERSION = 8;
 export interface GitConfigWireBounds {
   maxKeys: number;
   maxSerializedBytes: number;
