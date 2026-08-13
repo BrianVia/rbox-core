@@ -56,6 +56,20 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
     expect(m.ignores("src/git-state.ts")).toBe(false); // only the exact name matches
   });
 
+  test("`node_modules` matches every entry type — a SYMLINK/file, not just the dir", () => {
+    // pnpm/worktree setups symlink node_modules to a shared install. With the old
+    // `node_modules/` (dir-only) builtin, such a symlink synced to the fleet and
+    // wedged a receiver's applied-manifest oracle forever (issue #659, 2026-08-13).
+    // Path-string checks are stat-blind, so the bare name must match file-form too.
+    const m = buildIgnoreMatcher(root);
+    expect(m.ignores("node_modules")).toBe(true); // file/symlink form at the root
+    expect(m.ignores("pkg/node_modules")).toBe(true); // nested
+    expect(m.ignores(".claude/worktrees/wt1/node_modules")).toBe(true); // agent worktree
+    expect(m.ignores(".claude/worktrees/wt1/studio/node_modules")).toBe(true);
+    expect(m.ignores("node_modules/")).toBe(true); // dir form still excluded
+    expect(m.ignores("src/node_modules_helper.ts")).toBe(false); // only the exact name
+  });
+
   test("a `!.git` negation CANNOT re-include it (hard exclusion, like .rbox)", () => {
     // Raw `.git` trees synced file-by-file arrive torn; a project's stray `!.git`
     // must not switch that hazard back on — git state transfers via git-sync only.
@@ -745,7 +759,11 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
       BUILTIN_IGNORE.filter((p) => p.endsWith("/") && !p.startsWith("!") && !p.slice(0, -1).includes("/") && !/[*?[\]]/.test(p))
         .map((p) => p.slice(0, -1))
     );
-    bareDirNames.add(".git"); // the one slashless hard exclude that is also a prune dir
+    // Slashless builtins that are also prune dirs: they match ANY entry type
+    // (`.git` pointer files; `node_modules` symlinks — issue #659), so they
+    // carry no trailing slash and the derivation above misses them.
+    bareDirNames.add(".git");
+    bareDirNames.add("node_modules");
     for (const dir of HARD_PRUNE_DIRS) {
       expect([dir, dir.includes("/"), bareDirNames.has(dir)]).toEqual([dir, false, true]);
     }
