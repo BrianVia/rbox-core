@@ -6,6 +6,11 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- macOS filesystem scans now use the native bulk directory walk by default
+  when supported; no environment opt-in is required. Runtime capability,
+  directory-probe, and per-directory fallback guards remain in place.
+
 ### Fixed
 - Leftover `AUTO_MERGE`, `MERGE_MSG`, and `REBASE_HEAD` files from concluded
   Git operations no longer strand followers; real in-progress markers still
@@ -1188,7 +1193,7 @@ now field-verified and on, plus the macOS performance sprint.
 
 ### Improved (measured on the live fleet)
 - **macOS scans: per-file stat eliminated (design 107, #241).**
-  `RBOX_SCAN_BULK=1` (darwin-only) walks directories with one
+  At that release, the Darwin opt-in preview walked directories with one
   `getattrlistbulk` syscall instead of ~118k `lstat`s — warm full scan
   **5.5s → 3.1s bench, 3.9s pull-scan / 2.0–3.2s safety-scan live**, with
   value-identical attributes (0 parity mismatches across the full corpus)

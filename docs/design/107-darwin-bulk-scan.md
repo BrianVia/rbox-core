@@ -2,11 +2,11 @@
 
 ## 1. Scope and rollout
 
-Add an opt-in Darwin-only discovery fast path under `RBOX_SCAN_BULK=1`. The
-default path remains structurally unchanged: when the flag is absent, no FFI
-module initialization, `dlopen`, directory open, or bulk syscall occurs. The
-fast path applies only to non-dircache-reused directories and is disabled while
-the independent directory probe is active.
+Add a Darwin-only discovery fast path. Since the 2026-08 default-on change, the
+scanner uses it whenever the runtime supports the native binding. Unsupported
+runtimes fail closed without a syscall and use the ordinary listing. The fast
+path applies only to non-dircache-reused directories and is disabled while the
+independent directory probe is active.
 
 The optimization replaces a directory's `readdir` plus each regular child's
 initial `stat` with `getattrlistbulk`. Symlink target reads, recursive traversal,
@@ -66,7 +66,7 @@ the real stat's current type or omitted under the same supported-type policy.
 In the existing non-reused branch, the exact guard is:
 
 ```ts
-scanBulkEnabled() && !ctx.dirProbe && bulkWalkSupported()
+!ctx.dirProbe && bulkWalkSupported()
 ```
 
 On a successful bulk listing, derive the same `DirCacheChild[]` and a local map
@@ -96,6 +96,10 @@ make the stability check false without crashing. Linux asserts unsupported and
 timestamps), and exits nonzero on any disagreement. Required local gates are
 the focused Bun test and `bunx tsc --noEmit`; the macOS harness is the ABI and
 access-mask rollout arbiter because Linux CI cannot exercise the syscall.
+The platform-independent manifest integration test installs
+`setBulkWalkOverrideForTests`, scans without environment setup, and asserts the
+override is called for both its root and nested directory. This proves the
+default-on policy on Linux while leaving native capability detection untouched.
 
 ## Review ledger
 
@@ -125,17 +129,18 @@ dirs on APFS, Bun 1.3.14.
   syscall/dir at 1447 ms). **≈42 % faster**, −2278 ms. All 118,384 files hit the
   cache with 0 re-hashes in both modes (no cache invalidation).
 
-## Known scoping / pre-default-on gate
+## Default-on decision and remaining scope
 
-- **Opt-in only.** `RBOX_SCAN_BULK=1`, darwin-only. Flag-off is byte-identical
-  (no `dlopen`, no syscall). This PR does not flip the default.
+- **Default-on since 2026-08.** Darwin scans use the fast path when the native
+  binding is available. Unsupported runtimes and binding failures use the
+  ordinary listing, while each per-directory failure still falls back atomically.
 - **Failure mode is deferral, never corruption.** Any FFI/parse failure falls the
   whole directory back to readdir atomically. Even a bulk attr that were to differ
   from `lstat` cannot poison the cache: `HashCache.record` always stores
   post-hash `fs.lstat` values, so a divergent field only re-defers (re-hashes)
   that file each scan — bounded, self-correcting, not fleet-wide corruption.
-- **Residual parity risk to close before default-on:** attrs returned *valid but
-  divergent* escape the returned-bit safety net. HFS-compressed files were tested
+- **Accepted residual parity risk:** attrs returned *valid but divergent* escape
+  the returned-bit safety net. HFS-compressed files were tested
   and are parity-clean (DATALENGTH returns the logical size, matching `st_size`).
   Still unverified: iCloud-**dataless** (`SF_DATALESS`) placeholders and
   **non-APFS** mounts (SMB/exFAT synthesized inodes). Non-APFS that lacks
@@ -143,11 +148,11 @@ dirs on APFS, Bun 1.3.14.
   but synthesizes differently is the open case. Cheap hardening if needed: request
   `ATTR_CMN_FLAGS` and route `UF_COMPRESSED`/`SF_DATALESS` records through
   `childFromLstat` (shifts fileid→80, datalength→88; re-validate offsets on Mac).
-- **ScanStats semantics under the flag:** bulk-statted files count in
+- **ScanStats semantics under bulk walking:** bulk-statted files count in
   `filesStatted` but with ~0 `statMs` — their cost lands in `readdirMs` (the bulk
   syscall subsumes both readdir and stat). Dashboards reading these fields on a
   bulk scan should read `readdirMs` as the combined discovery cost.
-- **Dircache (Layer A) composition:** the bulk path does not call
-  `dircache.record`, so with `RBOX_SCAN_PRUNE` also on, bulk-walked dirs are not
-  seeded into / reused from the dircache. The two optimizations target the same
-  cost; composing them (record bulk children) is a follow-up.
+- **Dircache (Layer A) composition:** successful bulk listings feed the shared
+  `dircache.record` step, so later pruned scans can reuse them without another
+  bulk syscall. The runtime bulk guard only applies to directories not already
+  reused from the cache.

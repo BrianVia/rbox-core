@@ -426,10 +426,6 @@ function deferWalkFault(ctx: WalkCtx, childRel: string, error: unknown): boolean
 
 class RulesChangedDuringPrune extends Error {}
 
-export function scanBulkEnabled(): boolean {
-  return process.env.RBOX_SCAN_BULK === "1";
-}
-
 async function walk(
   ctx: WalkCtx,
   rel: string,
@@ -462,7 +458,7 @@ async function walk(
   if (reused) {
     if (ctx.scanStats) ctx.scanStats.dirsReusedFromCache += 1;
   } else {
-    if (scanBulkEnabled() && !ctx.dirProbe && bulkWalkSupported()) {
+    if (!ctx.dirProbe && bulkWalkSupported()) {
       const timedWarningSink = ctx.warningSink && ctx.accounting
         ? (line: string) => ctx.accounting!.observe(() => ctx.warningSink!(line))
         : ctx.warningSink;

@@ -21,15 +21,13 @@ test("bulk walk is safely unavailable off Darwin", () => {
   expect(bulkWalkDir(".")).toBeNull();
 });
 
-test("successful bulk listings seed dircache and the warm scan reuses every directory", async () => {
+test("supported bulk listings run by default, seed dircache, and are reused by the warm scan", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-bulk-dircache-"));
   roots.push(root);
   await fs.mkdir(path.join(root, "nested"));
   await fs.writeFile(path.join(root, "top.txt"), "top");
   await fs.writeFile(path.join(root, "nested/child.txt"), "child");
 
-  const priorFlag = process.env.RBOX_SCAN_BULK;
-  process.env.RBOX_SCAN_BULK = "1";
   setSystemTime(Date.now() + RACY_MARGIN_MS + 1_000);
   let bulkCalls = 0;
   setBulkWalkOverrideForTests((absDir): BulkChild[] => {
@@ -42,22 +40,17 @@ test("successful bulk listings seed dircache and the warm scan reuses every dire
     });
   });
 
-  try {
-    const dircache = new DirCache();
-    const seeded = await scanManifest(root, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dircache, "unpruned");
-    expect(bulkCalls).toBe(2);
+  const dircache = new DirCache();
+  const seeded = await scanManifest(root, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dircache, "unpruned");
+  expect(bulkCalls).toBe(2);
 
-    setBulkWalkOverrideForTests(() => { throw new Error("warm scan enumerated instead of reusing bulk-seeded listings"); });
-    const stats = createScanStats();
-    const warm = await scanManifest(root, undefined, undefined, undefined, undefined, stats, undefined, undefined, dircache, "pruned");
-    expect(warm.files).toEqual(seeded.files);
-    expect(stats.dircacheOutcome).toBe("hit");
-    expect(stats.dirsReusedFromCache).toBe(2);
-    expect(stats.dirsWalked).toBe(0);
-  } finally {
-    if (priorFlag === undefined) delete process.env.RBOX_SCAN_BULK;
-    else process.env.RBOX_SCAN_BULK = priorFlag;
-  }
+  setBulkWalkOverrideForTests(() => { throw new Error("warm scan enumerated instead of reusing bulk-seeded listings"); });
+  const stats = createScanStats();
+  const warm = await scanManifest(root, undefined, undefined, undefined, undefined, stats, undefined, undefined, dircache, "pruned");
+  expect(warm.files).toEqual(seeded.files);
+  expect(stats.dircacheOutcome).toBe("hit");
+  expect(stats.dirsReusedFromCache).toBe(2);
+  expect(stats.dirsWalked).toBe(0);
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;
@@ -123,8 +116,6 @@ darwinTest("getattrlistbulk inventory and file metadata exactly match Bun lstat"
   const deferred = new Set<string>();
   let mutating = true;
   const mutation = (async () => { while (mutating) await fs.appendFile(changingFile, "x"); })();
-  const priorFlag = process.env.RBOX_SCAN_BULK;
-  process.env.RBOX_SCAN_BULK = "1";
   try {
     const manifest = await scanManifest(changing, undefined, undefined, undefined, undefined, undefined, deferred);
     expect(manifest.files.some((entry) => entry.path === "changing.bin")).toBe(false);
@@ -132,7 +123,5 @@ darwinTest("getattrlistbulk inventory and file metadata exactly match Bun lstat"
   } finally {
     mutating = false;
     await mutation;
-    if (priorFlag === undefined) delete process.env.RBOX_SCAN_BULK;
-    else process.env.RBOX_SCAN_BULK = priorFlag;
   }
 });

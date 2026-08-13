@@ -18,8 +18,8 @@ fleet-wide (first-ever successful keep-mine, seq 2065); FM has a benign stale
 pending lane to take-theirs in a quiet moment (same signature as blog's).
 Task #21 verified IN SOURCE: parcel-watcher checkpoint-resume is real journal
 replay on macOS (GO with fail-closed harness), disguised full scan on Linux
-(NO-GO); Darwin bulk-walk ALREADY BUILT (design 107, RBOX_SCAN_BULK=1, 42%
-faster, needs its parity gate to default on); watcher passes only globs so
+(NO-GO); Darwin bulk-walk ALREADY BUILT (design 107, 42% faster, now default-on
+when supported); watcher passes only globs so
 FSEvents gets zero kernel-level exclusions (free fix, helps live watcher)._
 
 _RECEIVER SOLVED + SAVVY-CORE UNWEDGED (2026-08-13 overnight). LATEST

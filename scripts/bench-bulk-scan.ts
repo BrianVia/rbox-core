@@ -1,15 +1,16 @@
 /**
- * Full-scan wall-time benchmark for the darwin bulk-walk prototype (founder perf
- * task). Read-only against the target root.
+ * Full-scan wall-time benchmark for the default Darwin bulk walk. Read-only
+ * against the target root.
  *
  * Measures WARM scans (HashCache primed → all cache hits → the pass is stat +
  * readdir dominated, exactly the phase getattrlistbulk targets), plus one COLD
- * scan for context. Toggle the bulk path with RBOX_SCAN_BULK=1.
+ * scan for context. On unsupported runtimes the scanner uses its ordinary
+ * per-directory fallback.
  *
  *   bun scripts/bench-bulk-scan.ts <root> [--iters=N]
- *   RBOX_SCAN_BULK=1 bun scripts/bench-bulk-scan.ts <root> --iters=5
  */
 import { buildIgnoreMatcher, createScanStats, HashCache, scanManifest, type ScanStats } from "../src/engine/index.js";
+import { bulkWalkSupported } from "../src/engine/darwin-bulk-walk.js";
 
 const p50 = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
 
@@ -25,7 +26,7 @@ async function oneScan(root: string, cache: HashCache): Promise<{ wallMs: number
 const root = process.argv[2];
 if (!root) { console.error("usage: bun scripts/bench-bulk-scan.ts <root> [--iters=N]"); process.exit(2); }
 const iters = Number(process.argv.find((a) => a.startsWith("--iters="))?.split("=")[1] ?? 5);
-const bulk = process.env.RBOX_SCAN_BULK === "1";
+const bulk = bulkWalkSupported();
 
 const cache = new HashCache();
 const cold = await oneScan(root, cache); // primes the cache (hashes everything)
@@ -39,7 +40,7 @@ for (let i = 0; i < iters; i++) {
 }
 
 console.log(JSON.stringify({
-  mode: bulk ? "bulk" : "stock", platform: process.platform, arch: process.arch, root,
+  mode: bulk ? "bulk" : "fallback", platform: process.platform, arch: process.arch, root,
   coldWallMs: Math.round(cold.wallMs),
   warm: {
     iters,

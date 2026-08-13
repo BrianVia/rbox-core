@@ -75,16 +75,17 @@ the ones marked ✅ were additionally re-verified first-hand at HEAD.
 
 ## Tier B — founder decisions (cheap, large payoff)
 
-11. **Six shipped feature lanes are dark** — default-off `=== "1"` flags with
+11. **Five shipped feature lanes are dark** — default-off `=== "1"` flags with
     zero setters anywhere in src/apps/scripts/CI: `RBOX_PUBLISH_PIPELINE`
     (gates 961 non-test lines; **field gate FAILED 2026-07-13**, +71% slower,
-    STATUS:504), `RBOX_MDE_FAST_PULL`, `RBOX_MDE_DELTA`, `RBOX_SCAN_BULK`,
+    STATUS:504), `RBOX_MDE_FAST_PULL`, `RBOX_MDE_DELTA`,
     `RBOX_PREFLIGHT_DELTA` (was set by hand on fleet daemons in the v1.0.1
     era — i.e. it works and everyone wants it), `RBOX_WATCHER_RETRUST`
     (design 104, the Mac I/O duty-cycle fix; default-off contradicts the
     default-on rule and its fork has leaked contamination logic into the
     drift auditor). Each is CI-tested code that never runs in production.
-    Needed: one line per flag — flip default-on, or delete the lane.
+    Needed: one line per flag — flip default-on, or delete the lane. The Darwin
+    bulk scan called out in the original six-lane audit is now default-on.
 12. **Delete the dead pre-E2EE plaintext transport.** `commits.ts:377-385`
     still casts `/latest` to `{sequence, manifest}` — a field the Worker
     stopped returning — and `apiFor` (`sync/policy.ts:7`) installs that
