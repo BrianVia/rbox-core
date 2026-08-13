@@ -123,14 +123,12 @@ export class ScanAccounting {
     }
   }
 
-  async async<T>(bucket: ScanTimingBucket, fn: () => Promise<T>): Promise<T> {
+  async<T>(bucket: ScanTimingBucket, fn: () => Promise<T>): Promise<T> {
     const startedAt = performance.now();
     const observerAtStart = this.nestedObserverMs;
-    try {
-      return await fn();
-    } finally {
+    return fn().finally(() => {
       this.add(bucket, Math.max(0, performance.now() - startedAt - (this.nestedObserverMs - observerAtStart)));
-    }
+    });
   }
 
   /** Partition one concurrent async phase into exclusive wall-time buckets.

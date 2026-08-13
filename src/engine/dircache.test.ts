@@ -145,6 +145,31 @@ test("type swaps and a newly appeared nested rule force fresh structural truth",
   expect(asDir.files.some((f) => f.path === "d/item/inside")).toBeTrue();
 });
 
+test("a vanished child from a reused listing cancels only that cached subtree", async () => {
+  const root = await tmp();
+  await fs.mkdir(path.join(root, "real"));
+  await fs.writeFile(path.join(root, "real", "kept.txt"), "kept");
+  await settle();
+  const rootStat = await fs.lstat(root);
+  const priorScanStart = Date.now();
+  const dc = new DirCache({
+    version: 2,
+    lastScanStartMs: priorScanStart,
+    lastUnprunedScanAtMs: Date.now(),
+    ruleFiles: [{ relPath: ".gitignore", absent: true }, { relPath: ".rboxignore", absent: true }],
+    entries: {
+      "": {
+        mtimeMs: rootStat.mtimeMs,
+        ctimeMs: rootStat.ctimeMs,
+        children: [{ name: "ghost", type: "dir" }, { name: "real", type: "dir" }],
+      },
+    },
+  });
+
+  const manifest = await scanManifest(root, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dc, "pruned");
+  expect(manifest.files.map(({ path: rel }) => rel)).toEqual(["real/kept.txt"]);
+});
+
 test("rule changes, deadline, backward clock, and forced unpruned fail closed", async () => {
   const root = await tmp();
   await fs.mkdir(path.join(root, "hidden")); await fs.writeFile(path.join(root, "hidden/x"), "x");

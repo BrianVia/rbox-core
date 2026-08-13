@@ -390,7 +390,113 @@ interface PendingHash {
   st: FileStatLike;
 }
 
+interface PendingStat {
+  childRel: string;
+  abs: string;
+  bulkStat?: FileStatLike;
+}
+
 const HASH_CONCURRENCY = 16; // bound on parallel hashing — saturates disk without fd storms
+const WALK_CONCURRENCY = 16;
+const FILE_STAT_BATCH_SIZE = 16;
+
+interface WalkAbsenceScope {
+  parent?: WalkAbsenceScope;
+  cancelled: boolean;
+}
+
+interface WalkTask {
+  scope?: WalkAbsenceScope;
+  work(): Promise<void>;
+}
+
+/** One dynamic queue per walk. Directory tasks may add descendants without
+ * awaiting them, so the single bound covers both recursion and file stats. */
+class WalkPool {
+  private readonly queue: WalkTask[] = [];
+  private active = 0;
+  private fatal: unknown;
+  private settled = false;
+  private readonly done: Promise<void>;
+  private resolveDone!: () => void;
+  private rejectDone!: (error: unknown) => void;
+
+  constructor(private readonly concurrency: number) {
+    this.done = new Promise<void>((resolve, reject) => {
+      this.resolveDone = resolve;
+      this.rejectDone = reject;
+    });
+  }
+
+  enqueue(work: () => Promise<void>, scope?: WalkAbsenceScope): void {
+    if (this.fatal !== undefined || this.scopeCancelled(scope)) return;
+    this.queue.push({ work, scope });
+    this.pump();
+  }
+
+  abort(error: unknown): void {
+    if (this.fatal !== undefined) return;
+    this.fatal = error;
+    this.queue.length = 0;
+    this.finishIfIdle();
+  }
+
+  drain(): Promise<void> {
+    this.pump();
+    this.finishIfIdle();
+    return this.done;
+  }
+
+  canContinue(scope?: WalkAbsenceScope): boolean {
+    return this.fatal === undefined && !this.scopeCancelled(scope);
+  }
+
+  private pump(): void {
+    while (this.fatal === undefined && this.active < this.concurrency) {
+      const task = this.queue.shift();
+      if (!task) break;
+      if (this.scopeCancelled(task.scope)) continue;
+      this.active += 1;
+      void task.work().catch((error) => {
+        if (task.scope && isAbsent(error)) this.cancelScope(task.scope);
+        else this.abort(error);
+      }).finally(() => {
+        this.active -= 1;
+        this.pump();
+        this.finishIfIdle();
+      });
+    }
+    this.finishIfIdle();
+  }
+
+  private cancelScope(scope: WalkAbsenceScope): void {
+    scope.cancelled = true;
+    for (let index = this.queue.length - 1; index >= 0; index--) {
+      if (this.withinScope(this.queue[index]!.scope, scope)) this.queue.splice(index, 1);
+    }
+  }
+
+  private scopeCancelled(scope?: WalkAbsenceScope): boolean {
+    for (let current = scope; current; current = current.parent) {
+      if (current.cancelled) return true;
+    }
+    return false;
+  }
+
+  private withinScope(candidate: WalkAbsenceScope | undefined, owner: WalkAbsenceScope): boolean {
+    for (let current = candidate; current; current = current.parent) {
+      if (current === owner) return true;
+    }
+    return false;
+  }
+
+  private finishIfIdle(): void {
+    if (this.settled || this.active !== 0 || this.queue.length !== 0) return;
+    this.settled = true;
+    if (this.fatal !== undefined) this.rejectDone(this.fatal);
+    else this.resolveDone();
+  }
+}
 
 interface WalkCtx {
   root: string;
@@ -431,8 +537,11 @@ async function walk(
   rel: string,
   out: FileEntry[],
   toHash: PendingHash[],
-  discoveryPruned: boolean
+  discoveryPruned: boolean,
+  pool: WalkPool,
+  absenceScope?: WalkAbsenceScope,
 ): Promise<void> {
+  // Under the shared walk pool these buckets are cumulative task-time, not wall-time slices.
   const absDir = path.join(ctx.root, rel);
   let dirStat: Stats | undefined;
   let children: DirCacheChild[] | undefined;
@@ -531,6 +640,7 @@ async function walk(
         return { childRel, abs: path.join(ctx.root, childRel) };
       }))
     : undefined;
+  const pendingStats: PendingStat[] = [];
   for (let childIndex = 0; childIndex < children!.length; childIndex++) {
     const child = children![childIndex]!;
     const prepared = preparedPaths?.[childIndex];
@@ -540,7 +650,11 @@ async function walk(
     // entirely on the "off" (no-dircache) path so it stays zero-new-work.
     if (ctx.mode !== "off" && isIgnoreRuleFile(childRel)) {
       ctx.observedRuleFiles.add(childRel);
-      if (!reused && ctx.mode === "pruned" && !ctx.priorRuleFiles.has(childRel)) throw new RulesChangedDuringPrune();
+      if (!reused && ctx.mode === "pruned" && !ctx.priorRuleFiles.has(childRel)) {
+        const error = new RulesChangedDuringPrune();
+        pool.abort(error);
+        throw error;
+      }
     }
     if (child.name === ".git") {
       const discover = (): DiscoveredGitRepo | undefined => {
@@ -562,12 +676,8 @@ async function walk(
           ? timedMatcher(ctx.accounting, () => ctx.matcher.prunesForGitDiscovery?.(childDir) ?? ctx.matcher.ignores(childDir))
           : ctx.matcher.prunesForGitDiscovery?.(childDir) ?? ctx.matcher.ignores(childDir));
       if (ctx.accounting ? timedMatcher(ctx.accounting, () => ctx.matcher.prunes?.(childDir) ?? ctx.matcher.ignores(childDir)) : ctx.matcher.prunes?.(childDir) ?? ctx.matcher.ignores(childDir)) continue;
-      try {
-        await walk(ctx, childRel, out, toHash, childDiscoveryPruned);
-      } catch (error) {
-        if (reused && isAbsent(error)) continue;
-        throw error;
-      }
+      const childScope = reused ? { parent: absenceScope, cancelled: false } : absenceScope;
+      pool.enqueue(() => walk(ctx, childRel, out, toHash, childDiscoveryPruned, pool, childScope), childScope);
     } else if (child.type === "symlink") {
       const linkIgnored = () => symlinkIgnored(ctx.matcher, childRel);
       if (ctx.accounting ? timedMatcher(ctx.accounting, linkIgnored) : linkIgnored()) continue;
@@ -592,37 +702,7 @@ async function walk(
       else append();
     } else if (child.type === "file") {
       if (ctx.accounting ? timedMatcher(ctx.accounting, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
-      let st: FileStatLike | undefined = bulkStats?.get(child.name);
-      if (!st && ctx.accounting) {
-        try {
-          st = await ctx.accounting.async("statMs", () => fs.stat(abs));
-        } catch (error) {
-          if (deferWalkFault(ctx, childRel, error)) continue;
-          throw error;
-        }
-      } else if (!st) {
-        try { st = await fs.stat(abs); }
-        catch (error) {
-          if (deferWalkFault(ctx, childRel, error)) continue;
-          throw error;
-        }
-      }
-      ctx.onDiscover?.(st.size);
-      if (ctx.scanStats) ctx.scanStats.filesStatted += 1;
-      const cached = ctx.cache
-        ? ctx.accounting
-          ? ctx.accounting.sync("statMs", () => ctx.cache!.lookup(childRel, st!.mtimeMs, st!.size, st!.ctimeMs))
-          : ctx.cache.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs)
-        : undefined;
-      if (cached) {
-        if (ctx.scanStats) ctx.scanStats.filesSkippedCacheHit += 1;
-        const append = () => out.push({ path: childRel, type: "file" as const, sha256: cached, size: st!.size, mode: st!.mode & 0o777, mtimeMs: st!.mtimeMs });
-        if (ctx.accounting) ctx.accounting.sync("entryMs", append);
-        else append();
-      } else {
-        // Defer the hash — sequential per-file hashing dominates a cold scan.
-        toHash.push({ childRel, abs, st });
-      }
+      pendingStats.push({ childRel, abs, bulkStat: bulkStats?.get(child.name) });
     } else {
       // FIFOs/sockets/devices are not syncable manifest entries, but retaining
       // them in the directory cache is load-bearing for consumers that must
@@ -630,6 +710,59 @@ async function walk(
       continue;
     }
   }
+  for (let offset = 0; offset < pendingStats.length; offset += FILE_STAT_BATCH_SIZE) {
+    const batch = pendingStats.slice(offset, offset + FILE_STAT_BATCH_SIZE);
+    pool.enqueue(() => statFiles(ctx, batch, toHash, out, pool, absenceScope), absenceScope);
+  }
+}
+
+async function statFiles(
+  ctx: WalkCtx,
+  batch: PendingStat[],
+  toHash: PendingHash[],
+  out: FileEntry[],
+  pool: WalkPool,
+  absenceScope?: WalkAbsenceScope,
+): Promise<void> {
+  const observed: Array<{ pending: PendingStat; st: FileStatLike }> = [];
+  const readStats = async () => {
+    for (const pending of batch) {
+      if (!pool.canContinue(absenceScope)) return;
+      let st = pending.bulkStat;
+      if (!st) {
+        try { st = await fs.stat(pending.abs); }
+        catch (error) {
+          if (deferWalkFault(ctx, pending.childRel, error)) continue;
+          throw error;
+        }
+      }
+      observed.push({ pending, st });
+    }
+  };
+  if (ctx.accounting) await ctx.accounting.async("statMs", readStats);
+  else await readStats();
+
+  for (const { st } of observed) ctx.onDiscover?.(st.size);
+  if (ctx.scanStats) ctx.scanStats.filesStatted += observed.length;
+  const cached = ctx.cache
+    ? ctx.accounting
+      ? ctx.accounting.sync("statMs", () => observed.map(({ pending, st }) => ctx.cache!.lookup(pending.childRel, st.mtimeMs, st.size, st.ctimeMs)))
+      : observed.map(({ pending, st }) => ctx.cache!.lookup(pending.childRel, st.mtimeMs, st.size, st.ctimeMs))
+    : observed.map(() => undefined);
+  const entries: FileEntry[] = [];
+  for (let index = 0; index < observed.length; index++) {
+    const { pending, st } = observed[index]!;
+    const sha256 = cached[index];
+    if (sha256) {
+      if (ctx.scanStats) ctx.scanStats.filesSkippedCacheHit += 1;
+      entries.push({ path: pending.childRel, type: "file", sha256, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
+    } else {
+      toHash.push({ childRel: pending.childRel, abs: pending.abs, st });
+    }
+  }
+  const append = () => out.push(...entries);
+  if (ctx.accounting) ctx.accounting.sync("entryMs", append);
+  else append();
 }
 
 async function finishHashes(ctx: WalkCtx, pending: PendingHash[], out: FileEntry[]): Promise<void> {
@@ -671,7 +804,9 @@ async function finishHashes(ctx: WalkCtx, pending: PendingHash[], out: FileEntry
  *  every top-level walk shares. `discoveryPruned` starts false at the top level. */
 async function runWalk(ctx: WalkCtx, rel: string, out: FileEntry[]): Promise<void> {
   const toHash: PendingHash[] = [];
-  await walk(ctx, rel, out, toHash, false);
+  const pool = new WalkPool(WALK_CONCURRENCY);
+  pool.enqueue(() => walk(ctx, rel, out, toHash, false, pool));
+  await pool.drain();
   await finishHashes(ctx, toHash, out);
   ctx.flushProgress?.();
 }
