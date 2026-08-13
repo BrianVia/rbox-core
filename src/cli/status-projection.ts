@@ -264,7 +264,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
     includeBaseRepos = true,
   ): Promise<GitDivergenceStatus> => {
-    const base = { deferrals: laneDeferrals(state), configChecking: [] as string[], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
+    const base = { pendingOnly: false, deferrals: laneDeferrals(state), configChecking: [] as string[], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     if (!cfg.syncGit) return { count: 0, indeterminate: false, ...base };
     try {
       if (port.gitDivergenceStatus) return await port.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);

@@ -8,6 +8,11 @@ export const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
 
 export const MAX_ATTEMPTS = 5;
+/** Design 244 a2: an op stops re-entering the 409 pull-first loop once it has spent
+ *  this long losing races, even with attempts left — long retry belongs to the daemon's
+ *  recovery probe, not to one op holding the lane. Sync-owned; mirrors the daemon's
+ *  RECOVERY_PROBE_CAP_MS by design so a surrendered op lands in the probe's cadence. */
+export const PUSH_CONFLICT_SURRENDER_MS = 120_000;
 /** Mass-delete guard (design 44): a pull that wants to delete this many files AND at
  *  least half the baseline is far more likely a poisoned baseline / wrong workspace /
  *  server-side accident than a real edit, so it fails closed until a human says

@@ -27,6 +27,11 @@ export interface GitDivergenceStatus {
   count: number;
   /** At least one repo could not prove its local publication disposition. */
   indeterminate: boolean;
+  /** Every indeterminacy came from a PENDING repo — unapplied remote truth this host
+   *  carries, which cannot become local divergence until it is accepted. False when
+   *  nothing was indeterminate, and false as soon as one busy/unprobed repo (a
+   *  transient "cannot prove it this instant") contributed. */
+  pendingOnly: boolean;
   /** Durable lane projection. Read-only and intentionally excludes opaque keys. */
   deferrals: Array<{
     relPath: string;
@@ -103,7 +108,7 @@ export async function gitDivergenceStatus(
     const known = new Set([...Object.keys(base), ...Object.keys(pending), ...Object.keys(repoRecordsForState(state)).filter(inScope)]);
     if (discoveredRepos) for await (const repo of discoveredRepos) { if (inScope(repo.relPath)) known.add(repo.relPath); }
     else if (matcher) for (const repo of await discoverGitRepos(root, matcher)) { if (inScope(repo.relPath)) known.add(repo.relPath); }
-    return { count: 0, indeterminate: false, deferrals, configChecking: [], configDisabled: [], conflictSnapshots: await conflictSnapshotStatus(root, [...known]) };
+    return { count: 0, indeterminate: false, pendingOnly: false, deferrals, configChecking: [], configDisabled: [], conflictSnapshots: await conflictSnapshotStatus(root, [...known]) };
   }
   const needsRes = pick(state.gitNeedsResolution ?? {});
   const removedMem = pick(state.gitReposRemoved ?? {});
@@ -114,7 +119,10 @@ export async function gitDivergenceStatus(
   const sourcePaths = new Set<string>();
   const scheduled = new Set<string>();
   const inFlight = new Set<Promise<void>>();
-  let indeterminate = false;
+  // Split so callers can tell a PERMANENT pending carry from a transient "cannot prove
+  // it this instant" (busy/unprobed). Design 244 b1: only the former may suppress a push.
+  let pendingIndeterminate = false;
+  let otherIndeterminate = false;
   let repoSource: GitDivergenceRepoSource;
   if (discoveredRepos) {
     repoSource = discoveredRepos;
@@ -128,7 +136,7 @@ export async function gitDivergenceStatus(
     sourcePaths.add(repo.relPath);
     if (repo.kind) kindByPath.set(repo.relPath, repo.kind);
     if (pending[repo.relPath]) {
-      indeterminate = true;
+      pendingIndeterminate = true;
       return;
     }
     if (scheduled.has(repo.relPath)) return;
@@ -195,13 +203,13 @@ export async function gitDivergenceStatus(
   };
   for (const rel of keys) {
     if (pending[rel]) {
-      indeterminate = true;
+      pendingIndeterminate = true;
       continue; // unapplied remote truth is carried, never local divergence
     }
     const kind = kindByPath.get(rel);
     const baseSec = base[rel];
     if (!kind) {
-      if (sourcePaths.has(rel)) indeterminate = true;
+      if (sourcePaths.has(rel)) otherIndeterminate = true;
       if (!baseSec) continue;
       // Repo dir gone entirely → push would publish the removal. Present-but-
       // undiscoverable (ignored leftover) → push carries; not divergence.
@@ -214,7 +222,7 @@ export async function gitDivergenceStatus(
     }
     const probe = probes.get(rel);
     if (!probe || probe.busy) {
-      indeterminate = true;
+      otherIndeterminate = true;
       continue; // indeterminate this instant
     }
     // Suppressions FIRST, preflight second — planGitSections' exact order:
@@ -251,7 +259,12 @@ export async function gitDivergenceStatus(
     if (!carry) n++;
     else await countConfigDisposition(rel, baseSec);
   }
-  return { count: n, indeterminate, deferrals, configChecking, configDisabled, conflictSnapshots };
+  return {
+    count: n,
+    indeterminate: pendingIndeterminate || otherIndeterminate,
+    pendingOnly: pendingIndeterminate && !otherIndeterminate,
+    deferrals, configChecking, configDisabled, conflictSnapshots,
+  };
 }
 
 export async function gitDivergenceCount(

@@ -39,7 +39,7 @@ import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { withPushTailTiming } from "../push-tail-timing.js";
 import { savePathWarnings } from "../path-warnings.js";
 import { formatCommitTimings, formatPushSpan, formatScanStats, scanDetailsOf } from "./format.js";
-import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
+import { apiFor, MAX_ATTEMPTS, PUSH_CONFLICT_SURRENDER_MS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } from "./publish-candidate.js";
@@ -308,7 +308,12 @@ async function pushManifestInner(
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
   const backoff = deps.backoff ?? defaultBackoff;
+  const now = deps.now ?? Date.now;
   let attempt = 0;
+  // Design 244 a2: when the first pull-first conflict of this op happened. The op
+  // surrenders the lane once it has spent PUSH_CONFLICT_SURRENDER_MS losing 409 races,
+  // even with attempts left — the daemon probe, not this loop, owns long retry.
+  let firstConflictAt: number | undefined;
   // Loop-carried attempt state, mutated by the RecoveryAction transitions below.
   const reconciled = await reconcileResolutionReceipt(root, cfg, deps);
   surfaceResolutionReceiptReconciliation(reconciled, deps);
@@ -362,6 +367,11 @@ async function pushManifestInner(
   };
 
   for (;;) {
+    // Checked BEFORE the attempt: a single slow pull can outlast the budget on its own,
+    // and a new attempt must never start once the op has surrendered the lane.
+    if (firstConflictAt !== undefined && now() - firstConflictAt > PUSH_CONFLICT_SURRENDER_MS) {
+      throw new PushConflictExhaustedError("push: too many conflicts, remote is moving faster than we can reconcile");
+    }
     const outcome = await runPushAttempt(root, cfg, deps, backoff, state, baseIntegrityByMeta);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
@@ -385,6 +395,7 @@ async function pushManifestInner(
       await rescanReset(); // rebuild from disk truth
       continue; // does NOT increment attempt
     }
+    if (outcome.action.kind === "pull-first") firstConflictAt ??= now();
     const consumesAttempt =
       outcome.action.kind !== "reupload" ||
       outcome.action.unsatisfiedTotal === undefined ||

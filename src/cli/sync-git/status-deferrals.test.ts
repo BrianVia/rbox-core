@@ -37,6 +37,7 @@ test("gitDivergenceStatus projects durable lanes read-only even when git sync is
   expect(await gitDivergenceStatus("/unused", cfg, state)).toEqual({
     count: 0,
     indeterminate: false,
+    pendingOnly: false,
     configChecking: [],
     configDisabled: [],
     conflictSnapshots: { total: 0, prunable: 0 },
