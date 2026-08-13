@@ -27,9 +27,15 @@ MUST-DO QUEUE (tasks #20/#22 + issue #647 hold the detail):
    can't expect others to do this"). Task #22.
 2. #647: take-theirs self-invalidates at the locked boundary (token echo
    proof in the issue) + resolve must quiesce the daemon itself.
-3. Task #20: concluded-op litter self-heal in the deferral classifier
-   (AUTO_MERGE, REBASE_HEAD, per-WORKTREE — three litter finds tonight) +
-   probe must NAME the offending worktree/file.
+3. DONE 2026-08-13: #650 (design 236) — concluded-op fossils never defer
+   (REBASE_HEAD reclassified, waiver widened at 3 sites, epoch bump
+   converges wedged repos, deferrals name worktree/file). FOUNDER DECISION
+   SCOPE: fossil disposal approved for the DEV FLEET via merge-to-main
+   only; shipping it to external users is decided at the next stable
+   release tag (which needs its own fresh yes anyway). Pre-existing
+   presence-vs-value hole documented in 236 §3.2c, filed to the
+   git-resolve rig-suite candidate. `rbox git reset` DEFERRED by founder
+   step-out ruling — prevention first; revisit only if wedges persist.
 4. Carried-unchanged partial must not re-prove/re-lock per pull (held-skip
    semantic-key pattern) + batch the per-lock journal fsyncs — kills this
    tax class even while a repo IS wedged.
