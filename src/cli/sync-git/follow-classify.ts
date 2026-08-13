@@ -135,7 +135,11 @@ export async function classifyCheckout(args: {
   const details: string[] = [];
   const breadcrumbMismatches: BreadcrumbMismatch[] = [];
   const oracle = args.boundary ? await args.opts.oracle.reproveRepo(args.opts.relPath) : await args.opts.oracle.proveRepo(args.opts.relPath);
-  if (oracle.kind === "mismatch") { reasons.add("local-edits"); details.push("working tree differs from applied manifest"); }
+  if (oracle.kind === "mismatch") {
+    reasons.add("local-edits");
+    const sample = oracle.sample.length > 0 ? ` (differs at ${oracle.sample.join(", ")})` : "";
+    details.push(`working tree differs from applied manifest${sample}`);
+  }
   else if (oracle.kind === "indeterminate") { reasons.add("unreadable"); details.push(oracle.why); }
 
   const live = args.live;

@@ -684,6 +684,9 @@ for (const [label, expectedReason, dirty] of breadcrumbDirtyGuards) {
     const applied = await applyIncoming(state, incoming, result && "proveRepo" in result ? result : matchingOracle);
     expect(applied.outcome.deferrals?.repo?.apply?.reason).toBe(label === "local edit" || label === "index divergence" ? expectedReason : "local-operation");
     expect(applied.logs.some((line) => line.includes("operation state differs at ORIG_HEAD"))).toBe(true);
+    if (label === "local edit") {
+      expect(applied.logs.some((line) => line.includes("working tree differs from applied manifest (differs at repo/tracked.txt)"))).toBe(true);
+    }
     expect(applied.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
   });
 }
