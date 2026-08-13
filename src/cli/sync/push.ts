@@ -38,7 +38,7 @@ import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWri
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { withPushTailTiming } from "../push-tail-timing.js";
 import { savePathWarnings } from "../path-warnings.js";
-import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
+import { formatCommitTimings, formatPushSpan, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
@@ -503,6 +503,7 @@ async function runPushAttempt(
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
   let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  const candidateProjectionT0 = performance.now();
   state = await ensureCapableStateLineage(root, state);
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
@@ -666,6 +667,8 @@ async function runPushAttempt(
       onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
     },
   );
+  const candidateProjectionMs = performance.now() - candidateProjectionT0;
+  report.appendDetails("git-plan", { candidate_projection_ms: candidateProjectionMs }, formatPushSpan("candidate_projection_ms", candidateProjectionMs));
   const publication = sealed.publication;
   local = sealed.candidate;
   if (sealed.admission === "no-op") {
@@ -740,6 +743,7 @@ async function runPushAttempt(
     // Under the master kill (or with deltas killed) NOTHING is reconstructed: the
     // meta validate + manifestFromMeta + O(N) validateManifest + O(N) canonical
     // hash below are pure waste for a base the writer would immediately discard.
+    const deltaBaseT0 = performance.now();
     let deltaBase: { manifest: Manifest; meta: GlobalManifestMeta } | undefined;
     let deltaBaseRejection: "no-base" | "integrity" | undefined;
     if (mdeWritePolicy().delta && !forceSnapshot) {
@@ -771,6 +775,8 @@ async function runPushAttempt(
         }
       }
     }
+    const deltaBaseMs = performance.now() - deltaBaseT0;
+    report.appendDetails("git-plan", { delta_base_ms: deltaBaseMs }, formatPushSpan("delta_base_ms", deltaBaseMs));
     const parentSequence = repair?.parentSequence ?? appliedSequence;
     let keepMineArm: GitResolutionPublicationReceipt | undefined;
     if (resolution && publication.resolution?.outcome === "published") {

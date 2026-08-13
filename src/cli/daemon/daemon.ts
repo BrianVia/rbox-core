@@ -156,6 +156,7 @@ import { TelemetryQueue } from "../telemetry/queue.js";
 import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled, type GitCaptureSample } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
+import { formatPushResiduals } from "../sync/format.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
@@ -366,6 +367,7 @@ export class RboxDaemon {
   private readonly api: RboxApi;
   private readonly telemetry: TelemetryQueue;
   private readonly syncPhaseSampler = new SyncPhaseSampler();
+  private readonly pendingPushReports: Array<{ report: PhaseReport; metricsReport?: PhaseReport; prologueMs: number }> = [];
   private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   /** Design 224 §2.3: last observed stranded-ignored count from a push projection.
@@ -1802,14 +1804,26 @@ export class RboxDaemon {
   }
 
   private async settleAfterDrain(): Promise<void> {
-    await this.cache.save(this.root);
-    this.writeAmbientStatus();
-    // Settle the sidecar: all wants are drained here, so re-render if
-    // the state CHANGED from the last write — the mid-pump write said `pending`
-    // (push still queued) and the no-op push wrote nothing; an idle workspace must
-    // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
-    const settledNow = this.localSettled();
-    if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
+    const settleT0 = performance.now();
+    try {
+      await this.cache.save(this.root);
+      this.writeAmbientStatus();
+      // Settle the sidecar: all wants are drained here, so re-render if
+      // the state CHANGED from the last write — the mid-pump write said `pending`
+      // (push still queued) and the no-op push wrote nothing; an idle workspace must
+      // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
+      const settledNow = this.localSettled();
+      if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
+    } finally {
+      const settleMs = performance.now() - settleT0;
+      for (const pending of this.pendingPushReports.splice(0)) {
+        try {
+          pending.report.appendDetails("state-load", { prologue_ms: pending.prologueMs, settle_ms: settleMs }, formatPushResiduals(pending.prologueMs, settleMs));
+          this.syncPhaseSampler.recordCompleted(pending.report, "push", this.telemetry, { prologue_ms: pending.prologueMs, settle_ms: settleMs });
+          pending.metricsReport?.logSummaryTo(this.log);
+        } catch { /* Observation cannot replace the drain result. */ }
+      }
+    }
   }
 
   /** The publish composition root: prologue, the report lifecycle the push deps bag
@@ -1817,7 +1831,9 @@ export class RboxDaemon {
    *  lives in {@link PublishLocalWorkspaceTransition}. */
   private async doPush(syncMutex: WorkspaceSyncMutex, provenance: PushProvenance): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
+    const prologueT0 = performance.now();
     await this.applyPendingWatchEvents();
+    const prologueMs = performance.now() - prologueT0;
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
     const receipt = await this.publishTransition.publish(provenance, {
@@ -1843,10 +1859,9 @@ export class RboxDaemon {
         onStrandedIgnoredObserved: (count) => { this.strandedIgnored = count; },
       }, { localFileObservation: request.localFileObservation })),
       settleReport: () => {
-        if (report) this.syncPhaseSampler.recordCompleted(report, "push", this.telemetry);
-        metricsReport?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
-        // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
-        // invisible steady-state cost is exactly what that design instruments).
+        if (report) this.pendingPushReports.push(metricsReport
+          ? { report, metricsReport, prologueMs }
+          : { report, prologueMs });
       },
     });
     this.propagationTrace?.publishReceipt(receipt.sequence);

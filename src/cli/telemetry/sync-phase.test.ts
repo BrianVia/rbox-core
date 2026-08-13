@@ -24,6 +24,28 @@ test("sync_phase samples every eighth completed pull and push independently", ()
   expect(samples[1]).toMatchObject({ kind: "sync_phase", op: "push" });
 });
 
+test("push samples preserve phase gaps, tail, and daemon residuals", async () => {
+  const sampler = new SyncPhaseSampler();
+  const samples: TelemetrySample[] = [];
+  for (let i = 0; i < SYNC_PHASE_SAMPLE_EVERY - 1; i++) {
+    sampler.recordCompleted(PhaseReport.push(), "push", { record: (sample) => samples.push(sample) });
+  }
+  const report = PhaseReport.push();
+  await report.phase("state-load", async () => {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await report.phase("git-plan", async () => {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  sampler.recordCompleted(report, "push", { record: (sample) => samples.push(sample) }, { prologue_ms: 11.2, settle_ms: 12.8 });
+  expect(samples).toHaveLength(1);
+  expect(samples[0]).toMatchObject({
+    kind: "sync_phase",
+    op: "push",
+    phases: { "gap:state-load→git-plan": expect.any(Number), tailMs: expect.any(Number) },
+    prologue_ms: 11,
+    settle_ms: 13,
+  });
+});
+
 test("sync_phase always emits strict tail outliers and projects path-free git aggregates", () => {
   const sampler = new SyncPhaseSampler();
   const samples: TelemetrySample[] = [];

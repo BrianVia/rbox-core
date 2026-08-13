@@ -49,3 +49,7 @@ export const formatCasSteps = (steps: Record<string, number>): string | undefine
   const parts = Object.entries(steps).filter(([, ms]) => ms > 0).map(([step, ms]) => `${step}${fmtDetailSeconds(ms)}`);
   return parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
 };
+export const formatPushSpan = (name: "candidate_projection_ms" | "delta_base_ms", ms: number): string =>
+  `${name}=${fmtDetailSeconds(ms)}`;
+export const formatPushResiduals = (prologueMs: number, settleMs: number): string =>
+  `prologue_ms=${fmtDetailSeconds(prologueMs)} settle_ms=${fmtDetailSeconds(settleMs)}`;

@@ -11,6 +11,7 @@ import {
   firstPublishUploadStart,
   formatFirstPublishStats,
 } from "../cli/upload-lane-timing.js";
+import { formatPushResiduals } from "../cli/sync/format.js";
 
 describe("PhaseReport", () => {
   test("accumulates ms + bytes + count per phase across repeated hits", async () => {
@@ -145,6 +146,14 @@ describe("PhaseReport", () => {
     expect(line).toContain("git-apply");
     expect(line).toContain("repos=2 commonDirs=1");
     expect(line).toContain("repoMs=i0q0w1u,i1q1w1a");
+  });
+
+  test("push residuals stay path-free in JSON and the summary", () => {
+    const r = PhaseReport.push();
+    r.record("state-load", {});
+    r.appendDetails("state-load", { prologue_ms: 12, settle_ms: 34 }, formatPushResiduals(12, 34));
+    expect(r.toJSON().phases["state-load"]?.details).toMatchObject({ prologue_ms: 12, settle_ms: 34 });
+    expect(r.summaryLine()).toContain("prologue_ms=0.0 settle_ms=0.0");
   });
 
   test("toJSON emits phases in stable order regardless of record order", () => {

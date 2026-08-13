@@ -51,7 +51,12 @@ function gitApplyDetails(json: PhaseReportJson): Pick<SyncPhaseSample, "gitApply
 export class SyncPhaseSampler {
   private readonly completed = { pull: 0, push: 0 };
 
-  recordCompleted(report: PhaseReport, op: "pull" | "push", telemetry: TelemetryRecorder): void {
+  recordCompleted(
+    report: PhaseReport,
+    op: "pull" | "push",
+    telemetry: TelemetryRecorder,
+    residuals?: { prologue_ms: number; settle_ms: number },
+  ): void {
     try {
       const json = report.toJSON();
       if (json.op !== op) return;
@@ -64,13 +69,24 @@ export class SyncPhaseSampler {
           phases[name] = boundedInteger(ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
         }
       }
-      telemetry.record({
+      if (op === "push") {
+        for (const [key, ms] of Object.entries(json.gaps)) {
+          if (Number.isFinite(ms) && ms >= 0) phases[`gap:${key}`] = boundedInteger(ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
+        }
+        phases.tailMs = boundedInteger(json.tailMs, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
+      }
+      const sample: SyncPhaseSample = {
         kind: "sync_phase",
         op,
         wallMs: boundedInteger(json.wallMs, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numbers.wallMs.max),
         phases,
         ...gitApplyDetails(json),
-      });
+      };
+      if (residuals) {
+        sample.prologue_ms = boundedInteger(residuals.prologue_ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.optionalNumbers.prologue_ms.max);
+        sample.settle_ms = boundedInteger(residuals.settle_ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.optionalNumbers.settle_ms.max);
+      }
+      telemetry.record(sample);
     } catch {
       // Product telemetry cannot replace or fail a completed sync operation.
     }
