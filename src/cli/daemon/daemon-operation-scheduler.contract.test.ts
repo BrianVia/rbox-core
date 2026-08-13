@@ -212,10 +212,15 @@ test("contract: single-flight — a second service call joins rather than starti
   const first = r.service();
   await started; // the loop is inside its operation, parked on the gate
   r.scheduler.queue("push");
-  await r.service(); // must return immediately without a second loop
+  let joined = false;
+  const second = r.service().then(() => { joined = true; });
+  await Promise.resolve();
+  // The second caller starts no competing loop, but its completion receipt is the
+  // existing flight: an awaited pump cannot claim the queued push is done yet.
+  expect(joined).toBe(false);
   expect(r.serviced).toEqual(["pull"]);
   release();
-  await first;
+  await Promise.all([first, second]);
   expect(r.serviced).toEqual(["pull", "push"]);
   expect(r.drains).toBe(1);
 });
