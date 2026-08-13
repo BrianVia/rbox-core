@@ -78,7 +78,7 @@ test("previous fingerprint epoch misses held-skip with fingerprint-version", asy
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
-  expect(heldBlockersAllowSkip([localEdits, localCommit, localStash])).toBe(true);
+  expect(heldBlockersAllowSkip([localEdits, localCommit, localStash])).toBe(false);
   expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, localStash, localIndex, localOperation])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);
