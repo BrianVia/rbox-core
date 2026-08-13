@@ -1,15 +1,16 @@
 # 236 — Concluded-op litter must not defer: corroborated in-progress + named refusals
 
-Status: ALIGNED r5 (codex gpt-5.6-sol, 2026-08-13; fossil-disposal product
-decision in §3.3 still needs the founder's explicit yes before merge)
-(task #20; field evidence from the 2026-08-13 savvy-core
-wedges; r1 folds: executor sites, deletion policy, privacy bounds, epoch,
-test pins; r2 folds: real disposal owners (commitCheckout), structured
-sample carrier, manual-resolution boundary scoping, full tuple equality;
-r3 fold: opStateSample moves to the durable GitDeferral record — the
-held-skip attempt is absent in exactly the boundary/no-fingerprint lanes;
-r4 fold: the FollowResult → FollowRepoTransition → setDeferral plumbing
-carries the sample end-to-end, retainHeldRepo preserves it on re-stamp)
+Status: DRAFT r6-slim (task #20; fossil-disposal product decision in §3.3
+still needs the founder's explicit yes before merge). r1-r5 were a codex
+adversarial loop reaching ALIGNED on a wider design; the founder then
+invoked step-out-a-layer and rounds 3-5's entire subject — durable
+persistence of a "which file wedged you" sample — was CUT: it instrumented
+the permanent-wedge state this design eliminates. Also cut: boundary
+fossil value/set comparison (the waiver never reads fossil values; real
+ops announce themselves via in-progress markers). What remains: the table
+change, the waiver widening at three sites, the epoch bump, a
+worktree-qualified token in the existing log detail, and the field-wedge
+fixtures.
 
 ## 1. Problem
 
@@ -95,15 +96,16 @@ c) **Locked-boundary proof** (`src/cli/sync-git/follow.ts:992-999`): today
    instead clears `local-operation` via its own snapshot-bound second proof
    (follow-classify.ts:217); a literal unconditional rule would refuse every
    confirmed take-theirs with a fossil present, regressing 126. For
-   automatic follows: the boundary re-classification must be waived AND its
-   breadcrumb mismatches must equal the initial classification's **as full
-   canonical tuples (rel, live, base, incoming)** — not just the rel-set,
-   since a fossil can be rewritten in place between classify and boundary
-   and, unlike ORIG_HEAD, disposable breadcrumbs carry no byte-equality lock
-   (BreadcrumbMismatch already carries the values, follow-types.ts:180).
-   Any tuple difference = something changed mid-flight → defer. And
-   ORIG_HEAD ∈ set ⇔ `origHeadPreservation` exists. The boundary failure
-   detail names the actual rels instead of the current hard-coded
+   automatic follows: the boundary re-classification must be waived AND
+   ORIG_HEAD ∈ its mismatches ⇔ `origHeadPreservation` exists. No fossil
+   value/set comparison between initial and boundary classification
+   (r5 step-out cut): the waiver decision never reads fossil VALUES — only
+   whether corroborated in-progress markers exist — and any real git
+   operation starting mid-flight creates those markers first (the
+   in-progress set is exactly git's `wt_status_get_state` inputs), which
+   fails `breadcrumbWaived` at the boundary. ORIG_HEAD alone needs value
+   stability, and its preservation lock already provides it. The boundary
+   failure detail names the actual rels instead of the current hard-coded
    "differs at ORIG_HEAD" (:993 lies today whenever the mismatch was
    MERGE_MSG — small truthfulness fix riding along).
 
@@ -161,44 +163,22 @@ intended self-heal:
   dirs, which can contain `..`/external components (r1 finding: gitdir
   containment is not proven anywhere, shared.ts:395-401). A gitdir-internal
   token is workspace-safe by construction.
-- Prose carriers stay as-is: daemon log line (apply.ts:1335) and the
-  human-readable `TypedBlocker.detail`. The resolve-command privacy rule
-  (resolve-command.ts:1077-1083, pinned by git-cmd.test.ts:804) is
-  untouched — non-artifact details stay suppressed there.
-- **Structured carrier** (r2: never parse presentation prose; r3: the
-  held-skip attempt is the WRONG home — boundary-proof failures clear or
-  never write an attempt (`noteBoundaryFailure` defers after the prior
-  attempt was cleared), and attempts are also deliberately dropped when the
-  trusted fingerprint or worktree digest is unavailable, so an
-  attempt-carried sample is absent in exactly the lanes that need naming).
-  Instead: add ONE optional field `opStateSample?: string` — the first
-  offending token, worktree-qualified — to the durable **`GitDeferral`**
-  record (sync-state-model.ts:171-183), which is persisted on EVERY
-  deferral, initial or boundary. Whichever site stamps the deferral carries
-  the token: the classification site from its mismatch list, the boundary
-  path from the tuples it compared. Durable-record consequences, owned in
-  this change: field-coverage registration
-  (state-plane/codecs/coverage.ts:123), JSON/SQLite differential fixtures,
-  and a compatibility fixture proving old records without the field load
-  unchanged. No SQL migration — deferrals ride the generic CJSON column.
-- **The plumbing seam, explicitly** (r4 finding: today every hop drops
-  evidence): the follow result's defer shape (follow.ts:1120 area) gains
-  optional `opStateSample`, populated at both defer sites (initial classify,
-  boundary `noteBoundaryFailure`); `composeFollowRepoTransition` carries it
-  into `FollowRepoTransition.deferral` alongside `{ kind: "set", reason }`
-  (follow-repo-transition.ts:291); `nextDeferral`/`setDeferral`
-  (shared.ts:155, apply.ts:1214) copy it onto the durable record.
-  `retainHeldRepo` (apply.ts:456-468) preserves the existing record's
-  sample when it re-stamps an episode — a held-skip must not erase the
-  naming. Fixtures pin both boundary creation and re-stamp preservation.
-- `rbox status`: the projection currently drops attempt details entirely
-  (status-view.ts:346-361, 414-429). Selection rule: for a `local-operation`
-  row, read `opStateSample` from the selected lane's deferral record; render
-  as "Git operation files at <token>." (mirroring the `git-busy`
-  `samplePath` display shape, status-maintenance.ts:59-70). Because after
-  §3.1-3.3 fossils no longer defer, this row now only ever shows REAL
-  operations — the generic repair copy ("Finish or stop the Git operation")
-  finally becomes true, and the token answers "which worktree".
+- Carriers are the EXISTING prose ones only: the classifier detail string
+  (flowing to the daemon log line, apply.ts:1335, and the held-attempt
+  `TypedBlocker.detail`) and the boundary failure detail. The
+  resolve-command privacy rule (resolve-command.ts:1077-1083, pinned by
+  git-cmd.test.ts:804) is untouched — non-artifact details stay suppressed
+  there.
+- **Cut by the r5 step-out** (was: durable `GitDeferral.opStateSample` +
+  codec coverage + differential/compat fixtures + a 4-hop plumbing seam +
+  re-stamp preservation + status projection change — three review rounds of
+  persistence machinery): that whole apparatus served the state this design
+  ELIMINATES. After §3.1-3.3, fossils never defer, so `local-operation` only
+  ever shows real operations, which finish and self-clear; the permanent
+  unnamed wedge cannot recur. The daemon log's worktree-qualified token
+  covers the residual diagnostic need. Deletion condition met before birth.
+  If field evidence ever shows real operations wedging operators for hours,
+  add durable naming THEN, with that evidence as the spec.
 
 ### 3.5 Held-skip convergence (the #620 leftover)
 
@@ -267,25 +247,20 @@ does; revisit only if we forget the bump twice.
 - Real-git fixture matrix for §3.1 (r1 finding 7): REBASE_HEAD lifecycle
   under conflict-stop, interactive `edit`, `--quit`, finish, abort — assert
   the classifier tracks git's own resumability at every stage.
-- Boundary tuple rule: initial waives {MERGE_MSG}, a NEW fossil appears
-  before boundary → defers; identical tuples → follows; **same rel,
-  different live value** (fossil rewritten mid-flight) → defers. ORIG_HEAD ⇔
-  preservation cross-check both directions. Manual-resolution-plus-fossil:
-  confirmed take-theirs with a stale AUTO_MERGE present still applies (the
-  manual lane keeps its own proof; no regression from the new boundary
-  rule).
+- Boundary rule: a real op starting mid-flight (MERGE_HEAD appears before
+  boundary) → defers (breadcrumbWaived fails); fossils still alone at
+  boundary → follows. ORIG_HEAD ⇔ preservation cross-check both directions.
+  Manual-resolution-plus-fossil: confirmed take-theirs with a stale
+  AUTO_MERGE present still applies (the manual lane keeps its own proof; no
+  regression from the new boundary rule).
 - Held-skip epoch: unit test that an attempt carrying the previous
   `GIT_FINGERPRINT_VERSION` misses with reason "fingerprint-version".
 - Rig: extend scripts/rig/scenarios/git-stale-opstate.ts (fossil replant at
   :175-193) with the REBASE_HEAD-in-worktree case and the upgrade-convergence
   case (wedge on old table → new binary → converges without touching disk).
 - Detail naming: assert the worktree-qualified token appears in the daemon
-  log line and in `rbox status` output, and that no absolute path can appear
-  in the token (construction-level unit test).
-- Persistence lanes (r3 finding): boundary-proof failure stamps a deferral
-  WITH `opStateSample` (no held attempt exists in that lane); deferral
-  stamped when trusted fingerprint / worktree digest is unavailable also
-  carries the sample. Both as fixtures.
+  log line, and that no absolute path can appear in the token
+  (construction-level unit test).
 
 ## 7. Ownership
 
@@ -294,7 +269,6 @@ does; revisit only if we forget the bump twice.
 `follow-classify.ts` owns waivability; `follow.ts` owns waiver execution and
 the boundary proof; `commitCheckout`/`restoreOpStateWithCrash` own fossil
 disposal on the follow path (legacy engine apply keeps `restoreOpState`);
-`orig-head.ts` owns ORIG_HEAD preservation. The deferral evidence is owned
-at the site that stamps each deferral and flows through existing carriers
-plus one optional structured field (`GitDeferral.opStateSample`) — no new
-channel, no new authority.
+`orig-head.ts` owns ORIG_HEAD preservation. The deferral evidence stays in
+the existing prose detail carriers — no new field, no new channel, no new
+authority.

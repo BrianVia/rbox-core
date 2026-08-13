@@ -1,60 +1,59 @@
-# Implement design 236 — concluded-op litter self-heal
+# Implement design 236 — concluded-op litter self-heal (r6-slim)
 
 Objective: implement docs/design/236-concluded-op-litter-self-heal.md
-exactly as written (r5, codex-aligned). The doc is the authority; this file
-only adds execution order and acceptance criteria.
+exactly as written (r6-slim). The doc is the authority; this file only adds
+execution order and acceptance criteria.
+
+NOTE: the design was deliberately SLIMMED after alignment. There is NO
+GitDeferral.opStateSample field, NO codec/coverage work, NO status-view
+change, NO boundary tuple comparison. Do not build any of those.
 
 ## Execution order (each step keeps the tree green)
 
 1. **Table + epoch**: manifest-validate.ts:295 `REBASE_HEAD` →
-   `"breadcrumb"`; fingerprint.ts:8 `GIT_FINGERPRINT_SCHEMA_VERSION` 7→8
-   with the comment from §3.5. Update the table pin
-   (follow.test.ts:656-665) in the same commit.
+   `"breadcrumb"` (update the doc comment at :289-293 — its assumption is
+   field-falsified); fingerprint.ts:8 `GIT_FINGERPRINT_SCHEMA_VERSION` 7→8
+   with a comment that classifier semantics are part of the schema. Update
+   the table pin (follow.test.ts:656-665) in the same commit.
 2. **Classifier**: follow-classify.ts:157-176 — route any
    breadcrumb-classified mismatch into `breadcrumbMismatches`; veto gates
    at :196-216 untouched. Detail string becomes the worktree-qualified
-   token per §3.4 (segment concatenation ONLY — never path.relative on
-   absolute dirs). Rewrite the ORIG_HEAD-only pin (follow.test.ts:668-679)
+   token per design §3.4: `worktrees/<name>/<rel>` for a linked worktree
+   (name = basename of the gitdir under commonDir/worktrees/), `<rel>` for
+   the primary — segment concatenation ONLY, never path.relative on
+   absolute dirs. Rewrite the ORIG_HEAD-only pin (follow.test.ts:668-679)
    to the new rule.
-3. **Executor**: follow.ts:743-754 — new shape per §3.2b (at most one
-   ORIG_HEAD mismatch → preserveOrigHead unchanged; other breadcrumbs need
-   no action; guard becomes "ORIG_HEAD ∈ mismatches ⇔ preservation ran").
-4. **Boundary proof**: follow.ts:992-999 per §3.2c — keep
-   `!opts.manualResolution` scoping; automatic follows compare FULL
-   canonical tuples (rel, live, base, incoming) between initial and
-   boundary classification; ORIG_HEAD ⇔ preservation both directions;
-   failure detail names actual rels.
-5. **Durable sample**: `GitDeferral.opStateSample?: string`
-   (sync-state-model.ts:171-183) + coverage.ts:123 registration +
-   JSON/SQLite differential + compat fixture (old records load unchanged).
-   Plumb per §3.4 last bullet: follow defer shape → 
-   composeFollowRepoTransition (follow-repo-transition.ts:291) →
-   nextDeferral/setDeferral (shared.ts:155, apply.ts:1214);
-   retainHeldRepo (apply.ts:456-468) preserves existing sample.
-6. **Status**: status-view.ts local-operation row reads
-   `opStateSample` from the selected lane's deferral; render
-   "Git operation files at <token>." per §3.4 (mirror the git-busy
-   samplePath display shape).
-7. **Fixtures** per §6: three field-wedge red→greens, real-git
-   REBASE_HEAD lifecycle matrix, boundary tuple rules (new fossil /
-   same-rel-different-value / manual+fossil), held-skip epoch miss,
-   persistence lanes (boundary-failure deferral carries sample;
-   no-fingerprint lane carries sample; retainHeldRepo re-stamp preserves).
+3. **Executor**: follow.ts:743-754 — at most one ORIG_HEAD mismatch →
+   preserveOrigHead unchanged; other breadcrumb mismatches need no
+   execution-time action; guard becomes "ORIG_HEAD ∈ mismatches ⇔
+   preservation ran".
+4. **Boundary proof**: follow.ts:992-999 — keep `!opts.manualResolution`
+   scoping exactly; automatic follows require boundary classification
+   waived AND (ORIG_HEAD ∈ boundary mismatches ⇔ origHeadPreservation
+   exists). NO fossil value/set comparison. Failure detail names the
+   actual rels (fix the hard-coded "differs at ORIG_HEAD" lie at :993).
+5. **Fixtures** per design §6: three field-wedge red→greens (stale
+   AUTO_MERGE follows + fossil gone after checkout via existing
+   conformance; stale REBASE_HEAD in linked worktree follows; fossil +
+   real MERGE_HEAD defers with both rels named); real-git REBASE_HEAD
+   lifecycle matrix (conflict-stop, interactive edit, --quit, finish,
+   abort); boundary fixtures (real op appears mid-flight defers;
+   manual+fossil take-theirs still applies); held-skip epoch miss
+   ("fingerprint-version"); token construction unit test (no absolute
+   path possible).
 
 ## Constraints
 
-- Do NOT touch: orig-head.ts preservation machinery, the veto gates,
-  resolve-command privacy suppression (resolve-command.ts:1077-1083),
-  pruneEmptyOpStateDirs, the gitBusy/deferral-hygiene lock plane,
-  restoreOpState/restoreOpStateWithCrash bodies (they already conform
-  op-state — no changes needed).
-- Protected tests that must stay green UNMODIFIED:
-  git-cmd.test.ts:928-944, :966-989, :1024-1046, :804 (privacy pin);
-  capture-stability.test.ts:110,157,211; follow-matrix.test.ts.
-- Intentionally rewritten tests: follow.test.ts:656-665 (table pin),
-  :668-679 (ORIG_HEAD-only waiver pin).
-- No new flags, no config, no background sweepers. ≤500 lines/file target;
-  comments only for inexpressible constraints.
+- Do NOT touch: orig-head.ts, the veto gates, resolve-command privacy
+  suppression (resolve-command.ts:1077-1083), pruneEmptyOpStateDirs,
+  gitBusy/deferral-hygiene, restoreOpState/restoreOpStateWithCrash bodies,
+  sync-state-model.ts, state-plane codecs, status-view.ts.
+- Protected tests, green UNMODIFIED: git-cmd.test.ts:928-944, :966-989,
+  :1024-1046, :804; capture-stability.test.ts:110,157,211;
+  follow-matrix.test.ts.
+- Intentionally rewritten: follow.test.ts:656-665, :668-679.
+- No new flags, no config, no new fields. ≤500 lines/file target; comments
+  only for inexpressible constraints.
 - IMPORTANT: prove tests EXECUTE before writing implementation code (run
   one existing follow.test.ts test first; if the runner is blocked, STOP
   and report — do not write static-only tests).
@@ -65,9 +64,7 @@ only adds execution order and acceptance criteria.
 - bun test src/cli/git-cmd.test.ts
 - bun test src/cli/sync-git/follow-matrix.test.ts
 - bun test src/engine/git/capture-stability.test.ts
-- bun test src/cli/sync-git/held-skip.test.ts (or the suite containing
-  held-skip coverage)
-- bun test src/cli/state-plane (codec differential + coverage)
+- bun test src/cli/sync-git/  (held-skip + fingerprint suites included)
 - bun run typecheck
 - bun run lint:affected (warnings reviewed, not required zero)
 
