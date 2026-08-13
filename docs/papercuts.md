@@ -561,3 +561,10 @@ locally on the same commit. Same test family as the stateMtimeMs 1ms race
 masked in #648 — the differential harness appears to have more than one
 timing-sensitive field. If it flakes a third time, stop masking fields and
 make the differential compare a canonicalized projection instead.
+
+## 2026-08-13 — deferral log hides the mismatch sample (follow-classify.ts:138)
+"working tree differs from applied manifest" is logged with zero paths while
+the oracle verdict carries a `sample: string[]` of exactly which entries
+differ. Diagnosing FM's savvy-core wedge required an out-of-band bun script
+driving `oracleFromState`+`proveRepo` against live state. Append the (capped)
+sample to the detail string. Evidence: issue #659 comment 5285598893.
