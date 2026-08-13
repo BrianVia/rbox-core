@@ -2049,45 +2049,38 @@ test("disk-backed pull durably upgrades a matched legacy held attempt", async ()
   fetchToFile.mockRestore();
 });
 
-test("disk-backed pull retains a matched checkout hold from its standing deferral", async () => {
-  const { c1, state, base, incoming } = await baseAndIncoming();
-  const autoMerge = await git(receiver, "rev-parse", `${c1}^{tree}`);
-  await fs.writeFile(path.join(receiver, ".git", "AUTO_MERGE"), `${autoMerge}\n`);
-  const mismatchingOracle = {
-    proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
-    reproveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
-    receiptHash: () => undefined,
-  };
+test("disk-backed pull follows pending checkout when a local edit clears without another push", async () => {
+  const { state, base, incoming } = await baseAndIncoming();
+  const cleanDisk = await scanManifest(workspace, buildIgnoreMatcher(workspace));
+  state.stream = syncStreamId(cfg);
+  state.lastSyncedManifest = { ...cleanDisk, manifestSchema: 2, gitRepos: { repo: base } };
+  await saveStateUnsafeLegacyOrTest(workspace, state);
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "receiver-only edit\n");
 
-  const initial = await applyIncoming(state, incoming, mismatchingOracle, { collectMetrics: true });
-  expect(initial.outcome.attempt?.repo?.blockers).toContainEqual(expect.objectContaining({
+  const remote = { ...cleanDisk, manifestSchema: 2 as const, gitRepos: { repo: incoming } };
+  const api = { blobStore: () => store } as SyncRemote;
+  await applyPulledManifest(workspace, cfg, { remote: api }, api, { sequence: 2, manifest: remote });
+  const held = await loadState(workspace, syncStreamId(cfg));
+  expect(repoRecordsForState(held).repo?.attempt?.blockers).toContainEqual(expect.objectContaining({
     provenance: "checkout", reason: "local-edits",
   }));
-  const held = await landOutcome(state, initial.outcome, 2);
+  expect(repoRecordsForState(held).repo?.pending).toEqual(incoming);
   expect(repoRecordsForState(held).repo?.deferrals?.apply?.reason).toBe("local-edits");
 
-  const disk = await scanManifest(workspace, buildIgnoreMatcher(workspace));
-  held.stream = syncStreamId(cfg);
-  held.lastSyncedManifest = { ...disk, manifestSchema: 2, gitRepos: { repo: base } };
-  await saveStateUnsafeLegacyOrTest(workspace, held);
   await Bun.sleep(GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 100);
-
-  const remote = { ...disk, manifestSchema: 2 as const, gitRepos: { repo: incoming } };
-  const api = { blobStore: () => store } as SyncRemote;
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
   const logs: string[] = [];
   process.env.RBOX_TRACE_HELD = "1";
-  const fetch = spyOn(store, "get");
-  const fetchToFile = spyOn(store, "getToFile");
   await applyPulledManifest(workspace, cfg, { remote: api, onGitLog: (line) => logs.push(line) }, api, { sequence: 3, manifest: remote });
 
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+  const settled = repoRecordsForState(await loadState(workspace, syncStreamId(cfg))).repo;
+  expect(settled?.pending).toBeUndefined();
+  expect(settled?.partial).toBeUndefined();
+  expect(settled?.attempt).toBeUndefined();
+  expect(settled?.deferrals?.apply).toBeUndefined();
   expect(logs.find((line) => line.startsWith("git-sync held-trace ")))
-    .toMatch(/earlySkip=1 .*mismatch=none earlyReason=none blocker=checkout\/local-edits /);
-  expect(fetch).not.toHaveBeenCalled();
-  expect(fetchToFile).not.toHaveBeenCalled();
-  expect(repoRecordsForState(await loadState(workspace, syncStreamId(cfg))).repo?.deferrals?.apply?.reason)
-    .toBe("local-edits");
-  fetch.mockRestore();
-  fetchToFile.mockRestore();
+    .toMatch(/earlySkip=0 .*mismatch=none earlyReason=retention-ineligible /);
 });
 
 test("held skip survives a higher-sequence transport recapture and retries a semantic change", async () => {
@@ -2172,7 +2165,7 @@ test("design 176: own composer-pending hold maps to its causal ref blocker and b
   expect(followCalls).toBe(0);
 });
 
-test("local-edits held-skip requires its standing apply deferral", async () => {
+test("local-edits never held-skips because working-tree bytes are outside the Git fingerprint", async () => {
   const { state, incoming } = await baseAndIncoming();
   const oracle = {
     proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
@@ -2200,9 +2193,9 @@ test("local-edits held-skip requires its standing apply deferral", async () => {
     heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
-  expect(guarded.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(guarded.outcome.gitApplyMetrics?.results.skipped).toBe(0);
   expect(guarded.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
-  expect(capabilityCalls).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
 });
 
 test("stale AUTO_MERGE mismatch follows and checkout conformance removes the fossil", async () => {
