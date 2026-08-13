@@ -33,7 +33,7 @@ import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
-import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
+import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatCasSteps, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
 
 export async function scanManifestForPushResult(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<{ manifest: Manifest; observationComplete: boolean }> {
@@ -481,14 +481,10 @@ export async function applyPulledManifest(
     mutationBoundary: deps.mutationBoundary,
     observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
   });
-  if (report.enabled) {
-    const casSummary = Object.entries(casStepMs).filter(([, ms]) => ms > 0)
-      .map(([step, ms]) => `${step}${(ms / 1000).toFixed(1)}`).join(" ");
-    report.appendDetails("state-save", { cas: casStepMs }, casSummary ? `cas ${casSummary}` : undefined);
-  }
+  report.appendDetails("state-save", { cas: casStepMs }, formatCasSteps(casStepMs));
   const settleT0 = Date.now();
   savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
-  if (report.enabled) report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);
+  report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);
   try {
     deps.onGitDeferralsSaved?.(savedState);
   } catch {

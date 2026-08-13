@@ -1074,10 +1074,12 @@ export async function gitResolveCmd(
         const fresh = await buildSnapshot({ root, rel, ctx, state: freshState, record: freshRecord, incoming: freshIncoming, store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: now() });
         emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed at the locked checkout boundary; confirm the fresh snapshot", current: fresh.public }, json, deps, root);
       } else {
-        // The deferral's own detail names the actual failure (e.g. WHICH blob
-        // failed to fetch/verify); the canned per-code text alone has cost
-        // hours of field archaeology. Surface both.
-        const detail = (follow as { detail?: string }).detail;
+        // For artifact refusals the deferral's own detail names the actual
+        // failure (e.g. "planned graph connectivity proof failed"); the canned
+        // text alone cost hours of field archaeology (issue #647). Other codes
+        // keep the canned text only — their details can carry filesystem paths
+        // outside the workspace, which refusal output must never leak.
+        const detail = follow.reason === "artifact" ? (follow as { detail?: string }).detail : undefined;
         emit({ status: "refused", verb, repo: rel, code: follow.reason, message: detail ? `${refusalMessage(follow.reason)}: ${detail}` : refusalMessage(follow.reason) }, json, deps, root);
       }
       return 1;

@@ -111,9 +111,12 @@ async function snapshot(root: string): Promise<Record<string, string>> {
         if (rel === ".rbox/state/last-writer.json") {
           const witness = JSON.parse(bytes.toString("utf8")) as LastWriterWitness;
           // The witness binds the copied state's new physical inode. Compare every
-          // durable field except that necessarily root-specific filesystem identity.
+          // durable field except that necessarily root-specific filesystem identity —
+          // and the write-time mtime, which differs by clock ticks between the
+          // parallel on/off runs (1ms flake seen on CI shard 2, 2026-08-13).
           delete witness.stateDev;
           delete witness.stateIno;
+          delete (witness as { stateMtimeMs?: number }).stateMtimeMs;
           out[rel] = JSON.stringify(witness);
         } else {
           out[rel] = `${(await fs.stat(abs)).mode & 0o777}:${createHash("sha256").update(bytes).digest("hex")}:${bytes.toString("base64")}`;
