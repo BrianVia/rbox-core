@@ -45,3 +45,7 @@ export const formatApplyStats = (s: ApplyStats): string =>
   `mk${s.mkdirCalls}/cr${s.mkdirCreated} walk${s.dirComponentWalks} uniq${s.uniqueDirs} ls${s.lstatCalls} rn${s.renameCalls} stg${s.stageCalls} pre${fmtDetailSeconds(s.preflightMs)}s pool${fmtDetailSeconds(s.writePoolMs)}s sm${s.smallCount}n/${fmtDetailBytes(s.smallBytes)} lg${s.largeCount}n/${fmtDetailBytes(s.largeBytes)}`;
 export const formatPullOracleMetrics = (m: PullOracleMetrics): string =>
   `oracle prep${fmtDetailSeconds(m.prepareMs)} hash${fmtDetailSeconds(m.receiptHashMs)} indexed${m.entriesIndexed} proved${m.reposProved}`;
+export const formatCasSteps = (steps: Record<string, number>): string | undefined => {
+  const parts = Object.entries(steps).filter(([, ms]) => ms > 0).map(([step, ms]) => `${step}${fmtDetailSeconds(ms)}`);
+  return parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
+};
