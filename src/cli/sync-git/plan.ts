@@ -387,13 +387,20 @@ async function planGitSectionsWithRetention(
     // may intentionally restore bytes equal to this publisher's older advertised
     // checkpoint after another writer stripped them, so authorship itself is a
     // one-shot publication reason (the ACK stamps cfgSynced and bounds it).
-    let changed = supersededPending.size > 0 || resolvedPending.size > 0
+    const flagArmed = supersededPending.size > 0 || resolvedPending.size > 0
       || Object.keys(authoredCfgHashByRepo).length > 0;
+    let sectionsDiffer = false;
     for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
       if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && !isDeepStrictEqual(outgoing[k], prev[k]))) {
-        changed = true;
+        sectionsDiffer = true;
         break;
       }
+    }
+    const changed = flagArmed || sectionsDiffer;
+    // Design 244 b2: name the flag that armed an otherwise-unchanged plan — a
+    // one-shot publication reason that keeps re-arming is a publish ring.
+    if (flagArmed && !sectionsDiffer) {
+      glog(`git-sync plan: no section change; armed by superseded=${supersededPending.size} resolved=${resolvedPending.size} authoredCfg=${Object.keys(authoredCfgHashByRepo).length}`);
     }
     const captureDeferrals: Record<string, GitDeferralReason> = {};
     const configDeferrals: Record<string, GitDeferralReason> = {};

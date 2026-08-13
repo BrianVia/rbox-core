@@ -227,6 +227,33 @@ test("status mirrors presence publication and missing config is indeterminate, n
   expect(indeterminate.configChecking).toContain(".");
 });
 
+test("design 244 b2: a flag-armed plan with no section change names the flag and its size", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:repo.git");
+  const authoredLogs: string[] = [];
+  const state = stateWith(baseSection);
+  const authored = await planGitSections(
+    root, cfg, state, remote, new Set(), buildIgnoreMatcher(root), undefined, undefined,
+    { onGitLog: (line: string) => authoredLogs.push(line) },
+  );
+  expect(authored.changed).toBe(true);
+  expect(authoredLogs.filter((line) => line.includes("no section change"))).toEqual([]);
+
+  // The published section is now advertised, but no ACK stamped cfgSynced — authorship
+  // re-arms `changed` while the outbound map is byte-identical to the last commit.
+  state.repoRecords!["."]!.advertised = authored.gitRepos!["."]!;
+  const rearmedLogs: string[] = [];
+  const rearmed = await planGitSections(
+    root, cfg, state, remote, new Set(), buildIgnoreMatcher(root), undefined, undefined,
+    { onGitLog: (line: string) => rearmedLogs.push(line) },
+  );
+
+  expect(rearmed.authoredCfgHashByRepo["."]).toBeDefined();
+  expect(rearmed.changed).toBe(true);
+  expect(rearmedLogs.filter((line) => line.includes("no section change"))).toEqual([
+    "git-sync plan: no section change; armed by superseded=0 resolved=0 authoredCfg=1",
+  ]);
+});
+
 test("legacy cache version is discarded and forces one slow pass", async () => {
   const first = await plan();
   expect(first.gitPlanStats?.spawnedRepos).toBe(1);

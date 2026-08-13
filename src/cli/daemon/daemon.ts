@@ -1490,13 +1490,18 @@ export class RboxDaemon {
     this.writeActivity();
   }
 
-  private async hasPublishableLocalDivergence(): Promise<"none" | "some" | "indeterminate"> {
+  /** `pending-carry` is the one PERMANENT indeterminacy: unapplied remote truth this
+   *  host carries until it is accepted, which no push can resolve. `indeterminate` is
+   *  the transient kind (a busy or unprobed repo) — provable again next cycle. */
+  private async hasPublishableLocalDivergence(): Promise<"none" | "some" | "pending-carry" | "indeterminate"> {
     const base = this.syncBase;
     if (!base) return "some";
     const diff = diffManifests(base.lastSyncedManifest, this.local.manifest);
     if (diff.added.length || diff.changed.length || diff.deleted.some((item) => !this.matcher.ignores(item))) return "some";
     const git = await gitDivergenceStatus(this.root, this.cfg, base, this.matcher);
-    return git.count > 0 ? "some" : git.indeterminate ? "indeterminate" : "none";
+    if (git.count > 0) return "some";
+    if (!git.indeterminate) return "none";
+    return git.pendingOnly ? "pending-carry" : "indeterminate";
   }
 
   /** The op bodies the pump and the recovery probe run IDENTICALLY: pull (notify-latency
@@ -1543,7 +1548,11 @@ export class RboxDaemon {
         throw e;
       }
       if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-      if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
+      // Design 244 b1: a pending carry can never become publishable here, so re-arming
+      // on it publishes an empty sequence this daemon then pulls — the echo ring. Every
+      // other outcome (including a transient unprovable one) still re-arms.
+      const publishable = await this.hasPublishableLocalDivergence();
+      if (publishable !== "none" && publishable !== "pending-carry") this.requestPush("other");
       return;
     }
     let cov: ScanCoverage;
@@ -1566,7 +1575,7 @@ export class RboxDaemon {
     opWatcherErrorGeneration: number,
   ): Promise<void> {
     if (halt.typedReason?.kind === "push-conflict" || (halt.op === "push" && !halt.typedReason && !halt.terminal)) {
-      let publishable: "none" | "some" | "indeterminate";
+      let publishable: "none" | "some" | "pending-carry" | "indeterminate";
       try {
         await this.doPull(syncMutex, undefined, undefined, "none");
         publishable = await this.hasPublishableLocalDivergence();
@@ -1579,6 +1588,12 @@ export class RboxDaemon {
       }
       await this.doPush(syncMutex, this.takePushProvenance());
       if (this.pushTerminalBlocked) throw new RecoveryConditionPersistsError(this.activity.halt ?? halt);
+      // Design 244 a1: success is the resolved INTENT, not one landed commit. A push
+      // that committed while publishable divergence still stands leaves the episode
+      // in place so the ladder keeps climbing instead of restarting at tier one.
+      if (await this.hasPublishableLocalDivergence() === "some") {
+        throw new RecoveryConditionPersistsError(this.activity.halt ?? halt);
+      }
       this.clearRecoveryHalt();
       return;
     }

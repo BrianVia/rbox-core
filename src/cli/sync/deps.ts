@@ -52,6 +52,9 @@ export interface SyncDeps {
   forceFullScan?: boolean;
   remote?: SyncRemote;
   backoff?: (attempt: number) => Promise<void>;
+  /** Wall clock for the push conflict loop's elapsed-time budget; tests inject a
+   *  logical clock to exercise the surrender without spending the real budget. */
+  now?: () => number;
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
    *  tally retry pressure without sync.ts doing metrics I/O (design 09 §3). */
   onCommitConflict?: () => void;

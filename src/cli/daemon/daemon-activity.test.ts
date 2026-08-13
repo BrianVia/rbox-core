@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
+import { gitIdentity, HashCache, scanManifest, type BlobStore, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
@@ -120,7 +120,7 @@ interface DaemonInternals {
   loadSyncBase(): Promise<SyncState>;
   runDeferralHygiene(): Promise<void>;
   runSafetyCadenceTick(): Promise<void>;
-  hasPublishableLocalDivergence(): Promise<"none" | "some" | "indeterminate">;
+  hasPublishableLocalDivergence(): Promise<"none" | "some" | "pending-carry" | "indeterminate">;
   doPush(...args: unknown[]): Promise<void>;
   ambientStatusFrom(activity: DaemonActivity, settled: boolean, now: number): { deferredRepos: number };
   writeHeartbeatSurfaces(): void;
@@ -704,20 +704,91 @@ test("review M2: locked divergent repo is indeterminate and conflict recovery st
   expect(daemon.activity.halt).toBeUndefined();
 });
 
-test("review M2: post-pull indeterminate divergence does not suppress the push", async () => {
-  const repo = await makeCommittedRepo();
-  const daemon = await makeDaemon(new MiniRemote(), "locked-post-pull", {}, { syncGit: true });
-  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+/** Seed a git-enabled daemon whose baseline already carries the workspace's files: the
+ *  pull op re-scans, and a file-level diff would arm the push before the git verdict is
+ *  ever consulted. The folder catalog is the git-policy authority the pump reconciles
+ *  against, so the root is re-admitted with git on. */
+async function makeGitDaemon(bootId: string, gitPendingRemote: Record<string, GitSection> = {}): Promise<DaemonInternals> {
+  await releaseDaemonFolderAdmission(root);
+  await prepareDaemonFolderAdmission(root, testConfig({ syncGit: true }));
+  const daemon = await makeDaemon(new MiniRemote(), bootId, {}, { syncGit: true });
+  const seeded: SyncState = {
+    ...daemon.syncBase!,
+    lastSyncedManifest: await scanManifest(root),
+    gitPendingRemote,
+  };
+  await saveStateUnsafeLegacyOrTest(root, seeded);
+  daemon.syncBase = await loadState(root, seeded.stream);
   daemon.local.head = daemon.syncBase!.lastSyncedManifest;
-  expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
-  daemon.hasPublishableLocalDivergence = async () => "indeterminate";
+  // The seam under test is the post-pull re-arm predicate, which reads the REAL
+  // gitDivergenceStatus path. A live pull against the empty test remote would settle the
+  // seeded git state out from under it, so the transfer itself is a no-op.
+  daemon.doPull = async () => {};
+  return daemon;
+}
+
+test("design 244 b1: a pending carry never re-arms the post-pull push", async () => {
+  const repo = await makeCommittedRepo();
+  const section: GitSection = {
+    ...(await gitIdentity(repo))!,
+    bundleSha: "a".repeat(64),
+    bundleEncSha: "b".repeat(64),
+    bundleCipherSize: 1,
+    generatedAt: new Date(TEST_NOW).toISOString(),
+  };
+  const daemon = await makeGitDaemon("pending-post-pull", { repo: section });
   let pushAttempts = 0;
   daemon.doPush = async () => { pushAttempts++; };
+
+  // The echo-publish ring: the carried section makes divergence unprovable forever, so
+  // re-arming published an empty sequence this daemon then pulled back.
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("pending-carry");
+  daemon.want.pull = true;
+
+  await daemon.pump();
+
+  expect(pushAttempts).toBe(0);
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("pending-carry"); // the carry stood
+});
+
+test("review M2: a busy repo is transiently unprovable and still re-arms the post-pull push", async () => {
+  const repo = await makeCommittedRepo();
+  const daemon = await makeGitDaemon("locked-post-pull");
+  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+  let pushAttempts = 0;
+  daemon.doPush = async () => { pushAttempts++; };
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
   daemon.want.pull = true;
 
   await daemon.pump();
 
   expect(pushAttempts).toBe(1);
+});
+
+test("design 244 a1: a committed recovery push keeps the episode while divergence stands", async () => {
+  const daemon = await makeDaemon(new MiniRemote(), "recovery-intent");
+  daemon.hasPublishableLocalDivergence = async () => "some";
+  daemon.doPush = async () => {};
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  const firstFailureAt = daemon.activity.halt.firstFailureAt;
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(daemon.activity.halt?.consecutiveFailures).toBe(2);
+  expect(daemon.activity.halt?.firstFailureAt).toBe(firstFailureAt);
+  expect(daemon.activity.halt?.typedReason).toEqual({ kind: "push-conflict" });
+
+  daemon.hasPublishableLocalDivergence = async () => "none";
+  daemon.want.push = false;
+  daemon.recoveryDue = true;
+  await daemon.pump();
+
+  expect(daemon.activity.halt).toBeUndefined();
 });
 
 test("design 178 C: daemon hygiene updates the next ambient heartbeat projection", async () => {

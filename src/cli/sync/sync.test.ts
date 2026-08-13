@@ -5,7 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "../sync.js";
+import { accumulateRecoveryPage, pull, push, pushManifest, PushConflictExhaustedError, stampManifestSchemaForCommit, sync, type SyncDeps } from "../sync.js";
+import { PUSH_CONFLICT_SURRENDER_MS } from "./policy.js";
 import { missingBlobsChunked } from "../sync-recovery.js";
 import type { WorkspaceConfig } from "../config.js";
 import { loadState, saveStateUnsafeLegacyOrTest, StreamMismatchError, syncStreamId } from "../config.js";
@@ -905,6 +906,28 @@ test("409 forever: exhausts retries, throws, never commits our change, never los
   await expect(push(root, cfg, deps(remote))).rejects.toThrow(/too many conflicts/);
   const latest = await remote.latest();
   expect(latest.manifest.files.some((f) => f.path === "mine.txt")).toBe(false); // never committed
+  expect(await read("mine.txt")).toBe("mine\n"); // never lost
+});
+
+test("design 244 a2: a slow recovery pull surrenders the op before the next attempt", async () => {
+  const remote = new FakeRemote();
+  await write("mine.txt", "mine\n");
+  let clock = 0;
+  let n = 0;
+  remote.beforeCommit = async () => {
+    n++;
+    remote.injectCommit([await remote.seedEntry(`o.txt`, `other\n`)]);
+  };
+
+  await expect(push(root, cfg, {
+    ...deps(remote),
+    now: () => clock,
+    // The 409 recovery pull is the expensive step (368s on the field host); one of them
+    // outlasts the budget on its own, so the next attempt must never start.
+    onPullApplied: () => { clock += PUSH_CONFLICT_SURRENDER_MS + 1; },
+  })).rejects.toBeInstanceOf(PushConflictExhaustedError);
+
+  expect(remote.commitCalls).toBe(1); // budget, not MAX_ATTEMPTS (=5, six attempts)
   expect(await read("mine.txt")).toBe("mine\n"); // never lost
 });
 
