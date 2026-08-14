@@ -15,6 +15,8 @@ interface HaltInternals {
   resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping";
   resetHaltIdentity?: string;
   resetRetryTimer?: ReturnType<typeof setTimeout>;
+  safetyTimer?: unknown;
+  deepTimer?: unknown;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pump(): Promise<void>;
   resetOperationBoundary(): Promise<boolean>;
@@ -23,7 +25,6 @@ interface HaltInternals {
   stop(): Promise<void>;
   startWatcherFn: (...args: unknown[]) => Promise<{ close(): Promise<void> }>;
   localObserver: { observe(...args: unknown[]): Promise<unknown> };
-  handleWsMessageData(data: string): void;
 }
 
 let root = "";
@@ -52,7 +53,7 @@ function daemon(logs: string[] = []): HaltInternals {
   return new RboxDaemon(root, cfg, {} as never, {
     now: () => Date.parse("2026-07-17T12:00:00.000Z"),
     log: (line) => void logs.push(line),
-  }) as unknown as HaltInternals;
+  }) as HaltInternals;
 }
 
 test("warm syncBase cannot bypass the unconditional pump boundary", async () => {
@@ -167,17 +168,16 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
     expect(startupScans).toBe(0);
     expect(watcherStarts).toBe(1);
     deliverWatcher!([{ type: "update", path: path.join(root, "ignored.txt") }]);
-    d.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 99 }));
     expect(d.want.push).toBe(false);
     expect(d.want.pull).toBe(false);
-    const safety = (d as unknown as { safetyTimer?: unknown }).safetyTimer;
-    const deep = (d as unknown as { deepTimer?: unknown }).deepTimer;
+    const safety = d.safetyTimer;
+    const deep = d.deepTimer;
     await resetJournalDoctorCmd(root, { quarantine: true });
     expect(await d.resetOperationBoundary()).toBe(true);
     expect(d.resetLifecycle).toBe("ready");
     expect(watcherStarts).toBe(1);
-    expect((d as unknown as { safetyTimer?: unknown }).safetyTimer).toBe(safety);
-    expect((d as unknown as { deepTimer?: unknown }).deepTimer).toBe(deep);
+    expect(d.safetyTimer).toBe(safety);
+    expect(d.deepTimer).toBe(deep);
   } finally {
     await d.stop();
     if (previousWs === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED; else process.env.RBOX_DAEMON_WS_DISABLED = previousWs;
@@ -196,7 +196,7 @@ test("startup mutex contention queues both the initial pull and full scan", asyn
   const d = new RboxDaemon(root, cfg, {} as never, {
     pullOnly: true,
     acquireSyncMutex: async () => ({ status: "contended", holderKey: "test-holder", blockerKind: "live" }),
-  }) as unknown as HaltInternals;
+  }) as HaltInternals;
   let queued: HaltInternals["want"] | undefined;
   d.pump = async () => { queued = { ...d.want }; };
   try {
