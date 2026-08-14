@@ -107,5 +107,11 @@ retired.
 
 ## Progress
 
-- 2026-08-14: batch 1 dispatched (#31+#32 codex lane, #33 opus lane) —
-  in flight at time of writing.
+- 2026-08-14: **BATCH 1 COMPLETE** — #703 (CONTEXT.md, 9 brief corrections,
+  design-number decoder) + #704 (4 barrels deleted w/ importers rewritten,
+  5 facades audited-retained, one timing table, engine/index.ts shrink plan
+  in design 253). Ceremony killed: 4 CODEMAP entries, 1 facade-surface
+  test, the #698-shaped triple enumeration, ~10 repeated invariant
+  restatements. Burn-down: 3,421 → 3,372 anti-slop warnings. Fleet on
+  be6c39e. NEXT: batch 2 — #34 (daemon satellite inversion) then #35
+  (RemoteWakeupChannel).
