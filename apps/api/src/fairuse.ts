@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import type { JsonObject, JsonValue } from "../../../src/json.js";
 import { dbFor } from "./db.js";
 import { resolveAccountPlan } from "./retention.js";
 import { planFor } from "./plans.js";
@@ -186,11 +187,11 @@ export async function releaseFairUseLease(db: D1Database, accountId: string, val
   return Number(released.meta.changes ?? 0) === 1;
 }
 
-function validNonNegativeInt(value: unknown): value is number {
+function validNonNegativeInt(value: JsonValue | undefined): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
-function requireSha(value: unknown): string {
+function requireSha(value: JsonValue | undefined): string {
   if (typeof value !== "string" || !SHA_RE.test(value)) throw new Error("invalid root sha");
   return value;
 }
@@ -259,8 +260,8 @@ export async function readHeadEnvelope(
   return parseHeadEnvelope(await response.json());
 }
 
-export function parseHeadEnvelope(raw: unknown): HeadEnvelope {
-  const body = (raw ?? {}) as Partial<HeadEnvelope>;
+export function parseHeadEnvelope(raw: JsonValue): HeadEnvelope {
+  const body: JsonObject = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
   if (!validNonNegativeInt(body.head) || !validNonNegativeInt(body.pruneFloor) || body.pruneFloor > body.head
     || !validNonNegativeInt(body.indexGeneration) || typeof body.empty !== "boolean"
     || !Array.isArray(body.chainRefs) || body.chainRefs.length > MAX_MANIFEST_DELTA_CHAIN) {
@@ -274,7 +275,7 @@ export function parseHeadEnvelope(raw: unknown): HeadEnvelope {
   const chainRefs = body.chainRefs.map(requireSha);
   const encManifestSha = requireSha(body.encManifestSha);
   const mode = body.refMode;
-  if (!mode || typeof mode !== "object") throw new Error("invalid head envelope");
+  if (!mode || typeof mode !== "object" || Array.isArray(mode)) throw new Error("invalid head envelope");
   if (mode.kind === "inline") {
     if (!Array.isArray(mode.refShas)) throw new Error("invalid head envelope");
     return { ...base, empty: false, encManifestSha, refMode: { kind: "inline", refShas: mode.refShas.map(requireSha) }, chainRefs };
@@ -464,11 +465,16 @@ async function groupPass(env: Env, scan: ScanRow, leaseValue: string, nowMs: num
       .bind(scan.account_id, scan.epoch),
     db.prepare("SELECT workspace_id,cursor_sha,partial_bytes,found_refs FROM fairuse_group_progress WHERE account_id=? AND epoch=?")
       .bind(scan.account_id, scan.epoch),
-  ]);
-  const currentRows = (reads[0]?.results ?? []) as Array<{ workspace_id: string; project_id: string; created_at: number }>;
-  const streams = (reads[1]?.results ?? []) as unknown as StreamRow[];
-  const totalled = new Set(((reads[2]?.results ?? []) as Array<{ workspace_id: string }>).map((row) => row.workspace_id));
-  const progressRows = (reads[3]?.results ?? []) as unknown as ProgressRow[];
+  ]) as [
+    D1Result<{ workspace_id: string; project_id: string; created_at: number }>,
+    D1Result<StreamRow>,
+    D1Result<{ workspace_id: string }>,
+    D1Result<ProgressRow>,
+  ];
+  const currentRows = reads[0]?.results ?? [];
+  const streams = reads[1]?.results ?? [];
+  const totalled = new Set((reads[2]?.results ?? []).map((row) => row.workspace_id));
+  const progressRows = reads[3]?.results ?? [];
 
   // The workspace-SET aborts are preserved verbatim: they concern a wrong root SET,
   // not a stale one, and head movement no longer aborts anything.

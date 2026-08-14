@@ -46,8 +46,34 @@ async function bootstrap(name: string): Promise<{ token: string; accountId: stri
 function ownerPrincipal(accountId: string, userId: string, deviceId: string): Principal {
   return { deviceId, accountId, userId, role: "owner", kind: "device" };
 }
-const delReq = (confirm: unknown) => new Request(`${BASE}/v1/account`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm }) });
+const delReq = (confirm: string) => new Request(`${BASE}/v1/account`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm }) });
 const count = async (sql: string, ...binds: unknown[]) => Number((await db().prepare(sql).bind(...binds).first<{ n: number }>())!.n);
+
+/** The four statement members these paths touch; widened so a real `D1PreparedStatement`
+ *  satisfies it. Method syntax is load-bearing: it keeps the parameter check bivariant,
+ *  so `D1Database` stays assignable to `FakeD1`. */
+interface FakeStatement {
+  bind(...args: unknown[]): FakeStatement;
+  all(): Promise<{ results: unknown[] }>;
+  first(): Promise<unknown>;
+  run(): Promise<{ meta: unknown }>;
+}
+
+/** The one database member these paths touch; widened so `D1Database` satisfies it. */
+interface FakeD1 {
+  prepare(sql: string): FakeStatement;
+}
+
+/** A `WORKSPACE_SYNC` double whose every stub answers through `handle`. The stub `fetch`
+ *  takes the real `RequestInfo` shape and normalizes it to the URL the tests assert on. */
+function syncNamespace(handle: (url: URL, init?: RequestInit) => Promise<Response>): DurableObjectNamespace {
+  const fetch = (input: string | Request, init?: RequestInit): Promise<Response> =>
+    handle(new URL(typeof input === "string" ? input : input.url), init);
+  return {
+    idFromName: (name: string) => ({ name }) as DurableObjectId,
+    get: (_id: DurableObjectId) => ({ fetch }) as DurableObjectStub,
+  } as DurableObjectNamespace;
+}
 
 describe("DELETE /v1/account — owner-gating", () => {
   test("a non-owner (editor) device is rejected 403 and nothing is tombstoned", async () => {
@@ -346,16 +372,11 @@ describe("workspace purge — projectId with '/' (finding 3, no wedge)", () => {
   test("purgeWorkspaceDO posts a FIXED /purge path that can't mis-parse for any projectId", async () => {
     const captured: string[] = [];
     const fakeEnv = {
-      WORKSPACE_SYNC: {
-        idFromName: (name: string) => ({ name }),
-        get: (_id: unknown) => ({
-          fetch: async (url: string, init: { method: string }) => {
-            captured.push(`${init.method} ${new URL(url).pathname}`);
-            return new Response(null, { status: 200 });
-          },
-        }),
-      },
-    } as unknown as Env;
+      WORKSPACE_SYNC: syncNamespace(async (url, init) => {
+        captured.push(`${init?.method} ${url.pathname}`);
+        return new Response(null, { status: 200 });
+      }),
+    } as Env;
     const ok = await purgeWorkspaceDO(fakeEnv, "ws1", "weird/project/with/slashes");
     expect(ok).toBe(true);
     // Fixed path — the projectId is NOT embedded in the positionally-parsed URL, so a '/' in it
@@ -474,7 +495,7 @@ describe("diagnostics purge — fail-closed R2 cleanup", () => {
 describe("server-internal DO addressing is slash-safe (finding B)", () => {
   test("gcPurge addresses /roots with a FIXED path + ws/proj in the query (no mis-parse)", async () => {
     const captured: URL[] = [];
-    const fakeDb = {
+    const fakeDb: FakeD1 = {
       prepare(sql: string) {
         return {
           bind: () => fakeDb.prepare(sql),
@@ -485,10 +506,10 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
       },
     };
     const fakeEnv = {
-      rbox_dev_db: fakeDb,
+      rbox_dev_db: fakeDb as D1Database,
       rbox_dev_blobs: {},
-      WORKSPACE_SYNC: { idFromName: (name: string) => ({ name }), get: () => ({ fetch: async (url: string) => (captured.push(new URL(url)), Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] })) }) },
-    } as unknown as Env;
+      WORKSPACE_SYNC: syncNamespace(async (url) => (captured.push(url), Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] }))),
+    } as Env;
     const purgeResponse = await gcPurge(fakeEnv, 0);
     const purgeBody = await purgeResponse.json() as { purged: number; opened: number; ok?: boolean; budgetExceeded?: boolean };
     expect(purgeBody).toMatchObject({ purged: 0, opened: 0 });
@@ -501,7 +522,7 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
 
   test("retentionPrune addresses /prune with a FIXED path + ws/proj in the query (no mis-parse)", async () => {
     const captured: URL[] = [];
-    const fakeDb = {
+    const fakeDb: FakeD1 = {
       prepare(sql: string) {
         return {
           bind: () => fakeDb.prepare(sql),
@@ -512,9 +533,9 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
       },
     };
     const fakeEnv = {
-      rbox_dev_db: fakeDb,
-      WORKSPACE_SYNC: { idFromName: (name: string) => ({ name }), get: () => ({ fetch: async (url: string) => (captured.push(new URL(url)), Response.json({ pruned: 0, pruneFloor: 5 })) }) },
-    } as unknown as Env;
+      rbox_dev_db: fakeDb as D1Database,
+      WORKSPACE_SYNC: syncNamespace(async (url) => (captured.push(url), Response.json({ pruned: 0, pruneFloor: 5 }))),
+    } as Env;
     await retentionPrune(fakeEnv, Date.now());
     const prune = captured.find((u) => u.pathname === "/prune");
     expect(prune).toBeDefined();
@@ -525,7 +546,7 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
     const now = Date.now();
     let floorReads = 0;
     let pruneCalls = 0;
-    const fakeDb = {
+    const fakeDb: FakeD1 = {
       prepare(sql: string) {
         return {
           bind: () => fakeDb.prepare(sql),
@@ -544,12 +565,9 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
       },
     };
     const fakeEnv = {
-      rbox_dev_db: fakeDb,
-      WORKSPACE_SYNC: {
-        idFromName: (name: string) => ({ name }),
-        get: () => ({ fetch: async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 })) }),
-      },
-    } as unknown as Env;
+      rbox_dev_db: fakeDb as D1Database,
+      WORKSPACE_SYNC: syncNamespace(async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 }))),
+    } as Env;
 
     const body = (await (await retentionPrune(fakeEnv, now)).json()) as { inGrace: number; pruned: number };
     expect({ floorReads, pruneCalls, inGrace: body.inGrace, pruned: body.pruned }).toEqual({
@@ -564,7 +582,7 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
     const now = Date.now();
     let floorReads = 0;
     let pruneCalls = 0;
-    const fakeDb = {
+    const fakeDb: FakeD1 = {
       prepare(sql: string) {
         return {
           bind: () => fakeDb.prepare(sql),
@@ -582,12 +600,9 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
       },
     };
     const fakeEnv = {
-      rbox_dev_db: fakeDb,
-      WORKSPACE_SYNC: {
-        idFromName: (name: string) => ({ name }),
-        get: () => ({ fetch: async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 })) }),
-      },
-    } as unknown as Env;
+      rbox_dev_db: fakeDb as D1Database,
+      WORKSPACE_SYNC: syncNamespace(async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 }))),
+    } as Env;
 
     const body = (await (await retentionPrune(fakeEnv, now)).json()) as { inGrace: number; pruned: number };
     expect({ floorReads, pruneCalls, inGrace: body.inGrace, pruned: body.pruned }).toEqual({
