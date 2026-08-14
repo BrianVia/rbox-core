@@ -1,43 +1,28 @@
 import type { CaseFoldCollisionGroup, Manifest } from "../../engine/index.js";
+import type { DaemonActivity } from "../activity.js";
+import { saveMetrics, type SyncMetrics } from "../metrics.js";
 import { CommitRejectedError } from "../remote.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { PushManifestOptions, PushResult } from "../sync/push.js";
+import type { GitCaptureSample } from "../telemetry/contract.js";
+import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { PushProvenance } from "./daemon.js";
+import type { LocalAuthority } from "./local-observation-transition.js";
+import type { LocalRetryQueuePort } from "./local-workspace-observer.js";
 import { cleanPath, LOG_PATHS_MAX } from "./render.js";
-
-/**
- * `PublishLocalWorkspaceTransition` — the daemon side of the publish seam. It seals
- * one request from the daemon's current LOCAL/BASE/retry facts, hands it to the push
- * port, classifies the closed result, and reduces it into ONE ordered effect list
- * that the daemon applies verbatim.
- *
- * It owns no Git planning: candidate projection, commit execution, and publisher
- * acknowledgement are the push spine's (`src/cli/sync/`). What it owns is which facts
- * cross into a push and, exactly once, what the outcome is allowed to change here.
- *
- * Fail-closed: an outcome whose `attemptId` is not the one this transition sealed
- * performs NO effect at all.
- */
 
 /** The daemon facts a publication is planned against, read once at attempt start. */
 export interface PublishAttemptInputs {
-  /** LOCAL head as this daemon believes disk to be. */
   readonly manifest: Manifest;
-  /** `lastSyncedManifest`: what a GC-fenced path falls back to. Absent before BASE. */
   readonly appliedBase: Manifest | undefined;
   readonly gcFencedPaths: ReadonlySet<string>;
   readonly observationComplete: boolean;
-  /** Carried, not cloned: preserve-mode publication must not clear a prior episode. */
   readonly caseCollisions: readonly CaseFoldCollisionGroup[];
-  /** The fingerprint of a standing terminal push halt, so the remote can repeat or
-   *  retire its refusal against the exact block the daemon is holding. */
   readonly blockedFingerprint: string | undefined;
 }
 
-/** Everything the push port may read. No mutable daemon map crosses here. */
 export interface SealedPublishRequest {
   readonly attemptId: string;
-  /** Deferral-pruned publication input. */
   readonly manifest: Manifest;
   readonly blockedFingerprint: string | undefined;
   readonly localFileObservation: NonNullable<PushManifestOptions["localFileObservation"]>;
@@ -48,52 +33,40 @@ export type DaemonPushOutcome =
   | { readonly kind: "not-committed"; readonly attemptId: string; readonly result: PushResult }
   | { readonly kind: "terminal-block"; readonly attemptId: string; readonly fingerprint: string | undefined };
 
-/** The one narrow port this adapter invokes, sealed to a single attempt: it owns the
- *  mutex and the metrics/telemetry report that attempt runs under. */
+/** The real per-attempt seam: the sync engine and its report lifecycle. */
 export interface PushTransitionPort {
+  readonly appliedBase: Manifest | undefined;
   execute(request: SealedPublishRequest): Promise<DaemonPushOutcome>;
-  /** Close out that attempt's report. A terminal refusal never reaches it — the
-   *  attempt published nothing to sample or summarize. */
   settleReport(publishTransitionMs: number): void;
 }
-
-export type DaemonPublishEffect =
-  | { readonly kind: "terminal-block"; readonly fingerprint: string | undefined }
-  | { readonly kind: "record-git-capture-success" }
-  | { readonly kind: "commit-published-subset"; readonly manifest: Manifest; readonly deferred: readonly string[] }
-  | { readonly kind: "adopt-collision-observation"; readonly groups: readonly CaseFoldCollisionGroup[]; readonly observationComplete: boolean }
-  | { readonly kind: "log"; readonly line: string }
-  | { readonly kind: "note-published-sequence"; readonly sequence: number }
-  | { readonly kind: "record-publish-activity"; readonly files: number; readonly sequence: number }
-  | { readonly kind: "schedule-write-finish"; readonly paths: readonly string[] }
-  | { readonly kind: "schedule-gc-fence"; readonly paths: readonly string[] }
-  | { readonly kind: "refresh-durable-state" }
-  | { readonly kind: "record-sync-metric" }
-  | { readonly kind: "settle-report" };
 
 export interface DaemonPublishReceipt {
   readonly attemptId: string;
   readonly outcome: DaemonPushOutcome["kind"];
-  /** The sequence now in effect; absent when the remote refused terminally. */
   readonly sequence?: number;
-  readonly effects: readonly DaemonPublishEffect[];
 }
 
-export interface DaemonPublishEffects {
-  sealAttemptInputs(): PublishAttemptInputs;
-  /** The last sequence this daemon logged, so a repeat stays silent. */
-  lastPublishedSequence(): number | undefined;
-  noteTerminalBlock(fingerprint: string | undefined): void;
-  recordGitCaptureSuccess(provenance: PushProvenance): void;
-  commitPublishedSubset(next: Manifest, deferred: readonly string[]): void;
-  adoptCollisionObservation(groups: readonly CaseFoldCollisionGroup[], observationComplete: boolean): void;
+/** Stable deep owners used directly instead of callback projections of daemon fields. */
+export interface PublishTransitionState {
+  readonly root: string;
+  readonly local: LocalAuthority;
+  readonly retries: LocalRetryQueuePort;
+  readonly activity: DaemonActivity;
+  readonly metrics: SyncMetrics;
+  readonly telemetry: TelemetryRecorder;
+}
+
+/** The two genuine adjacent services that cannot be owned by the transition. */
+export interface PublishTransitionServices {
   log(line: string): void;
-  notePublishedSequence(sequence: number): void;
-  recordPublishActivity(files: number, sequence: number): void;
-  scheduleWriteFinish(paths: readonly string[]): void;
-  scheduleGcFence(paths: readonly string[]): void;
   refreshDurableState(): Promise<void>;
-  recordSyncMetric(): Promise<void>;
+}
+
+export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCaptureSample | undefined {
+  if (provenance.signal) return { kind: "git_capture", signalPushes: 1, candidatePushes: 0, scanPushes: 0 };
+  if (provenance.candidate) return { kind: "git_capture", signalPushes: 0, candidatePushes: 1, scanPushes: 0 };
+  if (provenance.scan) return { kind: "git_capture", signalPushes: 0, candidatePushes: 0, scanPushes: 1 };
+  return undefined;
 }
 
 export function sealPublishRequest(attemptId: string, inputs: PublishAttemptInputs): SealedPublishRequest {
@@ -109,11 +82,7 @@ export function sealPublishRequest(attemptId: string, inputs: PublishAttemptInpu
   };
 }
 
-/**
- * The only failure this seam may absorb: the remote repeated a terminal refusal
- * against the fingerprint the request carried. Every other failure — including a
- * FIRST terminal refusal, which the pump must still record as a halt — propagates.
- */
+/** Classify only the repeat terminal refusal; every other failure propagates. */
 export async function classifyPublishOutcome(
   request: SealedPublishRequest,
   run: () => Promise<PushResult>,
@@ -130,90 +99,115 @@ export async function classifyPublishOutcome(
   return { kind: result.committed ? "committed" : "not-committed", attemptId: request.attemptId, result };
 }
 
-export function reduceDaemonPublishOutcome(
-  outcome: DaemonPushOutcome,
-  context: { readonly lastPublishedSequence: number | undefined },
-): readonly DaemonPublishEffect[] {
-  if (outcome.kind === "terminal-block") {
-    // The attempt may have established the capable state lineage before the remote
-    // repeated its refusal. Adopt that durable nonce just as a completed push does,
-    // or the next pump mistakes our own initialization for an idle rebind.
-    return [{ kind: "terminal-block", fingerprint: outcome.fingerprint }, { kind: "refresh-durable-state" }];
-  }
-  const result = outcome.result;
-  const deferred = result.deferred ?? [];
-  const groups = result.caseCollisions.map((group) => ({ paths: [...group.paths] }));
-  const effects: DaemonPublishEffect[] = [
-    { kind: "record-git-capture-success" },
-    // The committed subset differs from what push was handed only at the DEFERRED
-    // paths — those carry the base entry, not observed disk truth, so they stay
-    // unsettled exactly like a scan's or a watcher's deferrals (design 108).
-    { kind: "commit-published-subset", manifest: result.manifest, deferred },
-    {
-      kind: "adopt-collision-observation",
-      groups,
-      observationComplete: result.localFileObservationAuthority === "authoritative" && groups.length === 0,
-    },
-  ];
-  // Gated on `committed` (design 44): a push whose internal 409-recovery PULLED a
-  // remote sequence and then no-opped must not be logged as if THIS daemon published
-  // it — and the steady-state no-op stays silent so it does not fill the log.
-  if (result.committed && result.sequence !== context.lastPublishedSequence) {
-    const note = deferred.length > 0
-      ? `; deferred ${deferred.length}: ${deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
-      : "";
-    effects.push({ kind: "log", line: `push: published sequence ${result.sequence} (${result.manifest.files.length} files${note})` });
-  }
-  effects.push({ kind: "note-published-sequence", sequence: result.sequence });
-  if (result.committed) effects.push({ kind: "record-publish-activity", files: result.manifest.files.length, sequence: result.sequence });
-  if (deferred.length > 0) {
-    const retryLater = new Set(result.retryLater ?? []);
-    const writeFinish = [...new Set(deferred.filter((path) => !retryLater.has(path)))];
-    if (writeFinish.length > 0) effects.push({ kind: "schedule-write-finish", paths: writeFinish });
-    if (retryLater.size > 0) effects.push({ kind: "schedule-gc-fence", paths: [...retryLater] });
-  }
-  effects.push({ kind: "refresh-durable-state" }, { kind: "record-sync-metric" }, { kind: "settle-report" });
-  return effects;
-}
-
+/**
+ * Owns the daemon's publish-local episode state and settles one classified result
+ * directly. No effect vocabulary or callback-per-effect interpreter crosses this
+ * boundary; callers supply only the engine/report operation port.
+ */
 export class PublishLocalWorkspaceTransition {
   private attempts = 0;
+  private lastSequence: number | undefined;
+  private terminalBlocked = false;
+  private lastTerminalBlockFingerprint = "";
+  private collisions: CaseFoldCollisionGroup[] = [];
+  private publishActivityDirty = false;
 
-  constructor(private readonly effects: DaemonPublishEffects) {}
+  constructor(
+    private readonly state: PublishTransitionState,
+    private readonly services: PublishTransitionServices,
+  ) {}
 
-  /** The port is supplied per attempt because the mutex and metrics report it runs
-   *  under belong to exactly one pump operation. */
+  get lastPublishedSequence(): number | undefined { return this.lastSequence; }
+  get isTerminalBlocked(): boolean { return this.terminalBlocked; }
+  get activeCaseCollisions(): readonly CaseFoldCollisionGroup[] { return this.collisions; }
+  get activityDirty(): boolean { return this.publishActivityDirty; }
+
+  adoptPublishedSequence(sequence: number): void { this.lastSequence = sequence; }
+  clearTerminalBlock(): void { this.terminalBlocked = false; }
+  acknowledgeActivityWrite(): void { this.publishActivityDirty = false; }
+
+  adoptCollisionObservation(groups: readonly CaseFoldCollisionGroup[], observationComplete: boolean): void {
+    this.collisions = groups.map((group) => ({ paths: [...group.paths] }));
+    this.state.local.setObservationComplete(observationComplete);
+  }
+
   async publish(provenance: PushProvenance, port: PushTransitionPort): Promise<DaemonPublishReceipt> {
-    const request = sealPublishRequest(`publish-${++this.attempts}`, this.effects.sealAttemptInputs());
+    const request = sealPublishRequest(`publish-${++this.attempts}`, {
+      manifest: this.state.local.manifest,
+      appliedBase: port.appliedBase,
+      gcFencedPaths: this.state.retries.gcFencedPaths,
+      observationComplete: this.state.local.observationComplete,
+      caseCollisions: this.collisions,
+      blockedFingerprint: this.terminalFingerprint(),
+    });
     const outcome = await port.execute(request);
     const publishTransitionT0 = performance.now();
     if (outcome.attemptId !== request.attemptId) {
       throw new Error(`publish transition: outcome for attempt ${outcome.attemptId} does not match ${request.attemptId}`);
     }
-    const plan = reduceDaemonPublishOutcome(outcome, { lastPublishedSequence: this.effects.lastPublishedSequence() });
-    for (const effect of plan) await this.apply(effect, provenance, port, publishTransitionT0);
-    return {
-      attemptId: request.attemptId,
-      outcome: outcome.kind,
-      ...(outcome.kind === "terminal-block" ? {} : { sequence: outcome.result.sequence }),
-      effects: plan,
-    };
+    if (outcome.kind === "terminal-block") {
+      this.noteTerminalBlock(outcome.fingerprint);
+      await this.services.refreshDurableState();
+      return { attemptId: request.attemptId, outcome: outcome.kind };
+    }
+    await this.settle(outcome.result, provenance, port, publishTransitionT0);
+    return { attemptId: request.attemptId, outcome: outcome.kind, sequence: outcome.result.sequence };
   }
 
-  private async apply(effect: DaemonPublishEffect, provenance: PushProvenance, port: PushTransitionPort, publishTransitionT0: number): Promise<void> {
-    switch (effect.kind) {
-      case "terminal-block": this.effects.noteTerminalBlock(effect.fingerprint); return;
-      case "record-git-capture-success": this.effects.recordGitCaptureSuccess(provenance); return;
-      case "commit-published-subset": this.effects.commitPublishedSubset(effect.manifest, effect.deferred); return;
-      case "adopt-collision-observation": this.effects.adoptCollisionObservation(effect.groups, effect.observationComplete); return;
-      case "log": this.effects.log(effect.line); return;
-      case "note-published-sequence": this.effects.notePublishedSequence(effect.sequence); return;
-      case "record-publish-activity": this.effects.recordPublishActivity(effect.files, effect.sequence); return;
-      case "schedule-write-finish": this.effects.scheduleWriteFinish(effect.paths); return;
-      case "schedule-gc-fence": this.effects.scheduleGcFence(effect.paths); return;
-      case "refresh-durable-state": await this.effects.refreshDurableState(); return;
-      case "record-sync-metric": await this.effects.recordSyncMetric(); return;
-      case "settle-report": port.settleReport(Math.max(0, performance.now() - publishTransitionT0)); return;
+  private terminalFingerprint(): string | undefined {
+    const halt = this.state.activity.halt;
+    return halt?.op === "push" ? halt.terminal?.fingerprint : undefined;
+  }
+
+  private noteTerminalBlock(fingerprint: string | undefined): void {
+    this.terminalBlocked = true;
+    if (!fingerprint || this.lastTerminalBlockFingerprint === fingerprint) return;
+    this.lastTerminalBlockFingerprint = fingerprint;
+    const reason = this.state.activity.halt?.reason ?? "push is blocked";
+    this.services.log(`push blocked: ${reason} — change the workspace or raise limits`);
+  }
+
+  private async settle(
+    result: PushResult,
+    provenance: PushProvenance,
+    port: PushTransitionPort,
+    publishTransitionT0: number,
+  ): Promise<void> {
+    const sample = gitCaptureSampleForProvenance(provenance);
+    if (sample) this.state.telemetry.record(sample);
+    const deferred = result.deferred ?? [];
+    this.state.local.commitPatch(
+      result.manifest,
+      { kind: "partial", source: "push-committed", paths: new Set(deferred) },
+      { add: deferred },
+    );
+    const groups = result.caseCollisions.map((group) => ({ paths: [...group.paths] }));
+    this.adoptCollisionObservation(
+      groups,
+      result.localFileObservationAuthority === "authoritative" && groups.length === 0,
+    );
+    if (result.committed && result.sequence !== this.lastSequence) {
+      const note = deferred.length > 0
+        ? `; deferred ${deferred.length}: ${deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
+        : "";
+      this.services.log(`push: published sequence ${result.sequence} (${result.manifest.files.length} files${note})`);
     }
+    this.lastSequence = result.sequence;
+    if (result.committed) {
+      this.state.activity.lastPush = {
+        at: new Date().toISOString(),
+        files: result.manifest.files.length,
+        sequence: result.sequence,
+      };
+      this.publishActivityDirty = true;
+    }
+    const retryLater = new Set(result.retryLater ?? []);
+    const writeFinish = new Set(deferred.filter((path) => !retryLater.has(path)));
+    if (writeFinish.size > 0) this.state.retries.scheduleWriteFinish(writeFinish);
+    if (retryLater.size > 0) this.state.retries.scheduleGcFence(retryLater);
+    await this.services.refreshDurableState();
+    this.state.metrics.syncs += 1;
+    await saveMetrics(this.state.root, this.state.metrics);
+    port.settleReport(Math.max(0, performance.now() - publishTransitionT0));
   }
 }
