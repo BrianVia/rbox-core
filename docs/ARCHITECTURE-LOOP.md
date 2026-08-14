@@ -1,9 +1,20 @@
 # Architecture goal loop
 
 Deepening roadmap from the 2026-08-14 architecture review (explorer report
-summarized in `docs/STATUS.md` evening cap). Goal: modules deep enough that
-`docs/CODEMAP.md` becomes unnecessary and gets deleted. Session task ids
-#31-#42 mirror this list; this file is the durable copy.
+summarized in `docs/STATUS.md` evening cap). Session task ids #31-#42
+mirror this list; this file is the durable copy.
+
+## End state (founder, 2026-08-14) — the loop is DONE when all three hold
+
+1. **`docs/CODEMAP.md` is deleted.** The structure explains itself; no map.
+2. **The code is understandable by looking at it.** No long comment
+   threads — comments only for constraints the code cannot express
+   (existing founder rule, now a termination condition: explanatory
+   comment blocks die as deepening makes them redundant).
+3. **The whole repo passes the oxlint anti-slop rules.** Repo-wide ZERO
+   warnings, not just touched-files. Baseline 2026-08-14: **3,421
+   anti-slop warnings** across src+apps — this is the burn-down number,
+   reported in the running totals at every batch boundary.
 
 ## The ceremony-kill metric (hard rule)
 
