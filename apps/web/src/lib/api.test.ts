@@ -36,7 +36,7 @@ const sessionCalls = (m: ReturnType<typeof vi.fn>) =>
 
 beforeEach(() => {
 	store = makeStorage();
-	(globalThis as unknown as { sessionStorage: unknown }).sessionStorage = store;
+	vi.stubGlobal('sessionStorage', store);
 });
 
 describe('rbox token cache (B3 / SF1)', () => {
@@ -55,7 +55,7 @@ describe('rbox token cache (B3 / SF1)', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValue({ ok: true, status: 200, json: async () => usageBody });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		await fetchUsage(clerk('A') as never);
 		await fetchUsage(clerk('A') as never);
 		expect(sessionCalls(f)).toBe(1);
@@ -70,7 +70,7 @@ describe('rbox token cache (B3 / SF1)', () => {
 					})
 				: Promise.resolve({ ok: true, status: 200, json: async () => usageBody })
 		);
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		const c = clerk('A');
 		const both = Promise.all([fetchUsage(c as never), fetchUsage(c as never)]);
 		await new Promise((r) => setTimeout(r, 10));
@@ -86,7 +86,7 @@ describe('rbox token cache (B3 / SF1)', () => {
 			.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_new' }) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => usageBody });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		const u = await fetchUsage(clerk('A') as never);
 		expect(u.plan).toBe('pro');
 		expect(sessionCalls(f)).toBe(2);
@@ -107,7 +107,7 @@ describe('rbox token cache (B3 / SF1)', () => {
 			}
 			return Promise.resolve({ ok: true, status: 200, json: async () => usageBody });
 		});
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		const both = Promise.all([fetchUsage(clerk('A') as never), fetchUsage(clerk('B') as never)]);
 		await new Promise((r) => setTimeout(r, 10));
 		releaseA();
@@ -122,7 +122,7 @@ describe('rbox token cache (B3 / SF1)', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'tokenB' }) })
 			.mockResolvedValue({ ok: true, status: 200, json: async () => usageBody });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		await fetchUsage(clerk('B') as never); // B must exchange, not reuse A
 		expect(store.getItem('rbox_token:B')).toBe('tokenB');
 		const usageCall = f.mock.calls.find((c) => String(c[0]).includes('/v1/account/usage'));
@@ -136,7 +136,7 @@ describe('billing checkout', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ url: 'https://checkout.test/session' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await expect(startCheckout(clerk('A') as never, 'solo', 'annual')).resolves.toBe('https://checkout.test/session');
 
@@ -151,7 +151,7 @@ describe('billing checkout', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ url: 'https://checkout.test/session' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await startCheckout(clerk('A') as never, 'pro');
 
@@ -175,7 +175,7 @@ describe('agent API keys', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ keys: [key] }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await expect(fetchApiKeys(clerk('A') as never)).resolves.toEqual([key]);
 
@@ -190,7 +190,7 @@ describe('agent API keys', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await revokeApiKey(clerk('A') as never, 'key/dev 1');
 
@@ -208,7 +208,7 @@ describe('CLI browser login — device-code (design 47)', () => {
 		const f = vi
 			.fn()
 			.mockResolvedValue({ ok: true, status: 200, json: async () => ({ label: 'my-macbook', status: 'pending' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		const r = await lookupDeviceAuth('ABCD-2345');
 		expect(r).toEqual({ label: 'my-macbook', status: 'pending' });
 		// It's the deliberately-public route: no session exchange, no Authorization header.
@@ -220,13 +220,13 @@ describe('CLI browser login — device-code (design 47)', () => {
 
 	it('lookup surfaces an already-approved code (e.g. a page refresh after confirming)', async () => {
 		const f = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ label: null, status: 'approved' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		expect(await lookupDeviceAuth('WXYZ-6789')).toEqual({ label: null, status: 'approved' });
 	});
 
 	it('lookup returns null on 404 (expired or unknown code)', async () => {
 		const f = vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: 'not_found' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		expect(await lookupDeviceAuth('ZZZZ-0000')).toBeNull();
 	});
 
@@ -235,7 +235,7 @@ describe('CLI browser login — device-code (design 47)', () => {
 		const f = vi
 			.fn()
 			.mockResolvedValue({ ok: true, status: 200, json: async () => keys });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await expect(lookupDeviceAuthPubkeys('ABCD-2345')).resolves.toEqual(keys);
 		expect(sessionCalls(f)).toBe(0);
@@ -252,7 +252,7 @@ describe('CLI browser login — device-code (design 47)', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) }) // session exchange
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true }) }); // approve
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		await approveDeviceAuth(clerk('A') as never, 'ABCD-2345');
 		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/auth/device/approve'));
 		expect(call).toBeTruthy();
@@ -271,7 +271,7 @@ describe('CLI browser login — device-code (design 47)', () => {
 				status: 200,
 				json: async () => ({ ok: true, keyDelivery: { status: 'pending' } })
 			});
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 
 		await approveDeviceAuth(clerk('A') as never, 'ABCD-2345', {
 			pubkeyFingerprint: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
@@ -294,7 +294,7 @@ describe('CLI browser login — device-code (design 47)', () => {
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
 			.mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: 'no_pending_auth' }) });
-		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		vi.stubGlobal('fetch', f);
 		await expect(approveDeviceAuth(clerk('A') as never, 'GONE-0000')).rejects.toThrow(/expired|already/i);
 	});
 });

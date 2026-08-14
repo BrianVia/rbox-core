@@ -51,6 +51,11 @@ const db = () => env.rbox_dev_db;
 const used = async (id: string) =>
   Number((await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(id).first())!.used_bytes);
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
 const fakeState = () =>
   {
     const kv = new Map<string, unknown>();
@@ -59,20 +64,20 @@ const fakeState = () =>
       storage: {
         kv: {
           get: (key: string) => kv.get(key),
-          put: (key: string, value: unknown) => kv.set(key, value),
+          put: <Value>(key: string, value: Value): void => void kv.set(key, value),
           delete: (key: string) => kv.delete(key),
         },
-        sql: { exec: () => ({ toArray: () => [] }) },
+        sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
         transactionSync(fn: () => void) { fn(); },
-        async getAlarm() { return null; },
-        async setAlarm() {},
+        async getAlarm(): Promise<number | null> { return null; },
+        async setAlarm(_scheduledTime: number | Date): Promise<void> {},
       },
-    } as unknown as DurableObjectState;
+    } as DurableObjectState;
   };
 
 async function redeem(accountId: string, receipts: Record<string, string>, handlerEnv: Env = env): Promise<Response> {
   const sync = new WorkspaceSync(fakeState(), handlerEnv);
-  return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
+  return sync["redeemReceipts"](
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-rbox-account": accountId },
@@ -541,7 +546,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const a = await bootstrap("refs-cap-count");
     const sync = new WorkspaceSync(fakeState(), env);
     const dataRefs = MAX_REFS_PER_COMMIT - CARRIER_REFS + 1;
-    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+    const res = await sync["commit"](
       new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1", "x-rbox-account": a.accountId },
@@ -559,7 +564,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const chain = [sha("chain-budget-a"), sha("chain-budget-b")];
     const count = MAX_REFS_PER_COMMIT - CARRIER_REFS - chain.length + 1;
     const sync = new WorkspaceSync(fakeState(), env);
-    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+    const res = await sync["commit"](
       new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1", "x-rbox-account": a.accountId },
@@ -614,7 +619,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     commit.body = JSON.stringify(parsed);
 
     const sync = new WorkspaceSync(fakeState(), env);
-    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+    const res = await sync["commit"](
       new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1", "x-rbox-account": a.accountId },
@@ -642,7 +647,7 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     parsed.blobRefs = [];
     commit.body = JSON.stringify(parsed);
     const sync = new WorkspaceSync(fakeState(), env);
-    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+    const res = await sync["commit"](
       new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-rbox-account": a.accountId },
