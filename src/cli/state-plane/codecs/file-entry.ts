@@ -35,17 +35,17 @@ export interface EncodedFileEntry {
   canonical: string;
 }
 
-function assertPath(path: unknown): asserts path is string {
+function assertPath(path: string): void {
   if (!isSafeRelPath(path)) throw new TypeError("FileEntry.path must be a safe POSIX-relative manifest path");
 }
 
-function hex(value: unknown, field: string, optional = false): Buffer | null {
+function hex(value: string | undefined, field: string, optional = false): Buffer | null {
   if (value === undefined && optional) return null;
   if (typeof value !== "string" || !HEX64.test(value)) throw new TypeError(`${field} must be lowercase hex64`);
   return Buffer.from(value, "hex");
 }
 
-function nonnegativeInteger(value: unknown, field: string): asserts value is number {
+function nonnegativeInteger(value: number | undefined, field: string): asserts value is number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative integer`);
 }
 
@@ -169,7 +169,7 @@ export function decodeFileEntry(row: FileEntryRow): FileEntry {
     ...(row.comp === null ? {} : { comp: row.comp }),
     ...(row.payload_sha === null ? {} : { payloadSha: Buffer.from(row.payload_sha).toString("hex") }),
     ...(row.cipher_size === null ? {} : { cipherSize: row.cipher_size }),
-  } as unknown as FileEntry;
+  } satisfies FileEntry;
   const commonFile = row.kind === "file" && row.symlink_target === null && row.enc_sha === null
     && row.comp === null && row.payload_sha === null && row.cipher_size === null && row.extras_cjson === null;
   let canonicalBytes: number;

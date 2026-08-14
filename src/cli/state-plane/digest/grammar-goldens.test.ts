@@ -12,7 +12,7 @@ import { expect, test } from "bun:test";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import type { JsonValue } from "../../../json.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
-import type { RepoRecordInput } from "../../sync-state-model.js";
+import type { GitHeldAttempt, RepoRecordInput } from "../../sync-state-model.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { REPO_RECORD_KEYS } from "../codecs/repo-record.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
@@ -107,7 +107,7 @@ const withEntry = (index: number, patch: Partial<ExtendedFileEntry> | { remove: 
     if ("remove" in patch && typeof patch.remove === "string") {
       return omit(entry, patch.remove);
     }
-    return { ...entry, ...patch } as unknown as FileEntry;
+    return { ...entry, ...patch } as FileEntry;
   }),
 });
 
@@ -188,6 +188,14 @@ const TOKEN: LineageSnapshot = {
 const GLOBAL: SourceStageBinding = { stageId: "e".repeat(32), logicalDigest: hex(64, 100), physicalSha256: hex(64, 101) };
 const GIT_PROOF: SourceStageBinding = { stageId: "f".repeat(32), logicalDigest: hex(64, 102), physicalSha256: hex(64, 103) };
 
+/** Deliberately only the attempt members this grammar frames: completing the
+ * record would move the digests pinned below. */
+const HELD_ATTEMPT: Partial<GitHeldAttempt> = {
+  incomingKey: "held", effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
+  incomingIndexArtifactDescriptor: "descriptor", localFingerprint: "fingerprint",
+  fingerprintVersion: "v1", reflogs: [], blockers: [],
+};
+
 /** Every optional and nested `RepoRecord` member present at once, so that removing
  * any ONE of them is a single-dimension variant. */
 const FULL_RECORD: RepoRecordInput = {
@@ -208,14 +216,10 @@ const FULL_RECORD: RepoRecordInput = {
   cfgShape: { shape: "standalone", commonDir: { realpath: "/repo/.git", dev: "1", ino: "2", birthtime: "3" } },
   deferrals: { apply: { lane: "apply", deferredSince: "t0", reasonSince: "t0", lastSeen: "t1", reason: "local-commits" } },
   partial: { incomingKey: "incoming", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: false },
-  attempt: {
-    incomingKey: "held", effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
-    incomingIndexArtifactDescriptor: "descriptor", localFingerprint: "fingerprint",
-    fingerprintVersion: "v1", reflogs: [], blockers: [],
-  },
+  attempt: HELD_ATTEMPT as GitHeldAttempt,
   resolutionReceipt: { repo: "repo-a", attemptedGitIncomingKey: "key", attemptedSequence: 41, confirmedReportHash: "hash" },
   idxProj: "projection",
-} as unknown as RepoRecordInput;
+};
 
 interface TransitionRowShape {
   relPath: string;
@@ -260,7 +264,7 @@ function transitionDigest(shape: TransitionShape): string {
 }
 
 const withRecord = (patch: (record: Mutable<RepoRecordInput>) => void): TransitionShape => {
-  const record: Mutable<RepoRecordInput> = { ...FULL_RECORD };
+  const record = { ...FULL_RECORD };
   patch(record);
   return {
     ...TRANSITION_BASE,
@@ -386,7 +390,7 @@ test("repo-transition-v1 moves for every binding, evidence, row, and snapshot di
   const variants = new Map<string, TransitionShape>([
     ["row relPath", { ...TRANSITION_BASE, rows: [{ ...first, relPath: "repo-z" }, second] }],
     ["row expected generation", { ...TRANSITION_BASE, rows: [{ ...first, expectedRepoGen: 9 }, second] }],
-    ["row proof absent", { ...TRANSITION_BASE, rows: [omit(first, "proof") as unknown as TransitionRowShape, second] }],
+    ["row proof absent", { ...TRANSITION_BASE, rows: [omit(first, "proof"), second] }],
     ["row proof value", { ...TRANSITION_BASE, rows: [{ ...first, proof: canonicalJson(carryRepoBaseProof("other")) }, second] }],
     ["row order", { ...TRANSITION_BASE, rows: [second, first] }],
     ["row count", { ...TRANSITION_BASE, rows: [first] }],
@@ -404,14 +408,14 @@ test("repo-transition-v1 moves for every binding, evidence, row, and snapshot di
     ["snapshot lineageId", { ...TRANSITION_BASE, token: { ...TOKEN, lineageId: "9".repeat(32) } }],
     ["snapshot stream", { ...TRANSITION_BASE, token: { ...TOKEN, stream: "workspace/other" } }],
     ["snapshot nonce value", { ...TRANSITION_BASE, token: { ...TOKEN, nonce: "9".repeat(32) } }],
-    ["snapshot nonce absent", { ...TRANSITION_BASE, token: omit(TOKEN, "nonce") as unknown as LineageSnapshot }],
+    ["snapshot nonce absent", { ...TRANSITION_BASE, token: omit(TOKEN, "nonce") }],
     ["snapshot stateRevision value", { ...TRANSITION_BASE, token: { ...TOKEN, stateRevision: 8 } }],
-    ["snapshot stateRevision absent", { ...TRANSITION_BASE, token: omit(TOKEN, "stateRevision") as unknown as LineageSnapshot }],
+    ["snapshot stateRevision absent", { ...TRANSITION_BASE, token: omit(TOKEN, "stateRevision") }],
     ["snapshot lastSyncedSequence", { ...TRANSITION_BASE, token: { ...TOKEN, lastSyncedSequence: 42 } }],
     ["snapshot baseGeneration", { ...TRANSITION_BASE, token: { ...TOKEN, baseGeneration: 4 } }],
     ["snapshot localRevision", { ...TRANSITION_BASE, token: { ...TOKEN, localRevision: 3 } }],
     ["snapshot telemetryBindingId value", { ...TRANSITION_BASE, token: { ...TOKEN, telemetryBindingId: "9".repeat(16) } }],
-    ["snapshot telemetryBindingId absent", { ...TRANSITION_BASE, token: omit(TOKEN, "telemetryBindingId") as unknown as LineageSnapshot }],
+    ["snapshot telemetryBindingId absent", { ...TRANSITION_BASE, token: omit(TOKEN, "telemetryBindingId") }],
     ["snapshot lineageExtras", { ...TRANSITION_BASE, token: { ...TOKEN, lineageExtras: {} } }],
     ["snapshot manifestGitReposPresent", { ...TRANSITION_BASE, token: { ...TOKEN, manifestGitReposPresent: false } }],
     ["snapshot baseHeader", { ...TRANSITION_BASE, token: { ...TOKEN, baseHeader: { ...HEADER, complete: false } } }],

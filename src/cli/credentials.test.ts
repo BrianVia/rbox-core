@@ -485,7 +485,7 @@ test("a peer that cycles the fence exhausts the budget and names the churn", asy
     cycles++;
     republish(String(cycles % 10));
   });
-  const failure = await saveCredentials(credential).then(() => undefined, (error: unknown) => error as Error);
+  const failure = await saveCredentials(credential).then(() => undefined, (error: Error) => error);
   // Boundedness comes from the hook's own attempt count, not from elapsed time:
   // the budget exhausted after a finite number of inspections, and the message
   // reports every one of them as churn rather than a stuck holder.
@@ -585,7 +585,7 @@ test("logout-only destructive recovery clears a malformed marker and prints the 
   await fs.writeFile(lockPath(), "tampered", { mode: 0o600 });
   const warnings: string[] = [];
   const oldWarn = console.warn;
-  console.warn = (line?: unknown) => void warnings.push(String(line ?? ""));
+  console.warn = (line?: string) => void warnings.push(String(line ?? ""));
   try {
     await clearCredentials();
   } finally {
@@ -683,7 +683,7 @@ test("atomic save faults before rename leave the prior credential intact", async
 test("directory sync failure is best-effort after a successful atomic save", async () => {
   const warnings: string[] = [];
   const oldWarn = console.warn;
-  console.warn = (value?: unknown) => void warnings.push(String(value));
+  console.warn = (value?: string) => void warnings.push(String(value));
   restoreHook = installCredentialTestHook((seam) => {
     if (seam === "save-before-directory-sync") throw new Error("injected directory sync failure");
   });
@@ -775,7 +775,10 @@ test("marker hardlink EEXIST is handled for both fence and main publication", as
 test("unsupported marker hardlinks fail closed with no partial final marker", async () => {
   await writeCorruptCredential();
   const originalLink = fs.link;
-  (fs as unknown as { link: typeof fs.link }).link = async () => {
+  // The namespace's own `link` binding is the seam the code under test calls;
+  // this is a mutable view of that binding, not a reinterpretation of `fs`.
+  const linkSeam: { link: typeof fs.link } = fs;
+  linkSeam.link = async () => {
     const error = new Error("hardlinks unsupported") as NodeJS.ErrnoException;
     error.code = "EOPNOTSUPP";
     throw error;
@@ -785,7 +788,7 @@ test("unsupported marker hardlinks fail closed with no partial final marker", as
     await expect(fs.lstat(`${lockPath()}.fence`)).rejects.toThrow();
     await expect(fs.lstat(lockPath())).rejects.toThrow();
   } finally {
-    (fs as unknown as { link: typeof fs.link }).link = originalLink;
+    linkSeam.link = originalLink;
   }
 });
 
@@ -891,7 +894,7 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
     restoreHook = installCredentialTestHook((seam) => {
       if (seam === "lock-contended") contentionObserved();
     });
-    console.warn = (value?: unknown) => void warnings.push(String(value));
+    console.warn = (value?: string) => void warnings.push(String(value));
     clearing = clearCredentials();
     await beforeDeadline(Promise.race([
       contended,
@@ -936,7 +939,7 @@ test("future main marker and a post-acquisition fence failure use the logout-onl
     }
     const warnings: string[] = [];
     const oldWarn = console.warn;
-    console.warn = (value?: unknown) => void warnings.push(String(value));
+    console.warn = (value?: string) => void warnings.push(String(value));
     try {
       await clearCredentials();
     } finally {
@@ -992,7 +995,7 @@ test("concurrent republish after override is non-definitive and a second logout 
   });
   const warnings: string[] = [];
   const oldWarn = console.warn;
-  console.warn = (value?: unknown) => void warnings.push(String(value));
+  console.warn = (value?: string) => void warnings.push(String(value));
   try {
     await clearCredentials();
   } finally {

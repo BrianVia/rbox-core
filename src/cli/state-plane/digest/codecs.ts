@@ -72,7 +72,13 @@ export function framedSha256(domain: string, values: Iterable<string | Uint8Arra
   return hash.digest("hex");
 }
 
-export function domainHash(domain: string): { token(value: string | Uint8Array): void; digest(): string } {
+/** A domain-separated framed hash: tokens go in, one hex digest comes out. */
+export interface DomainHash {
+  token(value: string | Uint8Array): void;
+  digest(): string;
+}
+
+export function domainHash(domain: string): DomainHash {
   const hash = createHash("sha256");
   frame(hash, domain);
   return {
