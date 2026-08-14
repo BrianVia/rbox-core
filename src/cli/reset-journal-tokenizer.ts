@@ -40,6 +40,12 @@ function memberAllowed(parentPath: string, member: string): boolean {
   return rule === undefined || rule[1].has(member);
 }
 
+/** The eight single-character JSON escapes, keyed by the character after `\`. */
+const SIMPLE_ESCAPES = new Map([
+  ["\"", "\""], ["\\", "\\"], ["/", "/"], ["b", "\b"],
+  ["f", "\f"], ["n", "\n"], ["r", "\r"], ["t", "\t"],
+]);
+
 const childPath = (base: string, key: string | number): string =>
   typeof key === "number" ? `${base}[${key}]` : `${base}.${key}`;
 
@@ -47,7 +53,7 @@ const childPath = (base: string, key: string | number): string =>
  * A duplicate-safe strict JSON machine. It deliberately produces null-
  * prototype records, so hostile member names never interact with prototypes.
  */
-export function tokenizeResetJournalJson(text: string): unknown {
+export function tokenizeResetJournalJson(text: string): JsonValue {
   let at = 0;
   let tokens = 0;
   let members = 0;
@@ -85,11 +91,9 @@ export function tokenizeResetJournalJson(text: string): unknown {
       }
       if (at >= text.length) fail("JSON_SYNTAX", path);
       const escaped = text[at++]!;
-      const simple: Record<string, string> = {
-        "\"": "\"", "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t",
-      };
-      if (simple[escaped] !== undefined) {
-        result += simple[escaped];
+      const unescaped = SIMPLE_ESCAPES.get(escaped);
+      if (unescaped !== undefined) {
+        result += unescaped;
       } else if (escaped === "u") {
         const hex = text.slice(at, at + 4);
         if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail("JSON_SYNTAX", path);

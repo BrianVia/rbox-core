@@ -8,7 +8,10 @@ const HEX32 = /^[0-9a-f]{32}$/;
 const DECIMAL_U64 = /^(?:0|[1-9][0-9]*)$/;
 const U64_MAX = (1n << 64n) - 1n;
 
-export interface RepoIdentityV1 {
+/** A durable, canonically encoded repository identity. `type`, not `interface`,
+ * so it keeps its implicit index signature and stays comparable with
+ * `JsonValue` wherever it is embedded in a decoded durable record. */
+export type RepoIdentityV1 = {
   relPath: string;
   kind: GitRepoKind;
   worktreeId: string;
@@ -17,7 +20,7 @@ export interface RepoIdentityV1 {
   dev: string;
   ino: string;
   birthtime: string;
-}
+};
 
 export interface StateLineageV1 {
   workspaceRootReal: string;

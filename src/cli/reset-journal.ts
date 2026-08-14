@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../engine/lockfile.js";
 import { withRepositoryRecoveryFence } from "../cli/sync-git/protocol-locks.js";
@@ -85,16 +85,18 @@ const MAX_TEXT = 4096;
 
 export type { ResetZEntry } from "./reset-z.js";
 
-const record = (value: unknown): JsonObject | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
+/** One field read out of a decoded incarnation marker: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
+const record = (value: JsonField): JsonObject | undefined => value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value) ? value : undefined;
 const exact = (value: JsonObject, keys: readonly string[]): boolean => {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 };
-const counter = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const bounded = (value: unknown): value is string => typeof value === "string" && Buffer.byteLength(value) <= MAX_TEXT && !value.includes("\0");
+const counter = (value: number | undefined): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const bounded = (value: string): boolean => Buffer.byteLength(value) <= MAX_TEXT && !value.includes("\0");
 const sha256 = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
-const canonicalLine = (value: unknown): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
+const canonicalLine = (value: JsonValue): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
 const corruption = (message: string): ResetCorruptionError => new ResetCorruptionError(message);
 
 export const resetJournalPath = (root: string): string => path.join(root, ".rbox", "state", "reset-v1.json");
@@ -169,7 +171,7 @@ async function markerDisposition(file: string, journal: ResetJournalV2): Promise
   const bytes = await boundedRead(file, MAX_JOURNAL_BYTES);
   if (!bytes) return "absent";
   try {
-    const value = record(JSON.parse(bytes.toString("utf8")));
+    const value = record(JSON.parse(bytes.toString("utf8")) as JsonValue);
     if (!value || !exact(value, ["stream", "stateNonce", "stateRevision"])) return "other";
     const tuple = `${String(value.stream)}\0${String(value.stateNonce)}\0${String(value.stateRevision)}`;
     if (tuple === `${journal.old.stream}\0${journal.old.stateNonce}\0${journal.old.stateRevision}`) return "old";

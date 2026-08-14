@@ -1,3 +1,4 @@
+import type { JsonValue } from "../json.js";
 import { constructResetJournal } from "./reset-journal-schema.js";
 import {
   ResetCorruptionError,
@@ -30,7 +31,7 @@ function rejected(cause: unknown): never {
   );
 }
 
-export function validateResetJournalV1(value: unknown): ResetJournalV1 {
+export function validateResetJournalV1(value: JsonValue): ResetJournalV1 {
   try {
     const journal = constructResetJournal(value);
     if ("stateFormat" in journal || journal.v !== 1) rejected("bad reset journal v1 envelope");
@@ -43,7 +44,7 @@ export function validateResetJournalV1(value: unknown): ResetJournalV1 {
   }
 }
 
-export function validateResetJournalV2(value: unknown): ResetJournalV2 {
+export function validateResetJournalV2(value: JsonValue): ResetJournalV2 {
   try {
     const journal = constructResetJournal(value);
     if ("stateFormat" in journal || journal.v !== 2) rejected("bad reset journal v2 envelope");

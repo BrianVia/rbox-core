@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import type { JsonObject, JsonValue } from "../json.js";
+
+/** One field read out of a decoded `op --format=json` row: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
 
 const OUTPUT_LIMIT = 256 * 1024;
 const SECRET_LIMIT = 4 * 1024;
@@ -90,24 +94,6 @@ export interface OnePasswordProvider {
   env: NodeJS.ProcessEnv;
   run?: RunOnePassword;
   signal?: AbortSignal;
-}
-
-interface OnePasswordAccountCandidate {
-  account_uuid?: unknown;
-  id?: unknown;
-  email?: unknown;
-  url?: unknown;
-}
-
-interface OnePasswordVaultCandidate {
-  id?: unknown;
-  name?: unknown;
-}
-
-interface OnePasswordItemCandidate {
-  id?: unknown;
-  tags?: unknown;
-  vault?: { id?: unknown };
 }
 
 function wipe(bytes: Uint8Array | undefined): void {
@@ -313,25 +299,30 @@ function safeFailure(result: OnePasswordProcessResult): OnePasswordFailureClass 
   return "process-unavailable";
 }
 
-function isSafeId(value: unknown): value is string {
+function isSafeId(value: JsonField): value is string {
   return typeof value === "string" && ID_RE.test(value);
 }
 
-function isSafeTag(value: unknown): value is string {
+function isSafeTag(value: JsonField): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= 128
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function parseJson(bytes: Uint8Array): unknown {
+function parseJson(bytes: Uint8Array): JsonField {
   if (bytes.length === 0 || bytes.length > OUTPUT_LIMIT) return undefined;
   try {
-    return JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8"));
+    return JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8")) as JsonValue;
   } catch {
     return undefined;
   }
 }
 
-function sanitizeLabel(value: unknown, fallback: string): string {
+/** One `op --format=json` array element, once it is known to be an object. */
+function row(value: JsonValue): JsonObject | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
+function sanitizeLabel(value: JsonField, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const sanitized = value.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/g, " ").replace(/\s+/g, " ").trim();
   return sanitized.slice(0, 120) || fallback;
@@ -401,13 +392,13 @@ export async function listOnePasswordAccounts(provider: OnePasswordProvider): Pr
     const seen = new Set<string>();
     const labels = new Map<string, number>();
     for (const value of parsed) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as OnePasswordAccountCandidate;
-      const uuid = row.account_uuid ?? row.id;
+      const account = row(value);
+      if (!account) return { state: "unavailable", reason: "invalid-response" };
+      const uuid = account.account_uuid ?? account.id;
       if (!isSafeId(uuid) || seen.has(uuid)) return { state: "unavailable", reason: "invalid-response" };
       seen.add(uuid);
-      const email = sanitizeLabel(row.email, "");
-      const url = sanitizeLabel(row.url, "");
+      const email = sanitizeLabel(account.email, "");
+      const url = sanitizeLabel(account.url, "");
       const label = email && url ? `${email} · ${url}` : email || url || `Account ${accounts.length + 1}`;
       labels.set(label, (labels.get(label) ?? 0) + 1);
       accounts.push({ uuid, label });
@@ -437,13 +428,13 @@ export async function listOnePasswordVaults(provider: OnePasswordProvider, accou
     const ids = new Set<string>();
     const names = new Map<string, number>();
     for (const value of parsed) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as OnePasswordVaultCandidate;
-      if (!isSafeId(row.id) || ids.has(row.id)) return { state: "unavailable", reason: "invalid-response" };
-      ids.add(row.id);
-      const name = sanitizeLabel(row.name, `Vault ${vaults.length + 1}`);
+      const vault = row(value);
+      if (!vault) return { state: "unavailable", reason: "invalid-response" };
+      if (!isSafeId(vault.id) || ids.has(vault.id)) return { state: "unavailable", reason: "invalid-response" };
+      ids.add(vault.id);
+      const name = sanitizeLabel(vault.name, `Vault ${vaults.length + 1}`);
       names.set(name, (names.get(name) ?? 0) + 1);
-      vaults.push({ uuid: row.id, name, label: name });
+      vaults.push({ uuid: vault.id, name, label: name });
     }
     return {
       state: "ok",
@@ -477,16 +468,17 @@ function itemJson(phrase: string, rboxAccountId: string, operationTag: string): 
   return undefined;
 }
 
-function locatorFromCreate(value: unknown, accountUuid: string, vaultUuid: string, operationTag: string): OnePasswordLocator | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const row = value as OnePasswordItemCandidate;
-  if (!isSafeId(row.id)) return undefined;
-  if (row.vault !== undefined) {
-    if (!row.vault || typeof row.vault !== "object" || Array.isArray(row.vault)) return undefined;
-    const returnedVault = row.vault.id;
+function locatorFromCreate(value: JsonField, accountUuid: string, vaultUuid: string, operationTag: string): OnePasswordLocator | undefined {
+  const item = value === undefined ? undefined : row(value);
+  if (!item) return undefined;
+  if (!isSafeId(item.id)) return undefined;
+  if (item.vault !== undefined) {
+    const vault = row(item.vault);
+    if (!vault) return undefined;
+    const returnedVault = vault.id;
     if (returnedVault !== undefined && returnedVault !== vaultUuid) return undefined;
   }
-  return { accountUuid, vaultUuid, itemUuid: row.id, fieldId: FIELD_ID, operationTag };
+  return { accountUuid, vaultUuid, itemUuid: item.id, fieldId: FIELD_ID, operationTag };
 }
 
 export async function createOnePasswordRecoveryItem(
@@ -542,12 +534,13 @@ export async function reconcileOnePasswordRecoveryItem(
     if (!Array.isArray(parsed) || parsed.length > 256) return { state: "unavailable", reason: "invalid-response" };
     const matches: string[] = [];
     for (const value of parsed) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "unavailable", reason: "invalid-response" };
-      const row = value as OnePasswordItemCandidate;
-      if (!isSafeId(row.id) || !Array.isArray(row.tags) || !row.tags.every((tag) => typeof tag === "string")) {
+      const item = row(value);
+      if (!item) return { state: "unavailable", reason: "invalid-response" };
+      const tags = item.tags;
+      if (!isSafeId(item.id) || !Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) {
         return { state: "unavailable", reason: "invalid-response" };
       }
-      if (row.tags.includes(target.operationTag)) matches.push(row.id);
+      if (tags.includes(target.operationTag)) matches.push(item.id);
     }
     if (matches.length === 0) return { state: "missing" };
     if (matches.length !== 1) return { state: "ambiguous" };
