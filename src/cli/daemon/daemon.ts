@@ -5,9 +5,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   buildIgnoreMatcher,
-  effectiveIgnoreRules,
-  nativePruneGlobs,
-  nativePruneCoverageComplete,
   discoverGitRepos,
   discoverGitReposUnder,
   diffManifests,
@@ -72,10 +69,10 @@ import {
   WatcherRecoveryScanError,
   WatcherSessionSupervisor,
   type WatcherAttemptWitness,
-  type WatcherArmCertification,
   type WatcherRearmClock,
   type WatcherRecoveryScanReceipt,
 } from "./watcher-session-supervisor.js";
+import { WatcherTrust } from "./watcher-trust.js";
 import {
   LocalRetryQueue,
   LocalWorkspaceObserver,
@@ -105,19 +102,12 @@ import { resolveBindingScope, ScopedBindingRefusal, type BindingScope } from "..
 import {
   ACTIVITY_HEARTBEAT_MS,
   ChainRepairHaltError,
-  classifyWatcherError,
   DaemonChainRepairPolicy,
   DEEP_SCAN_MS,
   jitter,
   recoveryProbeDelayMs,
   nextSafetyDelay,
   POLL_BACKSTOP_DEFAULT_MS,
-  recordWatcherDropEpisode,
-  RETRUST_DROP_WINDOW_MS,
-  RETRUST_FUSE_DROPS,
-  RETRUST_HOLD_MAX_MS,
-  RETRUST_MIN_QUIET_TICKS,
-  retrustEnabled,
   SAFETY_SYNC_MS,
   type TrustState,
   type PumpOperation,
@@ -384,9 +374,6 @@ export class RboxDaemon {
   private matcherGitReposKey = gitReposMatcherKey();
   /** Design 206 §2: bumped by every `rebuildMatcher`. */
   private matcherGeneration = 0;
-  /** The `nativePruneGlobs` output the live parcel subscription was created with —
-   *  backend state no facade can retro-fix (design 206 §3b). */
-  private watcherNativePruneKey = "";
   private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
   private resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping" = "ready";
@@ -408,10 +395,9 @@ export class RboxDaemon {
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
   private gitBusyEpisode?: { timers: DaemonTimerHandle[]; queuedStages: number[] };
 
+  private readonly watcherTrust: WatcherTrust;
   private readonly watcherSessions: WatcherSessionSupervisor;
   private watcherSessionIdOverride?: string;
-  private readonly monotonicNow: () => number;
-  private monotonicLastMs: number;
   private activityHeartbeatTimer?: ReturnType<typeof setInterval>;
   private ambientStatusHeartbeatTimer?: ReturnType<typeof setInterval>;
   private safetyTimer?: DaemonTimerHandle;
@@ -425,24 +411,6 @@ export class RboxDaemon {
   private safetyDelay = SAFETY_SYNC_MS;
   /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
   private churnSinceSafety = false;
-  /** Flips false on ANY post-init backend error and stays false: a watcher that has
-   *  errored once is no longer trusted to have delivered everything, so the safety
-   *  scan never backs off again (fail-safe toward pre-design-49 behavior). */
-  private watcherHealthy = true;
-  private trustState: TrustState = "trusted";
-  private lastTrustedErrorGeneration = 0;
-  /** First drops of overflow episodes in the strict rolling fuse window. */
-  private transientDropTimestamps: number[] = [];
-  private transientEpisodeFirstMs: number | undefined;
-  private lastTransientDropMs = 0;
-  private recoveryHoldMs = 0;
-  private watcherLivenessSinceDrop = false;
-  private hasCleanUnprunedScanThisEpisode = false;
-  private consecutiveQuietSafetyTicks = 0;
-  private watcherDegraded = false;
-  /** Monotonic post-init watcher error generation. A successful full/deep scan may
-   *  clear the visible degradation only if this did not advance after that scan began. */
-  private watcherErrorGeneration = 0;
   private lastSafetyCompletedMs?: number;
   private rulesChangedSinceDeepScan = false;
   private readonly openDriftAudits = new Set<OpenDriftAudit>();
@@ -460,8 +428,6 @@ export class RboxDaemon {
    * effects and sequences receipts; it holds none of that queue itself. */
   private readonly localObserver: LocalWorkspaceObserver;
   private readonly retryQueue: LocalRetryQueue;
-  private watcherUnsettled = false;
-  private watcherUnsettledGeneration = 0;
   private appliedPendingEventsInOp = false;
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
@@ -606,7 +572,6 @@ export class RboxDaemon {
     }, this.retryQueue);
     this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
-    this.watcherNativePruneKey = nativePruneGlobs(root).join("\n");
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
@@ -628,9 +593,7 @@ export class RboxDaemon {
       clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
     };
     this.deferralHygieneBudgetMs = opts.deferralHygieneBudgetMs ?? 2_000;
-    this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
-    const monotonicStart = this.monotonicNow();
-    this.monotonicLastMs = Number.isFinite(monotonicStart) ? Math.max(0, monotonicStart) : 0;
+    const monotonicNow = opts.monotonicNow ?? (() => performance.now());
     const wsDisabled = process.env.RBOX_DAEMON_WS_DISABLED === "1";
     const wsReliabilityDisabled = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED === "1";
     const pongDeadlineMs = wsReliabilityDisabled
@@ -644,7 +607,7 @@ export class RboxDaemon {
       : envInt("RBOX_DAEMON_POLL_BACKSTOP_MS", POLL_BACKSTOP_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
     const wakeupClock: RemoteWakeupClock = opts.remoteWakeupClock ?? {
       wallNow: () => this.now(),
-      monotonicNow: () => this.monotonicNow(),
+      monotonicNow,
       random: Math.random,
       setTimeout: (fn, ms) => setTimeout(fn, ms),
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -665,19 +628,40 @@ export class RboxDaemon {
       traceCommitted: (sequence) => this.propagationTrace?.wsCommittedFrame(sequence),
       tracePullDequeue: (sequence, latencyMs) => this.propagationTrace?.pullDequeue(sequence, latencyMs),
     });
+    this.watcherTrust = new WatcherTrust(root, {
+      watcher: () => this.watcherSessions.watcher,
+      respectGitignore: () => this.cfg.respectGitignore === true,
+      knownGitRepos: () => Object.keys(this.syncBase?.lastSyncedManifest.gitRepos ?? {}),
+      externalLocalWorkSettled: () => this.activePumpOp === undefined
+        && !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan
+        && this.pendingEvents.length === 0
+        && this.retryQueue.deferredPaths.size === 0,
+      fuseSession: () => this.watcherSessions.fused(),
+      fatalSession: () => this.watcherSessions.fatalError(),
+      contaminateAudits: (input) => {
+        for (const audit of this.openDriftAudits) {
+          audit.watcherHealthy = false;
+          if (input.trustState !== undefined) audit.trustState = worseTrust(audit.trustState, input.trustState);
+        }
+      },
+      statusChanged: () => this.writeAmbientStatus(),
+      pinSafetyFloor: () => this.pinSafetyFloor(),
+      log: (line) => this.log(line),
+    }, { monotonicNow });
     this.watcherSessions = new WatcherSessionSupervisor({
       root: this.root,
       rebuildArmAuthority: () => {
         this.rebuildMatcher(this.syncBase, true);
-        return this.watcherArmAuthority(this.currentMatcherFacade());
+        return this.watcherTrust.armAuthority(this.matcherGeneration, this.currentMatcherFacade());
       },
-      readArmCertification: () => this.watcherArmCertification(this.matcher),
-      errorGeneration: () => this.watcherErrorGeneration,
+      readArmCertification: () => this.watcherTrust.armCertification(this.matcher),
+      errorGeneration: () => this.watcherTrust.snapshot().errorGeneration,
       matcherGeneration: () => this.matcherGeneration,
-      retrustEnabled: () => this.watcherRetrustEnabled(),
+      retrustEnabled: () => this.watcherTrust.snapshot().retrustEnabled,
       stopped: () => this.stopped,
       onEvents: (events) => {
         if (this.resetLifecycle !== "ready") return;
+        this.watcherTrust.observe({ kind: "watch-activity" });
         this.noteChurn();
         this.pendingEvents.push(...events);
         this.request("push");
@@ -685,14 +669,15 @@ export class RboxDaemon {
       onRawEvent: (event) => {
         if (this.resetLifecycle !== "ready") return;
         if (isIgnoreRuleFile(event.relPath)) this.watcherSessions.matcherRebuilt();
+        const { wasUnsettled } = this.watcherTrust.observe({ kind: "raw-event" });
         this.noteChurn();
-        this.markLocalUnsettledFromWatchEvent();
+        if (this.syncBase && (!wasUnsettled || this.activity.local?.settled !== false)) this.enqueueActivityWrite(false);
         for (const audit of this.openDriftAudits) {
           if (audit.rawEvents.length < AUDIT_EVENT_CAP) audit.rawEvents.push(event);
           else audit.overflow = true;
         }
       },
-      onError: (error) => this.handleWatcherError(error),
+      onError: (error) => this.watcherTrust.observe({ kind: "error", error }),
       onGitBatch: (batch) => void this.handleGitSignalBatch(batch),
       attachRefBackend: ({ initial, onSignal, onArmed }) => this.gitDiscovery.attachRefBackend({
         root: this.root,
@@ -706,22 +691,14 @@ export class RboxDaemon {
       noteRefBackendUnavailable: () => this.gitDiscovery.noteRefBackendUnavailable(),
       requestFullScan: () => this.request("fullScan"),
       publishTrust: (errorGeneration) => {
-        this.lastTrustedErrorGeneration = errorGeneration;
-        this.setTrustState("trusted", `re-armed after witnessed full-tree scan (errorGen=${errorGeneration})`);
-        this.watcherDegraded = false;
-        this.resetSuspectEpisodeState();
-        this.writeAmbientStatus();
+        this.watcherTrust.observe({ kind: "rearmed", errorGeneration });
       },
       sessionInstalled: (admission) => {
-        this.watcherNativePruneKey = admission;
-        // An error may fuse trust after native subscribe but before the boot
-        // session finishes Git discovery and becomes installable.
-        if (this.trustState === "fused") this.watcherSessions.fused();
+        this.watcherTrust.observe({ kind: "session-installed", admissionFingerprint: admission });
       },
       watchUnavailable: (error) => {
         this.log(`live watch unavailable: ${error instanceof Error ? error.message : String(error)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
-        this.watcherDegraded = true;
-        this.writeAmbientStatus();
+        this.watcherTrust.observe({ kind: "watch-unavailable" });
       },
       log: this.log,
       startWatcher: (root, matcher, onSettle, watchOpts) => this.startWatcherFn(root, matcher, onSettle, {
@@ -973,67 +950,10 @@ export class RboxDaemon {
     await this.watcherSessions.startBootSession();
   }
 
-  /** RBOX_WATCHER_RETRUST is restart-scoped: a process env cannot change
-   * mid-run, so there is no enabled→disabled transition to own. The flag is
-   * sampled at each recovery decision point (schedule/fire/publish). */
-  private watcherRetrustEnabled(): boolean {
-    return retrustEnabled();
-  }
-
-  private handleWatcherError(err: Error): void {
-    if (!this.watcherRetrustEnabled()) {
-      if (this.watcherHealthy) this.log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
-      this.watcherHealthy = false;
-      for (const audit of this.openDriftAudits) audit.watcherHealthy = false;
-      this.watcherDegraded = true;
-      this.watcherErrorGeneration++;
-      this.writeAmbientStatus();
-      this.pinSafetyFloor();
-      return;
-    }
-    this.watcherDegraded = true;
-    this.watcherErrorGeneration++;
-    this.resetSuspectEpisodeState();
-    const fatal = classifyWatcherError(err.message) === "fatal";
-    if (fatal) this.watcherSessions.fatalError();
-    if (this.trustState === "fused") {
-      this.writeAmbientStatus();
-      this.pinSafetyFloor();
-      return;
-    }
-    if (fatal) {
-      this.log(`watcher error (fatal): ${err.message} — fused pending supervised re-arm`);
-      this.setTrustState("fused", "fatal error");
-      this.watcherSessions.fused();
-    } else {
-      const now = this.readMonotonicMs();
-      const episodes = recordWatcherDropEpisode({
-        currentFirstMs: this.transientEpisodeFirstMs,
-        startsMs: this.transientDropTimestamps,
-      }, now);
-      this.transientEpisodeFirstMs = episodes.currentFirstMs;
-      this.transientDropTimestamps = [...episodes.startsMs];
-      this.lastTransientDropMs = now;
-      this.logTransientDropDiagnostic(now);
-      const d = this.transientDropTimestamps.length;
-      if (d >= RETRUST_FUSE_DROPS) {
-        this.log(`watcher trust FUSED: ${d} transient drop episodes within ${RETRUST_DROP_WINDOW_MS}ms — safety-scan-only pending supervised re-arm`);
-        this.setTrustState("fused", `fuse ${d}/${RETRUST_FUSE_DROPS}`);
-        this.watcherSessions.fused();
-      } else {
-        this.recoveryHoldMs = Math.min(SAFETY_SYNC_MS * 2 ** (d - 1), RETRUST_HOLD_MAX_MS);
-        if (this.trustState === "trusted") this.log(`watcher error (transient overflow): ${err.message} — safety scan pinned; recovering`);
-        this.log(`retrust drop: window=${d}/${RETRUST_FUSE_DROPS} wouldFuse=n hold=${this.recoveryHoldMs}ms`);
-        this.setTrustState("suspect", `transient drop ${d}`);
-      }
-    }
-    this.writeAmbientStatus();
-    this.pinSafetyFloor();
-  }
-
   private async handleGitSignalBatch(batch: GitSignalBatch): Promise<void> {
     if (this.resetLifecycle !== "ready" || this.stopped) return;
     await this.gitDiscovery.observe({ kind: "signal", discoverAll: batch.discoverAll, candidates: batch.candidates });
+    this.watcherTrust.observe({ kind: "watch-activity" });
     this.noteChurn();
     if (batch.reasons.signal) this.requestPush("signal");
     if (batch.reasons.candidate) this.requestPush("candidate");
@@ -1046,7 +966,6 @@ export class RboxDaemon {
    *  the flag alone would let a drop from THIS storm wait out an armed 5m timer —
    *  the scan must return to its 60s cadence the moment there is churn to protect. */
   private noteChurn(): void {
-    this.watcherLivenessSinceDrop = true;
     this.churnSinceSafety = true;
     this.pinSafetyFloor();
   }
@@ -1096,19 +1015,10 @@ export class RboxDaemon {
   }
 
   private advanceSafetyCadenceForTick(): void {
-    if (this.churnSinceSafety) this.consecutiveQuietSafetyTicks = 0;
-    else this.consecutiveQuietSafetyTicks++;
-    const degradedBackoffEligible = this.watcherRetrustEnabled()
-      && this.trustState === "suspect"
-      && this.watcherLivenessSinceDrop
-      && this.hasCleanUnprunedScanThisEpisode
-      && this.consecutiveQuietSafetyTicks >= RETRUST_MIN_QUIET_TICKS;
-    // degradedBackoffEligible already embeds the flag; false and absent are
-    // identical to nextSafetyDelay, so flag-off output is unchanged.
+    this.watcherTrust.observe({ kind: "safety-tick", churned: this.churnSinceSafety });
     this.safetyDelay = nextSafetyDelay(this.safetyDelay, {
-      watcherLive: this.watcherLive(),
+      watcherLive: this.watcherTrust.liveEnoughToSkipSafetyScan(),
       churned: this.churnSinceSafety,
-      degradedBackoffEligible,
       pinToFloor: this.gitDiscovery.floorRequired,
     });
   }
@@ -1546,7 +1456,8 @@ export class RboxDaemon {
    *  dispatch rather than forcing an asymmetric branch through here.
    *
    *  `recovery` records which caller this is (design note 2026-07-24 D4): recovery ops run
-   *  outside the watcher-unsettled generation bracketing, so `maybeClearWatcherUnsettledAfterOp`
+   *  outside the watcher-unsettled generation bracketing, so the WatcherTrust
+   *  operation-complete observation
    *  stays with the pump's guarded call and is never invoked for a recovery op. */
   private async executeOp(
     op: "pull" | "fullScan" | "deepScan",
@@ -1578,7 +1489,11 @@ export class RboxDaemon {
       throw error;
     }
     await this.runDeferralHygiene();
-    this.maybeClearWatcherDegradedAfterScan(opts.opWatcherErrorGeneration, cov);
+    this.watcherTrust.observe({
+      kind: "scan",
+      operationErrorGeneration: opts.opWatcherErrorGeneration,
+      receipt: cov,
+    });
     if (op === "fullScan") this.watcherSessions.settleScan(cov as FullScanReceipt);
     if (op === "fullScan" && this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
     this.requestPush("scan");
@@ -1693,8 +1608,7 @@ export class RboxDaemon {
   }
 
   private async runPumpOperation(op: PumpOperation, syncMutex: WorkspaceSyncMutex): Promise<void> {
-    const opWatcherGeneration = this.watcherUnsettledGeneration;
-    const opWatcherErrorGeneration = this.watcherErrorGeneration;
+    const watcherOperation = this.watcherTrust.captureOperation();
     const recoveryHalt = this.probeHalt;
     this.probeHalt = undefined;
     try {
@@ -1705,7 +1619,7 @@ export class RboxDaemon {
       this.appliedPendingEventsInOp = false;
       try {
         if (op === "recoveryProbe") {
-          await this.runRecoveryProbe(syncMutex, recoveryHalt!, opWatcherErrorGeneration);
+          await this.runRecoveryProbe(syncMutex, recoveryHalt!, watcherOperation.errorGeneration);
         } else if (op === "push") {
           const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
           this.outOfStorageProbeArmed = false;
@@ -1716,12 +1630,17 @@ export class RboxDaemon {
             pushedToRemote = true;
           }
         } else {
-          await this.executeOp(op, syncMutex, { recovery: false, opWatcherErrorGeneration });
+          await this.executeOp(op, syncMutex, { recovery: false, opWatcherErrorGeneration: watcherOperation.errorGeneration });
         }
         // D4 (design note 2026-07-24): the exclusion is deliberate — a recovery op runs
         // outside the watcher-unsettled generation bracketing this guard's generation
         // argument assumes, so it must never clear the unsettled surface here.
-        if (op !== "recoveryProbe") this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+        if (op !== "recoveryProbe") this.watcherTrust.observe({
+          kind: "operation-complete",
+          operationEventGeneration: watcherOperation.eventGeneration,
+          pendingEvents: this.pendingEvents.length > 0,
+          refreshedLocalTruth: this.appliedPendingEventsInOp || op === "pull" || op === "fullScan" || op === "deepScan",
+        });
         if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
       } finally {
         if (op === "push") this.finishGitBusyRetry(gitBusyRetryStage);
@@ -1845,7 +1764,7 @@ export class RboxDaemon {
       // wrote nothing; an idle workspace must read `ok`. State-compared, so a
       // boundary that changed nothing (including one with work still queued behind
       // it) writes nothing extra.
-      const settledNow = this.localSettled();
+      const settledNow = this.watcherTrust.localSettled();
       if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
     } finally {
       const settleMs = performance.now() - settleT0;
@@ -1993,18 +1912,6 @@ export class RboxDaemon {
     await run;
   }
 
-  /** A watcher OBJECT exists and its stream has not faulted. `watcherHealthy` starts
-   *  true before watcher initialization, so the object-presence half is load-bearing
-   *  for startup failure and periodic-scan-only mode. */
-  private watcherLive(): boolean {
-    return this.watcher !== undefined && this.watcherHealthy;
-  }
-
-  /** P1: the watcher is live and its stream is trusted, not merely present. */
-  private watcherTrustedForPull(): boolean {
-    return this.watcherLive() && this.trustState === "trusted" && !this.watcherDegraded;
-  }
-
   /** P2: the manifest is a complete observation with no active case-fold collision. */
   private manifestSettledForPull(): boolean {
     return this.local.observationComplete && this.activeCaseCollisions.length === 0;
@@ -2013,7 +1920,7 @@ export class RboxDaemon {
   private pullTrustBeforeDrain(base: SyncState): PullTrustBeforeDrain {
     return {
       killSwitchOff: !pullTrustWatcherEnabled(),
-      watcherTrusted: this.watcherTrustedForPull(),
+      watcherTrusted: this.watcherTrust.trustedForPull(),
       manifestSettled: this.manifestSettledForPull(),
       fullWorkspaceSinceSeed: this.local.fullWorkspaceSinceSeed,
       resetReady: this.resetLifecycle === "ready",
@@ -2025,7 +1932,7 @@ export class RboxDaemon {
   private pullTrustAfterDrain(): PullTrustAfterDrain {
     return {
       pendingEmpty: this.pendingEvents.length === 0,
-      watcherTrusted: this.watcherTrustedForPull(),
+      watcherTrusted: this.watcherTrust.trustedForPull(),
       manifestSettled: this.manifestSettledForPull(),
       trustedView: () => ({ manifest: this.local.trustedProjection(), deferred: this.local.unsettledPaths }),
     };
@@ -2051,7 +1958,7 @@ export class RboxDaemon {
     postBase: Manifest,
     opWatcherErrorGeneration: number,
   ): "watcher-drop" | undefined {
-    if (this.watcherErrorGeneration !== opWatcherErrorGeneration) return "watcher-drop"; // F1
+    if (this.watcherTrust.snapshot().errorGeneration !== opWatcherErrorGeneration) return "watcher-drop"; // F1
     const patched = patchManifestFromPull(local, actions, postBase);
     // A conflict copy's content is unknown until something hashes it; the watcher
     // event that observes it settles it and the next push publishes it.
@@ -2113,7 +2020,7 @@ export class RboxDaemon {
       seal: async () => {
         // Design 202. P4 is captured HERE, at op start, and re-checked immediately
         // before the post-pull install; the pre-op base is F2's "before" side.
-        const watcherErrorGeneration = this.watcherErrorGeneration;
+        const watcherErrorGeneration = this.watcherTrust.captureOperation().errorGeneration;
         const preBase = this.syncBase ?? await this.loadSyncBase();
         return {
           beforeDrain: this.pullTrustBeforeDrain(preBase),
@@ -2299,77 +2206,6 @@ export class RboxDaemon {
     this.syncStateHeartbeatTimer.unref?.();
   }
 
-  private markLocalUnsettledFromWatchEvent(): void {
-    const wasUnsettled = this.watcherUnsettled;
-    this.watcherUnsettled = true;
-    this.watcherUnsettledGeneration++;
-    if (!this.syncBase || (wasUnsettled && this.activity.local?.settled === false)) return;
-    this.enqueueActivityWrite(false);
-  }
-
-  private localSettled(): boolean {
-    return (
-      this.activePumpOp === undefined &&
-      !this.watcherUnsettled &&
-      !this.want.pull &&
-      !this.want.push &&
-      !this.want.fullScan &&
-      !this.want.deepScan &&
-      this.pendingEvents.length === 0 &&
-      this.retryQueue.deferredPaths.size === 0
-    );
-  }
-
-  private maybeClearWatcherUnsettledAfterOp(op: keyof Wants, opWatcherGeneration: number): void {
-    if (!this.watcherUnsettled || this.watcherUnsettledGeneration > opWatcherGeneration || this.pendingEvents.length > 0) return;
-    const refreshedLocalTruth = this.appliedPendingEventsInOp || op === "pull" || op === "fullScan" || op === "deepScan";
-    if (refreshedLocalTruth) this.watcherUnsettled = false;
-  }
-
-  /** A completed full-tree scan covers the dropped-events window. Clear the ambient
-   *  warning only for a live watcher that reported no further error during that scan;
-   *  periodic-scan mode has no watcher to recover and therefore remains degraded. */
-  private maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: ScanCoverage): void {
-    // Visible-degraded clear: keyed on the PUMP-OP-START generation, byte-identical
-    // to pre-104 behavior — a second error DURING the covering scan (bumping errorGen
-    // after this capture) must keep status degraded (daemon-activity.test.ts).
-    const stable = this.watcher && this.watcherDegraded && this.watcherErrorGeneration === opWatcherErrorGeneration;
-    if (stable) { this.watcherDegraded = false; this.writeAmbientStatus(); }
-    if (!this.watcherRetrustEnabled()) return;
-    // Re-trust uses the scan's OWN inside-scan coverage evidence (design 85 R1 F8):
-    // coverage originates at the walker; a drop during config-reload OR
-    // the walk advances errorGen past errorGenAtStart and blocks re-trust.
-    const clean = this.watcher !== undefined && cov.coverage === "full-tree" && cov.errorGenAtStart === this.watcherErrorGeneration;
-    if (!clean) return;
-    if (this.trustState !== "suspect") return;
-    this.hasCleanUnprunedScanThisEpisode = true; // P2 episode evidence
-    if (this.watcherErrorGeneration > this.lastTrustedErrorGeneration
-      && this.readMonotonicMs() - this.lastTransientDropMs >= this.recoveryHoldMs) {
-      this.lastTrustedErrorGeneration = this.watcherErrorGeneration;
-      this.setTrustState("trusted", `re-trusted after clean full-tree scan (errorGen=${this.watcherErrorGeneration})`);
-      this.watcherDegraded = false;
-      this.resetSuspectEpisodeState();
-      this.writeAmbientStatus();
-    }
-  }
-
-  private setTrustState(next: TrustState, reason: string): void {
-    if (this.trustState === next) return;
-    this.trustState = next;
-    this.watcherHealthy = next === "trusted";
-    if (next !== "trusted") for (const audit of this.openDriftAudits) {
-      audit.watcherHealthy = false;
-      audit.trustState = worseTrust(audit.trustState, next);
-    }
-    this.log(`watcher trust ${this.trustState} (${reason})`);
-  }
-
-  private resetSuspectEpisodeState(): void {
-    this.watcherLivenessSinceDrop = false;
-    this.hasCleanUnprunedScanThisEpisode = false;
-    this.consecutiveQuietSafetyTicks = 0;
-  }
-
   private localSnapshot(settled: boolean, now: number): DaemonActivity["local"] | undefined {
     const base = this.syncBase;
     if (!base) return undefined;
@@ -2394,6 +2230,7 @@ export class RboxDaemon {
     // most specific active lease rather than masking it with its outer scope.
     const mutations = this.mutationGate.snapshot();
     const activeMutation = mutations[mutations.length - 1];
+    const watcherTrust = this.watcherTrust.snapshot();
     const status: RboxBarAmbientStatus = {
       ...projectAmbientDaemonStatus({
         activity: snapshot,
@@ -2402,8 +2239,8 @@ export class RboxDaemon {
         sequence: this.lastLoggedSeq,
         activePumpOp: this.activePumpOp,
         want: this.want,
-        watcherDegraded: this.watcherDegraded,
-        trustState: this.trustState,
+        watcherDegraded: watcherTrust.degraded,
+        trustState: watcherTrust.state,
         ownershipLost: this.ownershipWindDownStarted,
         currentPath: this.activeProgressPath,
         repoRecords: this.syncBase ? projectedRepoRecords(this.syncBase) : undefined,
@@ -2455,7 +2292,7 @@ export class RboxDaemon {
       status ??
       this.ambientStatusFrom(
         this.activitySnapshot(),
-        this.localSettled(),
+        this.watcherTrust.localSettled(),
         Date.now()
       );
     this.activityWrite = this.activityWrite.then(async () => {
@@ -2468,7 +2305,7 @@ export class RboxDaemon {
   }
 
   private pausedAmbientStatus(now = Date.now()): RboxBarAmbientStatus {
-    const previous = this.ambientStatusFrom(this.activity, this.localSettled(), now);
+    const previous = this.ambientStatusFrom(this.activity, this.watcherTrust.localSettled(), now);
     return {
       ...pausedAmbientDaemonStatus(now, previous),
       fileCount: previous.fileCount,
@@ -2489,7 +2326,7 @@ export class RboxDaemon {
   }
 
   private writeHeartbeatSurfaces(): void {
-    const settled = this.localSettled();
+    const settled = this.watcherTrust.localSettled();
     const now = Date.now();
     const snapshot = this.activitySnapshot();
     const shellState = shellLineStateOf(snapshot, settled, now);
@@ -2527,7 +2364,7 @@ export class RboxDaemon {
     // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
     // onto the same promise so BOTH files preserve write ordering and neither is ever
     // awaited on the sync path.
-    const settled = this.localSettled();
+    const settled = this.watcherTrust.localSettled();
     const now = Date.now();
     const localSnapshot = this.localSnapshot(settled, now);
     if (localSnapshot) this.activity.local = localSnapshot;
@@ -2635,21 +2472,6 @@ export class RboxDaemon {
     this.propagationTrace?.applyComplete(adoptedSequence, phaseMs);
   }
 
-  private readMonotonicMs(): number {
-    const raw = this.monotonicNow();
-    if (Number.isFinite(raw)) this.monotonicLastMs = Math.max(this.monotonicLastMs, raw);
-    return this.monotonicLastMs;
-  }
-
-  /** One post-callback sample per transient drop. This is supporting evidence:
-   * it cannot reconstruct event-loop starvation that happened before the error. */
-  private logTransientDropDiagnostic(atMs: number): void {
-    setTimeout(() => {
-      const lagMs = Math.max(0, this.readMonotonicMs() - atMs);
-      this.log(`watcher transient drop diagnostic: monotonicMs=${Math.floor(atMs)} eventLoopLagMs=${Math.floor(lagMs)}`);
-    }, 0);
-  }
-
   /** Live transfer progress → activity sidecar, throttled to ~2 writes/s so a big
    *  transfer isn't bottlenecked on progress bookkeeping. Phase changes, determinate
    *  final ticks, and raw same-phase regressions bypass the throttle so transitions,
@@ -2695,7 +2517,7 @@ export class RboxDaemon {
   private async doFullScan(): Promise<FullScanReceipt> {
     if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
     const witness = this.watcherSessions.captureScanWitness();
-    const errorGenAtStart = this.watcherErrorGeneration;
+    const errorGenAtStart = this.watcherTrust.captureOperation().errorGeneration;
     const stats = createScanStats();
     const started = Date.now();
     let scan: ScanObservationReceipt;
@@ -2722,9 +2544,9 @@ export class RboxDaemon {
     };
   }
 
-  /** Layer A may prune only while a live watcher is trusted (see `watcherLive`). */
+  /** Layer A may prune only while a live watcher stream has not faulted. */
   private watcherScanMode(): "pruned" | "unpruned" {
-    return this.watcherLive() ? "pruned" : "unpruned";
+    return this.watcherTrust.liveForPrunedScan() ? "pruned" : "unpruned";
   }
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
@@ -2734,17 +2556,19 @@ export class RboxDaemon {
     // under a stale matcher indefinitely. Runs BEFORE errorGen capture, audit creation,
     // and `watcherScanMode()` selection.
     if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
-    const errorGenAtStart = this.watcherErrorGeneration;
+    const watcherAtStart = this.watcherTrust.captureOperation();
+    const errorGenAtStart = watcherAtStart.errorGeneration;
     const scanStartMs = Date.now();
     const priorManifest = this.local.manifest;
-    const eventGenAtScan = this.watcherUnsettledGeneration;
+    const eventGenAtScan = watcherAtStart.eventGeneration;
     const rulesChanged = this.rulesChangedSinceDeepScan;
     const stats = createScanStats();
+    const trustAtStart = this.watcherTrust.snapshot();
     const audit: OpenDriftAudit = {
       scanStartMs, candidates: [], horizonInputs: new Map(), rawEvents: [], appliedEvents: [], overflow: false,
-      watcherHealthy: this.watcherLive(),
-      trustState: this.watcherRetrustEnabled() ? this.trustState : "trusted",
-      errorGen: this.watcherErrorGeneration,
+      watcherHealthy: trustAtStart.live,
+      trustState: trustAtStart.retrustEnabled ? trustAtStart.state : "trusted",
+      errorGen: trustAtStart.errorGeneration,
       sinceSafetyMs: this.lastSafetyCompletedMs === undefined ? 0 : Math.max(0, scanStartMs - this.lastSafetyCompletedMs),
       rulesChanged,
     };
@@ -2763,8 +2587,8 @@ export class RboxDaemon {
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
     audit.candidates = diffForDrift(priorManifest, freshManifest, {
       firstSeenAtMs: scanStartMs, eventGenAtScan, bootId: this.bootId,
-      watcherSessionId: this.watcherSessionId, errorGenAtScan: this.watcherErrorGeneration,
-      originUntrusted: this.watcherRetrustEnabled() && audit.trustState !== "trusted",
+      watcherSessionId: this.watcherSessionId, errorGenAtScan: this.watcherTrust.snapshot().errorGeneration,
+      originUntrusted: trustAtStart.retrustEnabled && audit.trustState !== "trusted",
     });
     // Stash the fresh-scan snapshot for each PENDING candidate now (the fresh
     // manifest is the horizon's disk truth) — but resolve nothing until the settle
@@ -2857,7 +2681,8 @@ export class RboxDaemon {
         const survivors: DriftCandidate[] = [];
         // Loop-invariant: the audit's trust stamp is monotonically downgraded and
         // never changes mid-loop (the decision section is synchronous).
-        const auditContaminated = this.watcherRetrustEnabled() && audit.trustState !== "trusted";
+        const trustNow = this.watcherTrust.snapshot();
+        const auditContaminated = trustNow.retrustEnabled && audit.trustState !== "trusted";
         for (const candidate of audit.candidates) {
           if (audit.overflow || eventsCoverPath(pendingCoverage, candidate.path)) { racing++; continue; }
           const current = reverified.get(candidate.path);
@@ -2871,8 +2696,8 @@ export class RboxDaemon {
         const held: DriftCandidate[] = [];
         const continuity = {
           bootId: this.bootId, watcherSessionId: this.watcherSessionId,
-          errorGeneration: this.watcherErrorGeneration,
-          watcherUnhealthySince: !this.watcherLive() || !audit.watcherHealthy,
+          errorGeneration: trustNow.errorGeneration,
+          watcherUnhealthySince: !trustNow.live || !audit.watcherHealthy,
         };
         for (const candidate of state.pending) {
           // Event-time truth is binding: a candidate covered by ANY event seen
@@ -2897,7 +2722,7 @@ export class RboxDaemon {
         this.openDriftAudits.delete(audit); // window closed — atomically with the pending update
         return before !== 0 || state.pending.length !== 0 || resolved.lateCovered !== 0 || resolved.coveredAmbiguous !== 0;
       });
-      this.log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"}${this.watcherRetrustEnabled() ? ` trustState=${audit.trustState}` : ""} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
+      this.log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"}${this.watcherTrust.snapshot().retrustEnabled ? ` trustState=${audit.trustState}` : ""} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
     } catch (e) {
       this.openDriftAudits.delete(audit);
       this.log(`drift audit failed (measurement only, sync unaffected): ${errCode(e)}`);
@@ -2922,25 +2747,7 @@ export class RboxDaemon {
     this.matcherGitReposKey = gitReposMatcherKey(state);
     this.matcherGeneration++;
     if (!armRecertification) this.watcherSessions.matcherRebuilt();
-    this.downgradeWatcherIfBackendStale();
-  }
-
-  private watcherArmCertification(matcher: IgnoreMatcher): WatcherArmCertification {
-    const admission = nativePruneGlobs(this.root);
-    const authorityFingerprint = crypto.createHash("sha256").update(JSON.stringify({
-      respectGitignore: this.cfg.respectGitignore === true,
-      knownGitRepos: Object.keys(this.syncBase?.lastSyncedManifest.gitRepos ?? {}).sort(),
-      rules: effectiveIgnoreRules(this.root),
-    })).digest("hex");
-    return {
-      admission,
-      authorityFingerprint,
-      coverage: nativePruneCoverageComplete(this.root, admission, matcher) ? "complete" : "structural-conflict",
-    };
-  }
-
-  private watcherArmAuthority(matcher: IgnoreMatcher) {
-    return { matcherGeneration: this.matcherGeneration, matcher, ...this.watcherArmCertification(matcher) };
+    this.watcherTrust.observe({ kind: "matcher-rebuilt", matcher: this.matcher });
   }
 
   /**
@@ -2952,34 +2759,6 @@ export class RboxDaemon {
    */
   private ensureMatcherProvenance(base: SyncState): void {
     if (this.matcherGitReposKey !== gitReposMatcherKey(base)) this.rebuildMatcher(base);
-  }
-
-  /**
-   * Design 206 §3b. The §3a facade keeps the JS filtering layer current, but the
-   * BACKEND subscription bakes in matcher-derived state it cannot retro-fix: parcel's
-   * native `ignore` globs are computed once at subscribe time, and chokidar bakes
-   * `matcher.prunes` into recursive watch admission. When a rebuild moves those
-   * inputs the live watch is blind for paths the new matcher observes, so trust drops
-   * to `fused` — P1 stays false and every pull takes the correct scan path while the
-   * watcher-session supervisor replaces Parcel and obtains fresh testimony. Chokidar
-   * remains terminal because it has no honest native-arm boundary.
-   */
-  private downgradeWatcherIfBackendStale(): void {
-    const backend = this.watcher?.backend;
-    if (backend === undefined || this.trustState === "fused") return;
-    const stale = backend === "chokidar"
-      // Chokidar admits recursive watches by the full `prunes` result: any rebuild
-      // can move it, and there is no cheaper subscription input to compare.
-      || nativePruneGlobs(this.root).join("\n") !== this.watcherNativePruneKey
-      // Glob output unchanged but matcher coverage EXPANDED into a natively-excluded
-      // dir (`!node_modules/`): those events never reach the JS layer at all.
-      || !nativePruneCoverageComplete(this.root, nativePruneGlobs(this.root), this.matcher);
-    if (!stale) return;
-    this.log("watcher downgraded: ignore-rule change alters native watch coverage — pulls scan pending supervised re-arm");
-    this.setTrustState("fused", "native watch coverage changed");
-    this.watcherSessions.fused();
-    this.writeAmbientStatus();
-    this.pinSafetyFloor();
   }
 
   /**

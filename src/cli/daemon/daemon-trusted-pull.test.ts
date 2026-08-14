@@ -37,7 +37,12 @@ class MiniRemote implements SyncRemote {
   }
   injectCommit(files: FileEntry[], gitRepos?: Record<string, GitSection>): void {
     this.head += 1;
-    this.manifests.set(this.head, { generatedAt: "", files, ...(gitRepos ? { gitRepos, manifestSchema: 2 as const } : {}) });
+    const manifest: Manifest = { generatedAt: "", files };
+    if (gitRepos) {
+      manifest.gitRepos = gitRepos;
+      manifest.manifestSchema = 2;
+    }
+    this.manifests.set(this.head, manifest);
   }
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     this.onLatest?.();
@@ -82,7 +87,6 @@ interface DaemonInternals {
   matcher: IgnoreMatcher;
   matcherGitReposKey: string;
   matcherGeneration: number;
-  watcherNativePruneKey: string;
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -101,10 +105,13 @@ interface DaemonInternals {
   activeCaseCollisions: { paths: string[] }[];
   resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping";
   watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
-  watcherHealthy: boolean;
-  watcherDegraded: boolean;
-  watcherErrorGeneration: number;
-  trustState: "trusted" | "suspect" | "fused";
+  watcherTrust: {
+    healthy: boolean;
+    degraded: boolean;
+    errorGeneration: number;
+    state: "trusted" | "suspect" | "fused";
+    nativePruneKey: string;
+  };
   gitDiscovery: { registry?: unknown };
   openDriftAudits: Set<{ candidates: unknown[]; timer?: ReturnType<typeof setTimeout> }>;
   activity: { halt?: { op: string; message?: string } };
@@ -190,7 +197,7 @@ function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceCl
     bootId: "boot-trust",
     log: (line: string) => lines.push(line),
     ...opts,
-  }) as unknown as DaemonInternals;
+  }) as DaemonInternals;
   d.cache = new HashCache();
   daemon = d;
   return d;
@@ -214,9 +221,9 @@ async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parce
   // rebuilds under a LIVE subscription, and arming must not trip it.
   d.rebuildMatcher(after ?? base);
   d.watcher = { backend, close: async () => {} };
-  d.watcherHealthy = true;
-  d.watcherDegraded = false;
-  d.trustState = "trusted";
+  d.watcherTrust.healthy = true;
+  d.watcherTrust.degraded = false;
+  d.watcherTrust.state = "trusted";
   d.local.complete = true;
   d.activeCaseCollisions = [];
   d.resetLifecycle = "ready";
@@ -238,9 +245,9 @@ test("design 202 P-matrix: every condition independently false drops the pull ba
 
   const cases: [string, string, () => void, () => void][] = [
     ["P1 no watcher", "p1-watcher", () => { d.watcher = undefined; }, () => { d.watcher = { backend: "parcel", close: async () => {} }; }],
-    ["P1 unhealthy", "p1-watcher", () => { d.watcherHealthy = false; }, () => { d.watcherHealthy = true; }],
-    ["P1 untrusted", "p1-watcher", () => { d.trustState = "suspect"; }, () => { d.trustState = "trusted"; }],
-    ["P1 degraded", "p1-watcher", () => { d.watcherDegraded = true; }, () => { d.watcherDegraded = false; }],
+    ["P1 unhealthy", "p1-watcher", () => { d.watcherTrust.healthy = false; }, () => { d.watcherTrust.healthy = true; }],
+    ["P1 untrusted", "p1-watcher", () => { d.watcherTrust.state = "suspect"; }, () => { d.watcherTrust.state = "trusted"; }],
+    ["P1 degraded", "p1-watcher", () => { d.watcherTrust.degraded = true; }, () => { d.watcherTrust.degraded = false; }],
     ["P2 incomplete observation", "p2-observation", () => { d.local.complete = false; }, () => { d.local.complete = true; }],
     ["P2 case collision", "p2-observation", () => { d.activeCaseCollisions = [{ paths: ["A.txt", "a.txt"] }]; }, () => { d.activeCaseCollisions = []; }],
     ["P5 no full-workspace install since seed", "p5-seed", () => { d.local.fullWorkspace = false; }, () => { d.local.fullWorkspace = true; }],
@@ -463,7 +470,7 @@ test("design 202 F1: a watcher drop during the pull fails the P4 re-check and fo
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
   remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
-  remote.onLatest = () => { d.watcherErrorGeneration++; remote.onLatest = undefined; };
+  remote.onLatest = () => { d.watcherTrust.errorGeneration++; remote.onLatest = undefined; };
 
   d.want.pull = true;
   await d.pump();
@@ -706,7 +713,7 @@ test("design 237: a native-coverage fuse recovers through the same witnessed Par
   d.rebuildMatcher(await d.loadSyncBase());
 
   expect(lines).toContain(DOWNGRADE_LINE);
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(d.watcher?.backend).toBe("parcel");
   expect(timer?.ms).toBe(120_000);
 
@@ -716,14 +723,14 @@ test("design 237: a native-coverage fuse recovers through the same witnessed Par
   expect(pullLine()).toBe("pull local=scan skip=p1-watcher");
 
   await d.doFullScan(); // a pre-arm scan is not testimony
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   const fireRearm = timer!.fn;
   timer = undefined;
   fireRearm();
   await d.watcherSessions.drainReplacement();
   expect(d.watcherSessions.activeAttempt).toBeDefined();
   await d.pumpRun;
-  expect(d.trustState).toBe("trusted");
+  expect(d.watcherTrust.state).toBe("trusted");
 });
 
 test("design 237 r4: post-arm recertification reads a real `.rboxignore` mutation", async () => {
@@ -747,7 +754,7 @@ test("design 237 r4: post-arm recertification reads a real `.rboxignore` mutatio
   timer!.fn();
   await d.watcherSessions.drainReplacement();
 
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(d.watcherSessions.activeAttempt).toBeUndefined();
   expect(timer?.ms).toBe(240_000);
 });
@@ -808,7 +815,7 @@ test("design 237 r4: publication recertifies real disk authority after the scan"
   release();
   await d.pumpRun;
 
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(timer?.ms).toBe(240_000);
 });
 
@@ -862,7 +869,7 @@ test("design 237 r4: daemon-classified fatal error makes a real stale scan inert
   releaseFirst();
   await d.pumpRun;
 
-  expect(d.trustState).toBe("trusted");
+  expect(d.watcherTrust.state).toBe("trusted");
   expect(lines.some((line) => line.includes("stale scan inert"))).toBe(true);
 });
 
@@ -902,7 +909,7 @@ test("design 237 r4: a real observer-flow refused commit cannot publish watcher 
   await d.pumpRun;
 
   expect(lines.some((line) => line.includes("not committed: stale-revision"))).toBe(true);
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(timer?.ms).toBe(240_000);
 });
 
@@ -933,7 +940,7 @@ test("design 237: watcher replacement never re-arms boot-owned safety or deep ti
   };
   await d.startLiveWatch();
   expect([safetyArms, deepArms]).toEqual([1, 1]);
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   rearm!.fn();
   await d.watcherSessions.drainReplacement();
   await d.pumpRun;
@@ -964,7 +971,7 @@ test("design 237: a thrown witnessed scan advances watcher backoff without a dae
   await d.pumpRun;
 
   expect(d.activity.halt).toBeUndefined();
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(timer?.ms).toBe(240_000);
 });
 
@@ -980,13 +987,13 @@ test("design 206 §3b: matcher coverage expanding into an ALWAYS_NATIVE_PRUNE di
       },
     },
   });
-  const globsBefore = d.watcherNativePruneKey;
+  const globsBefore = d.watcherTrust.nativePruneKey;
   await fs.writeFile(path.join(root, ".rboxignore"), "!node_modules/\n");
   d.rebuildMatcher(await d.loadSyncBase());
 
   expect(nativePruneGlobs(root).join("\n")).toBe(globsBefore); // the r4 false negative
   expect(lines).toContain(DOWNGRADE_LINE);
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   const fireTerminalRearm = timer!.fn;
   timer = undefined;
   fireTerminalRearm();
@@ -1004,7 +1011,7 @@ test("design 206 §3b: a rebuild that leaves the backend inputs alone does NOT d
   d.rebuildMatcher(await d.loadSyncBase());
 
   expect(lines).not.toContain(DOWNGRADE_LINE);
-  expect(d.trustState).toBe("trusted");
+  expect(d.watcherTrust.state).toBe("trusted");
 
   lines.length = 0;
   d.want.pull = true;
@@ -1023,7 +1030,7 @@ test("design 206 §3b: on chokidar ANY rebuild downgrades — its watch admissio
   d.rebuildMatcher(await d.loadSyncBase());
 
   expect(lines).toContain(DOWNGRADE_LINE);
-  expect(d.trustState).toBe("fused");
+  expect(d.watcherTrust.state).toBe("fused");
   expect(d.watcherSessions.rearmTimer).toBeUndefined();
 });
 

@@ -2,8 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, type Manifest } from "../engine/index.js";
+import { HashCache, type IgnoreMatcher, type Manifest, type WatchEvent } from "../engine/index.js";
 import { RboxDaemon } from "./daemon.js";
+import type { WatcherTrustObservation, WatcherTrustSnapshot } from "./daemon/watcher-trust.js";
 
 const DROP = "Events were dropped by the FSEvents client. File system must be re-scanned.";
 type Mode = "pruned" | "unpruned";
@@ -11,23 +12,36 @@ type Coverage = { coverage: "full-tree" | "pruned"; errorGenAtStart: number };
 type ScanResult = { freshManifest: Manifest; deferredPaths: ReadonlySet<string>; coverage: Coverage["coverage"] };
 
 interface Internals {
-  startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ close(): Promise<void> }>;
+  startWatcherFn: (root: string, matcher: IgnoreMatcher, cb: (events: WatchEvent[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   doFullScan(): Promise<Coverage>;
-  maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: Coverage): void;
   localObserver: { observe(plan: { kind: "scan"; mode: Mode }): Promise<ScanResult> };
   cache: HashCache;
   local: { head: Manifest };
   watcher?: { close(): Promise<void> };
-  watcherHealthy: boolean;
-  trustState: "trusted" | "suspect" | "fused";
-  watcherErrorGeneration: number;
-  lastTransientDropMs: number;
-  recoveryHoldMs: number;
-  hasCleanUnprunedScanThisEpisode: boolean;
+  watcherTrust: {
+    healthy: boolean;
+    lastTransientDropMs: number;
+    recoveryHoldMs: number;
+    cleanUnprunedScanThisEpisode: boolean;
+    captureOperation(): { errorGeneration: number; eventGeneration: number };
+    snapshot(): WatcherTrustSnapshot;
+    observe(input: WatcherTrustObservation): void | { wasUnsettled: boolean };
+  };
   pumping: boolean;
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
+}
+
+interface Harness {
+  daemon: Internals;
+  modes: Mode[];
+  start(): Promise<void>;
+  failInit(): void;
+  error(message?: string): void;
+  errorDuringNextScan(message?: string): void;
+  completeSafety(): Promise<Coverage>;
+  close(): Promise<void>;
 }
 
 let priorRetrust: string | undefined;
@@ -49,19 +63,10 @@ function setRetrust(enabled: boolean): void {
   else process.env.RBOX_WATCHER_RETRUST = "0";
 }
 
-function harness(): {
-  daemon: Internals;
-  modes: Mode[];
-  start(): Promise<void>;
-  failInit(): void;
-  error(message?: string): void;
-  errorDuringNextScan(message?: string): void;
-  completeSafety(): Promise<Coverage>;
-  close(): Promise<void>;
-} {
+function harness(): Harness {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-layer-a-watch-")));
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  const daemon = new RboxDaemon(root, cfg as never, {} as never) as unknown as Internals;
+  const daemon = new RboxDaemon(root, cfg as never, {} as never) as Internals;
   daemon.cache = new HashCache();
   daemon.pumping = true;
   const modes: Mode[] = [];
@@ -88,9 +93,9 @@ function harness(): {
     error: (message = DROP) => onError!(new Error(message)),
     errorDuringNextScan: (message = DROP) => { duringScan = () => onError!(new Error(message)); },
     completeSafety: async () => {
-      const opErrorGeneration = daemon.watcherErrorGeneration;
+      const opErrorGeneration = daemon.watcherTrust.captureOperation().errorGeneration;
       const coverage = await daemon.doFullScan();
-      daemon.maybeClearWatcherDegradedAfterScan(opErrorGeneration, coverage);
+      daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: opErrorGeneration, receipt: coverage });
       return coverage;
     },
     close: async () => {
@@ -110,7 +115,7 @@ test("watcher init failure requests unpruned coverage with re-trust off and on",
     try {
       await h.start();
       expect(h.daemon.watcher).toBeUndefined();
-      expect(h.daemon.watcherHealthy).toBe(true); // proves presence, not this boolean alone, gates pruning
+      expect(h.daemon.watcherTrust.healthy).toBe(true); // proves presence, not health alone, gates pruning
       expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
       expect(h.modes).toEqual(["unpruned"]);
     } finally { await h.close(); }
@@ -124,11 +129,11 @@ test("flag-off watcher errors permanently select unpruned mode", async () => {
     try {
       await h.start();
       h.error(message);
-      expect(h.daemon.watcherHealthy).toBe(false);
+      expect(h.daemon.watcherTrust.healthy).toBe(false);
       expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
       expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
       expect(h.modes).toEqual(["unpruned", "unpruned"]);
-      expect(h.daemon.watcherHealthy).toBe(false);
+      expect(h.daemon.watcherTrust.healthy).toBe(false);
     } finally { await h.close(); }
   }
 });
@@ -139,18 +144,18 @@ test("suspect recovery remains unpruned through the hold and prunes only after f
   try {
     await h.start();
     h.error();
-    expect(h.daemon.trustState).toBe("suspect");
-    expect(h.daemon.watcherHealthy).toBe(false);
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("suspect");
+    expect(h.daemon.watcherTrust.healthy).toBe(false);
 
     expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
-    expect(h.daemon.hasCleanUnprunedScanThisEpisode).toBe(true);
-    expect(h.daemon.trustState).toBe("suspect");
+    expect(h.daemon.watcherTrust.cleanUnprunedScanThisEpisode).toBe(true);
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("suspect");
     expect(h.modes).toEqual(["unpruned"]);
 
-    h.daemon.lastTransientDropMs -= h.daemon.recoveryHoldMs + 1;
+    h.daemon.watcherTrust.lastTransientDropMs -= h.daemon.watcherTrust.recoveryHoldMs + 1;
     expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
-    expect(h.daemon.trustState).toBe("trusted");
-    expect(h.daemon.watcherHealthy).toBe(true);
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("trusted");
+    expect(h.daemon.watcherTrust.healthy).toBe(true);
     expect(h.modes).toEqual(["unpruned", "unpruned"]);
 
     expect(await h.completeSafety()).toMatchObject({ coverage: "pruned" });
@@ -164,11 +169,11 @@ test("fused watcher stays unpruned even after stable full-tree coverage", async 
   try {
     await h.start();
     h.error("fatal watcher stream failure");
-    expect(h.daemon.trustState).toBe("fused");
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("fused");
     expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
     expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree" });
     expect(h.modes).toEqual(["unpruned", "unpruned"]);
-    expect(h.daemon.trustState).toBe("fused");
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("fused");
   } finally { await h.close(); }
 });
 
@@ -182,8 +187,8 @@ test("an error during a trusted pruned scan forces the following scan unpruned",
       const raced = await h.completeSafety();
       expect(raced.coverage).toBe("pruned");
       expect(raced.errorGenAtStart).toBe(0);
-      expect(h.daemon.watcherErrorGeneration).toBe(1);
-      expect(h.daemon.watcherHealthy).toBe(false);
+      expect(h.daemon.watcherTrust.snapshot().errorGeneration).toBe(1);
+      expect(h.daemon.watcherTrust.healthy).toBe(false);
       expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree", errorGenAtStart: 1 });
       expect(h.modes).toEqual(["pruned", "unpruned"]);
     } finally { await h.close(); }
@@ -196,12 +201,12 @@ test("an error during an unpruned recovery scan cannot re-trust despite full-tre
   try {
     await h.start();
     h.error();
-    h.daemon.lastTransientDropMs -= h.daemon.recoveryHoldMs + 1;
+    h.daemon.watcherTrust.lastTransientDropMs -= h.daemon.watcherTrust.recoveryHoldMs + 1;
     h.errorDuringNextScan();
     const raced = await h.completeSafety();
     expect(raced).toMatchObject({ coverage: "full-tree", errorGenAtStart: 1 });
-    expect(h.daemon.watcherErrorGeneration).toBe(2);
-    expect(h.daemon.trustState).toBe("suspect");
+    expect(h.daemon.watcherTrust.snapshot().errorGeneration).toBe(2);
+    expect(h.daemon.watcherTrust.snapshot().state).toBe("suspect");
     expect(await h.completeSafety()).toMatchObject({ coverage: "full-tree", errorGenAtStart: 2 });
     expect(h.modes).toEqual(["unpruned", "unpruned"]);
   } finally { await h.close(); }

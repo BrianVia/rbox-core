@@ -28,7 +28,7 @@ export type AmbientDaemonState = "synced" | "syncing" | "attention" | "paused";
 export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degraded" | "ownership-lost" | "unknown-error";
 export type AmbientOperationKind = "pull" | "push";
 export type DaemonMode = "pull-only" | "read-write";
-export type WatcherTrust = "suspect" | "fused";
+export type AmbientWatcherTrust = "suspect" | "fused";
 
 export interface AmbientGitDeferral {
   repo: string;
@@ -63,7 +63,7 @@ export interface AmbientDaemonStatusV1 {
   };
   attentionReason?: AmbientAttentionReason;
   /** Visibility-only watcher trust. Absence is unknown/old-writer, not trusted. */
-  watcherTrust?: WatcherTrust;
+  watcherTrust?: AmbientWatcherTrust;
   deferredRepos?: number;
   oldestDeferralAgeSeconds?: number | null;
   deferrals?: AmbientGitDeferral[];
@@ -121,7 +121,7 @@ export interface AmbientStatusProjectionInput {
   activePumpOp?: PumpOp;
   want?: Partial<Record<PumpOp, boolean>>;
   watcherDegraded?: boolean;
-  trustState?: "trusted" | WatcherTrust;
+  trustState?: "trusted" | AmbientWatcherTrust;
   ownershipLost?: boolean;
   currentPath?: string;
   repoRecords?: Record<string, RepoRecord>;
@@ -130,7 +130,7 @@ export interface AmbientStatusProjectionInput {
 const STATES = new Set<AmbientDaemonState>(["synced", "syncing", "attention", "paused"]);
 const MODES = new Set<DaemonMode>(["pull-only", "read-write"]);
 const REASONS = new Set<AmbientAttentionReason>(["halt", "out-of-storage", "watcher-degraded", "ownership-lost", "unknown-error"]);
-const WATCHER_TRUST = new Set<WatcherTrust>(["suspect", "fused"]);
+const WATCHER_TRUST = new Set<AmbientWatcherTrust>(["suspect", "fused"]);
 const PHASES = new Set<TransferPhase>(["scan", "gitcap", "encrypt", "upload", "download"]);
 const MUTATION_PHASES = new Set<MutationPhase>(["file-apply", "git-prepare", "git-commit", "state-cas"]);
 
@@ -360,7 +360,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.mode !== undefined && !MODES.has(j.mode as DaemonMode)) return undefined;
     if (j.bootId !== undefined && (typeof j.bootId !== "string" || j.bootId.length < 1 || j.bootId.length > 128 || /[\r\n\p{Cc}]/u.test(j.bootId))) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
-    if (j.watcherTrust !== undefined && !WATCHER_TRUST.has(j.watcherTrust as WatcherTrust)) return undefined;
+    if (j.watcherTrust !== undefined && !WATCHER_TRUST.has(j.watcherTrust as AmbientWatcherTrust)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
     if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
     const out: AmbientDaemonStatusV1 = {
@@ -374,7 +374,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.mode !== undefined) out.mode = j.mode as DaemonMode;
     if (j.bootId !== undefined) out.bootId = j.bootId;
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
-    if (j.watcherTrust !== undefined) out.watcherTrust = j.watcherTrust as WatcherTrust;
+    if (j.watcherTrust !== undefined) out.watcherTrust = j.watcherTrust as AmbientWatcherTrust;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
     if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
     if (j.deferrals !== undefined) {

@@ -19,7 +19,7 @@ import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import type { CheckoutTransactionCapability } from "../engine/index.js";
 import type { LockingHealth } from "./sync-mutex.js";
-import type { WatcherTrust } from "./daemon/ambient-status.js";
+import type { AmbientWatcherTrust } from "./daemon/ambient-status.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
 export interface StatusSnapshot {
@@ -130,7 +130,7 @@ export type BriefStatusSnapshot =
       halt?: BriefHaltReason;
       recovery?: { nextProbeAt?: string; running?: true };
       planQuota: PlanQuotaAttention;
-      watcherTrust?: WatcherTrust;
+      watcherTrust?: AmbientWatcherTrust;
       daemonVersion?: string;
       cliVersion: string;
       daemonVersionSkew: boolean;
@@ -668,7 +668,7 @@ function planQuotaLine(attention: PlanQuotaAttention): string | undefined {
   }
 }
 
-export function watcherTrustLine(trust: WatcherTrust): string {
+export function watcherTrustLine(trust: AmbientWatcherTrust): string {
   return trust === "suspect"
     ? "watcher trust suspect — pulls may scan while trust is rebuilt"
     : "watcher reliability reduced — syncing continues by scan; restarting rbox restores reactive sync.";
