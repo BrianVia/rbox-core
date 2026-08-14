@@ -43,6 +43,7 @@ import { apiFor, MAX_ATTEMPTS, PUSH_CONFLICT_SURRENDER_MS, NO_GIT_FORCE, makeDef
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } from "./publish-candidate.js";
+import type { LocalManifestProjectionSpans } from "../local-file-projection.js";
 import { executeManifestCommit, type ManifestCommitPort } from "./manifest-commit-executor.js";
 import { acknowledgePublishedGitTransitions, type RepoTransitionPort } from "./publisher-ack-transition.js";
 
@@ -525,7 +526,9 @@ async function runPushAttempt(
   const matcherT0 = performance.now();
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
   const matcherMs = performance.now() - matcherT0;
+  const projectionT0 = report.enabled ? performance.now() : 0;
   const scannedFilePaths = attemptState.rawScannedFilePaths;
+  let projectionSpans: (LocalManifestProjectionSpans & { projection_diff_ms: number; projection_ms: number }) | undefined;
 
   // Every Git-plane effect the candidate transition may order. `execute` is the
   // sole mutating member: it owns scratch/conflict-ref mutations, so the whole
@@ -629,6 +632,11 @@ async function runPushAttempt(
       (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(plan), plan);
     },
   };
+  if (report.enabled) {
+    capture.reportProjectionSpans = (spans) => {
+      projectionSpans = { ...spans, projection_ms: performance.now() - projectionT0 };
+    };
+  }
 
   const sealed = await preparePublishCandidate(
     { acceptedSequence: appliedSequence, appliedBase },
@@ -681,6 +689,13 @@ async function runPushAttempt(
       onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
     },
   );
+  if (projectionSpans) {
+    report.appendDetails("git-plan", { projection_ms: projectionSpans.projection_ms }, formatPushSpan("projection_ms", projectionSpans.projection_ms));
+    report.appendDetails("git-plan", { projection_ignore_carry_ms: projectionSpans.projection_ignore_carry_ms }, formatPushSpan("projection_ignore_carry_ms", projectionSpans.projection_ignore_carry_ms));
+    report.appendDetails("git-plan", { projection_casefold_ms: projectionSpans.projection_casefold_ms }, formatPushSpan("projection_casefold_ms", projectionSpans.projection_casefold_ms));
+    report.appendDetails("git-plan", { projection_sort_ms: projectionSpans.projection_sort_ms }, formatPushSpan("projection_sort_ms", projectionSpans.projection_sort_ms));
+    report.appendDetails("git-plan", { projection_diff_ms: projectionSpans.projection_diff_ms }, formatPushSpan("projection_diff_ms", projectionSpans.projection_diff_ms));
+  }
   report.appendDetails("git-plan", { state_lineage_ms: stateLineageMs }, formatPushSpan("state_lineage_ms", stateLineageMs));
   report.appendDetails("git-plan", { matcher_ms: matcherMs }, formatPushSpan("matcher_ms", matcherMs));
   const publication = sealed.publication;

@@ -50,7 +50,7 @@ export const formatCasSteps = (steps: Record<string, number>): string | undefine
   return parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
 };
 export const formatPushSpan = (
-  name: "ack_ms" | "delta_base_ms" | "drain_wait_ms" | "matcher_ms" | "publish_transition_ms" | "state_lineage_ms",
+  name: "ack_ms" | "delta_base_ms" | "drain_wait_ms" | "matcher_ms" | "projection_casefold_ms" | "projection_diff_ms" | "projection_ignore_carry_ms" | "projection_ms" | "projection_sort_ms" | "publish_transition_ms" | "state_lineage_ms",
   ms: number,
 ): string | undefined =>
   ms > 0 ? `${name.slice(0, -3)}=${fmtDetailSeconds(ms)}s` : undefined;

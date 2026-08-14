@@ -1047,6 +1047,10 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   const pushSummary = logs.find((line) => line.startsWith("rbox push "))!;
   expect(pushSummary).toContain("prologue_ms=");
   expect(pushSummary).toContain("settle_ms=");
+  expect(pushSummary).toContain("projection=");
+  expect(pushSummary).toContain("projection_ignore_carry=");
+  expect(pushSummary).toContain("projection_casefold=");
+  expect(pushSummary).toContain("projection_diff=");
   expect(pushSummary).toContain("delta_base=");
   expect(pushSummary).toContain("ack=");
   expect(pushSummary).toContain("publish_transition=");
