@@ -117,7 +117,7 @@ retired.
 
 | metric | baseline (2026-08-14) | current | target |
 |---|---:|---:|---:|
-| anti-slop warnings, repo-wide | 3,421 | **3,307** | 0 |
+| anti-slop warnings, repo-wide | 3,421 | **3,260** | 0 |
 | — no-runtime-typeof | — | 982 | 0 |
 | — no-conditional-empty-object-spread | — | 620 | 0 |
 | — no-unknown-parameters | — | 537 | 0 |
@@ -129,7 +129,7 @@ retired.
 | size-gate allowlist entries | 69 | 67 | 0 |
 | local branches | ~300 | 53 | ~10 |
 | worktrees | 61 | 34 | active-only |
-| loop tasks complete | 0/12 | **6/12** (#31-35) | 12/12 |
+| loop tasks complete | 0/12 | **9/12** (#31-38) | 12/12 |
 
 Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| grep -oE 'anti-slop\([a-z-]+\)' \| sort \| uniq -c`; allowlist `grep -cE '^  \["' src/cli/state-plane/file-size.test.ts` (÷2).
 
@@ -151,3 +151,14 @@ Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| 
   in design 255). daemon.ts total this loop: 3,540→3,097. Burn-down 3,307.
   Fleet on 590fee6. NEXT: batch 3 — #36/#37/#38 dispatched in parallel
   (three disjoint lanes).
+- 2026-08-14 (night): **BATCH 3 COMPLETE** — #707 (WatcherTrust owns the
+  episode, −206; duplicate-declaration gate forced the AmbientWatcherTrust
+  two-trusts disambiguation), #708 (PushSpans; push-tail-timing.ts +
+  lane-accumulator.ts DELETED; push.ts 16→0 warnings, pin DOWN), #709
+  (plan.ts 1,348-line closure → 214-line loop over three owners; pin
+  1,591→1,213 DOWN; grammar census re-pinned w/ SHA-256 copy proof).
+  daemon.ts now 2,891 nonblank (from 3,540 at loop start). Three corrective
+  rounds this batch, all caught by gates: un-migrated test harnesses ×2 +
+  census; zero production regressions reached main. Burn-down 3,260. Fleet
+  on 0a1e16d. NEXT: batch 4 — #40 (RefPlaneTransaction) + #41 (engine/git
+  merge), then capstones #39 + #42 (needs founder support-window sign-off).
