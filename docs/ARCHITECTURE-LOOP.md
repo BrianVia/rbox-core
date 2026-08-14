@@ -108,6 +108,26 @@ retired.
 > died, the running totals, and anything needing my decision. Cap
 > STATUS.md at session end.
 
+## Scoreboard (live — update at every batch boundary)
+
+| metric | baseline (2026-08-14) | current | target |
+|---|---:|---:|---:|
+| anti-slop warnings, repo-wide | 3,421 | **3,331** | 0 |
+| — no-runtime-typeof | — | 982 | 0 |
+| — no-conditional-empty-object-spread | — | 620 | 0 |
+| — no-unknown-parameters | — | 537 | 0 |
+| — no-shape-in-symbol-names | — | 447 | 0 |
+| — no-chained-type-assertions | — | 418 | 0 |
+| — no-known-value-widening | — | 287 | 0 |
+| — no-unsafe-dictionary-type / no-object-parameters | — | 40 | 0 |
+| CODEMAP.md size (lines) | 460 | 456 | **deleted** |
+| size-gate allowlist entries | 69 | 67 | 0 |
+| local branches | ~300 | 53 | ~10 |
+| worktrees | 61 | 34 | active-only |
+| loop tasks complete | 0/12 | **4/12** (#31-34) | 12/12 |
+
+Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| grep -oE 'anti-slop\([a-z-]+\)' \| sort \| uniq -c`; allowlist `grep -cE '^  \["' src/cli/state-plane/file-size.test.ts` (÷2).
+
 ## Progress
 
 - 2026-08-14: **BATCH 1 COMPLETE** — #703 (CONTEXT.md, 9 brief corrections,
