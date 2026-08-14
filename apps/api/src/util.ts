@@ -1,10 +1,12 @@
 /** Shared control-plane helpers (consolidated from per-file copies). */
 
+import type { JsonValue } from "../../../src/json.js";
+
 /** A lowercase-hex SHA-256 (32 bytes) — every content address / blob ref. */
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
 /** Stable error class for privacy-safe logging — never the raw message/stack. */
-export const errClass = (e: unknown): string => (e instanceof Error ? e.name : typeof e);
+export const errClass = (cause: unknown): string => (cause instanceof Error ? cause.name : typeof cause);
 
 /** Structured, metadata-safe error log. The ONLY way to log an error on a path that
  *  touches user metadata (workspace/project/commit/body/device binds): name the event
@@ -83,12 +85,12 @@ export type CappedJsonResult<T> = { ok: true; value: T } | { ok: false; response
 export async function cappedJson<T>(
   req: Request,
   limits: { maxBytes: number },
-  validate: (value: unknown) => T | null,
+  validate: (value: JsonValue) => T | null,
 ): Promise<CappedJsonResult<T>> {
   const result = await readBytesCapped(req, limits.maxBytes);
   if (result.kind === "overflow") return { ok: false, response: json({ error: "body_too_large" }, 413) };
   if (result.kind === "error") throw result.error;
-  let value: unknown;
+  let value: JsonValue;
   try {
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(result.bytes);
     value = JSON.parse(text);
@@ -102,25 +104,28 @@ export async function cappedJson<T>(
 }
 
 /** JSON-object exactness helper for route validators. */
-export function exactObject<const Keys extends readonly string[]>(
-  value: unknown,
+export function exactObject<Value, const Keys extends readonly string[]>(
+  value: Value,
   keys: Keys,
-): value is { [Key in Keys[number]]: unknown } {
+): value is Value & { [Key in Keys[number]]: JsonValue } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const actual = Object.keys(value);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 export function objectWithKeys<
+  Value,
   const Allowed extends readonly string[],
   const Required extends readonly Allowed[number][] = readonly [],
 >(
-  value: unknown,
+  value: Value,
   allowed: Allowed,
   required?: Required,
-): value is { [Key in Allowed[number]]?: unknown } & { [Key in Required[number]]: unknown };
-export function objectWithKeys(
-  value: unknown,
+): value is Value & { [Key in Required[number]]: JsonValue } & {
+  [Key in Exclude<Allowed[number], Required[number]>]?: JsonValue;
+};
+export function objectWithKeys<Value>(
+  value: Value,
   allowed: readonly string[],
   required: readonly string[] = [],
 ): boolean {
@@ -131,8 +136,16 @@ export function objectWithKeys(
 
 export const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
 
+/** ES2024's `String.prototype.isWellFormed`, absent from the ES2022 lib this project pins
+ *  and from older runtimes — hence optional, and hence the loop fallback below. */
+declare global {
+  interface String {
+    isWellFormed?(): boolean;
+  }
+}
+
 export function isWellFormed(value: string): boolean {
-  const method = (String.prototype as unknown as { isWellFormed?: (this: string) => boolean }).isWellFormed;
+  const method = String.prototype.isWellFormed;
   if (method) return method.call(value);
   for (let i = 0; i < value.length; i++) {
     const unit = value.charCodeAt(i);
@@ -163,11 +176,12 @@ export function truncateCodePoints(value: string, max: number): string {
   return [...value].slice(0, max).join("");
 }
 
-export function logErr(event: string, e: unknown): void {
-  console.error(JSON.stringify({ event, errorClass: errClass(e) }));
+export function logErr(event: string, cause: unknown): void {
+  console.error(JSON.stringify({ event, errorClass: errClass(cause) }));
 }
 
-export function json(data: unknown, status = 200, headers?: Record<string, string>): Response {
+/** Serializes the caller's own response type — `Data` keeps that evidence instead of erasing it. */
+export function json<Data>(data: Data, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", ...headers } });
 }
 

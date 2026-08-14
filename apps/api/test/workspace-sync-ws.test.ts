@@ -13,15 +13,32 @@ if (!("WebSocketRequestResponsePair" in globalThis)) {
   });
 }
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
+/** A prepared-statement double that also exposes the SQL and bound args the assertions read. */
+interface FakeStatement extends D1PreparedStatement {
+  sql: string;
+  args: unknown[];
+  bind(...values: unknown[]): FakeStatement;
+}
+
+/** The gate a blocked D1 mirror write parks on until the test releases it. */
+interface MirrorGate {
+  release?: () => void;
+}
+
 function fakeCtx(sockets: WebSocket[], kv = new Map<string, unknown>()): DurableObjectState & { __kv: Map<string, unknown> } {
   return {
     __kv: kv,
     storage: {
       kv: {
         get: (key: string) => kv.get(key),
-        put: (key: string, value: unknown) => kv.set(key, value),
+        put: <Value>(key: string, value: Value): void => void kv.set(key, value),
         delete: (key: string) => kv.delete(key),
-        list: ({ prefix, limit }: { prefix?: string; limit?: number } = {}) => {
+        list: ({ prefix, limit }: { prefix?: string; limit?: number } = {}): Iterable<[string, unknown]> => {
           const out = new Map<string, unknown>();
           for (const [key, value] of kv) {
             if (prefix && !key.startsWith(prefix)) continue;
@@ -31,19 +48,19 @@ function fakeCtx(sockets: WebSocket[], kv = new Map<string, unknown>()): Durable
           return out;
         },
       },
-      sql: { exec: () => ({ toArray: () => [] }) },
+      sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
       transactionSync: (fn: () => void) => fn(),
-      getAlarm: async () => null,
-      setAlarm: async () => {},
+      getAlarm: async (): Promise<number | null> => null,
+      setAlarm: async (_scheduledTime: number | Date): Promise<void> => {},
     },
     getWebSockets: () => sockets,
     setWebSocketAutoResponse: () => {},
-  } as unknown as DurableObjectState & { __kv: Map<string, unknown> };
+  } as DurableObjectState & { __kv: Map<string, unknown> };
 }
 
 function fakeDb(
   order: string[],
-  mirror: { release?: () => void },
+  mirror: MirrorGate,
   rows: {
     body?: { sequence: number; commit_hash: string; body: string; sig: string };
     failBodyRead?: boolean;
@@ -54,7 +71,7 @@ function fakeDb(
     onFirstBatch?: () => void;
   } = {},
 ): D1Database {
-  const makeStmt = (sql: string) => {
+  const makeStmt = (sql: string): FakeStatement => {
     const stmt = {
       sql,
       args: [] as unknown[],
@@ -62,7 +79,7 @@ function fakeDb(
         stmt.args = args;
         return stmt;
       },
-      first: async () => {
+      first: async (): Promise<unknown> => {
         if (sql.includes("FROM commits")) {
           if (rows.failBodyRead) throw new Error("body read failed");
           return rows.body ?? null;
@@ -86,28 +103,27 @@ function fakeDb(
         return { success: true };
       },
     };
-    return stmt as unknown as D1PreparedStatement;
+    return stmt as FakeStatement;
   };
 
   return {
     prepare: makeStmt,
-    batch: async (stmts: D1PreparedStatement[]) => {
+    batch: async (stmts: FakeStatement[]): Promise<unknown[]> => {
       const onFirstBatch = rows.onFirstBatch;
       rows.onFirstBatch = undefined;
       onFirstBatch?.();
       return stmts.map((stmt) => {
-        const s = stmt as unknown as { sql: string; args: unknown[] };
-        if (s.sql.includes("FROM blob_refs")) {
+        if (stmt.sql.includes("FROM blob_refs")) {
           return {
             results: rows.missingBlobRefs
               ? []
-              : s.args.slice(1).filter((sha256) => sha256 !== rows.missingBlobSha).map((sha256) => ({ sha256 })),
+              : stmt.args.slice(1).filter((sha256) => sha256 !== rows.missingBlobSha).map((sha256) => ({ sha256 })),
           };
         }
         return { results: [] };
       });
     },
-  } as unknown as D1Database;
+  } as D1Database & { prepare(query: string): FakeStatement };
 }
 
 function commitBody(seq: number, hashSeed = "b") {
@@ -224,7 +240,7 @@ function expectServerTimings(body: SyncResponseFixture) {
 describe("workspace sync websocket fanout", () => {
   test("hibernation cursor handler returns the KV head and ignores every other frame", () => {
     const sent: string[] = [];
-    const socket = { send: (message: string) => sent.push(message) } as unknown as WebSocket;
+    const socket = { send: (message: string): void => void sent.push(message) } as WebSocket;
     const sync = new WorkspaceSync(fakeCtx([], new Map([["head", { sequence: 7, commitHash: sha("a") }]])), metricsEnv() as never);
 
     sync.webSocketMessage(socket, "ping");
@@ -233,7 +249,7 @@ describe("workspace sync websocket fanout", () => {
     sync.webSocketMessage(socket, "cursor");
 
     expect(sent).toEqual([JSON.stringify({ head: 7 })]);
-    const deadSocket = { send: () => { throw new Error("dead"); } } as unknown as WebSocket;
+    const deadSocket = { send: (_message: string): void => { throw new Error("dead"); } } as WebSocket;
     expect(() => sync.webSocketMessage(deadSocket, "cursor")).not.toThrow();
   });
 
@@ -243,13 +259,13 @@ describe("workspace sync websocket fanout", () => {
     const socketA = {
       readyState: WebSocket.OPEN,
       deserializeAttachment: () => ({ deviceId: "dev-a" }),
-      send: (message: string) => receivedA.push(message),
-    } as unknown as WebSocket;
+      send: (message: string): void => void receivedA.push(message),
+    } as WebSocket;
     const socketB = {
       readyState: WebSocket.OPEN,
       deserializeAttachment: () => ({ deviceId: "dev-b" }),
-      send: (message: string) => { if (message !== "committed") receivedB.push(message); },
-    } as unknown as WebSocket;
+      send: (message: string): void => { if (message !== "committed") receivedB.push(message); },
+    } as WebSocket;
     const ctx = fakeCtx([socketA, socketB], new Map([["head", { sequence: 9, commitHash: sha("a") }]]));
     const sync = new WorkspaceSync(ctx, metricsEnv() as never);
 
@@ -301,34 +317,34 @@ describe("workspace sync websocket fanout", () => {
       {
         readyState: WebSocket.OPEN,
         deserializeAttachment: () => ({ deviceId: "dev-a" }),
-        send: (message: string) => sent.push(`a:${message}`),
+        send: (message: string): void => void sent.push(`a:${message}`),
       },
       {
         readyState: WebSocket.OPEN,
         deserializeAttachment: () => ({ deviceId: "dev-b" }),
-        send: (message: string) => sent.push(`b:${message}`),
+        send: (message: string): void => void sent.push(`b:${message}`),
       },
-    ] as unknown as WebSocket[];
+    ] as WebSocket[];
 
-    broadcast({ getWebSockets: () => sockets } as unknown as DurableObjectState, "committed");
+    broadcast({ getWebSockets: () => sockets } as DurableObjectState, "committed");
 
     expect(sent).toEqual(["a:committed", "b:committed"]);
   });
 
   test("commit fanout runs before the awaited D1 mirror settles", async () => {
     const order: string[] = [];
-    const mirror: { release?: () => void } = {};
+    const mirror: MirrorGate = {};
     let broadcastReached!: () => void;
     const broadcast = new Promise<void>((resolve) => { broadcastReached = resolve; });
     const sockets = [
       {
         readyState: WebSocket.OPEN,
-        send: () => {
+        send: (_message: string): void => {
           order.push("broadcast");
           broadcastReached();
         },
       },
-    ] as unknown as WebSocket[];
+    ] as WebSocket[];
     const sync = new WorkspaceSync(fakeCtx(sockets), { rbox_dev_db: fakeDb(order, mirror, { blockMirror: true }) } as never);
     const done = sync.fetch(
       new Request("https://api.test/v1/ws/ws_1/proj/root/manifests", {

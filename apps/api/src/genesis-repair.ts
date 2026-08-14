@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { dbFor, dirDb } from "./db.js";
 import { exactObject, json, objectWithKeys, sha256Hex, utf8Bytes } from "./util.js";
+import type { JsonValue } from "../../../src/json.js";
 
 export const GENESIS_TOMBSTONE_SENTINEL = "rbox:genesis-repair-tombstone:v1";
 export const GENESIS_CAPABILITY_HEADER = "x-rbox-genesis-capability";
@@ -60,7 +61,13 @@ export interface RepairProof {
 
 export type RepairClassification = "exact_legacy_orphan" | "not_found" | "malformed_claim" | "dependent_rows" | "workspace_history" | "already_tombstoned";
 
-const count = (value: unknown): number => {
+/** The single verdict `classifyRepairObservation` owns: what the row is, and the proof for it. */
+export interface RepairObservation {
+  classification: RepairClassification;
+  proof: RepairProof;
+}
+
+const count = (value: JsonValue | undefined): number => {
   const n = Number(value);
   return Number.isSafeInteger(n) && n >= 0 ? n : 0;
 };
@@ -85,7 +92,7 @@ export const GENESIS_OBSERVATION_SQL = `SELECT
        (SELECT COUNT(*) FROM workspace_keys WHERE account_id = ?1) AS workspaceKeys,
        (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AS e2eePairingTokens`;
 
-export function genesisObservationFromRow(value: unknown): GenesisObservationRow {
+export function genesisObservationFromRow<Row>(value: Row): GenesisObservationRow {
   const row = objectWithKeys(value, [
     "claimPresent", "recoveryWrap", "recoveryWrapId", "claimCreatedAt", "genesisDeviceId", "repairId", "repairedAt",
     "rosters", "keyStates", "devices", "workspaces", "workspaceKeys", "e2eePairingTokens",
@@ -118,7 +125,7 @@ export function presenceOf(row: GenesisObservationRow): GenesisPresence {
 
 export const allPresenceZero = (p: GenesisPresence): boolean => Object.values(p).every((n) => n === 0);
 
-function boundedText(value: unknown, max: number): value is string {
+function boundedText<Value>(value: Value, max: number): value is Value & string {
   return typeof value === "string" && value.length > 0 && utf8Bytes(value) <= max;
 }
 
@@ -141,7 +148,7 @@ export function isTombstoneFamily(row: GenesisObservationRow): boolean {
   );
 }
 
-export function classifyRepairObservation(row: GenesisObservationRow): { classification: RepairClassification; proof: RepairProof } {
+export function classifyRepairObservation(row: GenesisObservationRow): RepairObservation {
   const dependents = presenceOf(row);
   const ownsWorkspace = row.workspaces > 0;
   let claimShape: RepairProof["claimShape"] = "malformed";
@@ -168,13 +175,13 @@ export function classifyRepairObservation(row: GenesisObservationRow): { classif
   return { classification: "malformed_claim", proof };
 }
 
-function cleanBounded(value: unknown, max: number): string | null {
+function cleanBounded(value: JsonValue | undefined, max: number): string | null {
   if (typeof value !== "string" || value !== value.trim() || !value || utf8Bytes(value) > max) return null;
   // eslint-disable-next-line no-control-regex -- privileged audit labels are one-line text.
   return /[\u0000-\u001f\u007f-\u009f]/.test(value) ? null : value;
 }
 
-export function validateGenesisRepairRequest(value: unknown): GenesisRepairRequest | null {
+export function validateGenesisRepairRequest(value: JsonValue): GenesisRepairRequest | null {
   if (!exactObject(value, ["accountId", "operator", "reason", "dryRun"])) return null;
   const accountId = typeof value.accountId === "string" && ACCOUNT_ID_RE.test(value.accountId) ? value.accountId : null;
   const operator = cleanBounded(value.operator, 128);
@@ -212,6 +219,15 @@ interface GenesisRepairAuditRow extends GenesisRepairAuditEvidenceRow {
   outcome: string;
 }
 
+/** The post-attempt record persisted in `completion_observation_json` (and echoed to the caller). */
+interface RepairAuditObservation {
+  observational: true;
+  eligible?: boolean;
+  claimShape: RepairProof["claimShape"];
+  dependents: GenesisPresence;
+  ownsWorkspace: boolean;
+}
+
 function canonicalEvidence(row: GenesisRepairAuditEvidenceRow): string {
   const fields = ["account_id", "operator", "reason", "observed_classification", "proof_json", "completion_observation_json", "original_claim_present", "original_claim_snapshot", "original_recovery_wrap", "original_recovery_wrap_id", "original_created_at", "original_genesis_device_id", "original_repair_id", "original_repaired_at"] as const satisfies readonly (keyof GenesisRepairAuditEvidenceRow)[];
   return fields.map((key) => {
@@ -222,7 +238,7 @@ function canonicalEvidence(row: GenesisRepairAuditEvidenceRow): string {
   }).join("");
 }
 
-async function completeAudit(env: Env, accountId: string, id: string, outcome: string, vector: string | null, observation: unknown): Promise<void> {
+async function completeAudit(env: Env, accountId: string, id: string, outcome: string, vector: string | null, observation: RepairAuditObservation | null): Promise<void> {
   const db = dbFor(env, accountId);
   const row = await db.prepare("SELECT * FROM genesis_repair_audit WHERE audit_id = ? AND account_id = ?").bind(id, accountId).first<GenesisRepairAuditRow>();
   if (!row || row.outcome !== "attempted") return;
@@ -363,7 +379,7 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
   ).bind(accountId, id).first();
   const postRow=await readGenesisObservation(env,accountId),post = classifyRepairObservation(postRow).proof;
   const completedCompetitor=isExactTombstone(postRow)?await db.prepare("SELECT audit_id FROM genesis_repair_audit WHERE account_id=? AND audit_id=? AND audit_id<>? AND outcome='tombstone_claim_installed' AND completed_at IS NOT NULL LIMIT 1").bind(accountId,postRow.repairId,id).first<{audit_id:string}>():null;
-  const observation = { observational: true, claimShape: post.claimShape, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
+  const observation: RepairAuditObservation = { observational: true, claimShape: post.claimShape, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
   await completeAudit(env, accountId, id, "refused", vector, observation);
   if (competingAttempt || completedCompetitor || post.eligible) {
     await reconcileGenesisRepairAudits(env, accountId);
