@@ -213,7 +213,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // second BASE-writing path in the store, and a proofless row never reaches an
     // authority write (ProoflessBaseError) — including branch-origin-only removal.
     "src/cli/state-plane/store/cas-steps.ts": 8,
-    "src/cli/sync-git/apply.ts": 24,
+    // 24 before the held-decision decomposition: the follow path repeated one
+    // identical base composition four times. It is built once now
+    // (`followComposition`), so three copies of its three sites are gone.
+    "src/cli/sync-git/apply.ts": 15,
     "src/cli/sync-git/base-composer.ts": 2,
     // Was sync-git/follow.ts; the same single read-only site moved with
     // classifyCheckout when follow.ts was split. Count unchanged.

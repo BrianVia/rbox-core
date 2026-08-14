@@ -23,7 +23,9 @@ import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { blockersAfterComposer, createHeldAttempt, earlyHeldAttemptDecision, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldAttemptMismatchField, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
+import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, readWorktreeRegistryDigest } from "./held-skip.js";
+import { createHeldDecisionPlane, heldTraceEnabled, type HeldRepoDecision } from "./held-decision.js";
+import { startGitApplyRun, type GitApplyMetrics, type GitApplyRepoResult, type GitApplyRunKind } from "./apply-metrics.js";
 import {
   carryRepoBaseProof,
   recordOriginLineage,
@@ -38,15 +40,6 @@ import { gitConfigHash } from "./config-lane.js";
 interface KeySnapshot<T> {
   present: boolean;
   value: T | undefined;
-}
-
-interface HeldTraceAttempt {
-  storedAttempt: boolean;
-  earlySkip: boolean;
-  matchConsulted: boolean;
-  mismatch: string;
-  earlyReason: string;
-  blocker: string;
 }
 
 function snapshotKey<T>(record: Record<string, T>, key: string): KeySnapshot<T> {
@@ -105,176 +98,6 @@ export interface GitPullOutcome {
   publishedJournals?: string[];
   journalCrashAt?: (point: FollowCrashPoint) => void;
   gitApplyMetrics?: GitApplyMetrics;
-}
-
-export type GitApplyRunKind = "fresh" | "steady";
-export type GitApplyRepoResult =
-  | "unchanged"
-  | "applied"
-  | "deferred"
-  | "conflict"
-  | "removed"
-  | "skipped";
-
-export interface GitApplyRepoTiming {
-  index: number;
-  queueMs: number;
-  wallMs: number;
-  result: GitApplyRepoResult;
-  commonDirGroup?: number;
-  chain?: GitChainTimings;
-}
-
-export interface GitApplyMetrics {
-  runKind: GitApplyRunKind;
-  repos: number;
-  commonDirGroups: number;
-  results: Record<GitApplyRepoResult, number>;
-  repoTimings: GitApplyRepoTiming[];
-}
-
-const emptyGitApplyResults = (): Record<GitApplyRepoResult, number> => ({
-  unchanged: 0,
-  applied: 0,
-  deferred: 0,
-  conflict: 0,
-  removed: 0,
-  skipped: 0,
-});
-
-const GIT_APPLY_RESULT_ABBR: Record<GitApplyRepoResult, string> = {
-  unchanged: "u",
-  applied: "a",
-  deferred: "d",
-  conflict: "c",
-  removed: "rm",
-  skipped: "s",
-};
-
-const GIT_APPLY_REPO_EXEMPLAR_CAP = 8;
-
-interface GitApplyDistribution {
-  p50: number;
-  p95: number;
-  max: number;
-}
-
-function gitApplyDistribution(values: number[]): GitApplyDistribution {
-  if (values.length === 0) return { p50: 0, p95: 0, max: 0 };
-  const sorted = [...values].sort((a, b) => a - b);
-  const rank = (percentile: number) => sorted[Math.ceil(percentile * sorted.length) - 1]!;
-  return { p50: rank(0.5), p95: rank(0.95), max: sorted[sorted.length - 1]! };
-}
-
-function formatGitApplyDistribution(name: string, values: number[]): string {
-  const distribution = gitApplyDistribution(values);
-  return `${name} p50=${Math.round(distribution.p50)} p95=${Math.round(distribution.p95)} max=${Math.round(distribution.max)}`;
-}
-
-function gitApplyRepoExemplars(repoTimings: GitApplyRepoTiming[]): GitApplyRepoTiming[] {
-  if (process.env.RBOX_DEBUG) return repoTimings;
-  if (repoTimings.length <= GIT_APPLY_REPO_EXEMPLAR_CAP) {
-    return [...repoTimings].sort((a, b) => a.index - b.index);
-  }
-
-  const byWall = [...repoTimings].sort((a, b) => b.wallMs - a.wallMs || a.index - b.index);
-  const byQueue = [...repoTimings].sort((a, b) => b.queueMs - a.queueMs || a.index - b.index);
-  const selected = new Map<number, GitApplyRepoTiming>();
-  const add = (timing: GitApplyRepoTiming | undefined): void => {
-    if (timing && selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) selected.set(timing.index, timing);
-  };
-
-  add(byWall[0]);
-  add(byQueue[0]);
-  for (const timing of [...repoTimings].sort((a, b) => a.index - b.index)) {
-    if (timing.result !== "unchanged") add(timing);
-  }
-
-  let wallIndex = 0;
-  let queueIndex = 0;
-  const addNext = (ranked: GitApplyRepoTiming[], cursor: number): number => {
-    while (cursor < ranked.length && selected.has(ranked[cursor]!.index)) cursor += 1;
-    add(ranked[cursor]);
-    return cursor + 1;
-  };
-  while (selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) {
-    const sizeBefore = selected.size;
-    wallIndex = addNext(byWall, wallIndex);
-    if (selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) queueIndex = addNext(byQueue, queueIndex);
-    if (selected.size === sizeBefore) break;
-  }
-
-  return [...selected.values()].sort((a, b) => a.index - b.index);
-}
-
-function finishGitApplyMetrics(
-  metrics: GitApplyMetrics | undefined,
-  commonDirGroups: Map<string, number> | undefined
-): GitApplyMetrics | undefined {
-  if (!metrics) return undefined;
-  return {
-    ...metrics,
-    commonDirGroups: commonDirGroups?.size ?? 0,
-    results: { ...metrics.results },
-    repoTimings: metrics.repoTimings.map((timing) => ({
-      ...timing,
-      ...(timing.chain ? { chain: { ...timing.chain } } : {}),
-    })),
-  };
-}
-
-export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
-  const resultBits = (Object.entries(metrics.results) as Array<[GitApplyRepoResult, number]>)
-    .filter(([, n]) => n > 0)
-    .map(([k, n]) => `${k}=${n}`)
-    .join(",");
-  const repoBits = gitApplyRepoExemplars(metrics.repoTimings)
-    .map((t) => {
-      const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
-      const chain = t.chain && hasGitChainTiming(t.chain)
-        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}jr${Math.round(chainMetric(t.chain.journalMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cx${Math.round(chainMetric(t.chain.classifyExclusiveMs))}hi${Math.round(chainMetric(t.chain.heldInputMs))}sp${Math.round(chainMetric(t.chain.standingProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
-        : "";
-      return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
-    })
-    .join(",");
-  const distributions = [
-    formatGitApplyDistribution("queueMs", metrics.repoTimings.map((timing) => timing.queueMs)),
-    formatGitApplyDistribution("wallMs", metrics.repoTimings.map((timing) => timing.wallMs)),
-  ];
-  const chainTimings = metrics.repoTimings
-    .map((timing) => timing.chain)
-    .filter((chain): chain is GitChainTimings => chain !== undefined && hasGitChainTiming(chain));
-  if (chainTimings.length > 0) {
-    distributions.push(
-      formatGitApplyDistribution("fetchDecryptMs", chainTimings.map((chain) => chain.fetchDecryptMs)),
-      formatGitApplyDistribution("bundleVerifyMs", chainTimings.map((chain) => chain.bundleVerifyMs)),
-      formatGitApplyDistribution("gitImportMs", chainTimings.map((chain) => chain.gitImportMs)),
-      formatGitApplyDistribution("indexOpStateMs", chainTimings.map((chain) => chain.indexOpStateMs)),
-      formatGitApplyDistribution("journalMs", chainTimings.map((chain) => chainMetric(chain.journalMs))),
-      formatGitApplyDistribution("refTxnExclusiveMs", chainTimings.map((chain) => chainMetric(chain.refTxnExclusiveMs))),
-      formatGitApplyDistribution("ownershipMs", chainTimings.map((chain) => chainMetric(chain.ownershipMs))),
-      formatGitApplyDistribution("reflogMs", chainTimings.map((chain) => chainMetric(chain.reflogMs))),
-      formatGitApplyDistribution("connectivityProofMs", chainTimings.map((chain) => chainMetric(chain.connectivityProofMs))),
-      formatGitApplyDistribution("classifyExclusiveMs", chainTimings.map((chain) => chainMetric(chain.classifyExclusiveMs))),
-      formatGitApplyDistribution("heldInputMs", chainTimings.map((chain) => chainMetric(chain.heldInputMs))),
-      formatGitApplyDistribution("standingProofMs", chainTimings.map((chain) => chainMetric(chain.standingProofMs))),
-      formatGitApplyDistribution("classifyMs", chainTimings.map((chain) => chainMetric(chain.classifyMs))),
-      formatGitApplyDistribution("residualMs", chainTimings.map((chain) => chainMetric(chain.residualMs))),
-    );
-  }
-  return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} skippedHeld=${metrics.results.skipped} results=${resultBits || "none"} ${distributions.join(" ")} repoMs=${repoBits || "none"}`;
-}
-
-function hasGitChainTiming(chain: GitChainTimings): boolean {
-  return chain.chainLength > 0 || chain.fetchDecryptMs > 0 || chain.bundleVerifyMs > 0
-    || chain.gitImportMs > 0 || chain.refTxnExclusiveMs > 0 || chain.ownershipMs > 0
-    || chain.reflogMs > 0 || chain.connectivityProofMs > 0 || chain.indexOpStateMs > 0
-    || chain.journalMs > 0 || chain.classifyMs > 0 || chainMetric(chain.classifyExclusiveMs) > 0
-    || chainMetric(chain.heldInputMs) > 0 || chainMetric(chain.standingProofMs) > 0;
-}
-
-function chainMetric(value: number | undefined): number {
-  return Number.isFinite(value) ? value! : 0;
 }
 
 /**
@@ -349,7 +172,7 @@ opts: {
   const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
     Object.fromEntries(Object.entries(sections ?? {}).map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
   const baseRepos = sanitizeSections(state.lastSyncedManifest.gitRepos);
-  const applied: Record<string, GitSection> = { ...baseRepos };
+  const applied = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = sanitizeSections(state.gitPendingRemote);
@@ -362,8 +185,7 @@ opts: {
   const repoProofs: Record<string, RepoBaseProof> = {};
   const branchBaseOrigins: Record<string, NonNullable<RepoRecord["branchBaseOrigins"]>> = {};
   const publishedJournals: string[] = [];
-  let commonDirGroups: Map<string, number> | undefined;
-  let metrics: GitApplyMetrics | undefined;
+  let run: ReturnType<typeof startGitApplyRun> | undefined;
   const pack = (): GitPullOutcome => ({
     gitRepos: emptyToUndef(sanitizeSections(applied)),
     gitReposRemoved: emptyToUndef(removedMem),
@@ -378,7 +200,7 @@ opts: {
     branchBaseOrigins: emptyToUndef(branchBaseOrigins),
     publishedJournals: publishedJournals.length ? [...publishedJournals] : undefined,
     journalCrashAt: opts.crashAt,
-    gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
+    gitApplyMetrics: run?.snapshot(),
   });
   if (!cfg.syncGit) return pack();
   const allKeys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
@@ -400,20 +222,7 @@ opts: {
     glog,
   );
   const runKind: GitApplyRunKind = Object.keys(baseRepos).length === 0 && Object.keys(pending).length === 0 ? "fresh" : "steady";
-  if (opts.collectMetrics) {
-    commonDirGroups = new Map();
-    metrics = {
-      // "fresh" = no useful local/base git state (design 74 §3) — NOT sequence 0:
-      // a file-synced workspace receiving its first remote.gitRepos is fresh for
-      // git purposes even at a nonzero baseline (sequence-keyed
-      // classification would poison the Phase-1 gate data).
-      runKind,
-      repos: keys.length,
-      commonDirGroups: 0,
-      results: emptyGitApplyResults(),
-      repoTimings: [],
-    };
-  }
+  if (opts.collectMetrics) run = startGitApplyRun(runKind, keys.length);
   if (keys.length === 0) return pack();
   // Fail closed ONCE, before any per-repo work: git sections (incl. pending ones) are
   // E2EE artifacts — without the key nothing below can decrypt-verify.
@@ -421,16 +230,8 @@ opts: {
     throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox key recover`.");
   }
 
-  const commonDirGroupFor = (ctx: RepoCtx | undefined): number | undefined => {
-    if (!commonDirGroups || !ctx) return undefined;
-    const key = path.resolve(ctx.commonDir);
-    let group = commonDirGroups.get(key);
-    if (group === undefined) {
-      group = commonDirGroups.size + 1;
-      commonDirGroups.set(key, group);
-    }
-    return group;
-  };
+  const commonDirGroupFor = (ctx: RepoCtx | undefined): number | undefined =>
+    run && ctx ? run.groupFor(path.resolve(ctx.commonDir)) : undefined;
 
   const currentDeferral = (rel: string, lane: GitDeferral["lane"]): GitDeferral | undefined => {
     const transition = deferrals[rel];
@@ -458,20 +259,19 @@ opts: {
   const clearAttempt = (rel: string): void => {
     attempt[rel] = null;
   };
-  /** Preserve the exact sidecar transition shared by the early optimization and
-   * the authoritative post-protocol held check. */
-  const retainHeldRepo = (rel: string, priorAttempt: GitHeldAttempt): boolean => {
-    if (!heldBlockersAllowSkip(priorAttempt.blockers)) return false;
-    const standingApply = currentDeferral(rel, "apply");
-    const priorOwnershipOnly = ownershipBlockersArePerRefOnly(priorAttempt.blockers);
-    if (!standingApply && !(gitOwnershipNoEscalateEnabled() && priorOwnershipOnly)) return false;
-    if (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly) {
-      clearDeferral(rel, "apply");
-    } else if (standingApply) {
-      setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
-    }
-    return true;
-  };
+  // The held-skip owner. It decides every skip and writes every held attempt;
+  // this frame only lends it the two lanes a skip is allowed to touch.
+  const heldDecisions = createHeldDecisionPlane({
+    root,
+    log: glog,
+    attempts: attempt,
+    now: opts.heldNow,
+    deferrals: {
+      standingApply: (rel) => currentDeferral(rel, "apply"),
+      restandApply: (rel, standing) => setDeferral(rel, "apply", standing.reason, standing.subjectKey, standing.checkout),
+      clearApply: (rel) => clearDeferral(rel, "apply"),
+    },
+  });
   const markCheckpointReproof = (rel: string): void => {
     const transition = deferrals[rel];
     const apply = transition && transition !== null ? transition.apply : undefined;
@@ -508,7 +308,7 @@ opts: {
     rel: string,
     chainTimings: GitChainTimings | undefined,
     commonDirLock: HeldChainLock,
-    heldTrace?: HeldTraceAttempt,
+    held: HeldRepoDecision,
   ): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
@@ -540,13 +340,15 @@ opts: {
       inspectFreshInstall: async () => {
         const ctx = await repoCtxFromDisk(repoDir);
         if (!ctx) throw new Error("fresh config apply lost repository context");
-        const owned = await configReceiver(root, ctx);
-        if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
-        const installed = await readParsedConfigSnapshot(repoDir, owned.configPath, "locked");
+        // The receiver identity is carried forward untouched: this frame binds
+        // the config lane's evidence, it does not interpret it.
+        const { owned, configPath, ...receiverIdentity } = await configReceiver(root, ctx);
+        if (!owned) throw new Error("fresh config target is not receiver-owned");
+        const installed = await readParsedConfigSnapshot(repoDir, configPath, "locked");
         if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
         const post = canonicalizeGitConfig(installed.snapshot.entries);
         if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
-        return { shape: owned.shape, config: post.config, token: installed.snapshot.token };
+        return { ...receiverIdentity, config: post.config, token: installed.snapshot.token };
       },
       applyExisting: (configPath, incoming, baseConfig) => runMutation(repoDir, () =>
         (opts.applyConfig ?? applyConfigTransaction)(repoDir, configPath, incoming, { baseConfig })),
@@ -692,7 +494,7 @@ opts: {
             restoreKey(repoProofs, rel, before.repoProofs);
           };
         },
-        ...(opts.beforeRemovalCleanup ? { beforeCleanup: async () => { await opts.beforeRemovalCleanup!(rel); } } : {}),
+        beforeCleanup: opts.beforeRemovalCleanup ? async () => { await opts.beforeRemovalCleanup!(rel); } : undefined,
         clearJournal: () => clearCheckoutJournal(root, rel),
         sweepSkeleton: () => sweepRemovedRepoSkeleton(root, rel, opts.sweepRmdir ? { rmdir: opts.sweepRmdir } : {}),
         preservePending: (sec) => preserveGitConflict(repoDir, sec, store, cfg.kek!),
@@ -705,14 +507,17 @@ opts: {
     const partialFrom = (
       progress: Pick<GitPartialApply, "appliedRefs" | "heldRefs" | "configApplied">,
       checkoutPending: boolean,
-    ): GitPartialApply => ({
-      incomingKey: incomingKey!,
-      checkoutPending,
-      appliedRefs: progress.appliedRefs,
-      heldRefs: progress.heldRefs,
-      configApplied: progress.configApplied,
-      ...(!progress.configApplied && inheritedConfigBase !== undefined ? { configBase: inheritedConfigBase } : {}),
-    });
+    ): GitPartialApply => {
+      const record: GitPartialApply = {
+        incomingKey: incomingKey!,
+        checkoutPending,
+        appliedRefs: progress.appliedRefs,
+        heldRefs: progress.heldRefs,
+        configApplied: progress.configApplied,
+      };
+      if (!progress.configApplied && inheritedConfigBase !== undefined) record.configBase = inheritedConfigBase;
+      return record;
+    };
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
     // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
@@ -1006,8 +811,7 @@ opts: {
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
       const preparedProtocol = await prepareFollowerBranchProtocol({
         workspaceRoot: root, relPath: rel, state, ctx, record: records[rel], base: baseSec,
-        incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
-        ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
+        incoming: remoteSec, liveRefs: await readAllRefs(repoDir), d2RejectedRefs,
       });
       if (preparedProtocol.status === "hold") {
         await defer(preparedProtocol.reason, "artifact");
@@ -1055,8 +859,7 @@ opts: {
         reloadState: () => loadRawState(root),
         refreshProtocol: async (source) => prepareFollowerBranchProtocol({
           workspaceRoot: root, relPath: rel, state: source.state, ctx, record: source.record, base: source.base,
-          incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
-          ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
+          incoming: remoteSec, liveRefs: await readAllRefs(repoDir), d2RejectedRefs,
         }),
       };
       const settlement = await addTimedMs(chainTimings, "standingProofMs", () => settleStandingBranchProof({
@@ -1090,106 +893,30 @@ opts: {
         unmaterializedAbsenceRefs: settledProtocol.unmaterializedAbsenceRefs,
       };
       await opts.afterHeldSkipPrepass?.(rel);
-      const heldNowMs = opts.heldNow?.();
-      const effectivePartial = currentPartial(rel);
-      const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
-      const priorObservation = priorAttempt
-        ? await addTimedMs(chainTimings, "heldInputMs", () => observeHeldInputs({
-            root, relPath: rel, incoming: remoteSec,
-            record: records[rel], partial: effectivePartial,
-            stateNonce: expectedStateNonce(state),
-            effectiveBaseIndexProjection: records[rel]?.idxProj
-              ?? (baseSec?.indexSha === undefined ? null : undefined),
-            effectiveIncomingIndexProjection:
-              incomingIndexArtifactDescriptor(remoteSec) === priorAttempt.incomingIndexArtifactDescriptor
-                ? priorAttempt.effectiveIncomingIndexProjection
-                : undefined,
-            reflogPaths: priorAttempt.reflogs.map((entry) => entry.path),
-          }))
-        : undefined;
-      let priorInputsMatch = false;
-      if (priorAttempt && priorObservation) {
-        if (heldTrace) {
-          heldTrace.matchConsulted = true;
-          heldTrace.mismatch = heldAttemptMismatchField(priorAttempt, priorObservation, heldNowMs)?.toString() ?? "none";
-        }
-        priorInputsMatch = heldNowMs === undefined
-          ? heldAttemptMatches(priorAttempt, priorObservation)
-          : heldAttemptMatches(priorAttempt, priorObservation, heldNowMs);
-      } else if (heldTrace && priorAttempt) {
-        heldTrace.mismatch = "observation-unavailable";
-      }
-      const priorFloorElapsed = priorAttempt !== undefined && (heldNowMs === undefined
-        ? heldAttemptFloorElapsed(priorAttempt)
-        : heldAttemptFloorElapsed(priorAttempt, heldNowMs));
-      if (gitHeldSkipEnabled() && pend && priorAttempt && priorObservation && priorInputsMatch && !priorFloorElapsed
-        && retainHeldRepo(rel, priorAttempt)) {
-        // A compatibility attempt can prove the late matcher while lacking the
-        // explicit key required by the cheap gate. Re-store the exact matched
-        // inputs so the primary state-save packet upgrades even a deferred repo;
-        // artifact settlement is not this transition's persistence owner.
-        // Preserve `at`: migration must not reset the independent safety-floor clock.
-        attempt[rel] = createHeldAttempt(priorObservation, priorAttempt.blockers, priorAttempt.at);
-        if (heldTrace) {
-          const first = sortedTypedBlockers(priorAttempt.blockers)[0];
-          heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
-        }
-        return { result: "skipped", commonDirGroup };
-      }
+      if (await held.steadySkip({
+        attempt: pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined,
+        record: records[rel],
+        partial: currentPartial(rel),
+        stateNonce: expectedStateNonce(state),
+        effectiveBaseIndexProjection: records[rel]?.idxProj
+          ?? (baseSec?.indexSha === undefined ? null : undefined),
+      })) return { result: "skipped", commonDirGroup };
       // Once a full follow is required, omission must not preserve the rejected
       // attempt across an early artifact/capability/boundary exit. Only a
       // completed stable classification callback may install its replacement.
       clearAttempt(rel);
-      const recordAttempt = async (input: {
-        blockers: readonly TypedBlocker[];
-        reflogPaths: readonly string[];
-        trustedFingerprint: import("./fingerprint.js").GitFingerprint | undefined;
-        effectiveBaseIndexProjection: string | null | undefined;
-        effectiveIncomingIndexProjection: string | null | undefined;
-        boundBase?: GitSection;
-        boundOrigins?: RepoRecord["branchBaseOrigins"];
-        observationPartial?: GitPartialApply;
-        expectedWorktreeRegistryDigest?: string;
-      }): Promise<void> => {
-        const priorRecord = records[rel];
-        const observationPartial = input.observationPartial ?? currentPartial(rel);
-        if (!input.trustedFingerprint || !input.expectedWorktreeRegistryDigest) {
-          clearAttempt(rel);
-          return;
-        }
-        const observed = await addTimedMs(chainTimings, "heldInputMs", () => observeHeldInputs({
-          root, relPath: rel, incoming: remoteSec,
-          record: priorRecord,
-          ...((input.boundBase ?? applied[rel]) === undefined ? {} : { boundBase: input.boundBase ?? applied[rel] }),
-          ...((input.boundOrigins ?? branchBaseOrigins[rel]) === undefined ? {} : { boundOrigins: input.boundOrigins ?? branchBaseOrigins[rel] }),
-          partial: observationPartial,
-          stateNonce: expectedStateNonce(state), reflogPaths: input.reflogPaths,
-          trustedFingerprint: input.trustedFingerprint,
-          effectiveBaseIndexProjection: input.effectiveBaseIndexProjection,
-          effectiveIncomingIndexProjection: input.effectiveIncomingIndexProjection,
-          expectedWorktreeRegistryDigest: input.expectedWorktreeRegistryDigest,
-        }));
-        if (!observed) {
-          clearAttempt(rel);
-          return;
-        }
-        const merged = sortedTypedBlockers(input.blockers);
-        if (priorFloorElapsed && priorInputsMatch && priorAttempt && !sameHeldOutcome(priorAttempt.blockers, merged)) {
-          glog(`git-sync WARNING ${rel}: held-skip fingerprint miss`);
-        }
-        attempt[rel] = heldNowMs === undefined
-          ? createHeldAttempt(observed, merged)
-          : createHeldAttempt(observed, merged, new Date(heldNowMs).toISOString());
-      };
+      /** The pair every downstream composition binds: the prior authoritative
+       * anchor and the incoming section this follow is bound to. */
+      const followComposition = () => ({
+        identity: followIdentity,
+        incoming: remoteSec,
+        baseComposition: {
+          prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+          candidate: { base: remoteSec },
+        },
+      });
       const intendedFor = async (progress: FollowProgress): Promise<FollowIntended> => {
-        const authority = composeFollowAuthority({
-          identity: followIdentity,
-          incoming: remoteSec,
-          baseComposition: {
-            prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-            candidate: { base: remoteSec },
-          },
-        }, followProof, progress, true);
+        const authority = composeFollowAuthority(followComposition(), followProof, progress, true);
         const effectiveDeferrals = mergeFollowDeferralLanes(records[rel]?.deferrals, deferrals[rel]);
         if (authority.held && !(gitOwnershipNoEscalateEnabled() && authority.ownershipOnly)) {
           const heldReason = followHeldDeferralReason(progress);
@@ -1200,17 +927,19 @@ opts: {
         const part = authority.held || !progress.configApplied ? partialFrom(progress, false) : undefined;
         const previous = records[rel];
         const previousRecord = previous === undefined ? undefined : inputRecord(previous);
-        const record: RepoRecordInput = {
-          sourceSeq: opts.sourceGlobalSeq ?? state.lastSyncedSequence,
-          ...(authority.composed.base ? { base: authority.composed.base } : {}),
-          ...(authority.composed.branchBaseOrigins ? { branchBaseOrigins: authority.composed.branchBaseOrigins } : {}),
-          ...(authority.held ? { pending: remoteSec } : {}),
-          ...configLaneState(lane),
-          ...(Object.keys(effectiveDeferrals).length ? { deferrals: effectiveDeferrals } : {}),
-          ...(part ? { partial: part } : {}),
-          ...(progress.incomingIndexProjection ? { idxProj: progress.incomingIndexProjection } : {}),
-        };
-        return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: authority.proof, ...(previousRecord ? { previousRecord } : {}) };
+        // Assembled in the durable record's field order; a key is written only
+        // when the composed authority actually carries it.
+        const record: RepoRecordInput = { sourceSeq: opts.sourceGlobalSeq ?? state.lastSyncedSequence };
+        if (authority.composed.base) record.base = authority.composed.base;
+        if (authority.composed.branchBaseOrigins) record.branchBaseOrigins = authority.composed.branchBaseOrigins;
+        if (authority.held) record.pending = remoteSec;
+        Object.assign(record, configLaneState(lane));
+        if (Object.keys(effectiveDeferrals).length) record.deferrals = effectiveDeferrals;
+        if (part) record.partial = part;
+        if (progress.incomingIndexProjection) record.idxProj = progress.incomingIndexProjection;
+        const intended: FollowIntended = { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: authority.proof };
+        if (previousRecord) intended.previousRecord = previousRecord;
+        return intended;
       };
 
       /** Applies one composed transition to this pull's sidecar lanes in the
@@ -1272,35 +1001,26 @@ opts: {
         mutationBoundary: opts.mutationBoundary,
         afterHeldClassification: async (classification) => {
           await opts.afterHeldClassification?.(rel);
-          if (classification.phase === "followed") {
-            const final = composeFollowAuthority({
-              identity: followIdentity,
-              incoming: remoteSec,
-              baseComposition: {
-                prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-                candidate: { base: remoteSec },
-              },
-            }, followProof, classification.progress, true);
-            await recordAttempt({
-              ...classification,
-              expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
-              ...(final.composed.base ? { boundBase: final.composed.base } : {}),
-              ...(final.composed.branchBaseOrigins ? { boundOrigins: final.composed.branchBaseOrigins } : {}),
-              observationPartial: partialFrom(classification.progress, false),
-              blockers: blockersAfterComposer({
-                classification: classification.blockers,
-                disposition: final.composed.disposition,
-                holds: final.composed.holds,
-                checkoutComplete: final.proof.lockedProof.checkoutComplete,
-              }),
-            });
-          } else {
-            await recordAttempt({
-              ...classification,
-              expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
-              observationPartial: partialFrom(classification.progress, true),
-            });
-          }
+          const followed = classification.phase === "followed"
+            ? composeFollowAuthority(followComposition(), followProof, classification.progress, true)
+            : undefined;
+          await held.recordClassification({
+            ...classification,
+            record: records[rel],
+            stateNonce: expectedStateNonce(state),
+            expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
+            boundBase: followed?.composed.base ?? applied[rel],
+            boundOrigins: followed?.composed.branchBaseOrigins ?? branchBaseOrigins[rel],
+            partial: partialFrom(classification.progress, followed === undefined),
+            blockers: followed
+              ? blockersAfterComposer({
+                  classification: classification.blockers,
+                  disposition: followed.composed.disposition,
+                  holds: followed.composed.holds,
+                  checkoutComplete: followed.proof.lockedProof.checkoutComplete,
+                })
+              : classification.blockers,
+          });
         },
       }));
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
@@ -1309,10 +1029,7 @@ opts: {
         return legacyConflict(follow.reason, follow);
       }
       if (follow.status === "defer") {
-        if (heldTrace) {
-          const first = sortedTypedBlockers(follow.blockers)[0];
-          heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : follow.reason;
-        }
+        held.noteBlockers(follow.blockers, follow.reason);
         if (checkpointReproof && follow.reason !== "unsupported") {
           pending[rel] = remoteSec;
           partial[rel] = partialFrom(follow, true);
@@ -1322,14 +1039,7 @@ opts: {
           markCheckpointReproof(rel);
           return { result: "unchanged", commonDirGroup };
         }
-        await commitFollowTransition(composeFollowRepoTransition({
-          identity: followIdentity,
-          incoming: remoteSec,
-          baseComposition: {
-            prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-            candidate: { base: remoteSec },
-          },
-        }, {
+        await commitFollowTransition(composeFollowRepoTransition(followComposition(), {
           relPath: rel,
           incomingKey: incomingKey!,
           outcome: "deferred",
@@ -1340,14 +1050,7 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
 
-      await commitFollowTransition(composeFollowRepoTransition({
-        identity: followIdentity,
-        incoming: remoteSec,
-        baseComposition: {
-          prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-          candidate: { base: remoteSec },
-        },
-      }, {
+      await commitFollowTransition(composeFollowRepoTransition(followComposition(), {
         relPath: rel,
         incomingKey: incomingKey!,
         outcome: "followed",
@@ -1467,10 +1170,7 @@ opts: {
       }
       bypassed.add(rel);
       applied[rel] = sanitizeGitSectionForPersistence(remoteSec);
-      if (metrics) {
-        metrics.results.unchanged += 1;
-        metrics.repoTimings.push({ index: indexes.get(rel)!, queueMs: 0, wallMs: 0, result: "unchanged" });
-      }
+      run?.record({ index: indexes.get(rel)!, queueMs: 0, wallMs: 0, result: "unchanged" });
       opts.onProgress?.(++progressDone, keys.length);
     }
   }
@@ -1491,16 +1191,12 @@ opts: {
     let startedAt = Date.now();
     let result: GitApplyRepoResult = "deferred";
     let commonDirGroup: number | undefined;
-    const traceHeld = process.env.RBOX_TRACE_HELD === "1" && pending[rel] !== undefined;
-    const heldTrace: HeldTraceAttempt | undefined = traceHeld ? {
-      storedAttempt: records[rel]?.attempt !== undefined,
-      earlySkip: false,
-      matchConsulted: false,
-      mismatch: records[rel]?.attempt ? "not-consulted" : "none",
-      earlyReason: records[rel]?.attempt ? "not-consulted" : "no-attempt",
-      blocker: "none",
-    } : undefined;
-    const chainTimings = metrics || traceHeld ? zeroGitChainTimings() : undefined;
+    const traceHeld = heldTraceEnabled(pending[rel] !== undefined);
+    const chainTimings = run || traceHeld ? zeroGitChainTimings() : undefined;
+    const held = heldDecisions.repo({
+      relPath: rel, incoming: remoteSec, storedAttempt: records[rel]?.attempt,
+      traced: traceHeld, timings: chainTimings,
+    });
     try {
       if (collidingRepoKeys.has(rel)) {
         if (remoteSec) pending[rel] = remoteSec;
@@ -1512,28 +1208,11 @@ opts: {
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async (commonDirLock) => {
         startedAt = Date.now();
-        const priorAttempt = pending[rel] && remoteSec ? records[rel]?.attempt : undefined;
-        const heldNowMs = opts.heldNow?.();
-        const earlyDecision = gitHeldSkipEnabled() && priorAttempt
-          ? await addTimedMs(chainTimings, "heldInputMs", () => earlyHeldAttemptDecision({
-              root, relPath: rel, incoming: remoteSec!, attempt: priorAttempt,
-              ...(heldNowMs === undefined ? {} : { nowMs: heldNowMs }),
-            }))
-          : { matches: false, reason: priorAttempt ? "disabled" : "no-attempt" };
-        if (heldTrace) heldTrace.earlyReason = earlyDecision.reason;
-        if (earlyDecision.matches && priorAttempt && retainHeldRepo(rel, priorAttempt)) {
-          if (heldTrace) {
-            const first = sortedTypedBlockers(priorAttempt.blockers)[0];
-            heldTrace.earlySkip = true;
-            heldTrace.matchConsulted = true;
-            heldTrace.mismatch = "none";
-            heldTrace.earlyReason = "none";
-            heldTrace.blocker = first ? `${first.provenance}/${first.reason}` : "none";
-          }
+        if (await held.earlySkip({ pending: pending[rel] !== undefined, attempt: records[rel]?.attempt })) {
           result = "skipped";
           return;
-        } else if (heldTrace && earlyDecision.matches) heldTrace.earlyReason = "retention-ineligible";
-        const processed = await processRepo(rel, chainTimings, commonDirLock, heldTrace);
+        }
+        const processed = await processRepo(rel, chainTimings, commonDirLock, held);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });
@@ -1562,24 +1241,15 @@ opts: {
     } finally {
       const wallMs = Date.now() - startedAt;
       if (chainTimings) finalizeGitChainTimings(chainTimings, wallMs);
-      if (heldTrace && chainTimings) {
-        const deferral = currentDeferral(rel, "apply");
-        if (heldTrace.blocker === "none" && result === "deferred" && deferral) heldTrace.blocker = `apply/${deferral.reason}`;
-        const namedMs = chainTimings.fetchDecryptMs + chainTimings.bundleVerifyMs + chainTimings.gitImportMs
-          + chainTimings.classifyMs + chainTimings.standingProofMs;
-        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} earlyReason=${heldTrace.earlyReason} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(chainTimings.standingProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
-      }
-      if (metrics) {
-        metrics.results[result] += 1;
-        metrics.repoTimings.push({
-          index: i,
-          queueMs: startedAt - queuedAt,
-          wallMs,
-          result,
-          commonDirGroup,
-          chain: chainTimings,
-        });
-      }
+      held.emitTrace({ result, wallMs });
+      run?.record({
+        index: i,
+        queueMs: startedAt - queuedAt,
+        wallMs,
+        result,
+        commonDirGroup,
+        chain: chainTimings,
+      });
       opts.onProgress?.(++progressDone, keys.length);
     }
   };
