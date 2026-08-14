@@ -5,6 +5,37 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_EVENING CAP (2026-08-14, fleet on **1940cfc**, session PRs #684-#701 = 18):
+**#700 MERGED** — apply.ts decomposed at the held-decision seam (1,559→1,249
+nonblank, ratchet re-pinned DOWN below the original; held-decision.ts +
+apply-metrics.ts own their planes; move-fidelity audited; rig 136 PASS).
+**#701 MERGED + field-verified: cp 2,500-2,700ms → 10-11ms** (beats the
+pre-#696 ~400ms baseline; push walls 6.7/6.9s < 7.0s) — real mechanism was
+NOT held-ref iteration: the supersession pre-probe admitted on presence,
+#696's apply progress flipped it to maybe, every push force-captured the
+wedged repo (68-ref witness + encryption) then provePendingSupersession
+deterministically refused (config over the 512-key wire bound) and
+reverted; fix = memoized refusal in the divergence cache, fail-closed,
+red-proven both legs. **#702 filed**: rbox-core's config is STRUCTURALLY
+over the wire bound — carries pending forever; product options listed.
+NEW FOUNDER RULES (memory + enforced): sync-plane PRs close out with
+BEFORE/AFTER on BOTH lanes; touched files get ALL warnings fixed;
+size-ratchet trips get decomposition, never re-pins (both re-pins this
+session were reversed by real splits — shared.ts→chain-timings.ts,
+apply.ts→two deep modules). ARCHITECTURE REVIEW COMPLETE (explorer report
+in session records; presented as 12 ranked deepening candidates): CODEMAP
+= symptom of SHALLOW modules (356 entries, effects declared 4x in daemon
+satellites, flakes cluster exactly where no module exists — WS channel;
+55-file trace for one push; 29-module dead migration tree = ~35 map
+entries; 10-term CONTEXT.md glossary + design-number table proposed).
+FOUNDER PICK PENDING: default 7+8+12 (barrels/timing-table/CONTEXT.md)
+then 1→2 (daemon satellite inversion → RemoteWakeupChannel). Housekeeping:
+worktrees 61→35 (clean ones removed, refs kept; 33 dirty for triage),
+branches ~300→244, grammar-freeze census re-pinned STRONGER (emitter
+template frozen, re-proven red twice). Watches: #664 RSS, Mac
+ignore-counter divergence (no purge from Mac), trusted-pull flake family
+(2nd sighting class)._
+
 _AFTERNOON CAP (2026-08-14, fleet on **e5c1f3f**, session PRs #684-#696):
 **Desktop git-apply 45.3s → 1.3s FIELD-VERIFIED** (#696/#573 fix 1: typed
 checkout blockers — receiver-only branch publications failing BASE pre-state
