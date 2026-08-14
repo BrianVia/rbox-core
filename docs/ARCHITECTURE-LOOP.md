@@ -26,6 +26,9 @@ retired.
 
 ## Standing rules (founder, baked 2026-08-14)
 
+- **Implementation routes to codex (gpt-5.6-sol) by default** — founder call
+  2026-08-14; opus only as the two-strikes fallback when codex's output
+  misses the bar twice with corrective feedback. Reviews stay multi-model.
 - Behavior-preserving only; move-fidelity audit where code moves.
 - Touched files get ALL anti-slop warnings fixed (whole files, not new lines).
 - Size-gate trips get decomposition, never re-pins.
