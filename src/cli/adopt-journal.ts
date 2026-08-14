@@ -3,7 +3,10 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
+
+/** One field read out of a decoded adoption journal: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
 
 export const ADOPT_VERSION = 1 as const;
 export const LINKED_WORKTREE_REFUSAL = "linked worktree not adopted — its history travels with its main clone";
@@ -21,7 +24,7 @@ export type AdoptPhase =
 
 export type AdoptEntryKind = "file" | "directory" | "symlink" | "fifo" | "socket" | "device" | "other";
 
-export interface AdoptIdentity {
+export type AdoptIdentity = {
   kind: AdoptEntryKind;
   dev: string;
   ino: string;
@@ -31,34 +34,34 @@ export interface AdoptIdentity {
   birthtimeNs: string | "unavailable";
   sha256?: string;
   linkText?: string;
-}
+};
 
-export interface AdoptInventoryEntry {
+export type AdoptInventoryEntry = {
   path: string;
   identity: AdoptIdentity;
-}
+};
 
-export interface AdoptSourceRepo {
+export type AdoptSourceRepo = {
   path: string;
   sourceKind: "dir";
   worktreeReal: string;
   gitDirReal: string;
   commonDirReal: string;
   objectStoreReal: string;
-}
+};
 
-export interface AdoptRetainMove {
+export type AdoptRetainMove = {
   path: string;
   source: string;
   destination: string;
   before: AdoptIdentity;
   after?: AdoptIdentity;
   state: "intent" | "complete";
-}
+};
 
 export type AdoptOverlayDisposition = "landed" | "displaced" | "unplaced" | "special";
 
-export interface AdoptOverlayMove {
+export type AdoptOverlayMove = {
   path: string;
   source: string;
   destination: string;
@@ -71,9 +74,9 @@ export interface AdoptOverlayMove {
   baselineAfter?: AdoptIdentity;
   state: "intent" | "baseline-displaced" | "complete" | "aborted" | "paused";
   reason?: string;
-}
+};
 
-export interface AdoptRepoIdentity {
+export type AdoptRepoIdentity = {
   kind: "dir" | "pointer";
   worktreeId: string;
   gitDirReal: string;
@@ -89,7 +92,7 @@ export interface AdoptRepoIdentity {
   gitDirBirthtime: string;
   configHash: string;
   checkoutJournalHash: string;
-}
+};
 
 export type AdoptGitBranchState =
   | "equal"
@@ -102,7 +105,7 @@ export type AdoptGitBranchState =
   | "paused"
   | "aborted";
 
-export interface AdoptIndexRecord {
+export type AdoptIndexRecord = {
   present: boolean;
   savedPath: string;
   preparedPath?: string;
@@ -114,9 +117,9 @@ export interface AdoptIndexRecord {
   after?: AdoptIdentity;
   afterHash?: string;
   readTreeState: "none" | "intent" | "complete";
-}
+};
 
-export interface AdoptGitBranch {
+export type AdoptGitBranch = {
   ref: string;
   expectedOld: string;
   incomingOid: string;
@@ -135,9 +138,9 @@ export interface AdoptGitBranch {
   state: AdoptGitBranchState;
   reason?: string;
   index?: AdoptIndexRecord;
-}
+};
 
-export interface AdoptGitRepo {
+export type AdoptGitRepo = {
   path: string;
   source: AdoptSourceRepo;
   target?: AdoptRepoIdentity;
@@ -146,20 +149,20 @@ export interface AdoptGitRepo {
   detachedHead?: string;
   state: "pending" | "complete" | "parked" | "paused" | "unplaced";
   reason?: string;
-}
+};
 
 /** Catalog policy pinned before adoption begins its first sync. Optional so
  * journals written by older binaries remain resumable. */
-export interface JournalPinnedFolderPolicy {
+export type JournalPinnedFolderPolicy = {
   generation: string;
   syncGit: boolean;
   git: { incremental: boolean };
   respectGitignore: boolean;
   noDrift: boolean;
   trash: { days: number; maxBytes: number };
-}
+};
 
-export interface AdoptJournal {
+export type AdoptJournal = {
   version: typeof ADOPT_VERSION;
   journalId: string;
   createdAt: string;
@@ -199,7 +202,7 @@ export interface AdoptJournal {
     generationAfter?: number;
   };
   finishSync: { attempted: boolean; complete: boolean; error?: string };
-}
+};
 
 export const adoptDir = (root: string): string => path.join(root, ".rbox", "adopt");
 export const adoptJournalPath = (root: string): string => path.join(adoptDir(root), "journal.json");
@@ -287,17 +290,19 @@ export function isTerminalAdoptPhase(phase: AdoptPhase): boolean {
   return phase === "complete" || phase === "aborted";
 }
 
-function validJournal(value: unknown): value is AdoptJournal {
+function validJournal(value: JsonValue): value is AdoptJournal {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const j = value as Partial<AdoptJournal>;
-  const object = (candidate: unknown): candidate is JsonObject => !!candidate && typeof candidate === "object" && !Array.isArray(candidate);
-  const string = (candidate: unknown): candidate is string => typeof candidate === "string" && !candidate.includes("\0");
-  const decimal = (candidate: unknown): candidate is string => string(candidate) && /^\d+$/.test(candidate);
-  const hex = (candidate: unknown, length: number): candidate is string => string(candidate) && new RegExp(`^[0-9a-f]{${length}}$`).test(candidate);
-  const rel = (candidate: unknown, dot = false): candidate is string => string(candidate)
+  const j: JsonObject = value;
+  const object = (candidate: JsonField): candidate is JsonObject => !!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+  const string = (candidate: JsonField): candidate is string => typeof candidate === "string" && !candidate.includes("\0");
+  const decimal = (candidate: JsonField): candidate is string => string(candidate) && /^\d+$/.test(candidate);
+  const hex = (candidate: JsonField, length: number): candidate is string => string(candidate) && new RegExp(`^[0-9a-f]{${length}}$`).test(candidate);
+  const bounded = (candidate: JsonField, min: number, max: number): boolean =>
+    typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= min && candidate <= max;
+  const rel = (candidate: JsonField, dot = false): candidate is string => string(candidate)
     && (dot && candidate === "." || candidate.length > 0 && !path.isAbsolute(candidate)
       && !candidate.includes("\\") && candidate.split("/").every((part) => part !== "" && part !== "." && part !== ".."));
-  const identity = (candidate: unknown): candidate is AdoptIdentity => {
+  const identity = (candidate: JsonField): candidate is AdoptIdentity => {
     if (!object(candidate) || !["file", "directory", "symlink", "fifo", "socket", "device", "other"].includes(String(candidate.kind))) return false;
     if (![candidate.dev, candidate.ino, candidate.mode, candidate.size, candidate.mtimeNs].every(decimal)) return false;
     if (!(candidate.birthtimeNs === "unavailable" || decimal(candidate.birthtimeNs))) return false;
@@ -310,6 +315,7 @@ function validJournal(value: unknown): value is AdoptJournal {
   const baseline = j.baseline;
   const cache = j.cache;
   const finish = j.finishSync;
+  const workspaceRoot = object(workspace) && string(workspace.root) ? path.resolve(workspace.root) : undefined;
   return j.version === ADOPT_VERSION
     && typeof j.journalId === "string" && /^[0-9a-f]{32}$/.test(j.journalId)
     && string(j.createdAt) && Number.isFinite(Date.parse(j.createdAt))
@@ -327,10 +333,10 @@ function validJournal(value: unknown): value is AdoptJournal {
       && object(pinned.git) && Object.keys(pinned.git).length === 1 && typeof pinned.git.incremental === "boolean"
       && typeof pinned.respectGitignore === "boolean" && typeof pinned.noDrift === "boolean"
       && object(pinned.trash) && Object.keys(pinned.trash).length === 2
-      && Number.isSafeInteger(pinned.trash.days) && pinned.trash.days >= 0 && pinned.trash.days <= 365
-      && Number.isSafeInteger(pinned.trash.maxBytes) && pinned.trash.maxBytes >= 0 && pinned.trash.maxBytes <= 1099511627776)
-    && ["retaining", "baseline", "git", "overlay", "invalidating", "aborting", "paused", "complete", "aborted"].includes(j.phase ?? "")
-    && (j.resumePhase === undefined || ["retaining", "baseline", "git", "overlay", "invalidating", "aborting"].includes(j.resumePhase))
+      && bounded(pinned.trash.days, 0, 365)
+      && bounded(pinned.trash.maxBytes, 0, 1099511627776))
+    && string(j.phase) && ["retaining", "baseline", "git", "overlay", "invalidating", "aborting", "paused", "complete", "aborted"].includes(j.phase)
+    && (j.resumePhase === undefined || string(j.resumePhase) && ["retaining", "baseline", "git", "overlay", "invalidating", "aborting"].includes(j.resumePhase))
     && Array.isArray(j.pauseReasons) && j.pauseReasons.every(string)
     && Array.isArray(j.inventory) && j.inventory.every((entry) => object(entry) && rel(entry.path) && identity(entry.identity))
     && Array.isArray(j.sourceRepos) && j.sourceRepos.every((repo) => object(repo) && rel(repo.path, true) && repo.sourceKind === "dir"
@@ -338,8 +344,9 @@ function validJournal(value: unknown): value is AdoptJournal {
     && decimal(j.retainedBytes)
     && Array.isArray(j.retainMoves) && j.retainMoves.every((move) => object(move) && rel(move.path)
       && string(move.source) && path.isAbsolute(move.source) && string(move.destination) && path.isAbsolute(move.destination)
-      && path.resolve(move.source) === path.join(path.resolve(workspace.root), ...move.path.split("/"))
-      && path.resolve(move.destination) === path.join(adoptStashDir(path.resolve(workspace.root)), ...move.path.split("/"))
+      && workspaceRoot !== undefined
+      && path.resolve(move.source) === path.join(workspaceRoot, ...move.path.split("/"))
+      && path.resolve(move.destination) === path.join(adoptStashDir(workspaceRoot), ...move.path.split("/"))
       && identity(move.before) && (move.after === undefined || identity(move.after)) && ["intent", "complete"].includes(String(move.state)))
     && object(baseline) && typeof baseline.started === "boolean" && typeof baseline.complete === "boolean"
       && hex(baseline.continuationNonce, 32) && typeof baseline.consumed === "boolean" && string(baseline.mutexIncarnation)
@@ -354,8 +361,8 @@ function validJournal(value: unknown): value is AdoptJournal {
       && ["intent", "baseline-displaced", "complete", "aborted", "paused"].includes(String(move.state)))
     && Array.isArray(j.createdDirectories) && j.createdDirectories.every((entry) => object(entry) && rel(entry.path) && identity(entry.identity) && entry.identity.kind === "directory")
     && object(cache) && typeof cache.invalidated === "boolean"
-      && (cache.generationBefore === undefined || Number.isSafeInteger(cache.generationBefore) && cache.generationBefore >= 0)
-      && (cache.generationAfter === undefined || Number.isSafeInteger(cache.generationAfter) && cache.generationAfter >= 1)
+      && (cache.generationBefore === undefined || bounded(cache.generationBefore, 0, Number.MAX_SAFE_INTEGER))
+      && (cache.generationAfter === undefined || bounded(cache.generationAfter, 1, Number.MAX_SAFE_INTEGER))
     && object(finish) && typeof finish.attempted === "boolean" && typeof finish.complete === "boolean"
       && (finish.error === undefined || string(finish.error));
 }
@@ -444,8 +451,8 @@ export async function loadAdoptJournal(root: string): Promise<AdoptJournal | und
   } finally {
     await handle.close();
   }
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { throw new Error("malformed adoption journal"); }
+  let parsed: JsonValue;
+  try { parsed = JSON.parse(raw) as JsonValue; } catch { throw new Error("malformed adoption journal"); }
   if (!validJournal(parsed)) throw new Error("invalid adoption journal schema");
   if (path.resolve(parsed.workspace.root) !== resolvedRoot) throw new Error("adoption journal root binding mismatch");
   if (await fs.realpath(resolvedRoot) !== parsed.workspace.rootReal) throw new Error("adoption journal real-root binding mismatch");

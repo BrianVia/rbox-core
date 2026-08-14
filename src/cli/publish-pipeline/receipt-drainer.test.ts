@@ -5,7 +5,10 @@ import { ReceiptDrainer } from "./receipt-drainer.js";
 import { redeemReceipts } from "../remote/commits.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
-const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
+const json = <T>(status: number, body: T) => new Response(JSON.stringify(body), { status });
+/** The seam's own init type: `fetch` accepts a RequestInit or a fresh-init factory. */
+const initBody = (init: Parameters<RemoteContext["fetch"]>[1]): string =>
+  String((init instanceof Function ? init() : init)?.body);
 const port = (ctx: RemoteContext) => ({
   receiptCount: () => ctx.receipts.size,
   redeem: () => redeemReceipts(ctx),
@@ -18,7 +21,7 @@ test("ReceiptDrainer is single-flight and wakes backlog waiters on drain complet
   ctx.receipts.set(sha("c"), "c");
   let release!: () => void;
   let calls = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+  ctx.fetch = async () => {
     calls++;
     await new Promise<void>((resolve) => { release = resolve; });
     return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
@@ -39,7 +42,7 @@ test("ReceiptDrainer maybeKick drains below-threshold pre-existing receipts", as
   const ctx = new RemoteContext("https://test", "t", "w", "p");
   ctx.receipts.set(sha("a"), "a");
   let calls = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+  ctx.fetch = async () => {
     calls++;
     return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
   };
@@ -53,7 +56,7 @@ test("ReceiptDrainer latches errors and flush rethrows", async () => {
   const ctx = new RemoteContext("https://test", "t", "w", "p");
   ctx.receipts.set(sha("a"), "a");
   const err = new Error("network");
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => { throw err; };
+  ctx.fetch = async () => { throw err; };
   let latched: Error | undefined;
   const drainer = new ReceiptDrainer(port(ctx), { threshold: 1, backlogMax: 2, onError(e) { latched = e; } });
   drainer.capture();
@@ -66,7 +69,7 @@ test("ReceiptDrainer accumulates 422 residue until replacement is settled", asyn
   const address = sha("a");
   const ctx = new RemoteContext("https://test", "t", "w", "p");
   let response = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+  ctx.fetch = async () =>
     response++ === 0
       ? json(422, { missing: [address] })
       : json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
@@ -88,8 +91,8 @@ test("ReceiptDrainer preserves a replacement receipt installed during an in-flig
   const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
   const sent: string[] = [];
   let calls = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url: string, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { receipts: Record<string, string> };
+  ctx.fetch = async (_url, init) => {
+    const body = JSON.parse(initBody(init)) as { receipts: Record<string, string> };
     sent.push(body.receipts[address]!);
     calls++;
     if (calls === 1) {

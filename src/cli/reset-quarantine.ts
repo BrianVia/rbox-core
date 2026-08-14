@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { canonicalize } from "../engine/e2ee/jcs.js";
+import type { JsonObject, JsonValue } from "../json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedCopy, boundedHash, boundedJsonRead, boundedRead, RESET_STREAM_BYTE_LIMIT } from "./reset-io.js";
 import { observeResetJournalBytes } from "./reset-journal.js";
@@ -38,16 +39,16 @@ export interface ResetQuarantinePlan {
   artifacts: ResetQuarantineArtifactInput[];
 }
 
-interface QuarantineArtifact {
+type QuarantineArtifact = {
   kind: ResetQuarantineArtifactKind;
   original: string;
   bundled: string;
   cleanup: "remove-exact" | "preserve";
   sha256: string;
   bytes: number;
-}
+};
 
-interface ResetQuarantineManifestBaseV1 {
+type ResetQuarantineManifestBaseV1 = {
   v: 1;
   id: string;
   createdAt: string;
@@ -58,26 +59,26 @@ interface ResetQuarantineManifestBaseV1 {
   markerPrecondition: string;
   refPreconditions: string;
   artifacts: QuarantineArtifact[];
-}
-export interface LegacyResetQuarantineManifestV1 extends ResetQuarantineManifestBaseV1 {
+};
+export type LegacyResetQuarantineManifestV1 = ResetQuarantineManifestBaseV1 & {
   stateFormat?: never;
   decodedCandidateSha256?: never;
   decodedCandidateBytes?: never;
-}
-export interface SQLiteResetQuarantineManifestV1 extends ResetQuarantineManifestBaseV1 {
+};
+export type SQLiteResetQuarantineManifestV1 = ResetQuarantineManifestBaseV1 & {
   stateFormat: "sqlite/v1";
   decodedCandidateSha256: string;
   decodedCandidateBytes: number;
-}
+};
 export type ResetQuarantineManifestV1 =
   | LegacyResetQuarantineManifestV1
   | SQLiteResetQuarantineManifestV1;
 
-interface ResetQuarantineCommitV1 {
+type ResetQuarantineCommitV1 = {
   v: 1;
   manifestSha256: string;
   inventorySha256: string;
-}
+};
 
 export interface ResetQuarantineHooks {
   now?: () => Date;
@@ -91,7 +92,10 @@ export async function inspectResetJournalForQuarantine(file: string): Promise<De
 }
 const manifestPath = (bundle: string): string => path.join(bundle, "manifest.json");
 const committedPath = (bundle: string): string => path.join(bundle, "COMMITTED");
-const canonicalBytes = (value: unknown): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
+/** Exactly what this module canonicalizes: decoded JSON, or a manifest whose
+ * absent-only `never` members keep the legacy variant outside `JsonValue`. */
+type CanonicalRecord = JsonValue | ResetQuarantineManifestV1;
+const canonicalBytes = (value: CanonicalRecord): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
 const sha256 = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
 const safeRelative = (root: string, absolute: string): string => {
   const relative = path.relative(root, absolute);
@@ -140,25 +144,31 @@ async function publishCommitRecord(file: string, bytes: Uint8Array, hooks: Reset
   }
 }
 
-async function boundedJson(file: string, cap: number): Promise<unknown | undefined> {
+async function boundedJson(file: string, cap: number): Promise<JsonValue | undefined> {
   try {
-    return await boundedJsonRead(file, cap);
+    return await boundedJsonRead<JsonValue>(file, cap);
   } catch {
     return undefined;
   }
 }
 
-function validateManifest(value: unknown, expectedId?: string): ResetQuarantineManifestV1 | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const m = value as Partial<ResetQuarantineManifestV1>;
+/** One field read out of a decoded quarantine record: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
+const plain = (value: JsonField): value is JsonObject => !!value && typeof value === "object" && !Array.isArray(value);
+const hex64 = (value: JsonField): value is string => typeof value === "string" && HEX64.test(value);
+
+function validateManifest(value: JsonField, expectedId?: string): ResetQuarantineManifestV1 | undefined {
+  if (!plain(value)) return undefined;
+  const m = value;
   if (m.v !== 1 || typeof m.id !== "string" || !BUNDLE_ID.test(m.id) || (expectedId !== undefined && m.id !== expectedId)
-    || typeof m.createdAt !== "string" || !Number.isFinite(Date.parse(m.createdAt)) || !["journal-only", "transaction"].includes(m.scope ?? "")
+    || typeof m.createdAt !== "string" || !Number.isFinite(Date.parse(m.createdAt))
+    || (m.scope !== "journal-only" && m.scope !== "transaction")
     || typeof m.phase !== "string" || typeof m.markerPrecondition !== "string" || typeof m.refPreconditions !== "string"
-    || (m.activeStateSha256 !== undefined && !HEX64.test(m.activeStateSha256))
-    || (m.recoveredStateSha256 !== undefined && !HEX64.test(m.recoveredStateSha256))
+    || (m.activeStateSha256 !== undefined && !hex64(m.activeStateSha256))
+    || (m.recoveredStateSha256 !== undefined && !hex64(m.recoveredStateSha256))
     || !Array.isArray(m.artifacts) || m.artifacts.length < 1 || m.artifacts.length > 4) return undefined;
   const sqliteWitness = m.stateFormat === "sqlite/v1"
-    && typeof m.decodedCandidateSha256 === "string" && HEX64.test(m.decodedCandidateSha256)
+    && hex64(m.decodedCandidateSha256)
     && Number.isSafeInteger(m.decodedCandidateBytes) && Number(m.decodedCandidateBytes) >= 1
     && Number(m.decodedCandidateBytes) <= 256 * 1024;
   if (m.stateFormat !== undefined && !sqliteWitness) return undefined;
@@ -167,24 +177,27 @@ function validateManifest(value: unknown, expectedId?: string): ResetQuarantineM
   const originals = new Set<string>();
   const bundled = new Set<string>();
   for (const a of m.artifacts) {
-    if (!a || !["journal", "candidate", "archive"].includes(a.kind) || !["remove-exact", "preserve"].includes(a.cleanup)
-      || typeof a.original !== "string" || typeof a.bundled !== "string" || !HEX64.test(a.sha256)
-      || !Number.isSafeInteger(a.bytes) || a.bytes < 0 || originals.has(a.original) || bundled.has(a.bundled)) return undefined;
+    if (!plain(a) || (a.kind !== "journal" && a.kind !== "candidate" && a.kind !== "archive")
+      || (a.cleanup !== "remove-exact" && a.cleanup !== "preserve")
+      || typeof a.original !== "string" || typeof a.bundled !== "string" || !hex64(a.sha256)
+      || typeof a.bytes !== "number" || !Number.isSafeInteger(a.bytes) || a.bytes < 0
+      || originals.has(a.original) || bundled.has(a.bundled)) return undefined;
     if (a.kind === "journal") journals++;
     if (a.kind === "archive" && a.cleanup !== "preserve") return undefined;
     originals.add(a.original); bundled.add(a.bundled);
   }
   if (journals !== 1 || (m.scope === "journal-only" && m.artifacts.length !== 1)) return undefined;
+  // The accepted record is returned as read: its exact bytes are re-canonicalized
+  // against the committed inventory digest, so no key may be dropped or added.
   return m as ResetQuarantineManifestV1;
 }
 
-function validateCommit(value: unknown): ResetQuarantineCommitV1 | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const c = value as Partial<ResetQuarantineCommitV1>;
-  const keys = Object.keys(value as object).sort().join("\0");
+function validateCommit(value: JsonField): ResetQuarantineCommitV1 | undefined {
+  if (!plain(value)) return undefined;
+  const c = value;
+  const keys = Object.keys(c).sort().join("\0");
   return keys === ["inventorySha256", "manifestSha256", "v"].sort().join("\0") && c.v === 1
-    && typeof c.manifestSha256 === "string" && HEX64.test(c.manifestSha256)
-    && typeof c.inventorySha256 === "string" && HEX64.test(c.inventorySha256)
+    && hex64(c.manifestSha256) && hex64(c.inventorySha256)
     ? c as ResetQuarantineCommitV1 : undefined;
 }
 
@@ -195,8 +208,8 @@ const inventoryHash = (manifest: ResetQuarantineManifestV1): string => sha256(ca
 async function requireQuarantineDbS0(file: string): Promise<void> {
   if (!file.endsWith(".db")) return;
   for (const suffix of SQLITE_SIDECARS) {
-    const sidecar = await fs.lstat(`${file}${suffix}`).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    const sidecar = await fs.lstat(`${file}${suffix}`).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
       throw error;
     });
     if (sidecar !== undefined) {
@@ -247,8 +260,8 @@ export async function inspectResetQuarantineResidue(
   authority: "legacy-json" | "sqlite",
 ): Promise<ResetQuarantineResidue> {
   const parent = resetQuarantineRoot(root);
-  const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+  const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
     throw error;
   });
   const bundles = entries.map((entry) => entry.name).sort();
@@ -288,8 +301,8 @@ async function finishCommittedQuarantine(root: string, bundle: string, manifest:
 /** Resume/clean every bundle while the caller holds the recovery fence. */
 export async function resumeResetQuarantinesUnderFence(root: string, hooks: ResetQuarantineHooks = {}): Promise<void> {
   const parent = resetQuarantineRoot(root);
-  const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+  const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
     throw error;
   });
   for (const entry of entries) {

@@ -29,7 +29,7 @@ import {
   fsyncDirectory,
   writeFileAtomic,
 } from "../engine/fsutil.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 const VERSION = 1 as const;
 const DEVICE_CODE_RE = /^[0-9a-f]{64}$/;
@@ -159,7 +159,10 @@ export function loginAttemptPath(requestId: string): string {
   return candidate;
 }
 
-function plain(value: unknown): value is JsonObject {
+/** One field read out of a decoded login-attempt record: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
+
+function plain(value: JsonField): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -168,11 +171,11 @@ function exactKeys(value: JsonObject, expected: readonly string[]): boolean {
   return actual.length === expected.length && actual.every((key) => expected.includes(key));
 }
 
-function safeInteger(value: unknown): value is number {
+function safeInteger(value: JsonField): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function canonicalB64(value: unknown): value is string {
+function canonicalB64(value: JsonField): value is string {
   if (typeof value !== "string" || !value || value.includes("=")) return false;
   try {
     return toB64url(fromB64url(value)) === value;
@@ -181,14 +184,21 @@ function canonicalB64(value: unknown): value is string {
   }
 }
 
-function validateOwner(value: unknown): value is LoginAttemptOwner {
-  return plain(value)
-    && exactKeys(value, ["hostId", "bootId", "pid", "startTime", "nonce"])
-    && typeof value.hostId === "string" && value.hostId.length > 0
-    && typeof value.bootId === "string" && value.bootId.length > 0
-    && typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0
-    && typeof value.startTime === "string" && /^\d+(?:\.\d+)?$/.test(value.startTime)
-    && typeof value.nonce === "string" && /^[0-9a-f]{32}$/.test(value.nonce);
+function parseOwner(value: JsonField): LoginAttemptOwner | undefined {
+  if (!plain(value)
+    || !exactKeys(value, ["hostId", "bootId", "pid", "startTime", "nonce"])
+    || typeof value.hostId !== "string" || value.hostId.length === 0
+    || typeof value.bootId !== "string" || value.bootId.length === 0
+    || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0
+    || typeof value.startTime !== "string" || !/^\d+(?:\.\d+)?$/.test(value.startTime)
+    || typeof value.nonce !== "string" || !/^[0-9a-f]{32}$/.test(value.nonce)) return undefined;
+  return {
+    hostId: value.hostId,
+    bootId: value.bootId,
+    pid: value.pid,
+    startTime: value.startTime,
+    nonce: value.nonce,
+  };
 }
 
 function assertCanonicalPublicKeys(encPubKey: string, sigPubKey: string): void {
@@ -291,9 +301,9 @@ export async function requestIdForDeviceCode(deviceCode: string): Promise<string
 }
 
 async function parseRecord(raw: string, filenameRequestId?: string): Promise<LoginAttemptRecord> {
-  let value: unknown;
+  let value: JsonValue;
   try {
-    value = JSON.parse(raw);
+    value = JSON.parse(raw) as JsonValue;
   } catch {
     throw new Error("invalid login attempt journal JSON");
   }
@@ -305,6 +315,7 @@ async function parseRecord(raw: string, filenameRequestId?: string): Promise<Log
       "version", "requestId", "remoteUrl", "label", "pollIntervalSeconds", "createdAt", "expiresAt",
       "pubkeyFingerprint", "owner", "phase", "completedAt",
     ];
+    const owner = parseOwner(value.owner);
     if (!exactKeys(value, terminalKeys)
       || typeof value.requestId !== "string" || !REQUEST_ID_RE.test(value.requestId)
       || filenameRequestId !== undefined && value.requestId !== filenameRequestId
@@ -314,11 +325,23 @@ async function parseRecord(raw: string, filenameRequestId?: string): Promise<Log
       || !safeInteger(value.createdAt) || !safeInteger(value.expiresAt)
       || value.expiresAt <= value.createdAt
       || typeof value.pubkeyFingerprint !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.pubkeyFingerprint)
-      || !validateOwner(value.owner)
+      || !owner
       || !safeInteger(value.completedAt)) {
       throw new Error("invalid terminal login attempt journal");
     }
-    return value as unknown as LoginAttemptTerminal;
+    return {
+      version: VERSION,
+      requestId: value.requestId,
+      remoteUrl: value.remoteUrl,
+      label: value.label,
+      pollIntervalSeconds: value.pollIntervalSeconds,
+      createdAt: value.createdAt,
+      expiresAt: value.expiresAt,
+      pubkeyFingerprint: value.pubkeyFingerprint,
+      owner,
+      phase: value.phase,
+      completedAt: value.completedAt,
+    };
   }
 
   const commonKeys = [
@@ -334,6 +357,7 @@ async function parseRecord(raw: string, filenameRequestId?: string): Promise<Log
         ? [...commonKeys, "accountId", "deviceId", "delivery"]
         : [];
   if (Object.hasOwn(value, "deliveryExpiresAt")) phaseKeys.push("deliveryExpiresAt");
+  const owner = parseOwner(value.owner);
   if (!phaseKeys.length || !exactKeys(value, phaseKeys)
     || typeof value.requestId !== "string" || !REQUEST_ID_RE.test(value.requestId)
     || filenameRequestId !== undefined && value.requestId !== filenameRequestId
@@ -350,30 +374,64 @@ async function parseRecord(raw: string, filenameRequestId?: string): Promise<Log
     || !canonicalB64(value.sigPrivPkcs8) || !canonicalB64(value.encPrivPkcs8)
     || typeof value.pubkeyFingerprint !== "string"
     || await expectedFingerprint(value.encPubKey, value.sigPubKey) !== value.pubkeyFingerprint
-    || !validateOwner(value.owner)) {
+    || !owner) {
     throw new Error("invalid active login attempt journal");
   }
-  if (value.phase !== "staged") {
-    if (typeof value.accountId !== "string" || !ACCOUNT_ID_RE.test(value.accountId)
-      || typeof value.deviceId !== "string" || !value.deviceId) {
-      throw new Error("invalid login attempt credential identity");
-    }
+  const base = {
+    version: VERSION,
+    requestId: value.requestId,
+    deviceCode: value.deviceCode,
+    userCode: value.userCode,
+    remoteUrl: value.remoteUrl,
+    label: value.label,
+    pollIntervalSeconds: value.pollIntervalSeconds,
+    createdAt: value.createdAt,
+    expiresAt: value.expiresAt,
+    deliveryExpiresAt: value.deliveryExpiresAt,
+    pubkeyFingerprint: value.pubkeyFingerprint,
+    encPubKey: value.encPubKey,
+    sigPubKey: value.sigPubKey,
+    sigPrivPkcs8: value.sigPrivPkcs8,
+    encPrivPkcs8: value.encPrivPkcs8,
+    owner,
+  } satisfies LoginAttemptBase;
+  if (value.phase === "staged") return bound({ ...base, phase: "staged" });
+
+  if (typeof value.accountId !== "string" || !ACCOUNT_ID_RE.test(value.accountId)
+    || typeof value.deviceId !== "string" || !value.deviceId) {
+    throw new Error("invalid login attempt credential identity");
   }
-  if (value.phase === "persisted") {
-    if (!plain(value.delivery)
-      || !exactKeys(value.delivery, [
-        "requestId", "mkWrapDevice", "publishedRosterVersion", "accountEpoch", "expiresAt",
-      ])
-      || value.delivery.requestId !== value.requestId
-      || typeof value.delivery.mkWrapDevice !== "string" || !value.delivery.mkWrapDevice
-      || !safeInteger(value.delivery.publishedRosterVersion)
-      || !safeInteger(value.delivery.accountEpoch)
-      || !safeInteger(value.delivery.expiresAt)
-      || value.delivery.expiresAt > value.expiresAt) {
-      throw new Error("invalid persisted login delivery");
-    }
+  const identified = { ...base, accountId: value.accountId, deviceId: value.deviceId };
+  if (value.phase === "credential-reserved" || value.phase === "credential-saved") {
+    return bound({ ...identified, phase: value.phase });
   }
-  const record = value as unknown as LoginAttemptActive;
+  if (!plain(value.delivery)
+    || !exactKeys(value.delivery, [
+      "requestId", "mkWrapDevice", "publishedRosterVersion", "accountEpoch", "expiresAt",
+    ])
+    || value.delivery.requestId !== value.requestId
+    || typeof value.delivery.mkWrapDevice !== "string" || !value.delivery.mkWrapDevice
+    || !safeInteger(value.delivery.publishedRosterVersion)
+    || !safeInteger(value.delivery.accountEpoch)
+    || !safeInteger(value.delivery.expiresAt)
+    || value.delivery.expiresAt > value.expiresAt) {
+    throw new Error("invalid persisted login delivery");
+  }
+  return bound({
+    ...identified,
+    phase: "persisted",
+    delivery: {
+      requestId: value.delivery.requestId,
+      mkWrapDevice: value.delivery.mkWrapDevice,
+      publishedRosterVersion: value.delivery.publishedRosterVersion,
+      accountEpoch: value.delivery.accountEpoch,
+      expiresAt: value.delivery.expiresAt,
+    },
+  });
+}
+
+/** Every active record is returned only after its private keys bind to its published ones. */
+function bound(record: LoginAttemptActive): LoginAttemptActive {
   validatePrivateKeyBinding(record);
   return record;
 }

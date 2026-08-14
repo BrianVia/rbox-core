@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 import {
   repositoryIdentityHash,
   validateRepoIdentityV1,
@@ -14,6 +14,8 @@ import {
 } from "./state-plane/schema/application.js";
 
 export type ResetPhase = "prepared" | "ready" | "installed" | "z-retired";
+/** The identity/phase header every reset journal version carries. */
+export type ResetJournalEnvelope = { id: string; phase: ResetPhase; createdAt: string };
 export type ResetConsentKind = "setup-rebind" | "setup-create";
 export interface ResetJournalAuthorization {
   version: 2;
@@ -101,44 +103,46 @@ const MAX_DB_B64 = 349_528;
 const MAX_DB_BYTES = 262_144;
 
 type Obj = JsonObject;
+/** One field read out of a decoded reset-journal object: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
 function fail(code: ResetJournalSchemaErrorCode, path: string, limit: number | null = null): never {
   throw new ResetJournalSchemaError(code, path, limit);
 }
-const object = (value: unknown, path: string): Obj => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) fail("TYPE_MISMATCH", path);
-  return value as Obj;
+const object = (value: JsonField, path: string): Obj => {
+  if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) fail("TYPE_MISMATCH", path);
+  return value;
 };
 const exact = (value: Obj, keys: readonly string[], path: string): void => {
   const allowed = new Set(keys);
   for (const key of Object.keys(value)) if (!allowed.has(key)) fail("UNKNOWN_MEMBER", `${path}.${key}`);
   for (const key of keys) if (!Object.hasOwn(value, key)) fail("MISSING_MEMBER", `${path}.${key}`);
 };
-const string = (value: unknown, path: string, max = MAX_TEXT): string => {
+const string = (value: JsonField, path: string, max = MAX_TEXT): string => {
   if (typeof value !== "string") fail("TYPE_MISMATCH", path);
   if (encoder.encode(value).byteLength > max) fail("STRING_LIMIT", path, max);
   if (value.includes("\0")) fail("STRING_INVALID", path);
   return value;
 };
-const counter = (value: unknown, path: string): number => {
+const counter = (value: JsonField, path: string): number => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) fail("TYPE_MISMATCH", path);
   return value;
 };
-const fixed = (value: unknown, regex: RegExp, path: string): string => {
+const fixed = (value: JsonField, regex: RegExp, path: string): string => {
   if (typeof value !== "string") fail("TYPE_MISMATCH", path);
   if (!regex.test(value)) fail("STRING_INVALID", path);
   return value;
 };
-const canonicalTime = (value: unknown, path: string): string => {
+const canonicalTime = (value: JsonField, path: string): string => {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) fail("STRING_INVALID", path);
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) fail("STRING_INVALID", path);
   return value;
 };
 const hash = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
-const canonicalLine = (value: unknown): Uint8Array =>
+const canonicalLine = (value: ResetNextState): Uint8Array =>
   Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
 
-function authorization(value: unknown, path: string): ResetJournalAuthorization {
+function authorization(value: JsonField, path: string): ResetJournalAuthorization {
   const obj = object(value, path);
   exact(obj, ["version", "authorizedNextStream", "consentKind", "mintedAtRevision"], path);
   if (obj.version !== 2) fail("SCHEMA_DISCRIMINATOR", `${path}.version`);
@@ -152,7 +156,7 @@ function authorization(value: unknown, path: string): ResetJournalAuthorization 
   };
 }
 
-function identity(value: unknown, path: string): RepoIdentityV1 {
+function identity(value: JsonField, path: string): RepoIdentityV1 {
   const obj = object(value, path);
   exact(obj, ["relPath", "kind", "worktreeId", "gitDirReal", "commonDirReal", "dev", "ino", "birthtime"], path);
   if (obj.kind !== "dir" && obj.kind !== "pointer") fail("STRING_INVALID", `${path}.kind`);
@@ -170,7 +174,7 @@ function identity(value: unknown, path: string): RepoIdentityV1 {
   return typed;
 }
 
-function zEntries(value: unknown, path: string): ResetZEntry[] {
+function zEntries(value: JsonField, path: string): ResetZEntry[] {
   if (!Array.isArray(value)) fail("TYPE_MISMATCH", path);
   if (value.length > MAX_Z) fail("Z_LIMIT", path, MAX_Z);
   const result = value.map((raw, index): ResetZEntry => {
@@ -195,7 +199,7 @@ function zEntries(value: unknown, path: string): ResetZEntry[] {
   return result;
 }
 
-function oldState(value: unknown, path: string, v2: boolean): OldV1 | OldV2 {
+function oldState(value: JsonField, path: string, v2: boolean): OldV1 | OldV2 {
   const obj = object(value, path);
   exact(obj, ["stream", "stateNonce", "stateRevision", "stateSha256", ...(v2 ? ["archiveBaseline"] : []), "z"], path);
   const base: OldV1 = {
@@ -210,7 +214,7 @@ function oldState(value: unknown, path: string, v2: boolean): OldV1 | OldV2 {
   return { ...base, archiveBaseline: obj.archiveBaseline };
 }
 
-function legacyState(value: unknown, path: string): ResetNextState {
+function legacyState(value: JsonField, path: string): ResetNextState {
   const obj = object(value, path);
   const keys = ["stream", "stateNonce", "stateRevision", "lastSyncedSequence", "lastSyncedManifest", "repoRecords"];
   if (Object.hasOwn(obj, "telemetryBindingId")) keys.push("telemetryBindingId");
@@ -221,7 +225,9 @@ function legacyState(value: unknown, path: string): ResetNextState {
   if (manifest.generatedAt !== "" || !Array.isArray(manifest.files) || manifest.files.length !== 0 || Object.keys(repos).length !== 0 || obj.lastSyncedSequence !== 0) {
     fail("TYPE_MISMATCH", path);
   }
-  if (obj.telemetryBindingId !== undefined) fixed(obj.telemetryBindingId, HEX16, `${path}.telemetryBindingId`);
+  const telemetryBindingId = obj.telemetryBindingId === undefined
+    ? undefined
+    : fixed(obj.telemetryBindingId, HEX16, `${path}.telemetryBindingId`);
   return {
     stream: string(obj.stream, `${path}.stream`),
     stateNonce: fixed(obj.stateNonce, HEX32, `${path}.stateNonce`),
@@ -229,11 +235,11 @@ function legacyState(value: unknown, path: string): ResetNextState {
     lastSyncedSequence: 0,
     lastSyncedManifest: { generatedAt: "", files: [] },
     repoRecords: {},
-    ...(obj.telemetryBindingId === undefined ? {} : { telemetryBindingId: obj.telemetryBindingId as string }),
+    ...(telemetryBindingId === undefined ? {} : { telemetryBindingId }),
   };
 }
 
-function legacyNext(value: unknown, path: string): LegacyNext {
+function legacyNext(value: JsonField, path: string): LegacyNext {
   const obj = object(value, path);
   exact(obj, ["stream", "stateNonce", "stateRevision", "stateSha256", "state"], path);
   const state = legacyState(obj.state, `${path}.state`);
@@ -249,13 +255,13 @@ function legacyNext(value: unknown, path: string): LegacyNext {
   return next;
 }
 
-function envelope(obj: Obj): { id: string; phase: ResetPhase; createdAt: string } {
+function envelope(obj: Obj): ResetJournalEnvelope {
   const phase = obj.phase;
   if (phase !== "prepared" && phase !== "ready" && phase !== "installed" && phase !== "z-retired") fail("STRING_INVALID", "$.phase");
   return { id: fixed(obj.id, HEX32, "$.id"), phase, createdAt: canonicalTime(obj.createdAt, "$.createdAt") };
 }
 
-function sqliteNext(value: unknown): SQLiteResetJournalV2["next"] {
+function sqliteNext(value: JsonField): SQLiteResetJournalV2["next"] {
   const obj = object(value, "$.next");
   exact(obj, ["stream", "stateNonce", "stateRevision", "stateSha256", "dbBytesB64"], "$.next");
   const dbBytesB64 = string(obj.dbBytesB64, "$.next.dbBytesB64", MAX_DB_B64);
@@ -275,8 +281,10 @@ function sqliteNext(value: unknown): SQLiteResetJournalV2["next"] {
   };
 }
 
+/** `value` is the decoded reset-journal document: whatever the bounded tokenizer
+ * (or `JSON.parse`) produced for the journal bytes, i.e. exactly a `JsonValue`. */
 export function constructResetJournal(value: unknown): ResetJournal {
-  const obj = object(value, "$");
+  const obj = object(value as JsonValue, "$");
   if (obj.v === 1) {
     exact(obj, ["v", "id", "phase", "createdAt", "old", "next"], "$");
     return { v: 1, ...envelope(obj), old: oldState(obj.old, "$.old", false) as OldV1, next: legacyNext(obj.next, "$.next") };

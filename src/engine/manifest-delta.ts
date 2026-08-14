@@ -39,7 +39,19 @@ function isWellFormedUtf16(s: string): boolean {
   return true;
 }
 
-function canonicalJson(value: unknown): string {
+/** Everything this codec canonicalizes: the manifest domain records it writes,
+ *  and the decoded JSON it reads back for the byte-for-byte round trip. */
+type CanonicalInput =
+  | CanonicalManifestValue
+  | Manifest
+  | FileEntry
+  | GitSection
+  | ManifestDeltaOp
+  | ManifestDeltaOp[]
+  | ManifestDeltaHeader
+  | ManifestSnapshotHeader;
+
+function canonicalJson(value: CanonicalInput): string {
   if (value === null) return "null";
   switch (typeof value) {
     case "boolean":
@@ -93,7 +105,8 @@ export function canonicalManifestBytes(manifest: Manifest): Uint8Array {
 
 /** JSON.stringify's two-character escape spellings (the reference serializer
  *  delegates to JSON.stringify; the streaming emitter must match them). */
-const STRING_ESCAPES: Record<number, string> = { 8: "\\b", 9: "\\t", 10: "\\n", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\" };
+type JsonEscapeTable = Record<number, string>;
+const STRING_ESCAPES: JsonEscapeTable = { 8: "\\b", 9: "\\t", 10: "\\n", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\" };
 
 /** SHA-256 the canonical manifest token stream without materializing it. */
 export function canonicalManifestHashStreaming(manifest: Manifest): string {
@@ -140,7 +153,7 @@ export function canonicalManifestHashStreaming(manifest: Manifest): string {
     if (runStart < value.length) write(value.slice(runStart));
     write('"');
   };
-  const emit = (value: unknown): void => {
+  const emit = (value: CanonicalInput): void => {
     if (value === null) return write("null");
     switch (typeof value) {
       case "boolean":
@@ -177,7 +190,7 @@ export function canonicalManifestHashStreaming(manifest: Manifest): string {
           // `canonicalJson` IS the reference, so this special case cannot drift.
           if (value === manifest && key === "files" && Array.isArray(object[key])) {
             write("[");
-            (object[key] as unknown[]).forEach((entry, index) => {
+            (object[key] as CanonicalManifestValue[]).forEach((entry, index) => {
               if (index > 0) write(",");
               write(canonicalJson(entry));
             });
@@ -242,7 +255,7 @@ export class ManifestChainError extends Error {
   }
 }
 
-function deepEqual(a: unknown, b: unknown): boolean {
+function deepEqual(a: CanonicalInput | undefined, b: CanonicalInput | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
   return canonicalJson(a) === canonicalJson(b);
 }
@@ -393,7 +406,7 @@ function validateCommonHeader(record: ManifestEnvelopeHeaderCandidate): void {
   if (record.comp !== undefined && record.comp !== "zstd") throw new Error("manifest envelope compression invalid");
 }
 
-function parseHeader(value: unknown): ManifestSnapshotHeader | ManifestDeltaHeader {
+function parseHeader(value: CanonicalManifestValue): ManifestSnapshotHeader | ManifestDeltaHeader {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("manifest envelope header must be an object");
   const record = value as ManifestEnvelopeHeaderCandidate;
   validateCommonHeader(record);
@@ -496,7 +509,7 @@ export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedMani
   // Exactly one wire encoding of any header exists (I6's ethos applied to the
   // frame itself); writers emit canonicalJson, so honest envelopes pass.
   const headerText = decoder.decode(plaintext.subarray(headerStart, newline));
-  const parsedHeader = parseStrict(headerText);
+  const parsedHeader = parseStrict(headerText) as CanonicalManifestValue;
   if (canonicalJson(parsedHeader) !== headerText) throw new Error("manifest envelope header is not canonically encoded");
   const header = parseHeader(parsedHeader);
   const encodedBody = plaintext.subarray(newline + 1);
