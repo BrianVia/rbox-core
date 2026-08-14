@@ -4,7 +4,7 @@ import {
   type IgnoreMatcher,
   type Manifest,
 } from "../../engine/index.js";
-import { projectLocalManifest } from "../local-file-projection.js";
+import { projectLocalManifest, type LocalManifestProjectionSpans } from "../local-file-projection.js";
 import type { RepoStateValues } from "../sync-state.js";
 import type {
   CaptureObservationReceipt,
@@ -105,6 +105,8 @@ export interface NoOpBaseCarry {
  * report. Preparing a candidate never encrypts, uploads, POSTs, or advances BASE.
  */
 export interface GitCapturePort {
+  /** Projection-only measurements, delivered immediately before Git capture. */
+  reportProjectionSpans?(spans: LocalManifestProjectionSpans & { projection_diff_ms: number }): void;
   execute(plan: GitCaptureEffectPlan): Promise<GitCaptureExecutionReceipt>;
   /** Advisory daemon observer for repos this plan deferred as `git-busy`. */
   notifyBusyDeferred(relPaths: readonly string[]): void;
@@ -220,9 +222,16 @@ export async function preparePublishCandidate(
 ): Promise<SealedPushDecisionPlan> {
   const appliedBase = snapshot.appliedBase;
   let candidate = local.manifest;
+  let projectionSpans: LocalManifestProjectionSpans | undefined;
 
   if (!local.projected) {
-    const projected = projectLocalManifest(candidate, appliedBase, local.matcher, policy.purgeIgnored);
+    const projected = projectLocalManifest(
+      candidate,
+      appliedBase,
+      local.matcher,
+      policy.purgeIgnored,
+      capture.reportProjectionSpans ? (spans) => { projectionSpans = spans; } : undefined,
+    );
     const caseCollisions = local.authority === "authoritative"
       ? cloneCollisionGroups(projected.caseCollisions)
       : mergeCollisionGroups(local.caseCollisions, projected.caseCollisions);
@@ -237,7 +246,9 @@ export async function preparePublishCandidate(
   // Design 108 §3.2: the file-plane diff drives BOTH the files-must-diff guard and
   // the no-op / mass-delete checks. Computed once, before any capture, so the
   // files-first decision precedes Git capture.
+  const diffT0 = capture.reportProjectionSpans ? performance.now() : 0;
   const filesDiff = diffManifests(appliedBase, candidate);
+  const projectionDiffMs = capture.reportProjectionSpans ? performance.now() - diffT0 : 0;
   const fileDiffNonEmpty =
     filesDiff.added.length > 0 || filesDiff.changed.length > 0 || filesDiff.deleted.length > 0;
 
@@ -258,6 +269,12 @@ export async function preparePublishCandidate(
     filesFirstDefer,
     ...(policy.resolution ? { resolution: policy.resolution } : {}),
   };
+  capture.reportProjectionSpans?.({
+    projection_ignore_carry_ms: projectionSpans?.projection_ignore_carry_ms ?? 0,
+    projection_casefold_ms: projectionSpans?.projection_casefold_ms ?? 0,
+    projection_sort_ms: projectionSpans?.projection_sort_ms ?? 0,
+    projection_diff_ms: projectionDiffMs,
+  });
   const captureReceipt = await capture.execute(effectPlan);
   if (captureReceipt.planId !== effectPlan.planId) {
     throw new PublishCandidateSealError(
