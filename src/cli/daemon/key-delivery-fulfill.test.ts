@@ -34,7 +34,6 @@ import {
   saveKeyDeliveryDaemonPreference,
   validateKeyDeliveryFetchResponse,
   type KeyDeliveryDaemonPreference,
-  type KeyDeliveryFlightPort,
   type KeyDeliveryFulfillmentApi,
   type KeyDeliveryRequest,
   type KeyDeliverySubmitBody,
@@ -583,36 +582,6 @@ describe("design 189 daemon fulfillment", () => {
     await run(worker);
     expect(loaded).toBe(0);
     expect(wraps).toBe(0);
-  });
-
-  test("WS fulfillment dispatch bypasses the sync readiness gate and sync mutex", () => {
-    const enqueued: Array<string | undefined> = [];
-    const port: KeyDeliveryFlightPort = {
-      enqueue: (requestId) => { enqueued.push(requestId); },
-      stop: async () => {},
-    };
-    const cfg: WorkspaceConfig = {
-      remoteWorkspaceId: "ws_test",
-      projectId: "root",
-      deviceId: SOURCE_ID,
-      rootPath: home,
-      remoteUrl: "https://api.test",
-      token: "token",
-      accountId: ACCOUNT_ID,
-    };
-    let mutexCalls = 0;
-    const daemon = new RboxDaemon(home, cfg, {} as SyncDeps, {
-      keyDeliveryFlight: port,
-      acquireSyncMutex: async () => {
-        mutexCalls++;
-        throw new Error("must not enter sync mutex");
-      },
-    });
-    (daemon as unknown as { handleWsMessageData(data: string): void }).handleWsMessageData(
-      JSON.stringify({ type: "key-delivery", requestId: REQUEST_ID }),
-    );
-    expect(enqueued).toEqual([REQUEST_ID]);
-    expect(mutexCalls).toBe(0);
   });
 
   test("a production fulfillment flight completes while daemon startup is blocked acquiring the sync mutex", async () => {

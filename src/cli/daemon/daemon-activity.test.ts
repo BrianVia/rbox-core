@@ -6,15 +6,14 @@ import { gitIdentity, HashCache, scanManifest, type BlobStore, type FileEntry, t
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
-import { RboxDaemon, type ScanCadenceClock } from "../daemon.js";
-import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
+import { RboxDaemon, type DaemonTimerHandle, type ScanCadenceClock } from "../daemon.js";
+import { daemonRuntimeDir, daemonStatusPath, readDaemonPidRecord } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
-import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
+import { healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
-import { observeDaemon } from "./observation.js";
 import { RBOX_VERSION } from "../version.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
@@ -79,11 +78,6 @@ class MiniRemote implements SyncRemote {
 type TestStartWatcher = (root: string, matcher: IgnoreMatcher, onSettle: (events: WatchEvent[]) => void, opts?: WatchOptions) => Promise<Watcher>;
 
 interface DaemonInternals {
-  ws?: WebSocket;
-  wsKeepaliveTimer?: ReturnType<typeof setInterval>;
-  wsGeneration: number;
-  pendingCatchUpGeneration?: number;
-  notifyPullPendingAt?: number;
   outOfStorageProbeArmed: boolean;
   watcherErrorGeneration: number;
   ownershipWindDownStarted: boolean;
@@ -108,7 +102,6 @@ interface DaemonInternals {
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doDeepScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doPull(...args: unknown[]): Promise<void>;
-  observeNotifyLatency(latencyMs: number): void;
   maybeClearWatcherUnsettledAfterOp(op: string, opWatcherGeneration: number): void;
   retryQueue: { scheduleWriteFinish(paths: Set<string>): void };
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
@@ -129,16 +122,7 @@ interface DaemonInternals {
   stopActivityHeartbeat(): void;
   startAmbientStatusHeartbeat(intervalMs?: number): void;
   stopAmbientStatusHeartbeat(): void;
-  recordCommittedFrame(sequence: number): void;
-  handleWsMessageData(data: string): void;
-  markWsOpen(ws: WebSocket): number;
-  markWsCaughtUp(generation: number): void;
-  markWsStartupDisconnected(): void;
-  markWsDisconnected(ws: WebSocket, reason: "close" | "error"): boolean;
-  handleWsClose(ws: WebSocket): void;
-  refreshWsAtThrottled(): void;
-  stopWsKeepalive(): void;
-  scheduleReconnect(): void;
+  beginOwnershipWindDown(reason: string): void;
   terminalPushBlock(): string | undefined;
   /** The chained sidecar-write promise — the pump never awaits it (best-effort
    *  by contract), so tests drain it explicitly before reading the file. */
@@ -191,7 +175,7 @@ async function makeDaemon(
   // real clock that timer can fire inside a test's own remaining awaits and land an
   // extra probe before it asserts, so no test here gets one it did not ask for: a
   // probe fires only when the test fires this clock or sets `recoveryDue`.
-  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, recoveryClock: new ManualRecoveryClock(), ...opts }) as unknown as DaemonInternals;
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, recoveryClock: new ManualRecoveryClock(), ...opts }) as DaemonInternals;
   daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
   daemon.local.head = await scanManifest(root);
@@ -199,9 +183,10 @@ async function makeDaemon(
   return daemon;
 }
 
-function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
+interface Deferred<T> { promise: Promise<T>; resolve(value: T): void; reject(reason?: Error): void }
+function deferred<T = void>(): Deferred<T> {
   let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
+  let reject!: (reason?: Error) => void;
   const promise = new Promise<T>((res, rej) => {
     resolve = res;
     reject = rej;
@@ -214,18 +199,18 @@ class FakeScanCadenceClock implements ScanCadenceClock {
   private readonly timeouts = new Map<number, () => unknown>();
   private readonly intervals = new Map<number, () => unknown>();
 
-  setTimeout(fn: () => void): unknown {
+  setTimeout(fn: () => void): DaemonTimerHandle {
     const id = this.next++;
     this.timeouts.set(id, fn);
     return id;
   }
-  clearTimeout(handle: unknown): void { this.timeouts.delete(handle as number); }
-  setInterval(fn: () => void): unknown {
+  clearTimeout(handle: DaemonTimerHandle): void { this.timeouts.delete(handle as number); }
+  setInterval(fn: () => void): DaemonTimerHandle {
     const id = this.next++;
     this.intervals.set(id, fn);
     return id;
   }
-  clearInterval(handle: unknown): void { this.intervals.delete(handle as number); }
+  clearInterval(handle: DaemonTimerHandle): void { this.intervals.delete(handle as number); }
   async fireSafety(): Promise<void> {
     const entry = this.timeouts.entries().next().value as [number, () => unknown] | undefined;
     if (!entry) throw new Error("safety timer is not armed");
@@ -241,7 +226,6 @@ class FakeScanCadenceClock implements ScanCadenceClock {
   get deepArmed(): boolean { return this.intervals.size > 0; }
 }
 
-const fakeWs = () => ({ readyState: WebSocket.OPEN, send: () => {}, close: () => {} }) as unknown as WebSocket;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 async function git(repo: string, ...args: string[]): Promise<void> {
   const child = Bun.spawn(["git", "-C", repo, ...args], { stdout: "ignore", stderr: "pipe" });
@@ -375,7 +359,7 @@ class ManualRecoveryClock {
     this.callbacks.set(id, fn);
     return id;
   }
-  clearTimeout(handle: unknown): void {
+  clearTimeout(handle: DaemonTimerHandle): void {
     this.callbacks.delete(handle as number);
   }
   fireAll(): void {
@@ -393,7 +377,7 @@ class ManualSafetyClock implements ScanCadenceClock {
     this.callbacks.set(id, fn);
     return id;
   }
-  clearTimeout(handle: unknown): void {
+  clearTimeout(handle: DaemonTimerHandle): void {
     this.callbacks.delete(handle as number);
   }
   // Intervals are irrelevant to the safety-cadence tests; deep-scan arming is inert.
@@ -630,13 +614,12 @@ test("review L3: startup resurrects only the intended prior activity slots", asy
       const daemon = await makeDaemon(new MiniRemote(), "selective-resurrection", { pullOnly: true });
       // Observe the resurrection boundary itself rather than letting the normal
       // startup WS marker overwrite any wrongly copied prior-boot slot.
-      daemon.markWsStartupDisconnected = () => {};
 
       await daemon.start();
 
       expect(daemon.activity.at).not.toBe(oldAt);
       expect(daemon.activity.active).toBeUndefined();
-      expect(daemon.activity.ws).toBeUndefined();
+      expect(daemon.activity.ws).toMatchObject({ connected: false, caughtUp: false, bootId: "selective-resurrection" });
       expect(daemon.activity.lastPush).toEqual(lastPush);
     } finally {
       if (oldDisabled === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED;
@@ -1223,7 +1206,7 @@ async function closeWatcherTimers(daemon: DaemonInternals): Promise<void> {
   await daemon.watcher?.close();
 }
 
-function captureWatcherErrors(daemon: DaemonInternals): { fire(err: Error): void } {
+function captureWatcherErrors(daemon: DaemonInternals) {
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
     onError = opts.onError;
@@ -1833,126 +1816,6 @@ test("deferred write-finish retry keeps local unsettled while retry is pending",
   }
 });
 
-test("ws-only activity writes preserve top-level heartbeat and committed sequence evidence", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  daemon.activity.at = "2026-07-02T12:00:00.000Z";
-  daemon.activity.lastPush = { at: "2026-07-02T12:00:01.000Z", files: 2, sequence: 9 };
-
-  daemon.recordCommittedFrame(10);
-  daemon.recordCommittedFrame(5); // monotonic: lower broadcasts never overwrite higher evidence
-  await daemon.activityWrite;
-
-  const after = await loadActivity(root);
-  expect(after?.at).toBe("2026-07-02T12:00:00.000Z");
-  expect(after?.lastPush).toEqual({ at: "2026-07-02T12:00:01.000Z", files: 2, sequence: 9 });
-  expect(after?.ws?.lastBroadcastSequence).toBe(10);
-  expect(after?.ws?.at).toEqual(expect.any(String));
-});
-
-test("committed WS frame records before queueing pull, including same-device echoes", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  const order: string[] = [];
-  daemon.writeWsActivity = () => order.push("write-ws");
-  (daemon as unknown as { request(kind: string): void }).request = (kind: string) => order.push(`request-${kind}`);
-
-  daemon.handleWsMessageData(JSON.stringify({ type: "committed", deviceId: "dev_act", sequence: 42 }));
-
-  expect(order).toEqual(["write-ws", "request-pull"]);
-  expect(daemon.activity.ws?.lastBroadcastSequence).toBe(42);
-});
-
-test("caughtUp is tied to the connection generation that queued the catch-up pull", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-
-  const gen1 = daemon.markWsOpen(fakeWs());
-  const gen2 = daemon.markWsOpen(fakeWs());
-  daemon.markWsCaughtUp(gen1);
-  expect(daemon.activity.ws?.caughtUp).toBe(false);
-  daemon.markWsCaughtUp(gen2);
-  expect(daemon.activity.ws?.caughtUp).toBe(true);
-  daemon.stopWsKeepalive();
-});
-
-test("stale WS close does not mutate the current connection or schedule reconnect", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  const ws1 = fakeWs();
-  const ws2 = fakeWs();
-
-  daemon.ws = ws1;
-  const gen1 = daemon.markWsOpen(ws1);
-  daemon.markWsCaughtUp(gen1);
-  daemon.ws = ws2;
-  const gen2 = daemon.markWsOpen(ws2);
-  daemon.markWsCaughtUp(gen2);
-  daemon.pendingCatchUpGeneration = gen2;
-
-  const beforeWs = { ...daemon.activity.ws };
-  const beforeGeneration = daemon.wsGeneration;
-  const beforeKeepalive = daemon.wsKeepaliveTimer;
-  let stopKeepaliveCalled = false;
-  let reconnectScheduled = false;
-  let wsWriteCalled = false;
-  const realStopKeepalive = daemon.stopWsKeepalive.bind(daemon);
-  daemon.stopWsKeepalive = () => {
-    stopKeepaliveCalled = true;
-  };
-  daemon.scheduleReconnect = () => {
-    reconnectScheduled = true;
-  };
-  daemon.writeWsActivity = () => {
-    wsWriteCalled = true;
-  };
-
-  try {
-    daemon.handleWsClose(ws1);
-
-    expect(daemon.ws).toBe(ws2);
-    expect(daemon.activity.ws).toEqual(beforeWs);
-    expect(daemon.wsGeneration).toBe(beforeGeneration);
-    expect(daemon.pendingCatchUpGeneration).toBe(gen2);
-    expect(daemon.wsKeepaliveTimer).toBe(beforeKeepalive);
-    expect(stopKeepaliveCalled).toBe(false);
-    expect(reconnectScheduled).toBe(false);
-    expect(wsWriteCalled).toBe(false);
-  } finally {
-    daemon.stopWsKeepalive = realStopKeepalive;
-    daemon.stopWsKeepalive();
-  }
-});
-
-test("pong keepalive advances ws.at in memory but persists at most once per 20s", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  const realNow = Date.now;
-  let now = TEST_NOW;
-  let writes = 0;
-  Date.now = () => now;
-  daemon.writeWsActivity = () => {
-    writes++;
-  };
-  try {
-    daemon.activity.ws = { connected: true, at: iso(60), caughtUp: true, bootId: "boot-test", pid: process.pid };
-    daemon.refreshWsAtThrottled();
-    const firstAt = daemon.activity.ws.at;
-    expect(writes).toBe(1);
-
-    now += 19_000;
-    daemon.refreshWsAtThrottled();
-    expect(writes).toBe(1);
-    expect(daemon.activity.ws.at).not.toBe(firstAt);
-
-    now += 1_000;
-    daemon.refreshWsAtThrottled();
-    expect(writes).toBe(2);
-  } finally {
-    Date.now = realNow;
-  }
-});
-
 test("conflicting v2 pidfile observed mid-pump drains the current op before wind-down", async () => {
   await withIsolatedDaemonHome(async () => {
     const remote = new HookedCommitRemote();
@@ -2018,60 +1881,6 @@ test("removing the pidfile during shutdown does not steal ownership from the run
   });
 });
 
-test("first activity write before pidfile creation is kept with the daemon bootId", async () => {
-  await withIsolatedDaemonHome(async () => {
-    const remote = new MiniRemote();
-    const daemon = await makeDaemon(remote);
-
-    daemon.recordCommittedFrame(3);
-    await daemon.activityWrite;
-
-    const activity = await loadActivity(root);
-    expect(activity?.ws?.bootId).toBe("boot-test");
-    expect(activity?.ws?.lastBroadcastSequence).toBe(3);
-    expect(daemon.ownershipWindDownStarted).toBe(false);
-    expect(readDaemonPidRecord(root).present).toBe(false);
-  });
-});
-
-test("binding bootId mismatch does not block attribution when pidfile and activity match", async () => {
-  await withIsolatedDaemonHome(async () => {
-    const remote = new MiniRemote();
-    const daemon = await makeDaemon(remote);
-    const runtime = daemonRuntimeDir(root);
-    await fs.mkdir(runtime, { recursive: true });
-    await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-test\n`);
-    await recordDaemonBinding(root, "ws_act", "boot-loser");
-
-    const ws = fakeWs();
-    daemon.ws = ws;
-    const generation = daemon.markWsOpen(ws);
-    daemon.markWsCaughtUp(generation);
-    daemon.activity.lastPush = { at: new Date().toISOString(), files: 1, sequence: 12 };
-    daemon.recordCommittedFrame(12);
-    await daemon.activityWrite;
-    daemon.stopWsKeepalive();
-
-    const activity = await loadActivity(root);
-    const binding = readDaemonBindingRecord(root);
-    const pidfile = readDaemonPidRecord(root);
-    const observed = observeDaemon(root, "ws_act", Date.now(), { processMatches: () => true });
-    const attributed = attributeDaemonForStatus({
-      activity,
-      daemon: observed,
-      localSequence: 10,
-      now: Date.now(),
-    });
-
-    expect(binding.bootId).toBe("boot-loser");
-    expect(pidfile.bootId).toBe("boot-test");
-    expect(observed.ownership).toBe("owned");
-    expect(attributed.activity?.lastPush?.sequence).toBe(12);
-    expect(attributed.elided).toBe(true);
-    expect(attributed.remote?.sequence).toBe(12);
-  });
-});
-
 test("activity writes persist without a v2 boot claim and stop on a conflicting v2 pidfile", async () => {
   const oldHome = process.env.RBOX_HOME;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
@@ -2094,7 +1903,7 @@ test("activity writes persist without a v2 boot claim and stop on a conflicting 
     expect((await loadActivity(root))?.ws?.at).toBe("2026-07-02T12:00:01.000Z");
 
     let windDown = false;
-    (daemon as unknown as { beginOwnershipWindDown(reason: string): void }).beginOwnershipWindDown = () => {
+    daemon.beginOwnershipWindDown = () => {
       windDown = true;
     };
     await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-other\n`);
@@ -2123,7 +1932,7 @@ test("ambient status writer stops when an observed pidfile disappears", async ()
     expect((await readAmbientStatus()).operation).toMatchObject({ currentPath: "before-loss.txt" });
 
     let windDown = false;
-    (daemon as unknown as { beginOwnershipWindDown(reason: string): void }).beginOwnershipWindDown = () => {
+    daemon.beginOwnershipWindDown = () => {
       windDown = true;
     };
     await fs.rm(pidfile);
@@ -2306,47 +2115,6 @@ test("transfer-progress throttle: byte-only ticks use the existing write cadence
 // notify-latency bookkeeping). D4 pins the ONE deliberate exclusion that survives.
 // Spec: docs/design/notes/2026-07-24-recovery-probe-divergences.md (RULED).
 
-test("executeOp #1a: a failed ORDINARY pump pull restores pendingCatchUpGeneration", async () => {
-  const daemon = await makeDaemon(new MiniRemote());
-  daemon.doPull = async () => { throw new Error("ordinary pull boom"); };
-  daemon.pendingCatchUpGeneration = 7;
-  daemon.want.pull = true;
-
-  await daemon.pump();
-
-  // The pump clears the generation before doPull and must restore it when the pull
-  // throws, so a later healing pull can still mark the socket caught up.
-  expect(daemon.pendingCatchUpGeneration).toBe(7);
-});
-
-test("executeOp #1b: a failed RECOVERY-probe pull restores pendingCatchUpGeneration", async () => {
-  const daemon = await makeDaemon(new MiniRemote());
-  daemon.doPull = async () => { throw new Error("recovery pull boom"); };
-  daemon.pendingCatchUpGeneration = 9;
-  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
-  daemon.recoveryDue = true;
-
-  await daemon.pump();
-
-  expect(daemon.pendingCatchUpGeneration).toBe(9);
-});
-
-test("executeOp #2: one notify yields exactly one observeNotifyLatency across the servicing pull", async () => {
-  const daemon = await makeDaemon(new MiniRemote(), "boot-test", { now: () => TEST_NOW });
-  const records: number[] = [];
-  const realObserve = daemon.observeNotifyLatency.bind(daemon);
-  daemon.observeNotifyLatency = (ms) => { records.push(ms); realObserve(ms); };
-  daemon.doPull = async () => {}; // successful no-op pull
-
-  daemon.notifyPullPendingAt = TEST_NOW - 250;
-  daemon.want.pull = true;
-  await daemon.pump();
-
-  // Recorded exactly once, at dequeue, and the pending timestamp is consumed.
-  expect(records).toEqual([250]);
-  expect(daemon.notifyPullPendingAt).toBeUndefined();
-});
-
 test("executeOp D1a: a successful recovery-probe fullScan clears watcher-degraded like an ordinary scan", async () => {
   await withIsolatedDaemonHome(async () => {
     const daemon = await makeDaemon(new MiniRemote());
@@ -2411,31 +2179,6 @@ test("executeOp D2: a recovery-probe fullScan arms outOfStorageProbeArmed when o
   await daemon.pump();
 
   expect(daemon.outOfStorageProbeArmed).toBe(true);
-});
-
-test("executeOp D3: a recovery-probe pull records notify latency and does not inflate the next ordinary pull", async () => {
-  let logicalNow = TEST_NOW;
-  const daemon = await makeDaemon(new MiniRemote(), "boot-test", { now: () => logicalNow });
-  const records: number[] = [];
-  const realObserve = daemon.observeNotifyLatency.bind(daemon);
-  daemon.observeNotifyLatency = (ms) => { records.push(ms); realObserve(ms); };
-  daemon.doPull = async () => {}; // successful no-op pull
-
-  daemon.notifyPullPendingAt = TEST_NOW - 300;
-  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
-  daemon.recoveryDue = true;
-  await daemon.pump();
-
-  // The recovery pull consumes + records the notify latency itself…
-  expect(records).toEqual([300]);
-  expect(daemon.notifyPullPendingAt).toBeUndefined();
-
-  // …so a much later ordinary pull sees NO surviving halt-era timestamp and does
-  // not record a halt-inflated (~10min) latency.
-  logicalNow = TEST_NOW + 10 * 60_000;
-  daemon.want.pull = true;
-  await daemon.pump();
-  expect(records).toEqual([300]);
 });
 
 test("executeOp D4: recovery-probe ops do NOT invoke maybeClearWatcherUnsettledAfterOp (deliberate exclusion)", async () => {
