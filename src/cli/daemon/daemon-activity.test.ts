@@ -79,7 +79,10 @@ type TestStartWatcher = (root: string, matcher: IgnoreMatcher, onSettle: (events
 
 interface DaemonInternals {
   outOfStorageProbeArmed: boolean;
-  watcherErrorGeneration: number;
+  watcherTrust: {
+    degraded: boolean;
+    observe(input: { kind: string }): unknown;
+  };
   ownershipWindDownStarted: boolean;
   cache: HashCache;
   local: { head: Manifest };
@@ -94,7 +97,6 @@ interface DaemonInternals {
   startWatcherFn: TestStartWatcher;
   startLiveWatch(): Promise<void>;
   watcher?: Watcher;
-  watcherDegraded: boolean;
   safetyTimer?: unknown;
   scheduleSafetyScan(): void;
   deepTimer?: ReturnType<typeof setInterval>;
@@ -102,7 +104,6 @@ interface DaemonInternals {
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doDeepScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doPull(...args: unknown[]): Promise<void>;
-  maybeClearWatcherUnsettledAfterOp(op: string, opWatcherGeneration: number): void;
   retryQueue: { scheduleWriteFinish(paths: Set<string>): void };
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
@@ -1302,19 +1303,19 @@ test("transient watcher degradation clears after a clean covering scan and stays
       await daemon.startLiveWatch();
       errors.fire(new Error("Events were dropped by the FSEvents client"));
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(true);
+      expect(daemon.watcherTrust.degraded).toBe(true);
       expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
 
       daemon.want.fullScan = true;
       await daemon.pump();
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.watcherTrust.degraded).toBe(false);
       expect(await readAmbientStatus()).toMatchObject({ state: "synced" });
 
       daemon.want.fullScan = true;
       await daemon.pump();
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.watcherTrust.degraded).toBe(false);
       expect(await readAmbientStatus()).toMatchObject({ state: "synced" });
     } finally {
       await closeWatcherTimers(daemon);
@@ -1347,7 +1348,7 @@ test("a second watcher error during the covering scan keeps status degraded", as
       await pumpDone;
       await daemon.activityWrite;
 
-      expect(daemon.watcherDegraded).toBe(true);
+      expect(daemon.watcherTrust.degraded).toBe(true);
       expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
     } finally {
       releaseScan.resolve();
@@ -1373,7 +1374,7 @@ test("watch-unavailable degradation never self-clears without a live watcher", a
       daemon.want.fullScan = true;
       await daemon.pump();
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(true);
+      expect(daemon.watcherTrust.degraded).toBe(true);
       expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
     } finally {
       await closeWatcherTimers(daemon);
@@ -1804,6 +1805,31 @@ test("raw watcher event persists local unsettled before the debounced pump runs"
   }
 });
 
+test("a second raw event projects an episode first seen before BASE was available", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  let onRawEvent: ((event: WatchEvent) => void) | undefined;
+  daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
+    onRawEvent = opts.onRawEvent;
+    return { backend: "parcel", close: async () => {} };
+  };
+  daemon.syncBase = undefined;
+
+  try {
+    await daemon.startLiveWatch();
+    onRawEvent?.({ relPath: "before-base.txt", kind: "add" });
+    await daemon.activityWrite;
+    expect((await loadActivity(root))?.local).toBeUndefined();
+
+    await daemon.loadSyncBase();
+    onRawEvent?.({ relPath: "after-base.txt", kind: "add" });
+    await daemon.activityWrite;
+    expect((await loadActivity(root))?.local?.settled).toBe(false);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+  }
+});
+
 test("deferred write-finish retry keeps local unsettled while retry is pending", async () => {
   const daemon = await makeDaemon(new MiniRemote());
   try {
@@ -2125,7 +2151,7 @@ test("executeOp D1a: a successful recovery-probe fullScan clears watcher-degrade
       await daemon.startLiveWatch();
       errors.fire(new Error("Events were dropped by the FSEvents client"));
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(true);
+      expect(daemon.watcherTrust.degraded).toBe(true);
 
       // A fullScan halt drives the recovery probe (the halt masks want.fullScan, so
       // the ONLY scan this pump runs is the recovery scan).
@@ -2134,7 +2160,7 @@ test("executeOp D1a: a successful recovery-probe fullScan clears watcher-degrade
       await daemon.pump();
       await daemon.activityWrite;
 
-      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.watcherTrust.degraded).toBe(false);
       expect(daemon.activity.halt).toBeUndefined();
     } finally {
       await closeWatcherTimers(daemon);
@@ -2152,14 +2178,14 @@ test("executeOp D1b: a successful recovery-probe deepScan clears watcher-degrade
       await daemon.startLiveWatch();
       errors.fire(new Error("Events were dropped by the FSEvents client"));
       await daemon.activityWrite;
-      expect(daemon.watcherDegraded).toBe(true);
+      expect(daemon.watcherTrust.degraded).toBe(true);
 
       daemon.activity.halt = { at: iso(10), reason: "scan failed", count: 1, op: "deepScan" };
       daemon.recoveryDue = true;
       await daemon.pump();
       await daemon.activityWrite;
 
-      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.watcherTrust.degraded).toBe(false);
       expect(daemon.activity.halt).toBeUndefined();
     } finally {
       await closeWatcherTimers(daemon);
@@ -2181,16 +2207,16 @@ test("executeOp D2: a recovery-probe fullScan arms outOfStorageProbeArmed when o
   expect(daemon.outOfStorageProbeArmed).toBe(true);
 });
 
-test("executeOp D4: recovery-probe ops do NOT invoke maybeClearWatcherUnsettledAfterOp (deliberate exclusion)", async () => {
+test("executeOp D4: recovery-probe ops do NOT report watcher operation completion (deliberate exclusion)", async () => {
   const daemon = await makeDaemon(new MiniRemote());
   const calls: string[] = [];
-  daemon.maybeClearWatcherUnsettledAfterOp = (op) => { calls.push(op); };
+  daemon.watcherTrust.observe = (input) => { calls.push(input.kind); };
   daemon.doPull = async () => {};
   daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
   daemon.recoveryDue = true;
 
   await daemon.pump();
 
-  // Recovery ops run outside the watcher-generation bracketing the guard assumes.
+  // Recovery ops run outside the watcher-generation bracketing the observation assumes.
   expect(calls).toEqual([]);
 });

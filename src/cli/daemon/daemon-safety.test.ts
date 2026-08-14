@@ -5,7 +5,8 @@ import path from "node:path";
 import { nextSafetyDelay, RboxDaemon } from "../daemon.js";
 import { folderCatalogPath } from "../rbox-paths.js";
 import type { GitSignalBatch } from "./watcher.js";
-import { HashCache } from "../../engine/index.js";
+import { HashCache, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
+import type { WatcherTrustObservation } from "./watcher-trust.js";
 
 // Design 49: the safety scan heals DROPPED watcher events, and drops happen under
 // churn — so quiet intervals back the scan off (60s → 5m cap) instead of
@@ -56,8 +57,8 @@ test("design 172: an active Linux git ref-watch pins quiet safety cadence to 60s
 interface SafetyInternals {
   startWatcherFn: (
     root: string,
-    matcher: unknown,
-    cb: (events: unknown[]) => void,
+    matcher: IgnoreMatcher,
+    cb: (events: WatchEvent[]) => void,
     opts?: {
       onError?: (err: Error) => void;
       signalDebouncer?: { push(reason: "signal" | "candidate" | "other"): void };
@@ -67,18 +68,21 @@ interface SafetyInternals {
   startLiveWatch(): Promise<void>;
   advanceSafetyCadenceForTick(): void;
   churnSinceSafety: boolean;
-  watcherHealthy: boolean;
-  trustState: "trusted" | "suspect" | "fused";
   ambientStatusFrom(activity: { at: string }, settled: boolean, now: number): { watcherTrust?: "suspect" | "fused" };
-  watcherErrorGeneration: number;
-  lastTransientDropMs: number;
-  recoveryHoldMs: number;
-  maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
+  watcherTrust: {
+    healthy: boolean;
+    state: "trusted" | "suspect" | "fused";
+    degraded: boolean;
+    errorGeneration: number;
+    lastTransientDropMs: number;
+    recoveryHoldMs: number;
+    unsettled: boolean;
+    observe(input: WatcherTrustObservation): void | { wasUnsettled: boolean };
+  };
   safetyDelay: number;
   pumping: boolean;
   want: { push: boolean; fullScan: boolean };
-  pendingEvents: unknown[];
-  watcherUnsettled: boolean;
+  pendingEvents: WatchEvent[];
   watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
@@ -100,8 +104,8 @@ interface SafetyInternals {
   folderAdmissionHaltReason?: string;
   folderMatcherRebuildPending: boolean;
   folderPolicyRecyclePending: boolean;
-  localObserver: { observe(plan: unknown): Promise<{ deferredPaths: ReadonlySet<string> }> };
-  rebuildMatcher(state?: unknown): void;
+  localObserver: { observe(plan: RecycleScanPlan): Promise<{ deferredPaths: ReadonlySet<string> }> };
+  rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
   acknowledgeFolderPolicyRecycle(): Promise<boolean>;
   gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
@@ -124,7 +128,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   const daemon = makeDaemon(root);
   let signal: (() => void) | undefined;
   let signalHandled!: () => void;
-  let signalFailed!: (error: unknown) => void;
+  let signalFailed!: (error: Error) => void;
   const handled = new Promise<void>((resolve, reject) => {
     signalHandled = resolve;
     signalFailed = reject;
@@ -135,7 +139,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
       await handleGitSignalBatch(batch);
     } catch (error) {
       if (!batch.reasons.signal) throw error;
-      signalFailed(error);
+      signalFailed(error instanceof Error ? error : new Error(String(error)));
       return;
     }
     if (batch.reasons.signal) signalHandled();
@@ -163,7 +167,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
     expect(daemon.want.push).toBe(true);
     expect(daemon.churnSinceSafety).toBe(true);
     expect(daemon.pendingEvents).toEqual([]);
-    expect(daemon.watcherUnsettled).toBe(false);
+    expect(daemon.watcherTrust.unsettled).toBe(false);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
@@ -264,9 +268,11 @@ test.skipIf(process.platform !== "linux")("design 175: fallback and dir snapshot
   }
 });
 
+interface RecycleScanPlan { mode?: string; cache?: HashCache }
+
 function makeDaemon(root: string, opts: { pullOnly?: boolean; log?: (message: string) => void } = {}): SafetyInternals {
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  return new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as SafetyInternals;
+  return new RboxDaemon(root, cfg as never, {} as never, opts) as SafetyInternals;
 }
 
 function writeFolderCatalog(root: string, respectGitignore: boolean): string {
@@ -355,19 +361,19 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
 
   try {
     await daemon.startLiveWatch();
-    expect(daemon.watcherHealthy).toBe(true);
+    expect(daemon.watcherTrust.healthy).toBe(true);
     // Simulate a fully backed-off idle daemon at the moment the stream dies.
     daemon.safetyDelay = CAP;
     const armedBefore = daemon.safetyTimer;
     onError!(new Error("FSEvents stream died"));
-    expect(daemon.watcherHealthy).toBe(false); // …and stays false: trust is not restored
+    expect(daemon.watcherTrust.healthy).toBe(false); // …and stays false: trust is not restored
     // The error must also pull the ARMED backed-off timer forward — the
     // flag alone would wait out the remaining (up to 5m) timeout.
     expect(daemon.safetyDelay).toBe(FLOOR);
     expect(daemon.safetyTimer).not.toBe(armedBefore);
     // With trust revoked, quiet intervals must NOT back off — the scan is now the
     // only healer for anything the (possibly dead) watcher misses.
-    expect(nextSafetyDelay(CAP, { watcherLive: daemon.watcher !== undefined && daemon.watcherHealthy, churned: false })).toBe(FLOOR);
+    expect(nextSafetyDelay(CAP, { watcherLive: daemon.watcher !== undefined && daemon.watcherTrust.healthy, churned: false })).toBe(FLOOR);
   } finally {
     if (previous === undefined) delete process.env.RBOX_WATCHER_RETRUST;
     else process.env.RBOX_WATCHER_RETRUST = previous;
@@ -392,13 +398,17 @@ test("a transient post-init watcher error is suspect and recoverable with the fl
   try {
     await daemon.startLiveWatch();
     onError!(new Error("Events were dropped by the FSEvents client. File system must be re-scanned."));
-    expect(daemon.trustState).toBe("suspect");
+    expect(daemon.watcherTrust.state).toBe("suspect");
     expect(daemon.ambientStatusFrom({ at: new Date().toISOString() }, true, Date.now()).watcherTrust).toBe("suspect");
-    expect(daemon.watcherHealthy).toBe(false);
-    daemon.lastTransientDropMs -= daemon.recoveryHoldMs;
-    daemon.maybeClearWatcherDegradedAfterScan(daemon.watcherErrorGeneration, { coverage: "full-tree", errorGenAtStart: daemon.watcherErrorGeneration });
-    expect(daemon.trustState).toBe("trusted");
-    expect(daemon.watcherHealthy).toBe(true);
+    expect(daemon.watcherTrust.healthy).toBe(false);
+    daemon.watcherTrust.lastTransientDropMs -= daemon.watcherTrust.recoveryHoldMs;
+    daemon.watcherTrust.observe({
+      kind: "scan",
+      operationErrorGeneration: daemon.watcherTrust.errorGeneration,
+      receipt: { coverage: "full-tree", errorGenAtStart: daemon.watcherTrust.errorGeneration },
+    });
+    expect(daemon.watcherTrust.state).toBe("trusted");
+    expect(daemon.watcherTrust.healthy).toBe(true);
   } finally {
     if (previous === undefined) delete process.env.RBOX_WATCHER_RETRUST;
     else process.env.RBOX_WATCHER_RETRUST = previous;
@@ -624,12 +634,12 @@ test("rootPath-less legacy workspace binding is admitted at its observed root", 
 test("Git-policy recycle uses an uncached unpruned scan and acknowledges only after cache save", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root);
-  const plans: Array<{ mode?: string; cache?: unknown }> = [];
+  const plans: RecycleScanPlan[] = [];
   let deferred = new Set<string>();
   let rebuilds = 0;
   daemon.localObserver = {
     observe: async (plan) => {
-      plans.push(plan as { mode?: string; cache?: unknown });
+      plans.push(plan);
       return { deferredPaths: deferred };
     },
   };

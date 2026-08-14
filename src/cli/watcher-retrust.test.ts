@@ -2,9 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest } from "../engine/index.js";
+import { HashCache, scanManifest, type IgnoreMatcher, type Manifest, type WatchEvent } from "../engine/index.js";
 import { classifyWatcherError, nextSafetyDelay, RboxDaemon } from "./daemon.js";
-import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate } from "./daemon/drift-audit.js";
+import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate, type EntrySnapshot } from "./daemon/drift-audit.js";
+import type { WatcherTrustObservation } from "./daemon/watcher-trust.js";
 import {
   recordWatcherDropEpisode,
   RETRUST_DROP_WINDOW_MS,
@@ -28,30 +29,31 @@ afterEach(() => {
 });
 
 interface Internals {
-  startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
+  startWatcherFn: (root: string, matcher: IgnoreMatcher, cb: (events: WatchEvent[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
-  maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
   advanceSafetyCadenceForTick(): void;
   noteChurn(): void;
-  resetSuspectEpisodeState(): void;
-  trustState: "trusted" | "suspect" | "fused";
-  watcherHealthy: boolean;
-  watcherErrorGeneration: number;
-  lastTrustedErrorGeneration: number;
-  transientDropTimestamps: number[];
-  lastTransientDropMs: number;
-  recoveryHoldMs: number;
-  watcherLivenessSinceDrop: boolean;
-  hasCleanUnprunedScanThisEpisode: boolean;
-  consecutiveQuietSafetyTicks: number;
+  watcherTrust: {
+    healthy: boolean;
+    state: "trusted" | "suspect" | "fused";
+    errorGeneration: number;
+    lastTrustedErrorGeneration: number;
+    transientDropTimestamps: number[];
+    lastTransientDropMs: number;
+    recoveryHoldMs: number;
+    livenessSinceDrop: boolean;
+    cleanUnprunedScanThisEpisode: boolean;
+    consecutiveQuietSafetyTicks: number;
+    observe(input: WatcherTrustObservation): void | { wasUnsettled: boolean };
+  };
   churnSinceSafety: boolean;
   safetyDelay: number;
   pumping: boolean;
   watcher?: { close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
-  openDriftAudits: Set<unknown>;
-  runDriftAuditNow(audit?: unknown): Promise<void>;
+  openDriftAudits: Set<TestDriftAudit>;
+  runDriftAuditNow(audit?: TestDriftAudit): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -62,10 +64,24 @@ test("watcher re-trust defaults ON with the env unset; =0 disables", () => {
   expect(retrustEnabled()).toBe(false);
 });
 
-function daemonHarness(opts: { monotonicNow?: () => number; log?: (line: string) => void } = {}): { daemon: Internals; error(err?: string): void; close(): Promise<void> } {
+interface TestDriftAudit {
+  scanStartMs: number;
+  candidates: DriftCandidate[];
+  horizonInputs: Map<string, EntrySnapshot | null>;
+  rawEvents: WatchEvent[];
+  appliedEvents: WatchEvent[];
+  overflow: boolean;
+  watcherHealthy: boolean;
+  trustState: "trusted" | "suspect" | "fused";
+  errorGen: number;
+  sinceSafetyMs: number;
+  rulesChanged: boolean;
+}
+
+function daemonHarness(opts: { monotonicNow?: () => number; log?: (line: string) => void } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-retrust-")));
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  const daemon = new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as Internals;
+  const daemon = new RboxDaemon(root, cfg as never, {} as never, opts) as Internals;
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     onError = opts?.onError;
@@ -92,16 +108,16 @@ test("re-trust requires stable advanced full-tree coverage after the hold", asyn
   try {
     await h.daemon.startLiveWatch();
     h.error();
-    expect(h.daemon.trustState).toBe("suspect");
-    h.daemon.lastTransientDropMs -= h.daemon.recoveryHoldMs;
-    h.daemon.maybeClearWatcherDegradedAfterScan(1, { coverage: "pruned", errorGenAtStart: 1 });
-    expect(h.daemon.trustState).toBe("suspect");
-    h.daemon.maybeClearWatcherDegradedAfterScan(0, { coverage: "full-tree", errorGenAtStart: 0 });
-    expect(h.daemon.trustState).toBe("suspect");
-    h.daemon.maybeClearWatcherDegradedAfterScan(1, { coverage: "full-tree", errorGenAtStart: 1 });
-    expect(h.daemon.trustState).toBe("trusted");
-    expect(h.daemon.watcherHealthy).toBe(true);
-    expect(h.daemon.watcherErrorGeneration).toBe(1);
+    expect(h.daemon.watcherTrust.state).toBe("suspect");
+    h.daemon.watcherTrust.lastTransientDropMs -= h.daemon.watcherTrust.recoveryHoldMs;
+    h.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 1, receipt: { coverage: "pruned", errorGenAtStart: 1 } });
+    expect(h.daemon.watcherTrust.state).toBe("suspect");
+    h.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 0, receipt: { coverage: "full-tree", errorGenAtStart: 0 } });
+    expect(h.daemon.watcherTrust.state).toBe("suspect");
+    h.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 1, receipt: { coverage: "full-tree", errorGenAtStart: 1 } });
+    expect(h.daemon.watcherTrust.state).toBe("trusted");
+    expect(h.daemon.watcherTrust.healthy).toBe(true);
+    expect(h.daemon.watcherTrust.errorGeneration).toBe(1);
   } finally { await h.close(); }
 });
 
@@ -130,11 +146,11 @@ test("six spaced episodes fuse, while a rapid burst is one episode and its hold 
   try {
     await h.daemon.startLiveWatch();
     for (let i = 0; i < 6; i++) h.error();
-    expect(h.daemon.trustState).toBe("suspect");
-    expect(h.daemon.transientDropTimestamps).toEqual([0]);
-    now += h.daemon.recoveryHoldMs;
-    h.daemon.maybeClearWatcherDegradedAfterScan(6, { coverage: "full-tree", errorGenAtStart: 6 });
-    expect(h.daemon.trustState).toBe("trusted");
+    expect(h.daemon.watcherTrust.state).toBe("suspect");
+    expect(h.daemon.watcherTrust.transientDropTimestamps).toEqual([0]);
+    now += h.daemon.watcherTrust.recoveryHoldMs;
+    h.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 6, receipt: { coverage: "full-tree", errorGenAtStart: 6 } });
+    expect(h.daemon.watcherTrust.state).toBe("trusted");
   } finally { await h.close(); }
 
   now = 0;
@@ -145,9 +161,9 @@ test("six spaced episodes fuse, while a rapid burst is one episode and its hold 
       spaced.error();
       now += RETRUST_EPISODE_COALESCE_MS;
     }
-    expect(spaced.daemon.trustState).toBe("fused");
-    spaced.daemon.maybeClearWatcherDegradedAfterScan(6, { coverage: "full-tree", errorGenAtStart: 6 });
-    expect(spaced.daemon.trustState).toBe("fused");
+    expect(spaced.daemon.watcherTrust.state).toBe("fused");
+    spaced.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 6, receipt: { coverage: "full-tree", errorGenAtStart: 6 } });
+    expect(spaced.daemon.watcherTrust.state).toBe("fused");
   } finally { await spaced.close(); }
 });
 
@@ -255,9 +271,10 @@ test("P2 cadence requires suspect liveness and clean coverage, and resets on chu
     h.error();
     // No monotonic time has elapsed: clean coverage records P2 evidence but the
     // recovery hold still keeps the watcher suspect.
-    h.daemon.maybeClearWatcherDegradedAfterScan(1, { coverage: "full-tree", errorGenAtStart: 1 });
+    h.daemon.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 1, receipt: { coverage: "full-tree", errorGenAtStart: 1 } });
     for (let i = 0; i < 3; i++) h.daemon.advanceSafetyCadenceForTick();
     expect(h.daemon.safetyDelay).toBe(FLOOR); // no callback since the drop
+    h.daemon.watcherTrust.observe({ kind: "watch-activity" });
     h.daemon.noteChurn();
     h.daemon.advanceSafetyCadenceForTick();
     expect(h.daemon.safetyDelay).toBe(FLOOR);
@@ -268,18 +285,20 @@ test("P2 cadence requires suspect liveness and clean coverage, and resets on chu
     h.daemon.advanceSafetyCadenceForTick();
     expect(h.daemon.safetyDelay).toBe(FLOOR);
     h.error();
-    expect(h.daemon.watcherLivenessSinceDrop).toBe(false);
-    expect(h.daemon.hasCleanUnprunedScanThisEpisode).toBe(false);
-    expect(h.daemon.consecutiveQuietSafetyTicks).toBe(0);
+    expect(h.daemon.watcherTrust.livenessSinceDrop).toBe(false);
+    expect(h.daemon.watcherTrust.cleanUnprunedScanThisEpisode).toBe(false);
+    expect(h.daemon.watcherTrust.consecutiveQuietSafetyTicks).toBe(0);
   } finally { await h.close(); }
 });
 
 test("dedupePending ORs originUntrusted across same-path duplicates (clean-oldest + contaminated-newer)", () => {
-  const mk = (firstSeenAtMs: number, originUntrusted?: boolean): DriftCandidate => ({
-    path: "a", kind: "modified", expected: null, observed: null,
-    firstSeenAtMs, eventGenAtScan: 0, bootId: "boot", errorGenAtScan: 1, quiescentAtScan: true,
-    ...(originUntrusted ? { originUntrusted: true } : {}),
-  });
+  const mk = (firstSeenAtMs: number, originUntrusted?: boolean): DriftCandidate => {
+    const candidate: DriftCandidate = {
+      path: "a", kind: "modified", expected: null, observed: null,
+      firstSeenAtMs, eventGenAtScan: 0, bootId: "boot", errorGenAtScan: 1, quiescentAtScan: true,
+    };
+    return originUntrusted ? { ...candidate, originUntrusted: true } : candidate;
+  };
   // oldest is CLEAN, a newer same-path duplicate is contaminated: the merge must
   // keep the oldest's evidence (firstSeenAtMs) yet carry the contamination.
   const merged = mergePending([mk(1)], [mk(2, true)]);
@@ -294,6 +313,22 @@ test("dedupePending ORs originUntrusted across same-path duplicates (clean-oldes
 // stays UNATTRIBUTABLE when a subsequent, re-trusted, generation-matching audit
 // classifies it — originUntrusted is the SOLE decider here (errorGen matches and
 // the watcher is healthy at classification, so nothing else forces it).
+interface DriftDaemonInternals {
+  cache: HashCache;
+  local: { head: Manifest };
+  matcher: IgnoreMatcher;
+  watcher?: { close(): Promise<void> };
+  watcherSessionId?: string;
+  startWatcherFn: (root: string, matcher: IgnoreMatcher, events: (events: WatchEvent[]) => void, options?: { onError?: (error: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
+  startLiveWatch(): Promise<void>;
+  doDeepScan(): Promise<unknown>;
+  runDriftAuditNow(): Promise<void>;
+  watcherTrust: Internals["watcherTrust"];
+  safetyTimer?: ReturnType<typeof setTimeout>;
+  deepTimer?: ReturnType<typeof setInterval>;
+  stop(): Promise<void>;
+}
+
 test("drop-spanning survivor is unattributable via a subsequent re-trusted audit", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-retrust-e2e-")));
   const logs: string[] = [];
@@ -303,35 +338,27 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
   try {
     fs.writeFileSync(path.join(root, "drift.txt"), "old");
     const cfg = { remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "" };
-    const d = new RboxDaemon(root, cfg as never, {} as never, { bootId: "boot" }) as never as {
-      cache: HashCache; local: { head: unknown }; matcher: unknown; watcher?: unknown; watcherSessionId?: string;
-      trustState: string; watcherHealthy: boolean; watcherErrorGeneration: number; lastTransientDropMs: number; recoveryHoldMs: number;
-      startWatcherFn: (r: string, m: unknown, cb: unknown, o?: { onError?: (e: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
-      startLiveWatch(): Promise<void>; doDeepScan(): Promise<unknown>; runDriftAuditNow(): Promise<void>;
-      maybeClearWatcherDegradedAfterScan(g: number, c: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
-      safetyTimer?: ReturnType<typeof setTimeout>; deepTimer?: ReturnType<typeof setInterval>;
-      stop(): Promise<void>;
-    };
+    const d = new RboxDaemon(root, cfg as never, {} as never, { bootId: "boot" }) as DriftDaemonInternals;
     daemon = d;
     let onError: ((e: Error) => void) | undefined;
     d.startWatcherFn = (_r, _m, _cb, o) => { onError = o?.onError; return Promise.resolve({ backend: "parcel", close: async () => {} }); };
     d.cache = await HashCache.load(root);
-    d.local.head = await scanManifest(root, d.matcher as never, d.cache);
+    d.local.head = await scanManifest(root, d.matcher, d.cache);
     await d.startLiveWatch();
     d.watcherSessionId = "session";
 
     onError!(new Error(DROP));                 // errorGen 1, trustState suspect
-    expect(d.trustState).toBe("suspect");
+    expect(d.watcherTrust.state).toBe("suspect");
     fs.writeFileSync(path.join(root, "drift.txt"), "changed"); // drift, no watcher event
     await d.doDeepScan();                       // audit A opens SUSPECT → candidate born originUntrusted, errorGenAtScan=1
     await d.runDriftAuditNow();                 // → contaminated survivor persisted
     expect((await loadDriftAudit(root)).pending[0]!.originUntrusted).toBe(true);
 
-    d.lastTransientDropMs -= d.recoveryHoldMs; // monotonic hold elapsed
-    d.maybeClearWatcherDegradedAfterScan(1, { coverage: "full-tree", errorGenAtStart: 1 }); // re-trust; errorGen stays 1
-    expect(d.trustState).toBe("trusted");
-    expect(d.watcherHealthy).toBe(true);
-    expect(d.watcherErrorGeneration).toBe(1);   // gen unchanged by re-trust
+    d.watcherTrust.lastTransientDropMs -= d.watcherTrust.recoveryHoldMs; // monotonic hold elapsed
+    d.watcherTrust.observe({ kind: "scan", operationErrorGeneration: 1, receipt: { coverage: "full-tree", errorGenAtStart: 1 } }); // re-trust; errorGen stays 1
+    expect(d.watcherTrust.state).toBe("trusted");
+    expect(d.watcherTrust.healthy).toBe(true);
+    expect(d.watcherTrust.errorGeneration).toBe(1);   // gen unchanged by re-trust
 
     logs.length = 0;
     await d.doDeepScan();                        // audit B: trusted, errorGen 1, stashes the survivor

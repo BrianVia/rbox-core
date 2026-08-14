@@ -1,20 +1,11 @@
 import crypto from "node:crypto";
-import type { IgnoreMatcher, WatchEvent, DiscoveredGitRepo } from "../../engine/index.js";
+import type { WatchEvent, DiscoveredGitRepo } from "../../engine/index.js";
 import { gitRefSideChannelEligible } from "./git-ref-watch.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type SignalDebouncer, type Watcher } from "./watcher.js";
 import type { LocalObservationCommitOutcome } from "./local-observation-transition.js";
+import type { WatcherArmAuthority, WatcherArmCertification } from "./watcher-trust.js";
 
 const REARM_DELAYS_MS = [120_000, 240_000, 480_000, 1_800_000] as const;
-
-export interface WatcherArmAuthority {
-  readonly matcherGeneration: number;
-  readonly admission: readonly string[];
-  readonly authorityFingerprint: string;
-  readonly coverage: "complete" | "structural-conflict";
-  readonly matcher: IgnoreMatcher;
-}
-
-export type WatcherArmCertification = Pick<WatcherArmAuthority, "admission" | "authorityFingerprint" | "coverage">;
 
 export interface WatcherAttemptWitness {
   readonly attemptId: string;
