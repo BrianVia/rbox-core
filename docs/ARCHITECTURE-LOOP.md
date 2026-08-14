@@ -33,6 +33,9 @@ retired.
 - Touched files get ALL anti-slop warnings fixed (whole files, not new
   lines) — triggers on SUBSTANTIVE changes; import-line-only touches are
   exempt, but grab cheap fixes opportunistically (founder ruling 08-14).
+  The exemption is SCHEDULING, not forgiveness: every warning is AI-authored
+  debt and repo-wide zero (end-state #3) remains the contract — no warning
+  is ever grandfathered, only deferred to a named later pass.
 - Size-gate trips get decomposition, never re-pins.
 - Sync-plane batches close out with BEFORE/AFTER field checks on BOTH lanes.
 - Codex adversarial review for daemon/sync-git/state planes; merge on
