@@ -180,20 +180,29 @@ async function retryPack(pack: BuiltPack, accountId: string, handlerEnv: Env = e
   return blobPackPut(packRequest(pack), handlerEnv, accountId);
 }
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
 const fakeState = () => ({
   setWebSocketAutoResponse() {},
   storage: {
-    kv: { get() {}, put() {}, delete() {} },
-    sql: { exec: () => ({ toArray: () => [] }) },
+    kv: {
+      get: <Value>(_key: string): Value | undefined => undefined,
+      put: <Value>(_key: string, _value: Value): void => {},
+      delete: (_key: string): boolean => false,
+    },
+    sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
     transactionSync(fn: () => void) { fn(); },
-    async getAlarm() { return null; },
-    async setAlarm() {},
+    async getAlarm(): Promise<number | null> { return null; },
+    async setAlarm(_scheduledTime: number | Date): Promise<void> {},
   },
-}) as unknown as DurableObjectState;
+}) as DurableObjectState;
 
 async function redeem(accountId: string, receipts: Record<string, string>, handlerEnv: Env = env): Promise<Response> {
   const sync = new WorkspaceSync(fakeState(), handlerEnv);
-  return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
+  return sync["redeemReceipts"](
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-rbox-account": accountId },
@@ -357,7 +366,14 @@ function receiptIssuedAt(receipt: string): number {
   return Number((JSON.parse(atob(padded)) as { t: number }).t);
 }
 
-function fenceBarrierEnv(order: "before" | "after"): { handlerEnv: Env; reached: Promise<void>; release: () => void } {
+/** A fixture that parks the pack fence read so a test can interleave a mutation around it. */
+interface FenceBarrier {
+  handlerEnv: Env;
+  reached: Promise<void>;
+  release: () => void;
+}
+
+function fenceBarrierEnv(order: "before" | "after"): FenceBarrier {
   const real = env.rbox_dev_db;
   let fencePrepared = false;
   let signalReached!: () => void;
@@ -741,7 +757,7 @@ describe("design 114 §7.3 fence release gates", () => {
           .run();
         return head;
       },
-    } as unknown as R2Bucket;
+    } as R2Bucket;
     expect(await runAt(NOW, {}, { ...env, rbox_dev_blobs: racedBucket } as Env)).toMatchObject({ deleted: 0 });
     expect(await packRow(staleTerminal.id)).toEqual({ state: "ready" });
     expect(await db().prepare("SELECT epoch,deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(staleTerminal.id).first()).toEqual({ epoch: terminalE2, deleting_at: null });
@@ -852,9 +868,9 @@ describe("design 114 §7.3 fence release gates", () => {
       ...env,
       rbox_metrics: { writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => points.push(point) } as AnalyticsEngineDataset,
       rbox_dev_blobs: {
-        delete: async () => { bucketCalls++; throw new Error("packed logical GC touched R2"); },
-        head: async () => { bucketCalls++; throw new Error("packed logical GC touched R2"); },
-      } as unknown as R2Bucket,
+        delete: async (_keys: string | string[]): Promise<void> => { bucketCalls++; throw new Error("packed logical GC touched R2"); },
+        head: async (_key: string): Promise<R2Object | null> => { bucketCalls++; throw new Error("packed logical GC touched R2"); },
+      } as R2Bucket,
     } as Env;
     const response = await gcPurge(noR2, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("logical") });
     expect(await canonicalGcPurgeBody(response)).toMatchObject({ purged: 1 });
@@ -988,9 +1004,9 @@ describe("design 114 §7.3 fence release gates", () => {
       ...env,
       rbox_dev_db: proxiedDb,
       rbox_dev_blobs: {
-        delete: async () => { deletes++; },
+        delete: async (_keys: string | string[]): Promise<void> => { deletes++; },
         head: (key: string) => env.rbox_dev_blobs.head(key),
-      } as unknown as R2Bucket,
+      } as R2Bucket,
     } as Env;
     const response = await runPackGc(guarded, { nowMs: NOW, clock: () => live, owner: nextId("expiring") });
     expect(response.status).toBe(200);
@@ -1016,7 +1032,7 @@ describe("design 114 §7.3 fence release gates", () => {
           await real.delete(key);
         },
         head: (key: string) => real.head(key),
-      } as unknown as R2Bucket,
+      } as R2Bucket,
     } as Env;
     expect(await runAt(NOW, {}, uncertain)).toMatchObject({ deleted: 0 });
     for (const pack of [deleteFailure, headPresent]) {

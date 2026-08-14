@@ -91,17 +91,42 @@ async function workspaces(count: number): Promise<void> {
   }
 }
 
-function emptyRootsEnv(): { value: Env; calls: () => number } {
+/** A `WORKSPACE_SYNC` double whose every stub answers roots-inspect with `fetch`. */
+function rootsNamespace(fetch: (input: string | Request, init?: RequestInit) => Promise<Response>): DurableObjectNamespace {
+  return {
+    idFromName: (name: string) => ({ name }) as DurableObjectId,
+    get: (_id: DurableObjectId) => ({ fetch }) as DurableObjectStub,
+  } as DurableObjectNamespace;
+}
+
+/** The two members GC reads off a listed object; widened so `R2Object` satisfies it. */
+interface ListedObject {
+  key: string;
+  uploaded: Date;
+}
+
+/** The listing page GC consumes; widened so `R2Objects` satisfies it. */
+interface ListedPage {
+  objects: ListedObject[];
+  truncated: boolean;
+  cursor?: string;
+  delimitedPrefixes: string[];
+}
+
+/** A roots double that reports every project empty, plus its fan-out call counter. */
+interface EmptyRootsEnv {
+  value: Env;
+  calls: () => number;
+}
+
+function emptyRootsEnv(): EmptyRootsEnv {
   let count = 0;
   const value = {
     ...env,
-    WORKSPACE_SYNC: {
-      idFromName: () => ({} as DurableObjectId),
-      get: () => ({ fetch: async () => {
-        count++;
-        return Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] });
-      } }),
-    } as unknown as DurableObjectNamespace,
+    WORKSPACE_SYNC: rootsNamespace(async () => {
+      count++;
+      return Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] });
+    }),
   } as Env;
   return { value, calls: () => count };
 }
@@ -526,10 +551,8 @@ describe("design 95 candidacy classes and cursors", () => {
     await db().prepare("INSERT INTO workspaces(workspace_id,project_id,created_at) VALUES ('w','p',?)").bind(NOW).run();
     const rooted = {
       ...env,
-      WORKSPACE_SYNC: {
-        idFromName: () => ({}) as DurableObjectId,
-        get: () => ({ fetch: async () => Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, gap: [], droppedPage: [ordinary, intent], seqRootsPage: [] }) }),
-      } as unknown as DurableObjectNamespace,
+      WORKSPACE_SYNC: rootsNamespace(async () =>
+        Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, gap: [], droppedPage: [ordinary, intent], seqRootsPage: [] })),
     } as Env;
     await gcPurge(rooted, GRACE, { nowMs: NOW, owner: "roots" });
     expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", ordinary)).toBe(false);
@@ -569,17 +592,17 @@ describe("design 95 bounded work and read-only audit", () => {
     await workspaces(1);
     const rootsFailure = {
       ...env,
-      WORKSPACE_SYNC: {
-        idFromName: () => ({} as DurableObjectId),
-        get: () => ({ fetch: async () => new Response("failed", { status: 500 }) }),
-      } as unknown as DurableObjectNamespace,
+      WORKSPACE_SYNC: rootsNamespace(async () => new Response("failed", { status: 500 })),
     } as Env;
     await expect(gcMark(rootsFailure, 0, NOW)).rejects.toThrow("fail-closed");
     let stored = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_mark'").first<{ v: string }>())!.v) as GcObservationV1;
     expect(stored).toMatchObject({ outcome: "thrown", stage: "reachability" });
 
     await db().batch([db().prepare("DELETE FROM workspaces"), db().prepare("DELETE FROM gc_state")]);
-    const listFailure = { ...env, rbox_dev_blobs: { list: async () => { throw new Error("list failed"); } } as unknown as R2Bucket } as Env;
+    const listFailure = {
+      ...env,
+      rbox_dev_blobs: { list: async (_options?: R2ListOptions): Promise<ListedPage> => { throw new Error("list failed"); } } as R2Bucket,
+    } as Env;
     await expect(gcMark(listFailure, 0, NOW)).rejects.toThrow("list failed");
     stored = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_mark'").first<{ v: string }>())!.v) as GcObservationV1;
     expect(stored).toMatchObject({ outcome: "thrown", stage: "list" });
@@ -597,12 +620,12 @@ describe("design 95 bounded work and read-only audit", () => {
       ...env,
       rbox_dev_db: failingBatch,
       rbox_dev_blobs: {
-        list: async () => ({
+        list: async (_options?: R2ListOptions): Promise<ListedPage> => ({
           objects: [{ key: "blobs/sha256/candidate", uploaded: new Date(NOW - 1) }],
           truncated: false,
           delimitedPrefixes: [],
         }),
-      } as unknown as R2Bucket,
+      } as R2Bucket,
     } as Env;
     await expect(gcMark(candidateEnv, 0, NOW)).rejects.toThrow("candidate batch failed");
     const stored = JSON.parse((await realDb.prepare("SELECT v FROM gc_state WHERE k='gc_obs_mark'").first<{ v: string }>())!.v) as GcObservationV1;
@@ -613,27 +636,22 @@ describe("design 95 bounded work and read-only audit", () => {
     await workspaces(1);
     const capped = {
       ...env,
-      WORKSPACE_SYNC: {
-        idFromName: () => ({} as DurableObjectId),
-        get: () => ({
-          fetch: async () => ({
-            status: 200,
-            ok: true,
-            json: async () => ({
-              head: 0,
-              pruneFloor: 0,
-              indexGeneration: 0,
-              gap: [],
-              droppedPage: {
-                *[Symbol.iterator]() {
-                  for (let i = 0; i <= 750_000; i++) yield `root-${i}`;
-                },
-              },
-              seqRootsPage: [],
-            }),
-          }) as Response,
+      WORKSPACE_SYNC: rootsNamespace(async () => ({
+        status: 200,
+        ok: true,
+        json: async () => ({
+          head: 0,
+          pruneFloor: 0,
+          indexGeneration: 0,
+          gap: [],
+          droppedPage: {
+            *[Symbol.iterator]() {
+              for (let i = 0; i <= 750_000; i++) yield `root-${i}`;
+            },
+          },
+          seqRootsPage: [],
         }),
-      } as unknown as DurableObjectNamespace,
+      }) as Response),
     } as Env;
     await expect(gcMark(capped, 0, NOW)).rejects.toThrow("reachable roots exceed");
     const stored = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_mark'").first<{ v: string }>())!.v) as GcObservationV1;
@@ -773,7 +791,10 @@ describe("design 95 bounded work and read-only audit", () => {
     let calls = 0;
     const guarded = {
       ...env,
-      WORKSPACE_SYNC: { idFromName: () => ({}), get: () => ({ fetch: async () => { calls++; return Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] }); } }) } as unknown as DurableObjectNamespace,
+      WORKSPACE_SYNC: rootsNamespace(async () => {
+        calls++;
+        return Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] });
+      }),
     } as Env;
     expect(await body(await gcPurge(guarded, GRACE, { nowMs: NOW, owner: "budget" }), true)).toMatchObject({ budgetExceeded: true, purged: 0, opened: 0 });
     expect(calls).toBe(0);
@@ -924,7 +945,9 @@ describe("design 95 bounded work and read-only audit", () => {
     const marked = {
       ...env,
       rbox_dev_db: d1,
-      rbox_dev_blobs: { list: async () => ({ objects, truncated: true, cursor: "next-page", delimitedPrefixes: [] }) } as unknown as R2Bucket,
+      rbox_dev_blobs: {
+        list: async (_options?: R2ListOptions): Promise<ListedPage> => ({ objects, truncated: true, cursor: "next-page", delimitedPrefixes: [] }),
+      } as R2Bucket,
     } as Env;
     const result = (await (await gcMark(marked, 0, NOW)).json()) as { marked: number; cursor: { prefix: string; cursor?: string } };
     expect(result).toEqual({ marked: 70, cursor: { prefix: "blobs/sha256/", cursor: "next-page" } });
@@ -987,12 +1010,12 @@ describe("design 95 cron steering and rollout switch", () => {
       ...env,
       RBOX_GC_PURGE_DISABLED: "1",
       rbox_dev_blobs: {
-        list: async () => ({
+        list: async (_options?: R2ListOptions): Promise<ListedPage> => ({
           objects: [{ key: `blobs/sha256/${cronMark}`, uploaded: new Date(scheduled.scheduledTime - GRACE - 1) }],
           truncated: false,
           delimitedPrefixes: [],
         }),
-      } as unknown as R2Bucket,
+      } as R2Bucket,
     } as Env;
     await worker.scheduled(scheduled, marked);
     expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=? AND deleting_at IS NULL", cronMark)).toBe(true);

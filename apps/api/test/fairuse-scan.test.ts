@@ -88,24 +88,25 @@ function project(overrides: Partial<ProjectState> = {}): ProjectState {
 
 function scanningEnv(projects: Record<string, ProjectState>, log: DoLog): Env {
   const blobs = {
-    get: (key: string, options?: unknown) => {
+    get: (key: string, options?: R2GetOptions) => {
       log.r2Gets.push(key);
-      return (env.rbox_dev_blobs as unknown as { get: (k: string, o?: unknown) => unknown }).get(key, options);
+      return env.rbox_dev_blobs.get(key, options);
     },
-  } as unknown as R2Bucket;
+  } as R2Bucket;
   return {
     ...env,
     rbox_dev_blobs: blobs,
     WORKSPACE_SYNC: {
-      idFromName: (name: string) => ({ name }),
-      get: (id: { name: string }) => ({
+      idFromName: (name: string) => ({ name }) as DurableObjectId,
+      get: (id: DurableObjectId) => ({
         fetch: async (input: string | Request) => {
           const url = new URL(typeof input === "string" ? input : input.url);
           log.paths.push(url.pathname);
-          const state = projects[id.name];
-          if (!state) throw new Error(`unexpected workspace ${id.name}`);
+          const workspace = id.name ?? "";
+          const state = projects[workspace];
+          if (!state) throw new Error(`unexpected workspace ${workspace}`);
           if (url.searchParams.get("head") !== "1") throw new Error("fair-use must only use the head-envelope mode");
-          log.headReads.push(id.name);
+          log.headReads.push(workspace);
           state.reads++;
           state.onRead?.(state);
           if (state.failWith) {
@@ -125,8 +126,8 @@ function scanningEnv(projects: Record<string, ProjectState>, log: DoLog): Env {
             chainRefs: state.chainRefs ?? [],
           });
         },
-      }),
-    } as unknown as DurableObjectNamespace,
+      }) as DurableObjectStub,
+    } as DurableObjectNamespace,
   } as Env;
 }
 
@@ -586,25 +587,31 @@ describe("design 225 active bytes at head", () => {
 
 // ---- the DO head-envelope surface ----------------------------------------
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
 function fakeCtx(kv: Map<string, unknown>) {
+  const sql: { exec(query: string, ...bindings: unknown[]): FakeSqlCursor } = fakeDoSql();
   return {
     storage: {
-      sql: fakeDoSql(),
+      sql,
       kv: {
         get: (key: string) => kv.get(key),
-        put: (key: string, value: unknown) => kv.set(key, value),
+        put: <Value>(key: string, value: Value): void => void kv.set(key, value),
         delete: (key: string) => kv.delete(key),
-        list: (options?: { prefix?: string }) => new Map(
+        list: (options?: { prefix?: string }): Iterable<[string, unknown]> => new Map(
           [...kv].filter(([key]) => !options?.prefix || key.startsWith(options.prefix)),
         ),
       },
       transactionSync: (fn: () => void) => fn(),
-      getAlarm: () => null,
-      setAlarm: () => {},
+      getAlarm: async (): Promise<number | null> => null,
+      setAlarm: async (_scheduledTime: number | Date): Promise<void> => {},
     },
-    getWebSockets: () => [],
+    getWebSockets: (): WebSocket[] => [],
     setWebSocketAutoResponse: () => {},
-  } as unknown as DurableObjectState;
+  } as DurableObjectState;
 }
 
 type CommitCarrier =
@@ -696,10 +703,8 @@ describe("roots-inspect head-envelope mode", () => {
     // The formula this pins is the one commit admission enforces on the branch
     // PRODUCTION runs (RBOX_COMMIT_DELTA_ADMISSION=enforce, workspace-sync.ts:644),
     // not the deltaMode === "off" branch at :597.
-    const refSetAt = (sync as unknown as {
-      refSetAt(seq: number): Promise<{ refs: Set<string>; manifestSha: string; carrierSha: string | null }>;
-    }).refSetAt.bind(sync);
-    const authoritative = await refSetAt(1);
+    const authoritative = await sync["refSetAt"](1);
+    if (!authoritative) throw new Error("refSetAt(1) must resolve the DO's own head ref set");
     const expected = new Set([...authoritative.refs, authoritative.manifestSha, ...(authoritative.carrierSha ? [authoritative.carrierSha] : [])]);
     expect([...(built as { refs: Set<string> }).refs].sort()).toEqual([...expected].sort());
   });
