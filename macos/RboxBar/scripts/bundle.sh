@@ -8,8 +8,13 @@ MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 
 cd "$ROOT"
-swift build -c release
-BIN_PATH="$(swift build -c release --show-bin-path)"
+BUILD_ARGS=(-c release)
+if [[ "${RBOXBAR_ARCHS:-}" == "universal" ]]; then
+  BUILD_ARGS+=(--arch arm64 --arch x86_64)
+fi
+
+swift build "${BUILD_ARGS[@]}"
+BIN_PATH="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
@@ -24,7 +29,7 @@ if [[ -z "$BUNDLE_PATH" ]]; then
 fi
 cp -R "$BUNDLE_PATH" "$RESOURCES/"
 
-cat > "$CONTENTS/Info.plist" <<'PLIST'
+cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44,7 +49,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>LSUIElement</key>
   <true/>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>${RBOXBAR_VERSION:-0.1.0}</string>
 </dict>
 </plist>
 PLIST
