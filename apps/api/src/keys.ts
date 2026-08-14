@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import type { JsonValue } from "../../../src/json.js";
 import { exactObject, json, objectWithKeys, utf8Bytes } from "./util.js";
 import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";
@@ -38,11 +39,11 @@ export const KEY_STATE_MAX_BYTES = 512 * 1024;
 export const KEY_WORKSPACE_MAX_BYTES = 1024 * 1024;
 
 /** A bounded opaque string field, or null if missing/oversized/non-string. */
-function str(v: unknown): string | null {
+function str(v: JsonValue | undefined): string | null {
   return typeof v === "string" && v.length > 0 && utf8Bytes(v) <= MAX_FIELD ? v : null;
 }
 /** A non-negative safe integer, or null. */
-function nat(v: unknown): number | null {
+function nat(v: JsonValue | undefined): number | null {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER ? v : null;
 }
 
@@ -67,7 +68,7 @@ export interface KeyAdmitBody { device: KeyDeviceBody; roster: KeyRosterBody }
 export interface KeyStateBody { accountEpoch: number; signed: string }
 export interface WorkspaceKeyBody { workspaceId: string; keyEpoch: number; kekWrap: string }
 
-export function validateKeyBootstrapBody(value: unknown): KeyBootstrapBody | null {
+export function validateKeyBootstrapBody(value: JsonValue): KeyBootstrapBody | null {
   if (!objectWithKeys(value,
     ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device", "repairId"],
     ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"],
@@ -85,19 +86,19 @@ export function validateKeyBootstrapBody(value: unknown): KeyBootstrapBody | nul
     : null;
 }
 
-export function validateKeyDeviceBody(value: unknown): KeyDeviceBody | null {
+export function validateKeyDeviceBody(value: JsonValue): KeyDeviceBody | null {
   if (!exactObject(value, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
   const deviceId = str(value.deviceId), sigPubKey = str(value.sigPubKey), encPubKey = str(value.encPubKey), mkWrap = str(value.mkWrap);
   return deviceId && sigPubKey && encPubKey && mkWrap ? { deviceId, sigPubKey, encPubKey, mkWrap } : null;
 }
 
-export function validateKeyRosterBody(value: unknown): KeyRosterBody | null {
+export function validateKeyRosterBody(value: JsonValue): KeyRosterBody | null {
   if (!exactObject(value, ["version", "signed"])) return null;
   const version = nat(value.version), signed = str(value.signed);
   return version !== null && signed ? { version, signed } : null;
 }
 
-export function validateKeyAdmitBody(value: unknown): KeyAdmitBody | null {
+export function validateKeyAdmitBody(value: JsonValue): KeyAdmitBody | null {
   if (!exactObject(value, ["device", "roster"])) return null;
   if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
   if (!exactObject(value.roster, ["version", "signed"])) return null;
@@ -105,13 +106,13 @@ export function validateKeyAdmitBody(value: unknown): KeyAdmitBody | null {
   return device && roster ? { device, roster } : null;
 }
 
-export function validateKeyStateBody(value: unknown): KeyStateBody | null {
+export function validateKeyStateBody(value: JsonValue): KeyStateBody | null {
   if (!exactObject(value, ["accountEpoch", "signed"])) return null;
   const accountEpoch = nat(value.accountEpoch), signed = str(value.signed);
   return accountEpoch !== null && signed ? { accountEpoch, signed } : null;
 }
 
-export function validateWorkspaceKeyBody(value: unknown): WorkspaceKeyBody | null {
+export function validateWorkspaceKeyBody(value: JsonValue): WorkspaceKeyBody | null {
   if (!exactObject(value, ["workspaceId", "keyEpoch", "kekWrap"])) return null;
   const workspaceId = str(value.workspaceId), keyEpoch = nat(value.keyEpoch), kekWrap = str(value.kekWrap);
   return workspaceId && keyEpoch !== null && kekWrap ? { workspaceId, keyEpoch, kekWrap } : null;
