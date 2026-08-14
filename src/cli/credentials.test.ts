@@ -8,6 +8,7 @@ import {
   credentialsForStrictFlow,
   installCredentialTestHeartbeatInterval,
   installCredentialTestHook,
+  installCredentialTestRetryPolicy,
   loadCredentials,
   parseCredentialDocument,
   saveCredentials,
@@ -17,6 +18,7 @@ let home: string;
 let priorEnv: NodeJS.ProcessEnv;
 let restoreHook: (() => void) | undefined;
 let restoreHeartbeat: (() => void) | undefined;
+let restoreRetryPolicy: (() => void) | undefined;
 const fixedNow = new Date("2026-07-17T12:34:56.789Z");
 const credential = { token: "tok_secret", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_0000000000000001" };
 const credentialPath = () => path.join(home, ".rbox", "credentials.json");
@@ -53,6 +55,7 @@ beforeEach(async () => {
   priorEnv = { ...process.env };
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-credentials-"));
   process.env.HOME = home;
+  process.env.RBOX_HOME = home;
   delete process.env.RBOX_TOKEN;
   delete process.env.RBOX_DEVICE_ID;
   delete process.env.RBOX_API;
@@ -65,6 +68,8 @@ afterEach(async () => {
   restoreHook = undefined;
   restoreHeartbeat?.();
   restoreHeartbeat = undefined;
+  restoreRetryPolicy?.();
+  restoreRetryPolicy = undefined;
   setSystemTime();
   process.env = priorEnv;
   await fs.rm(home, { recursive: true, force: true });
@@ -89,7 +94,7 @@ test("RBOX_HOME isolates the credential store while HOME stays untouched (#505)"
     expect(loaded.state).toBe("valid");
     if (loaded.state === "valid") expect(loaded.credentials.token).toBe("tok_scratch");
   } finally {
-    delete process.env.RBOX_HOME;
+    process.env.RBOX_HOME = home;
     await fs.rm(scratch, { recursive: true, force: true });
   }
 
@@ -529,6 +534,15 @@ test("a long fenced operation refreshes the main marker while retaining its fenc
 
 test("fresh main contention and a live exact-incarnation fence fail closed without reaping", async () => {
   setSystemTime();
+  const retryBudget = 4;
+  restoreRetryPolicy = installCredentialTestRetryPolicy(retryBudget, 1);
+  const attemptsByPath = new Map<string, string[]>();
+  restoreHook = installCredentialTestHook((seam, context) => {
+    if (seam !== "lock-contended") return;
+    const attempts = attemptsByPath.get(context.lockPath) ?? [];
+    attempts.push(context.attempt);
+    attemptsByPath.set(context.lockPath, attempts);
+  });
   const identityModule = await import("../engine/git/lockfile.js");
   const identity = await identityModule.systemLockIdentity.current();
   for (const target of [lockPath(), `${lockPath()}.fence`]) {
@@ -539,6 +553,7 @@ test("fresh main contention and a live exact-incarnation fence fail closed witho
     await fs.writeFile(target, raw, { mode: 0o600 });
     expect((await loadCredentials()).state).toBe("unreadable");
     expect(await fs.readFile(target, "utf8")).toBe(raw);
+    expect(attemptsByPath.get(target)).toEqual(Array.from({ length: retryBudget }, (_, attempt) => String(attempt)));
   }
 });
 
@@ -804,11 +819,13 @@ test("secret parent ownership and symlinked HOME ancestors are refused", async (
   const linkedHome = path.join(home, "linked-home");
   await fs.symlink(realHome, linkedHome);
   process.env.HOME = linkedHome;
+  process.env.RBOX_HOME = linkedHome;
   try {
     await expect(saveCredentials(credential)).rejects.toThrow(/unsafe credential directory component/);
     expect((await loadCredentials()).state).toBe("unreadable");
   } finally {
     process.env.HOME = home;
+    process.env.RBOX_HOME = home;
     await fs.rm(realHome, { recursive: true, force: true });
   }
 });

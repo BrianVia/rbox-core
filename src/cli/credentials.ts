@@ -72,6 +72,8 @@ const LOCK_RETRY_MS = 25;
 const LOCK_RETRIES = 80;
 const HEARTBEAT_MS = 25_000;
 const OPTIMISTIC_READ_RETRIES = 3;
+let lockRetryMs = LOCK_RETRY_MS;
+let lockRetries = LOCK_RETRIES;
 let heartbeatIntervalMs = HEARTBEAT_MS;
 const MARKER_MAX_BYTES = 1024;
 const NONCE_RE = /^[0-9a-f]{32}$/;
@@ -104,6 +106,20 @@ export function installCredentialTestHeartbeatInterval(ms: number): () => void {
   const previous = heartbeatIntervalMs;
   heartbeatIntervalMs = ms;
   return () => { heartbeatIntervalMs = previous; };
+}
+
+/** @internal Shortens bounded lock retries only for deterministic in-process tests. */
+export function installCredentialTestRetryPolicy(retries: number, delayMs: number): () => void {
+  if (!Number.isInteger(retries) || retries <= 0) throw new Error("credential test retry count must be a positive integer");
+  if (!Number.isFinite(delayMs) || delayMs <= 0) throw new Error("credential test retry delay must be positive");
+  const previousRetries = lockRetries;
+  const previousDelayMs = lockRetryMs;
+  lockRetries = retries;
+  lockRetryMs = delayMs;
+  return () => {
+    lockRetries = previousRetries;
+    lockRetryMs = previousDelayMs;
+  };
 }
 
 async function testSeam(seam: CredentialTestSeam, context: Readonly<Record<string, string>> = {}): Promise<void> {
@@ -431,7 +447,7 @@ async function inspectHeldFence(markerPath: string): Promise<"retry" | "turnover
 async function acquireFence(): Promise<{ path: string; observation: MarkerObservation }> {
   const markerPath = fenceFile();
   let turnovers = 0;
-  for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < lockRetries; attempt++) {
     const created = await markerForCurrentProcess();
     const result = await publishMarker(markerPath, created.raw);
     if (result === "created") {
@@ -443,11 +459,11 @@ async function acquireFence(): Promise<{ path: string; observation: MarkerObserv
     if (inspected === "turnover") turnovers++;
     if (inspected !== "held") continue;
     if (credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
-    if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
+    if (attempt + 1 < lockRetries) await sleep(lockRetryMs);
   }
   // Benign turnovers stay silent; only exhaustion needs to name marker churn,
   // which points at a cycling peer rather than one stuck holder.
-  const churn = turnovers > 0 ? `; ${turnovers} of ${LOCK_RETRIES} attempts saw the marker change during inspection` : "";
+  const churn = turnovers > 0 ? `; ${turnovers} of ${lockRetries} attempts saw the marker change during inspection` : "";
   throw new Error(`credential fence is held or its owner cannot be proved dead: ${markerPath}${churn}`);
 }
 
@@ -570,7 +586,7 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
   await testSeam("lock-before-acquire", { lockPath: lockFile() });
   await secureCredentialDirectory(true);
   const markerPath = lockFile();
-  for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < lockRetries; attempt++) {
     const fence = await acquireFence();
     let acquired: OwnedCredentialLock | undefined;
     let contended = false;
@@ -607,7 +623,7 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
     }
     if (acquired) return acquired;
     if (contended && credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
-    if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
+    if (attempt + 1 < lockRetries) await sleep(lockRetryMs);
   }
   throw new Error(`credential lock contention did not clear: ${markerPath}`);
 }
