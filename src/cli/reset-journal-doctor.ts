@@ -10,7 +10,9 @@ import {
   decodeResetJournal,
   inspectResetJournalEnvelopeStreams,
   resetJournalFileSource,
+  type ResetJournal,
 } from "./reset-journal-codec.js";
+import type { PrefixDisposition } from "./reset-journal-classifier.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { resetJournalPath } from "./reset-journal.js";
 import {
@@ -58,18 +60,21 @@ export async function withResetJournalDoctorFence<T>(root: string, requests: rea
   }));
 }
 
-function requestsFromJournal(value: unknown): RepositoryProtocolFenceRequest[] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  const journal = value as { old?: { z?: unknown[] } };
-  if (!Array.isArray(journal.old?.z)) return [];
+/** The stream pair recovered from a bundle whose journal bytes no longer decode:
+ * enough to judge restore eligibility, never enough to recover from. */
+type ResetJournalStreams = { old: { stream: string }; next: { stream: string } };
+/** Every journal shape this doctor reads: a decoded journal of any version, or
+ * the stream-only envelope of an undecodable one. */
+type DoctorJournal = ResetJournal | ResetJournalStreams;
+
+function requestsFromJournal(journal: DoctorJournal | undefined): RepositoryProtocolFenceRequest[] {
+  const entries = journal !== undefined && "z" in journal.old ? journal.old.z : [];
   const byCommon = new Map<string, Set<string>>();
-  for (const raw of journal.old.z) {
-    const entry = raw as { repositoryIdentity?: { commonDirReal?: unknown }; activeRef?: unknown; recoveryRef?: unknown };
-    const commonDir = entry.repositoryIdentity?.commonDirReal;
-    if (typeof commonDir !== "string") continue;
+  for (const entry of entries) {
+    const commonDir = entry.repositoryIdentity.commonDirReal;
     const refs = byCommon.get(commonDir) ?? new Set<string>();
-    if (typeof entry.activeRef === "string") refs.add(entry.activeRef);
-    if (typeof entry.recoveryRef === "string") refs.add(entry.recoveryRef);
+    refs.add(entry.activeRef);
+    refs.add(entry.recoveryRef);
     byCommon.set(commonDir, refs);
   }
   return [...byCommon].map(([commonDir, refs]) => ({ commonDir, reflogRefs: [...refs], origins: true }));
@@ -81,7 +86,7 @@ function bundlePath(root: string, value: string): string {
   return candidate;
 }
 
-async function journalFromBundle(root: string, bundle: string): Promise<{ old: { stream: string; z?: unknown[] }; next: { stream: string }; [key: string]: unknown } | undefined> {
+async function journalFromBundle(root: string, bundle: string): Promise<DoctorJournal | undefined> {
   const manifest = await readResetQuarantineBundle(root, bundle);
   const journal = manifest?.artifacts.find((artifact) => artifact.kind === "journal");
   if (!manifest || !journal) return undefined;
@@ -95,7 +100,7 @@ async function journalFromBundle(root: string, bundle: string): Promise<{ old: {
         ? { old: { stream: envelope.oldStream }, next: { stream: envelope.nextStream } }
         : undefined;
     }
-    return decoded.journal as unknown as { old: { stream: string; z?: unknown[] }; next: { stream: string }; [key: string]: unknown };
+    return decoded.journal;
   } catch {
     return undefined;
   }
@@ -167,13 +172,10 @@ async function quarantineStandingJournal(root: string): Promise<void> {
       }
       const recoveryRefs = observation.recoveryRefs;
       const activeRefGroups = observation.activeRefGroups;
-      const isRestorablePrefix = (value: unknown): value is { kind: "prefix"; count: number; total: number } => {
-        if (!value || typeof value !== "object") return false;
-        const disposition = value as { kind?: unknown; count?: unknown; total?: unknown };
-        return disposition.kind === "prefix" && Number.isSafeInteger(disposition.count)
-          && Number.isSafeInteger(disposition.total) && Number(disposition.count) >= 0
-          && Number(disposition.count) <= Number(disposition.total);
-      };
+      const isRestorablePrefix = (value: PrefixDisposition): boolean =>
+        value.kind === "prefix" && Number.isSafeInteger(value.count)
+          && Number.isSafeInteger(value.total) && value.count >= 0
+          && value.count <= value.total;
       if (!isRestorablePrefix(recoveryRefs) || !isRestorablePrefix(activeRefGroups)) {
         throw new Error("reset ref preconditions could not be safely observed; retry the command");
       }

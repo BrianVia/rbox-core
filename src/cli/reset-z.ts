@@ -1,13 +1,15 @@
 import type { RepoIdentityV1 } from "../cli/sync-git/repo-lineage.js";
 
-export interface ResetZEntry {
+/** A durable reset-journal `old.z` member. `type`, not `interface`, so it keeps
+ * its implicit index signature and stays comparable with `JsonValue`. */
+export type ResetZEntry = {
   lineageHash: string;
   repositoryIdentityHash: string;
   repositoryIdentity: RepoIdentityV1;
   activeRef: string;
   targetOid: string;
   recoveryRef: string;
-}
+};
 
 /** The one ordering used by journal construction, validation, and recovery. */
 export function compareResetZEntries(

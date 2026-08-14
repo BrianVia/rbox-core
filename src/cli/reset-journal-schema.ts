@@ -17,13 +17,16 @@ export type ResetPhase = "prepared" | "ready" | "installed" | "z-retired";
 /** The identity/phase header every reset journal version carries. */
 export type ResetJournalEnvelope = { id: string; phase: ResetPhase; createdAt: string };
 export type ResetConsentKind = "setup-rebind" | "setup-create";
-export interface ResetJournalAuthorization {
+// Every durable journal record below is a `type`, not an `interface`, so it keeps
+// TypeScript's implicit index signature and stays comparable with `JsonValue` —
+// these records are exactly what the tokenizer decodes and the codec re-encodes.
+export type ResetJournalAuthorization = {
   version: 2;
   authorizedNextStream: string;
   consentKind: ResetConsentKind;
   mintedAtRevision: number;
-}
-export interface ResetNextState {
+};
+export type ResetNextState = {
   stream: string;
   stateNonce: string;
   stateRevision: number;
@@ -31,29 +34,31 @@ export interface ResetNextState {
   lastSyncedManifest: { generatedAt: ""; files: [] };
   repoRecords: Record<string, never>;
   telemetryBindingId?: string;
-}
-interface OldV1 {
+};
+type OldV1 = {
   stream: string;
   stateNonce: string;
   stateRevision: number;
   stateSha256: string;
   z: ResetZEntry[];
-}
-interface OldV2 extends OldV1 { archiveBaseline: "absent" | "exact" }
-interface LegacyNext {
+};
+type OldV2 = OldV1 & { archiveBaseline: "absent" | "exact" };
+type LegacyNext = {
   stream: string;
   stateNonce: string;
   stateRevision: number;
   stateSha256: string;
   state: ResetNextState;
-}
-export interface ResetJournalV1 {
+};
+export type ResetJournalV1 = {
   v: 1; id: string; phase: ResetPhase; createdAt: string; old: OldV1; next: LegacyNext;
-}
-export interface ResetJournalV2 {
+};
+export type ResetJournalV2 = {
   v: 2; id: string; phase: ResetPhase; createdAt: string;
   authorization: ResetJournalAuthorization; old: OldV2; next: LegacyNext;
-}
+};
+/** The only journal record that is deliberately NOT `JsonValue`-comparable: it
+ * carries the decoded `dbBytes` alongside its base64 wire member. */
 export interface SQLiteResetJournalV2 {
   v: 2;
   stateFormat: "sqlite/v1";
@@ -282,9 +287,9 @@ function sqliteNext(value: JsonField): SQLiteResetJournalV2["next"] {
 }
 
 /** `value` is the decoded reset-journal document: whatever the bounded tokenizer
- * (or `JSON.parse`) produced for the journal bytes, i.e. exactly a `JsonValue`. */
-export function constructResetJournal(value: unknown): ResetJournal {
-  const obj = object(value as JsonValue, "$");
+ * (or `JSON.parse`) produced for the journal bytes. */
+export function constructResetJournal(value: JsonValue): ResetJournal {
+  const obj = object(value, "$");
   if (obj.v === 1) {
     exact(obj, ["v", "id", "phase", "createdAt", "old", "next"], "$");
     return { v: 1, ...envelope(obj), old: oldState(obj.old, "$.old", false) as OldV1, next: legacyNext(obj.next, "$.next") };

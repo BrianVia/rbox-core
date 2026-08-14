@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { canonicalize } from "../engine/e2ee/jcs.js";
+import type { JsonValue } from "../json.js";
 import { assertResetParseAdmission, ResetMemoryAdmissionError } from "./reset-io.js";
 import {
   constructResetJournal,
@@ -211,7 +212,7 @@ export async function decodeResetJournal(source: ResetJournalByteSource): Promis
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(pulled); }
   catch { return error("UTF8_INVALID"); }
-  let value: unknown;
+  let value: JsonValue;
   try {
     value = tokenizeResetJournalJson(text);
   } catch (cause) {

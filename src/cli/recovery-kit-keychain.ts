@@ -28,16 +28,19 @@ export interface KeychainSeams {
   runSecurity(args: readonly string[], stdin: Uint8Array | undefined, limits: SecurityLimits): Promise<SecurityResult>;
 }
 
-export interface KeychainIdentity {
+/** The durable Keychain record persisted inside the recovery-kit JSON file.
+ * `type`, not `interface`, so it keeps its implicit index signature and stays
+ * comparable with `JsonValue` at the record's parse/write boundary. */
+export type KeychainIdentity = {
   service: typeof RECOVERY_KIT_SERVICE;
   account: string;
   keychainPath: string;
-}
+};
 
-export interface KeychainArtifact extends KeychainIdentity {
+export type KeychainArtifact = KeychainIdentity & {
   writtenAt?: string;
   discoveredAt?: string;
-}
+};
 
 const SECURITY_BIN = "/usr/bin/security";
 const STDIO_LIMIT = 64 * 1024;

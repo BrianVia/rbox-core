@@ -390,7 +390,9 @@ export function stripObsoleteResolutionIntents(state: SyncState): SyncState {
   return changed ? { ...state, repoRecords } : state;
 }
 
-export function normalizeStateCounter(value: unknown): number {
+/** `value` is either a typed counter this process already holds, or the same
+ * field as decoded from a durable JSON record — never anything else. */
+export function normalizeStateCounter(value: JsonValue | undefined): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 

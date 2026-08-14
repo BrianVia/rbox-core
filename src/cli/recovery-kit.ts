@@ -224,8 +224,7 @@ function sameOnePasswordIdentity(left: OnePasswordArtifactIdentity, right: OnePa
 
 /** `value` is a decoded recovery-kit record: `JSON.parse` output for the durable
  * file, or an in-memory record re-validated before it is written back. */
-export function parseRecoveryKitRecord(raw: unknown, accountId: string): RecoveryKitRecord | undefined {
-  const value = raw as JsonValue;
+export function parseRecoveryKitRecord(value: JsonValue, accountId: string): RecoveryKitRecord | undefined {
   if (!isObject(value)) return undefined;
   if (!("version" in value) && !("kind" in value) && exactKeys(value, ["path", "writtenAt"]) && validAbsolute(value.path) && validIso(value.writtenAt)) {
     return { version: 3, accountId, plaintextArtifacts: [{ path: value.path, writtenAt: value.writtenAt, cleanup: "pending" }], onePasswordArtifacts: [] };

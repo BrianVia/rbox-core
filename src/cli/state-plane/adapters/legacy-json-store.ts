@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection, Manifest } from "../../../engine/index.js";
+import type { JsonValue } from "../../../json.js";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
@@ -51,7 +52,7 @@ export async function loadRawLegacyJsonState(root: string): Promise<SyncState | 
   const state = await boundedJsonRead<SyncState>(statePath(root));
   if (state) return stripObsoleteResolutionIntents(state);
   const marker = await boundedJsonRead<{
-    stream?: unknown; stateNonce?: unknown; stateRevision?: unknown;
+    stream?: JsonValue; stateNonce?: JsonValue; stateRevision?: JsonValue;
   }>(stateIncarnationPath(root), 512 * 1024);
   if (!marker) return undefined;
   if (typeof marker.stream === "string" && typeof marker.stateNonce === "string") {
