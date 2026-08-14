@@ -16,7 +16,7 @@ const socketClosed = () =>
     code: "ECONNRESET",
   });
 
-const resp = (status: number, body: unknown): Response =>
+const resp = <T>(status: number, body: T): Response =>
   ({
     ok: status >= 200 && status < 300,
     status,
@@ -88,7 +88,7 @@ afterEach(() => {
   if (savedNetRetries === undefined) delete process.env.RBOX_NET_RETRIES;
   else process.env.RBOX_NET_RETRIES = savedNetRetries;
   globalThis.fetch = origFetch;
-  (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origAbortSignalTimeout;
+  AbortSignal.timeout = origAbortSignalTimeout;
 });
 
 describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
@@ -107,7 +107,7 @@ describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
     let puts = 0;
     const bodies = new Set<BodyInit>();
     const payloads: string[] = [];
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    globalThis.fetch = async (_url, init) => {
       if ((init?.method ?? "GET") === "PUT") {
         puts++;
         expect(init?.body).toBeTruthy();
@@ -118,7 +118,7 @@ describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
         return resp(200, { receipt: "r1" });
       }
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
     // backoff via a monkeypatched short timer is unnecessary: the default 1s/4s runs, but the test
     // stays fast because only ONE retry fires. Keep the assertion on behavior, not timing.
     await api().putBlobFile(SHA, file, 10);
@@ -128,7 +128,7 @@ describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
 
   test("a successful single-PUT reconciles byte progress to the full size", async () => {
     const bytes: number[] = [];
-    globalThis.fetch = (async () => resp(200, { receipt: "r1" })) as unknown as typeof fetch;
+    globalThis.fetch = async () => resp(200, { receipt: "r1" });
     await api().putBlobFile(SHA, file, 10, undefined, (abs) => bytes.push(abs));
     expect(bytes).toEqual([10]);
   });
@@ -137,17 +137,17 @@ describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
 describe("buffered blob GET — stalled OK body is inside the retry deadline", () => {
   test("a headers-then-stalled body times out, retries, and succeeds on attempt 2", async () => {
     let gets = 0;
-    (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = (() => {
+    AbortSignal.timeout = () => {
       const ctrl = new AbortController();
       queueMicrotask(() => ctrl.abort(new DOMException("buffered body stalled", "TimeoutError")));
       return ctrl.signal;
-    }) as typeof AbortSignal.timeout;
+    };
 
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    globalThis.fetch = async (_url, init) => {
       gets++;
       if (gets === 1) return stalledBodyResponse(init!.signal as AbortSignal);
       return new Response("ciphertext", { status: 200 });
-    }) as unknown as typeof fetch;
+    };
 
     const out = await api().getBlob(SHA);
     expect(out.toString("utf8")).toBe("ciphertext");
@@ -171,14 +171,14 @@ describe("streaming blob GET — retry starts from a clean destination file", ()
     const final = Buffer.from("attempt two complete ciphertext");
     const finalSha = createHash("sha256").update(final).digest("hex");
     let gets = 0;
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    globalThis.fetch = async (_url, init) => {
       if ((init?.method ?? "GET") === "GET") {
         gets++;
         if (gets === 1) return transientAfterPartialBody(new TextEncoder().encode("partial attempt one"));
         return new Response(final, { status: 200 });
       }
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
 
     await api().getBlobToFile(finalSha, dest);
     expect(await fs.readFile(dest, "utf8")).toBe(final.toString("utf8"));
@@ -202,7 +202,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
     let completes = 0;
     let checks = 0;
     const bytes: number[] = [];
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = async (url, init) => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (u.endsWith("/multipart") && method === "POST") return resp(200, { uploadId: "up1", partSize: BIG }); // 1 part
@@ -216,7 +216,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
         return resp(200, { missing: [] }); // present-check: the blob landed despite the drop
       }
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
 
     await api().putBlobFile(SHA, file, BIG, undefined, (abs) => bytes.push(abs)); // resolves via the present-check, no throw
     expect(completes).toBe(1); // exactly ONE complete attempt — NOT auto-retried at the network layer
@@ -226,7 +226,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
 
   test("a complete error with a now-present blob reconciles byte progress to full size", async () => {
     const bytes: number[] = [];
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = async (url, init) => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (u.endsWith("/multipart") && method === "POST") return resp(200, { uploadId: "up1", partSize: BIG });
@@ -234,7 +234,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
       if (u.endsWith("/complete") && method === "POST") return resp(500, { error: "publish_lost" });
       if (u.endsWith("/blobs/check") && method === "POST") return resp(200, { missing: [] });
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
 
     await api().putBlobFile(SHA, file, BIG, undefined, (abs) => bytes.push(abs));
     expect(bytes.at(-1)).toBe(BIG);
@@ -248,7 +248,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
     await fs.writeFile(path.join(uploadsDir, `${SHA}.json`), JSON.stringify({ uploadId: "up-resume" }));
     const bytes: number[] = [];
     let part2Attempts = 0;
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = async (url, init) => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (u.endsWith(`/multipart/up-resume`) && method === "GET") return resp(200, { partSize, completedParts: [1, 3] });
@@ -259,7 +259,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
       }
       if (u.endsWith("/complete") && method === "POST") return resp(200, {});
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
 
     await api().putBlobFile(SHA, file, size, uploadsDir, (abs) => bytes.push(abs));
     expect(part2Attempts).toBe(2);
@@ -268,7 +268,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
 
   test("if the blob is genuinely absent after a complete drop, the friendly NetworkError surfaces", async () => {
     let completes = 0;
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = async (url, init) => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (u.endsWith("/multipart") && method === "POST") return resp(200, { uploadId: "up1", partSize: BIG });
@@ -279,7 +279,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
       }
       if (u.endsWith("/blobs/check") && method === "POST") return resp(200, { missing: [SHA] }); // still missing
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
 
     const err = await api().putBlobFile(SHA, file, BIG).catch((e) => e);
     // putBlobMultipart's second attempt (fresh init) also drops on complete → NetworkError, not the
@@ -293,13 +293,13 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
 describe("commit 409 — a duplicate after socket-close-post-apply passes through as a conflict", () => {
   test("the network layer returns the 409 Response; commit() maps it to { conflict }", async () => {
     let posts = 0;
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    globalThis.fetch = async (_url, init) => {
       if ((init?.method ?? "GET") === "POST") {
         posts++;
         return resp(409, { head: 42 }); // stale parent (our own already-applied commit)
       }
       return resp(200, {});
-    }) as unknown as typeof fetch;
+    };
     const out = await api().commit(41, "dev1", { version: 1, files: [] } as never);
     expect(out.conflict).toBe(true);
     expect(out.head).toBe(42);
@@ -309,9 +309,9 @@ describe("commit 409 — a duplicate after socket-close-post-apply passes throug
 
 describe("minting calls — retry-exhausted hint does not claim re-run safety", () => {
   test("workspace create says to check status/workspaces before re-running", async () => {
-    globalThis.fetch = (async () => {
+    globalThis.fetch = async () => {
       throw socketClosed();
-    }) as unknown as typeof fetch;
+    };
     const err = await createRemoteWorkspace("https://api.test", "tok", "proj_1").catch((e) => e);
     expect(err).toBeInstanceOf(NetworkError);
     expect((err as Error).message).toContain("creating the workspace");
