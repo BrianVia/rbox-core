@@ -26,7 +26,7 @@ import { collectRepoResidue } from "../doctor-cmd.js";
 import type { SyncRemote } from "../remote.js";
 import { pull } from "../sync.js";
 import { applyGitSections } from "./apply.js";
-import { formatGitApplyMetrics } from "./apply.js";
+import { formatGitApplyMetrics } from "./apply-metrics.js";
 import { checkoutJournalBinding } from "./follow.js";
 import { gitIncomingKey } from "./shared.js";
 import { GIT_FINGERPRINT_VERSION, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -112,7 +112,12 @@ async function observe<T>(fn: () => Promise<T>): Promise<{ value: T; commands: s
   }
 }
 
-function countingBoundary(): { boundary: MutationBoundary; count: () => number } {
+interface CountingBoundary {
+  boundary: MutationBoundary;
+  count: () => number;
+}
+
+function countingBoundary(): CountingBoundary {
   let enters = 0;
   return {
     boundary: {
@@ -125,7 +130,12 @@ function countingBoundary(): { boundary: MutationBoundary; count: () => number }
   };
 }
 
-function deferred(): { promise: Promise<void>; resolve: () => void } {
+interface DeferredSignal {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
+function deferred(): DeferredSignal {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
@@ -138,18 +148,19 @@ async function writeValidIntentJournal(rel: string, section: GitSection): Promis
   const headContent = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
   const currentRefName = /^ref:\s*(refs\/\S+)/.exec(headContent)?.[1];
   const currentRefOid = currentRefName ? section.refs[currentRefName] : undefined;
+  const old: CheckoutJournal<Record<string, never>>["old"] = {
+    headContent,
+    indexPresent: true,
+    opState: {},
+  };
+  if (currentRefName) old.currentRefName = currentRefName;
+  if (currentRefOid) old.currentRefOid = currentRefOid;
   const journal: CheckoutJournal<Record<string, never>> = {
     journalId: `1700000000000-${"c".repeat(16)}`,
     phase: "intent",
     incomingKey: gitIncomingKey(section),
     incomingSection: section,
-    old: {
-      ...(currentRefName ? { currentRefName } : {}),
-      ...(currentRefOid ? { currentRefOid } : {}),
-      headContent,
-      indexPresent: true,
-      opState: {},
-    },
+    old,
     expectedNew: {
       opState: {},
       refs: section.refs,

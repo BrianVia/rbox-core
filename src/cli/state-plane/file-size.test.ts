@@ -165,10 +165,11 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/state-plane/reset/recovery.ts", { nonblank: 455, bytes: 21036 }],
   ["src/cli/status-projection.ts", { nonblank: 424, bytes: 18693 }],
   ["src/cli/status-view.ts", { nonblank: 875, bytes: 47095 }],
-  // Re-pinned 2026-08-14: +125 nonblank from #696 (typed checkout blockers) and
-  // #573 fix 3 (four untimed regions gained addTimedMs brackets). Instrumentation
-  // and safety growth on a file already on the #502 decomposition roadmap.
-  ["src/cli/sync-git/apply.ts", { nonblank: 1559, bytes: 84942 }],
+  // Re-pinned 2026-08-14 to the measured size after the held-decision and
+  // apply-metrics decomposition retired the earlier 1559 bridge pin. The
+  // #696/#573 growth it excused is gone: the held-skip decision plane moved to
+  // held-decision.ts and the run's measurement record to apply-metrics.ts.
+  ["src/cli/sync-git/apply.ts", { nonblank: 1249, bytes: 68629 }],
   ["src/cli/sync-git/base-composer.ts", { nonblank: 611, bytes: 28706 }],
   ["src/cli/sync-git/deferral-hygiene.ts", { nonblank: 507, bytes: 24777 }],
   ["src/cli/sync-git/follow.ts", { nonblank: 1183, bytes: 61997 }],

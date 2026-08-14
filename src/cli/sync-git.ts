@@ -17,15 +17,14 @@ export {
   type GitConfigWireBounds,
 } from "./sync-git/fingerprint.js";
 export { gitDivergenceFastRepoSource, classifyDivergenceCacheEntry, type GitDivergenceRepoHint } from "./sync-git/divergence-cache.js";
+export { applyGitSections, type GitPullOutcome } from "./sync-git/apply.js";
 export {
-  applyGitSections,
   formatGitApplyMetrics,
-  type GitPullOutcome,
   type GitApplyRunKind,
   type GitApplyRepoResult,
   type GitApplyRepoTiming,
   type GitApplyMetrics,
-} from "./sync-git/apply.js";
+} from "./sync-git/apply-metrics.js";
 export {
   revalidateGitPartialApplies,
   settleCommittedBranchArtifacts,
