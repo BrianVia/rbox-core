@@ -80,7 +80,7 @@ const observeWithDaemon = (
 async function captureStdout(fn: () => Promise<void> | void): Promise<string> {
   const out: string[] = [];
   process.stdout.write = ((chunk: string | Uint8Array) => {
-    out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    out.push(Buffer.from(chunk).toString("utf8"));
     return true;
   }) as typeof process.stdout.write;
   try {
@@ -92,15 +92,13 @@ async function captureStdout(fn: () => Promise<void> | void): Promise<string> {
 }
 
 function stubFetch(responder: (url: string) => { status: number; body: unknown }): void {
-  globalThis.fetch = (async (url: string) => {
-    const r = responder(String(url));
-    return {
-      ok: r.status >= 200 && r.status < 300,
+  globalThis.fetch = async (input: URL | RequestInfo) => {
+    const r = responder(String(input));
+    return new Response(JSON.stringify(r.body), {
       status: r.status,
-      json: async () => r.body,
-      text: async () => JSON.stringify(r.body),
-    } as Response;
-  }) as unknown as typeof fetch;
+      headers: { "content-type": "application/json" },
+    });
+  };
 }
 
 function statusDeps(overrides: Partial<StatusCmdDeps> = {}): StatusCmdDeps {
@@ -174,7 +172,7 @@ beforeEach(async () => {
   await fs.mkdir(process.env.HOME, { recursive: true, mode: 0o700 });
   // The crypto DTO asserts jobsRun/workerExecutions, which are process-global —
   // crypto-pool tests running earlier in the same process leave them non-zero.
-  const { __cryptoPoolTestHooks } = await import("../engine/crypto-pool.js");
+  const { __cryptoPoolTestHooks } = await import("../engine/crypto-pool/pool.js");
   await __cryptoPoolTestHooks.reset();
 });
 
@@ -587,7 +585,7 @@ test("key status --json projects an unreleased genesis hold without mutating an 
 test("json error mode emits {error} to stderr", () => {
   const err: string[] = [];
   process.stderr.write = ((chunk: string | Uint8Array) => {
-    err.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    err.push(Buffer.from(chunk).toString("utf8"));
     return true;
   }) as typeof process.stderr.write;
   setJsonErrorMode(true);

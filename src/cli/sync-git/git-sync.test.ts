@@ -8,7 +8,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, scanManifestForPush, sync, type SyncDeps } from "../sync.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
-import { gitResolveCmd } from "../git-cmd.js";
+import { gitResolveCmd } from "../git/resolve-command.js";
 import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
 import { buildIgnoreMatcher, captureGitState, checkoutJournalDir, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
@@ -323,7 +323,7 @@ async function retainedGitCiphertext(root: string): Promise<string[]> {
 
 /** Design 226 §0: count every WRITE the plan makes to the workspace BlobStore, so a
  *  capture that is decided AGAINST can be asserted to cost exactly zero bytes. */
-function countingGitRemote(base: SyncRemote): { api: SyncRemote; writes: () => number } {
+function countingGitRemote(base: SyncRemote) {
   const inner = base.blobStore();
   let writes = 0;
   const store: BlobStore = {
@@ -343,7 +343,7 @@ function countingGitRemote(base: SyncRemote): { api: SyncRemote; writes: () => n
     get(target, prop) {
       if (prop === "blobStore") return () => store;
       const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      return value instanceof Function ? value.bind(target) : value;
     },
   });
   return { api, writes: () => writes };
@@ -397,7 +397,7 @@ async function markDivergenceCacheTrusted(root: string): Promise<void> {
   const cache = await readDivergenceCache(root);
   const trustedWrittenAt = Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 5_000;
   for (const entry of Object.values(cache.repos ?? {})) {
-    if (entry && typeof entry === "object") entry.writtenAtMs = trustedWrittenAt;
+    if (entry) entry.writtenAtMs = trustedWrittenAt;
   }
   await writeDivergenceCache(root, cache);
 }
@@ -407,14 +407,8 @@ function gitPlanSurface(plan: GitPushPlan): Omit<GitPushPlan, "gitPlanStats"> {
   return surface;
 }
 
-function deferred<T = void>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void; reject: (reason?: unknown) => void } {
-  let resolve!: (value?: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
+function deferred<T = void>() {
+  return Promise.withResolvers<T>();
 }
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -3726,14 +3720,14 @@ test("design 83: racy-clean margin refuses a hash-matching entry and takes the s
 
   let cache = await readDivergenceCache(rootA);
   for (const entry of Object.values(cache.repos ?? {})) {
-    if (entry && typeof entry === "object") entry.writtenAtMs = 0;
+    if (entry) entry.writtenAtMs = 0;
   }
   await writeDivergenceCache(rootA, cache);
 
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   cache = await readDivergenceCache(rootA);
   for (const entry of Object.values(cache.repos ?? {})) {
-    if (entry && typeof entry === "object") entry.writtenAtMs = 0;
+    if (entry) entry.writtenAtMs = 0;
   }
   await writeDivergenceCache(rootA, cache);
 
@@ -4188,16 +4182,16 @@ test("design 83/93: status and plan writers leave one loadable bounds-versioned 
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   let cache = await readDivergenceCache(rootA);
   expect(cache.version).toBe(GIT_FINGERPRINT_VERSION);
-  expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
-  expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
+  expect(cache.repos?.["d83-cross-writer"]?.writtenAtMs).toEqual(expect.any(Number));
+  expect(cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toEqual(expect.any(String));
 
   await fs.rm(divergenceCachePath(rootA), { force: true });
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
   cache = await readDivergenceCache(rootA);
   expect(cache.version).toBe(GIT_FINGERPRINT_VERSION);
-  expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
-  expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
+  expect(cache.repos?.["d83-cross-writer"]?.writtenAtMs).toEqual(expect.any(Number));
+  expect(cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toEqual(expect.any(String));
 }, 120_000);
 
 // ── gitcap progress (the long silent phase on a repo-heavy first push) ───────────
@@ -4211,7 +4205,7 @@ test("push emits gitcap progress per CAPTURED repo — monotonic settle count, r
   await commitFile(beta, "b.txt", "b", "c1");
 
   type Ev = { done: number; total: number; detail?: string; bytesDone?: number; bytesTotal?: number };
-  const cap = (): { events: Ev[]; logs: string[]; summaries: GitPushPlan[]; deps: SyncDeps } => {
+  const cap = () => {
     const events: Ev[] = [];
     const logs: string[] = [];
     const summaries: GitPushPlan[] = [];
@@ -4311,16 +4305,16 @@ test("design 226: a throw after capture still sweeps every retained ciphertext",
 
   // A `has` fault throws at the FIRST flush point, with the second repo's ciphertext
   // still retained and nothing yet uploaded — the exception path the sweep must cover.
-  const failing = new Proxy(remote, {
+  const failing: SyncRemote = new Proxy(remote, {
     get(target, prop) {
       if (prop === "blobStore") {
         const inner = target.blobStore();
         return () => ({ ...inner, has: async () => { throw new Error("catalog probe failed"); } });
       }
       const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      return value instanceof Function ? value.bind(target) : value;
     },
-  }) as SyncRemote;
+  });
 
   await expect(planGitSections(
     rootA, cfgA, await st(rootA), failing, new Set(), buildIgnoreMatcher(rootA),

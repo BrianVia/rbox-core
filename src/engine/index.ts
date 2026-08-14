@@ -1,43 +1,61 @@
 export type { FileEntry, FileType, Manifest, GitSection, GitRefScope, GitRefTombstone, GitArtifactRef, GitPackLink } from "./types.js";
+export { isSyncableRef, validateGitSection } from "./manifest-validate.js";
 export {
   gitPreflight,
   gitRefStorage,
+  isGitBusy,
+  type GitPreflightResult,
+} from "./git/preflight.js";
+export {
   gitIdentity,
+  gitIdentityKey,
+  projectIdentity,
+  type GitIdentity,
+} from "./git/identity.js";
+export {
   captureGitState,
-  readSyncableRefSurface,
   normalizeSymbolicHeadCasing,
   decideDirBundleAllArgs,
   gitCaptureScratchRoot,
   sweepStaleGitCaptureDirs,
-  applyGitState,
   GitCaptureDeferredError,
+} from "./git/capture.js";
+export { readSyncableRefSurface } from "./git/refs.js";
+export {
+  applyGitState,
+  type ApplyGitResult,
+  type ApplyBranchTransitionInput,
+  type ApplyBranchTransitionResult,
+  type ApplyBranchTransitionAdapter,
+} from "./git/apply.js";
+export {
   preserveGitConflict,
+  quarantineAndWipeGitState,
+} from "./git/quarantine.js";
+export {
   gitSectionBlobRefs,
   gitSectionNewestLink,
   gitSectionPackLinks,
   gitSectionTips,
-  validateGitSection,
-  isSyncableRef,
-  gitIdentityKey,
-  projectIdentity,
-  assertGitTargetWithinRoot,
-  isGitBusy,
-  quarantineAndWipeGitState,
   inTreeWorktreeParentRel,
   inTreeWorktreeParentRelFromCtx,
   repoCtxFromDisk,
   inspectGitBusy,
   inspectGitBusyShared,
   setGitSpawnObserver,
+  type GitRepoKind,
+  type RepoCtx,
+  type GitBusyInspection,
+  type GitBusyLock,
+  type GitBusySharedInspection,
+} from "./git/shared.js";
+export {
   zeroGitChainTimings,
   finalizeGitChainTimings,
-  BASE_ABSENT_PREFIX,
-  BASE_PRESENT_PREFIX,
-  BASE_PRESENT_KEEP_PREFIX,
-  SETTLED_ABSENCE_PREFIX,
-  MAX_UNSETTLED_BASE_ABSENT,
-  MAX_BASE_PRESENT,
-  MAX_BASE_PRESENT_KEEP,
+  type GitChainTimings,
+} from "./git/chain-timings.js";
+export { assertGitTargetWithinRoot } from "./git/containment.js";
+export {
   validateRepoIdentityV1,
   encodeRepoIdentityV1,
   repositoryIdentityHash,
@@ -49,6 +67,18 @@ export {
   artifactBinding,
   bindingForContext,
   repositoryIdentityForContext,
+  type RepoIdentityV1,
+  type StateLineageV1,
+  type ArtifactBinding,
+} from "./git/repo-lineage.js";
+export {
+  BASE_ABSENT_PREFIX,
+  BASE_PRESENT_PREFIX,
+  BASE_PRESENT_KEEP_PREFIX,
+  SETTLED_ABSENCE_PREFIX,
+  MAX_UNSETTLED_BASE_ABSENT,
+  MAX_BASE_PRESENT,
+  MAX_BASE_PRESENT_KEEP,
   branchRefHash,
   baseAbsentArtifactRef,
   basePresentArtifactRef,
@@ -65,7 +95,6 @@ export {
   readBasePresentArtifact,
   readBasePresentArtifactRef,
   inspectBasePresentArtifactRef,
-  scanBaseArtifacts,
   buildSettledAbsenceTree,
   readSettledAbsence,
   lookupSettledAbsence,
@@ -73,6 +102,24 @@ export {
   prepareRetireSettledAbsence,
   settleBaseAbsentArtifact,
   commitProtocolRefTransaction,
+  type BaseAbsentPayload,
+  type BasePresentPayload,
+  type SettledAbsenceMeta,
+  type PreparedProtocolRef,
+  type PreparedBasePresent,
+  type ArtifactInvalidReason,
+  type ArtifactReadResult,
+  type SettledAbsenceLedger,
+  type SettledAbsenceReadResult,
+  type PreparedSettledAbsence,
+  type PreparedSettledAbsenceRetirement,
+} from "./git/base-artifacts.js";
+export {
+  scanBaseArtifacts,
+  type BaseArtifactScan,
+  type ForeignBaseArtifactScanEntry,
+} from "./git/base-artifact-scan.js";
+export {
   PROTOCOL_LOCK_ORDER,
   heldProtocolLocks,
   assertProtocolLockHeld,
@@ -86,40 +133,11 @@ export {
   withKeepOriginsLock,
   withRepoProtocolLocks,
   withRepositoryRecoveryFence,
-  type ApplyGitResult,
-  type ApplyBranchTransitionInput,
-  type ApplyBranchTransitionResult,
-  type ApplyBranchTransitionAdapter,
-  type GitIdentity,
-  type GitChainTimings,
-  type GitRepoKind,
-  type GitPreflightResult,
-  type RepoCtx,
-  type GitBusyInspection,
-  type GitBusyLock,
-  type GitBusySharedInspection,
-  type RepoIdentityV1,
-  type StateLineageV1,
-  type ArtifactBinding,
-  type BaseAbsentPayload,
-  type BasePresentPayload,
-  type SettledAbsenceMeta,
-  type PreparedProtocolRef,
-  type PreparedBasePresent,
-  type ArtifactInvalidReason,
-  type ArtifactReadResult,
-  type SettledAbsenceLedger,
-  type SettledAbsenceReadResult,
-  type PreparedSettledAbsence,
-  type PreparedSettledAbsenceRetirement,
-  type BaseArtifactScan,
-  type ForeignBaseArtifactScanEntry,
   type ProtocolLockClass,
   type ProtocolLockTraceEvent,
   type RepositoryProtocolFenceRequest,
-  type OwnedRefMutationBoundary,
-  type OwnedRefMutationLease,
-} from "./git-state.js";
+} from "./git/protocol-locks.js";
+export type { OwnedRefMutationBoundary, OwnedRefMutationLease } from "./git/pins.js";
 export { discoverGitRepos, discoverGitReposUnder, type DiscoveredGitRepo } from "./git-discover.js";
 export {
   generateKek,
@@ -154,7 +172,8 @@ export {
   type ManifestDeltaOp,
   type DecodedManifestEnvelope,
 } from "./manifest-delta.js";
-export { cryptoPoolStatus, shutdownCryptoPool, withCryptoPool, type CryptoPoolStatus, type CryptoPool, type CoalescedBlob } from "./crypto-pool.js";
+export { cryptoPoolStatus, shutdownCryptoPool, withCryptoPool, type CryptoPoolStatus, type CryptoPool } from "./crypto-pool/pool.js";
+export type { CoalescedBlob } from "./crypto-pool/budget.js";
 export { hashFile, hashBytes } from "./hash.js";
 export {
   ALWAYS_NATIVE_PRUNE,
@@ -397,7 +416,6 @@ export {
   withGenerationOwnerScope,
   workerRequest,
   EntryArena,
-  EntryShapeError,
   GenerationOwnerCapabilityError,
   OwnerReentrancyError,
   GenerationReplacementConflict,
@@ -415,3 +433,4 @@ export {
   type WorkerRegistration,
   type WorkerReplacementResult,
 } from "./entry-arena/index.js";
+export { "EntryShapeError" } from "./entry-arena/index.js";

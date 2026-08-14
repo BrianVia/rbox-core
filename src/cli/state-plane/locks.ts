@@ -9,7 +9,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { repoCtxFromDisk } from "../../engine/git-state.js";
+import { repoCtxFromDisk } from "../../engine/git/shared.js";
 import { acquireLock, type OwnedLock } from "../../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../engine/git/protocol-locks.js";
 import { repositoryIdentityForContext, repositoryIdentityHash } from "../../engine/git/repo-lineage.js";
@@ -30,7 +30,7 @@ import { blocksSqliteWrites } from "./migration/control-codec.js";
 import { readCanonicalControl } from "./migration/control-publication.js";
 import { stateLockPath, statePath } from "./paths.js";
 
-declare const heldStatePlaneLocks: unique symbol;
+const heldStatePlaneLocks: unique symbol = Symbol("held-state-plane-locks");
 
 /** Proof that the complete state-plane lock set is held right now. */
 export interface HeldStatePlaneLocks {
@@ -296,8 +296,8 @@ export async function withStatePlaneLocks<T>(
           if (!await stateLock.isOwner()) throw new Error("state-plane locks refused: state lock ownership was lost");
           await options.onStage?.("body");
           const locks = {
-            mutex, stateLock, underRepositoryFence: true,
-          } as unknown as HeldStatePlaneLocks;
+            mutex, stateLock, underRepositoryFence: true, [heldStatePlaneLocks]: true,
+          } satisfies HeldStatePlaneLocks;
           return { restart: false as const, value: await fn(locks) };
         } finally {
           await stateLock.release();

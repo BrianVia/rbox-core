@@ -38,12 +38,15 @@ export class WorkerLifecycleError extends Error {
 /** Extension members are arbitrary decoded JSON, which interning fully
  *  supports. This is raised only for values JSON cannot produce (functions,
  *  symbols, bigints) or nesting past `MAX_EXTENSION_DEPTH`. */
-export class EntryShapeError extends Error {
+export class EntryStructureError extends Error {
   constructor(key: string, detail: string) {
     super(`entry field ${key} is not internable: ${detail}`);
     this.name = "EntryShapeError";
   }
 }
+
+// Compatibility name retained for existing imports and runtime diagnostics.
+export { EntryStructureError as "EntryShapeError" };
 
 /** A terminal operation was started from inside a resource-release callback.
  *  Same-owner is a direct cycle and cross-owner pairs are a mutual one, so NO

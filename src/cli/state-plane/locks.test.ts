@@ -109,10 +109,10 @@ test("a post-Q workspace with no database behind its marker is corruption, not a
   const root = await workspace("rbox-locks-post-q-");
   await fs.writeFile(statePath(root), `${AUTHORITY_MARKER_MAGIC}\n${"a".repeat(32)}\n`);
   expect(await classifyStateFormat(statePath(root))).toBe("authority-marker");
-  const raised = await withStatePlaneLocks(root, async () => "never").catch((error: unknown) => error);
-  expect(raised).toBeInstanceOf(Error);
-  expect((raised as Error).name).toBe("StateAuthorityCorruptError");
-  expect((raised as Error).message).not.toMatch(/newer version of rbox/);
+  const raised = await withStatePlaneLocks(root, async () => "never").catch((error) => error);
+  if (!(raised instanceof Error)) throw new Error("expected state authority corruption");
+  expect(raised.name).toBe("StateAuthorityCorruptError");
+  expect(raised.message).not.toMatch(/newer version of rbox/);
 });
 
 test("a state.json the parse budget refuses is a typed refusal, not an escaping RangeError", async () => {
@@ -145,18 +145,21 @@ test("a state.json the parse budget refuses is a typed refusal, not an escaping 
 
 // 222 §7.9. The bundle is the proof object every mutator trusts without
 // re-verifying — `control-publication.ts` takes it and does `void locks` — so
-// its unforgeability rests entirely on the brand. A cast anywhere else in
-// production reaches an admitted migration with no lock held.
-test("only locks.ts casts its way to a bundle in production code", () => {
-  // Deliberately loose: `as unknown as HeldStatePlaneLocks` is only the obvious
-  // spelling. A qualified reference (`as unknown as Mod.HeldStatePlaneLocks`)
-  // is the same forgery and slipped past a tighter pattern when probed.
-  const sweep = Bun.spawnSync([
+// its unforgeability rests entirely on the unexported runtime brand. No
+// production cast may forge it, and only locks.ts may name or mint the brand.
+test("only locks.ts can mint a branded lock bundle in production code", () => {
+  const casts = Bun.spawnSync([
     "git", "grep", "-lIE", "\\bas\\b[^;]*HeldStatePlaneLocks", "--", "src", ":!*.test.ts",
   ], { cwd: path.resolve(import.meta.dir, "../../..") });
-  expect(sweep.exitCode, "git grep failed to run").toBeLessThanOrEqual(1);
-  const files = new TextDecoder().decode(sweep.stdout).trim().split("\n").filter(Boolean);
-  expect(files).toEqual(["src/cli/state-plane/locks.ts"]);
+  expect(casts.exitCode, "git grep failed to run").toBeLessThanOrEqual(1);
+  expect(new TextDecoder().decode(casts.stdout).trim()).toBe("");
+
+  const brand = Bun.spawnSync([
+    "git", "grep", "-lF", "heldStatePlaneLocks", "--", "src", ":!*.test.ts",
+  ], { cwd: path.resolve(import.meta.dir, "../../..") });
+  expect(brand.exitCode, "git grep failed to run").toBeLessThanOrEqual(1);
+  const brandFiles = new TextDecoder().decode(brand.stdout).trim().split("\n").filter(Boolean);
+  expect(brandFiles).toEqual(["src/cli/state-plane/locks.ts"]);
 });
 
 test("a standing reset journal is recovered to completion before the body runs", async () => {

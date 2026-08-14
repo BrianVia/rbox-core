@@ -5,10 +5,12 @@ import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import type { GlobalManifestMeta } from "../config.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob } from "./blobs.js";
-import { BlobBatchDownloader, BlobBatchUploader } from "./blob-batch.js";
+import { BlobBatchDownloader } from "./blob-batch/downloader.js";
+import { BlobBatchUploader } from "./blob-batch/uploader.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult, type LatestOptions } from "./commits.js";
 import { redeemReceipts } from "./commits.js";
 import type { ReceiptPort } from "../publish-pipeline/receipt-drainer.js";
+import type { JsonValue } from "../../json.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
 import {
@@ -116,7 +118,7 @@ export class RboxApi implements SyncRemote {
     return putBlob(this.ctx, sha256, bytes, onBytes);
   }
 
-  bootstrapKeys(body: unknown): Promise<void> {
+  bootstrapKeys<Body extends JsonValue>(body: Body): Promise<void> {
     return bootstrapKeys(this.ctx, body);
   }
 
@@ -128,16 +130,16 @@ export class RboxApi implements SyncRemote {
     return getGenesisObservation(this.ctx);
   }
 
-  putDeviceKeys(body: unknown): Promise<void> {
+  putDeviceKeys<Body extends JsonValue>(body: Body): Promise<void> {
     return putDeviceKeys(this.ctx, body);
   }
 
   /** Atomic device-keys + roster admission (C5). 409 → caller refetches + retries. */
-  admitDevice(body: unknown, signal?: AbortSignal): Promise<{ ok: boolean; conflict?: boolean }> {
+  admitDevice<Body extends JsonValue>(body: Body, signal?: AbortSignal): Promise<{ ok: boolean; conflict?: boolean }> {
     return admitDevice(this.ctx, body, signal);
   }
 
-  appendRoster(body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {
+  appendRoster<Body extends JsonValue>(body: Body): Promise<{ ok: boolean; conflict?: boolean }> {
     return appendRoster(this.ctx, body);
   }
 
@@ -187,7 +189,7 @@ export class RboxApi implements SyncRemote {
 
   /** JSON POST on the daemon's ONE RemoteContext (telemetry ingest, design 120) —
    *  structurally satisfies TelemetryTransport without a second context. */
-  postJson(path: string, body: unknown, opts: { signal?: AbortSignal; retries?: number } = {}): Promise<Response> {
+  postJson<Body extends Partial<Record<keyof Body, JsonValue>>>(path: string, body: Body, opts: { signal?: AbortSignal; retries?: number } = {}): Promise<Response> {
     return this.ctx.postJson(path, body, opts);
   }
 

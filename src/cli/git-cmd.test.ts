@@ -8,7 +8,9 @@ import { LocalBlobStore, buildIgnoreMatcher, captureGitState, setGitSpawnObserve
 import { checkoutJournalDir } from "../engine/git/journal.js";
 import { repoCtx } from "../engine/git/shared.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "./config.js";
-import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
+import { gitDeferralsCmd } from "./git/deferrals-command.js";
+import { gitResolveCmd } from "./git/resolve-command.js";
+import { safeResolveText, type GitResolveShow } from "./git/resolve-presentation.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { settleCommittedBranchArtifacts } from "./sync-git/received-git-transition-commit.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
@@ -98,14 +100,13 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
   expect(applied.gitRepos?.repo).toEqual(base);
   // Mirror production's state-first P settlement instead of deleting protocol
   // refs in the fixture. This also keeps the later manual episode in one lineage.
+  const repoRecord: RepoRecord = { repoGen: 1, sourceSeq: 1, base };
+  if (applied.branchBaseOrigins?.repo) repoRecord.branchBaseOrigins = applied.branchBaseOrigins.repo;
   const initial: SyncState = {
     ...emptyState,
     lastSyncedSequence: 1,
     lastSyncedManifest: manifest(base),
-    repoRecords: { repo: {
-      repoGen: 1, sourceSeq: 1, base,
-      ...(applied.branchBaseOrigins?.repo ? { branchBaseOrigins: applied.branchBaseOrigins.repo } : {}),
-    } },
+    repoRecords: { repo: repoRecord },
   };
   await saveStateUnsafeLegacyOrTest(root, initial);
   await settleCommittedBranchArtifacts(root, initial, applied);
@@ -198,8 +199,8 @@ class ManualProgressScheduler {
     return id;
   };
 
-  readonly clearInterval = (handle: unknown): void => {
-    if (this.active.delete(handle as number)) this.cleared++;
+  readonly clearInterval = <Handle>(handle: Handle): void => {
+    if (this.active.delete(Number(handle))) this.cleared++;
   };
 
   fireActive(): void {
@@ -1011,7 +1012,7 @@ test("a concluded operation's leftover MERGE_MSG/AUTO_MERGE previews and publish
   const confirmed: string[] = [];
   expect(await gitResolveCmd(root, receiver, "keep-mine", {
     confirm: preview.current.snapshot,
-    ...(preview.confirm.forceDiscardIncoming ? { forceDiscardIncoming: true } : {}),
+    forceDiscardIncoming: preview.confirm.forceDiscardIncoming === true,
   }, deps(confirmed))).toBe(0);
   expect(confirmed.join("\n")).toContain("published");
   // Publication never touches the fossils; they keep syncing as op-state.

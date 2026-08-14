@@ -11,7 +11,7 @@ import {
   UPLOAD_GRANT_RETRY_INTERVAL_MS,
 } from "../context.js";
 import { BlobBatchUploader } from "./uploader.js";
-import { resetBatchBlobStateForTests } from "../blob-batch.js";
+import { resetBatchBlobStateForTests } from "./gate.js";
 import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES } from "./wire.js";
 import {
   beginFirstPublishTiming,
@@ -34,7 +34,7 @@ let calls: Call[] = [];
 
 const sha = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const context = (): RemoteContext => new RemoteContext("https://api.test", "durable-token", "ws_1", "proj_1");
-const json = (body: unknown, headers: Record<string, string> = {}): Response =>
+const json = <Body>(body: Body, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
 
 async function waitFor(condition: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
@@ -46,9 +46,9 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 5_00
 }
 
 function activeUploadGrantRefresh(ctx: RemoteContext): Promise<void> {
-  const refresh = (ctx as unknown as { uploadGrantRefresh?: Promise<void> }).uploadGrantRefresh;
-  if (!refresh) throw new Error("expected an active upload-grant refresh");
-  return refresh;
+  const refresh = Reflect.get(ctx, "uploadGrantRefresh");
+  if (!(refresh instanceof Promise)) throw new Error("expected an active upload-grant refresh");
+  return refresh.then(() => undefined);
 }
 
 async function file(name: string): Promise<{ path: string; bytes: Uint8Array; sha: string }> {

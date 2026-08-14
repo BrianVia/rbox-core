@@ -4,7 +4,7 @@ import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
 import { BLOB_CIPHERTEXT_TAG_BYTES, decryptFileToPath } from "./crypto.js";
-import { withCryptoPool } from "./crypto-pool.js";
+import { withCryptoPool } from "./crypto-pool/pool.js";
 import { assertWithinRoot, claimUnclobberedName, isAbsent, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
@@ -417,7 +417,7 @@ export async function restoreEntryToPath(
     await stageEntryToTemp(tmp, entry, store, kek);
     let previousCopyTrashed = false;
     if (opts.trash) {
-      const exists = await fs.lstat(abs).then(() => true, (error: unknown) => {
+      const exists = await fs.lstat(abs).then(() => true, (error) => {
         if (isAbsent(error)) return false;
         throw error;
       });
