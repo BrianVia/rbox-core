@@ -24,6 +24,12 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track![0]!.usage).toContain("rbox track");
 });
 
+test("start help documents one trace flag for every diagnostic stream", () => {
+  const start = byName.get("start")!;
+  expect(start.usage).toContain("[--trace[=<streams>]]");
+  expect(renderCommand(start)).toContain("trace all diagnostics, or select with --trace=propagation,held");
+});
+
 test("include help uses the founder-approved surface and track documents repeatable --include", () => {
   const include = byName.get("include")!;
   expect(renderCommand(include)).toContain("include — sync only the folders you include on this machine");

@@ -8,6 +8,7 @@ import {
   type DaemonLiveObservation,
   type DaemonModeIntent,
 } from "../daemon-control.js";
+import type { DaemonTraceStream } from "../daemon/process-control.js";
 import { assertBindingUsable, resolveBindingScope } from "../scope/binding-scope.js";
 import { withScopeTransitionLock } from "../scope/scope-lock.js";
 import type { DaemonMode } from "../daemon/ambient-status.js";
@@ -34,6 +35,8 @@ import {
 export interface StartStopDeps extends DesiredDeps {
   startDaemon?: typeof startDaemon;
   stopDaemon?: typeof stopDaemon;
+  /** Interactive-start-only trace selection; never written to desired state. */
+  traceStreams?: readonly DaemonTraceStream[];
   modeWitnessTimeoutMs?: number;
   modeWitnessPollMs?: number;
   /** Resume-only generation guard; never supplied by an interactive start. */
@@ -129,6 +132,7 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
     result = await (deps.startDaemon ?? startDaemon)(identity.rootPath, {
       pullOnly: requested.mode === "pull-only",
       modeIntent: requested.intent,
+      traceStreams: deps.traceStreams,
       ...(deps.modeWitnessTimeoutMs === undefined ? {} : { modeWitnessTimeoutMs: deps.modeWitnessTimeoutMs }),
       ...(deps.modeWitnessPollMs === undefined ? {} : { modeWitnessPollMs: deps.modeWitnessPollMs }),
       onLive: recordLive,

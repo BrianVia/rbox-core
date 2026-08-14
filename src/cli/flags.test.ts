@@ -19,6 +19,17 @@ test("boolean long flags do not consume following positionals", () => {
   expect(parseFlags(["deferrals", "--brief"])).toEqual({ positional: ["deferrals"], flags: { brief: "true" } });
 });
 
+test("start --trace is valueless but preserves an explicit equals selection", () => {
+  expect(parseFlags(["--trace", "/home/dev/app"], "start")).toEqual({
+    positional: ["/home/dev/app"],
+    flags: { trace: "true" },
+  });
+  expect(parseFlags(["--trace=propagation,held", "/home/dev/app"], "start")).toEqual({
+    positional: ["/home/dev/app"],
+    flags: { trace: "propagation,held" },
+  });
+});
+
 test("known value long flags still consume values", () => {
   expect(parseFlags(["--limit", "25", "--path", "."])).toEqual({ positional: [], flags: { limit: "25", path: "." } });
 });
