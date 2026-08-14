@@ -112,6 +112,18 @@ Statuses used below:
 | Status / fix | **CONFIRMED — NOTE-ONLY** (environment drift, no repo change possible). Disposition for recurrences: a red canary-driver rig job with a green same-SHA history is first re-run against the *current* canary before any code investigation; record the failing `bun --revision` from the job log immediately — it is unrecoverable once the tag moves. |
 | Proof | Failed attempt-1 log (canary `827475e21`), [green same-SHA rerun](https://github.com/BrianVia/rbox-core/actions/runs/31402717470) (canary `9fcdea80b`), green PR-run 2026-08-09 23:57 (canary `52bf09cb1`), green local rig on 1.3.14, exact SHA `321bf75991ceedd1d95a20108d6e7a580b5ed4ab`. |
 
+### FLAKE-008 — credentials fresh-main contention fence timeout
+
+| Field | Record |
+|---|---|
+| Test | `fresh main contention and a live exact-incarnation fence fail closed without reaping` |
+| File | `src/cli/credentials.test.ts` |
+| First / last seen | 2026-08-13 / 2026-08-14 |
+| Failure | PR #682 `tests · shard 6/6` attempt 1 timed out at `[15001.53ms]`; PR #689 `tests · shard 3/6` attempt 1 timed out at `[15000.45ms]`. Both were instrumentation-only diffs outside credential fencing. |
+| Root cause | The test sequentially exhausted the production 80-attempt, 25-ms retry policy twice—first against the fresh main marker, then against the live exact-incarnation fence. That requests about four seconds of sleeps before filesystem work; starved CI runners stretched the timers and marker inspection past Bun's 15-second ceiling. Both markers are under the test's private root, so no neighboring lock holder was involved. |
+| Status / fix | **CONFIRMED — FIXED** on `credentials-flake-fix`. A process-local installer, patterned after the existing heartbeat installer, supplies a short retry delay/count while production remains 80×25 ms. The regression exhausts every configured attempt for both marker classes, asserts acquisition fails closed, and compares each live marker byte-for-byte after failure. The harness now sets and restores both `HOME` and the preferred `RBOX_HOME`; the symlink-root case redirects both. No shard serialization, timeout increase, or safety-coverage reduction. |
+| Proof | PR #682 attempt 2 passed on the same SHA; pre-fix isolation was 49/49 green in 4.6 s. Post-fix, the complete file passed in ten fresh processes (48 pass, 1 skip each; 0.493–0.610 s), plus an independent review run (48 pass, 1 skip in 0.526 s). The test's exact attempt traces are `0..3` for both main and fence markers. |
+
 ## Same-class audit candidates
 
 These are the actionable occurrences found by the `src/**/*.test.ts` and
@@ -516,24 +528,3 @@ removed; the redacted result is retained at
   write earlier in `start()` and this test drives pull trust. If it recurs,
   suspect that interaction first and reproduce under shard ordering
   (`bun test --shard`), not the file alone.
-
-## SUSPECTED (proof pending): credentials fresh-main contention fence timeout
-
-- 2026-08-13, PR #682 (instrumentation-only diff — plan/push timing buckets;
-  touches neither `credentials.ts` nor daemon fencing), `tests · shard 6/6`
-  attempt 1: `(fail) fresh main contention and a live exact-incarnation fence
-  fail closed without reaping [15001.53ms]` — the 15s test ceiling, i.e. a
-  stall, not an assertion. Attempt 2 (same SHA): pass. Locally: file alone
-  49/49 green in 4.6s.
-- Same file as FLAKE-002/FLAKE-006 (`src/cli/credentials.test.ts`), third
-  distinct test to flake there — all contention/fence handshakes. If it
-  recurs, reproduce under shard ordering (the file's contention tests share
-  real lock files; a co-scheduled shard neighbor holding the fence is the
-  first suspect), and check whether the design-242 leak classes cover it.
-- SECOND SIGHTING 2026-08-14, PR #689 (also instrumentation-only; touches
-  push/daemon spans, not credentials), `tests · shard 3/6` attempt 1: same
-  test, same 15000.45ms ceiling. Two sightings on two different shards
-  within 24h, both on diffs that cannot influence it — this now clears the
-  recurrence bar: next session should run the shard-ordering reproduction
-  and either fix the shared-lock contention or quarantine the test with an
-  owner note.
