@@ -6,7 +6,7 @@ import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clear
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "../../engine/git/config-txn.js";
 import { readAllRefs } from "../../engine/git/refs.js";
-import { git, readHead, warnOnce } from "../../engine/git/shared.js";
+import { addTimedMs, git, readHead, warnOnce } from "../../engine/git/shared.js";
 import { expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
 import { checkoutJournalBinding, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
@@ -46,7 +46,6 @@ interface HeldTraceAttempt {
   mismatch: string;
   earlyReason: string;
   blocker: string;
-  supersessionProofMs: number;
 }
 
 function snapshotKey<T>(record: Record<string, T>, key: string): KeySnapshot<T> {
@@ -232,7 +231,7 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
       const chain = t.chain && hasGitChainTiming(t.chain)
-        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}jr${Math.round(chainMetric(t.chain.journalMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
+        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}jr${Math.round(chainMetric(t.chain.journalMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cx${Math.round(chainMetric(t.chain.classifyExclusiveMs))}hi${Math.round(chainMetric(t.chain.heldInputMs))}sp${Math.round(chainMetric(t.chain.standingProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
         : "";
       return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
@@ -255,6 +254,9 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
       formatGitApplyDistribution("ownershipMs", chainTimings.map((chain) => chainMetric(chain.ownershipMs))),
       formatGitApplyDistribution("reflogMs", chainTimings.map((chain) => chainMetric(chain.reflogMs))),
       formatGitApplyDistribution("connectivityProofMs", chainTimings.map((chain) => chainMetric(chain.connectivityProofMs))),
+      formatGitApplyDistribution("classifyExclusiveMs", chainTimings.map((chain) => chainMetric(chain.classifyExclusiveMs))),
+      formatGitApplyDistribution("heldInputMs", chainTimings.map((chain) => chainMetric(chain.heldInputMs))),
+      formatGitApplyDistribution("standingProofMs", chainTimings.map((chain) => chainMetric(chain.standingProofMs))),
       formatGitApplyDistribution("classifyMs", chainTimings.map((chain) => chainMetric(chain.classifyMs))),
       formatGitApplyDistribution("residualMs", chainTimings.map((chain) => chainMetric(chain.residualMs))),
     );
@@ -266,7 +268,8 @@ function hasGitChainTiming(chain: GitChainTimings): boolean {
   return chain.chainLength > 0 || chain.fetchDecryptMs > 0 || chain.bundleVerifyMs > 0
     || chain.gitImportMs > 0 || chain.refTxnExclusiveMs > 0 || chain.ownershipMs > 0
     || chain.reflogMs > 0 || chain.connectivityProofMs > 0 || chain.indexOpStateMs > 0
-    || chain.journalMs > 0 || chain.classifyMs > 0;
+    || chain.journalMs > 0 || chain.classifyMs > 0 || chainMetric(chain.classifyExclusiveMs) > 0
+    || chainMetric(chain.heldInputMs) > 0 || chainMetric(chain.standingProofMs) > 0;
 }
 
 function chainMetric(value: number | undefined): number {
@@ -871,68 +874,71 @@ opts: {
     const legacyDiverged = !cleanMaterialize && localDivergedFromBase(divergenceId, baseSec);
     let semanticIndexDiverged = false;
     if (!legacyDiverged && !cleanMaterialize && dotGit && baseSec) {
-      const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-      if (!ctx) {
-        semanticIndexDiverged = true;
-      } else {
-        const liveIndexPath = path.join(ctx.gitDir, "index");
-        const liveIndexPresent = await fs.lstat(liveIndexPath).then(
-          (stat) => stat.isFile(),
-          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error),
-        ).catch(() => undefined);
-        const baseHasIndex = baseSec.indexSha !== undefined
-          && baseSec.indexEncSha !== undefined
-          && baseSec.indexCipherSize !== undefined;
-        let baseProjection = records[rel]?.idxProj;
-        const deriveProjection = async (ignoreCache = false): Promise<string | undefined> => {
-          const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-base-projection-${process.pid}-`));
-          try {
-            return await deriveBaseIndexProjection({ ctx, base: baseSec, store, kek, record: records[rel] }, tmpDir, ignoreCache);
-          } finally {
-            await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-          }
-        };
-        if (baseHasIndex && baseProjection === undefined) {
-          baseProjection = await deriveProjection();
-          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
-        }
-        const liveProjection = liveIndexPresent === true
-          ? await indexIdentityV2(repoDir, liveIndexPath)
-          : undefined;
-        // A projection cached by an older client may be stale. Re-derive only
-        // on disagreement; a real semantic edit still disagrees, while a stale
-        // cache is repaired without manufacturing a local-index episode.
-        if (baseHasIndex && liveProjection !== undefined && baseProjection !== liveProjection && records[rel]?.idxProj) {
-          baseProjection = await deriveProjection(true);
-          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
-        }
-        let matchesRboxPartial = false;
-        if (recordedPartial && pend
-          && recordedPartial.incomingKey === gitIncomingKey(pend)
-          && recordedPartial.checkoutPending === false
-          && liveIndexPresent !== undefined) {
-          const partialHasIndex = pend.indexSha !== undefined
-            && pend.indexEncSha !== undefined
-            && pend.indexCipherSize !== undefined;
-          if (!partialHasIndex) {
-            matchesRboxPartial = liveIndexPresent === false;
-          } else if (liveProjection !== undefined) {
-            const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-partial-projection-${process.pid}-`));
+      const projectionBase = baseSec;
+      await addTimedMs(chainTimings, "indexOpStateMs", async () => {
+        const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+        if (!ctx) {
+          semanticIndexDiverged = true;
+        } else {
+          const liveIndexPath = path.join(ctx.gitDir, "index");
+          const liveIndexPresent = await fs.lstat(liveIndexPath).then(
+            (stat) => stat.isFile(),
+            (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error),
+          ).catch(() => undefined);
+          const baseHasIndex = projectionBase.indexSha !== undefined
+            && projectionBase.indexEncSha !== undefined
+            && projectionBase.indexCipherSize !== undefined;
+          let baseProjection = records[rel]?.idxProj;
+          const deriveProjection = async (ignoreCache = false): Promise<string | undefined> => {
+            const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-base-projection-${process.pid}-`));
             try {
-              const partialProjection = await deriveBaseIndexProjection(
-                { ctx, base: pend, store, kek, record: undefined },
-                tmpDir,
-              );
-              matchesRboxPartial = partialProjection !== undefined && liveProjection === partialProjection;
+              return await deriveBaseIndexProjection({ ctx, base: projectionBase, store, kek, record: records[rel] }, tmpDir, ignoreCache);
             } finally {
               await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
             }
+          };
+          if (baseHasIndex && baseProjection === undefined) {
+            baseProjection = await deriveProjection();
+            if (baseProjection !== undefined) idxProj[rel] = baseProjection;
           }
+          const liveProjection = liveIndexPresent === true
+            ? await indexIdentityV2(repoDir, liveIndexPath)
+            : undefined;
+          // A projection cached by an older client may be stale. Re-derive only
+          // on disagreement; a real semantic edit still disagrees, while a stale
+          // cache is repaired without manufacturing a local-index episode.
+          if (baseHasIndex && liveProjection !== undefined && baseProjection !== liveProjection && records[rel]?.idxProj) {
+            baseProjection = await deriveProjection(true);
+            if (baseProjection !== undefined) idxProj[rel] = baseProjection;
+          }
+          let matchesRboxPartial = false;
+          if (recordedPartial && pend
+            && recordedPartial.incomingKey === gitIncomingKey(pend)
+            && recordedPartial.checkoutPending === false
+            && liveIndexPresent !== undefined) {
+            const partialHasIndex = pend.indexSha !== undefined
+              && pend.indexEncSha !== undefined
+              && pend.indexCipherSize !== undefined;
+            if (!partialHasIndex) {
+              matchesRboxPartial = liveIndexPresent === false;
+            } else if (liveProjection !== undefined) {
+              const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-partial-projection-${process.pid}-`));
+              try {
+                const partialProjection = await deriveBaseIndexProjection(
+                  { ctx, base: pend, store, kek, record: undefined },
+                  tmpDir,
+                );
+                matchesRboxPartial = partialProjection !== undefined && liveProjection === partialProjection;
+              } finally {
+                await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+              }
+            }
+          }
+          semanticIndexDiverged = !matchesRboxPartial && (liveIndexPresent === undefined
+            || liveIndexPresent !== baseHasIndex
+            || (liveIndexPresent && (liveProjection === undefined || baseProjection === undefined || liveProjection !== baseProjection)));
         }
-        semanticIndexDiverged = !matchesRboxPartial && (liveIndexPresent === undefined
-          || liveIndexPresent !== baseHasIndex
-          || (liveIndexPresent && (liveProjection === undefined || baseProjection === undefined || liveProjection !== baseProjection)));
-      }
+      });
     }
     const localDiverged = legacyDiverged || semanticIndexDiverged;
     // Design 116 review R2-1/R2-2: a usable, already-materialized STEADY
@@ -1052,14 +1058,11 @@ opts: {
           ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
         }),
       };
-      const settlementStartedAt = performance.now();
-      const settlement = await settleStandingBranchProof({
+      const settlement = await addTimedMs(chainTimings, "standingProofMs", () => settleStandingBranchProof({
         identity: { relPath: rel, incomingKey: incomingKey! },
         state, record: records[rel], serializedBase: baseSec, incomingRefScope: remoteSec.refScope,
         protocol: preparedProtocol.protocol, retryBudget: 8,
-      }, standingProofEffects).finally(() => {
-        if (heldTrace) heldTrace.supersessionProofMs += performance.now() - settlementStartedAt;
-      });
+      }, standingProofEffects));
       state = settlement.carry.state;
       if (settlement.carry.recoveredRecord) installRecoveredRecord(rel, settlement.carry.recoveredRecord);
       baseSec = baseRepos[rel];
@@ -1090,7 +1093,7 @@ opts: {
       const effectivePartial = currentPartial(rel);
       const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
       const priorObservation = priorAttempt
-        ? await observeHeldInputs({
+        ? await addTimedMs(chainTimings, "heldInputMs", () => observeHeldInputs({
             root, relPath: rel, incoming: remoteSec,
             record: records[rel], partial: effectivePartial,
             stateNonce: expectedStateNonce(state),
@@ -1101,7 +1104,7 @@ opts: {
                 ? priorAttempt.effectiveIncomingIndexProjection
                 : undefined,
             reflogPaths: priorAttempt.reflogs.map((entry) => entry.path),
-          })
+          }))
         : undefined;
       let priorInputsMatch = false;
       if (priorAttempt && priorObservation) {
@@ -1153,7 +1156,7 @@ opts: {
           clearAttempt(rel);
           return;
         }
-        const observed = await observeHeldInputs({
+        const observed = await addTimedMs(chainTimings, "heldInputMs", () => observeHeldInputs({
           root, relPath: rel, incoming: remoteSec,
           record: priorRecord,
           ...((input.boundBase ?? applied[rel]) === undefined ? {} : { boundBase: input.boundBase ?? applied[rel] }),
@@ -1164,7 +1167,7 @@ opts: {
           effectiveBaseIndexProjection: input.effectiveBaseIndexProjection,
           effectiveIncomingIndexProjection: input.effectiveIncomingIndexProjection,
           expectedWorktreeRegistryDigest: input.expectedWorktreeRegistryDigest,
-        });
+        }));
         if (!observed) {
           clearAttempt(rel);
           return;
@@ -1495,7 +1498,6 @@ opts: {
       mismatch: records[rel]?.attempt ? "not-consulted" : "none",
       earlyReason: records[rel]?.attempt ? "not-consulted" : "no-attempt",
       blocker: "none",
-      supersessionProofMs: 0,
     } : undefined;
     const chainTimings = metrics || traceHeld ? zeroGitChainTimings() : undefined;
     try {
@@ -1512,10 +1514,10 @@ opts: {
         const priorAttempt = pending[rel] && remoteSec ? records[rel]?.attempt : undefined;
         const heldNowMs = opts.heldNow?.();
         const earlyDecision = gitHeldSkipEnabled() && priorAttempt
-          ? await earlyHeldAttemptDecision({
+          ? await addTimedMs(chainTimings, "heldInputMs", () => earlyHeldAttemptDecision({
               root, relPath: rel, incoming: remoteSec!, attempt: priorAttempt,
               ...(heldNowMs === undefined ? {} : { nowMs: heldNowMs }),
-            })
+            }))
           : { matches: false, reason: priorAttempt ? "disabled" : "no-attempt" };
         if (heldTrace) heldTrace.earlyReason = earlyDecision.reason;
         if (earlyDecision.matches && priorAttempt && retainHeldRepo(rel, priorAttempt)) {
@@ -1563,8 +1565,8 @@ opts: {
         const deferral = currentDeferral(rel, "apply");
         if (heldTrace.blocker === "none" && result === "deferred" && deferral) heldTrace.blocker = `apply/${deferral.reason}`;
         const namedMs = chainTimings.fetchDecryptMs + chainTimings.bundleVerifyMs + chainTimings.gitImportMs
-          + chainTimings.classifyMs + heldTrace.supersessionProofMs;
-        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} earlyReason=${heldTrace.earlyReason} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(heldTrace.supersessionProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
+          + chainTimings.classifyMs + chainTimings.standingProofMs;
+        glog(`git-sync held-trace repo=${JSON.stringify(rel)} storedAttempt=${heldTrace.storedAttempt ? 1 : 0} earlySkip=${heldTrace.earlySkip ? 1 : 0} matchConsulted=${heldTrace.matchConsulted ? 1 : 0} mismatch=${heldTrace.mismatch} earlyReason=${heldTrace.earlyReason} blocker=${heldTrace.blocker} fetchDecryptMs=${Math.round(chainTimings.fetchDecryptMs)} verifyMs=${Math.round(chainTimings.bundleVerifyMs)} importMs=${Math.round(chainTimings.gitImportMs)} classifyMs=${Math.round(chainTimings.classifyMs)} supersessionProofMs=${Math.round(chainTimings.standingProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);
       }
       if (metrics) {
         metrics.results[result] += 1;

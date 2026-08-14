@@ -1930,6 +1930,9 @@ test("unchanged allowlisted hold skips before fetch and prep; a ref move resumes
     afterBranchPinsPrepared: () => { pinCalls++; },
   });
   expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  const skippedTiming = skipped.outcome.gitApplyMetrics?.repoTimings[0];
+  if (!skippedTiming?.chain) throw new Error("missing held-skip timing partition");
+  expect(skippedTiming.chain.heldInputMs).toBeGreaterThan(0);
   expect(capabilityCalls).toBe(0);
   expect(pinCalls).toBe(0);
   expect(ordering).toEqual([]);
@@ -3079,9 +3082,14 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
   if (!timing || !chain) throw new Error("missing instrumented repo timing");
   const leafSum = chain.fetchDecryptMs + chain.bundleVerifyMs + chain.gitImportMs
     + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
-    + chain.connectivityProofMs + chain.indexOpStateMs + chain.journalMs;
+    + chain.connectivityProofMs + chain.indexOpStateMs + chain.journalMs
+    + chain.classifyExclusiveMs + chain.heldInputMs + chain.standingProofMs;
   expect(chain.classifyMs).toBeGreaterThan(0);
+  expect(chain.classifyExclusiveMs).toBeGreaterThan(0);
+  expect(chain.heldInputMs).toBeGreaterThan(0);
+  expect(chain.standingProofMs).toBeGreaterThan(0);
   expect(chain.journalMs).toBeGreaterThan(0);
   expect(chain.residualMs).toBeCloseTo(Math.max(0, timing.wallMs - leafSum), 5);
+  expect(Math.abs(leafSum + chain.residualMs - timing.wallMs)).toBeLessThan(2);
   expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
 }, 30_000);
