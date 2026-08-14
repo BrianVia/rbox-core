@@ -1,11 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
-import {
-  gitIdentityKey,
-  validateGitSection,
-  type GitRefTombstone,
-  type GitSection,
-} from "../../engine/index.js";
+import { validateGitSection, type GitRefTombstone, type GitSection } from "../../engine/index.js";
+import { gitIdentityKey } from "./identity.js";
 import { gitIncomingKey } from "./shared.js";
 import { composeStateSavePacket } from "../sync-state.js";
 import { stateFromRepoRecords, type SyncState } from "../config.js";

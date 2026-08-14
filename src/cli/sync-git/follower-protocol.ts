@@ -1,15 +1,8 @@
-import {
-  artifactBinding,
-  readRepoIdentityV1,
-  readSettledAbsence,
-  readStateLineageV1,
-  scanBaseArtifacts,
-  type ArtifactBinding,
-  type BasePresentPayload,
-  type GitSection,
-  type RepoCtx,
-  type PreparedProtocolRef,
-} from "../../engine/index.js";
+import { type GitSection } from "../../engine/index.js";
+import { artifactBinding, readRepoIdentityV1, readStateLineageV1, type ArtifactBinding } from "./repo-lineage.js";
+import { readSettledAbsence, type BasePresentPayload, type PreparedProtocolRef } from "./base-artifacts.js";
+import { scanBaseArtifacts } from "./base-artifact-scan.js";
+import { type RepoCtx } from "./git-state.js";
 import type { RepoRecord, SyncState } from "../config.js";
 import { gitIncomingKey } from "./shared.js";
 import {

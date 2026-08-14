@@ -9,9 +9,9 @@ import {
   type RepoRecord,
   type StateSaveOptions,
 } from "../sync-state-model.js";
-import type { BasePresentPayload, PreparedProtocolRef } from "../../engine/git/base-artifacts.js";
-import { parsePRepairReceipt, type PRepairReceipt } from "../../engine/git/p-repair.js";
-import type { PRepairStatePort, PRepairStateSnapshot } from "../../engine/git/p-repair-transaction.js";
+import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
+import { parsePRepairReceipt, type PRepairReceipt } from "./p-repair.js";
+import type { PRepairStatePort, PRepairStateSnapshot } from "./p-repair-transaction.js";
 import type { GitRefScope } from "../../engine/types.js";
 import {
   carryRepoBaseProof,

@@ -1,8 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRelFromCtx, isGitBusy, repoCtxFromDisk, writeFileAtomic, type GitIdentity, type GitPreflightResult, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
-import { repoCtx } from "../../engine/git/shared.js";
-import { type GitConfigRunner } from "../../engine/git/config-txn.js";
+import { writeFileAtomic, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import { gitIdentity, gitIdentityKey, type GitIdentity } from "./identity.js";
+import { gitPreflight, isGitBusy, type GitPreflightResult } from "./preflight.js";
+import { inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, type GitRepoKind, type RepoCtx } from "./git-state.js";
+import { repoCtx } from "./git-state.js";
+import { type GitConfigRunner } from "./config-txn.js";
 import { repoDirOf, errMsg } from "./shared.js";
 import { readLocalGitConfig, type CachedLocalCfg, type LocalCfgRead } from "./config-lane.js";
 import { GIT_FINGERPRINT_VERSION, GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun, type GitFingerprint, type GitFingerprintRun } from "./fingerprint.js";

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { git, gitOk } from "../engine/git/shared.js";
+import { git, gitOk } from "../engine/git-spawn.js";
 import { bindRetainedRepoIncarnations, abortGitAdoption, runGitAdoption } from "./adopt-git.js";
 import { inventoryAdoptionSource } from "./adopt-inventory.js";
 import {

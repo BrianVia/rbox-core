@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../../engine/index.js";
-import type { ContentEquivalenceCache } from "../../engine/git/reachability.js";
+import type { ContentEquivalenceCache } from "./reachability.js";
 
 const CACHE_REL = ".rbox/state/git-content-equivalence.json";
 const CACHE_VERSION = 1;

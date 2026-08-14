@@ -28,7 +28,7 @@ import {
   type MarkerObservation,
   type ProcessIncarnation,
   type SerializedMarkerObservation,
-} from "../../engine/git/lockfile.js";
+} from "../../engine/lockfile.js";
 
 const execFileAsync = promisify(execFile);
 const JOURNAL_VERSION = 1 as const;

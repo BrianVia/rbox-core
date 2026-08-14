@@ -3,15 +3,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import {
-  indexIdentityV2,
-  LocalBlobStore,
-  type BlobStore,
-  type GitArtifactRef,
-  type GitSection,
-  type JournalRecoveryResult,
-} from "../../engine/index.js";
-import { cleanGitEnv, git, putGitArtifact, repoCtx } from "../../engine/git/shared.js";
+import { LocalBlobStore, type BlobStore, type GitArtifactRef, type GitSection } from "../../engine/index.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { type JournalRecoveryResult } from "./journal.js";
+import { putGitArtifact, repoCtx } from "./git-state.js";
+import { cleanGitEnv, git } from "../../engine/git-spawn.js";
 import {
   gitPendingSupersedeEnabled,
   journalAllowsPendingSupersession,

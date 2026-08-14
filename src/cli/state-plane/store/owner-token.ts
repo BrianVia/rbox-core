@@ -14,7 +14,7 @@
  * factory so the engine never imports a CLI type: the engine exposes
  * `isOwnerSync`, and state-plane brands the token.
  */
-import type { OwnedLock } from "../../../engine/git/lockfile.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
 import type { CasOwnerToken } from "../ports.js";
 
 declare const casOwnerTokenBrand: unique symbol;

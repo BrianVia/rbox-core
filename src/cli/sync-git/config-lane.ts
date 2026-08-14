@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { hashBytes, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js";
-import { canonicalizeGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
-import { readStableParsedConfigSnapshot, type ConfigFault, type GitConfigRunner } from "../../engine/git/config-txn.js";
+import { hashBytes } from "../../engine/index.js";
+import { repoCtxFromDisk, type RepoCtx } from "./git-state.js";
+import { canonicalizeGitConfig, type GitConfig } from "./config-sync.js";
+import { readStableParsedConfigSnapshot, type ConfigFault, type GitConfigRunner } from "./config-txn.js";
 import { type ConfigShapeIdentity } from "../config.js";
 import { repoDirOf } from "./shared.js";
 export interface CachedLocalCfg {

@@ -1,20 +1,12 @@
 import crypto from "node:crypto";
-import {
-  branchRefHash,
-  lookupSettledAbsence,
-  prepareBaseAbsentArtifact,
-  prepareBasePresentArtifact,
-  prepareRetireSettledAbsence,
-  readBaseAbsentArtifact,
-  readRefReflogFingerprint,
-  runPreparedUpdateRefTransaction,
-  type ArtifactBinding,
-} from "../../engine/index.js";
+import { branchRefHash, lookupSettledAbsence, prepareBaseAbsentArtifact, prepareBasePresentArtifact, prepareRetireSettledAbsence, readBaseAbsentArtifact } from "./base-artifacts.js";
+import { readRefReflogFingerprint, runPreparedUpdateRefTransaction } from "./keep-pins.js";
+import { type ArtifactBinding } from "./repo-lineage.js";
 import type { GitPartialApply } from "../config.js";
-import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
-import { addTimedMs, type GitChainTimings } from "../../engine/git/chain-timings.js";
-import { readAllRefsStrict } from "../../engine/git/refs.js";
-import { readHead, repoCtx } from "../../engine/git/shared.js";
+import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
+import { addTimedMs, type GitChainTimings } from "./chain-timings.js";
+import { readAllRefsStrict } from "./refs.js";
+import { readHead, repoCtx } from "./git-state.js";
 import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;

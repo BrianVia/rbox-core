@@ -1,4 +1,5 @@
-import type { CheckoutTransactionCapability, HashCache, IgnoreMatcher, scanManifest } from "../engine/index.js";
+import type { HashCache, IgnoreMatcher, scanManifest } from "../engine/index.js";
+import type { CheckoutTransactionCapability } from "./sync-git/checkout-txn.js";
 import type { CryptoPoolStatus } from "../engine/crypto-pool/pool.js";
 import type { TrashStats } from "../engine/trash.js";
 import type { DaemonActivity } from "./activity.js";

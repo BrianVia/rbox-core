@@ -2,7 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ApplyGitResult, GitSection, RepoCtx } from "../../engine/index.js";
+import type { GitSection } from "../../engine/index.js";
+import type { ApplyGitResult } from "./git-state-apply.js";
+import type { RepoCtx } from "./git-state.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { materializeCleanGit } from "./clean-materialization.js";
 

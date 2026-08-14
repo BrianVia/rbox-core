@@ -1,8 +1,9 @@
 import path from "node:path";
-import { readBaseAbsentArtifact, readBasePresentArtifact, repoCtxFromDisk, settleBaseAbsentArtifact } from "../../engine/index.js";
-import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
-import { git } from "../../engine/git/shared.js";
-import type { LockfileHooks } from "../../engine/git/lockfile.js";
+import { readBaseAbsentArtifact, readBasePresentArtifact, settleBaseAbsentArtifact } from "./base-artifacts.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { readAllRefs, readAllRefsStrict } from "./refs.js";
+import { git } from "../../engine/git-spawn.js";
+import type { LockfileHooks } from "../../engine/lockfile.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { expectedStateNonce, repoRecordsForState, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";

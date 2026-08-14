@@ -4,19 +4,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { hashBytes, hashFile } from "../engine/hash.js";
-import { branchesCheckedOutElsewhere } from "../engine/git/apply.js";
-import { checkoutJournalDir } from "../engine/git/journal.js";
-import { readRepoIdentityV1 } from "../engine/git/repo-lineage.js";
-import { readAllRefs, readOpState, readScopedRefs } from "../engine/git/refs.js";
-import {
-  HEX40,
-  git,
-  gitWithIndexFile,
-  headBranchOf,
-  readHead,
-  repoCtx,
-  type RepoCtx,
-} from "../engine/git/shared.js";
+import { branchesCheckedOutElsewhere } from "../cli/sync-git/git-state-apply.js";
+import { checkoutJournalDir } from "../cli/sync-git/journal.js";
+import { readRepoIdentityV1 } from "../cli/sync-git/repo-lineage.js";
+import { readAllRefs, readOpState, readScopedRefs } from "../cli/sync-git/refs.js";
+import { HEX40, headBranchOf, readHead, repoCtx, type RepoCtx } from "../cli/sync-git/git-state.js";
+import { git, gitWithIndexFile } from "../engine/git-spawn.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../engine/manifest-validate.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { openAdoptDirectory } from "./adopt-fs.js";

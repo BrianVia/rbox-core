@@ -9,7 +9,7 @@ import {
   fsyncDirectory,
   writeFileAtomic,
 } from "../engine/fsutil.js";
-import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/lockfile.js";
 import codecInternals, {
   FOLDER_CATALOG_MAX_BYTES,
   FolderCatalogStaleEditError,

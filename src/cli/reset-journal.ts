@@ -4,8 +4,8 @@ import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
 import type { JsonObject } from "../json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
-import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
+import { acquireLock, type OwnedLock } from "../engine/lockfile.js";
+import { withRepositoryRecoveryFence } from "../cli/sync-git/protocol-locks.js";
 import {
   assertStateReadable,
   recordLastWriterWitness,

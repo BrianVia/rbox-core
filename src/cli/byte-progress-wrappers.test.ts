@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { generateKek, LocalBlobStore } from "../engine/index.js";
-import { putGitArtifact } from "../engine/git/shared.js";
+import { putGitArtifact } from "../cli/sync-git/git-state.js";
 import { E2eeRemote, type E2eeApi } from "./e2ee-remote.js";
 import { RemoteBlobStore, type RboxApi } from "./remote.js";
 

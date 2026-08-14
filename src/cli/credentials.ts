@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { compareProcessStart, systemLockIdentity } from "../engine/git/lockfile.js";
+import { compareProcessStart, systemLockIdentity } from "../engine/lockfile.js";
 import { rboxDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";

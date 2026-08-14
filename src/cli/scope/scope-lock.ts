@@ -11,7 +11,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock } from "../../engine/git/lockfile.js";
+import { acquireLock } from "../../engine/lockfile.js";
 
 export class ScopeEditInProgressError extends Error {
   constructor() {

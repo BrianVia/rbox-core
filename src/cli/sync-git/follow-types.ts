@@ -2,15 +2,11 @@
  * follow module is written against, plus the blocker constructors that turn a
  * classification into a typed deferral. Moved verbatim out of follow.ts. */
 import type { MutationBoundary } from "../../engine/mutation-gate.js";
-import type {
-  AppliedManifestOracle,
-  BlobStore,
-  CheckoutCapabilityProbe,
-  CheckoutJournalBinding,
-  GitChainTimings,
-  GitSection,
-} from "../../engine/index.js";
-import type { RepoCtx } from "../../engine/git/shared.js";
+import type { AppliedManifestOracle, BlobStore, GitSection } from "../../engine/index.js";
+import type { CheckoutCapabilityProbe } from "./checkout-txn.js";
+import type { CheckoutJournalBinding } from "./journal.js";
+import type { GitChainTimings } from "./chain-timings.js";
+import type { RepoCtx } from "./git-state.js";
 import type { OpStateRoot } from "../../engine/manifest-validate.js";
 import type {
   GitDeferralReason,

@@ -3,7 +3,7 @@ import { readFile, mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { gitPreflight } from "../../../src/engine/git/preflight.js";
+import { gitPreflight } from "../../../src/cli/sync-git/preflight.js";
 import { validateManifest } from "../../../src/engine/manifest-validate.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../../../src/engine/manifest-validate.js";
 import { formatGitPushLine, type GitPushPlan } from "../../../src/cli/sync-git/plan.js";

@@ -1,4 +1,5 @@
-import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, HashCache, scanManifest, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, cryptoPoolStatus, HashCache, scanManifest, type IgnoreMatcher } from "../engine/index.js";
+import { checkoutTransactionCapability } from "./sync-git/checkout-txn.js";
 import { trashStats } from "../engine/trash.js";
 import { fetchAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";

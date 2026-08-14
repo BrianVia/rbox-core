@@ -5,7 +5,7 @@ import {
   repositoryIdentityHash,
   validateRepoIdentityV1,
   type RepoIdentityV1,
-} from "../engine/git/repo-lineage.js";
+} from "../cli/sync-git/repo-lineage.js";
 import { compareResetZEntries, type ResetZEntry } from "./reset-z.js";
 import {
   STATE_STORE_SCHEMA_VERSION,

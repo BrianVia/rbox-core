@@ -5,7 +5,8 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildIgnoreMatcher, captureGitState, type BlobStore, type WatchEvent } from "../../engine/index.js";
+import { buildIgnoreMatcher, type BlobStore, type WatchEvent } from "../../engine/index.js";
+import { captureGitState } from "../sync-git/capture.js";
 import { createBatcher, createSignalDebouncer, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp

@@ -22,7 +22,7 @@ import {
   systemLockIdentity,
   type LockIdentitySource,
   type ProcessIncarnation,
-} from "../engine/git/lockfile.js";
+} from "../engine/lockfile.js";
 import {
   ensureDirectoryChain,
   fsyncCreatedDirectoryAncestors,

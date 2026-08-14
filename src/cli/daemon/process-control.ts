@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { systemLockIdentity } from "../../engine/git/lockfile.js";
+import { systemLockIdentity } from "../../engine/lockfile.js";
 import { isStandaloneBinary } from "../runtime.js";
 import { daemonCrashLogPath } from "../rbox-paths.js";
 import { AMBIENT_STATUS_STALE_MS, readAmbientDaemonStatusRecord, validDaemonVersion, type DaemonMode } from "./ambient-status.js";

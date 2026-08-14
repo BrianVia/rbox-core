@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock } from "../engine/git/lockfile.js";
-import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../engine/git/protocol-locks.js";
+import { acquireLock } from "../engine/lockfile.js";
+import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../cli/sync-git/protocol-locks.js";
 import { loadConfig, stateLockPath, statePath, syncStreamId } from "./config.js";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { classifyStateFormat } from "./state-plane/authority-marker.js";

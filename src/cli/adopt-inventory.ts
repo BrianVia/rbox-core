@@ -1,7 +1,8 @@
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { git, repoCtx } from "../engine/git/shared.js";
+import { repoCtx } from "../cli/sync-git/git-state.js";
+import { git } from "../engine/git-spawn.js";
 import { isSafeRelPath } from "../engine/manifest-validate.js";
 import {
   LINKED_WORKTREE_REFUSAL,

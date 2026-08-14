@@ -97,7 +97,7 @@ Statuses used below:
 | First / last seen | 2026-07-28 / 2026-07-28 |
 | Failure | `expect(await Promise.all([first.exited, second.exited])).toEqual([0, 0])` received `[0, 1]` after `[80.19ms]` on PR #536, shard 3/6 |
 | Root cause | Real product race, not a test artifact: `readMarker` opened a *contended* fence marker after lstat'ing it, and the fence holder's release unlinked that marker inside the window, so the observing writer took a fatal `ENOENT` out of `acquireFence` instead of retrying. Nothing fences the fence, so the window is unavoidable; only its disposition was wrong. |
-| Status / fix | **CONFIRMED — FIXED** on `chore/flake-006`. An inspection-window disappearance or replacement now raises `MarkerTurnoverError`, and the fence observer (`inspectHeldFence`) treats it as "look again" — the same disposition `readMarkerNoFollow` already gives "lock changed during inspection" in `src/engine/git/lockfile.ts`. Owners of a marker keep failing closed by not catching it. |
+| Status / fix | **CONFIRMED — FIXED** on `chore/flake-006`. An inspection-window disappearance or replacement now raises `MarkerTurnoverError`, and the fence observer (`inspectHeldFence`) treats it as "look again" — the same disposition `readMarkerNoFollow` already gives "lock changed during inspection" in `src/engine/lockfile.ts`. Owners of a marker keep failing closed by not catching it. |
 | Proof | [2026-07-28 failure](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90167390189) and [green same-SHA rerun](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90193788407), exact SHA `7ce9e01adf04c9b673e7ad148755dea1da213140`. Root-caused by reproducing the exact `ENOENT` stack under 8-way load (1 loss in 240 contended pairs; 0 in 240 after the fix). Regression test `a fence released inside the inspection window is a retry, not a lost writer` drives the interleaving through the `marker-observe-before-open` seam: red with the fix stashed, green with it; 10× isolation of the file green (47 tests, 4.59–4.71 s). |
 
 ### FLAKE-007 — onboarding rig sha_mismatch under one overwritten Bun canary
@@ -140,7 +140,7 @@ deterministic disposition after implementation review.
 | AUDIT-005 | `src/cli/remote/blob-batch/upload-grant.test.ts` — refresh and close cases | Unawaited refresh followed by `setTimeout(0)`/100 ms race; observe the actual in-flight refresh promise or positive state and structurally drain close. The protected `src/cli/remote/context.ts` needed no edit; the disabled overlap case remains note-only. | **FIXED / NOTE-ONLY SKIP** `f0559760`, `f1d56a55` |
 | AUDIT-006 | `src/engine/crypto-pool/crypto-pool.test.ts` — post-reset status | A 25 ms sleep follows an already-awaited reset and is redundant; remove it. | **FIXED** `30aa28cd` |
 | AUDIT-007 | `src/cli/e2ee-sync.test.ts` — `D fast pull evidence mismatches...` | Fake chain GET sleeps 5 ms to manufacture overlap; entered/release gates prove the expected chain reads (not the sequential head read) are in flight. | **FIXED** `30aa28cd`, `f1d56a55` |
-| AUDIT-008 | `src/engine/git/capture-stability.test.ts` — ambient index churn | Unawaited churn producer plus 10 ms startup guess; wait for first churn and stop/drain the producer on every exit. | **FIXED** `30aa28cd`, `f1d56a55` |
+| AUDIT-008 | `src/cli/sync-git/capture-stability.test.ts` — ambient index churn | Unawaited churn producer plus 10 ms startup guess; wait for first churn and stop/drain the producer on every exit. | **FIXED** `30aa28cd`, `f1d56a55` |
 | AUDIT-009 | `src/cli/sync-git/follow.test.ts` — held fingerprint aging | Eight 2.1 s sleeps age a 2 s racy-clean margin; inject one shared logical `heldNow` for tests while omitted production call sites retain their original independent wall-clock reads. | **FIXED** `aecf3634`, `f1d56a55` |
 | AUDIT-010 | `src/cli/redeem-drain-upload.test.ts` — serialized backpressure | 20 ms negative window before exact PUT count despite an existing drain gate; assert through that gate. | **FIXED** `30aa28cd` |
 | AUDIT-011 | `src/cli/daemon/daemon-safety.test.ts` — signal/state and safety cadence cases | A 450 ms signal wait and `setTimeout(0)` scheduler turn precede exact assertions; drive/await the exact signal batch and scheduler state. | **FIXED** `15d98beb`, `f1d56a55` |
@@ -181,14 +181,14 @@ Additional note-only audit entries:
 | `src/cli/upload-lane-timing.test.ts` | Subprocess upload/queue attribution is an explicit timing contract. |
 | `src/cli/publish-pipeline/pipeline.test.ts` | Latency-driven overlap/backpressure is asserted structurally and by ranges. |
 | `src/engine/darwin-bulk-walk.test.ts` and layer-A racy-margin cases | Clock movement establishes filesystem race preconditions. |
-| `src/engine/git/lockfile.test.ts` real process timeout | The real SIGKILL/identity deadline is an explicit performance boundary with a generous outer ceiling. |
+| `src/engine/lockfile.test.ts` real process timeout | The real SIGKILL/identity deadline is an explicit performance boundary with a generous outer ceiling. |
 | `src/cli/watcher-compiled.test.ts` | Child/native watcher soak delays are compiled integration contracts. |
 | `src/cli/daemon/daemon-git-capture.test.ts` | Condition polling has a 3 s ceiling; the separate sustained lock pulses intentionally exercise the synchronous 3 s max-wait contract. |
 | `src/cli/daemon/daemon-git-ref-integration.test.ts` | 250/650 ms windows observe real native watcher arm/drain behavior; positive state uses a condition wait. |
 | `src/cli/design85-layer-a.test.ts` | Racy-margin sleeps establish the filesystem quiescence precondition. |
 | `src/cli/remote/blob-batch/uploader-fill.test.ts` | Scheduling uses an injected fake clock; the 5 s loop is a condition-driven failure ceiling. |
 | `src/engine/apply-concurrency.test.ts` | The test awaits an explicit peak event; 10 s is only its generous failure ceiling. |
-| `src/engine/git/keep-pins.test.ts` | A real subprocess result races a 10 s outer failure ceiling and reports timeout explicitly. |
+| `src/cli/sync-git/keep-pins.test.ts` | A real subprocess result races a 10 s outer failure ceiling and reports timeout explicitly. |
 | `src/engine/manifest-delta.bench.test.ts` | The 2 s gate is an explicit benchmark/performance regression contract. |
 | `src/cli/sync-git/git-sync.test.ts` — shared-common-dir, nested parent/child, and concurrency=1 non-overlap | The held first operation plus 1 s negative window is the concurrency contract; elapsed delay cannot turn a correct implementation positive, and structural scheduler inspection would exceed this sweep. |
 | Skipped upload-grant overlap test | It contains timing risk but is disabled; retain as a note until re-enabled. |
@@ -220,7 +220,7 @@ note-only loci already registered.
   `held-skip.test.ts`, `pending-supersession.test.ts`,
   `sync-git-config-push.test.ts`, `src/cli/telemetry/sync-phase.test.ts`,
   `src/engine/apply-receipt.test.ts`, `engine-m1.test.ts`, `engine.test.ts`,
-  `git-state.test.ts`, `src/engine/git/config-txn.test.ts`,
+  `git-state.test.ts`, `src/cli/sync-git/config-txn.test.ts`,
   `index-identity.test.ts`, and `src/engine/trash.test.ts`.
 - CLI/engine reviewed timing loci already represented by an actionable or
   note-only row: `src/cli/credentials.test.ts`,
@@ -233,7 +233,7 @@ note-only loci already registered.
   `src/cli/watcher-retrust.test.ts`,
   `src/engine/crypto-pool/crypto-fused.test.ts`,
   `src/engine/darwin-bulk-walk.test.ts`, `dircache.test.ts`, and
-  `src/engine/git/lockfile.test.ts`.
+  `src/engine/lockfile.test.ts`.
 
 The audit found four unawaited-producer families requiring fixes
 (AUDIT-001, AUDIT-005, AUDIT-008, AUDIT-017). Reviewed D1 helper arrows ending in
@@ -270,7 +270,7 @@ All 170 processes passed. The retained transcript is
 | `src/cli/sync-git/git-sync.test.ts` | 10/10 | 44.62–46.42 |
 | `src/cli/telemetry/sync-state.test.ts` | 10/10 | 0.08–0.10 |
 | `src/engine/crypto-pool/crypto-pool.test.ts` | 10/10 | 0.45–0.48 |
-| `src/engine/git/capture-stability.test.ts` | 10/10 | 0.78–0.81 |
+| `src/cli/sync-git/capture-stability.test.ts` | 10/10 | 0.78–0.81 |
 
 ### Repository gates
 
@@ -339,7 +339,7 @@ removed; the redacted result is retained at
   (SafetyCadenceClock seam + ManualRecoveryClock) with assertions unchanged;
   looped 10x green.
 
-## src/engine/git-state.test.ts — RECURRING under CI sharding (2 distinct tests, 2 nights' PRs)
+## src/cli/sync-git/capture-identity.test.ts — RECURRING under CI sharding (2 distinct tests, 2 nights' PRs)
 
 - 2026-07-26: "detached pointer captures use detached HEAD as basis" failed
   once on shard 4/6 (PR #478, status-only diff). Green isolation + rerun.

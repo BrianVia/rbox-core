@@ -4,8 +4,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../../engine/fsutil.js";
 import { hashBytes } from "../../engine/hash.js";
-import { git, readRegularFileNoFollow, type RepoCtx } from "../../engine/git/shared.js";
-import { listRefs } from "../../engine/git/refs.js";
+import { readRegularFileNoFollow, type RepoCtx } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
+import { listRefs } from "./refs.js";
 
 export interface OrigHeadBreadcrumbMismatch {
   rel: "ORIG_HEAD";

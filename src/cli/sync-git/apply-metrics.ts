@@ -1,4 +1,4 @@
-import type { GitChainTimings } from "../../engine/index.js";
+import type { GitChainTimings } from "./chain-timings.js";
 
 /**
  * The pull-side Git apply run's measurement record.

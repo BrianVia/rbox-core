@@ -4,13 +4,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildIgnoreMatcher, gitPreflight, hashBytes } from "../../engine/index.js";
+import { buildIgnoreMatcher, hashBytes } from "../../engine/index.js";
+import { gitPreflight } from "./preflight.js";
 import {
   MAX_GIT_CONFIG_KEYS,
   MAX_GIT_CONFIG_KEY_BYTES,
   MAX_GIT_CONFIG_SERIALIZED_BYTES,
   MAX_GIT_CONFIG_VALUE_BYTES,
-} from "../../engine/git/config-sync.js";
+} from "./config-sync.js";
 import { gitDivergenceFastRepoSource } from "./divergence-cache.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 

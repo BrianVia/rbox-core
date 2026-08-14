@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore } from "../../engine/blobstore.js";
-import { importGitPackChain } from "../../engine/git/shared.js";
+import { importGitPackChain } from "./git-state.js";
 import type { GitSection } from "../../engine/types.js";
 import type { SyncRemote } from "../remote.js";
 import type { WorkspaceConfig } from "../config.js";

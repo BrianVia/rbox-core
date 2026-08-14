@@ -1,7 +1,9 @@
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { assertGitTargetWithinRoot, gitIdentityKey, type GitIdentity, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { type GitRefScope, type GitSection } from "../../engine/index.js";
+import { assertGitTargetWithinRoot } from "./containment.js";
+import { gitIdentityKey, type GitIdentity } from "./identity.js";
 import { openAdoptDirectory } from "../adopt-fs.js";
 import { carryRepoBaseProof, type RepoBaseProof } from "./base-composer.js";
 import { errMsg, localDivergedFromBase, projectedKey } from "./shared.js";

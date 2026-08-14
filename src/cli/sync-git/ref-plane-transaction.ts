@@ -1,22 +1,11 @@
 import crypto from "node:crypto";
 import path from "node:path";
-import {
-  ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY,
-  basePresentKeepRef,
-  clearCheckoutJournal,
-  commitCheckout,
-  markCheckoutJournalPublished,
-  tipOwnedByIncoming,
-  updateCheckoutJournal,
-  writeCheckoutJournal,
-  type CheckoutJournal,
-  type CheckoutPlan,
-  type CheckoutRefUpdate,
-  type CommitCheckoutOptions,
-  type OwnershipProofContext,
-} from "../../engine/index.js";
-import { addTimedMs } from "../../engine/git/chain-timings.js";
-import { humanDisplacementOrigin, prepareDisplacementPins } from "../../engine/git/keep-pins.js";
+import { ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";
+import { basePresentKeepRef } from "./base-artifacts.js";
+import { clearCheckoutJournal, markCheckoutJournalPublished, updateCheckoutJournal, writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
+import { tipOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
+import { addTimedMs } from "./chain-timings.js";
+import { humanDisplacementOrigin, prepareDisplacementPins } from "./keep-pins.js";
 import type { GitDeferralReason } from "../config.js";
 import type { LockedBranchProof } from "./base-composer.js";
 import {

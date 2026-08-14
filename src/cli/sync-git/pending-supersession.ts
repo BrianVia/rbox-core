@@ -1,21 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import {
-  gitIdentity,
-  gitIdentityKey,
-  gitPreflight,
-  indexIdentityV2,
-  isGitBusy,
-  validateGitSection,
-  type GitRepoKind,
-  type GitSection,
-  type JournalRecoveryResult,
-} from "../../engine/index.js";
+import { validateGitSection, type GitSection } from "../../engine/index.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { gitPreflight, isGitBusy } from "./preflight.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { type GitRepoKind } from "./git-state.js";
+import { type JournalRecoveryResult } from "./journal.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
-import { getGitArtifact, git, headBranchOf, type GitArtifactReadStore, type RepoCtx } from "../../engine/git/shared.js";
-import { graphEnv } from "../../engine/git/reachability.js";
-import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
+import { getGitArtifact, headBranchOf, type GitArtifactReadStore, type RepoCtx } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
+import { graphEnv } from "./reachability.js";
+import { validateCanonicalGitConfig } from "./config-sync.js";
 import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
 import { gitCommitAncestry } from "./git-ancestry.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";

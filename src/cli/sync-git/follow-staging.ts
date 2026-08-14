@@ -5,23 +5,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  indexIdentityV2,
-  probeReceiverEquivalence,
-  receiverEquivalentCollisionNames,
-  receiverEquivalentPath,
-  type GitSection,
-} from "../../engine/index.js";
-import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
-import { listRefs } from "../../engine/git/refs.js";
-import { addTimedMs } from "../../engine/git/chain-timings.js";
-import {
-  clearIndexResolveUndo,
-  getGitArtifact,
-  git,
-  gitWithIndexFile,
-  importGitPackChain,
-} from "../../engine/git/shared.js";
+import { probeReceiverEquivalence, receiverEquivalentCollisionNames, receiverEquivalentPath, type GitSection } from "../../engine/index.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { pruneStaleScratchRefs } from "./pins.js";
+import { listRefs } from "./refs.js";
+import { addTimedMs } from "./chain-timings.js";
+import { clearIndexResolveUndo, getGitArtifact, importGitPackChain } from "./git-state.js";
+import { git, gitWithIndexFile } from "../../engine/git-spawn.js";
 import type { FollowOptions, StagedIncoming, StageIncomingOptions } from "./follow-types.js";
 
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();

@@ -11,13 +11,19 @@ import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type RepoR
 import { gitResolveCmd } from "../git/resolve-command.js";
 import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
-import { buildIgnoreMatcher, captureGitState, checkoutJournalDir, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
+import { buildIgnoreMatcher, MAX_PACK_CHAIN, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { checkoutJournalDir } from "./journal.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { gitPreflight } from "./preflight.js";
+import { gitSectionBlobRefs, gitSectionNewestLink } from "./git-state.js";
+import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import {
   MAX_GIT_CONFIG_KEYS,
   MAX_GIT_CONFIG_KEY_BYTES,
   MAX_GIT_CONFIG_SERIALIZED_BYTES,
   MAX_GIT_CONFIG_VALUE_BYTES,
-} from "../../engine/git/config-sync.js";
+} from "./config-sync.js";
 import {
   applyGitSections,
   GIT_FINGERPRINT_VERSION,
@@ -38,7 +44,7 @@ import { loadGitDivergenceCache, type GitDivergenceCacheEntry } from "./divergen
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { stateCasJournalDir } from "./state-cas-locks.js";
-import { keepPinRef, readKeepPinOrigins } from "../../engine/git/keep-pins.js";
+import { keepPinRef, readKeepPinOrigins } from "./keep-pins.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {

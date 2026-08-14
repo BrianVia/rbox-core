@@ -10,7 +10,7 @@ import {
   type GitBusyLock,
   type GitBusySharedInspection,
   type RepoCtx,
-} from "../../engine/git/shared.js";
+} from "./git-state.js";
 import {
   applyStateSavePacket,
   expectedStateNonce,

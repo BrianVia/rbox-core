@@ -18,7 +18,7 @@
  * - A tracked file MODIFIED-but-uncommitted and an UNTRACKED file are ordinary working-
  *   tree files → they sync through the PLAIN-FILE path like any other file (design 43
  *   §1/§7: "its files are already synced as plain files; its git state is its own").
- * - The captured `.git/index` is A's index verbatim (src/engine/git/capture.ts:57) and is
+ * - The captured `.git/index` is A's index verbatim (src/cli/sync-git/capture.ts:57) and is
  *   restored on B (apply.ts:286). A's uncommitted modification is NOT staged, so A's index
  *   still holds the committed blob for that path; B restores that same index. B's working
  *   file carries A's modified content (plain-file sync). So on B the file reads as

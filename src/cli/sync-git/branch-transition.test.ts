@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { baseAbsentArtifactRef, basePresentArtifactRef, readBasePresentArtifact, type ArtifactBinding } from "../../engine/index.js";
+import { baseAbsentArtifactRef, basePresentArtifactRef, readBasePresentArtifact } from "./base-artifacts.js";
+import { type ArtifactBinding } from "./repo-lineage.js";
 import {
   commitAbsentBranchVerification,
   commitPlannedBranchTransition,

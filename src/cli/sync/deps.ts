@@ -1,15 +1,5 @@
-import {
-  DirCache,
-  HashCache,
-  PhaseReport,
-  createScanStats,
-  scanPruneEnabled,
-  type Action,
-  type CaseFoldCollisionGroup,
-  type DiscoveredGitRepo,
-  type OwnedRefMutationBoundary,
-  type ScanStats,
-} from "../../engine/index.js";
+import { DirCache, HashCache, PhaseReport, createScanStats, scanPruneEnabled, type Action, type CaseFoldCollisionGroup, type DiscoveredGitRepo, type ScanStats } from "../../engine/index.js";
+import { type OwnedRefMutationBoundary } from "../sync-git/pins.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { EncryptAndUploadOptions } from "../sync-recovery.js";

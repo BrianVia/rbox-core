@@ -1,6 +1,6 @@
 import type { FileEntry, GitSection, Manifest } from "../../../engine/index.js";
-import type { PRepairReceipt } from "../../../engine/git/p-repair.js";
-import type { ConfigStatToken } from "../../../engine/git/config-txn.js";
+import type { PRepairReceipt } from "../../../cli/sync-git/p-repair.js";
+import type { ConfigStatToken } from "../../../cli/sync-git/config-txn.js";
 import type { BranchBaseOrigin } from "../../sync-git/base-composer.js";
 import type {
   ConfigShapeIdentity,

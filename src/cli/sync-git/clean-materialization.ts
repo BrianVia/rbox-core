@@ -1,13 +1,9 @@
-import {
-  assertGitTargetWithinRoot,
-  type ApplyBranchTransitionAdapter,
-  type ApplyBranchTransitionInput,
-  type ApplyGitResult,
-  type GitChainTimings,
-  type GitSection,
-  type RepoCtx,
-} from "../../engine/index.js";
-import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
+import { type GitSection } from "../../engine/index.js";
+import { assertGitTargetWithinRoot } from "./containment.js";
+import { type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type ApplyGitResult } from "./git-state-apply.js";
+import { type GitChainTimings } from "./chain-timings.js";
+import { type RepoCtx } from "./git-state.js";
+import { runUpdateRefTransaction } from "./keep-pins.js";
 import type { GitDeferralReason, GitPartialApply } from "../config.js";
 import { composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue } from "./base-composer.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";

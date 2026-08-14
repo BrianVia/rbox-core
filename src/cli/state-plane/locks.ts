@@ -9,10 +9,10 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { repoCtxFromDisk } from "../../engine/git/shared.js";
-import { acquireLock, type OwnedLock } from "../../engine/git/lockfile.js";
-import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../engine/git/protocol-locks.js";
-import { repositoryIdentityForContext, repositoryIdentityHash } from "../../engine/git/repo-lineage.js";
+import { repoCtxFromDisk } from "../../cli/sync-git/git-state.js";
+import { acquireLock, type OwnedLock } from "../../engine/lockfile.js";
+import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../cli/sync-git/protocol-locks.js";
+import { repositoryIdentityForContext, repositoryIdentityHash } from "../../cli/sync-git/repo-lineage.js";
 import { ResetMemoryAdmissionError } from "../reset-io.js";
 import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-journal.js";
 import { repoRecordsForState } from "../sync-state-model.js";

@@ -1,9 +1,5 @@
-import type {
-  BasePresentPayload,
-  GitRefScope,
-  GitSection,
-  PreparedProtocolRef,
-} from "../../engine/index.js";
+import type { GitRefScope, GitSection } from "../../engine/index.js";
+import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;

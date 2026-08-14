@@ -1,7 +1,7 @@
 import type { GitSection, Manifest } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
-import type { ConfigStatToken } from "../engine/git/config-txn.js";
-import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
+import type { ConfigStatToken } from "../cli/sync-git/config-txn.js";
+import { sanitizeGitSectionForPersistence } from "../cli/sync-git/config-sync.js";
 import {
   composeRepoBase,
   type BranchBaseOrigin,

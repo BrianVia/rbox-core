@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { gitIdentityKey, type GitIdentity, type GitSection } from "../../engine/index.js";
+import { type GitSection } from "../../engine/index.js";
+import { gitIdentityKey, type GitIdentity } from "./identity.js";
 import { carryRepoBaseProof, type RepoBaseProof } from "./base-composer.js";
 import { projectedKey } from "./shared.js";
 import {

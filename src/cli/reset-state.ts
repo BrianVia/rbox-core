@@ -1,26 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  SETTLED_ABSENCE_PREFIX,
-  artifactBinding,
-  checkoutJournalDir,
-  readSettledAbsence,
-  readStateLineageV1,
-  recoverJournal,
-  repositoryIdentityForContext,
-  repoCtxFromDisk,
-  scanBaseArtifacts,
-  settleBaseAbsentArtifact,
-  repositoryIdentityHash,
-  withRepositoryRecoveryFence,
-  readBasePresentArtifact,
-  runLockedPRepairAttempt,
-  resumeLockedAcceptedPRepair,
-  refreshLockedAcceptedPRepair,
-} from "../engine/index.js";
+import { SETTLED_ABSENCE_PREFIX, readSettledAbsence, settleBaseAbsentArtifact, readBasePresentArtifact } from "./sync-git/base-artifacts.js";
+import { artifactBinding, readStateLineageV1, repositoryIdentityForContext, repositoryIdentityHash } from "./sync-git/repo-lineage.js";
+import { checkoutJournalDir, recoverJournal } from "./sync-git/journal.js";
+import { repoCtxFromDisk } from "./sync-git/git-state.js";
+import { scanBaseArtifacts } from "./sync-git/base-artifact-scan.js";
+import { withRepositoryRecoveryFence } from "./sync-git/protocol-locks.js";
+import { runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair } from "./sync-git/p-repair-transaction.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
-import { acquireLock, captureCommonDirIdentity, type OwnedLock } from "../engine/git/lockfile.js";
-import { gitRaw } from "../engine/git/shared.js";
+import { acquireLock, captureCommonDirIdentity, type OwnedLock } from "../engine/lockfile.js";
+import { gitRaw } from "../engine/git-spawn.js";
 import {
   acquireWorkspaceSyncMutex,
   assertSyncMutex,

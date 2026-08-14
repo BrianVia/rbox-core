@@ -1,17 +1,15 @@
 import crypto from "node:crypto";
-import {
-  receiverEquivalentCollisionNames,
-  tipOwnedByIncoming,
-} from "../../engine/index.js";
-import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
-import { addTimedMs } from "../../engine/git/chain-timings.js";
+import { receiverEquivalentCollisionNames } from "../../engine/index.js";
+import { tipOwnedByIncoming } from "./reachability.js";
+import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
+import { addTimedMs } from "./chain-timings.js";
 import {
   humanDisplacementOrigin,
   prepareDisplacementPins,
   prepareTombstonePrunePins,
   runUpdateRefTransaction,
-} from "../../engine/git/keep-pins.js";
-import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
+} from "./keep-pins.js";
+import { readAllRefs, readAllRefsStrict } from "./refs.js";
 import type { GitDeferralReason, GitPartialApply, TypedBlocker } from "../config.js";
 import type { BranchTransitionWitness, LockedBranchProof, SafeRefWitness } from "./base-composer.js";
 import {

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { git } from "../../engine/git/shared.js";
+import { git } from "../../engine/git-spawn.js";
 import { gitCommitAncestry } from "./git-ancestry.js";
 
 const roots: string[] = [];

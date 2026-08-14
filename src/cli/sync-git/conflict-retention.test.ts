@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { repoCtxFromDisk, setGitSpawnObserver } from "../../engine/index.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import { CONFLICT_REF_PRUNE_LIMIT, CONFLICT_REF_RETENTION_MS, inspectConflictRefs, pruneConflictRefs } from "./conflict-retention.js";
 
 const exec = promisify(execFile);

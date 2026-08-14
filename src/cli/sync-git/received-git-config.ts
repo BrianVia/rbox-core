@@ -1,13 +1,14 @@
 import path from "node:path";
-import type { GitSection, RepoCtx } from "../../engine/index.js";
-import { repoCtxFromDisk } from "../../engine/index.js";
-import { validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
+import type { GitSection } from "../../engine/index.js";
+import type { RepoCtx } from "./git-state.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { validateCanonicalGitConfig, type GitConfig } from "./config-sync.js";
 import {
   readConfigSnapshot,
   sameConfigStatToken,
   type ConfigStatToken,
   type ConfigTransactionResult,
-} from "../../engine/git/config-txn.js";
+} from "./config-txn.js";
 import type { ConfigShapeIdentity, RepoRecordInput } from "../config.js";
 import { completeConfigApply, configLaneState, type ConfigLaneState } from "../sync-state.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, sameConfigShape } from "./config-lane.js";

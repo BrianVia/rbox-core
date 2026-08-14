@@ -2,8 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { git } from "../../engine/git/shared.js";
-import { gitPreflight, hashBytes } from "../../engine/index.js";
+import { git } from "../../engine/git-spawn.js";
+import { hashBytes } from "../../engine/index.js";
+import { gitPreflight } from "./preflight.js";
 import type { GitHeldAttempt, TypedBlocker } from "../config.js";
 import { GIT_FINGERPRINT_SCHEMA_VERSION, GIT_FINGERPRINT_VERSION } from "./fingerprint.js";
 import {
@@ -11,7 +12,7 @@ import {
   MAX_GIT_CONFIG_KEY_BYTES,
   MAX_GIT_CONFIG_SERIALIZED_BYTES,
   MAX_GIT_CONFIG_VALUE_BYTES,
-} from "../../engine/git/config-sync.js";
+} from "./config-sync.js";
 import { gitIncomingKey } from "./shared.js";
 import {
   blockersAfterComposer,

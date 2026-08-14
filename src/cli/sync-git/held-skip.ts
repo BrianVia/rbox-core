@@ -1,7 +1,8 @@
-import { hashBytes, readRepoIdentityV1, repositoryIdentityHash, type GitSection } from "../../engine/index.js";
+import { hashBytes, type GitSection } from "../../engine/index.js";
+import { readRepoIdentityV1, repositoryIdentityHash } from "./repo-lineage.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
-import { readRefReflogFingerprint } from "../../engine/git/keep-pins.js";
-import { listWorktrees } from "../../engine/git/shared.js";
+import { readRefReflogFingerprint } from "./keep-pins.js";
+import { listWorktrees } from "./git-state.js";
 import {
   applyStateSavePacket,
   expectedStateNonce,

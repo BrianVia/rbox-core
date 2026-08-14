@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { hashBytes, isSyncableRef, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js";
+import { hashBytes, isSyncableRef } from "../../engine/index.js";
+import { repoCtxFromDisk, type RepoCtx } from "./git-state.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
-import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "../../engine/git/config-sync.js";
-import { git } from "../../engine/git/shared.js";
+import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "./config-sync.js";
+import { git } from "../../engine/git-spawn.js";
 import { repoDirOf } from "./shared.js";
 // Classifier semantics participate in the schema because held decisions must
 // be reprobed when an unchanged on-disk marker changes meaning.

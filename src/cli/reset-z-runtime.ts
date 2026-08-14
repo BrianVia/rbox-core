@@ -1,8 +1,8 @@
 import {
   readRepoIdentityV1,
   repositoryIdentityHash,
-} from "../engine/git/repo-lineage.js";
-import { gitRaw } from "../engine/git/shared.js";
+} from "../cli/sync-git/repo-lineage.js";
+import { gitRaw } from "../engine/git-spawn.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import type { PrefixDisposition } from "./reset-journal-classifier.js";
 import type { ResetZEntry } from "./reset-z.js";

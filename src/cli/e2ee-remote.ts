@@ -22,21 +22,8 @@ import {
 import { activeSigners } from "../engine/e2ee/roster.js";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
-import {
-  canonicalManifestHash,
-  canonicalManifestHashStreaming,
-  decodeEnvelope,
-  encodeDeltaEnvelope,
-  encodeSnapshotEnvelope,
-  foldDelta,
-  gitSectionBlobRefs,
-  hasEnvelopePrefix,
-  ManifestChainError,
-  MAX_MANIFEST_DELTA_CHAIN,
-  poolMap,
-  type BlobStore,
-  type Manifest,
-} from "../engine/index.js";
+import { canonicalManifestHash, canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, encodeSnapshotEnvelope, foldDelta, hasEnvelopePrefix, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, poolMap, type BlobStore, type Manifest } from "../engine/index.js";
+import { gitSectionBlobRefs } from "./sync-git/git-state.js";
 import type { GlobalManifestMeta } from "./config.js";
 import type { CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo } from "./e2ee-remote-types.js";
 import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";

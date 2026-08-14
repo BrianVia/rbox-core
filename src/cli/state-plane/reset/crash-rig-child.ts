@@ -10,7 +10,7 @@ import { runStatement } from "../store/statements.js";
 import { sqliteResetFacade } from "./index.js";
 import { sqliteResetPaths } from "./artifacts.js";
 import { stableDbHash } from "./artifacts.js";
-import { readRepoIdentityV1, repositoryIdentityHash } from "../../../engine/git/repo-lineage.js";
+import { readRepoIdentityV1, repositoryIdentityHash } from "../../../cli/sync-git/repo-lineage.js";
 import type { ResetZEntry } from "../../reset-z.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

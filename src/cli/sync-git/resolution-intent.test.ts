@@ -2,8 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { captureGitState, LocalBlobStore, type BlobStore, type GitSection } from "../../engine/index.js";
-import { git, repoCtx } from "../../engine/git/shared.js";
+import { LocalBlobStore, type BlobStore, type GitSection } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { repoCtx } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
 import type { GitResolutionBinding } from "../config.js";
 import { discardedIncomingOids, finalResolutionReport, preliminaryResolutionReport, reportAuthorized, type ResolutionDiscardReport } from "./resolution-intent.js";
 

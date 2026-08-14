@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { captureGitState, GIT_REF_SIGNAL_TAIL_TABLE, isGitRefSignal, type BlobStore, type OwnedRefMutationBoundary } from "../../engine/index.js";
+import { GIT_REF_SIGNAL_TAIL_TABLE, isGitRefSignal, type BlobStore } from "../../engine/index.js";
+import { captureGitState } from "../sync-git/capture.js";
+import { type OwnedRefMutationBoundary } from "../sync-git/pins.js";
 import {
   GitRefWatchRegistry,
   classifyRefEvent,

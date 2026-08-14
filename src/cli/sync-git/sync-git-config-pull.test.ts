@@ -4,21 +4,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  buildIgnoreMatcher,
-  captureGitState,
-  gitIdentity,
-  gitIdentityKey,
-  repoCtxFromDisk,
-  validateManifest,
-  writeCheckoutJournal,
-  type CheckoutJournal,
-  type GitSection,
-  type Manifest,
-} from "../../engine/index.js";
-import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-sync.js";
-import { readConfigSnapshot } from "../../engine/git/config-txn.js";
+import { LocalBlobStore, buildIgnoreMatcher, validateManifest, type GitSection, type Manifest } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
+import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "./config-sync.js";
+import { readConfigSnapshot } from "./config-txn.js";
 import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
 import { applyGitSections, gitConfigHash } from "../sync-git.js";

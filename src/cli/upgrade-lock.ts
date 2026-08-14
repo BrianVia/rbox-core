@@ -1,4 +1,4 @@
-import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, type OwnedLock } from "../engine/lockfile.js";
 
 export interface UpgradeLockContext {
   elevated: boolean;

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { inspectGitBusyShared, type GitBusyInspection, type GitBusySharedInspection, type RepoCtx } from "../../engine/git/shared.js";
+import { inspectGitBusyShared, type GitBusyInspection, type GitBusySharedInspection, type RepoCtx } from "./git-state.js";
 import {
   applyStateSavePacket,
   loadState,

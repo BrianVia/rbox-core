@@ -158,7 +158,7 @@ async function basenameHexSet(device: Device, directory: string): Promise<string
 
 /** Execute the product preflight in the guest; expected text remains shared. */
 async function productPreflightReason(device: Device, rel: string): Promise<string> {
-  const script = `import { gitPreflight } from '/app/src/engine/git/preflight.ts'; const r = await gitPreflight(${JSON.stringify(`${GUEST.workDir}/`)} + process.argv[1]); console.log(r.reason ?? '');`;
+  const script = `import { gitPreflight } from '/app/src/cli/sync-git/preflight.ts'; const r = await gitPreflight(${JSON.stringify(`${GUEST.workDir}/`)} + process.argv[1]); console.log(r.reason ?? '');`;
   return (await device.exec(["bun", "-e", script, rel])).stdout.trim();
 }
 

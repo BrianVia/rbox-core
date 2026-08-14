@@ -3,7 +3,7 @@ import { rmSync, symlinkSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireLock } from "../../engine/git/lockfile.js";
+import { acquireLock } from "../../engine/lockfile.js";
 import {
   AUTHORITY_MARKER_BYTES,
   AUTHORITY_MARKER_MAGIC,

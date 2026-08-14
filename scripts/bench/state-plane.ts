@@ -8,7 +8,7 @@ import { applySavePacketToStore } from "../../src/cli/state-plane/adapters/sqlit
 import { loadRawStateFromStore } from "../../src/cli/state-plane/adapters/read-only.js";
 import { createStateStore } from "../../src/cli/state-plane/store/open.js";
 import { casOwnerTokenFromLock } from "../../src/cli/state-plane/store/owner-token.js";
-import type { OwnedLock } from "../../src/engine/git/lockfile.js";
+import type { OwnedLock } from "../../src/engine/lockfile.js";
 
 const DEFAULT_N = 119_000;
 const count = Number(process.env.BENCH_N ?? DEFAULT_N);

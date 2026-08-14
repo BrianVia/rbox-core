@@ -1,15 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  enumerateStashReflogOids,
-  noDropProof,
-  receiverEquivalentCollisionNames,
-  tipOwnedByIncoming,
-  type OwnershipProofContext,
-} from "../../engine/index.js";
-import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
-import { addTimedMs } from "../../engine/git/chain-timings.js";
-import { headBranchOf, warnOnce } from "../../engine/git/shared.js";
+import { receiverEquivalentCollisionNames } from "../../engine/index.js";
+import { enumerateStashReflogOids, noDropProof, tipOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
+import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
+import { addTimedMs } from "./chain-timings.js";
+import { headBranchOf, warnOnce } from "./git-state.js";
 import type { GitDeferralReason, TypedBlocker } from "../config.js";
 import { branchBaseOriginMatches } from "./base-composer.js";
 import { loadContentEquivalenceCache } from "./content-equivalence-cache.js";

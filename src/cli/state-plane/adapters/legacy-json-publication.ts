@@ -10,7 +10,7 @@
  */
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
-import type { OwnedLock } from "../../../engine/git/lockfile.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
 import { assertStatePublishable } from "../authority-marker.js";
 import { StateWriteRefusedError } from "../errors.js";
 import { ensureStateReserve } from "../migration/reserve.js";

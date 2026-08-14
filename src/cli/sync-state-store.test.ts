@@ -2,8 +2,8 @@ import { expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireLock } from "../engine/git/lockfile.js";
-import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
+import { acquireLock } from "../engine/lockfile.js";
+import { withRepositoryRecoveryFence } from "../cli/sync-git/protocol-locks.js";
 import {
   applyStateSavePacket,
   installGenesisResetStateUnderHeldLock,
