@@ -999,6 +999,28 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   expect((await loadActivity(root))?.lastPush?.sequence).toBe(1);
 });
 
+test("#661: a committed push's report settles at its own boundary, not behind later queued work", async () => {
+  const remote = new MiniRemote();
+  const logs: string[] = [];
+  const daemon: DaemonInternals = await makeDaemon(remote, "push-settle-boundary", {
+    log: (line: string) => {
+      logs.push(line);
+      // The field shape (#661): publishing provokes a pull that the same pump loop
+      // then services. The push's report must already be out.
+      if (line.startsWith("push: published sequence")) daemon.want.pull = true;
+    },
+  });
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.local.head = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  const pushSummary = logs.findIndex((line) => line.startsWith("rbox push "));
+  const pullRun = logs.findIndex((line) => line.startsWith("pull local="));
+  expect(pushSummary).toBeGreaterThanOrEqual(0);
+  expect(pullRun).toBeGreaterThan(pushSummary);
+});
+
 test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
