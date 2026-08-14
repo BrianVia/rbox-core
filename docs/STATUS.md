@@ -5,6 +5,31 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_POST-MIDNIGHT BENCH VERDICT (2026-08-14 ~05:30Z, fleet on 26a4de7 + RBOX_TRACE_PROPAGATION=1 restarts; Mac = #664 boot 5): 30-attempt
+traced propagation run — **receiver + scheduling SOLVED** (write→settle
+491ms, settle→push-begin 200ms, WS→dequeue ≤170ms, apply 3.3s FM / 9.3s
+Mac), **sender push op is the whole remaining cost**: 64s on the closing
+attempt, FM 11/26 attempts ≤10s, Mac 0/18. Named suspect: a ~40-60s
+POST-STATE-SAVE TAIL inside content-carrying push ops (`state-save→end
+44.3s` seen solo) that no ms[] bucket attributes — instrument the push
+epilogue FIRST, then trusted-view push (kills Mac 2.7-5.2s rescan gap —
+spans exonerated lineage/matcher), then git-plan cy/f/cp on many-repo hosts.
+Detail + ranking on #661. ALSO SETTLED TONIGHT (short-circuited, no
+overnight wait): echo-ring proof COMPLETE (idle FM publishes only real
+content post-fix, zero ops=0, b2 never fired — config-authorship suspect
+UNCONFIRMED by direct state probe, no fix built); #686 merged (join-ahead
+was design-231-correct behavior, scenario now enrolls a 2nd device + pins
+the refusal — rig FAST whole, first since Jul 31); #687 merged (RboxBar
+ships with every tag — universal, tag-versioned, fail-closed; signing/
+upgrade-integration = founder decisions); #688 filed then DE-SCOPED by
+founder decision: external users START FRESH on 2.0 (upgrade note deleted;
+residual = cheap up-front refusal guard); rbox-home PR #14 open awaiting
+founder (next/install.sh served the SPA — one-line redirect); FM churn:
+Personal/home-dashboard/build.log rewrites every 10min and wakes the fleet
+(ignore-rule candidate, founder's project); Mac RSS 15→19GB across the
+evening (#664 watch, now loop-free baseline); Mac ignore-counter 35,723 vs
+0 elsewhere — matcher divergence suspicion, do NOT purge from the Mac._
+
 _NIGHT CAP (2026-08-13, fleet now on **26a4de7**, 17 PRs total): **#683 echo
 ring + conflict loop FIXED (#685, design 244)** — root cause was NOT the
 hypothesized zero-backoff: the desktop published EMPTY sequences forever
