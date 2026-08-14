@@ -514,7 +514,6 @@ async function runPushAttempt(
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
   let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
-  const candidateProjectionT0 = performance.now();
   const stateLineageT0 = performance.now();
   state = await ensureCapableStateLineage(root, state);
   const stateLineageMs = performance.now() - stateLineageT0;
@@ -682,10 +681,8 @@ async function runPushAttempt(
       onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
     },
   );
-  const candidateProjectionMs = performance.now() - candidateProjectionT0;
   report.appendDetails("git-plan", { state_lineage_ms: stateLineageMs }, formatPushSpan("state_lineage_ms", stateLineageMs));
   report.appendDetails("git-plan", { matcher_ms: matcherMs }, formatPushSpan("matcher_ms", matcherMs));
-  report.appendDetails("git-plan", { candidate_projection_ms: candidateProjectionMs }, formatPushSpan("candidate_projection_ms", candidateProjectionMs));
   const publication = sealed.publication;
   local = sealed.candidate;
   if (sealed.admission === "no-op") {
@@ -793,7 +790,6 @@ async function runPushAttempt(
       }
     }
     const deltaBaseMs = performance.now() - deltaBaseT0;
-    report.appendDetails("git-plan", { delta_base_ms: deltaBaseMs }, formatPushSpan("delta_base_ms", deltaBaseMs));
     const parentSequence = repair?.parentSequence ?? appliedSequence;
     let keepMineArm: GitResolutionPublicationReceipt | undefined;
     if (resolution && publication.resolution?.outcome === "published") {
@@ -876,6 +872,7 @@ async function runPushAttempt(
       },
       commitPort,
     );
+    report.appendDetails("commit", { delta_base_ms: deltaBaseMs }, formatPushSpan("delta_base_ms", deltaBaseMs));
 
     if (commitReceipt.kind === "ack-uncertain") {
       return { done: true, result: {
@@ -948,7 +945,7 @@ async function runPushAttempt(
             expectedStream: syncStreamId(cfg),
             sourceGlobalSeq: write.acceptedSequence,
             globalManifest: write.globalManifest,
-            ...(write.manifestMeta ? { manifestMeta: write.manifestMeta } : {}),
+            manifestMeta: write.manifestMeta,
             observedRepos: write.observedRepos,
             values: write.values,
             repoProofs: write.repoProofs,
