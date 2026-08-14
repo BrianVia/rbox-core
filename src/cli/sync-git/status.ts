@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { discoverGitRepos, poolMap, repoCtxFromDisk, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
-import { type GitConfigRunner } from "../../engine/git/config-txn.js";
+import { discoverGitRepos, poolMap, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import { repoCtxFromDisk, type GitRepoKind } from "./git-state.js";
+import { type GitConfigRunner } from "./config-txn.js";
 import { DEFERRAL_LANES, repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
 import { knownRepoKeys } from "../sync-state-model.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";

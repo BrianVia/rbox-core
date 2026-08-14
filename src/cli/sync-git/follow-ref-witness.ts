@@ -5,7 +5,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection } from "../../engine/index.js";
-import { git, repoCtx, type RepoCtx } from "../../engine/git/shared.js";
+import { repoCtx, type RepoCtx } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
 import type { GitPartialApply } from "../config.js";
 
 export async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {

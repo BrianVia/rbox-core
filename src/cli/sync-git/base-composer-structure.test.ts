@@ -181,14 +181,14 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     // when follow.ts was split into domain modules. Count unchanged.
     "src/cli/sync-git/follow-staging.ts": 1,
     "src/cli/sync-git/orig-head.ts": 1,
-    "src/engine/git/apply.ts": 3,
-    "src/engine/git/base-artifacts.ts": 1,
-    "src/engine/git/checkout-txn.ts": 1,
-    "src/engine/git/keep-pins.ts": 2,
-    "src/engine/git/pins.ts": 1,
-    "src/engine/git/quarantine.ts": 3,
-    "src/engine/git/rollback.ts": 4,
-    "src/engine/git/v1724-journal-fixture.test-helper.ts": 1,
+    "src/cli/sync-git/git-state-apply.ts": 3,
+    "src/cli/sync-git/base-artifacts.ts": 1,
+    "src/cli/sync-git/checkout-txn.ts": 1,
+    "src/cli/sync-git/keep-pins.ts": 2,
+    "src/cli/sync-git/pins.ts": 1,
+    "src/cli/sync-git/quarantine.ts": 3,
+    "src/cli/sync-git/rollback.ts": 4,
+    "src/cli/sync-git/v1724-journal-fixture.test-helper.ts": 1,
   });
 });
 

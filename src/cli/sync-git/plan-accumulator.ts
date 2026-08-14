@@ -5,7 +5,7 @@ import type { GitDeferralReason, SyncState } from "../config.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { repoRecordsForState } from "../config.js";
 import { emptyToUndef } from "./shared.js";
-import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
+import { sanitizeGitSectionForPersistence } from "./config-sync.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 import type { GitPlanOptions, GitPlanStats, GitPushPlan } from "./plan.js";
 

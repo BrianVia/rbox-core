@@ -17,7 +17,8 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { gitSectionBlobRefs } from "./sync-git/git-state.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, mdeWritePolicy, resetMdeWritePolicyWarnOnceForTests, SIDECAR_THRESHOLD } from "./e2ee-remote.js";

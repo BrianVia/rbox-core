@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { RBOX_DIR } from "../config.js";
-import { acquireLock, type OwnedLock } from "../../engine/git/lockfile.js";
+import { acquireLock, type OwnedLock } from "../../engine/lockfile.js";
 import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import { currentWorkspaceId, daemonRuntimeDir, type DaemonModeIntent } from "../daemon-control.js";
 import { credentialsForStrictFlow, loadCredentials } from "../credentials.js";

@@ -17,8 +17,8 @@ import {
   type DoctorChecks,
   type DoctorContext,
 } from "./doctor-cmd.js";
-import { git } from "../engine/git/shared.js";
-import { gitIdentity, gitIdentityKey } from "../engine/index.js";
+import { git } from "../engine/git-spawn.js";
+import { gitIdentity, gitIdentityKey } from "./sync-git/identity.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";

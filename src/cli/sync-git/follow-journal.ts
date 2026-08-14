@@ -3,9 +3,9 @@
  * unbindable one, clear a settled one. Moved verbatim out of follow.ts. */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { clearCheckoutJournal, recoverJournal, type CheckoutJournalBinding } from "../../engine/index.js";
-import { captureCommonDirIdentity } from "../../engine/git/lockfile.js";
-import type { RepoCtx } from "../../engine/git/shared.js";
+import { clearCheckoutJournal, recoverJournal, type CheckoutJournalBinding } from "./journal.js";
+import { captureCommonDirIdentity } from "../../engine/lockfile.js";
+import type { RepoCtx } from "./git-state.js";
 import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
 import { observedLandingRepoBaseProof, recordOriginLineage } from "./base-composer.js";
 import type { FollowIntended, FollowOptions } from "./follow-types.js";

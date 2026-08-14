@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireLock } from "../../engine/git/lockfile.js";
+import { acquireLock } from "../../engine/lockfile.js";
 import { resetJournalPath } from "../reset-journal.js";
 import { workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";

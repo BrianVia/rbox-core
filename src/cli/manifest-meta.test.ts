@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { canonicalManifestHashStreaming, type GitSection } from "../engine/index.js";
-import type { LockIdentitySource } from "../engine/git/lockfile.js";
+import type { LockIdentitySource } from "../engine/lockfile.js";
 import {
   applyStateSavePacket,
   loadState,

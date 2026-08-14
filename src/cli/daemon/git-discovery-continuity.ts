@@ -1,4 +1,5 @@
-import type { DiscoveredGitRepo, OwnedRefMutationLease } from "../../engine/index.js";
+import type { DiscoveredGitRepo } from "../../engine/index.js";
+import type { OwnedRefMutationLease } from "../sync-git/pins.js";
 import { errCode } from "./logger.js";
 import {
   GitRefWatchRegistry,

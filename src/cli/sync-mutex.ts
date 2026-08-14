@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/lockfile.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { resolveDaemonLogSources } from "./daemon-control.js";
 import { inspectAdoptFence } from "./adopt-journal.js";

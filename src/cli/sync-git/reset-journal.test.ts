@@ -5,17 +5,17 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
-import { artifactBinding, readRepoIdentityV1, readStateLineageV1, repositoryIdentityHash } from "../../engine/git/repo-lineage.js";
-import { checkoutJournalDir } from "../../engine/git/journal.js";
+import { artifactBinding, readRepoIdentityV1, readStateLineageV1, repositoryIdentityHash } from "./repo-lineage.js";
+import { checkoutJournalDir } from "./journal.js";
 import {
   commitProtocolRefTransaction,
   prepareBaseAbsentArtifact,
   prepareBasePresentArtifact,
   readBaseAbsentArtifact,
   readBasePresentArtifact,
-} from "../../engine/git/base-artifacts.js";
-import { gitRaw, setGitSpawnObserver } from "../../engine/git/shared.js";
-import type { RepoIdentityV1 } from "../../engine/git/repo-lineage.js";
+} from "./base-artifacts.js";
+import { gitRaw, setGitSpawnObserver } from "../../engine/git-spawn.js";
+import type { RepoIdentityV1 } from "./repo-lineage.js";
 import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
 import {
   beginResetJournal,

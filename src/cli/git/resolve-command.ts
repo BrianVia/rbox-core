@@ -2,33 +2,20 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import {
-  assertGitTargetWithinRoot,
-  buildIgnoreMatcher,
-  checkoutJournalDir,
-  incomingOwnershipRoots,
-  isGitBusy,
-  gitPreflight,
-  oracleFromState,
-  partitionOwnedByIncoming,
-  receiverEquivalentCollisionNames,
-  type AppliedManifestOracle,
-  type BlobStore,
-  type CheckoutCapabilityProbe,
-  type GitSection,
-  settleBaseAbsentArtifact,
-  inspectLockedPRepairReceipt,
-  persistPRepairTerminal,
-  readBasePresentArtifact,
-  refreshLockedAcceptedPRepair,
-  resumeLockedAcceptedPRepair,
-  runLockedPRepairAttempt,
-} from "../../engine/index.js";
-import { pinDisplaced } from "../../engine/git/keep-pins.js";
-import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
-import { quarantineLocal } from "../../engine/git/quarantine.js";
-import { hasInProgressOpState, readAllRefs, readAllRefsStrict, readOpStateSnapshot } from "../../engine/git/refs.js";
-import { git, headBranchOf, repoCtx, type RepoCtx } from "../../engine/git/shared.js";
+import { buildIgnoreMatcher, oracleFromState, receiverEquivalentCollisionNames, type AppliedManifestOracle, type BlobStore, type GitSection } from "../../engine/index.js";
+import { assertGitTargetWithinRoot } from "../sync-git/containment.js";
+import { checkoutJournalDir } from "../sync-git/journal.js";
+import { incomingOwnershipRoots, partitionOwnedByIncoming } from "../sync-git/reachability.js";
+import { isGitBusy, gitPreflight } from "../sync-git/preflight.js";
+import { type CheckoutCapabilityProbe } from "../sync-git/checkout-txn.js";
+import { settleBaseAbsentArtifact, readBasePresentArtifact } from "../sync-git/base-artifacts.js";
+import { inspectLockedPRepairReceipt, persistPRepairTerminal, refreshLockedAcceptedPRepair, resumeLockedAcceptedPRepair, runLockedPRepairAttempt } from "../sync-git/p-repair-transaction.js";
+import { pinDisplaced } from "../../cli/sync-git/keep-pins.js";
+import { branchesCheckedOutElsewhereStrict } from "../../cli/sync-git/git-state-apply.js";
+import { quarantineLocal } from "../../cli/sync-git/quarantine.js";
+import { hasInProgressOpState, readAllRefs, readAllRefsStrict, readOpStateSnapshot } from "../../cli/sync-git/refs.js";
+import { headBranchOf, repoCtx, type RepoCtx } from "../../cli/sync-git/git-state.js";
+import { git } from "../../engine/git-spawn.js";
 import { hashBytes, hashFile } from "../../engine/hash.js";
 import {
   expectedStateNonce,

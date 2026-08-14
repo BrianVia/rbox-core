@@ -17,7 +17,7 @@ import type { GitDeferral, GitDeferralReason, RepoRecord } from "./sync-state-mo
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
-import type { CheckoutTransactionCapability } from "../engine/index.js";
+import type { CheckoutTransactionCapability } from "./sync-git/checkout-txn.js";
 import type { LockingHealth } from "./sync-mutex.js";
 import type { AmbientWatcherTrust } from "./daemon/ambient-status.js";
 

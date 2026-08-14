@@ -6,10 +6,10 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import type { JsonValue } from "../json.js";
-import type { AcquireLockOptions, OwnedLock } from "../engine/git/lockfile.js";
-import type { ConfigStatToken } from "../engine/git/config-txn.js";
-import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
-import type { PRepairReceipt } from "../engine/git/p-repair.js";
+import type { AcquireLockOptions, OwnedLock } from "../engine/lockfile.js";
+import type { ConfigStatToken } from "./sync-git/config-txn.js";
+import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
+import type { PRepairReceipt } from "./sync-git/p-repair.js";
 import {
   carryRepoBaseProof,
   composeRepoBase,

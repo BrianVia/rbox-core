@@ -1,19 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  gitIdentity,
-  hashBytes,
-  indexIdentityV2,
-  readRepoIdentityV1,
-  repositoryIdentityHash,
-  type AppliedManifestOracle,
-  type GitSection,
-  type RepoCtx,
-} from "../../engine/index.js";
+import { hashBytes, type AppliedManifestOracle, type GitSection } from "../../engine/index.js";
+import { gitIdentity } from "./identity.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { readRepoIdentityV1, repositoryIdentityHash } from "./repo-lineage.js";
+import { type RepoCtx } from "./git-state.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
-import { enumerateRefReflogOids } from "../../engine/git/keep-pins.js";
-import { readAllRefs, readOpState } from "../../engine/git/refs.js";
-import { exists, getGitArtifact, git, type GitArtifactReadStore } from "../../engine/git/shared.js";
+import { enumerateRefReflogOids } from "./keep-pins.js";
+import { readAllRefs, readOpState } from "./refs.js";
+import { exists, getGitArtifact, type GitArtifactReadStore } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
 import { hashFile } from "../../engine/hash.js";
 import {
   expectedStateNonce,

@@ -1,18 +1,10 @@
 import path from "node:path";
-import {
-  basePresentKeepRef,
-  PreparedRefTransactionPrepareError,
-  readBasePresentArtifact,
-  readRefReflogFingerprint,
-  runPreparedUpdateRefTransaction,
-  withProtocolLockClass,
-  withRepoProtocolLocks,
-  type ArtifactBinding,
-  type BasePresentPayload,
-  type PreparedProtocolRef,
-  type RepoCtx,
-} from "../../engine/index.js";
-import { ZERO_OID } from "../../engine/git/shared.js";
+import { basePresentKeepRef, readBasePresentArtifact, type BasePresentPayload, type PreparedProtocolRef } from "./base-artifacts.js";
+import { PreparedRefTransactionPrepareError, readRefReflogFingerprint, runPreparedUpdateRefTransaction } from "./keep-pins.js";
+import { withProtocolLockClass, withRepoProtocolLocks } from "./protocol-locks.js";
+import { type ArtifactBinding } from "./repo-lineage.js";
+import { type RepoCtx } from "./git-state.js";
+import { ZERO_OID } from "./git-state.js";
 import {
   applyStateSavePacket,
   loadRawState,

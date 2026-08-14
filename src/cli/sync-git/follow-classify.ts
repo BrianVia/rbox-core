@@ -8,14 +8,10 @@
  * and the timed override `classifyCheckout` passes it — and neither changes the
  * number of git subprocesses spawned. Moved verbatim out of follow.ts. */
 import path from "node:path";
-import {
-  enumerateStashReflogOids,
-  partitionOwnedByIncoming,
-  type RepoCtx,
-  type OwnershipProofContext,
-} from "../../engine/index.js";
+import { enumerateStashReflogOids, partitionOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
+import { type RepoCtx } from "./git-state.js";
 import { OP_STATE_CLASSIFICATION } from "../../engine/manifest-validate.js";
-import { addTimedMs } from "../../engine/git/chain-timings.js";
+import { addTimedMs } from "./chain-timings.js";
 import type { GitDeferralReason, GitPartialApply, TypedBlocker } from "../config.js";
 import { GIT_DEFERRAL_REASON_RANK } from "../sync-state-model.js";
 import {

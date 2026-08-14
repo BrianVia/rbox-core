@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
-import { formatLockMarker, observeLockMarker, publishLockMarker, releaseObservedLock, type ProcessIncarnation } from "../../engine/git/lockfile.js";
+import { formatLockMarker, observeLockMarker, publishLockMarker, releaseObservedLock, type ProcessIncarnation } from "../../engine/lockfile.js";
 import {
   acquirePreparedStateCasLocks,
   classifyStateCasLockEvidence,

@@ -1,15 +1,8 @@
-import type {
-  ArtifactBinding,
-  ArtifactReadResult,
-  BasePresentPayload,
-  GitRefScope,
-  GitSection,
-  PreparedProtocolRef,
-  PRepairAttemptResult,
-  PRepairReceipt,
-  PRepairResumeResult,
-  PRepairRetryAction,
-} from "../../engine/index.js";
+import type { GitRefScope, GitSection } from "../../engine/index.js";
+import type { ArtifactBinding } from "./repo-lineage.js";
+import type { ArtifactReadResult, BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
+import type { PRepairAttemptResult, PRepairResumeResult } from "./p-repair-transaction.js";
+import type { PRepairReceipt, PRepairRetryAction } from "./p-repair.js";
 import type { GitDeferralReason, RepoRecord, SyncState } from "../config.js";
 import { repoRecordsForState } from "../config.js";
 import type { FollowerBranchProtocol, FollowerBranchProtocolResult } from "./follower-protocol.js";

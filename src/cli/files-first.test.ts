@@ -13,7 +13,8 @@ import { promisify } from "node:util";
 import { filesFirstFlagEnabled, push, type SyncDeps } from "./sync.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { PhaseReport, gitSectionBlobRefs, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { PhaseReport, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { gitSectionBlobRefs } from "./sync-git/git-state.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { firstPublishTiming } from "./upload-lane-timing.js";
 

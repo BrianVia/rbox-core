@@ -2,7 +2,7 @@
  * refused. Run: rbox-lockdoctor [dir]  (defaults to ~/src). Prints each step
  * and the precise thrown error; never mutates the workspace. */
 import { acquireWorkspaceSyncMutex } from "./sync-mutex.js";
-import { refreshSystemLockIdentityLedger, resolveDarwinIdentityComponents, hostIdentityLedgerPath } from "../engine/git/lockfile.js";
+import { refreshSystemLockIdentityLedger, resolveDarwinIdentityComponents, hostIdentityLedgerPath } from "../engine/lockfile.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";

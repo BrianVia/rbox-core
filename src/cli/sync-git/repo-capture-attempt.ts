@@ -1,16 +1,10 @@
-import {
-  gitIdentity,
-  gitIdentityKey,
-  gitPreflight,
-  isGitBusy,
-  repoCtxFromDisk,
-  type GitRepoKind,
-  type GitSection,
-  type OwnedRefMutationBoundary,
-  type RepoCtx,
-} from "../../engine/index.js";
-import type { PendingGitUpload } from "../../engine/git/shared.js";
-import type { GitConfigRunner } from "../../engine/git/config-txn.js";
+import { type GitSection } from "../../engine/index.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { gitPreflight, isGitBusy } from "./preflight.js";
+import { repoCtxFromDisk, type GitRepoKind, type RepoCtx } from "./git-state.js";
+import { type OwnedRefMutationBoundary } from "./pins.js";
+import type { PendingGitUpload } from "./git-state.js";
+import type { GitConfigRunner } from "./config-txn.js";
 import type { GitDeferralReason, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";

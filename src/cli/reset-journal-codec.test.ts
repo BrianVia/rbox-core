@@ -10,7 +10,7 @@ import {
   type ResetJournalV2,
   type SQLiteResetJournalV2,
 } from "./reset-journal-codec.js";
-import { repositoryIdentityHash, type RepoIdentityV1 } from "../engine/git/repo-lineage.js";
+import { repositoryIdentityHash, type RepoIdentityV1 } from "../cli/sync-git/repo-lineage.js";
 
 const line = (value: unknown): Buffer =>
   Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);

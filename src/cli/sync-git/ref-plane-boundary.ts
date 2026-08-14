@@ -1,13 +1,11 @@
 import path from "node:path";
-import {
-  ownershipProofContext,
-  receiverEquivalentCollisionNames,
-} from "../../engine/index.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
-import { addClassifyTimedMs, addTimedMs } from "../../engine/git/chain-timings.js";
-import { readRefReflogFingerprint } from "../../engine/git/keep-pins.js";
-import { readAllRefsStrict } from "../../engine/git/refs.js";
-import { exists, headBranchOf, readHead, repoCtx } from "../../engine/git/shared.js";
+import { receiverEquivalentCollisionNames } from "../../engine/index.js";
+import { ownershipProofContext } from "./reachability.js";
+import { branchesCheckedOutElsewhere } from "./git-state-apply.js";
+import { addClassifyTimedMs, addTimedMs } from "./chain-timings.js";
+import { readRefReflogFingerprint } from "./keep-pins.js";
+import { readAllRefsStrict } from "./refs.js";
+import { exists, headBranchOf, readHead, repoCtx } from "./git-state.js";
 import type { GitDeferralReason } from "../config.js";
 import type { LockedBranchProof } from "./base-composer.js";
 import type { PlannedBranchTransition } from "./branch-transition.js";

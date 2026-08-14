@@ -4,9 +4,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../../engine/index.js";
-import { MAX_GIT_CONFIG_KEYS, sanitizeGitSectionForPersistence, type GitConfig } from "../../engine/git/config-sync.js";
-import { gitRaw } from "../../engine/git/shared.js";
+import { LocalBlobStore, buildIgnoreMatcher, type GitSection } from "../../engine/index.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { MAX_GIT_CONFIG_KEYS, sanitizeGitSectionForPersistence, type GitConfig } from "./config-sync.js";
+import { gitRaw } from "../../engine/git-spawn.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import {

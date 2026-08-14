@@ -7,7 +7,7 @@ import { main } from "./main-dispatch.js";
 import { resetJournalDoctorCmd, withResetJournalDoctorFence } from "./reset-journal-doctor.js";
 import { resetJournalPath } from "./reset-journal.js";
 import { resetQuarantineRoot } from "./reset-quarantine.js";
-import { setProtocolLockTraceForTests, type ProtocolLockTraceEvent } from "../engine/git/protocol-locks.js";
+import { setProtocolLockTraceForTests, type ProtocolLockTraceEvent } from "../cli/sync-git/protocol-locks.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import crypto from "node:crypto";
 

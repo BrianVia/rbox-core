@@ -1,8 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection, type OwnedRefMutationBoundary } from "../../engine/index.js";
-import type { GitCaptureOptions, GitCaptureUploadCollector } from "../../engine/git/capture.js";
-import { headBranchOf, type PendingGitUpload } from "../../engine/git/shared.js";
+import { hashBytes, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitPackLink, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { gitIdentityKey, projectIdentity, type GitIdentity } from "./identity.js";
+import { gitSectionNewestLink, gitSectionTips, repoCtxFromDisk, type GitRepoKind } from "./git-state.js";
+import { type OwnedRefMutationBoundary } from "./pins.js";
+import type { GitCaptureOptions, GitCaptureUploadCollector } from "./capture.js";
+import { headBranchOf, type PendingGitUpload } from "./git-state.js";
 import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "../sync-recovery.js";

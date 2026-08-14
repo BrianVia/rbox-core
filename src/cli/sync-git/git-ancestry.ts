@@ -1,5 +1,5 @@
-import { graphEnv } from "../../engine/git/reachability.js";
-import { git } from "../../engine/git/shared.js";
+import { graphEnv } from "./reachability.js";
+import { git } from "../../engine/git-spawn.js";
 
 type GitCommitAncestry = "equal" | "ancestor" | "not-ancestor";
 

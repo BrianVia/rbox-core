@@ -1,16 +1,11 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import {
-  GIT_REF_SIGNAL_TAIL_TABLE,
-  gitRefStorage,
-  isGitRefSignalTail,
-  readSyncableRefSurface,
-  repoCtxFromDisk,
-  type DiscoveredGitRepo,
-  type OwnedRefMutationLease,
-  type RepoCtx,
-} from "../../engine/index.js";
+import { GIT_REF_SIGNAL_TAIL_TABLE, isGitRefSignalTail, type DiscoveredGitRepo } from "../../engine/index.js";
+import { gitRefStorage } from "../sync-git/preflight.js";
+import { readSyncableRefSurface } from "../sync-git/refs.js";
+import { repoCtxFromDisk, type RepoCtx } from "../sync-git/git-state.js";
+import { type OwnedRefMutationLease } from "../sync-git/pins.js";
 import { gitRepoCap } from "../sync-git/shared.js";
 
 /** Physical watch-root roles in the Linux Git ref side-channel. */

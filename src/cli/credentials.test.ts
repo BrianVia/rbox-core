@@ -438,7 +438,7 @@ test("a fence released inside the inspection window is a retry, not a lost write
   setSystemTime();
   const fence = `${lockPath()}.fence`;
   await fs.mkdir(path.dirname(fence), { mode: 0o700 });
-  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  const identity = await (await import("../engine/lockfile.js")).systemLockIdentity.current();
   // A live peer holds the fence, so this writer's publication collides and it
   // must inspect the holder's marker.
   await fs.writeFile(fence, JSON.stringify({
@@ -462,7 +462,7 @@ test("a peer that cycles the fence exhausts the budget and names the churn", asy
   setSystemTime();
   const fence = `${lockPath()}.fence`;
   await fs.mkdir(path.dirname(fence), { mode: 0o700 });
-  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  const identity = await (await import("../engine/lockfile.js")).systemLockIdentity.current();
   // Allocate the successor while the current marker is still linked, then
   // rename it over: the two inodes coexist, so the replacement can never
   // inherit the old inode number. Unlink-then-create would let the allocator
@@ -543,7 +543,7 @@ test("fresh main contention and a live exact-incarnation fence fail closed witho
     attempts.push(context.attempt);
     attemptsByPath.set(context.lockPath, attempts);
   });
-  const identityModule = await import("../engine/git/lockfile.js");
+  const identityModule = await import("../engine/lockfile.js");
   const identity = await identityModule.systemLockIdentity.current();
   for (const target of [lockPath(), `${lockPath()}.fence`]) {
     await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });

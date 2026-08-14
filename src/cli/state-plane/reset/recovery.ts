@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock } from "../../../engine/git/lockfile.js";
-import { withRepositoryRecoveryFence } from "../../../engine/git/protocol-locks.js";
+import { acquireLock } from "../../../engine/lockfile.js";
+import { withRepositoryRecoveryFence } from "../../../cli/sync-git/protocol-locks.js";
 import {
   classifyResetPhysicalSignature,
   type MarkerDisposition,

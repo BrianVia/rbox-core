@@ -21,8 +21,8 @@
  * included.
  */
 import path from "node:path";
-import { acquireLock, type OwnedLock } from "../../../engine/git/lockfile.js";
-import { assertProtocolLockHeld } from "../../../engine/git/protocol-locks.js";
+import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
+import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
 import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
 import type {
   StateSaveOptions, StateSavePacket, StateSaveResult, SyncState,

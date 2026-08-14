@@ -25,7 +25,7 @@ import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
-import { refreshSystemLockIdentityLedger } from "../engine/git/lockfile.js";
+import { refreshSystemLockIdentityLedger } from "../engine/lockfile.js";
 import { expandUserPath } from "./directory-picker.js";
 import { homeDir } from "./rbox-paths.js";
 

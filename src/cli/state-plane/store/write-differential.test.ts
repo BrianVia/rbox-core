@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry, GitSection, Manifest } from "../../../engine/index.js";
-import type { LockIdentitySource } from "../../../engine/git/lockfile.js";
+import type { LockIdentitySource } from "../../../engine/lockfile.js";
 import { carryRepoBaseProof, type RepoBaseProof } from "../../sync-git/base-composer.js";
 import {
   applyStateSavePacket, loadRawState, statePath,

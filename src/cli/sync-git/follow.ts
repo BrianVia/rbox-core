@@ -1,14 +1,12 @@
 /** Public follow surface and receive/check-out orchestration. */
-import {
-  checkoutTransactionSupported,
-  incomingOwnershipRoots,
-  indexIdentityV2,
-  ownershipProofContext,
-  validateGitSection,
-} from "../../engine/index.js";
-import { addClassifyTimedMs, addTimedMs } from "../../engine/git/chain-timings.js";
-import { readAllRefsStrict } from "../../engine/git/refs.js";
-import { git, headBranchOf } from "../../engine/git/shared.js";
+import { validateGitSection } from "../../engine/index.js";
+import { checkoutTransactionSupported } from "./checkout-txn.js";
+import { incomingOwnershipRoots, ownershipProofContext } from "./reachability.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { addClassifyTimedMs, addTimedMs } from "./chain-timings.js";
+import { readAllRefsStrict } from "./refs.js";
+import { headBranchOf } from "./git-state.js";
+import { git } from "../../engine/git-spawn.js";
 import { pruneOrigHeadRecoveryRefs } from "./orig-head.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { checkoutJournalBinding } from "./follow-journal.js";

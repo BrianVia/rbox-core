@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DirCache, HashCache } from "../engine/index.js";
-import { git } from "../engine/git/shared.js";
+import { git } from "../engine/git-spawn.js";
 import { fsyncDirectory } from "../engine/fsutil.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { loadConfigIfPresent, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";

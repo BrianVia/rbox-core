@@ -4,18 +4,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  buildIgnoreMatcher,
-  captureGitState,
-  gitIdentity,
-  gitIdentityKey,
-  gitSectionBlobRefs,
-  type BlobStore,
-  type GitSection,
-  type Manifest,
-} from "../engine/index.js";
-import type { GitConfigRunner } from "../engine/git/config-txn.js";
+import { LocalBlobStore, buildIgnoreMatcher, type BlobStore, type GitSection, type Manifest } from "../engine/index.js";
+import { captureGitState } from "./sync-git/capture.js";
+import { gitIdentity, gitIdentityKey } from "./sync-git/identity.js";
+import { gitSectionBlobRefs } from "./sync-git/git-state.js";
+import type { GitConfigRunner } from "../cli/sync-git/config-txn.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
 import {

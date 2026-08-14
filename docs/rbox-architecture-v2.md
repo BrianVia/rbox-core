@@ -258,7 +258,7 @@ on DO broadcast {manifestId, sequence}:
 
 > **SUPERSEDED (2026-08-11).** Git state does not sync as a hashed snapshot of
 > `.git` files swapped in from a temp directory. It syncs as `git bundle` /
-> incremental pack chains per repository (`src/engine/git/pins.ts`,
+> incremental pack chains per repository (`src/cli/sync-git/pins.ts`,
 > `src/cli/sync-git/`), applied through a fetch/transition pipeline with
 > deferrals, divergence handling and quarantine. There is no
 > `snapshotConsistent` field. The *goal* below — never ship a torn `.git` — is

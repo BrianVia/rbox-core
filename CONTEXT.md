@@ -23,7 +23,7 @@ loudly. Design 40 names an unbuilt chunking prototype "manifest v2"; unrelated.
 **section** — one `Manifest.gitRepos[relPath]`, i.e. a `GitSection`: the entire
 git state of one discovered repo as one indivisible sync unit. Exactly one kind
 of section exists; files are a flat array and are not sectioned. Homonym: git
-*config* sections (`src/engine/git/config-sync.ts`).
+*config* sections (`src/cli/sync-git/config-sync.ts`).
 
 **sequence** — the monotone commit number of one workspace's append-only chain,
 per `(workspaceId, projectId)` Durable Object. The client signs `seq`/
@@ -62,7 +62,7 @@ Every composition names one **authority** (`ComposeRepoBaseAuthority`:
 `publisher-ack`, `manual`, `p-repair`, plus a branded `migration` kind mintable
 only in `state-plane/migration/`). Serialized BASE is a materialized view:
 readers first overlay valid base-absent artifacts under
-`refs/rbox-local/base-absent/` (`src/engine/git/base-artifacts.ts`), and a valid
+`refs/rbox-local/base-absent/` (`src/cli/sync-git/base-artifacts.ts`), and a valid
 one beats stale serialized presence. A bad ref yields a `RepoBaseHardHold` →
 `disposition: "pending"` → the previous BASE is retained and the candidate ref
 move dropped. It never fails the push.
@@ -116,7 +116,7 @@ mean the section may be skipped: it means a **later pull may skip the expensive
 fetch and classification** when the stored attempt still matches, under a closed
 blocker allowlist, a one-hour floor and three kill switches. What held blocks is
 retirement of `pending`, which suppresses local capture. Homonyms: held *locks*,
-and an in-flight `heldRefs` in `src/engine/git/apply.ts`.
+and an in-flight `heldRefs` in `src/cli/sync-git/git-state-apply.ts`.
 
 ## Carry
 
@@ -177,7 +177,7 @@ to a different account/epoch/purpose. Consolidation is unbuilt work.
 the workspace root, `SyncState.stream`, the state nonce and the repo identity,
 naming *which repo incarnation under which state incarnation* owns a BASE proof
 artifact. Compared for equality only, never a row, embedded in ref namespaces
-(`src/engine/git/repo-lineage.ts`). `repositoryIdentityHash` is a narrower
+(`src/cli/sync-git/repo-lineage.ts`). `repositoryIdentityHash` is a narrower
 *component* (paths, dev/ino, birthtime); a `rbox reset` changes lineage but not
 repository identity.
 
@@ -295,7 +295,7 @@ Svelte `bind:` homonyms.
 
 **fence** — usually mutual exclusion, and **never a fencing token**: the lock
 marker's token is a random nonce nobody orders. The canonical one is the *reap
-fence* (`acquireFence`, `src/engine/git/lockfile.ts`), a second `O_EXCL` lock at
+fence* (`acquireFence`, `src/engine/lockfile.ts`), a second `O_EXCL` lock at
 `<lockPath>.reap` stopping two processes from breaking the same stale lock;
 released in a `finally`, reclaimed by liveness probe rather than TTL (`unknown`
 is never reclaimed). Also a *recovery fence* (an ordered acquisition over
@@ -325,7 +325,7 @@ deletions (`MassDeleteGuardError`); the pull-side twin is inlined in
 
 The actual exclusion set is elsewhere: the **workspace sync mutex**
 (`src/cli/sync-mutex.ts`, `<root>/.rbox/state/sync.lock`), `acquireLock` /
-`OwnedLock` (`src/engine/git/lockfile.ts` — `O_EXCL` + hardlink marker with
+`OwnedLock` (`src/engine/lockfile.ts` — `O_EXCL` + hardlink marker with
 dead-owner reap; **there is no `flock` and no `proper-lockfile` in this repo**),
 the ranked protocol lock classes, genesis pairing locks, state CAS locks, and
 `HeldStatePlaneLocks` as a branded witness. The one true monotonic epoch is

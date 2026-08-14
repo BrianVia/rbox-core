@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import type { BlobStore } from "../../engine/blobstore.js";
-import { flushGitArtifact, type GitArtifactReadStore, type PendingGitUpload } from "../../engine/git/shared.js";
-import { makeGitCaptureDir } from "../../engine/git/capture.js";
+import { flushGitArtifact, type GitArtifactReadStore, type PendingGitUpload } from "./git-state.js";
+import { makeGitCaptureDir } from "./capture.js";
 import { errMsg } from "./shared.js";
 
 // ---- design 226: plan-lifetime git artifact retention ------------------------------

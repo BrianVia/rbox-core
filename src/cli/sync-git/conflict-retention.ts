@@ -1,12 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  commitProtocolRefTransaction,
-  partitionOwnedByIncoming,
-  repoCtxFromDisk,
-  type RepoCtx,
-} from "../../engine/index.js";
-import { gitRaw } from "../../engine/git/shared.js";
+import { commitProtocolRefTransaction } from "./base-artifacts.js";
+import { partitionOwnedByIncoming } from "./reachability.js";
+import { repoCtxFromDisk, type RepoCtx } from "./git-state.js";
+import { gitRaw } from "../../engine/git-spawn.js";
 
 export const CONFLICT_REF_PREFIX = "refs/rbox-conflict/";
 export const CONFLICT_REF_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;

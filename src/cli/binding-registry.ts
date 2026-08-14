@@ -20,7 +20,7 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, type OwnedLock } from "../engine/lockfile.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { readDesiredDaemonRows } from "./autostart/desired-state.js";
 import { currentWorkspaceId } from "./daemon/runtime-state.js";

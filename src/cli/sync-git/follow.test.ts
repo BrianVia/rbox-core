@@ -5,28 +5,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  BASE_ABSENT_PREFIX,
-  SETTLED_ABSENCE_PREFIX,
-  buildIgnoreMatcher,
-  captureGitState,
-  hashBytes,
-  indexIdentityV2,
-  oracleFromState,
-  ownershipProofContext,
-  probeReceiverEquivalence,
-  resetCheckoutCapabilityProbeCacheForTests,
-  scanManifest,
-  setGitSpawnObserver,
-  setReceiverEquivalenceProbeForTests,
-  type AppliedManifestOracle,
-  type GitSection,
-  type Manifest,
-} from "../../engine/index.js";
-import { keepPinRef, readKeepPinOrigins } from "../../engine/git/keep-pins.js";
-import { hasInProgressOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
-import { repoCtx } from "../../engine/git/shared.js";
+import { LocalBlobStore, buildIgnoreMatcher, hashBytes, oracleFromState, probeReceiverEquivalence, scanManifest, setReceiverEquivalenceProbeForTests, type AppliedManifestOracle, type GitSection, type Manifest } from "../../engine/index.js";
+import { BASE_ABSENT_PREFIX, SETTLED_ABSENCE_PREFIX } from "./base-artifacts.js";
+import { captureGitState } from "./capture.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { ownershipProofContext } from "./reachability.js";
+import { resetCheckoutCapabilityProbeCacheForTests } from "./checkout-txn.js";
+import { setGitSpawnObserver } from "../../engine/git-spawn.js";
+import { keepPinRef, readKeepPinOrigins } from "./keep-pins.js";
+import { hasInProgressOpState, readOpStateSnapshot } from "./refs.js";
+import { repoCtx } from "./git-state.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";

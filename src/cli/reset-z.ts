@@ -1,4 +1,4 @@
-import type { RepoIdentityV1 } from "../engine/git/repo-lineage.js";
+import type { RepoIdentityV1 } from "../cli/sync-git/repo-lineage.js";
 
 export interface ResetZEntry {
   lineageHash: string;

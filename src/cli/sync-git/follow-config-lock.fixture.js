@@ -7,8 +7,8 @@ import { promisify } from "node:util";
 import {
   LocalBlobStore,
   buildIgnoreMatcher,
-  captureGitState,
 } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
 
 // A distinct module identity preserves the real implementation while the
 // canonical import used by apply.ts is wrapped below.

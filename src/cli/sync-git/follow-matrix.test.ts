@@ -4,19 +4,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  buildIgnoreMatcher,
-  captureGitState,
-  hashBytes,
-  indexIdentityV2,
-  oracleFromState,
-  type AppliedManifestOracle,
-  type FileEntry,
-  type GitSection,
-  type Manifest,
-} from "../../engine/index.js";
-import { readOpState } from "../../engine/git/refs.js";
+import { LocalBlobStore, buildIgnoreMatcher, hashBytes, oracleFromState, type AppliedManifestOracle, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { indexIdentityV2 } from "./index-identity.js";
+import { readOpState } from "./refs.js";
 import { hashFile } from "../../engine/hash.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { collectRepoResidue, renderDoctor, type DoctorChecks } from "../doctor-cmd.js";

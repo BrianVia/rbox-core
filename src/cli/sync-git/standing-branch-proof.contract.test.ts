@@ -1,14 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type {
-  ArtifactBinding,
-  ArtifactReadResult,
-  BasePresentPayload,
-  GitSection,
-  PRepairAttemptResult,
-  PRepairReceipt,
-  PRepairResumeResult,
-  PreparedProtocolRef,
-} from "../../engine/index.js";
+import type { GitSection } from "../../engine/index.js";
+import type { ArtifactBinding } from "./repo-lineage.js";
+import type { ArtifactReadResult, BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
+import type { PRepairAttemptResult, PRepairResumeResult } from "./p-repair-transaction.js";
+import type { PRepairReceipt } from "./p-repair.js";
 import type { RepoRecord, SyncState } from "../config.js";
 import type { FollowerBranchProtocol, FollowerBranchProtocolResult } from "./follower-protocol.js";
 import type { ExactPSettlementResult } from "./p-settlement.js";

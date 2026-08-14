@@ -4,13 +4,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { repoCtxFromDisk, type GitSection } from "../../engine/index.js";
-import type { GitConfig } from "../../engine/git/config-sync.js";
+import { type GitSection } from "../../engine/index.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import type { GitConfig } from "./config-sync.js";
 import {
   readConfigSnapshot,
   type ConfigStatToken,
   type ConfigTransactionResult,
-} from "../../engine/git/config-txn.js";
+} from "./config-txn.js";
 import type { ConfigShapeIdentity, RepoRecordInput } from "../config.js";
 import type { ConfigLaneState } from "../sync-state.js";
 import { configReceiver, gitConfigHash } from "./config-lane.js";

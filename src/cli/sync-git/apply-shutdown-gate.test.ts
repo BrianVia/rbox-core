@@ -4,13 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  buildIgnoreMatcher,
-  captureGitState,
-  type GitSection,
-  type Manifest,
-} from "../../engine/index.js";
+import { LocalBlobStore, buildIgnoreMatcher, type GitSection, type Manifest } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
 import { MutationGateClosedError, ShutdownMutationGate, type MutationBoundary } from "../../engine/mutation-gate.js";
 import type { GitHeldAttempt, SyncState, WorkspaceConfig } from "../config.js";
 import { applyGitSections } from "./apply.js";

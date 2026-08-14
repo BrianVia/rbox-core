@@ -4,17 +4,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  artifactBinding,
-  prepareBaseAbsentArtifact,
-  prepareBasePresentArtifact,
-  readBaseAbsentArtifact,
-  readBasePresentArtifact,
-  readRepoIdentityV1,
-  readStateLineageV1,
-  repoCtxFromDisk,
-} from "../../engine/index.js";
-import { gitRaw } from "../../engine/git/shared.js";
+import { artifactBinding, readRepoIdentityV1, readStateLineageV1 } from "./repo-lineage.js";
+import { prepareBaseAbsentArtifact, prepareBasePresentArtifact, readBaseAbsentArtifact, readBasePresentArtifact } from "./base-artifacts.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { gitRaw } from "../../engine/git-spawn.js";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { loadRawState, saveStateUnsafeLegacyOrTest, type GitPartialApply, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";

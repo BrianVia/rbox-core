@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireLock } from "../../../engine/git/lockfile.js";
+import { acquireLock } from "../../../engine/lockfile.js";
 import { casOwnerTokenFromLock } from "./owner-token.js";
 
 test("the CAS owner token agrees with the async lease across acquire and release", async () => {

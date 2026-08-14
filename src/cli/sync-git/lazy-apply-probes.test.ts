@@ -4,22 +4,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  LocalBlobStore,
-  buildIgnoreMatcher,
-  captureGitState,
-  checkoutJournalDir,
-  gitIdentity,
-  gitIdentityKey,
-  repoCtxFromDisk,
-  setGitSpawnObserver,
-  writeCheckoutJournal,
-  type CheckoutJournal,
-  type GitSection,
-  type Manifest,
-} from "../../engine/index.js";
+import { LocalBlobStore, buildIgnoreMatcher, type GitSection, type Manifest } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { checkoutJournalDir, writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
+import { gitIdentity, gitIdentityKey } from "./identity.js";
+import { repoCtxFromDisk } from "./git-state.js";
+import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import type { MutationBoundary } from "../../engine/mutation-gate.js";
-import { applyConfigTransaction } from "../../engine/git/config-txn.js";
+import { applyConfigTransaction } from "./config-txn.js";
 import type { RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
 import { collectRepoResidue } from "../doctor-cmd.js";

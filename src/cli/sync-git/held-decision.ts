@@ -1,5 +1,6 @@
-import { addTimedMs } from "../../engine/git/chain-timings.js";
-import type { GitChainTimings, GitSection } from "../../engine/index.js";
+import { addTimedMs } from "./chain-timings.js";
+import type { GitSection } from "../../engine/index.js";
+import type { GitChainTimings } from "./chain-timings.js";
 import type { GitDeferral, GitHeldAttempt, GitPartialApply, RepoRecord, TypedBlocker } from "../config.js";
 import type { GitApplyRepoResult } from "./apply-metrics.js";
 import type { GitFingerprint } from "./fingerprint.js";

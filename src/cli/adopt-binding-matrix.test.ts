@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
-import { git } from "../engine/git/shared.js";
+import { git } from "../engine/git-spawn.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { adoptCmd, adoptionStatus } from "./adopt-cmd.js";
 import { bindRetainedRepoIncarnations, runGitAdoption } from "./adopt-git.js";
