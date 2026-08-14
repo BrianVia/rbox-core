@@ -106,6 +106,15 @@ export { selectCheckoutSelfRootWitness, type CheckoutSelfRootWitness } from "./f
 
 const refEquivalenceWarnings = new Set<string>();
 
+/** The one classifier for a thrown ref-publication failure. Classify on the raw
+ * message: boundedRefFailure truncates, and a `lock`/`busy`/`transaction` token
+ * past the bound must still count. A message no rule recognizes stays `other`:
+ * an unexplained failure must never inherit an allowlisted reason. */
+function refPublicationFailureReason(message: string): GitDeferralReason {
+  if (message.includes("ref-read-unreadable")) return "ref-read-unreadable";
+  return /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
+}
+
 async function publishRefPlane(
   opts: FollowOptions,
   live: LiveMetadata,
@@ -232,6 +241,15 @@ async function publishRefPlane(
       hold = "worktree-ownership";
       if (opts.manualResolution) checkoutRefReason ??= "worktree-ownership";
       checkoutRefDetail ??= `branch ${ref.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(ref)}`;
+    }
+    // A branch whose receiver value the logical BASE does not authorize is a
+    // receiver-only hold — the same rule the equality arm applies below
+    // ("equality cannot invent branch P/A authority"). planBranchTransition
+    // refuses exactly this pre-state, so the hold is classified here instead of
+    // arriving later as a thrown, untyped `other` from the publication path.
+    if (!hold && !opts.manualResolution && ref.startsWith("refs/heads/") && opts.branchProtocol
+      && (opts.branchProtocol.logicalBaseRefs[ref] ?? null) !== (oldOid ?? null)) {
+      hold = "local-commits";
     }
     if (oldOid) {
       const protectedOids = ref === "refs/stash" && opts.ctx.kind === "dir"
@@ -411,10 +429,13 @@ async function publishRefPlane(
             appliedRefs[ref] = plan.partial;
           } catch (error) {
             heldRefs[ref] = "local-commits";
-            checkoutRefReason ??= String((error as Error)?.message ?? error).includes("ref-read-unreadable")
-              ? "ref-read-unreadable"
-              : "other";
-            checkoutRefDetail ??= `manual absent branch proof failed for ${ref}: ${boundedRefFailure(error)}`;
+            // Reason and detail are one cause: a failure that does not win the
+            // reason must not overwrite the winning cause's evidence, and one
+            // that does win must carry its own.
+            if (!checkoutRefReason) {
+              checkoutRefReason = refPublicationFailureReason(String((error as Error)?.message ?? error));
+              checkoutRefDetail = `manual absent branch proof failed for ${ref}: ${boundedRefFailure(error)}`;
+            }
           }
         } else if (baseOid !== (newOid ?? null)) {
           heldRefs[ref] = "local-commits"; // equality cannot invent branch P/A authority.
@@ -549,13 +570,10 @@ async function publishRefPlane(
         await addTimedMs(opts.chainTimings, "reflogMs", () => ensureStashReflog(opts.ctx.repoDir, newOid));
       }
     } catch (error) {
-      const message = String((error as Error)?.message ?? error);
-      // Classify on the raw message: boundedRefFailure truncates, and a
-      // `lock`/`busy`/`transaction` token past the bound must still count.
-      checkoutRefReason ??= message.includes("ref-read-unreadable")
-        ? "ref-read-unreadable"
-        : /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
-      checkoutRefDetail ??= `publishing ref ${ref} failed: ${boundedRefFailure(error)}`;
+      if (!checkoutRefReason) {
+        checkoutRefReason = refPublicationFailureReason(String((error as Error)?.message ?? error));
+        checkoutRefDetail = `publishing ref ${ref} failed: ${boundedRefFailure(error)}`;
+      }
     }
   }
 
