@@ -93,7 +93,7 @@ export function validateRefTombstones(section: Partial<GitSection>): GitSectionV
 }
 
 /** A relative POSIX path that cannot escape the root or smuggle control bytes. */
-export function isSafeRelPath(p: unknown): p is string {
+export function isSafeRelPath(p: string | undefined): p is string {
   if (typeof p !== "string" || p.length === 0) return false;
   if (utf8.encode(p).length > MAX_PATH_BYTES) return false;
   if (p.includes("\0") || p.includes("\\")) return false; // NUL, backslash (Windows-style / smuggling)
@@ -145,7 +145,7 @@ export function caseFoldCollisionGroups(
  * gates and file/repo collision rule; persisted fold evidence uses the newest
  * understood schema because the described manifest was already validated. */
 export function validateGitRepos(
-  gitRepos: unknown,
+  gitRepos: WireCandidate<Manifest["gitRepos"]>,
   schema: number = KNOWN_MANIFEST_SCHEMA,
   filePaths: ReadonlySet<string> = new Set(),
 ): ValidationResult {
@@ -194,7 +194,7 @@ export function validateManifest(m: WireCandidate<Partial<Manifest>>): Validatio
     const e = entry as Partial<FileEntry>;
 
     if (!isSafeRelPath(e.path)) return { ok: false, error: `unsafe path: ${JSON.stringify(e.path)}` };
-    const p = e.path as string;
+    const p = e.path;
 
     if (seen.has(p)) return { ok: false, error: `duplicate path: ${p}` };
     const lower = manifestPathCaseFold(p);
@@ -257,7 +257,7 @@ export function validateManifest(m: WireCandidate<Partial<Manifest>>): Validatio
       return { ok: false, error: "manifest.gitRepos is not an object" };
     }
     if (typeof schema !== "number" || schema < 2) return { ok: false, error: "gitRepos requires manifestSchema >= 2" };
-    const reposValidation = validateGitRepos(gitRepos, schema as number, seen);
+    const reposValidation = validateGitRepos(gitRepos, schema, seen);
     if (!reposValidation.ok) return reposValidation;
   }
   return { ok: true };

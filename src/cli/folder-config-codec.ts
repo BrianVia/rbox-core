@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { homeDir } from "./rbox-paths.js";
+import type { JsonValue } from "../json.js";
 import { trashConfig, type WorkspaceConfig } from "./workspace-config.js";
 
 export const FOLDER_CATALOG_MAX_BYTES = 1024 * 1024;
@@ -15,13 +16,13 @@ export const FOLDER_PATH_MAX_BYTES = 4096;
 export const FOLDER_TRASH_MAX_DAYS = 365;
 export const FOLDER_TRASH_MAX_BYTES = 1099511627776;
 
-export interface FolderOptions {
+export type FolderOptions = {
   syncGit?: boolean;
   git?: { incremental?: boolean };
   respectGitignore?: boolean;
   noDrift?: boolean;
   trash?: { days?: number; maxBytes?: number };
-}
+};
 
 export interface ResolvedFolderPolicy {
   syncGit: boolean;
@@ -91,32 +92,38 @@ function digest(bytes: string | Uint8Array): string {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
-type UnknownObject = { [key: string]: unknown };
+/**
+ * A member of the parsed config document, or the same member as a typed caller
+ * already holds it (an absent optional field is `undefined`, which JSON has no
+ * spelling for). Every validator below reads exactly this domain.
+ */
+type ConfigValue = JsonValue | undefined | { [key: string]: ConfigValue } | ConfigValue[];
+type ConfigObject = { [key: string]: ConfigValue };
 
-function object(value: unknown, at: string): UnknownObject {
+function object(value: ConfigValue, at: string): ConfigObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new FolderCatalogError(`${at} must be an object`);
   }
-  return value as UnknownObject;
+  return value;
 }
 
-function closed(value: UnknownObject, allowed: readonly string[], at: string): void {
+function closed(value: ConfigObject, allowed: readonly string[], at: string): void {
   const allow = new Set(allowed);
   const unknown = Object.keys(value).find((key) => !allow.has(key));
   if (unknown !== undefined) throw new FolderCatalogError(`${at}.${unknown} is not supported`);
 }
 
-function required(value: UnknownObject, key: string, at: string): unknown {
+function required(value: ConfigObject, key: string, at: string): ConfigValue {
   if (!Object.hasOwn(value, key)) throw new FolderCatalogError(`${at}.${key} is required`);
   return value[key];
 }
 
-function booleanField(value: unknown, at: string): boolean {
+function booleanField(value: ConfigValue, at: string): boolean {
   if (typeof value !== "boolean") throw new FolderCatalogError(`${at} must be true or false`);
   return value;
 }
 
-function boundedInteger(value: unknown, min: number, max: number, at: string): number {
+function boundedInteger(value: ConfigValue, min: number, max: number, at: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(value)
     || value < min || value > max) {
     throw new FolderCatalogError(`${at} must be an integer from ${min} through ${max}`);
@@ -137,7 +144,7 @@ function hasOnlyUnicodeScalars(value: string): boolean {
   return true;
 }
 
-function parseOptions(value: unknown, at: string): FolderOptions {
+function parseOptions(value: ConfigValue, at: string): FolderOptions {
   const raw = object(value, at);
   closed(raw, ["syncGit", "git", "respectGitignore", "noDrift", "trash"], at);
   const result: FolderOptions = {};
@@ -173,7 +180,7 @@ function parseOptions(value: unknown, at: string): FolderOptions {
   return result;
 }
 
-function validateName(value: unknown, at: string): string {
+function validateName(value: ConfigValue, at: string): string {
   if (typeof value !== "string") throw new FolderCatalogError(`${at} must be a string`);
   if (!hasOnlyUnicodeScalars(value)) throw new FolderCatalogError(`${at} contains an invalid Unicode scalar`);
   if (value.length === 0 || value.trim() !== value) {
@@ -221,7 +228,7 @@ export function parseFolderCatalog(bytes: string, home = homeDir()): FolderCatal
   if (Buffer.byteLength(bytes, "utf8") > FOLDER_CATALOG_MAX_BYTES) {
     throw new FolderCatalogError(`config exceeds ${FOLDER_CATALOG_MAX_BYTES} bytes`);
   }
-  let decoded: unknown;
+  let decoded: ConfigValue;
   try {
     decoded = JSON.parse(bytes);
   } catch (error) {

@@ -7,7 +7,7 @@ import { compareProcessStart, systemLockIdentity } from "../engine/git/lockfile.
 import { rboxDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 /** The whitelisted, versioned credential document written to disk. */
 export interface CredentialsV1 {
@@ -150,11 +150,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function nonempty(value: unknown): value is string {
+function nonempty(value: JsonValue | undefined): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function validRemote(value: unknown): value is string {
+function validRemote(value: JsonValue | undefined): value is string {
   if (!nonempty(value)) return false;
   try {
     const parsed = new URL(value);
@@ -164,13 +164,13 @@ function validRemote(value: unknown): value is string {
   }
 }
 
-function objectRecord(value: unknown): value is JsonObject {
+function objectRecord(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Pure parser exported so wire-format compatibility can be tested without I/O. */
 export function parseCredentialDocument(raw: string | Uint8Array): ParsedCredential {
-  let value: unknown;
+  let value: JsonValue;
   try {
     value = JSON.parse(typeof raw === "string" ? raw : Buffer.from(raw).toString("utf8"));
   } catch {
@@ -292,8 +292,10 @@ function regular(mode: bigint): boolean {
 function parseMarker(raw: string): MarkerV1 | undefined {
   if (Buffer.byteLength(raw) > MARKER_MAX_BYTES) return undefined;
   try {
-    const value = JSON.parse(raw) as Partial<MarkerV1>;
-    if (!objectRecord(value) || value.v !== 1 || !Number.isSafeInteger(value.pid) || (value.pid ?? 0) <= 0) return undefined;
+    const parsed: JsonValue = JSON.parse(raw);
+    if (!objectRecord(parsed)) return undefined;
+    const value = parsed as Partial<MarkerV1>;
+    if (value.v !== 1 || !Number.isSafeInteger(value.pid) || (value.pid ?? 0) <= 0) return undefined;
     if (!nonempty(value.processStart) || !PROCESS_START_RE.test(value.processStart) || !nonempty(value.acquiredAt) || !NONCE_RE.test(value.nonce ?? "")) return undefined;
     if (!Number.isFinite(Date.parse(value.acquiredAt))) return undefined;
     const keys = Object.keys(value).sort().join(",");

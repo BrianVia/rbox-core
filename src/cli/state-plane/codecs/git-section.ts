@@ -1,5 +1,6 @@
-import type { GitSection } from "../../../engine/index.js";
+import type { GitSection, ValidationResult } from "../../../engine/index.js";
 import { isSafeRelPath, validateGitRepos } from "../../../engine/index.js";
+import type { JsonValue } from "../../../json.js";
 import { canonicalJson, parseCanonicalJson } from "../digest/codecs.js";
 
 /**
@@ -31,9 +32,14 @@ function assertSafeGitPath(relPath: string): asserts relPath is string {
   }
 }
 
-function assertValidSection(relPath: string, section: unknown): asserts section is GitSection {
-  const result = validateGitRepos({ [relPath]: section });
+function assertAdmitted(relPath: string, result: ValidationResult): void {
   if (!result.ok) throw new TypeError(`invalid GitSection at ${relPath}: ${result.error}`);
+}
+
+/** The persisted-bytes half of the same admission: a canonical JSON value the
+ * wire validator admits IS a `GitSection`, so no caller has to assert it. */
+function assertParsedSection(relPath: string, section: JsonValue): asserts section is JsonValue & GitSection {
+  assertAdmitted(relPath, validateGitRepos({ [relPath]: section }));
 }
 
 /**
@@ -43,7 +49,7 @@ function assertValidSection(relPath: string, section: unknown): asserts section 
  */
 export function encodeGitSection(relPath: string, section: GitSection): EncodedGitSection {
   assertSafeGitPath(relPath);
-  assertValidSection(relPath, section);
+  assertAdmitted(relPath, validateGitRepos({ [relPath]: section }));
   const canonical = canonicalJson(section);
   return { relPath, canonical, bytes: Buffer.byteLength(canonical) + Buffer.byteLength(relPath) };
 }
@@ -58,6 +64,6 @@ export function encodeGitSection(relPath: string, section: GitSection): EncodedG
 export function decodeGitSection(relPath: string, sectionCjson: string): GitSection {
   const parsed = parseCanonicalJson(sectionCjson);
   assertSafeGitPath(relPath);
-  assertValidSection(relPath, parsed);
-  return parsed as unknown as GitSection;
+  assertParsedSection(relPath, parsed);
+  return parsed;
 }

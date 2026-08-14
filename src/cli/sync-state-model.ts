@@ -5,6 +5,7 @@ import {
   type GitSection,
   type Manifest,
 } from "../engine/index.js";
+import type { JsonValue } from "../json.js";
 import type { AcquireLockOptions, OwnedLock } from "../engine/git/lockfile.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
@@ -93,25 +94,33 @@ export interface GlobalManifestMeta {
   gitRepos: Record<string, GitSection>;
 }
 
-type GlobalManifestMetaCandidate = Partial<Record<keyof GlobalManifestMeta, unknown>>;
+/** A persisted meta as it is actually read back: the typed record a writer
+ * saved, or the raw JSON a foreign/older writer left behind. Either way every
+ * member is re-established below before the record is trusted. */
+type GlobalManifestMetaCandidate = Partial<Record<keyof GlobalManifestMeta, JsonValue | undefined>>;
 
-export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+export function validManifestMeta(v: GlobalManifestMeta | JsonValue | undefined): GlobalManifestMeta | undefined {
+  return admissibleManifestMeta(v) ? v : undefined;
+}
+
+/** Re-establishes every member of a persisted meta. The value itself is returned
+ * unchanged when it holds, so members this rule cannot see ride along. */
+function admissibleManifestMeta(v: GlobalManifestMeta | JsonValue | undefined): v is GlobalManifestMeta {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const meta = v as GlobalManifestMetaCandidate;
-  const hex = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
-  const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
-  if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return undefined;
-  if (!counter(meta.accountEpoch) || !counter(meta.keyEpoch) || !counter(meta.chainBytes)) return undefined;
-  if (!Number.isSafeInteger(meta.snapshotBytes) || (meta.snapshotBytes as number) <= 0) return undefined;
+  const hex = (value: JsonValue | undefined): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const counter = (value: JsonValue | undefined): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return false;
+  if (!counter(meta.accountEpoch) || !counter(meta.keyEpoch) || !counter(meta.chainBytes)) return false;
+  if (!Number.isSafeInteger(meta.snapshotBytes) || (meta.snapshotBytes as number) <= 0) return false;
   // The chain shape rule (cap, hex, dedup, self-exclusion) is the SAME invariant
   // the wire parser enforces — one definition, or persisted metas could drift
   // from what the commit codec/server accept. Explicit Array check first: the
   // wire parser normalizes an ABSENT field to [], but a partial meta missing
   // `chain` must reject wholesale (§3.4 fail-to-snapshot).
-  if (!Array.isArray(meta.chain) || readManifestChain(meta.chain, meta.encManifestSha) === null) return undefined;
-  if ((meta.chainBytes === 0) !== (meta.chain.length === 0)) return undefined;
-  if (!validateGitRepos(meta.gitRepos).ok) return undefined;
-  return meta as unknown as GlobalManifestMeta;
+  if (!Array.isArray(meta.chain) || readManifestChain(meta.chain, meta.encManifestSha) === null) return false;
+  if ((meta.chainBytes === 0) !== (meta.chain.length === 0)) return false;
+  return validateGitRepos(meta.gitRepos).ok;
 }
 
 /** Reconstruct the exact described manifest independently of local repo apply progress. */
@@ -324,6 +333,11 @@ export interface RepoRecord {
 
 export type RepoRecordInput = Omit<RepoRecord, "repoGen">;
 
+/** Every repository a state knows, keyed by repository relPath. */
+export interface RepoRecordsByPath {
+  [relPath: string]: RepoRecord;
+}
+
 export interface RepoTransition {
   relPath: string;
   expectedRepoGen: number;
@@ -393,7 +407,7 @@ export function knownRepoKeys(state: SyncState): string[] {
 
 /** Fold the legacy parallel maps into complete records. Every later state write
  * reconstructs gitRepos and sidecars solely from this returned record set. */
-export function repoRecordsForState(state: SyncState): Record<string, RepoRecord> {
+export function repoRecordsForState(state: SyncState): RepoRecordsByPath {
   const legacyDeferrals = state.repoRecords === undefined
     ? Object.fromEntries(Object.entries(state.gitDeferrals ?? {}).sort(([a], [b]) => a.localeCompare(b)).slice(0, MAX_LEGACY_GIT_SIDECAR_REPOS))
     : {};
@@ -409,7 +423,7 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
     ...Object.keys(legacyDeferrals),
     ...Object.keys(legacyPartial),
   ]);
-  const records: Record<string, RepoRecord> = {};
+  const records: RepoRecordsByPath = {};
   for (const relPath of keys) {
     const saved = state.repoRecords?.[relPath];
     if (saved) {
