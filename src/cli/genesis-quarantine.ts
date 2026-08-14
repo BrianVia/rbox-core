@@ -3,30 +3,35 @@ import path from "node:path";
 import { canonicalString, parseStrict, sha256Hex, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
 import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 export type GenesisQuarantinePurpose="repaired-legacy"|"abandoned-attempt";
-export interface GenesisQuarantineEntry{source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string}
-export interface GenesisQuarantineManifest{version:1;accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;createdAt:string;entries:GenesisQuarantineEntry[]}
-export interface GenesisQuarantineCompleted{version:1;accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;manifestSha256:string;completedAt:string}
+export type GenesisQuarantineEntry={source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string};
+export type GenesisQuarantineManifest={version:1;accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;createdAt:string;entries:GenesisQuarantineEntry[]};
+export type GenesisQuarantineCompleted={version:1;accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;manifestSha256:string;completedAt:string};
 
+/** One field read out of a parsed JSON object: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
+
+/** `parseStrict` hands back exactly what `JSON.parse` produced — a JSON value. */
+const parsed=(raw:string):JsonValue=>parseStrict(raw) as JsonValue;
 const exact=(value:object,keys:string[])=>{const actual=Object.keys(value);return actual.length===keys.length&&actual.every((k)=>keys.includes(k));};
-const plain=(value:unknown):value is JsonObject=>typeof value==="object"&&value!==null&&!Array.isArray(value);
-const iso=(value:unknown):value is string=>typeof value==="string"&&!Number.isNaN(Date.parse(value))&&new Date(value).toISOString()===value;
+const plain=(value:JsonField):value is JsonObject=>typeof value==="object"&&value!==null&&!Array.isArray(value);
+const iso=(value:JsonField):value is string=>typeof value==="string"&&!Number.isNaN(Date.parse(value))&&new Date(value).toISOString()===value;
 const shaRe=/^[0-9a-f]{64}$/;
 
 function directoryName(purpose:GenesisQuarantinePurpose,key:string):string{return purpose==="repaired-legacy"?`genesis-legacy-${key}`:`genesis-attempt-${key}`;}
 export function genesisQuarantineDir(accountId:string,purpose:GenesisQuarantinePurpose,key:string):string{assertGenesisAccountId(accountId);if(purpose==="repaired-legacy"?!GENESIS_REPAIR_ID_RE.test(key):!GENESIS_REQUEST_SHA_RE.test(key))throw new Error("invalid genesis quarantine key");return path.join(genesisPaths(accountId).quarantine,directoryName(purpose,key));}
 
 export function parseGenesisQuarantineManifest(raw:string,accountId:string,purpose:GenesisQuarantinePurpose,key:string):GenesisQuarantineManifest{
-  const v=parseStrict(raw);if(!plain(v)||!exact(v,["version","accountId","purpose","uniquenessKey","createdAt","entries"])||v.version!==1||v.accountId!==accountId||v.purpose!==purpose||v.uniquenessKey!==key||!iso(v.createdAt)||!Array.isArray(v.entries))throw new Error("invalid genesis quarantine manifest");
+  const v=parsed(raw);if(!plain(v)||!exact(v,["version","accountId","purpose","uniquenessKey","createdAt","entries"])||v.version!==1||v.accountId!==accountId||v.purpose!==purpose||v.uniquenessKey!==key||!iso(v.createdAt)||!Array.isArray(v.entries))throw new Error("invalid genesis quarantine manifest");
   const names=purpose==="repaired-legacy"?["device.json","mk.key"]:["rk.key.staged","device.json","mk.key"];
   if(v.entries.length!==names.length)throw new Error("invalid genesis quarantine inventory");
   v.entries.forEach((entry,index)=>{if(!plain(entry)||!exact(entry,["source","destination","sha256"])||entry.source!==names[index]||entry.destination!==names[index]||typeof entry.sha256!=="string"||!shaRe.test(entry.sha256))throw new Error("invalid genesis quarantine entry");});
-  return v as unknown as GenesisQuarantineManifest;
+  return v as GenesisQuarantineManifest;
 }
 
-export function parseGenesisQuarantineCompleted(raw:string,manifest:GenesisQuarantineManifest,manifestRaw:string):Promise<GenesisQuarantineCompleted>{return(async()=>{const v=parseStrict(raw);if(!plain(v)||!exact(v,["version","accountId","purpose","uniquenessKey","manifestSha256","completedAt"])||v.version!==1||v.accountId!==manifest.accountId||v.purpose!==manifest.purpose||v.uniquenessKey!==manifest.uniquenessKey||!iso(v.completedAt)||v.manifestSha256!==await sha256Hex(utf8(manifestRaw)))throw new Error("invalid genesis quarantine completion marker");return v as unknown as GenesisQuarantineCompleted;})();}
+export function parseGenesisQuarantineCompleted(raw:string,manifest:GenesisQuarantineManifest,manifestRaw:string):Promise<GenesisQuarantineCompleted>{return(async()=>{const v=parsed(raw);if(!plain(v)||!exact(v,["version","accountId","purpose","uniquenessKey","manifestSha256","completedAt"])||v.version!==1||v.accountId!==manifest.accountId||v.purpose!==manifest.purpose||v.uniquenessKey!==manifest.uniquenessKey||!iso(v.completedAt)||v.manifestSha256!==await sha256Hex(utf8(manifestRaw)))throw new Error("invalid genesis quarantine completion marker");return v as GenesisQuarantineCompleted;})();}
 
 async function fileHash(file:string):Promise<string>{const stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>4*1024*1024)throw new Error(`unsafe genesis quarantine source: ${path.basename(file)}`);return sha256Hex(new Uint8Array(await fs.readFile(file)));}
 async function exists(file:string):Promise<boolean>{try{await fs.lstat(file);return true;}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return false;throw error;}}

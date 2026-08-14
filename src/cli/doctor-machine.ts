@@ -18,7 +18,7 @@ import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
 import { inspectFolderCatalog } from "./folder-config.js";
 import { listFolderInventory, type FolderAdmission, type FolderInventoryRow } from "./folder-inventory.js";
-import { type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
+import { type AmbientAttentionReason, type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import { style } from "./style.js";
@@ -77,12 +77,19 @@ export interface MachineAggregate {
   configuredButUnbound: ConfiguredButUnboundFolder[];
 }
 
-const ATTENTION_SUMMARY: Record<string, string> = {
+/** Plain-English line per attention reason the daemon can report. Partial: a
+ *  reason without its own sentence (today `unknown-error`) falls back below. */
+type AttentionSummaries = Partial<Record<AmbientAttentionReason, string>>;
+
+const ATTENTION_SUMMARY: AttentionSummaries = {
   halt: "syncing stopped and needs your decision",
   "out-of-storage": "out of storage — new changes cannot upload",
   "watcher-degraded": "not noticing file changes instantly; syncing is slow",
   "ownership-lost": "another rbox process took over syncing this folder",
 };
+
+const attentionSummary = (reason: AmbientAttentionReason | undefined): string =>
+  (reason === undefined ? undefined : ATTENTION_SUMMARY[reason]) ?? "syncing hit a problem";
 
 const MISSING_SUMMARY =
   "this folder is gone or is no longer set up for rbox, so rbox is not syncing it. If you moved it back, run `rbox start` inside it.";
@@ -95,14 +102,17 @@ function deferralSuffix(status: AmbientDaemonStatusV1 | undefined): string {
   return count === 1 ? " · 1 code folder is waiting on you" : ` · ${count} code folders are waiting on you`;
 }
 
+/** The two workspace-row fields a live daemon record decides on its own. */
+type SummarizedState = Pick<MachineWorkspaceSummary, "state" | "summary">;
+
 /** Only ever called with a record already proven to belong to the live daemon
  * incarnation, so every field — including `mode` (design 178) — is authoritative. */
-function summarize(status: AmbientDaemonStatusV1): { state: MachineWorkspaceState; summary: string } {
+function summarize(status: AmbientDaemonStatusV1): SummarizedState {
   switch (status.state) {
     case "attention":
       return {
         state: "attention",
-        summary: `needs attention — ${ATTENTION_SUMMARY[status.attentionReason ?? ""] ?? "syncing hit a problem"}`,
+        summary: `needs attention — ${attentionSummary(status.attentionReason)}`,
       };
     case "syncing":
       return { state: "syncing", summary: "syncing right now" };
@@ -232,7 +242,7 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
   return (await collectMachineAggregate(deps)).triage;
 }
 
-const MARK: Record<MachineWorkspaceState, string> = {
+const MARK = {
   syncing: style.sym.ok,
   synced: style.sym.ok,
   attention: style.sym.err,
@@ -240,7 +250,7 @@ const MARK: Record<MachineWorkspaceState, string> = {
   stopped: style.sym.warn,
   unreachable: style.sym.err,
   unknown: style.sym.warn,
-};
+} satisfies Record<MachineWorkspaceState, string>;
 
 /** A problem worth interrupting the user for. A folder whose background sync is
  * simply stopped is reported in its own row, but is not an alarm — plenty of
@@ -293,13 +303,13 @@ export function renderMachineTriage(
   return lines;
 }
 
-const BINDING_LABEL: Record<BindingHealth, string> = {
+const BINDING_LABEL = {
   bound: "ok",
   missing: "root gone",
   rebound: "rebound",
-};
+} satisfies Record<BindingHealth, string>;
 
-const DAEMON_LABEL: Record<MachineWorkspaceState, string> = {
+const DAEMON_LABEL = {
   syncing: "running",
   synced: "running",
   attention: "running",
@@ -307,7 +317,7 @@ const DAEMON_LABEL: Record<MachineWorkspaceState, string> = {
   stopped: "stopped",
   unreachable: "—",
   unknown: "no report",
-};
+} satisfies Record<MachineWorkspaceState, string>;
 
 /** `dd mmm HH:MM`, or `—` when the daemon has never reported a completed sync. */
 function relativeSync(iso: string | undefined, now: number): string {
