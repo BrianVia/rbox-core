@@ -83,9 +83,26 @@ function r2Object(bytes: Uint8Array): R2ObjectBody {
   } as R2ObjectBody;
 }
 
-const emptyPlacementDb = () => {
-  const statement = { bind: () => statement };
-  return { prepare: () => statement, batch: async (stmts: unknown[]) => stmts.map(() => ({ results: [] })) } as unknown as D1Database;
+/** The one statement member `resolvePackPlacements` touches; widened so a real
+ *  `D1PreparedStatement` satisfies it. Method syntax keeps the parameter check
+ *  bivariant, so `D1Database` stays assignable to `PlacementDb`. */
+interface PlacementStatement {
+  bind(...args: unknown[]): PlacementStatement;
+}
+
+/** The two database members it touches; widened so `D1Database` satisfies it. */
+interface PlacementDb {
+  prepare(sql: string): PlacementStatement;
+  batch(statements: PlacementStatement[]): Promise<{ results: unknown[] }[]>;
+}
+
+const emptyPlacementDb = (): D1Database => {
+  const statement: PlacementStatement = { bind: () => statement };
+  const db: PlacementDb = {
+    prepare: () => statement,
+    batch: async (statements) => statements.map(() => ({ results: [] })),
+  };
+  return db as D1Database;
 };
 
 function fakePutEnv(opts: {
@@ -97,12 +114,14 @@ function fakePutEnv(opts: {
   d1Now?: number;
 } = {}): Env & { putKeys: string[] } {
   const putKeys: string[] = [];
-  return {
+  // Only the four bindings the PUT path reads; `Pick` keeps each one's real type
+  // (and optionality), so the single assertion below stays a plain downcast.
+  const bindings: Pick<Env, "RBOX_RECEIPT_KEY" | "rbox_dev_db" | "rbox_metrics" | "rbox_dev_blobs"> & { putKeys: string[] } = {
     RBOX_RECEIPT_KEY: "r".repeat(40),
     rbox_dev_db: {
       prepare: (sql: string) => ({
         bind: (...binds: unknown[]) => ({
-          first: () => {
+          first: (): Promise<unknown> => {
             opts.onFenceRead?.();
             if (opts.fenceReadError) return Promise.reject(new Error("D1 unavailable"));
             if (sql.includes("julianday('now')") && opts.d1Now !== undefined && opts.d1Now >= Number(binds[0])) {
@@ -112,20 +131,21 @@ function fakePutEnv(opts: {
           },
         }),
       }),
-    },
+    } as D1Database,
     rbox_metrics: opts.metrics
-      ? { writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => opts.metrics!.push(point) }
+      ? { writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => opts.metrics!.push(point) } as AnalyticsEngineDataset
       : undefined,
     rbox_dev_blobs: {
-      put: (key: string, body: Uint8Array) => {
+      put: (key: string, body: Uint8Array): Promise<R2Object> => {
         const s = key.slice(-64);
         putKeys.push(s);
         if (s === opts.throwSha) throw new Error("r2 down");
-        return Promise.resolve({ size: body.byteLength });
+        return Promise.resolve({ size: body.byteLength } as R2Object);
       },
-    },
+    } as R2Bucket,
     putKeys,
-  } as unknown as Env & { putKeys: string[] };
+  };
+  return bindings as Env & { putKeys: string[] };
 }
 
 function batchPutBody(records: Array<{ sha: string; payload: Uint8Array }>): Uint8Array {
@@ -155,14 +175,10 @@ async function batchPutDirect(body: Uint8Array, envOverride = fakePutEnv(), head
   return blobBatchPut(new Request(`${BASE}/v1/blob-batch/put`, { method: "POST", headers, body }), envOverride, "acct_batch_put");
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
-  let resolve!: (v: T) => void;
-  let reject!: (e: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
 }
 
 describe("batch blob frame encoding", () => {
@@ -270,14 +286,14 @@ describe("POST /v1/blob-batch/get", () => {
     const fakeEnv = {
       rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
-        get: (key: string) => {
+        get: (key: string): Promise<R2ObjectBody | null> => {
           const s = key.slice(-64);
           started.push(s);
           if (started.length === shas.length) allStarted();
           return waits.get(s)!.promise;
         },
-      },
-    } as unknown as Env;
+      } as R2Bucket,
+    } as Env;
     const res = await blobBatchGetWithVerifiedGrant(
       new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify(shas) }),
       fakeEnv,
@@ -314,12 +330,12 @@ describe("POST /v1/blob-batch/get", () => {
     const fakeEnv = {
       rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
-        get: () => {
+        get: (_key: string): Promise<R2ObjectBody | null> => {
           calls++;
           throw new Error("r2 down");
         },
-      },
-    } as unknown as Env;
+      } as R2Bucket,
+    } as Env;
     const res = await blobBatchGetWithVerifiedGrant(new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify([s]) }), fakeEnv, "acct_r2");
     const [frame] = await decodeFrames(res);
     expect(calls).toBe(2);
@@ -331,15 +347,16 @@ describe("POST /v1/blob-batch/get", () => {
     const fakeEnv = {
       rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
-        get: () =>
+        // Answers synchronously; the awaited real `get` resolves a promise, hence the union.
+        get: (_key: string): R2ObjectBody | Promise<R2ObjectBody | null> =>
           ({
             size: MAX_BATCH_RECORD_BYTES + 1,
             get body(): ReadableStream<Uint8Array> {
               throw new Error("body should not be read");
             },
           }) as R2ObjectBody,
-      },
-    } as unknown as Env;
+      } as R2Bucket,
+    } as Env;
     const res = await blobBatchGetWithVerifiedGrant(new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify([s]) }), fakeEnv, "acct_big");
     const [frame] = await decodeFrames(res);
     expect(statusText(frame!)).toBe(`{"status":"too_large","size":${MAX_BATCH_RECORD_BYTES + 1}}`);

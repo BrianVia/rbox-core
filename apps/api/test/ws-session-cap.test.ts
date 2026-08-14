@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import type { JsonValue } from "../../../src/json.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { acceptConnection, broadcast, broadcastKeyDelivery } from "../src/ws-fanout.js";
 
@@ -6,13 +7,30 @@ const sha = (ch: string) => ch.repeat(64);
 const now = Date.parse("2026-07-12T12:00:00Z");
 const sixHours = 6 * 60 * 60_000;
 
-function socket(connectedAt?: unknown) {
+/** The four socket members fan-out touches; widened so a real `WebSocket` satisfies it.
+ *  `send`/`close` stay plain function types — `vi.fn()`'s `Mock` shape is a narrowing
+ *  the real `WebSocket` could never satisfy, and `expect(...)` does not need it. */
+interface FakeWebSocket {
+  readyState: number;
+  deserializeAttachment(): JsonValue;
+  send(message: string | ArrayBuffer | ArrayBufferView): void;
+  close(code?: number, reason?: string): void;
+}
+
+/** A hibernation attachment is whatever the DO serialized — the fan-out cap deliberately
+ *  accepts any JSON value for `connectedAt` and fails closed on anything non-numeric. */
+function socket(connectedAt?: JsonValue): FakeWebSocket {
   return {
     readyState: WebSocket.OPEN,
-    deserializeAttachment: () => connectedAt === undefined ? {} : { deviceId: "dev-a", connectedAt },
+    deserializeAttachment: (): JsonValue => connectedAt === undefined ? {} : { deviceId: "dev-a", connectedAt },
     send: vi.fn(),
     close: vi.fn(),
   };
+}
+
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
 }
 
 function fakeCtx(sockets: ReturnType<typeof socket>[]): DurableObjectState {
@@ -20,44 +38,64 @@ function fakeCtx(sockets: ReturnType<typeof socket>[]): DurableObjectState {
   return {
     storage: {
       kv: {
-        get: (key: string) => kv.get(key),
-        put: (key: string, value: unknown) => kv.set(key, value),
-        delete: (key: string) => kv.delete(key),
-        list: () => new Map(),
+        get: (key: string): unknown => kv.get(key),
+        put: <Value>(key: string, value: Value): void => { kv.set(key, value); },
+        delete: (key: string): boolean => kv.delete(key),
+        list: (): Iterable<[string, unknown]> => new Map<string, unknown>(),
       },
-      sql: { exec: () => ({ toArray: () => [] }) },
-      transactionSync: (fn: () => void) => fn(),
-      getAlarm: async () => null,
-      setAlarm: async () => {},
+      sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
+      transactionSync: <T>(fn: () => T): T => fn(),
+      getAlarm: async (): Promise<number | null> => null,
+      setAlarm: async (_scheduledTime: number | Date): Promise<void> => {},
     },
-    getWebSockets: () => sockets as unknown as WebSocket[],
-    setWebSocketAutoResponse: () => {},
-  } as unknown as DurableObjectState;
+    getWebSockets: (): WebSocket[] => sockets as WebSocket[],
+    setWebSocketAutoResponse: (): void => {},
+  } as DurableObjectState;
+}
+
+/** The statement double: the three members the commit path calls, plus the sql + binds
+ *  it records so `batch` can answer per query. These MUST be own properties — `startOp`
+ *  Proxy-wraps every prepared statement, and the proxy forwards property reads but not
+ *  object identity, so the recording cannot live in a side table keyed on the object. */
+interface RecordedQuery {
+  sql: string;
+  args: unknown[];
+  bind(...args: unknown[]): RecordedQuery;
+  first(): Promise<unknown>;
+  run(): Promise<{ success: boolean }>;
+}
+
+/** What this double hands back from `prepare`: a stand-in D1 statement that also records.
+ *  The intersection is what keeps `RecordingStatement[]` assignable to
+ *  `D1PreparedStatement[]`, so `D1Database` stays assignable to `FakeD1` below. */
+type RecordingStatement = D1PreparedStatement & RecordedQuery;
+
+/** The two database members the commit path touches; widened so `D1Database` satisfies it. */
+interface FakeD1 {
+  prepare(sql: string): D1PreparedStatement;
+  batch(statements: RecordingStatement[]): Promise<{ results: unknown[] }[]>;
 }
 
 function fakeDb(): D1Database {
-  const statement = (sql: string) => {
-    const stmt = {
+  const statement = (sql: string, args: unknown[]): RecordingStatement => {
+    const recorded: RecordedQuery = {
       sql,
-      args: [] as unknown[],
-      bind: (...args: unknown[]) => {
-        stmt.args = args;
-        return stmt;
-      },
+      args,
+      bind: (...next: unknown[]) => statement(sql, next),
       first: async () => null,
       run: async () => ({ success: true }),
     };
-    return stmt as unknown as D1PreparedStatement;
+    return recorded as RecordingStatement;
   };
-  return {
-    prepare: statement,
-    batch: async (stmts: D1PreparedStatement[]) => stmts.map((raw) => {
-      const s = raw as unknown as { sql: string; args: unknown[] };
-      return s.sql.includes("FROM blob_refs")
-        ? { results: s.args.slice(1).map((sha256) => ({ sha256 })) }
-        : { results: [] };
-    }),
-  } as unknown as D1Database;
+  const db: FakeD1 = {
+    prepare: (sql) => statement(sql, []),
+    batch: async (statements) => statements.map((stmt) => (
+      stmt.sql.includes("FROM blob_refs")
+        ? { results: stmt.args.slice(1).map((sha256) => ({ sha256 })) }
+        : { results: [] }
+    )),
+  };
+  return db as D1Database;
 }
 
 function signed() {
@@ -83,8 +121,8 @@ describe("websocket session cap", () => {
   test("accepted sockets carry a numeric connectedAt attachment", () => {
     let accepted: WebSocket | undefined;
     const ctx = {
-      acceptWebSocket: (ws: WebSocket) => { accepted = ws; },
-    } as unknown as DurableObjectState;
+      acceptWebSocket: (ws: WebSocket): void => { accepted = ws; },
+    } as DurableObjectState;
     const response = acceptConnection(ctx, new URL("https://api.test/connect?device=dev-a"));
     expect(response.status).toBe(101);
     expect(accepted).toBeDefined();

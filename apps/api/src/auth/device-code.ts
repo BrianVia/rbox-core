@@ -1,4 +1,5 @@
 import type { Env } from "../env.js";
+import type { JsonValue } from "../../../../src/json.js";
 import { cappedJson, ctEqual, exactObject, isWellFormed, json, objectWithKeys, sha256Hex, truncateUtf8, utf8Bytes } from "../util.js";
 import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
@@ -35,7 +36,7 @@ function randomUserCode(): string {
   return `${c.slice(0, 4)}-${c.slice(4)}`;
 }
 
-export function validateDeviceStartBody(value: unknown): ({ label?: string } & Partial<DevicePublicKeys>) | null {
+export function validateDeviceStartBody(value: JsonValue): ({ label?: string } & Partial<DevicePublicKeys>) | null {
   if (!objectWithKeys(value, ["label", "encPubKey", "sigPubKey"])) return null;
   if ((value.encPubKey === undefined) !== (value.sigPubKey === undefined)) return null;
   if (value.encPubKey !== undefined && (
@@ -52,7 +53,7 @@ export function validateDeviceStartBody(value: unknown): ({ label?: string } & P
   return { label: truncateUtf8(value.label, 600), ...keys };
 }
 
-export function validateDevicePollBody(value: unknown): { deviceCode: string } | null {
+export function validateDevicePollBody(value: JsonValue): { deviceCode: string } | null {
   return exactObject(value, ["deviceCode"])
     && typeof value.deviceCode === "string"
     && value.deviceCode.length === TOKEN_BYTES * 2
@@ -65,8 +66,8 @@ export type DeviceApproveBody =
   | { userCode: string; keyConsent?: false }
   | { userCode: string; keyConsent: true; pubkeyFingerprint: string; clerkToken: string };
 
-export function validateDeviceApproveBody(value: unknown): DeviceApproveBody | null {
-  const validCode = (candidate: unknown): candidate is string =>
+export function validateDeviceApproveBody(value: JsonValue): DeviceApproveBody | null {
+  const validCode = (candidate: JsonValue | undefined): candidate is string =>
     typeof candidate === "string" && /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(candidate);
   if (exactObject(value, ["userCode"]) && validCode(value.userCode)) return { userCode: value.userCode };
   if (
@@ -374,7 +375,7 @@ export async function queueApprovedKeyDelivery(
 }
 
 export function validateDeviceApproveDevBody(
-  value: unknown,
+  value: JsonValue,
 ): { userCode: string; pubkeyFingerprint: string; bootstrapSecret: string } | null {
   if (!exactObject(value, ["userCode", "pubkeyFingerprint", "bootstrapSecret"])) return null;
   if (typeof value.userCode !== "string" || !/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(value.userCode)) return null;
