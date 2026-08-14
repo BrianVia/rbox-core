@@ -352,6 +352,10 @@ interface OpenDriftAudit {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+function divergenceNeedsPush(verdict: "none" | "some" | "pending-carry" | "indeterminate"): boolean {
+  return verdict === "some" || verdict === "indeterminate";
+}
+
 /**
  * The rbox daemon: passive, continuous, resource-disciplined sync.
  *
@@ -1552,7 +1556,7 @@ export class RboxDaemon {
       // on it publishes an empty sequence this daemon then pulls — the echo ring. Every
       // other outcome (including a transient unprovable one) still re-arms.
       const publishable = await this.hasPublishableLocalDivergence();
-      if (publishable !== "none" && publishable !== "pending-carry") this.requestPush("other");
+      if (divergenceNeedsPush(publishable)) this.requestPush("other");
       return;
     }
     let cov: ScanCoverage;
@@ -1582,7 +1586,7 @@ export class RboxDaemon {
       } catch (error) {
         throw new RecoveryProbePreflightError(error);
       }
-      if (publishable === "none") {
+      if (!divergenceNeedsPush(publishable)) {
         this.clearRecoveryHalt();
         return;
       }

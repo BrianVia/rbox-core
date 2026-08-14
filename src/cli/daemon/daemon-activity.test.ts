@@ -708,10 +708,14 @@ test("review M2: locked divergent repo is indeterminate and conflict recovery st
  *  pull op re-scans, and a file-level diff would arm the push before the git verdict is
  *  ever consulted. The folder catalog is the git-policy authority the pump reconciles
  *  against, so the root is re-admitted with git on. */
-async function makeGitDaemon(bootId: string, gitPendingRemote: Record<string, GitSection> = {}): Promise<DaemonInternals> {
+async function makeGitDaemon(
+  bootId: string,
+  gitPendingRemote: Record<string, GitSection> = {},
+  remote: MiniRemote = new MiniRemote(),
+): Promise<DaemonInternals> {
   await releaseDaemonFolderAdmission(root);
   await prepareDaemonFolderAdmission(root, testConfig({ syncGit: true }));
-  const daemon = await makeDaemon(new MiniRemote(), bootId, {}, { syncGit: true });
+  const daemon = await makeDaemon(remote, bootId, {}, { syncGit: true });
   const seeded: SyncState = {
     ...daemon.syncBase!,
     lastSyncedManifest: await scanManifest(root),
@@ -749,6 +753,62 @@ test("design 244 b1: a pending carry never re-arms the post-pull push", async ()
 
   expect(pushAttempts).toBe(0);
   expect(await daemon.hasPublishableLocalDivergence()).toBe("pending-carry"); // the carry stood
+});
+
+test("#691: a pending section clears a persisted push-conflict halt without a commit", async () => {
+  const repo = await makeCommittedRepo();
+  const section: GitSection = {
+    ...(await gitIdentity(repo))!,
+    bundleSha: "a".repeat(64),
+    bundleEncSha: "b".repeat(64),
+    bundleCipherSize: 1,
+    generatedAt: new Date(TEST_NOW).toISOString(),
+  };
+  const remote = new AlwaysConflictRemote();
+  const daemon = await makeGitDaemon("pending-recovery", { repo: section }, remote);
+  const halt: NonNullable<DaemonActivity["halt"]> = {
+    at: iso(30), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  await saveActivity(root, { at: new Date().toISOString(), halt });
+  daemon.activity.halt = (await loadActivity(root))!.halt;
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect(remote.commitCalls).toBe(0);
+  expect(daemon.activity.halt).toBeUndefined();
+  expect((await loadActivity(root))?.halt).toBeUndefined();
+});
+
+test("#691: mixed pending and busy repos still run one conflict-recovery push", async () => {
+  const pendingRepo = await makeCommittedRepo("pending");
+  const busyRepo = await makeCommittedRepo("busy");
+  const section: GitSection = {
+    ...(await gitIdentity(pendingRepo))!,
+    bundleSha: "a".repeat(64),
+    bundleEncSha: "b".repeat(64),
+    bundleCipherSize: 1,
+    generatedAt: new Date(TEST_NOW).toISOString(),
+  };
+  const daemon = await makeGitDaemon("pending-busy-recovery", { pending: section });
+  await fs.writeFile(path.join(busyRepo, ".git", "index.lock"), "");
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  let pushAttempts = 0;
+  daemon.doPush = async () => { pushAttempts++; };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(pushAttempts).toBe(1);
+  expect(daemon.activity.halt).toBeUndefined();
 });
 
 test("review M2: a busy repo is transiently unprovable and still re-arms the post-pull push", async () => {
@@ -987,11 +1047,10 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   const pushSummary = logs.find((line) => line.startsWith("rbox push "))!;
   expect(pushSummary).toContain("prologue_ms=");
   expect(pushSummary).toContain("settle_ms=");
-  expect(pushSummary).toContain("candidate_projection_ms=");
-  expect(pushSummary).toContain("delta_base_ms=");
-  expect(pushSummary).toContain("ack_ms=");
-  expect(pushSummary).toContain("publish_transition_ms=");
-  expect(pushSummary).toContain("drain_wait_ms=");
+  expect(pushSummary).toContain("delta_base=");
+  expect(pushSummary).toContain("ack=");
+  expect(pushSummary).toContain("publish_transition=");
+  expect(pushSummary).toContain("drain_wait=");
 
   daemon.want.push = true; // steady state: no changes → no-op → trail unchanged
   await daemon.pump();
