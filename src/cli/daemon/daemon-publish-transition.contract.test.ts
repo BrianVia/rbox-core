@@ -47,6 +47,7 @@ function pushResult(overrides: Partial<PushResult> = {}): PushResult {
 
 class RecordingEffects implements DaemonPublishEffects, PushTransitionPort {
   readonly calls: string[] = [];
+  publishTransitionMs: number | undefined;
   requests: SealedPublishRequest[] = [];
   outcomeFor: (request: SealedPublishRequest) => Promise<DaemonPushOutcome> = async (request) =>
     ({ kind: "committed", attemptId: request.attemptId, result: pushResult() });
@@ -64,7 +65,10 @@ class RecordingEffects implements DaemonPublishEffects, PushTransitionPort {
     this.calls.push("execute");
     return this.outcomeFor(request);
   }
-  settleReport(): void { this.calls.push("settle-report"); }
+  settleReport(publishTransitionMs: number): void {
+    this.publishTransitionMs = publishTransitionMs;
+    this.calls.push("settle-report");
+  }
   noteTerminalBlock(fingerprint: string | undefined): void { this.calls.push(`terminal-block:${fingerprint}`); }
   recordGitCaptureSuccess(provenance: PushProvenance): void { this.calls.push(`capture-success:${provenance.scan}`); }
   commitPublishedSubset(next: Manifest, deferred: readonly string[]): void {
@@ -316,6 +320,7 @@ describe("PublishLocalWorkspaceTransition", () => {
     expect(receipt.outcome).toBe("committed");
     expect(receipt.sequence).toBe(7);
     expect(receipt.attemptId).toBe(effects.requests[0]!.attemptId);
+    expect(effects.publishTransitionMs).toBeGreaterThanOrEqual(0);
   });
 
   test("provenance is consumed exactly once per publication", async () => {

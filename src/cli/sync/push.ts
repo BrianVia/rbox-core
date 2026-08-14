@@ -936,26 +936,33 @@ async function runPushAttempt(
       firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
     }
 
+    let stateSaveMs = 0;
     const transitionPort: RepoTransitionPort = {
       records: repoRecordsForState(state),
       observedRepos: (values) => observedRepoKeys(state, committed.gitRepos, values),
       announce: (line) => { (deps.onGitLog ?? ((l: string) => console.error(l)))(line); },
       save: async (write) => {
-        await report.phase("state-save", () => saveStateSource(root, state, {
-          expectedStream: syncStreamId(cfg),
-          sourceGlobalSeq: write.acceptedSequence,
-          globalManifest: write.globalManifest,
-          ...(write.manifestMeta ? { manifestMeta: write.manifestMeta } : {}),
-          observedRepos: write.observedRepos,
-          values: write.values,
-          repoProofs: write.repoProofs,
-          authoredCfgHashByRepo: write.authoredCfgHashByRepo,
-        }, {
-          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-        }));
+        const stateSaveT0 = performance.now();
+        try {
+          await report.phase("state-save", () => saveStateSource(root, state, {
+            expectedStream: syncStreamId(cfg),
+            sourceGlobalSeq: write.acceptedSequence,
+            globalManifest: write.globalManifest,
+            ...(write.manifestMeta ? { manifestMeta: write.manifestMeta } : {}),
+            observedRepos: write.observedRepos,
+            values: write.values,
+            repoProofs: write.repoProofs,
+            authoredCfgHashByRepo: write.authoredCfgHashByRepo,
+          }, {
+            allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+            forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+          }));
+        } finally {
+          stateSaveMs += performance.now() - stateSaveT0;
+        }
       },
     };
+    const acknowledgementT0 = performance.now();
     const acknowledgement = await acknowledgePublishedGitTransitions(
       {
         identity: sealed.identity,
@@ -966,6 +973,8 @@ async function runPushAttempt(
       commitReceipt,
       transitionPort,
     );
+    const acknowledgementMs = Math.max(0, performance.now() - acknowledgementT0 - stateSaveMs);
+    report.appendDetails("state-save", { ack_ms: acknowledgementMs }, formatPushSpan("ack_ms", acknowledgementMs));
     if (acknowledgement.kind === "accepted-state-pending") {
       // An unarmed publication keeps the pre-seam contract: the state-save error
       // is the caller's, not a soft "landed but unrecorded" result.
