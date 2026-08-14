@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { canonicalString, fromB64url, parseStrict, rkToPhrase, sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 export const GENESIS_ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/;
 export const GENESIS_REPAIR_ID_RE = /^gra_[0-9a-f]{32}$/;
@@ -129,14 +129,14 @@ export async function hardenedFsyncExisting(file:string):Promise<void>{
   await regularOrAbsent(file);const handle=await fs.open(file,"r");try{await handle.sync();}finally{await handle.close();}await fsyncDirectory(path.dirname(file));
 }
 
-export interface GenesisPrepublishMarker {
+export type GenesisPrepublishMarker = {
   version: 1;
   accountId: string;
   deviceId: string;
   repairId: string | null;
   startedAt: string;
   phase: "prepublish";
-}
+};
 
 export type GenesisCompletionReceipt =
   | { outcome: "phrase-delivered" | "competing-cleaned"; at: string }
@@ -150,7 +150,7 @@ export type GenesisCompletionReceipt =
       continuedAfterPartial: boolean;
     };
 
-export interface GenesisJournal {
+export type GenesisJournal = {
   version: 1;
   accountId: string;
   deviceId: string;
@@ -161,16 +161,16 @@ export interface GenesisJournal {
   originalCacheRecovery: boolean;
   completionHolds: ["recovery-kit-staging"];
   completionReceipts: { "recovery-kit-staging"?: GenesisCompletionReceipt };
-}
+};
 
-export interface GenesisBootstrapRequest {
+export type GenesisBootstrapRequest = {
   recoveryWrap: string;
   recoveryWrapId: string;
   genesisRoster: string;
   genesisKeyState: string;
   device: { deviceId: string; sigPubKey: string; encPubKey: string; mkWrap: string };
   repairId?: string;
-}
+};
 
 export type LegacyCompletionIntent =
   | { version: 1; accountId: string; requestSha256: string; mode: "phrase-display"; intentAt: string }
@@ -183,7 +183,7 @@ export type RecoveryDestination =
   | { kind: "kit-path"; path: string }
   | { kind: "clipboard" };
 
-export interface DestinationSetCompletionIntent {
+export type DestinationSetCompletionIntent = {
   version: 2;
   accountId: string;
   requestSha256: string;
@@ -191,7 +191,7 @@ export interface DestinationSetCompletionIntent {
   destinations: RecoveryDestination[];
   successThreshold: 1;
   intentAt: string;
-}
+};
 
 export type CompletionIntent = LegacyCompletionIntent | DestinationSetCompletionIntent;
 
@@ -208,16 +208,16 @@ export type DestinationEvent =
   | { kind: "completed"; destinationIndex: number; completion: DestinationCompletion; at: string }
   | { kind: "invalidated"; destinationIndex: number; priorCompletionSha256: string; reason: "missing" | "mismatch"; at: string };
 
-export interface DestinationProgress {
+export type DestinationProgress = {
   version: 1;
   accountId: string;
   requestSha256: string;
   intentSha256: string;
   events: DestinationEvent[];
   updatedAt: string;
-}
+};
 
-export interface LegacyCompletionIntentRetargetWitness {
+export type LegacyCompletionIntentRetargetWitness = {
   version: 1;
   accountId: string;
   requestSha256: string;
@@ -226,15 +226,15 @@ export interface LegacyCompletionIntentRetargetWitness {
   newIntent: LegacyCompletionIntent;
   newIntentSha256: string;
   witnessedAt: string;
-}
+};
 
-export interface CarriedDestinationCompletion {
+export type CarriedDestinationCompletion = {
   oldDestinationIndex: number;
   newDestinationIndex: number;
   completionSha256: string;
-}
+};
 
-export interface DestinationSetRetargetWitness {
+export type DestinationSetRetargetWitness = {
   version: 2;
   accountId: string;
   requestSha256: string;
@@ -248,46 +248,50 @@ export interface DestinationSetRetargetWitness {
   newProgressSha256: string;
   carriedCompletions: CarriedDestinationCompletion[];
   witnessedAt: string;
-}
+};
 
 export type CompletionIntentRetargetWitness = LegacyCompletionIntentRetargetWitness | DestinationSetRetargetWitness;
 
 /** Durable local proof that the current device/MK bytes were verified against a
  * complete server enrollment. It is only a routing optimization: any parse or
  * byte-binding failure falls back to a fresh server consultation. */
-export interface GenesisEnrollmentWitness {
+export type GenesisEnrollmentWitness = {
   version: 1;
   accountId: string;
   deviceSha256: string;
   mkSha256: string;
   verifiedAt: string;
-}
+};
 
 const exactKeys = (value: object, keys: readonly string[]): boolean => {
   const actual = Object.keys(value);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
 };
-const iso = (value: unknown): value is string => typeof value === "string" && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
-const plain = (value: unknown): value is JsonObject => typeof value === "object" && value !== null && !Array.isArray(value);
+/** One field read out of a parsed JSON object: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
 
-function parseBounded(raw: string): unknown {
+const iso = (value: JsonField): value is string => typeof value === "string" && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
+const plain = (value: JsonField): value is JsonObject => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** `parseStrict` hands back exactly what `JSON.parse` produced — a JSON value. */
+function parseBounded(raw: string): JsonValue {
   if (Buffer.byteLength(raw, "utf8") > GENESIS_MAX_JSON_BYTES) throw new Error("genesis artifact exceeds size bound");
-  return parseStrict(raw);
+  return parseStrict(raw) as JsonValue;
 }
 
-const boundedOpaque = (value: unknown): value is string =>
+const boundedOpaque = (value: JsonField): value is string =>
   typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 64 * 1024;
 
 const DESTINATION_LIMIT = 4;
 const DESTINATION_EVENT_LIMIT = 128;
 const DESTINATION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const safeBoundedString = (value: unknown, maxBytes = 4096): value is string =>
+const safeBoundedString = (value: JsonField, maxBytes = 4096): value is string =>
   typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes && !/[\0-\x1f\x7f]/.test(value);
-const safeAbsolutePath = (value: unknown): value is string =>
+const safeAbsolutePath = (value: JsonField): value is string =>
   safeBoundedString(value) && path.isAbsolute(value) && path.normalize(value) === value;
 const digest = (value: string): Promise<string> => sha256Hex(utf8(value));
 
-function parseRecoveryDestination(value: unknown, accountId: string): RecoveryDestination {
+function parseRecoveryDestination(value: JsonField, accountId: string): RecoveryDestination {
   if (!plain(value) || typeof value.kind !== "string") throw new Error("invalid recovery destination");
   if (value.kind === "onepassword") {
     if (!exactKeys(value, ["kind","accountUuid","vaultUuid","operationTag","fieldId"])
@@ -295,18 +299,18 @@ function parseRecoveryDestination(value: unknown, accountId: string): RecoveryDe
       || typeof value.vaultUuid !== "string" || !DESTINATION_TOKEN_RE.test(value.vaultUuid)
       || typeof value.operationTag !== "string" || !DESTINATION_TOKEN_RE.test(value.operationTag)
       || value.fieldId !== "rboxRecoveryPhrase") throw new Error("invalid 1Password destination");
-    return value as unknown as RecoveryDestination;
+    return value as RecoveryDestination;
   }
   if (value.kind === "keychain") {
     if (!exactKeys(value, ["kind","service","account","keychainPath"]) || value.service !== "rbox recovery phrase"
       || value.account !== accountId || !safeAbsolutePath(value.keychainPath)) throw new Error("invalid Keychain destination");
-    return value as unknown as RecoveryDestination;
+    return value as RecoveryDestination;
   }
   if (value.kind === "kit-path") {
     if (!exactKeys(value, ["kind","path"]) || !safeAbsolutePath(value.path)) throw new Error("invalid kit-path destination");
-    return value as unknown as RecoveryDestination;
+    return value as RecoveryDestination;
   }
-  if (value.kind === "clipboard" && exactKeys(value, ["kind"])) return value as unknown as RecoveryDestination;
+  if (value.kind === "clipboard" && exactKeys(value, ["kind"])) return value as RecoveryDestination;
   throw new Error("invalid recovery destination");
 }
 
@@ -320,7 +324,7 @@ function destinationIdentity(destination: RecoveryDestination): string {
 const destinationRank = (destination: RecoveryDestination): number =>
   destination.kind === "onepassword" ? 0 : destination.kind === "keychain" ? 1 : destination.kind === "kit-path" ? 2 : 3;
 
-function parseDestinationCompletion(value: unknown, destination?: RecoveryDestination): DestinationCompletion {
+function parseDestinationCompletion(value: JsonField, destination?: RecoveryDestination): DestinationCompletion {
   if (!plain(value) || typeof value.kind !== "string") throw new Error("invalid destination completion");
   let parsed: DestinationCompletion;
   if (value.kind === "onepassword") {
@@ -330,18 +334,18 @@ function parseDestinationCompletion(value: unknown, destination?: RecoveryDestin
       || typeof value.operationTag !== "string" || !DESTINATION_TOKEN_RE.test(value.operationTag)
       || typeof value.itemUuid !== "string" || !DESTINATION_TOKEN_RE.test(value.itemUuid)
       || value.fieldId !== "rboxRecoveryPhrase" || !iso(value.completedAt)) throw new Error("invalid 1Password completion");
-    parsed = value as unknown as DestinationCompletion;
+    parsed = value as DestinationCompletion;
   } else if (value.kind === "keychain") {
     if (!exactKeys(value, ["kind","service","account","keychainPath","completedAt"]) || value.service !== "rbox recovery phrase"
       || typeof value.account !== "string" || !GENESIS_ACCOUNT_ID_RE.test(value.account)
       || !safeAbsolutePath(value.keychainPath) || !iso(value.completedAt)) throw new Error("invalid Keychain completion");
-    parsed = value as unknown as DestinationCompletion;
+    parsed = value as DestinationCompletion;
   } else if (value.kind === "kit-path") {
     if (!exactKeys(value, ["kind","path","completedAt"]) || !safeAbsolutePath(value.path) || !iso(value.completedAt)) throw new Error("invalid kit-path completion");
-    parsed = value as unknown as DestinationCompletion;
+    parsed = value as DestinationCompletion;
   } else if (value.kind === "clipboard") {
     if (!exactKeys(value, ["kind","confirmedAt"]) || !iso(value.confirmedAt)) throw new Error("invalid clipboard completion");
-    parsed = value as unknown as DestinationCompletion;
+    parsed = value as DestinationCompletion;
   } else throw new Error("invalid destination completion");
   if (destination && !completionMatchesDestination(parsed, destination)) throw new Error("destination completion does not match selected target");
   return parsed;
@@ -360,7 +364,7 @@ function completionMatchesDestination(completion: DestinationCompletion, destina
   return completion.kind === "clipboard" && destination.kind === "clipboard";
 }
 
-function parseDestinationEvent(value: unknown, intent: DestinationSetCompletionIntent): DestinationEvent {
+function parseDestinationEvent(value: JsonField, intent: DestinationSetCompletionIntent): DestinationEvent {
   if (!plain(value) || typeof value.kind !== "string" || !Number.isInteger(value.destinationIndex)
     || (value.destinationIndex as number) < 0 || (value.destinationIndex as number) >= intent.destinations.length || !iso(value.at)) {
     throw new Error("invalid destination event");
@@ -369,13 +373,13 @@ function parseDestinationEvent(value: unknown, intent: DestinationSetCompletionI
   if (value.kind === "op-dispatch-prepared" || value.kind === "op-may-have-dispatched") {
     if (!exactKeys(value, ["kind","destinationIndex","attemptId","at"]) || intent.destinations[index]?.kind !== "onepassword"
       || typeof value.attemptId !== "string" || !DESTINATION_TOKEN_RE.test(value.attemptId)) throw new Error("invalid 1Password dispatch event");
-    return value as unknown as DestinationEvent;
+    return value as DestinationEvent;
   }
   if (value.kind === "op-child-not-started") {
     if (!exactKeys(value, ["kind","destinationIndex","attemptId","reason","at"]) || intent.destinations[index]?.kind !== "onepassword"
       || typeof value.attemptId !== "string" || !DESTINATION_TOKEN_RE.test(value.attemptId)
       || (value.reason !== "spawn-enoent" && value.reason !== "spawn-eacces")) throw new Error("invalid 1Password child event");
-    return value as unknown as DestinationEvent;
+    return value as DestinationEvent;
   }
   if (value.kind === "completed") {
     if (!exactKeys(value, ["kind","destinationIndex","completion","at"])) throw new Error("invalid completed event");
@@ -392,7 +396,7 @@ function parseDestinationEvent(value: unknown, intent: DestinationSetCompletionI
     if (!exactKeys(value, ["kind","destinationIndex","priorCompletionSha256","reason","at"])
       || typeof value.priorCompletionSha256 !== "string" || !GENESIS_REQUEST_SHA_RE.test(value.priorCompletionSha256)
       || (value.reason !== "missing" && value.reason !== "mismatch")) throw new Error("invalid invalidation event");
-    return value as unknown as DestinationEvent;
+    return value as DestinationEvent;
   }
   throw new Error("invalid destination event");
 }
@@ -415,7 +419,7 @@ export function parseGenesisBootstrapRequest(raw: string, deviceId?: string): Ge
   if (Object.hasOwn(v, "repairId") && (typeof v.repairId !== "string" || !GENESIS_REPAIR_ID_RE.test(v.repairId))) {
     throw new Error("invalid genesis bootstrap repair binding");
   }
-  return v as unknown as GenesisBootstrapRequest;
+  return v as GenesisBootstrapRequest;
 }
 
 export function parsePrepublishMarker(raw: string, accountId?: string): GenesisPrepublishMarker {
@@ -424,7 +428,7 @@ export function parsePrepublishMarker(raw: string, accountId?: string): GenesisP
     || typeof v.accountId !== "string" || !GENESIS_ACCOUNT_ID_RE.test(v.accountId) || (accountId !== undefined && v.accountId !== accountId)
     || typeof v.deviceId !== "string" || !v.deviceId || !iso(v.startedAt) || v.phase !== "prepublish"
     || !(v.repairId === null || (typeof v.repairId === "string" && GENESIS_REPAIR_ID_RE.test(v.repairId)))) throw new Error("invalid genesis prepublish marker");
-  return v as unknown as GenesisPrepublishMarker;
+  return v as GenesisPrepublishMarker;
 }
 
 export function parseGenesisEnrollmentWitness(raw:string,accountId?:string):GenesisEnrollmentWitness{
@@ -433,7 +437,7 @@ export function parseGenesisEnrollmentWitness(raw:string,accountId?:string):Gene
     ||typeof v.accountId!=="string"||!GENESIS_ACCOUNT_ID_RE.test(v.accountId)||(accountId!==undefined&&v.accountId!==accountId)
     ||typeof v.deviceSha256!=="string"||!GENESIS_REQUEST_SHA_RE.test(v.deviceSha256)
     ||typeof v.mkSha256!=="string"||!GENESIS_REQUEST_SHA_RE.test(v.mkSha256)||!iso(v.verifiedAt))throw new Error("invalid genesis enrollment witness");
-  return v as unknown as GenesisEnrollmentWitness;
+  return v as GenesisEnrollmentWitness;
 }
 
 export async function parseGenesisJournal(raw: string, accountId?: string): Promise<GenesisJournal> {
@@ -466,7 +470,7 @@ export async function parseGenesisJournal(raw: string, accountId?: string): Prom
   }
   if ((v.phase==="active") !== (receipt===undefined)) throw new Error("genesis journal phase/receipt mismatch");
   parseGenesisBootstrapRequest(v.requestBody, v.deviceId);
-  return v as unknown as GenesisJournal;
+  return v as GenesisJournal;
 }
 
 export function serializeCompletionIntent(intent: CompletionIntent): string { return canonicalString(intent); }
@@ -474,18 +478,18 @@ export function serializeCompletionIntent(intent: CompletionIntent): string { re
 export function parseCompletionIntent(raw: string, journal: GenesisJournal): CompletionIntent {
   const v=parseBounded(raw);
   if (!plain(v)||v.accountId!==journal.accountId||v.requestSha256!==journal.requestSha256||!iso(v.intentAt)) throw new Error("invalid genesis completion intent binding");
-  if (v.version===1 && v.mode==="phrase-display" && exactKeys(v,["version","accountId","requestSha256","mode","intentAt"])) return v as unknown as CompletionIntent;
-  if (v.version===1 && v.mode==="kit-path" && exactKeys(v,["version","accountId","requestSha256","mode","path","intentAt"]) && safeAbsolutePath(v.path)) return v as unknown as CompletionIntent;
+  if (v.version===1 && v.mode==="phrase-display" && exactKeys(v,["version","accountId","requestSha256","mode","intentAt"])) return v as CompletionIntent;
+  if (v.version===1 && v.mode==="kit-path" && exactKeys(v,["version","accountId","requestSha256","mode","path","intentAt"]) && safeAbsolutePath(v.path)) return v as CompletionIntent;
   if (v.version===1 && v.mode==="keychain" && exactKeys(v,["version","accountId","requestSha256","mode","keychain","intentAt"]) && plain(v.keychain)
     && exactKeys(v.keychain,["service","account","keychainPath"]) && v.keychain.service==="rbox recovery phrase" && typeof v.keychain.account==="string" && !!v.keychain.account
-    && safeAbsolutePath(v.keychain.keychainPath)) return v as unknown as CompletionIntent;
+    && safeAbsolutePath(v.keychain.keychainPath)) return v as CompletionIntent;
   if (v.version===2 && v.mode==="destination-set" && exactKeys(v,["version","accountId","requestSha256","mode","destinations","successThreshold","intentAt"])
     && v.successThreshold===1 && Array.isArray(v.destinations) && v.destinations.length>=1 && v.destinations.length<=DESTINATION_LIMIT) {
     const destinations=v.destinations.map((destination)=>parseRecoveryDestination(destination,journal.accountId));
     const identities=destinations.map(destinationIdentity);
     if(new Set(identities).size!==identities.length)throw new Error("duplicate recovery destination");
     for(let index=1;index<destinations.length;index++)if(destinationRank(destinations[index-1]!)>=destinationRank(destinations[index]!))throw new Error("recovery destinations are not in canonical order");
-    return {...v,destinations} as unknown as CompletionIntent;
+    return {...v,destinations} as CompletionIntent;
   }
   throw new Error("invalid genesis completion intent shape");
 }
@@ -563,7 +567,7 @@ export async function parseRetargetWitness(raw:string,journal:GenesisJournal):Pr
       ||old.version!==1||old.mode!=="keychain"||next.version!==1||next.mode!=="kit-path"
       ||typeof v.oldIntentSha256!=="string"||typeof v.newIntentSha256!=="string"
       ||await completionIntentSha256(old)!==v.oldIntentSha256||await completionIntentSha256(next)!==v.newIntentSha256)throw new Error("invalid completion RETARGET witness digests");
-    return v as unknown as CompletionIntentRetargetWitness;
+    return v as CompletionIntentRetargetWitness;
   }
   if(v.version!==2||!exactKeys(v,["version","accountId","requestSha256","oldIntent","oldIntentSha256","newIntent","newIntentSha256","oldProgress","oldProgressSha256","newProgress","newProgressSha256","carriedCompletions","witnessedAt"])
     ||old.version!==2||next.version!==2||!plain(v.oldProgress)||!plain(v.newProgress)||!Array.isArray(v.carriedCompletions)
@@ -582,7 +586,7 @@ export async function parseRetargetWitness(raw:string,journal:GenesisJournal):Pr
       ||(rawMapping.oldDestinationIndex as number)<0||(rawMapping.oldDestinationIndex as number)>=old.destinations.length
       ||(rawMapping.newDestinationIndex as number)<0||(rawMapping.newDestinationIndex as number)>=next.destinations.length
       ||typeof rawMapping.completionSha256!=="string"||!GENESIS_REQUEST_SHA_RE.test(rawMapping.completionSha256))throw new Error("invalid carried destination completion");
-    const mapping=rawMapping as unknown as CarriedDestinationCompletion;
+    const mapping=rawMapping as CarriedDestinationCompletion;
     const oldCompletion=oldFold.completions[mapping.oldDestinationIndex],newCompletion=newFold.completions[mapping.newDestinationIndex];
     if(!oldCompletion||!newCompletion||canonicalString(oldCompletion)!==canonicalString(newCompletion)
       ||await digest(canonicalString(oldCompletion))!==mapping.completionSha256
@@ -591,7 +595,7 @@ export async function parseRetargetWitness(raw:string,journal:GenesisJournal):Pr
   }
   const newCompletedIndexes=newFold.completions.flatMap((completion,index)=>completion?[index]:[]);
   if(newCompletedIndexes.length!==carried.length||newCompletedIndexes.some((index)=>!newIndexes.has(index)))throw new Error("replacement progress contains an uncarried completion");
-  return{...(v as unknown as DestinationSetRetargetWitness),oldIntent:old,newIntent:next,oldProgress,newProgress,carriedCompletions:carried};
+  return{...(v as DestinationSetRetargetWitness),oldIntent:old,newIntent:next,oldProgress,newProgress,carriedCompletions:carried};
 }
 
 export const genesisPaths=(accountId:string)=>{const dir=genesisAccountRoot(accountId);return{

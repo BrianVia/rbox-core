@@ -5,8 +5,11 @@ import { beginFirstPublishTiming, formatFirstPublishStats } from "./upload-lane-
 import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
 
 const originalSendCap = process.env.RBOX_RECEIPT_SEND_CAP;
-const json = (status: number, body: unknown) =>
+const json = <T>(status: number, body: T) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+/** The seam's own init type: `fetch` accepts a RequestInit or a fresh-init factory. */
+const initBody = (init: Parameters<RemoteContext["fetch"]>[1]): string =>
+  String((init instanceof Function ? init() : init)?.body);
 const key = (i: number) => `sha-${i.toString().padStart(64, "0")}`;
 
 function restoreEnv(): void {
@@ -35,8 +38,8 @@ test("redeemReceipts clamps a raised session cap after a server rollback bounce"
   for (let i = 0; i < 15_001; i++) ctx.receipts.set(key(i), `receipt-${i}`);
   const sizes: number[] = [];
   const settled = new Set<string>();
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
-    const receipts = (JSON.parse(String(init.body)) as { receipts: Record<string, string> }).receipts;
+  ctx.fetch = async (_url, init) => {
+    const receipts = (JSON.parse(initBody(init)) as { receipts: Record<string, string> }).receipts;
     const entries = Object.entries(receipts);
     sizes.push(entries.length);
     if (entries.length > RECEIPT_REDEEM_BATCH_MAX) {
@@ -85,7 +88,7 @@ for (const [label, response] of [
     process.env.RBOX_RECEIPT_SEND_CAP = "3";
     const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
     for (let i = 0; i < 3; i++) ctx.receipts.set(key(i), `receipt-${i}`);
-    (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => json(400, response);
+    ctx.fetch = async () => json(400, response);
 
     await expect(redeemReceipts(ctx)).rejects.toThrow("invalid non-shrinking");
     expect([...ctx.receipts.keys()]).toEqual([key(0), key(1), key(2)]);
@@ -97,9 +100,9 @@ test("redeemReceipts bounds repeated server cap shrink bounces", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   for (let i = 0; i < 10; i++) ctx.receipts.set(key(i), `receipt-${i}`);
   let requests = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
+  ctx.fetch = async (_url, init) => {
     requests++;
-    const count = Object.keys((JSON.parse(String(init.body)) as { receipts: object }).receipts).length;
+    const count = Object.keys((JSON.parse(initBody(init)) as { receipts: object }).receipts).length;
     return json(400, { error: "too_many_receipts", max: count - 1 });
   };
 
@@ -112,7 +115,7 @@ test("redeemReceipts fails hard on a malformed 422 without looping", async () =>
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(key(1), "receipt-1");
   let requests = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+  ctx.fetch = async () => {
     requests++;
     return json(422, { missing: [key(2)] });
   };
@@ -129,8 +132,8 @@ test("redeemReceipts slices by exact serialized byte size and sends an oversized
   for (let i = 0; i < 8; i++) ctx.receipts.set(key(i), `${oneMiB}${i}`);
   const bodyBytes: number[] = [];
   const sizes: number[] = [];
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
-    const body = String(init.body);
+  ctx.fetch = async (_url, init) => {
+    const body = initBody(init);
     bodyBytes.push(Buffer.byteLength(body));
     const count = Object.keys((JSON.parse(body) as { receipts: object }).receipts).length;
     sizes.push(count);
@@ -145,8 +148,8 @@ test("redeemReceipts slices by exact serialized byte size and sends an oversized
   oversized.receipts.set(key(99), "x".repeat(RECEIPT_REDEEM_REQUEST_BYTES_MAX + 1));
   let sentCount = 0;
   let sentBytes = 0;
-  (oversized as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
-    const body = String(init.body);
+  oversized.fetch = async (_url, init) => {
+    const body = initBody(init);
     sentBytes = Buffer.byteLength(body);
     sentCount = Object.keys((JSON.parse(body) as { receipts: object }).receipts).length;
     return json(413, { error: "body_too_large" });
@@ -166,8 +169,8 @@ test("default receipt send cap preserves the exact legacy request bodies", async
     ctx.receipts.set(...entry);
   }
   const bodies: string[] = [];
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
-    const body = String(init.body);
+  ctx.fetch = async (_url, init) => {
+    const body = initBody(init);
     bodies.push(body);
     const count = Object.keys((JSON.parse(body) as { receipts: object }).receipts).length;
     return json(200, { granted: count, alreadyEntitled: 0, rejected: 0 });
@@ -184,8 +187,8 @@ test("redeem instrumentation counts bounces as requests but not submitted receip
   const measured = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   for (let i = 0; i < 4; i++) measured.receipts.set(key(i), `receipt-${i}`);
   const sentBodies: string[] = [];
-  (measured as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url, init) => {
-    const body = String(init.body);
+  measured.fetch = async (_url, init) => {
+    const body = initBody(init);
     sentBodies.push(body);
     const count = Object.keys((JSON.parse(body) as { receipts: object }).receipts).length;
     return count > 2
@@ -205,7 +208,7 @@ test("redeem instrumentation counts bounces as requests but not submitted receip
   resetFirstPublishStats();
   const unmeasured = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   unmeasured.receipts.set(key(10), "receipt");
-  (unmeasured as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+  unmeasured.fetch = async () =>
     json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
   await redeemReceipts(unmeasured);
   expect(firstPublishTiming.stats.redeemRequestCount).toBe(0);
@@ -218,7 +221,7 @@ test("redeem instrumentation counts entries on a definitive generic error respon
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(key(1), "receipt-1");
   ctx.receipts.set(key(2), "receipt-2");
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+  ctx.fetch = async () =>
     json(400, { error: "bad_request" });
   beginFirstPublishTiming(true);
 
@@ -231,7 +234,7 @@ test("redeem instrumentation counts entries on a definitive generic error respon
 test("redeemReceipts preserves the parsed-null TypeError compatibility edge", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(key(1), "receipt-1");
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+  ctx.fetch = async () =>
     new Response("null", { status: 400, headers: { "content-type": "application/json" } });
 
   const error = await redeemReceipts(ctx).catch((cause) => cause);
