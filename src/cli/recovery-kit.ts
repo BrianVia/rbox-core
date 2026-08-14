@@ -12,7 +12,7 @@ import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { RECOVERY_KIT_SERVICE } from "./genesis-seam.js";
 import type { KeychainArtifact, KeychainProbe } from "./recovery-kit-keychain.js";
 import { assertAccountId } from "./account-id.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 export const KIT_BANNER = "rbox RECOVERY KIT — keep this somewhere safe";
 const FILE_MODE = 0o600;
@@ -37,34 +37,37 @@ export interface RecoveryKitOptions { kit: boolean; kitPath?: string }
 export interface KitTargetEnv { homeDir: string; downloadsExists: boolean }
 export interface RenderKitInput { accountId: string; deviceId?: string; phrase: string; hostname: string; generatedAt: Date }
 
-export interface PlaintextArtifact {
+export type PlaintextArtifact = {
   path: string;
   writtenAt: string;
   cleanup: "pending" | "declined" | "failed";
-}
+};
 
-export type RecoveryKitOfferSurface = "login" | "status" | "genesis" | "backup" | "recover" | "wizard-recover";
-export type RecoveryKitPhraseSource = "cached-rk" | "typed" | "in-hand";
-export type RecoveryKitOfferOutcome = "claimed" | "shown" | "accepted" | "declined";
+const OFFER_SURFACES = ["login", "status", "genesis", "backup", "recover", "wizard-recover"] as const;
+const OFFER_PHRASE_SOURCES = ["cached-rk", "typed", "in-hand"] as const;
+const OFFER_OUTCOMES = ["claimed", "shown", "accepted", "declined"] as const;
+export type RecoveryKitOfferSurface = (typeof OFFER_SURFACES)[number];
+export type RecoveryKitPhraseSource = (typeof OFFER_PHRASE_SOURCES)[number];
+export type RecoveryKitOfferOutcome = (typeof OFFER_OUTCOMES)[number];
 
-export interface RecoveryKitOffer {
+export type RecoveryKitOffer = {
   claimedAt: string;
   surface: RecoveryKitOfferSurface;
   phraseSource: RecoveryKitPhraseSource;
   outcome: RecoveryKitOfferOutcome;
-}
+};
 
 export const ONE_PASSWORD_FIELD_ID = "rboxRecoveryPhrase" as const;
 export const MAX_ONE_PASSWORD_ARTIFACTS = 16;
 
-export interface OnePasswordArtifactIdentity {
+export type OnePasswordArtifactIdentity = {
   rboxAccountId: string;
   accountUuid: string;
   vaultUuid: string;
   itemUuid: string;
   fieldId: typeof ONE_PASSWORD_FIELD_ID;
   operationTag: string;
-}
+};
 
 export type OnePasswordArtifact = OnePasswordArtifactIdentity & {
   writtenAt: string;
@@ -81,14 +84,14 @@ export type OnePasswordArtifactStatus =
   | (OnePasswordArtifact & { status: "recorded" })
   | (OnePasswordArtifact & { status: "invalidated" });
 
-export interface RecoveryKitRecord {
+export type RecoveryKitRecord = {
   version: 3;
   accountId: string;
   keychain?: KeychainArtifact;
   plaintextArtifacts: PlaintextArtifact[];
   onePasswordArtifacts: OnePasswordArtifact[];
   offer?: RecoveryKitOffer;
-}
+};
 
 export type RecoveryKitRecordRead =
   | { state: "missing" }
@@ -138,24 +141,29 @@ export function displayPath(file: string, homeDir = os.homedir()): string {
   return file;
 }
 
+/** One field read out of a decoded recovery-kit record: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
+const oneOf = <T extends string>(allowed: readonly T[], value: JsonField): value is T =>
+  typeof value === "string" && allowed.some((option) => option === value);
+
 function exactKeys(value: object, allowed: readonly string[]): boolean {
   const actual = Object.keys(value).sort(); const expected = [...allowed].sort();
   return actual.length === expected.length && actual.every((key, i) => key === expected[i]);
 }
-function isObject(value: unknown): value is JsonObject { return typeof value === "object" && value !== null && !Array.isArray(value) }
-function validIso(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
-function validAbsolute(value: unknown): value is string { return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value && !value.includes("\0") && !/[\r\n]/.test(value) }
-function validProviderId(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) }
-function validOperationTag(value: unknown): value is string {
+function isObject(value: JsonField): value is JsonObject { return typeof value === "object" && value !== null && !Array.isArray(value) }
+function validIso(value: JsonField): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
+function validAbsolute(value: JsonField): value is string { return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value && !value.includes("\0") && !/[\r\n]/.test(value) }
+function validProviderId(value: JsonField): value is string { return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) }
+function validOperationTag(value: JsonField): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function parsePlaintextArtifact(value: unknown): PlaintextArtifact | undefined {
+function parsePlaintextArtifact(value: JsonField): PlaintextArtifact | undefined {
   if (!isObject(value) || !exactKeys(value, ["path", "writtenAt", "cleanup"])) return undefined;
   if (!validAbsolute(value.path) || !validIso(value.writtenAt) || !["pending", "declined", "failed"].includes(String(value.cleanup))) return undefined;
   return { path: value.path, writtenAt: value.writtenAt, cleanup: value.cleanup as PlaintextArtifact["cleanup"] };
 }
-function parseKeychainArtifact(value: unknown, accountId: string): KeychainArtifact | undefined {
+function parseKeychainArtifact(value: JsonField, accountId: string): KeychainArtifact | undefined {
   if (!isObject(value)) return undefined;
   const keys = Object.keys(value);
   if (!keys.every((key) => ["service", "account", "keychainPath", "writtenAt", "discoveredAt"].includes(key))) return undefined;
@@ -166,16 +174,17 @@ function parseKeychainArtifact(value: unknown, accountId: string): KeychainArtif
   if (value.writtenAt === undefined && value.discoveredAt === undefined) return undefined;
   return { service: RECOVERY_KIT_SERVICE, account: accountId, keychainPath: value.keychainPath, ...(value.writtenAt ? { writtenAt: value.writtenAt as string } : {}), ...(value.discoveredAt ? { discoveredAt: value.discoveredAt as string } : {}) };
 }
-function parseOffer(value: unknown): RecoveryKitOffer | undefined {
+function parseOffer(value: JsonField): RecoveryKitOffer | undefined {
   if (!isObject(value) || !exactKeys(value, ["claimedAt", "surface", "phraseSource", "outcome"])) return undefined;
-  if (!validIso(value.claimedAt)) return undefined;
-  if (!["login", "status", "genesis", "backup", "recover", "wizard-recover"].includes(String(value.surface))) return undefined;
-  if (!["cached-rk", "typed", "in-hand"].includes(String(value.phraseSource))) return undefined;
-  if (!["claimed", "shown", "accepted", "declined"].includes(String(value.outcome))) return undefined;
-  return value as unknown as RecoveryKitOffer;
+  const { claimedAt, surface, phraseSource, outcome } = value;
+  if (!validIso(claimedAt)) return undefined;
+  if (!oneOf(OFFER_SURFACES, surface)) return undefined;
+  if (!oneOf(OFFER_PHRASE_SOURCES, phraseSource)) return undefined;
+  if (!oneOf(OFFER_OUTCOMES, outcome)) return undefined;
+  return { claimedAt, surface, phraseSource, outcome };
 }
 
-function parseOnePasswordArtifact(value: unknown, accountId: string): OnePasswordArtifact | undefined {
+function parseOnePasswordArtifact(value: JsonField, accountId: string): OnePasswordArtifact | undefined {
   if (!isObject(value)) return undefined;
   const common = ["rboxAccountId", "accountUuid", "vaultUuid", "itemUuid", "fieldId", "operationTag", "writtenAt", "state"];
   const activeKeys = common;
@@ -213,7 +222,10 @@ function sameOnePasswordIdentity(left: OnePasswordArtifactIdentity, right: OnePa
   return left.accountUuid === right.accountUuid && left.vaultUuid === right.vaultUuid && left.itemUuid === right.itemUuid;
 }
 
-export function parseRecoveryKitRecord(value: unknown, accountId: string): RecoveryKitRecord | undefined {
+/** `value` is a decoded recovery-kit record: `JSON.parse` output for the durable
+ * file, or an in-memory record re-validated before it is written back. */
+export function parseRecoveryKitRecord(raw: unknown, accountId: string): RecoveryKitRecord | undefined {
+  const value = raw as JsonValue;
   if (!isObject(value)) return undefined;
   if (!("version" in value) && !("kind" in value) && exactKeys(value, ["path", "writtenAt"]) && validAbsolute(value.path) && validIso(value.writtenAt)) {
     return { version: 3, accountId, plaintextArtifacts: [{ path: value.path, writtenAt: value.writtenAt, cleanup: "pending" }], onePasswordArtifacts: [] };
@@ -231,7 +243,7 @@ export function parseRecoveryKitRecord(value: unknown, accountId: string): Recov
   const offer = value.offer === undefined ? undefined : parseOffer(value.offer);
   if (value.keychain !== undefined && !keychain || value.offer !== undefined && !offer) return undefined;
   const onePasswordArtifacts = value.version === 3
-    ? (value.onePasswordArtifacts as unknown[]).map((artifact) => parseOnePasswordArtifact(artifact, accountId))
+    ? (value.onePasswordArtifacts as JsonValue[]).map((artifact) => parseOnePasswordArtifact(artifact, accountId))
     : [];
   if (onePasswordArtifacts.length > MAX_ONE_PASSWORD_ARTIFACTS || onePasswordArtifacts.some((artifact) => !artifact)) return undefined;
   const identities = new Set<string>();
@@ -253,8 +265,8 @@ export function parseRecoveryKitRecord(value: unknown, accountId: string): Recov
 export async function readRecoveryKitRecordState(accountId: string): Promise<RecoveryKitRecordRead> {
   try {
     const raw = await fs.readFile(recordPath(accountId), "utf8");
-    let value: unknown;
-    try { value = JSON.parse(raw) } catch { return { state: "unknown" } }
+    let value: JsonValue;
+    try { value = JSON.parse(raw) as JsonValue } catch { return { state: "unknown" } }
     const record = parseRecoveryKitRecord(value, accountId);
     return record ? { state: "recognized", record } : { state: "unknown" };
   } catch (error) {
@@ -373,12 +385,12 @@ export async function writeRecoveryKit(
 }
 
 export async function recordKeychainArtifact(accountId: string, artifact: KeychainArtifact): Promise<void> {
-  if (!parseKeychainArtifact(artifact, accountId)) throw new Error("invalid Keychain artifact metadata");
+  if (!parseKeychainArtifact({ ...artifact }, accountId)) throw new Error("invalid Keychain artifact metadata");
   await mutateRecoveryKitRecord(accountId, (current) => ({ ...current, keychain: artifact }));
 }
 
 export async function mergeDiscoveredKeychainArtifact(accountId: string, artifact: KeychainArtifact): Promise<"merged" | "unchanged" | "conflict"> {
-  if (!parseKeychainArtifact(artifact, accountId) || !artifact.discoveredAt || artifact.writtenAt) throw new Error("invalid discovered Keychain metadata");
+  if (!parseKeychainArtifact({ ...artifact }, accountId) || !artifact.discoveredAt || artifact.writtenAt) throw new Error("invalid discovered Keychain metadata");
   let outcome: "merged" | "unchanged" | "conflict" = "merged";
   await mutateRecoveryKitRecord(accountId, (current) => {
     if (!current.keychain) return { ...current, keychain: artifact };
