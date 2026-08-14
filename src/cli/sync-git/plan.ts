@@ -13,11 +13,11 @@ import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, observePackedRefsIdentity, packedRefsMtimeRegressed, type ResolutionCaptureTestHooks } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
-import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
-import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
+import { cachedSupersessionRefusal, gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession, recordSupersessionRefusal, supersessionMemoKeys } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
 import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
@@ -151,6 +151,8 @@ export interface GitPlanOptions {
   onHygieneCtx?: (relPath: string, ctx: RepoCtx | undefined) => void;
 }
 
+const SUPERSESSION_REFUSED_REASON = "final candidate did not supersede pending section — carrying pending verbatim";
+
 /**
  * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
  * repo either CARRY (protected pending, needs-resolution checkpoint, or unchanged identity
@@ -272,8 +274,20 @@ async function planGitSectionsWithRetention(
   const packedRefsIdentity: NonNullable<GitPushPlan["packedRefsIdentity"]> = {};
   const removed: string[] = [];
   const deferred: Array<{ relPath: string; reason: string; typedReason?: GitDeferralReason }> = [];
+  /** Every config-ownership skip says the same reassuring thing; say it once. */
+  const skipConfigOwnership = (rel: string, why: string): void =>
+    logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: ${why}. rbox left shared Git settings alone; Git history can still sync.`);
   const configLaneDefers = new Set<(typeof deferred)[number]>();
   const configLaneItems = new Set<(typeof deferred)[number]>();
+  /** The config lane's one deferral emitter. Every config refusal is a deferral, a
+   *  lane member (so the pointer pre-skip can withdraw it) and — when the fault is
+   *  transient — a `config` deferral owed to the durable observation. */
+  const deferConfigLane = (rel: string, reason: string, transient = false): void => {
+    const item = { relPath: rel, reason };
+    deferred.push(item);
+    configLaneItems.add(item);
+    if (transient) configLaneDefers.add(item);
+  };
   const captureObserved = new Set<string>();
   const configObserved = new Set<string>();
   const skipped: Array<{ relPath: string; reason: string }> = [];
@@ -303,6 +317,9 @@ async function planGitSectionsWithRetention(
     deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
   };
   const pendingSupersessionCandidates = new Set<string>();
+  /** The bracketed probe evidence a refusal is recorded against (#573) — never a
+   *  post-capture re-read. */
+  const supersessionProbeEvidence = new Map<string, { fingerprint: GitFingerprint; identityKey: string; kind: GitRepoKind | undefined }>();
   const supersededPending = new Set<string>();
   const supersessionIdentityKeys: NonNullable<GitPushPlan["supersessionIdentityKeys"]> = {};
   const resolutionCandidates = new Set<string>();
@@ -597,32 +614,22 @@ async function planGitSectionsWithRetention(
     configObserved.add(rel);
     const diskCtx = knownCtx ?? await preCaptureRepoCtx(rel);
     if (!diskCtx || diskCtx.kind !== "dir") {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config. rbox left shared Git settings alone; Git history can still sync.`);
+      skipConfigOwnership(rel, `local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
       return;
     }
     const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
     if (!receiver?.owned) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local common config is outside workspace ownership. rbox left shared Git settings alone; Git history can still sync.`);
+      skipConfigOwnership(rel, "local common config is outside workspace ownership");
       return;
     }
     const localCfg = bracketed ?? (await readConfigForPush(rel));
     if (localCfg.status === "over-bounds") {
-      const item = {
-        relPath: rel,
-        reason: `git config over wire bounds — publication disabled; carrying base verbatim (${localCfg.reason})`,
-      };
-      deferred.push(item);
-      configLaneItems.add(item);
+      deferConfigLane(rel, `git config over wire bounds — publication disabled; carrying base verbatim (${localCfg.reason})`);
       return;
     }
     if (localCfg.status === "failed") {
-      const item = {
-        relPath: rel,
-        reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} (${localCfg.fault.reason}) — carrying base verbatim`,
-      };
-      deferred.push(item);
-      configLaneItems.add(item);
-      if (localCfg.fault.disposition === "transient") configLaneDefers.add(item);
+      const { disposition, reason } = localCfg.fault;
+      deferConfigLane(rel, `git config ${disposition === "permanent" ? "disabled" : "deferred"} (${reason}) — carrying base verbatim`, disposition === "transient");
       return;
     }
     if (!shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) return;
@@ -641,24 +648,18 @@ async function planGitSectionsWithRetention(
     const repoDir = repoDirOf(root, rel);
     const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
     if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
-      logOnce(
-        configOwnershipSkipLogged,
-        rel,
-        `git-sync config skipped ${rel}: capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config. rbox left shared Git settings alone; Git history can still sync.`
-      );
-      const unowned = { ...section };
-      delete unowned.config;
-      return unowned;
+      skipConfigOwnership(rel, `capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config`);
+      return carryBaseConfig(section, undefined);
     }
     let receiver: Awaited<ReturnType<typeof configReceiver>>;
     try {
       receiver = await configReceiver(root, diskCtx);
     } catch (error) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture ownership could not be proven (${errMsg(error)}). rbox left shared Git settings alone; Git history can still sync.`);
+      skipConfigOwnership(rel, `capture ownership could not be proven (${errMsg(error)})`);
       return carryBaseConfig(section, undefined);
     }
     if (!receiver.owned) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture common config is outside workspace ownership. rbox left shared Git settings alone; Git history can still sync.`);
+      skipConfigOwnership(rel, "capture common config is outside workspace ownership");
       return carryBaseConfig(section, undefined);
     }
 
@@ -672,22 +673,12 @@ async function planGitSectionsWithRetention(
       };
     }
     if (localCfg.status === "over-bounds") {
-      const item = {
-        relPath: rel,
-        reason: `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`,
-      };
-      deferred.push(item);
-      configLaneItems.add(item);
+      deferConfigLane(rel, `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`);
       return carryBaseConfig(section, base[rel]);
     }
     if (localCfg.status === "failed") {
-      const item = {
-        relPath: rel,
-        reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} during capture (${localCfg.fault.reason}) — carrying base config`,
-      };
-      deferred.push(item);
-      configLaneItems.add(item);
-      if (localCfg.fault.disposition === "transient") configLaneDefers.add(item);
+      const { disposition, reason } = localCfg.fault;
+      deferConfigLane(rel, `git config ${disposition === "permanent" ? "disabled" : "deferred"} during capture (${reason}) — carrying base config`, disposition === "transient");
       return carryBaseConfig(section, base[rel]);
     }
     const embedded = { ...section, config: localCfg.config };
@@ -697,11 +688,12 @@ async function planGitSectionsWithRetention(
   /** Per-repo failure → defer. P always wins byte-for-byte. A forced non-P repo takes
    *  the legacy M5 drop because its BASE references the exact blob the server lost. */
   const deferOne = (rel: string, reason: string, typedReason?: GitDeferralReason) => {
+    const typed = typedReason ? { typedReason } : {};
     const protectedSection = pending[rel];
     if (protectedSection) {
       out[rel] = protectedSection;
       if (!carried.includes(rel)) carried.push(rel);
-      deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
+      deferred.push({ relPath: rel, reason, ...typed });
       delete authoredCfgHashByRepo[rel];
       return;
     }
@@ -710,13 +702,13 @@ async function planGitSectionsWithRetention(
     // treating that failed observation as a repository omission would turn local
     // corruption into deletion authority, so the active BASE must still carry.
     if (force.has(rel) && typedReason !== "ref-read-unreadable") {
-      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)`, ...(typedReason ? { typedReason } : {}) });
+      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)`, ...typed });
       return;
     }
     const b = base[rel];
     if (b) out[rel] = b; // defer-with-base-carry: never regress a synced repo (§6.4)
     if (b && !carried.includes(rel)) carried.push(rel);
-    deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
+    deferred.push({ relPath: rel, reason, ...typed });
   };
   const pendingPointerPreSkips: Array<{ relPath: string; parentRel: string; admissionAlreadyCounted: boolean }> = [];
   const processRepoSlowPath = async (
@@ -948,17 +940,24 @@ async function planGitSectionsWithRetention(
         carried.push(rel);
         continue;
       }
-      const probe = await pendingSupersessionPreProbe(root, rel, pend, baseSec);
+      const probe = await pendingSupersessionPreProbe(root, rel, pend, baseSec, (fingerprint) =>
+        cachedSupersessionRefusal(cache, rel, fingerprint, supersessionMemoKeys(pend, baseSec)));
       if (probe.status === "carry") {
         out[rel] = pend;
         carried.push(rel);
-        if (probe.busy) deferred.push({ relPath: rel, reason: probe.reason });
+        // A recorded refusal re-emits the deferral its discarded capture produced.
+        if (probe.busy || probe.refused) deferred.push({ relPath: rel, reason: probe.reason });
         // Field-forensics lesson (Mac wedge, 2026-07-21): a silent carry made the
         // no-heal diagnosis require SSH log archaeology. One bounded line per push.
         else logOnce(pendingCarryLogged, rel, `git-sync pending carry ${rel}: ${probe.reason}. Your local Git work is safe while rbox retries.`);
         continue;
       }
       pendingSupersessionCandidates.add(rel);
+      supersessionProbeEvidence.set(rel, {
+        fingerprint: probe.fastLookup.fingerprint,
+        identityKey: probe.fastLookup.probe.identityKey,
+        kind: probe.fastLookup.kind,
+      });
       await options.afterPendingPreProbe?.(rel);
       await processRepoSlowPath(rel, kind, baseSec, probe.fastLookup, { forceCapture: true });
       continue;
@@ -1209,6 +1208,14 @@ async function planGitSectionsWithRetention(
         .filter(([ref]) => candidate.refs[ref] === undefined);
 
       if (absenceCaptureEnabled && missing.length > 0) await options.beforeAbsenceWitness?.(rel);
+      /** One branch-deletion refusal: name it, drop this cycle's proofs, and fall back
+       *  to the protected pending section or the BASE that was carrying before. */
+      const refuseBranchDeletion = (reason: string, typed: GitDeferralReason): void => {
+        glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
+        delete absentBranchProofs[rel];
+        const fallback = pending[rel] ?? baseSection;
+        if (fallback) revertCapture(rel, fallback, reason, typed);
+      };
       let ctx: RepoCtx | undefined;
       let ctxFailure: unknown;
       try {
@@ -1218,10 +1225,7 @@ async function planGitSectionsWithRetention(
       }
       if (!ctx) {
         if (absenceCaptureEnabled && missing.length > 0) {
-          const reason = `repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`;
-          glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
-          const fallback = pending[rel] ?? baseSection;
-          if (fallback) revertCapture(rel, fallback, reason, "unreadable");
+          refuseBranchDeletion(`repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`, "unreadable");
         }
         continue;
       }
@@ -1329,15 +1333,7 @@ async function planGitSectionsWithRetention(
       }
 
       const reason = refusal ?? "branch deletion proof unavailable";
-      glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
-      delete absentBranchProofs[rel];
-      const fallback = pending[rel] ?? baseSection;
-      if (fallback) revertCapture(
-        rel,
-        fallback,
-        reason,
-        refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"),
-      );
+      refuseBranchDeletion(reason, refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"));
   }
 
   timings.captureMs += performance.now() - captureStartedAt;
@@ -1416,8 +1412,9 @@ async function planGitSectionsWithRetention(
     const candidate = finalizedOutgoing[rel];
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
     const binding = publisherAckBindings[rel];
-    const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
-      && binding !== undefined
+    const candidateProduced = captured.includes(rel) && p !== undefined && candidate !== undefined
+      && ctx !== undefined && binding !== undefined;
+    const proven = candidateProduced
       && await provePendingSupersession({
         ctx, pending: p, candidate, store: artifactStore(), kek,
         base: base[rel], absentBranchProofs: absentBranchProofs[rel],
@@ -1441,7 +1438,17 @@ async function planGitSectionsWithRetention(
       };
       continue;
     }
-    if (p) revertCapture(rel, p, "final candidate did not supersede pending section — carrying pending verbatim");
+    if (!p) continue;
+    // Only a candidate that reached the proof is evidence about the repository
+    // state; a transport or context fault says nothing and must re-run (#573).
+    const evidence = supersessionProbeEvidence.get(rel);
+    if (candidateProduced && evidence) {
+      recordSupersessionRefusal(cache, rel, evidence.fingerprint, evidence.identityKey, {
+        ...supersessionMemoKeys(p, base[rel]),
+        reason: SUPERSESSION_REFUSED_REASON,
+      }, evidence.kind);
+    }
+    revertCapture(rel, p, SUPERSESSION_REFUSED_REASON);
   }
 
   // Design 226 flush point 2, and the invariant this whole design exists to hold:

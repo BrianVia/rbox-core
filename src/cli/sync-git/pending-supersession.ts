@@ -8,6 +8,7 @@ import {
   indexIdentityV2,
   isGitBusy,
   validateGitSection,
+  type GitRepoKind,
   type GitSection,
   type JournalRecoveryResult,
 } from "../../engine/index.js";
@@ -15,11 +16,11 @@ import { canonicalString } from "../../engine/e2ee/index.js";
 import { getGitArtifact, git, headBranchOf, type GitArtifactReadStore, type RepoCtx } from "../../engine/git/shared.js";
 import { graphEnv } from "../../engine/git/reachability.js";
 import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
-import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
 import { gitCommitAncestry } from "./git-ancestry.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
 import { indexArtifact } from "./follow.js";
-import type { FingerprintHitProbeResult } from "./divergence-cache.js";
+import { trustedGitFingerprintHit, type FingerprintHitProbeResult, type GitDivergenceCache, type GitDivergenceCacheEntry, type GitSupersessionRefusal } from "./divergence-cache.js";
 import { composeRepoBase, type BranchBaseOrigin } from "./base-composer.js";
 
 export const gitPendingSupersedeEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
@@ -80,16 +81,75 @@ export function journalAllowsPendingSupersession(status: JournalRecoveryResult["
   }
 }
 
-export type PendingPreProbeResult =
-  | { status: "maybe"; fastLookup: FingerprintHitProbeResult }
-  | { status: "carry"; reason: string; busy?: true };
+/** Design 43 §7 / #573: a refused proof is a function of exactly three inputs —
+ *  the local repository state, the protected pending section, and the synced base
+ *  section. An unchanged triple cannot change the verdict, so re-capturing the whole
+ *  repository (bundle, artifacts, per-ref branch-deletion witness) only to revert it
+ *  again is pure waste. The verdict rides the divergence cache because that file
+ *  already carries the fingerprint identity and racy-clean discipline this needs. */
+export function supersessionMemoKeys(pending: GitSection, base: GitSection | undefined) {
+  return { pendingKey: gitIncomingKey(pending), baseKey: base ? gitIncomingKey(base) : "none" };
+}
 
-/** Cheap stable admission probe only. It never grants publication authority. */
+/** The recorded refusal reason when THIS repository state, pending section and base
+ *  section already failed the proof. Fail-closed on every uncertainty the ordinary
+ *  fingerprint fast path fails closed on: incomplete dependency enumeration, a
+ *  fingerprint that moved, the racy-clean window, a rotated cache version (the file
+ *  carries the fingerprint version), and any change to the pending or base identity. */
+export function cachedSupersessionRefusal(
+  cache: GitDivergenceCache,
+  rel: string,
+  fresh: GitFingerprint,
+  keys: { pendingKey: string; baseKey: string },
+): string | undefined {
+  const cached = cache.repos.get(rel);
+  const refusal = cached?.supersessionRefusal;
+  if (!cached || !refusal || !fresh.dependenciesComplete) return undefined;
+  if (!trustedGitFingerprintHit(fresh, cached)) return undefined;
+  return refusal.pendingKey === keys.pendingKey && refusal.baseKey === keys.baseKey ? refusal.reason : undefined;
+}
+
+/** Record a refusal proven against a CAPTURED candidate. A capture that never
+ *  produced a candidate (transport fault, unreadable context, missing binding) is
+ *  not evidence about the repository state and must never be recorded here. */
+export function recordSupersessionRefusal(
+  cache: GitDivergenceCache,
+  rel: string,
+  fresh: GitFingerprint,
+  identityKey: string,
+  refusal: GitSupersessionRefusal,
+  kind?: GitRepoKind,
+): void {
+  if (!fresh.dependenciesComplete) return;
+  // Probe/config summaries survive only when they describe THIS fingerprint; a
+  // stale entry is replaced outright, exactly as every other reader already treats it.
+  const current = cache.repos.get(rel);
+  const entry: GitDivergenceCacheEntry = current?.fingerprint === fresh.hash ? { ...current } : { fingerprint: fresh.hash, writtenAtMs: 0, identityKey };
+  entry.writtenAtMs = Date.now();
+  entry.identityKey = identityKey;
+  const entryKind = kind ?? entry.kind;
+  if (entryKind) entry.kind = entryKind;
+  entry.supersessionRefusal = refusal;
+  cache.repos.set(rel, entry);
+  cache.dirty = true;
+}
+
+export type PendingPreProbeResult =
+  | { status: "maybe"; fastLookup: Extract<FingerprintHitProbeResult, { status: "hit" }> }
+  | { status: "carry"; reason: string; busy?: true; refused?: true };
+
+/** Cheap stable admission probe only. It never grants publication authority.
+ *
+ * `alreadyRefused` is consulted LAST, against the bracketed fingerprint this probe
+ * already proved stable: every ordinary carry reason still wins, and a recorded
+ * refusal only ever suppresses work whose outcome this exact repository state has
+ * already produced. */
 export async function pendingSupersessionPreProbe(
   root: string,
   relPath: string,
   pending: GitSection,
   base?: GitSection,
+  alreadyRefused?: (fingerprint: GitFingerprint) => string | undefined,
 ): Promise<PendingPreProbeResult> {
   try {
     const before = await gitFingerprint(gitFingerprintRun("per-decision"), root, relPath);
@@ -116,6 +176,8 @@ export async function pendingSupersessionPreProbe(
     }
     const after = await gitFingerprint(gitFingerprintRun("per-decision"), root, relPath);
     if (before.hash !== after.hash) return { status: "carry", reason: "pending supersession probe was unstable" };
+    const refused = alreadyRefused?.(after);
+    if (refused !== undefined) return { status: "carry", reason: refused, refused: true };
     return {
       status: "maybe",
       fastLookup: {

@@ -18,7 +18,11 @@ import {
   pendingSupersessionPreProbe,
   pendingSupersessionAckConverges,
   provePendingSupersession,
+  cachedSupersessionRefusal,
+  recordSupersessionRefusal,
 } from "./pending-supersession.js";
+import { type GitDivergenceCache } from "./divergence-cache.js";
+import { gitFingerprint, gitFingerprintRun, GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, type GitFingerprint } from "./fingerprint.js";
 
 const roots: string[] = [];
 const KEK = Buffer.alloc(32, 23);
@@ -415,4 +419,80 @@ test("absence-capture switch-off keeps a BASE-bound missing pending head on the 
     if (previous === undefined) delete process.env.RBOX_GIT_ABSENCE_CAPTURE;
     else process.env.RBOX_GIT_ABSENCE_CAPTURE = previous;
   }
+});
+
+test("#573: a recorded refusal carries without capture, and every fail-closed input re-admits it", async () => {
+  const { root, b } = await fixture();
+  const pending = section(b, { head: "ref: refs/heads/main" });
+  const cache: GitDivergenceCache = { repos: new Map(), dirty: false };
+  const fingerprint = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  const keys = { pendingKey: "pending-key", baseKey: "base-key" };
+  const consult = (probeKeys = keys) =>
+    (fresh: GitFingerprint) => cachedSupersessionRefusal(cache, ".", fresh, probeKeys);
+
+  // No record yet: the ordinary admission path is untouched.
+  expect((await pendingSupersessionPreProbe(root, ".", pending, undefined, consult())).status).toBe("maybe");
+
+  const probeKind = (await pendingSupersessionPreProbe(root, ".", pending, undefined));
+  if (probeKind.status !== "maybe") throw new Error("fixture must be admissible");
+  recordSupersessionRefusal(cache, ".", fingerprint, probeKind.fastLookup.probe.identityKey, {
+    ...keys, reason: "refused earlier",
+  });
+  // Racy-clean discipline is shared with the ordinary fast path: a just-written
+  // entry over a just-written repository is not yet trustworthy.
+  expect((await pendingSupersessionPreProbe(root, ".", pending, undefined, consult())).status).toBe("maybe");
+
+  const entry = cache.repos.get(".")!;
+  cache.repos.set(".", { ...entry, writtenAtMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 10_000 });
+  expect(await pendingSupersessionPreProbe(root, ".", pending, undefined, consult())).toMatchObject({
+    status: "carry", reason: "refused earlier", refused: true,
+  });
+
+  // Fail-closed on each input of the proof.
+  expect((await pendingSupersessionPreProbe(root, ".", pending, undefined,
+    consult({ pendingKey: "other", baseKey: keys.baseKey }))).status).toBe("maybe");
+  expect((await pendingSupersessionPreProbe(root, ".", pending, undefined,
+    consult({ pendingKey: keys.pendingKey, baseKey: "other" }))).status).toBe("maybe");
+  cache.repos.set(".", { ...cache.repos.get(".")!, fingerprint: "moved" });
+  expect((await pendingSupersessionPreProbe(root, ".", pending, undefined, consult())).status).toBe("maybe");
+});
+
+test("#573: an ordinary carry reason always outranks a recorded refusal", async () => {
+  const { root, a, b } = await fixture();
+  const pending = section(b, { head: "ref: refs/heads/main", refs: { "refs/heads/main": b, "refs/heads/absent": a } });
+  const cache: GitDivergenceCache = { repos: new Map(), dirty: false };
+  const fingerprint = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  recordSupersessionRefusal(cache, ".", fingerprint, "identity", {
+    pendingKey: "pending-key", baseKey: "none", reason: "refused earlier",
+  });
+  cache.repos.set(".", {
+    ...cache.repos.get(".")!,
+    writtenAtMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 10_000,
+  });
+  expect(await pendingSupersessionPreProbe(root, ".", pending, undefined, (fresh) =>
+    cachedSupersessionRefusal(cache, ".", fresh, { pendingKey: "pending-key", baseKey: "none" }))).toMatchObject({
+    status: "carry",
+    reason: "local repository lacks pending ref refs/heads/absent",
+  });
+});
+
+test("#573: an incomplete dependency enumeration is never recorded and never reused", async () => {
+  const { root } = await fixture();
+  const cache: GitDivergenceCache = { repos: new Map(), dirty: false };
+  const fresh = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  const incomplete: GitFingerprint = { ...fresh, dependenciesComplete: false };
+  recordSupersessionRefusal(cache, ".", incomplete, "identity", {
+    pendingKey: "pending-key", baseKey: "none", reason: "refused earlier",
+  });
+  expect(cache.repos.size).toBe(0);
+
+  recordSupersessionRefusal(cache, ".", fresh, "identity", {
+    pendingKey: "pending-key", baseKey: "none", reason: "refused earlier",
+  });
+  cache.repos.set(".", {
+    ...cache.repos.get(".")!,
+    writtenAtMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 10_000,
+  });
+  expect(cachedSupersessionRefusal(cache, ".", incomplete, { pendingKey: "pending-key", baseKey: "none" })).toBeUndefined();
+  expect(cachedSupersessionRefusal(cache, ".", fresh, { pendingKey: "pending-key", baseKey: "none" })).toBe("refused earlier");
 });
