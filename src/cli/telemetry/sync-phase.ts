@@ -1,13 +1,17 @@
 import type { PhaseReport, PhaseReportJson } from "../../engine/index.js";
 import {
+  SYNC_PHASE_GAP_CARDINALITY,
+  SYNC_PHASE_GAP_KEYS,
   SYNC_PHASE_NAMES,
   TELEMETRY_SAMPLE_SCHEMAS,
+  type SyncPhaseGapKey,
   type SyncPhaseSample,
 } from "./contract.js";
 import type { TelemetryRecorder } from "./queue.js";
 
 export const SYNC_PHASE_SAMPLE_EVERY = 8;
 export const SYNC_PHASE_OUTLIER_MS = { pull: 20_000, push: 15_000 } as const;
+const SYNC_PHASE_GAP_KEY_SET: ReadonlySet<string> = new Set(SYNC_PHASE_GAP_KEYS);
 
 interface GitApplyPhaseDetails {
   repoTimings?: Array<{ wallMs?: unknown }>;
@@ -69,11 +73,19 @@ export class SyncPhaseSampler {
           phases[name] = boundedInteger(ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
         }
       }
+      let gaps: Partial<Record<SyncPhaseGapKey, number>> | undefined;
       if (op === "push") {
-        for (const [key, ms] of Object.entries(json.gaps)) {
-          if (Number.isFinite(ms) && ms >= 0) phases[`gap:${key}`] = boundedInteger(ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
+        const entries = Object.entries(json.gaps);
+        if (entries.length + 1 > SYNC_PHASE_GAP_CARDINALITY) return;
+        gaps = {};
+        for (const [transition, ms] of entries) {
+          const key = `gap:${transition}`;
+          if (!SYNC_PHASE_GAP_KEY_SET.has(key)) return;
+          if (Number.isFinite(ms) && ms >= 0) {
+            gaps[key as SyncPhaseGapKey] = boundedInteger(ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.pointRecords.gaps.domain.max);
+          }
         }
-        phases.tailMs = boundedInteger(json.tailMs, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.numericRecords.phases.domain.max);
+        gaps.tailMs = boundedInteger(json.tailMs, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.pointRecords.gaps.domain.max);
       }
       const sample: SyncPhaseSample = {
         kind: "sync_phase",
@@ -82,6 +94,7 @@ export class SyncPhaseSampler {
         phases,
         ...gitApplyDetails(json),
       };
+      if (gaps) sample.gaps = gaps;
       if (residuals) {
         sample.prologue_ms = boundedInteger(residuals.prologue_ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.optionalNumbers.prologue_ms.max);
         sample.settle_ms = boundedInteger(residuals.settle_ms, TELEMETRY_SAMPLE_SCHEMAS.sync_phase.optionalNumbers.settle_ms.max);

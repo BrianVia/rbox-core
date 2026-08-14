@@ -9,17 +9,27 @@ import {
   SERVER_CORPUS_BUCKETS,
   SERVER_GIT_DEFERRAL_REASONS,
   SERVER_SYNC_STATE_NUMERIC_DOMAINS,
+  SERVER_SYNC_PHASE_GAP_CARDINALITY,
+  SERVER_SYNC_PHASE_GAP_KEYS,
+  SERVER_SYNC_PHASE_GAP_TRANSITIONS,
   SERVER_SYNC_PHASE_NAMES,
   SERVER_TELEMETRY_SAMPLE_SCHEMAS,
   TELEMETRY_BATCH_CAP as SERVER_TELEMETRY_BATCH_CAP,
+  TELEMETRY_DROP_POINT_BUDGET as SERVER_TELEMETRY_DROP_POINT_BUDGET,
+  TELEMETRY_POINT_BUDGET as SERVER_TELEMETRY_POINT_BUDGET,
 } from "../src/telemetry-ingest.js";
 import {
   CORPUS_BUCKETS,
   BINDING_ID_RE,
   GIT_DEFERRAL_REASONS,
   SYNC_STATE_NUMERIC_DOMAINS,
+  SYNC_PHASE_GAP_CARDINALITY,
+  SYNC_PHASE_GAP_KEYS,
+  SYNC_PHASE_GAP_TRANSITIONS,
   SYNC_PHASE_NAMES,
   TELEMETRY_BATCH_CAP,
+  TELEMETRY_DROP_POINT_BUDGET,
+  TELEMETRY_POINT_BUDGET,
   TELEMETRY_SAMPLE_SCHEMAS,
 } from "../../../src/cli/telemetry/contract.js";
 
@@ -62,13 +72,17 @@ function post(body: unknown): Request {
 
 describe("telemetry contract drift guard", () => {
   test("server runtime constants equal the client wire contract", () => {
-    const serverShape = Object.fromEntries(Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS).map(([kind, schema]) => [kind, {
-      numbers: Object.fromEntries(schema.numbers.map(({ field, ...domain }) => [field, domain])),
-      enums: Object.fromEntries(schema.enums.map(({ field, values }) => [field, values])),
-      ...(schema.optionalNumbers ? { optionalNumbers: Object.fromEntries(schema.optionalNumbers.map(({ field, ...domain }) => [field, domain])) } : {}),
-      ...(schema.numericRecords ? { numericRecords: Object.fromEntries(schema.numericRecords.map(({ field, keys, domain }) => [field, { keys, domain }])) } : {}),
-    }]));
-    expect(serverShape).toEqual(TELEMETRY_SAMPLE_SCHEMAS);
+    const serverContract = Object.fromEntries(Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS).map(([kind, schema]) => {
+      const contract = {
+        numbers: Object.fromEntries(schema.numbers.map(({ field, ...domain }) => [field, domain])),
+        enums: Object.fromEntries(schema.enums.map(({ field, values }) => [field, values])),
+        optionalNumbers: schema.optionalNumbers ? Object.fromEntries(schema.optionalNumbers.map(({ field, ...domain }) => [field, domain])) : undefined,
+        numericRecords: schema.numericRecords ? Object.fromEntries(schema.numericRecords.map(({ field, keys, domain }) => [field, { keys, domain }])) : undefined,
+        pointRecords: schema.pointRecords ? Object.fromEntries(schema.pointRecords.map(({ field, ...pointRecord }) => [field, pointRecord])) : undefined,
+      };
+      return [kind, Object.fromEntries(Object.entries(contract).filter(([, value]) => value !== undefined))];
+    }));
+    expect(serverContract).toEqual(TELEMETRY_SAMPLE_SCHEMAS);
     expect(Object.keys(SERVER_TELEMETRY_SAMPLE_SCHEMAS)).toEqual(Object.keys(TELEMETRY_SAMPLE_SCHEMAS));
     for (const [kind, serverSchema] of Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS)) {
       const clientSchema = TELEMETRY_SAMPLE_SCHEMAS[kind as keyof typeof TELEMETRY_SAMPLE_SCHEMAS];
@@ -76,12 +90,18 @@ describe("telemetry contract drift guard", () => {
       expect(serverSchema.enums.map(({ field }) => field), `${kind} enum field order`).toEqual(Object.keys(clientSchema.enums));
       expect((serverSchema.optionalNumbers ?? []).map(({ field }) => field), `${kind} optional number field order`).toEqual(Object.keys("optionalNumbers" in clientSchema ? clientSchema.optionalNumbers : {}));
       expect((serverSchema.numericRecords ?? []).map(({ field }) => field), `${kind} numeric record field order`).toEqual(Object.keys("numericRecords" in clientSchema ? clientSchema.numericRecords : {}));
+      expect((serverSchema.pointRecords ?? []).map(({ field }) => field), `${kind} point record field order`).toEqual(Object.keys("pointRecords" in clientSchema ? clientSchema.pointRecords : {}));
     }
     expect(SERVER_SYNC_PHASE_NAMES).toEqual(SYNC_PHASE_NAMES);
+    expect(SERVER_SYNC_PHASE_GAP_TRANSITIONS).toEqual(SYNC_PHASE_GAP_TRANSITIONS);
+    expect(SERVER_SYNC_PHASE_GAP_KEYS).toEqual(SYNC_PHASE_GAP_KEYS);
+    expect(SERVER_SYNC_PHASE_GAP_CARDINALITY).toBe(SYNC_PHASE_GAP_CARDINALITY);
     expect(SERVER_CORPUS_BUCKETS).toEqual(CORPUS_BUCKETS);
     expect(SERVER_GIT_DEFERRAL_REASONS).toEqual(GIT_DEFERRAL_REASONS);
     expect(SERVER_SYNC_STATE_NUMERIC_DOMAINS).toEqual(SYNC_STATE_NUMERIC_DOMAINS);
     expect(SERVER_TELEMETRY_BATCH_CAP).toBe(TELEMETRY_BATCH_CAP);
+    expect(SERVER_TELEMETRY_DROP_POINT_BUDGET).toBe(TELEMETRY_DROP_POINT_BUDGET);
+    expect(SERVER_TELEMETRY_POINT_BUDGET).toBe(TELEMETRY_POINT_BUDGET);
     expect({ source: SERVER_BINDING_ID_RE.source, flags: SERVER_BINDING_ID_RE.flags }).toEqual({ source: BINDING_ID_RE.source, flags: BINDING_ID_RE.flags });
   });
 });
@@ -98,7 +118,7 @@ describe("POST /v1/telemetry", () => {
       { kind: "safety_event", eventType: "scan_fault", count: 3 },
       { kind: "git_capture", signalPushes: 5, candidatePushes: 6, scanPushes: 7 },
       { kind: "ws_health", windowMs: 120_000, wsConnectedMs: 110_000, wsReconnects: 1, wsHalfOpenDetected: 2, backstopAttempts: 3, backstopAppliedPulls: 4, cursorAppliedPulls: 0, notifyAppliedPulls: 5, notifyLatencyCount: 6, notifyLatencySumMs: 7_000, notifyLatencyMaxMs: 2_000 },
-      { kind: "sync_phase", op: "push", wallMs: 99, phases: { latest: 3, "git-apply": 8, "gap:state-load→git-plan": 9, tailMs: 10 }, gitApplyMaxRepoMs: 7, gitApplySkippedHeld: 2, prologue_ms: 11, settle_ms: 12 },
+      { kind: "sync_phase", op: "push", wallMs: 99, phases: { latest: 3, "git-apply": 8 }, gaps: { "gap:state-load→git-plan": 9, tailMs: 10 }, gitApplyMaxRepoMs: 7, gitApplySkippedHeld: 2, prologue_ms: 11, settle_ms: 12 },
     ] }), testEnv(points), devicePrincipal(a));
     expect(res.status).toBe(202);
     expect(await res.json()).toEqual({ accepted: 8, dropped: 0 });
@@ -113,6 +133,28 @@ describe("POST /v1/telemetry", () => {
       { indexes: ["client.sync_phase"], blobs: ["client.sync_phase", "push"], doubles: [99, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 7, 2, 11, 12] },
       { indexes: ["client.sync_phase.gap"], blobs: ["client.sync_phase.gap", "push", "gap:state-load→git-plan"], doubles: [9] },
       { indexes: ["client.sync_phase.gap"], blobs: ["client.sync_phase.gap", "push", "tailMs"], doubles: [10] },
+    ]);
+  });
+
+  test("bounds maximum-cardinality push gaps and rejects an over-cardinality sample before any partial write", async () => {
+    const a = await bootstrap("telemetry-gap-bound");
+    const maximumGaps = Object.fromEntries(SYNC_PHASE_GAP_KEYS.map((key, index) => [key, index]));
+    const points: AnalyticsEngineDataPoint[] = [];
+    const accepted = await ingestTelemetry(post({ v: 1, samples: [{
+      kind: "sync_phase", op: "push", wallMs: 99, phases: {}, gaps: maximumGaps,
+    }] }), testEnv(points), devicePrincipal(a));
+    expect(await accepted.json()).toEqual({ accepted: 1, dropped: 0 });
+    expect(points).toHaveLength(1 + SYNC_PHASE_GAP_CARDINALITY);
+    expect(points.filter((point) => point.indexes?.[0] === "client.sync_phase.gap")).toHaveLength(SYNC_PHASE_GAP_CARDINALITY);
+    expect(points.length).toBeLessThanOrEqual(TELEMETRY_POINT_BUDGET);
+
+    points.length = 0;
+    const rejected = await ingestTelemetry(post({ v: 1, samples: [{
+      kind: "sync_phase", op: "push", wallMs: 99, phases: {}, gaps: { ...maximumGaps, "gap:impossible→start": 1 },
+    }] }), testEnv(points), devicePrincipal(a));
+    expect(await rejected.json()).toEqual({ accepted: 0, dropped: 1 });
+    expect(points).toEqual([
+      { indexes: ["client.telemetry.drops"], blobs: ["client.telemetry.drops", "point_cap"], doubles: [1] },
     ]);
   });
 

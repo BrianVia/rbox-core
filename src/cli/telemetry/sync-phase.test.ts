@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { PhaseReport } from "../../engine/index.js";
-import type { TelemetrySample } from "./contract.js";
+import { SYNC_PHASE_GAP_KEYS, SYNC_PHASE_GAP_TRANSITIONS, type TelemetrySample } from "./contract.js";
 import { SYNC_PHASE_SAMPLE_EVERY, SyncPhaseSampler } from "./sync-phase.js";
 
 test("sync_phase samples every eighth completed pull and push independently", () => {
@@ -40,10 +40,30 @@ test("push samples preserve phase gaps, tail, and daemon residuals", async () =>
   expect(samples[0]).toMatchObject({
     kind: "sync_phase",
     op: "push",
-    phases: { "gap:state-load→git-plan": expect.any(Number), tailMs: expect.any(Number) },
+    gaps: { "gap:state-load→git-plan": expect.any(Number), tailMs: expect.any(Number) },
     prologue_ms: 11,
     settle_ms: 13,
   });
+});
+
+test("push gap projection preserves the complete bounded producer contract atomically", () => {
+  const record = (report: PhaseReport): TelemetrySample[] => {
+    const sampler = new SyncPhaseSampler();
+    const samples: TelemetrySample[] = [];
+    for (let i = 0; i < 7; i++) sampler.recordCompleted(PhaseReport.push(), "push", { record: (sample) => samples.push(sample) });
+    sampler.recordCompleted(report, "push", { record: (sample) => samples.push(sample) });
+    return samples;
+  };
+
+  const maximum = PhaseReport.push();
+  const gaps = Reflect.get(maximum, "gaps") as Map<string, number>;
+  for (const [index, transition] of SYNC_PHASE_GAP_TRANSITIONS.entries()) gaps.set(transition, index);
+  expect(Object.keys(record(maximum)[0]?.gaps ?? {}).sort()).toEqual([...SYNC_PHASE_GAP_KEYS].sort());
+
+  const impossible = PhaseReport.push();
+  const impossibleGaps = Reflect.get(impossible, "gaps") as Map<string, number>;
+  impossibleGaps.set("state-load→start", 1);
+  expect(record(impossible)).toEqual([]);
 });
 
 test("sync_phase always emits strict tail outliers and projects path-free git aggregates", () => {
