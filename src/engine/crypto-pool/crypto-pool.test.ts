@@ -13,7 +13,7 @@ import {
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "../crypto.js";
-import { __cryptoPoolTestHooks, cryptoPoolStatus, shutdownCryptoPool, withCryptoPool } from "../crypto-pool.js";
+import { __cryptoPoolTestHooks, cryptoPoolStatus, shutdownCryptoPool, withCryptoPool } from "./pool.js";
 
 const ENV_KEYS = ["RBOX_CRYPTO_WORKERS", "RBOX_CRYPTO_POOL_MIN_JOBS", "RBOX_CRYPTO_WORKER_TEST_DELAY_MS"] as const;
 let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string>>;

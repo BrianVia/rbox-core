@@ -73,6 +73,27 @@ const GIT_APPLY_RESULT_ABBR = {
 
 const GIT_APPLY_REPO_EXEMPLAR_CAP = 8;
 
+const GIT_CHAIN_TIMING_FIELDS = {
+  chainLength: { abbr: "L", label: "chainLength" },
+  fetchDecryptMs: { abbr: "fd", label: "fetchDecryptMs" },
+  bundleVerifyMs: { abbr: "bv", label: "bundleVerifyMs" },
+  gitImportMs: { abbr: "gi", label: "gitImportMs" },
+  indexOpStateMs: { abbr: "io", label: "indexOpStateMs" },
+  journalMs: { abbr: "jr", label: "journalMs" },
+  refTxnExclusiveMs: { abbr: "rt", label: "refTxnExclusiveMs" },
+  ownershipMs: { abbr: "ow", label: "ownershipMs" },
+  reflogMs: { abbr: "rl", label: "reflogMs" },
+  connectivityProofMs: { abbr: "cp", label: "connectivityProofMs" },
+  classifyExclusiveMs: { abbr: "cx", label: "classifyExclusiveMs" },
+  heldInputMs: { abbr: "hi", label: "heldInputMs" },
+  standingProofMs: { abbr: "sp", label: "standingProofMs" },
+  classifyMs: { abbr: "cl", label: "classifyMs" },
+  residualMs: { abbr: "rs", label: "residualMs" },
+} as const satisfies Record<keyof GitChainTimings, { abbr: string; label: string }>;
+
+const GIT_CHAIN_TIMING_FIELD_ROWS = Object.values(GIT_CHAIN_TIMING_FIELDS);
+const GIT_CHAIN_LEGACY_REQUIRED_DISTRIBUTION_FIELDS = 4;
+
 function copyRepoTiming(timing: GitApplyRepoTiming): GitApplyRepoTiming {
   const copy = { ...timing };
   if (timing.chain) copy.chain = { ...timing.chain };
@@ -178,8 +199,10 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
   const repoBits = gitApplyRepoExemplars(metrics.repoTimings)
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
-      const chain = t.chain && hasGitChainTiming(t.chain)
-        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}jr${Math.round(chainMetric(t.chain.journalMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cx${Math.round(chainMetric(t.chain.classifyExclusiveMs))}hi${Math.round(chainMetric(t.chain.heldInputMs))}sp${Math.round(chainMetric(t.chain.standingProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
+      const chainTimings = t.chain;
+      const chain = chainTimings && hasGitChainTiming(chainTimings)
+        ? ` ${GIT_CHAIN_TIMING_FIELD_ROWS.map((field) =>
+          `${field.abbr}${Math.round(chainMetric(chainTimings[field.label]))}`).join("")}`
         : "";
       return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
@@ -192,32 +215,22 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
     .map((timing) => timing.chain)
     .filter((chain): chain is GitChainTimings => chain !== undefined && hasGitChainTiming(chain));
   if (chainTimings.length > 0) {
-    distributions.push(
-      formatGitApplyDistribution("fetchDecryptMs", chainTimings.map((chain) => chain.fetchDecryptMs)),
-      formatGitApplyDistribution("bundleVerifyMs", chainTimings.map((chain) => chain.bundleVerifyMs)),
-      formatGitApplyDistribution("gitImportMs", chainTimings.map((chain) => chain.gitImportMs)),
-      formatGitApplyDistribution("indexOpStateMs", chainTimings.map((chain) => chain.indexOpStateMs)),
-      formatGitApplyDistribution("journalMs", chainTimings.map((chain) => chainMetric(chain.journalMs))),
-      formatGitApplyDistribution("refTxnExclusiveMs", chainTimings.map((chain) => chainMetric(chain.refTxnExclusiveMs))),
-      formatGitApplyDistribution("ownershipMs", chainTimings.map((chain) => chainMetric(chain.ownershipMs))),
-      formatGitApplyDistribution("reflogMs", chainTimings.map((chain) => chainMetric(chain.reflogMs))),
-      formatGitApplyDistribution("connectivityProofMs", chainTimings.map((chain) => chainMetric(chain.connectivityProofMs))),
-      formatGitApplyDistribution("classifyExclusiveMs", chainTimings.map((chain) => chainMetric(chain.classifyExclusiveMs))),
-      formatGitApplyDistribution("heldInputMs", chainTimings.map((chain) => chainMetric(chain.heldInputMs))),
-      formatGitApplyDistribution("standingProofMs", chainTimings.map((chain) => chainMetric(chain.standingProofMs))),
-      formatGitApplyDistribution("classifyMs", chainTimings.map((chain) => chainMetric(chain.classifyMs))),
-      formatGitApplyDistribution("residualMs", chainTimings.map((chain) => chainMetric(chain.residualMs))),
-    );
+    const distributionFields = GIT_CHAIN_TIMING_FIELD_ROWS.filter((field) => field.label !== "chainLength");
+    for (const [index, field] of distributionFields.entries()) {
+      distributions.push(formatGitApplyDistribution(
+        field.label,
+        chainTimings.map((chain) => index < GIT_CHAIN_LEGACY_REQUIRED_DISTRIBUTION_FIELDS
+          ? chain[field.label]
+          : chainMetric(chain[field.label])),
+      ));
+    }
   }
   return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} skippedHeld=${metrics.results.skipped} results=${resultBits || "none"} ${distributions.join(" ")} repoMs=${repoBits || "none"}`;
 }
 
 function hasGitChainTiming(chain: GitChainTimings): boolean {
-  return chain.chainLength > 0 || chain.fetchDecryptMs > 0 || chain.bundleVerifyMs > 0
-    || chain.gitImportMs > 0 || chain.refTxnExclusiveMs > 0 || chain.ownershipMs > 0
-    || chain.reflogMs > 0 || chain.connectivityProofMs > 0 || chain.indexOpStateMs > 0
-    || chain.journalMs > 0 || chain.classifyMs > 0 || chainMetric(chain.classifyExclusiveMs) > 0
-    || chainMetric(chain.heldInputMs) > 0 || chainMetric(chain.standingProofMs) > 0;
+  return GIT_CHAIN_TIMING_FIELD_ROWS.some((field) =>
+    field.label !== "residualMs" && chainMetric(chain[field.label]) > 0);
 }
 
 function chainMetric(value: number | undefined): number {

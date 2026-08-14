@@ -5,7 +5,8 @@ import { bootstrapAccount, parseCommit, parseRefset, type DeviceSecrets, type Si
 import type { BlobStore } from "../engine/index.js";
 import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type E2eeContext, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
-import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT, DEFAULT_BATCH_RECORD_BYTES } from "./remote/blob-batch.js";
+import { DEFAULT_BATCH_RECORD_BYTES } from "./remote/blob-batch/config.js";
+import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT } from "./remote/blob-batch/wire.js";
 import type { WorkspaceConfig } from "./config.js";
 
 /**
@@ -136,7 +137,7 @@ export class FakeServer implements E2eeApi {
 
   /** Every byte an operator could inspect (for the zero-knowledge assertion). */
   allBytes(): Uint8Array[] {
-    const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
+    const enc = <Value>(value: Value) => new TextEncoder().encode(JSON.stringify(value));
     return [...this.store.blobs.values(), enc(this.commits), enc(this.account), enc([...this.wsKeys])];
   }
 }
@@ -166,7 +167,7 @@ function decodeBatchPutFrames(body: Uint8Array): { ok: true; records: Array<{ sh
   return out.length ? { ok: true, records: out } : { ok: false, message: "empty batch" };
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse<Body>(status: number, body: Body): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 

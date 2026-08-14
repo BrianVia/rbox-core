@@ -7,7 +7,7 @@ import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
 import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "../crypto.js";
 import { hashBytes } from "../hash.js";
-import { __cryptoPoolTestHooks, CryptoPool, withCryptoPool } from "../crypto-pool.js";
+import { __cryptoPoolTestHooks, CryptoPool, withCryptoPool } from "./pool.js";
 import { PhaseReport, type Manifest } from "../index.js";
 import { encryptAndUpload, setDefaultEncryptObserverForTest } from "../../cli/sync-recovery.js";
 import type { SyncRemote } from "../../cli/remote.js";
@@ -222,7 +222,13 @@ describe("fused crypto", () => {
       const base: Manifest = { generatedAt: "", files: [] };
       const kek = generateKek();
       const cfg: WorkspaceConfig = { remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "memory://", token: "", kek, accountId: "acct", accountEpoch: 1, keyEpoch: 1 };
-      const remote = { missingBlobs: async () => [] } as unknown as SyncRemote;
+      const remote: SyncRemote = {
+        latest: async () => { throw new Error("unexpected latest"); },
+        missingBlobs: async () => [],
+        putBlobFile: async () => { throw new Error("unexpected upload"); },
+        commit: async () => { throw new Error("unexpected commit"); },
+        blobStore: () => { throw new Error("unexpected blob store"); },
+      };
       let coalescedCalls = 0;
       let oracleCalls = 0;
       const originalEncryptCoalesced = CryptoPool.prototype.encryptCoalesced;

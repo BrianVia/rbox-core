@@ -9,15 +9,16 @@ import { FakeServer } from "../../e2ee-fake-server.js";
 import { encryptFileToTemp, generateKek } from "../../../engine/crypto.js";
 import type { FileEntry } from "../../../engine/types.js";
 import {
-  BATCH_FRAME_HEADER_BYTES,
-  BATCH_STATUS_BIT,
   DEFAULT_BATCH_RECORD_BYTES,
   downloadBatchConfig,
+  uploadBatchConfig,
+} from "./config.js";
+import {
   resetBatchBlobStateForTests,
   resetUploaderDispatchCountForTests,
-  uploadBatchConfig,
   uploaderDispatchCount,
-} from "../blob-batch.js";
+} from "./gate.js";
+import { BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT } from "./wire.js";
 import { setUploaderClockForTests } from "./uploader.js";
 
 const origFetch = globalThis.fetch;
@@ -87,12 +88,14 @@ beforeEach(async () => {
       return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
     }) });
   };
-  globalThis.fetch = (async (url: string, init?: RequestInit) => {
-    const u = String(url);
+  globalThis.fetch = async (input: URL | RequestInfo, init?: RequestInit) => {
+    const u = String(input);
     const method = init?.method ?? "GET";
-    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const headers = Object.fromEntries(new Headers(init?.headers));
     const rawBody = await readFetchBody(init?.body);
-    const body = typeof init?.body === "string" ? JSON.parse(init.body) : rawBody;
+    const body = u.endsWith("/v1/blob-batch/get")
+      ? JSON.parse(new TextDecoder().decode(rawBody))
+      : rawBody;
     calls.push({ url: u, method, headers, body });
     if (u.endsWith("/latest")) return new Response(JSON.stringify({ sequence: 0, commit: null, grant: "fresh-grant" }), { status: 200 });
     if (u.endsWith("/v1/blob-batch/get")) return batchHandler((body ?? []) as string[], headers);
@@ -115,7 +118,7 @@ beforeEach(async () => {
       return b ? new Response(b, { status: 200 }) : new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
     }
     return new Response("not found", { status: 404 });
-  }) as unknown as typeof fetch;
+  };
 });
 
 afterEach(async () => {
@@ -420,15 +423,16 @@ describe("BlobBatchDownloader fallback behavior", () => {
 describe("BlobBatchUploader queueing", () => {
   test("close rejects queued groups and prevents later dispatch", async () => {
     process.env.RBOX_BATCH_RECORDS = "32";
-    let timer: { fn: () => void } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     setUploaderClockForTests({
       now: () => 0,
       setTimeout: (fn) => {
-        timer = { fn };
-        return timer as unknown as ReturnType<typeof setTimeout>;
+        timer = globalThis.setTimeout(fn, 60_000);
+        return timer;
       },
       clearTimeout: (handle) => {
-        if (handle === timer as unknown as ReturnType<typeof setTimeout>) timer = undefined;
+        globalThis.clearTimeout(handle);
+        if (handle === timer) timer = undefined;
       },
     });
     const f = await uploadFile("queued-close", "queued");
@@ -630,12 +634,12 @@ describe("BlobBatchDownloader grant freshness", () => {
     let now = 1_000_000;
     Date.now = () => now;
     let latestCalls = 0;
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
-      const u = String(url);
+    globalThis.fetch = async (input: URL | RequestInfo, init?: RequestInit) => {
+      const u = String(input);
       const method = init?.method ?? "GET";
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      let body: unknown;
-      if (init?.body && typeof init.body === "string") body = JSON.parse(init.body);
+      const headers = Object.fromEntries(new Headers(init?.headers));
+      const rawBody = await readFetchBody(init?.body);
+      const body = rawBody.byteLength > 0 ? JSON.parse(new TextDecoder().decode(rawBody)) : undefined;
       calls.push({ url: u, method, headers, body });
       if (u.endsWith("/latest")) {
         latestCalls++;
@@ -644,7 +648,7 @@ describe("BlobBatchDownloader grant freshness", () => {
       if (u.endsWith("/v1/blob-batch/get")) return batchHandler((body ?? []) as string[], headers);
       const m = u.match(/\/v1\/blobs\/([0-9a-f]{64})$/);
       return new Response(singles.get(m?.[1] ?? "") ?? new Uint8Array(), { status: m ? 200 : 404 });
-    }) as unknown as typeof fetch;
+    };
 
     const a = api();
     await a.latestCommit();
@@ -733,37 +737,13 @@ function singlePutCalls() {
   return singleCalls().filter((c) => c.method === "PUT");
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse<Body>(status: number, body: Body): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 async function readFetchBody(body: BodyInit | null | undefined): Promise<Uint8Array> {
   if (!body) return new Uint8Array(0);
-  if (typeof body === "string") return bytes(body);
-  if (body instanceof Uint8Array) return body;
-  if (body instanceof ArrayBuffer) return new Uint8Array(body);
-  if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
-  if (typeof (body as ReadableStream<Uint8Array>).getReader === "function") {
-    const reader = (body as ReadableStream<Uint8Array>).getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        chunks.push(value);
-        total += value.byteLength;
-      }
-    }
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, off);
-      off += chunk.byteLength;
-    }
-    return out;
-  }
-  return new Uint8Array(0);
+  return new Uint8Array(await new Response(body).arrayBuffer());
 }
 
 function decodeBatchPutFrames(body: Uint8Array): Array<{ sha: string; payload: Uint8Array }> | null {
@@ -850,7 +830,7 @@ function frameData(sha: string, payload: Uint8Array): Uint8Array {
   return frame(sha, payload, false);
 }
 
-function frameStatus(sha: string, body: unknown): Uint8Array {
+function frameStatus<Body>(sha: string, body: Body): Uint8Array {
   return frame(sha, new TextEncoder().encode(JSON.stringify(body)), true);
 }
 
@@ -881,10 +861,10 @@ describe("download integrity self-healing (codex-Sol reviewed)", () => {
     const p = dest("exhaust");
     const err = await api().getBlobToFile(sha, p, DEFAULT_BATCH_RECORD_BYTES + 1).then(
       () => undefined,
-      (e: unknown) => e
+      (error) => error,
     );
-    expect(err).toBeInstanceOf(BlobDownloadIntegrityError);
-    expect((err as BlobDownloadIntegrityError).bytesReceived).toBe(1024); // same-length corruption, not truncation
+    if (!(err instanceof BlobDownloadIntegrityError)) throw new Error("expected a blob integrity error");
+    expect(err.bytesReceived).toBe(1024); // same-length corruption, not truncation
     await expect(fs.stat(p)).rejects.toThrow(); // no corrupt file left behind
     // 5 attempts × jittered backoff can exceed bun's 5s default timeout (worst case ~5.6s).
   }, 30_000);

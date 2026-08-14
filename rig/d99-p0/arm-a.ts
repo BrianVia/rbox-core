@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
-import { withCryptoPool, __cryptoPoolTestHooks } from "../../src/engine/crypto-pool.js";
+import { withCryptoPool, __cryptoPoolTestHooks } from "../../src/engine/crypto-pool/pool.js";
 import type { CorpusFile } from "./corpus.js";
 import { quantile } from "./metrics.js";
 

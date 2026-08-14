@@ -12,8 +12,7 @@ Scope: the API Worker and sync engine — `apps/api/src/`, `src/cli/sync*`, `src
 `src/cli/telemetry/`, `src/cli/state-plane/`, `src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
 are deliberately not mapped.
 
-Barrels (`sync.ts`, `sync-git.ts`, `daemon.ts`, `crypto-pool.ts`,
-`blob-batch.ts`, `remote.ts`, `git-state.ts`, the `index.ts` files) preserve
+Barrels (`sync.ts`, `sync-git.ts`, `daemon.ts`, `remote.ts`, the `index.ts` files) preserve
 a stable public surface. Never: logic, state, or an export that isn't a
 plain re-export. Internal modules never import their own barrel.
 
@@ -300,7 +299,6 @@ src/cli/daemon-control.ts     — compatibility facade for the established daemo
 src/cli/daemon/runtime-state.ts — daemon runtime filesystem state: binding/pid formats and records, workspace identity, incarnation key, lifecycle state mutations, whole-runtime removal. Never: process inspection/signalling, mode policy, or log consumption.
 src/cli/daemon/process-control.ts — daemon process lifecycle: spawn/start/stop, mode admission/witnesses, signalling, and spawn crash-sink preparation, plus compatibility re-exports of observation/identity queries. Never: an independent liveness/binding/ambient trust calculation, record serialization, the daemon sync loop, or log consumption.
 src/cli/daemon/log-reader.ts  — daemon log discovery, bounded tails, chronological merging, and lifecycle-pinned follow. Never: process control or runtime-state mutation.
-src/cli/git-cmd.ts            — compatibility facade for the git command surface. Never: behavior.
 src/cli/git/deferrals-command.ts — `rbox git deferrals` projection, remediation copy, resolve-offer policy. Never: resolution transactions or presentation bodies.
 src/cli/git/resolve-command.ts — `rbox git resolve` snapshot/confirm/discard workflow, manual-protocol preflight/settlement, refusal semantics. Never: deferrals policy or output formatting bodies.
 src/cli/git/resolve-presentation.ts — resolve output rendering, human/JSON emission, root scrubbing. Never: state machines or filesystem access.
@@ -339,7 +337,6 @@ src/cli/remote/multipart-fake-server.ts — test-only in-process fake of the ser
 ## `src/cli/remote/blob-batch/` — batched blob transfer
 
 ```
-src/cli/remote/blob-batch.ts            — barrel: pre-113-split public surface of blob-batch/.
 src/cli/remote/blob-batch/wire.ts       — client half of the wire contract with apps/api/src/blob-batch.ts: framing constants, BatchFrame, parseBatchFrames, codecs (framedBytes, parseStatus, parseBatchPutResponse). Change in lockstep with the server twin. Never: tuning knobs, scheduling.
 src/cli/remote/blob-batch/gate.ts       — process-wide batch/pack kill switches + pack-latch subscriber fanout + monotonic records ceiling + dispatch counter + SingleGate + shared UploadSlotArbiter. SINGLE definition site for upload permit accounting and process-wide degradation (a second instance breaks concurrency/degradation). Never: per-request logic.
 src/cli/remote/blob-batch/config.ts     — all tuning defaults/caps + fill/pack policy selectors + wire-cap constants + BatchConfig/PackConfig + RBOX_BATCH_*/RBOX_PACK_* env readers (uploadBatchConfig/downloadBatchConfig/packUploadConfig) + pack fill constants. Never: wire framing constants, class logic.
@@ -391,7 +388,6 @@ src/engine/pool.ts                  — generic bounded-concurrency poolMap (fai
 src/engine/trash.ts                 — local trash tier: atomic rename soft-delete, prune/list/restore, cross-process .active marker. Owns "never destroy bytes on apply". Never: the decision to delete (reconcile.ts).
 src/engine/phase-report.ts          — pure per-run phase timing/byte accumulator, no PII by construction. Never: emission I/O (caller owns).
 src/engine/git-discover.ts          — ignore-pruned walk finding every nested git repo (dir or pointer). Never: repo-boundary stops, symlink following.
-src/engine/git-state.ts             — barrel: stable git-state API over git/* + validate helpers. Never: implementation.
 src/engine/detect.ts                — pure ecosystem/package-manager detection for hydration (fixed in-binary allowlist). Never: disk I/O, execution.
 src/engine/doctor.ts                — pure host-vs-project readiness judging for hydration. Never: tool probing/execution (caller's job).
 src/engine/darwin-bulk-walk.ts      — macOS-only bulk directory enumeration (bun:ffi getattrlistbulk) scan fast path. Never: fallback logic (caller falls back).
@@ -403,7 +399,6 @@ src/engine/refset.ts                — dependency-free binary codec for the rbo
 ## `src/engine/crypto-pool/` — worker-based crypto pool
 
 ```
-src/engine/crypto-pool.ts           — barrel: pre-113-split public surface of crypto-pool/ (serves engine/index.ts unchanged).
 src/engine/crypto-pool/pool.ts      — CryptoPool + CryptoWorkerSlot (§2.7 — bidirectionally coupled; a slot/pool file split is an import cycle by construction, REVIEW-113 HIGH 1) + process-wide registry/selection (selectCryptoPool, withCryptoPool, shutdownCryptoPool, cryptoPoolStatus, test hooks) + kekFingerprint. Never: worker artifact resolution (crypto-worker-files.ts), sizing config (config.ts), the algorithm (crypto.ts), the worker body (crypto-worker.ts).
 src/engine/crypto-pool/config.ts    — operating constants, env parsing, worker sizing (configuredWorkers + its cache, fileDescriptorWorkerCap, minJobs). Owns configuredWorkersCache (permitted test reset lives here). Never: pool state/scheduling, worker paths.
 src/engine/crypto-pool/budget.ts    — ciphertext contracts + CiphertextBudget (reserve/convert/release/wait) + fused-job record types. Never: worker spawning, I/O.

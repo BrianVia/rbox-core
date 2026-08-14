@@ -185,7 +185,7 @@ export interface MainDispatchDeps {
 
 export async function main(deps: MainDispatchDeps = {}): Promise<void> {
   let [cmd] = process.argv.slice(2) as [string | undefined];
-  const elevated = (deps.isElevated ?? (() => typeof process.geteuid === "function" && process.geteuid() === 0))();
+  const elevated = (deps.isElevated ?? (() => process.geteuid?.() === 0))();
   // Resolve and persist this boot even for commands which never acquire a
   // workspace lock. Locking remains availability-biased when identity is
   // unavailable, so non-locking commands must not fail on this health hook.
@@ -685,7 +685,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
           break;
         }
         const root = await resolveRoot(undefined);
-        const { gitDeferralsCmd } = await import("./git-cmd.js");
+        const { gitDeferralsCmd } = await import("./git/deferrals-command.js");
         const code = await gitDeferralsCmd(root, { brief: flags.brief === "true", json: jsonMode }, { now: deps.now });
         if (code !== 0) process.exitCode = code;
         break;
@@ -697,7 +697,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
           break;
         }
         const root = await resolveRoot(target);
-        const { gitRepublishCmd } = await import("./git-cmd.js");
+        const { gitRepublishCmd } = await import("./git/republish-command.js");
         const code = await withWorkspaceSyncMutex(root, (syncMutex) =>
           gitRepublishCmd(root, target, syncMutex, { json: jsonMode }, { now: deps.now }));
         if (code !== 0) process.exitCode = code;
@@ -710,7 +710,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         break;
       }
       const root = await resolveRoot(repo);
-      const { gitResolveCmd } = await import("./git-cmd.js");
+      const { gitResolveCmd } = await import("./git/resolve-command.js");
       const code = await gitResolveCmd(root, repo, verb as "show-me" | "take-theirs" | "keep-mine", {
         json: jsonMode,
         confirm: flags.confirm,
