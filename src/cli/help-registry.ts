@@ -227,10 +227,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "start",
     group: "SYNCING",
     summary: "start background sync for this folder",
-    usage: "rbox start [path] [--pull-only | --read-write]",
+    usage: "rbox start [path] [--pull-only | --read-write] [--trace[=<streams>]]",
     flags: [
       { flag: "--pull-only", desc: "watch remote changes without pushing local changes" },
       { flag: "--read-write", desc: "pull and push changes" },
+      { flag: "--trace", desc: "trace all diagnostics, or select with --trace=propagation,held" },
     ],
     notes: ["[path] defaults to the current directory; run `rbox` to set one up."],
   },

@@ -4,6 +4,7 @@ import { findRoot as findWorkspaceRoot } from "./config.js";
 import { rememberResolvedRoot } from "./binding-registry.js";
 import { runPullCommand, runPushCommand, runSyncCommand } from "./sync-cmd.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
+import { parseDaemonTraceStreams } from "./daemon/process-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonForUser, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keySave, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
@@ -572,9 +573,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         : flags["read-write"] === "true"
           ? "read-write" as const
           : undefined;
+      const traceStreams = flags.trace === undefined ? undefined : parseDaemonTraceStreams(flags.trace);
       const root = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
       if (!root) throw startWorkspaceRequiredError();
-      await startDaemonForUser(root, { mode });
+      await startDaemonForUser(root, { mode, traceStreams });
       break;
     }
     case "stop": {

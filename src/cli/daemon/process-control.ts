@@ -105,6 +105,8 @@ export interface DaemonLiveObservation {
 }
 export interface StartDaemonOptions {
   pullOnly?: boolean;
+  /** Invocation-scoped diagnostic streams to arm in the freshly spawned daemon. */
+  traceStreams?: readonly DaemonTraceStream[];
   /** Whether the operator supplied --pull-only/--read-write. Unknown legacy live mode is safe only for preserve. */
   modeIntent?: DaemonModeIntent;
   /** Awaited after a current-workspace live daemon is confirmed, before mode admission. */
@@ -123,6 +125,39 @@ export interface StartDaemonOptions {
 }
 
 export const DAEMON_MODE_WITNESS_TIMEOUT_MS = 15_000;
+
+const DAEMON_TRACE_ENV = {
+  propagation: "RBOX_TRACE_PROPAGATION",
+  held: "RBOX_TRACE_HELD",
+} as const satisfies Record<string, `RBOX_TRACE_${string}`>;
+
+export type DaemonTraceStream = keyof typeof DAEMON_TRACE_ENV;
+const DAEMON_TRACE_STREAMS = Object.freeze(Object.keys(DAEMON_TRACE_ENV) as DaemonTraceStream[]);
+
+function traceSelectionError(value: string): Error {
+  return new Error(`unknown trace stream${value ? ` ${value}` : ""}; valid streams: ${DAEMON_TRACE_STREAMS.join(", ")}`);
+}
+
+/** Parse the start flag's boolean sentinel or exact comma list into closed stream names. */
+export function parseDaemonTraceStreams(value: string): DaemonTraceStream[] {
+  if (value === "true") return [...DAEMON_TRACE_STREAMS];
+  const names = value.split(",");
+  const unknown = names.find((name) => !Object.hasOwn(DAEMON_TRACE_ENV, name));
+  if (unknown !== undefined) throw traceSelectionError(unknown);
+  return names as DaemonTraceStream[];
+}
+
+/** Pure environment projection used by the detached spawn and its differential tests. */
+export function daemonSpawnEnv(
+  inherited: NodeJS.ProcessEnv,
+  bootId: string,
+  pullOnly: boolean,
+  traceStreams: readonly DaemonTraceStream[] = [],
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...inherited, [DAEMON_BOOT_ID_ENV]: bootId, RBOX_DAEMON_PULL_ONLY: pullOnly ? "1" : "0" };
+  for (const stream of traceStreams) env[DAEMON_TRACE_ENV[stream]] = "1";
+  return env;
+}
 
 export type DaemonModeWitness = { kind: "known"; mode: DaemonMode; bootId: string } | { kind: "unknown" };
 
@@ -320,7 +355,7 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
     child = spawn(process.execPath, args, {
       detached: true,
       stdio: ["ignore", out ?? "ignore", out ?? "ignore"],
-      env: { ...process.env, [DAEMON_BOOT_ID_ENV]: bootId, RBOX_DAEMON_PULL_ONLY: opts.pullOnly ? "1" : "0" },
+      env: daemonSpawnEnv(process.env, bootId, opts.pullOnly === true, opts.traceStreams),
     });
   } finally {
     if (out !== undefined) fs.closeSync(out);

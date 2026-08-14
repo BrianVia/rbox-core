@@ -59,6 +59,22 @@ test("start and stop record desired state with account and workspace guards", as
   });
 });
 
+test("interactive trace selection reaches only spawn options, not desired state", async () => {
+  const root = await workspace("ws_trace");
+  let traceStreams: readonly string[] | undefined;
+  await startDaemonAndRecordDesired(root, {
+    loadCredentials: creds("acct_trace"),
+    traceStreams: ["held"],
+    startDaemon: async (_candidate, options) => {
+      traceStreams = options.traceStreams;
+      return "started";
+    },
+  });
+
+  expect(traceStreams).toEqual(["held"]);
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"))).not.toHaveProperty("traceStreams");
+});
+
 test("retry-later start does not create or replace desired running state", async () => {
   const absent = await workspace("ws_retry_absent");
   await startDaemonAndRecordDesired(absent, {
@@ -157,4 +173,3 @@ test("a live mode mismatch still records running without accepting the requested
   expect(desired.pullOnly).toBeUndefined();
   expect(desired.pendingModeIntent).toBe("pull-only");
 });
-
