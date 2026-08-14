@@ -189,8 +189,8 @@ describe("design 130 all-to-all authoring and the final boundary", () => {
     expect(tombstoneFindingLine("repo", result.findings.find((item) => item.kind === "repository-evicted")!)).toContain("repository cap");
   });
 
-  test("plan.ts has one final normalizer and returns only its finalized map", async () => {
-    const source = await fs.readFile(new URL("./plan.ts", import.meta.url), "utf8");
+  test("the plan accumulator has one final normalizer and returns only its finalized map", async () => {
+    const source = await fs.readFile(new URL("./plan-accumulator.ts", import.meta.url), "utf8");
     expect(source.match(/normalizeOutgoingGitSections\s*\(/g)).toHaveLength(1);
     expect(source).toContain("gitRepos: emptyToUndef(outgoing)");
     expect(source).not.toContain("gitRepos: emptyToUndef(out),");

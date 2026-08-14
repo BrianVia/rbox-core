@@ -1,22 +1,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isDeepStrictEqual } from "node:util";
-import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type OwnedRefMutationBoundary, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type OwnedRefMutationBoundary, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
-import { git, type GitArtifactReadStore, type PendingGitUpload } from "../../engine/git/shared.js";
-import { makeGitCaptureDir } from "../../engine/git/capture.js";
-import { flushGitArtifacts, planReadThroughStore } from "./plan-artifacts.js";
+import { git } from "../../engine/git/shared.js";
+import { PlanArtifactLifecycle } from "./plan-artifacts.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
-import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { expectedStateNonce, repoRecordsForState, syncStreamId, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, observePackedRefsIdentity, packedRefsMtimeRegressed, type ResolutionCaptureTestHooks } from "./shared.js";
-import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
-import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
-import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, observePackedRefsIdentity, packedRefsMtimeRegressed, type ResolutionCaptureTestHooks } from "./shared.js";
+import { shouldPublishGitConfig } from "./config-lane.js";
+import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult } from "./divergence-cache.js";
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
-import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 import { cachedSupersessionRefusal, gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession, recordSupersessionRefusal, supersessionMemoKeys } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
@@ -27,6 +23,788 @@ import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./branch-transition.js";
 import { asyncMemo } from "./async-memo.js";
 import { republishPlanInput } from "./republish-requests.js";
+import { GitPlanAccumulator } from "./plan-accumulator.js";
+import { RepoCaptureAttempt, type RepoAttemptCommand } from "./repo-capture-attempt.js";
+
+function applyRepoAttemptCommands(
+  accumulator: GitPlanAccumulator,
+  rel: string,
+  commands: readonly RepoAttemptCommand[],
+): void {
+  for (const command of commands) {
+    switch (command.kind) {
+      case "carry":
+        accumulator.carry(rel, command.section);
+        break;
+      case "defer":
+        accumulator.deferRepo(rel, command.reason, command.forced, command.typedReason);
+        break;
+      case "clear-removal":
+        delete accumulator.removedMemory[rel];
+        break;
+      case "clear-resolution":
+        delete accumulator.needsResolution[rel];
+        break;
+      case "structural-refusal":
+        if (command.removed) accumulator.removed.push(rel);
+        if (command.repoAbsent) accumulator.repoAbsent[rel] = true;
+        accumulator.defer(rel, command.reason);
+        delete accumulator.needsResolution[rel];
+        break;
+      case "config-observed":
+        accumulator.configObserved.add(rel);
+        break;
+      case "config-defer":
+        accumulator.deferConfig(rel, command.reason, command.transient);
+        break;
+      case "config-skip":
+        accumulator.logOnce(
+          configOwnershipSkipLogged,
+          rel,
+          `git-sync config skipped ${rel}: ${command.reason}. rbox left shared Git settings alone; Git history can still sync.`,
+        );
+        break;
+      case "config-authored":
+        accumulator.authoredCfgHashByRepo[rel] = command.hash;
+        break;
+    }
+  }
+}
+
+interface RepoClassificationStage {
+  accumulator: GitPlanAccumulator;
+  root: string;
+  state: SyncState;
+  kindByPath: ReadonlyMap<string, GitRepoKind>;
+  keys: readonly string[];
+  recoveryBlocked: ReadonlyMap<string, string>;
+  recoveryAllowsSupersession: ReadonlyMap<string, boolean>;
+  matcher: IgnoreMatcher;
+  force: ReadonlySet<string>;
+  republish: ReadonlySet<string>;
+  cache: Awaited<ReturnType<typeof loadGitDivergenceCache>>;
+  fingerprintRun: ReturnType<typeof gitFingerprintRun>;
+  options: GitPlanOptions;
+  preCaptureRepoCtx(rel: string): Promise<RepoCtx | undefined>;
+  clearPreCaptureCtx(): void;
+}
+
+interface RepoClassificationResult {
+  attempts: Map<string, RepoCaptureAttempt>;
+  toCapture: string[];
+}
+
+async function classifyGitRepositories(stage: RepoClassificationStage): Promise<RepoClassificationResult> {
+  const {
+    accumulator,
+    root,
+    state,
+    kindByPath,
+    keys,
+    recoveryBlocked,
+    recoveryAllowsSupersession,
+    matcher,
+    force,
+    republish,
+    cache,
+    fingerprintRun,
+    options,
+    preCaptureRepoCtx,
+  } = stage;
+  const {
+    base,
+    pending,
+    needsResolution,
+    removedMemory,
+    out,
+    removed,
+    repoAbsent,
+    skipped,
+    deferred,
+    configObserved,
+    stableCarryHygiene,
+    pendingSupersessionCandidates,
+    resolutionCandidates,
+    stats,
+    timings,
+  } = accumulator;
+  const startedAt = performance.now();
+  const fingerprintAtStart = timings.fingerprintMs;
+  for (const rel of keys) accumulator.captureObserved.add(rel);
+  stats.repos = keys.length;
+  const cap = gitRepoCap();
+  let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
+  let toCapture: string[] = [];
+  let carried = accumulator.carried;
+  const attempts = new Map<string, RepoCaptureAttempt>();
+  const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
+  const noteCredentialSkip = (rel: string): void => accumulator.logOnce(
+    configCredentialSkipLogged,
+    rel,
+    `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`,
+  );
+  const attemptFor = (rel: string, kind: GitRepoKind | undefined): RepoCaptureAttempt => {
+    let attempt = attempts.get(rel);
+    if (attempt) return attempt;
+    attempt = new RepoCaptureAttempt({
+      root,
+      relPath: rel,
+      kind,
+      base: base[rel],
+      pending: pending[rel],
+      removedKey: removedMemory[rel],
+      resolutionKey: needsResolution[rel],
+      recordExists: repoRecordsForState(state)[rel] !== undefined,
+      cfgSynced: state.repoRecords?.[rel]?.cfgSynced,
+      forced: force.has(rel),
+      mustCapture: mustCapture(rel),
+      repoCap: cap,
+      disableConfigLane: options.disableConfigLane === true,
+      cache,
+      fingerprintRun,
+      gitConfigRunner: options.gitConfigRunner,
+      preCaptureRepoCtx: () => preCaptureRepoCtx(rel),
+      onCredentialSkip: () => noteCredentialSkip(rel),
+    });
+    attempts.set(rel, attempt);
+    return attempt;
+  };
+  const deferOne = (rel: string, reason: string, typedReason?: GitDeferralReason): void =>
+    accumulator.deferRepo(rel, reason, force.has(rel), typedReason);
+  const processSlow = async (
+    rel: string,
+    kind: GitRepoKind | undefined,
+    fastLookup?: FingerprintHitProbeResult,
+    options: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolution?: boolean } = {},
+  ): Promise<void> => {
+    stats.spawnedRepos++;
+    const attempt = attemptFor(rel, kind);
+    const result = await attempt.classify(fastLookup, { ...options, admissionAvailable: admitted < cap });
+    applyRepoAttemptCommands(accumulator, rel, attempt.drainCommands());
+    if (result.parentRelKnown) fastPathParentRel.set(rel, result.parentRel);
+    if (result.stableCarry) stableCarryHygiene.add(rel);
+    if (result.admissionUsed) admitted++;
+    if (result.queued) toCapture.push(rel);
+  };
+  const fastPathParentRel = new Map<string, string | undefined>();
+  const pointerPreSkips: Array<{ relPath: string; parentRel: string; admissionAlreadyCounted: boolean }> = [];
+
+  for (const rel of keys) {
+    const kind = kindByPath.get(rel);
+    const baseSection = base[rel];
+    const protectedSection = pending[rel];
+    let fastLookup: FingerprintHitProbeResult | undefined;
+    const recoveryReason = recoveryBlocked.get(rel);
+    if (recoveryReason) {
+      if (protectedSection) {
+        accumulator.defer(rel, recoveryReason);
+        accumulator.carry(rel, protectedSection);
+        if (options.resolution?.repo === rel) accumulator.resolutionDisposition = { outcome: "refused", reason: recoveryReason };
+      } else {
+        deferOne(rel, recoveryReason);
+      }
+      continue;
+    }
+    if (protectedSection) {
+      const rider = options.resolution?.repo === rel ? options.resolution : undefined;
+      if (rider) {
+        if (options.degradedMutex) {
+          accumulator.carry(rel, protectedSection);
+          const reason = "workspace locking is degraded; keep-mine publication requires safe serialization";
+          accumulator.defer(rel, reason);
+          accumulator.resolutionDisposition = { outcome: "refused", reason };
+        } else {
+          resolutionCandidates.add(rel);
+          await processSlow(rel, kind, undefined, { forceCapture: true, admissionAlreadyCounted: true, resolution: true });
+        }
+        continue;
+      }
+      if (recoveryAllowsSupersession.get(rel) === false || !gitPendingSupersedeEnabled()) {
+        accumulator.carry(rel, protectedSection);
+        continue;
+      }
+      const probe = await pendingSupersessionPreProbe(root, rel, protectedSection, baseSection, (fingerprint) =>
+        cachedSupersessionRefusal(cache, rel, fingerprint, supersessionMemoKeys(protectedSection, baseSection)));
+      if (probe.status === "carry") {
+        accumulator.carry(rel, protectedSection);
+        if (probe.busy || probe.refused) accumulator.defer(rel, probe.reason);
+        else accumulator.logOnce(
+          pendingCarryLogged,
+          rel,
+          `git-sync pending carry ${rel}: ${probe.reason}. Your local Git work is safe while rbox retries.`,
+        );
+        continue;
+      }
+      pendingSupersessionCandidates.add(rel);
+      attemptFor(rel, kind).rememberSupersessionEvidence({
+        fingerprint: probe.fastLookup.fingerprint,
+        identityKey: probe.fastLookup.probe.identityKey,
+        kind: probe.fastLookup.kind,
+      });
+      await options.afterPendingPreProbe?.(rel);
+      await processSlow(rel, kind, probe.fastLookup, { forceCapture: true });
+      continue;
+    }
+    if (!kind) {
+      if (!baseSection) continue;
+      const dirPresent = await fs.lstat(repoDirOf(root, rel)).then((entry) => entry.isDirectory()).catch((error) =>
+        isPresentButUnreadableError(error) ? undefined : false);
+      if (dirPresent === undefined) {
+        deferOne(rel, "repo dir unreadable (permission/IO fault) — carrying base");
+      } else if (!dirPresent) {
+        removed.push(rel);
+        repoAbsent[rel] = true;
+        delete needsResolution[rel];
+      } else {
+        const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
+        if (dotGit && rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) {
+          out[rel] = baseSection;
+          skipped.push({ relPath: rel, reason: "gitignored by discovery pruning — carrying base" });
+        } else {
+          deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
+        }
+      }
+      continue;
+    }
+    if (!mustCapture(rel) && needsResolution[rel] === undefined && removedMemory[rel] === undefined && baseSection) {
+      fastLookup = await accumulator.measure(
+        "fingerprintMs",
+        () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
+      );
+      if (fastLookup.status === "untrusted") {
+        stats.fpUntrusted++;
+      } else if (fastLookup.status === "hit") {
+        const probe = fastLookup.probe;
+        const baseHeadMissing = Object.keys(baseSection.refs).some((ref) =>
+          ref.startsWith("refs/heads/") && probe.identityRefs?.[ref] === undefined);
+        if (!baseHeadMissing && !probe.busy && probe.preflightOk && !probe.preflightStructural
+          && isGitRepoKind(probe.preflightKind) && carryMatrixMatches(baseSection, probe.preflightKind, probe.identityKey)
+          && (options.disableConfigLane || (fastLookup.cachedLocalCfg
+            && !shouldPublishGitConfig(baseSection.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced)))) {
+          accumulator.carry(rel, baseSection);
+          if (!options.disableConfigLane) configObserved.add(rel);
+          fastPathParentRel.set(rel, probe.parentRel);
+          stats.fpHits++;
+          stableCarryHygiene.add(rel);
+          continue;
+        }
+        stats.fpMisses++;
+      } else {
+        stats.fpMisses++;
+      }
+    }
+    if (!mustCapture(rel) && needsResolution[rel] === undefined && removedMemory[rel] === undefined
+      && kind === "pointer" && !baseSection) {
+      fastLookup = await accumulator.measure(
+        "fingerprintMs",
+        () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
+      );
+      if (fastLookup.status === "untrusted") {
+        stats.fpUntrusted++;
+      } else if (fastLookup.status === "hit") {
+        const probe = fastLookup.probe;
+        if (!probe.busy && probe.preflightOk && !probe.preflightStructural
+          && isGitRepoKind(probe.preflightKind) && probe.parentRel && admitted < cap) {
+          admitted++;
+          pointerPreSkips.push({ relPath: rel, parentRel: probe.parentRel, admissionAlreadyCounted: true });
+          continue;
+        }
+        stats.fpMisses++;
+      } else {
+        stats.fpMisses++;
+      }
+    }
+    await processSlow(rel, kind, fastLookup);
+  }
+
+  const sectioned = new Set([...Object.keys(out), ...toCapture]);
+  const skippedRelPaths = new Set<string>();
+  const skipPointer = (rel: string, parentRel: string): void => {
+    skippedRelPaths.add(rel);
+    accumulator.skipLinkedPointer(rel, parentRel);
+  };
+  for (const pointer of pointerPreSkips) {
+    if (sectioned.has(pointer.parentRel)) {
+      skipPointer(pointer.relPath, pointer.parentRel);
+      stats.pointerPreSkips++;
+    } else {
+      stats.fpMisses++;
+      await processSlow(pointer.relPath, kindByPath.get(pointer.relPath), undefined, {
+        admissionAlreadyCounted: pointer.admissionAlreadyCounted,
+      });
+    }
+  }
+  for (const rel of [...toCapture, ...carried]) {
+    if (mustCapture(rel) || kindByPath.get(rel) !== "pointer" || pending[rel] || needsResolution[rel] !== undefined) continue;
+    let parentRel: string | undefined;
+    if (fastPathParentRel.has(rel)) {
+      parentRel = fastPathParentRel.get(rel);
+      stats.parentRelCached++;
+    } else {
+      parentRel = await inTreeWorktreeParentRel(root, repoDirOf(root, rel));
+    }
+    if (parentRel && sectioned.has(parentRel)) skipPointer(rel, parentRel);
+  }
+  if (skippedRelPaths.size > 0) {
+    toCapture = toCapture.filter((rel) => !skippedRelPaths.has(rel));
+    carried = carried.filter((rel) => !skippedRelPaths.has(rel));
+    accumulator.carried = carried;
+  }
+  stage.clearPreCaptureCtx();
+  await options.beforeCapturePool?.();
+  timings.carryMs += performance.now() - startedAt - (timings.fingerprintMs - fingerprintAtStart);
+  return { attempts, toCapture };
+}
+interface RepoCaptureStage {
+  accumulator: GitPlanAccumulator;
+  root: string;
+  cfg: WorkspaceConfig;
+  state: SyncState;
+  api: SyncRemote;
+  kek: Buffer;
+  force: ReadonlySet<string>;
+  attempts: ReadonlyMap<string, RepoCaptureAttempt>;
+  toCapture: readonly string[];
+  artifacts: PlanArtifactLifecycle;
+  options: GitPlanOptions;
+  backoff?: (attempt: number) => Promise<void>;
+}
+
+async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise<void> {
+  const { accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, backoff } = stage;
+  const { base, pending, captured, out, resolutionCandidates, absentBranchProofs, packedRefsIdentity, publisherAckBindings, timings } = accumulator;
+  const carried = accumulator.carried;
+  const commitCapture = accumulator.capture.bind(accumulator);
+  const revertCapture = accumulator.revertCapture.bind(accumulator);
+  const glog = accumulator.log.bind(accumulator);
+  const captureStartedAt = performance.now();
+  accumulator.beginCaptureProgress(toCapture.length);
+  const uploadsDir = path.join(root, ".rbox", "state", "uploads");
+  const retainDir = await artifacts.startIfNeeded(toCapture.length > 0);
+  await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
+    options.onCaptureQueued?.(rel);
+    try {
+      const attempt = attempts.get(rel);
+      if (!attempt) throw new Error(`git-sync capture attempt missing for ${rel}`);
+      const resolution = resolutionCandidates.has(rel);
+      const { section: sec, reason, pendingUploads } = await attempt.capture({
+        cfg,
+        api,
+        kek,
+        uploadsDir,
+        backoff,
+        onBytes: (absoluteBytes) => accumulator.noteRepoBytes(rel, absoluteBytes),
+        resolution,
+        resolutionHooks: resolution ? options.resolutionCaptureTestHooks : undefined,
+        retainDir,
+        ownedRefMutationBoundary: options.ownedRefMutationBoundary,
+      });
+      if (sec) {
+        artifacts.retain(rel, pendingUploads ?? []);
+        applyRepoAttemptCommands(accumulator, rel, attempt.drainCommands());
+        commitCapture(rel, sec);
+      } else {
+        accumulator.deferRepo(
+          rel,
+          reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)",
+          force.has(rel),
+        );
+      }
+    } catch (e) {
+      const reason = e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`;
+      accumulator.deferRepo(
+        rel,
+        reason,
+        force.has(rel),
+        reason.startsWith("ref-read-unreadable:") ? "ref-read-unreadable" : undefined,
+      );
+    } finally {
+      accumulator.settleCapture(rel);
+    }
+  });
+
+  // Design 200 W/L/D: observe the packed-refs mtime baseline on captured and
+  // carried dir repos regardless of the kill switch. A strict capture may turn
+  // a BASE-positive branch into an omission only after the full witness and a
+  // prepared verify-only lock.
+  const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
+  for (const rel of [...new Set([...captured, ...carried])].sort()) {
+      const candidate = out[rel];
+      if (!candidate) continue;
+      const record = repoRecordsForState(state)[rel];
+      // A hidden BASE is provenance, never W/L/D refusal authority. A fresh
+      // repository at the same path must flow through the normal re-add path.
+      if (record?.repoAbsent === true || record?.removedKey !== undefined) continue;
+      const baseSection = record?.base ?? base[rel];
+      // W/L/D and absence proofs are CAPTURE authority only. A carried pending
+      // section legitimately omits held BASE heads (it is protected inbound
+      // state, not this cycle's evidence) — carried repos take the packed-refs
+      // baseline observation below and nothing else.
+      const missing = !captured.includes(rel) ? [] : Object.entries(baseSection?.refs ?? {})
+        .filter(([ref]) => ref.startsWith("refs/heads/"))
+        .filter(([ref]) => candidate.refs[ref] === undefined);
+
+      if (absenceCaptureEnabled && missing.length > 0) await options.beforeAbsenceWitness?.(rel);
+      /** One branch-deletion refusal: name it, drop this cycle's proofs, and fall back
+       *  to the protected pending section or the BASE that was carrying before. */
+      const refuseBranchDeletion = (reason: string, typed: GitDeferralReason): void => {
+        glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
+        delete absentBranchProofs[rel];
+        const fallback = pending[rel] ?? baseSection;
+        if (fallback) revertCapture(rel, fallback, reason, typed);
+      };
+      let ctx: RepoCtx | undefined;
+      let ctxFailure: unknown;
+      try {
+        ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+      } catch (error) {
+        ctxFailure = error;
+      }
+      if (!ctx) {
+        if (absenceCaptureEnabled && missing.length > 0) {
+          refuseBranchDeletion(`repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`, "unreadable");
+        }
+        continue;
+      }
+      if (ctx.kind !== "dir") continue;
+
+      const packedObservation = await observePackedRefsIdentity(ctx.commonDir);
+      const previousPacked = record?.packedRefsIdentity;
+      const packedRegressed = packedRefsMtimeRegressed(previousPacked, packedObservation);
+      if (packedObservation.status === "absent") {
+        packedRefsIdentity[rel] = null;
+      } else if (packedObservation.status === "present"
+        && !packedRegressed) {
+        packedRefsIdentity[rel] = packedObservation.identity;
+      }
+
+      if (!absenceCaptureEnabled || missing.length === 0) continue;
+
+      let refusal: string | undefined = packedObservation.status === "unreadable"
+        ? `packed-refs baseline could not be read: ${errMsg(packedObservation.error)}`
+        : packedRegressed
+          ? "packed-refs mtime regressed while a BASE branch was absent"
+          : undefined;
+      let refusalType: GitDeferralReason | undefined =
+        packedObservation.status === "unreadable" ? "unreadable" : undefined;
+      const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
+      if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
+      const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
+        workspaceRoot: root, relPath: rel, state, ctx, record,
+        base: baseSection, incoming: candidate, liveRefs: candidate.refs,
+      });
+      if (protocol?.status !== "ready") refusal ??= protocol?.reason ?? "BASE artifact/lineage proof unavailable";
+      const readyProtocol = protocol?.status === "ready" ? protocol.protocol : undefined;
+      const binding = publisherAckBindings[rel];
+      if (readyProtocol && (!binding
+        || binding.lineageHash !== readyProtocol.lineageHash
+        || binding.repositoryIdentityHash !== readyProtocol.repositoryIdentityHash)) {
+        refusal ??= "publisher repository binding changed before absence proof";
+      }
+      let busy = false;
+      let preflight: Awaited<ReturnType<typeof gitPreflight>> = { ok: true };
+      let owned = new Map<string, string>();
+      let head = "";
+      if (!refusal) {
+        try {
+          await options.beforeAbsencePreflight?.(rel);
+          const [busyRead, preflightRead, ownedRead, headRead] = await Promise.all([
+            isGitBusy(ctx.repoDir),
+            gitPreflight(ctx.repoDir),
+            branchesCheckedOutElsewhereStrict(ctx),
+            readHead(ctx),
+          ]);
+          if (ownedRead.status === "unreadable") throw ownedRead.cause;
+          busy = busyRead;
+          preflight = preflightRead;
+          owned = ownedRead.owned;
+          head = headRead;
+        } catch (error) {
+          refusal = `branch deletion authorization evidence could not be read: ${errMsg(error)}`;
+          refusalType = "unreadable";
+        }
+      }
+      if (busy) refusal ??= "repository operation began before absence proof";
+      if (!preflight.ok) refusal ??= preflight.reason;
+      const collisions = receiverEquivalentCollisionNames([
+        ...Object.keys(baseSection?.refs ?? {}),
+        ...Object.keys(candidate.refs),
+        ...owned.keys(),
+      ]);
+      const proofs: Record<string, { priorOid: string }> = {};
+
+      for (const [ref, priorOid] of missing) {
+        if (refusal) break;
+        const origin = record?.branchBaseOrigins?.[ref];
+        const artifacts = readyProtocol!.artifacts[ref];
+        const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
+          && artifacts.present === "absent"
+          && artifacts.keeps === "clear"
+          && artifacts.settledAbsence === "absent");
+        const witnessRefusals = [
+          ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
+          ...(!branchBaseOriginMatches(origin, priorOid) ? ["origin-mismatch"] : []),
+          ...(branchBaseOriginMatches(origin, priorOid) && origin.lineageHash !== readyProtocol!.lineageHash ? ["lineage-changed"] : []),
+          ...(!artifactsClear ? ["artifacts-standing"] : []),
+          ...(owned.has(ref) ? ["worktree-owned"] : []),
+          ...(collisions.has(ref) ? ["name-collision"] : []),
+          ...(head === `ref: ${ref}` ? ["head-symref"] : []),
+        ];
+        if (witnessRefusals.length > 0) {
+          refusal = `branch deletion witness refused ${ref} (${witnessRefusals.join("+")})`;
+          break;
+        }
+        try {
+          const verification = await planAbsentBranchVerification(ctx.repoDir, ref);
+          await commitAbsentBranchVerification(verification);
+          proofs[ref] = { priorOid };
+        } catch (error) {
+          refusal = errMsg(error);
+          break;
+        }
+      }
+
+      if (!refusal && Object.keys(proofs).length === missing.length) {
+        absentBranchProofs[rel] = proofs;
+        continue;
+      }
+
+      const reason = refusal ?? "branch deletion proof unavailable";
+      refuseBranchDeletion(reason, refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"));
+  }
+
+  timings.captureMs += performance.now() - captureStartedAt;
+}
+interface CandidateFinalizeStage {
+  accumulator: GitPlanAccumulator;
+  root: string;
+  state: SyncState;
+  artifacts: PlanArtifactLifecycle;
+  cache: Awaited<ReturnType<typeof loadGitDivergenceCache>>;
+  kek: Buffer;
+  options: GitPlanOptions;
+  attempts: ReadonlyMap<string, RepoCaptureAttempt>;
+}
+
+async function finalizeCandidates(stage: CandidateFinalizeStage): Promise<void> {
+  const { accumulator, root, state, artifacts, cache, kek, options, attempts } = stage;
+  const { base, pending, captured, deferred, absentBranchProofs, pendingSupersessionCandidates, resolutionCandidates, resolvedPending, publisherAckBindings, supersededPending, supersessionIdentityKeys, timings } = accumulator;
+  const revertCapture = accumulator.revertCapture.bind(accumulator);
+  const projectionStartedAt = performance.now();
+  const finalizedOutgoing = accumulator.finalizeOutgoing();
+  for (const [rel, proofs] of Object.entries(absentBranchProofs)) {
+    const section = finalizedOutgoing[rel];
+    const exact = section !== undefined && Object.entries(proofs).every(([ref, proof]) =>
+      section.refTombstones?.[ref]?.some((entry) => entry.oid === proof.priorOid) === true);
+    if (exact) continue;
+    delete absentBranchProofs[rel];
+    const fallback = pending[rel] ?? base[rel];
+    if (fallback) revertCapture(
+      rel,
+      fallback,
+      "proof-backed tombstone could not be authored exactly",
+      "deletion-pending",
+    );
+  }
+  timings.projectionMs += performance.now() - projectionStartedAt;
+  const finalizeStartedAt = performance.now();
+  // Design 226 flush point 1. Every revert that can reach a repo in NEITHER candidate
+  // set — unreadable, absence-witness, tombstone-exactness — has now run, so these
+  // sections are final and their bytes are owed. Bounds retained disk without narrowing
+  // the retained SET, which those three reverts would have leaked past.
+  const decidedLate = new Set([...pendingSupersessionCandidates, ...resolutionCandidates]);
+  await artifacts.flush(captured.filter((rel) => !decidedLate.has(rel)));
+
+  for (const rel of [...resolutionCandidates].sort()) {
+    const rider = options.resolution?.repo === rel ? options.resolution : undefined;
+    const p = pending[rel];
+    const candidate = finalizedOutgoing[rel];
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (!rider || !p || !candidate || !ctx || !captured.includes(rel)) {
+      const reason = deferred.find((item) => item.relPath === rel)?.reason
+        ?? "keep-mine capture did not produce a final candidate";
+      if (p && candidate !== p) revertCapture(rel, p, reason);
+      accumulator.resolutionDisposition = { outcome: "refused", reason };
+      continue;
+    }
+    const report = await finalResolutionReport({ ctx, pending: p, candidate, store: artifacts.store(), kek });
+    if (!reportAuthorized(rider.authorizedLanes, report)) {
+      const reason = report.lanes.some((lane) => lane.disposition === "indeterminate")
+        ? "keep-mine final discard report was indeterminate"
+        : "keep-mine final candidate would discard a lane that was not confirmed — review and confirm again";
+      revertCapture(rel, p, reason);
+      accumulator.resolutionDisposition = { outcome: "refused", reason };
+      continue;
+    }
+    const reachable: string[] = [];
+    for (const oid of discardedIncomingOids(report)) {
+      if (await git(ctx.repoDir, ["cat-file", "-e", `${oid}^{object}`]).then(() => true, () => false)) reachable.push(oid);
+    }
+    if (reachable.length > 0) {
+      await pinDisplaced(ctx.repoDir, reachable, {
+        ref: `keep-mine:${rel}`,
+        episode: resolutionReportHash(rider.confirmedReport),
+        time: (options.now?.() ?? new Date()).toISOString(),
+        class: "human",
+      });
+    }
+    resolvedPending.add(rel);
+    accumulator.resolutionDisposition = {
+      outcome: "published",
+      confirmedReportHash: resolutionReportHash(rider.confirmedReport),
+    };
+  }
+  for (const rel of [...pendingSupersessionCandidates].sort()) {
+    const p = pending[rel];
+    const candidate = finalizedOutgoing[rel];
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    const binding = publisherAckBindings[rel];
+    const candidateProduced = captured.includes(rel) && p !== undefined && candidate !== undefined
+      && ctx !== undefined && binding !== undefined;
+    const proven = candidateProduced
+      && await provePendingSupersession({
+        ctx, pending: p, candidate, store: artifacts.store(), kek,
+        base: base[rel], absentBranchProofs: absentBranchProofs[rel],
+      })
+      && pendingSupersessionAckConverges({
+        previousBase: base[rel],
+        previousOrigins: repoRecordsForState(state)[rel]?.branchBaseOrigins,
+        candidate,
+        binding,
+        absentBranchProofs: absentBranchProofs[rel],
+      });
+    if (proven) {
+      supersededPending.add(rel);
+      const candidateKey = gitIncomingKey(candidate!);
+      supersessionIdentityKeys[rel] = {
+        pending: gitIncomingKey(p!),
+        candidate: candidateKey,
+        // Admission proved order-insensitive deep equality with the exact
+        // composer output, so its section identity is necessarily identical.
+        composed: candidateKey,
+      };
+      continue;
+    }
+    if (!p) continue;
+    // Only a candidate that reached the proof is evidence about the repository
+    // state; a transport or context fault says nothing and must re-run (#573).
+    const evidence = attempts.get(rel)?.supersessionRefusalEvidence();
+    if (candidateProduced && evidence) {
+      recordSupersessionRefusal(cache, rel, evidence.fingerprint, evidence.identityKey, {
+        ...supersessionMemoKeys(p, base[rel]),
+        reason: SUPERSESSION_REFUSED_REASON,
+      }, evidence.kind);
+    }
+    revertCapture(rel, p, SUPERSESSION_REFUSED_REASON);
+  }
+
+  // Design 226 flush point 2, and the invariant this whole design exists to hold:
+  // planGitSections returns only after every fresh artifact referenced by its final
+  // captured sections is either already remotely satisfied or successfully flushed.
+  // All-or-nothing — a failure here rejects the push rather than publishing a section
+  // whose bytes are missing (the repos past commitAbsentBranchVerification/pinDisplaced
+  // cannot be reverted, and the set is not statically known at this point).
+  await artifacts.flush(captured);
+  timings.finalizeMs += performance.now() - finalizeStartedAt;
+}
+interface PlanCleanupStage {
+  accumulator: GitPlanAccumulator;
+  root: string;
+  cache: Awaited<ReturnType<typeof loadGitDivergenceCache>>;
+  fingerprintRun: ReturnType<typeof gitFingerprintRun>;
+  kindByPath: ReadonlyMap<string, GitRepoKind>;
+  keys: readonly string[];
+  options: GitPlanOptions;
+}
+
+async function cleanAndRefreshPlan(stage: PlanCleanupStage): Promise<void> {
+  const { accumulator, root, cache, fingerprintRun, kindByPath, keys, options } = stage;
+  const { captured, stableCarryHygiene, resolutionCandidates, timings } = accumulator;
+  const measure = accumulator.measure.bind(accumulator);
+  const noteCredentialSkip = (rel: string): void => accumulator.logOnce(
+    configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`,
+  );
+  // Design 174 D: independently bounded scratch-ref hygiene. Only an exact
+  // stable carry or a successful final capture qualifies; an unconditional P,
+  // needs-resolution, policy, or failure carry never spends this authority.
+  let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
+  const cleanedCommonDirs = new Set<string>();
+  const postCleanupCacheRefresh = new Set(captured);
+  await measure("hygieneMs", async () => {
+    for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
+      .filter((candidate) => !resolutionCandidates.has(candidate))
+      .sort()) {
+      if (conflictDeleteBudget === 0) break;
+      const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+      options.onHygieneCtx?.(rel, ctx);
+      if (!ctx) continue;
+      const commonDir = path.resolve(ctx.commonDir);
+      if (cleanedCommonDirs.has(commonDir)) continue;
+      cleanedCommonDirs.add(commonDir);
+      const result = await pruneConflictRefs(repoDirOf(root, rel), {
+        limit: conflictDeleteBudget,
+        ctx,
+        onBatch: async () => {
+          for (const cachedRel of [...cache.repos.keys()]) {
+            const cachedCtx = await repoCtxFromDisk(repoDirOf(root, cachedRel)).catch(() => undefined);
+            if (cachedCtx && path.resolve(cachedCtx.commonDir) === commonDir) {
+              postCleanupCacheRefresh.add(cachedRel);
+              cache.repos.delete(cachedRel);
+            }
+          }
+          cache.dirty = true;
+          fingerprintRun.commonDirFingerprints.delete(commonDir);
+        },
+      }).catch(() => undefined);
+      conflictDeleteBudget -= result?.deleted ?? 0;
+    }
+  });
+
+  // Refresh captured entries only after every capture-side cleanup, including
+  // conflict-ref pruning above. A per-repo fingerprint run avoids reusing the
+  // full-plan common-dir memo that predates capture scratch refs.
+  const divergenceCacheStartedAt = performance.now();
+  const divergenceCacheFingerprintStartedAt = timings.fingerprintMs;
+  const refreshOrder = [...postCleanupCacheRefresh].sort();
+  for (const rel of refreshOrder) {
+    cache.repos.delete(rel);
+    cache.dirty = true;
+    try {
+      const postCaptureFingerprintRun = gitFingerprintRun("per-decision");
+      const beforeFingerprint = await measure(
+        "fingerprintMs",
+        () => gitFingerprint(postCaptureFingerprintRun, root, rel),
+      );
+      const pf = await gitPreflight(repoDirOf(root, rel));
+      const built = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx, pf);
+      await writeDivergenceCacheEntry(
+        postCaptureFingerprintRun,
+        root,
+        rel,
+        cache,
+        built.probe,
+        pf.kind ?? kindByPath.get(rel),
+        beforeFingerprint,
+        undefined,
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane,
+      );
+    } catch {
+      // Cache absence is the safe fallback; it is never correctness-bearing.
+    }
+  }
+
+  const liveKeys = new Set(keys);
+  for (const rel of [...cache.repos.keys()]) {
+    if (!liveKeys.has(rel)) {
+      cache.repos.delete(rel);
+      cache.dirty = true;
+    }
+  }
+  await saveGitDivergenceCache(root, cache).catch(() => {});
+  timings.divergenceCacheMs += performance.now() - divergenceCacheStartedAt
+    - (timings.fingerprintMs - divergenceCacheFingerprintStartedAt);
+}
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -183,20 +961,20 @@ export async function planGitSections(
   backoff?: (attempt: number) => Promise<void>,
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
-  // Design 226: capture ENCRYPTS into this dir and the flush uploads from it after the
-  // plan has decided. One sweep on every exit — including a throw — is the ONLY
-  // reclamation: retained artifacts collapse across repos by encSha, so per-file cleanup
-  // could delete bytes a still-undecided repo's read-through GET needs.
-  const retention: { dir?: string } = {};
+  const artifacts = new PlanArtifactLifecycle(
+    root,
+    () => api.blobStore(),
+    options.onGitLog ?? ((line: string) => console.error(line)),
+  );
   try {
-    return await planGitSectionsWithRetention(retention, root, cfg, state, api, force, matcher, onProgress, backoff, options);
+    return await planGitSectionsWithRetention(artifacts, root, cfg, state, api, force, matcher, onProgress, backoff, options);
   } finally {
-    if (retention.dir) await fs.rm(retention.dir, { recursive: true, force: true }).catch(() => {});
+    await artifacts.dispose();
   }
 }
 
 async function planGitSectionsWithRetention(
-  retention: { dir?: string },
+  artifacts: PlanArtifactLifecycle,
   root: string,
   cfg: WorkspaceConfig,
   state: SyncState,
@@ -208,6 +986,7 @@ async function planGitSectionsWithRetention(
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
   const planStartedAt = performance.now();
+  const accumulator = new GitPlanAccumulator(root, state, options, onProgress);
   // #526: pending operator chain restarts. Read once at entry alongside the 422
   // force set. A republished repo must skip every carry fast-path and capture with
   // no basis, but — unlike a 422 force, whose BASE references blobs the server has
@@ -216,31 +995,10 @@ async function planGitSectionsWithRetention(
   const { repos: republish, warning: republishWarning } = await republishPlanInput(root, syncStreamId(cfg));
   if (republishWarning) options.onGitLog?.(republishWarning);
   if (republish.size > 0) options.onGitLog?.(`git-sync republish pending ${[...republish].sort().join(", ")}`);
-  const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
   // Design 204 §5.1: one policy read at entry. The legacy arm retains the
   // pre-204 probe order and does not consume the scoped memo.
   const gitPlanLazy = process.env.RBOX_GIT_PLAN_LAZY !== "0";
-  const timings = {
-    setupMs: 0,
-    discoverMs: 0,
-    removalPruneMs: 0,
-    journalPreloopMs: 0,
-    carryMs: 0,
-    fingerprintMs: 0,
-    captureMs: 0,
-    projectionMs: 0,
-    finalizeMs: 0,
-    hygieneMs: 0,
-    divergenceCacheMs: 0,
-  };
-  const measure = async <T>(key: keyof typeof timings, fn: () => Promise<T>): Promise<T> => {
-    const startedAt = performance.now();
-    try {
-      return await fn();
-    } finally {
-      timings[key] += performance.now() - startedAt;
-    }
-  };
+  const measure = accumulator.measure.bind(accumulator);
   const preCaptureCtx = new Map<string, ReturnType<typeof asyncMemo<RepoCtx | undefined>>>();
   const preCaptureRepoCtx = (rel: string): Promise<RepoCtx | undefined> => {
     if (!gitPlanLazy) return repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
@@ -251,219 +1009,18 @@ async function planGitSectionsWithRetention(
     }
     return get();
   };
-  const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
-    Object.fromEntries(Object.entries(sections ?? {}).map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
-  const base = sanitizeSections(state.lastSyncedManifest.gitRepos);
-  const repoAbsent: Record<string, true> = Object.fromEntries(
-    Object.entries(repoRecordsForState(state))
-      .filter(([, record]) => record.repoAbsent === true)
-      .map(([relPath]) => [relPath, true as const]),
-  );
-  const removedMem = { ...(state.gitReposRemoved ?? {}) };
-  const needsRes = { ...(state.gitNeedsResolution ?? {}) };
-  // Immutable durable pre-plan checkpoint. Planner-local `pending` is allowed to
-  // change (including syncGit:false deletion), but it can never rewrite the
-  // expected-previous truth used by the final comparison.
-  const durablePending = sanitizeSections(state.gitPendingRemote);
-  const pending = { ...durablePending };
-  const captured: string[] = [];
-  let carried: string[] = [];
-  const authoredCfgHashByRepo: Record<string, string> = {};
-  const publisherAckBindings: NonNullable<GitPushPlan["publisherAckBindings"]> = {};
-  const absentBranchProofs: NonNullable<GitPushPlan["absentBranchProofs"]> = {};
-  const packedRefsIdentity: NonNullable<GitPushPlan["packedRefsIdentity"]> = {};
-  const removed: string[] = [];
-  const deferred: Array<{ relPath: string; reason: string; typedReason?: GitDeferralReason }> = [];
-  /** Every config-ownership skip says the same reassuring thing; say it once. */
-  const skipConfigOwnership = (rel: string, why: string): void =>
-    logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: ${why}. rbox left shared Git settings alone; Git history can still sync.`);
-  const configLaneDefers = new Set<(typeof deferred)[number]>();
-  const configLaneItems = new Set<(typeof deferred)[number]>();
-  /** The config lane's one deferral emitter. Every config refusal is a deferral, a
-   *  lane member (so the pointer pre-skip can withdraw it) and — when the fault is
-   *  transient — a `config` deferral owed to the durable observation. */
-  const deferConfigLane = (rel: string, reason: string, transient = false): void => {
-    const item = { relPath: rel, reason };
-    deferred.push(item);
-    configLaneItems.add(item);
-    if (transient) configLaneDefers.add(item);
-  };
-  const captureObserved = new Set<string>();
-  const configObserved = new Set<string>();
-  const skipped: Array<{ relPath: string; reason: string }> = [];
-  const out: Record<string, GitSection> = {};
-  // Normalize exactly once, then prove-and-publish that exact object.
-  // A failed proof restores the original P object by identity.
-  let finalizedOutgoing: Record<string, GitSection> | undefined;
-  const commitCapture = (rel: string, section: GitSection): void => {
-    out[rel] = section;
-    delete repoAbsent[rel];
-    captured.push(rel);
-  };
-  const revertCapture = (
-    rel: string,
-    fallback: GitSection,
-    reason: string,
-    typedReason?: GitDeferralReason,
-  ): void => {
-    delete absentBranchProofs[rel];
-    out[rel] = fallback;
-    if (finalizedOutgoing) finalizedOutgoing[rel] = fallback;
-    delete authoredCfgHashByRepo[rel];
-    delete repoAbsent[rel];
-    const capturedIndex = captured.indexOf(rel);
-    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
-    if (!carried.includes(rel)) carried.push(rel);
-    deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
-  };
-  const pendingSupersessionCandidates = new Set<string>();
-  /** The bracketed probe evidence a refusal is recorded against (#573) — never a
-   *  post-capture re-read. */
-  const supersessionProbeEvidence = new Map<string, { fingerprint: GitFingerprint; identityKey: string; kind: GitRepoKind | undefined }>();
-  const supersededPending = new Set<string>();
-  const supersessionIdentityKeys: NonNullable<GitPushPlan["supersessionIdentityKeys"]> = {};
-  const resolutionCandidates = new Set<string>();
-  const resolvedPending = new Set<string>();
-  let resolutionDisposition: GitPushPlan["resolution"];
-  const stableCarryHygiene = new Set<string>();
+  const {
+    base,
+    repoAbsent,
+    removedMemory: removedMem,
+    needsResolution: needsRes,
+    pending,
+    publisherAckBindings,
+    timings,
+  } = accumulator;
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
-  const fastPathParentRel = new Map<string, string | undefined>();
-  const stats: Omit<
-    GitPlanStats,
-    keyof typeof timings | "carried" | "captured" | "totalMs" | "otherMs"
-  > = {
-    repos: 0,
-    fpHits: 0,
-    fpMisses: 0,
-    fpUntrusted: 0,
-    spawnedRepos: 0,
-    pointerPreSkips: 0,
-    parentRelCached: 0,
-  };
-  const glog = options.onGitLog ?? ((line: string) => console.error(line));
-  const logOnce = (seen: Set<string>, rel: string, line: string) => {
-    const key = `${root}\0${rel}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    glog(line);
-  };
-  const normalizeCurrentOutgoing = () => {
-    const records = repoRecordsForState(state);
-    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [
-      relPath,
-      record.advertised === undefined ? undefined : sanitizeGitSectionForPersistence(record.advertised),
-    ]));
-    return normalizeOutgoingGitSections(
-      out, pending, advertised, (options.now?.() ?? new Date()).toISOString(), absentBranchProofs,
-    );
-  };
-  const noteCredentialSkip = (rel: string) =>
-    logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
-  const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
-    readLocalGitConfig(root, rel, diskCtx, options.gitConfigRunner, () => noteCredentialSkip(rel));
-  const captureReason = (reason: string): GitDeferralReason => {
-    if (/ref-read-unreadable/i.test(reason)) return "ref-read-unreadable";
-    if (/\bbusy\b/i.test(reason)) return "git-busy";
-    if (/ownership|worktree/i.test(reason)) return "worktree-ownership";
-    if (/containment|outside.*root/i.test(reason)) return "containment";
-    if (/unsupported|structural|shallow|bare|alternates/i.test(reason)) return "unsupported";
-    if (/capture|artifact|blob|decrypt|import|bundle/i.test(reason)) return "artifact";
-    if (/unreadable|no usable \.git|preflight/i.test(reason)) return "unreadable";
-    return "other";
-  };
-  const plan = (): GitPushPlan => {
-    const records = repoRecordsForState(state);
-    const normalized = finalizedOutgoing === undefined
-      ? normalizeCurrentOutgoing()
-      : { sections: finalizedOutgoing, findings: [] };
-    for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
-    const outgoing = normalized.sections;
-    // Changed = the outbound map differs from what the LAST COMMIT carried. For a
-    // pending repo the last commit carried the pending section itself (see the per-repo
-    // base-advance in pushManifest), so the expected-previous map is base ∪ pending —
-    // a steady pending carry is NOT a change (no echo-commit storm).
-    const prev: Record<string, GitSection> = { ...base };
-    for (const [relPath, record] of Object.entries(records)) {
-      if (record.advertised) {
-        const expected = sanitizeGitSectionForPersistence(record.advertised);
-        // A cfgSynced baseline over config-absent BASE is the pull lane's durable
-        // witness that an invalid-present field was sanitized. Do not compare a
-        // safe carry against this publisher's older config-present ACK and author
-        // the very corrective echo the baseline suppresses. Genuine wire absence
-        // clears cfgSynced during pull, preserving old-writer presence healing.
-        if (base[relPath]?.config === undefined && record.cfgSynced !== undefined && expected.config !== undefined) {
-          const withoutConfig = { ...expected };
-          delete withoutConfig.config;
-          prev[relPath] = withoutConfig;
-        } else prev[relPath] = expected;
-      }
-    }
-    Object.assign(prev, durablePending); // PENDING has final precedence.
-    // Config authorship is selected against the current BASE/cfgSynced lane. It
-    // may intentionally restore bytes equal to this publisher's older advertised
-    // checkpoint after another writer stripped them, so authorship itself is a
-    // one-shot publication reason (the ACK stamps cfgSynced and bounds it).
-    const flagArmed = supersededPending.size > 0 || resolvedPending.size > 0
-      || Object.keys(authoredCfgHashByRepo).length > 0;
-    let sectionsDiffer = false;
-    for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
-      if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && !isDeepStrictEqual(outgoing[k], prev[k]))) {
-        sectionsDiffer = true;
-        break;
-      }
-    }
-    const changed = flagArmed || sectionsDiffer;
-    // Design 244 b2: name the flag that armed an otherwise-unchanged plan — a
-    // one-shot publication reason that keeps re-arming is a publish ring.
-    if (flagArmed && !sectionsDiffer) {
-      glog(`git-sync plan: no section change; armed by superseded=${supersededPending.size} resolved=${resolvedPending.size} authoredCfg=${Object.keys(authoredCfgHashByRepo).length}`);
-    }
-    const captureDeferrals: Record<string, GitDeferralReason> = {};
-    const configDeferrals: Record<string, GitDeferralReason> = {};
-    for (const item of deferred) {
-      if (configLaneDefers.has(item)) configDeferrals[item.relPath] = "config";
-      else if (configLaneItems.has(item)) continue;
-      else captureDeferrals[item.relPath] = item.typedReason ?? captureReason(item.reason);
-    }
-    const totalMs = performance.now() - planStartedAt;
-    const otherMs = Math.max(0, totalMs - Object.values(timings).reduce((sum, value) => sum + value, 0));
-    const gitPlanStats: GitPlanStats = {
-      ...stats,
-      ...timings,
-      carried: carried.length,
-      captured: captured.length,
-      totalMs,
-      otherMs,
-    };
-    return {
-      gitRepos: emptyToUndef(outgoing),
-      changed,
-      repoAbsent: emptyToUndef(repoAbsent),
-      gitReposRemoved: emptyToUndef(removedMem),
-      gitNeedsResolution: emptyToUndef(needsRes),
-      gitPendingRemote: emptyToUndef(pending),
-      authoredCfgHashByRepo,
-      ...(Object.keys(publisherAckBindings).length > 0 ? { publisherAckBindings } : {}),
-      ...(Object.keys(absentBranchProofs).length > 0 ? { absentBranchProofs } : {}),
-      ...(Object.keys(packedRefsIdentity).length > 0 ? { packedRefsIdentity } : {}),
-      captured,
-      carried,
-      supersededPending: [...supersededPending].sort(),
-      ...(Object.keys(supersessionIdentityKeys).length > 0 ? { supersessionIdentityKeys } : {}),
-      resolvedPending: [...resolvedPending].sort(),
-      ...(resolutionDisposition ? { resolution: resolutionDisposition } : {}),
-      protectedPending: Object.keys(pending).sort(),
-      deferred,
-      captureDeferrals,
-      configDeferrals,
-      captureObserved: [...captureObserved].sort(),
-      configObserved: [...configObserved].sort(),
-      skipped,
-      removed,
-      gitPlanStats,
-    };
-  };
+  const glog = accumulator.log.bind(accumulator);
   timings.setupMs = performance.now() - planStartedAt;
   // Design 108 §3.2/§3.1: genesis files-first defer — attach nothing this commit. On a
   // genuine genesis (parentSequence 0, fresh state) base/pending/needsRes/removed are
@@ -478,7 +1035,9 @@ async function planGitSectionsWithRetention(
       () => discoverGitRepos(root, matcher),
     );
     try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
-    return { ...plan(), ...(discovered.length > 0 ? { filesFirstDeferred: true } : {}) };
+    const plan = accumulator.plan();
+    if (discovered.length > 0) plan.filesFirstDeferred = true;
+    return plan;
   }
   if (!cfg.syncGit) {
     const carryStartedAt = performance.now();
@@ -487,15 +1046,15 @@ async function planGitSectionsWithRetention(
     // pending entry would otherwise re-trigger the per-repo base restore every push
     // (changed forever → echo-commit loop).
     for (const k of new Set([...Object.keys(state.repoRecords ?? {}), ...Object.keys(base), ...Object.keys(pending)])) {
-      captureObserved.add(k);
-      configObserved.add(k);
+      accumulator.captureObserved.add(k);
+      accumulator.configObserved.add(k);
       repoAbsent[k] = true;
     }
     for (const k of Object.keys(pending)) delete pending[k];
     for (const k of Object.keys(needsRes)) delete needsRes[k];
     for (const k of Object.keys(removedMem)) delete removedMem[k];
     timings.carryMs += performance.now() - carryStartedAt;
-    return plan();
+    return accumulator.plan();
   }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
   const kek = cfg.kek;
@@ -579,6 +1138,7 @@ async function planGitSectionsWithRetention(
           continue;
         }
         state = landedRecovery.state;
+        accumulator.state = state;
         const record = repoRecordsForState(state)[rel];
         if (record?.base) base[rel] = record.base; else delete base[rel];
         if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
@@ -598,950 +1158,35 @@ async function planGitSectionsWithRetention(
     }
   });
   await options.afterJournalPreloop?.();
-  const carryStartedAt = performance.now();
-  const carryFingerprintStartedAt = timings.fingerprintMs;
-  for (const rel of keys) captureObserved.add(rel);
-  stats.repos = keys.length;
-  // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
-  const cap = gitRepoCap();
-  let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
-
-  let toCapture: string[] = [];
-  const carryOwnedWithConfig = async (rel: string, baseSec: GitSection, bracketed?: LocalCfgRead, knownCtx?: RepoCtx): Promise<void> => {
-    out[rel] = baseSec;
-    carried.push(rel);
-    if (options.disableConfigLane) return;
-    configObserved.add(rel);
-    const diskCtx = knownCtx ?? await preCaptureRepoCtx(rel);
-    if (!diskCtx || diskCtx.kind !== "dir") {
-      skipConfigOwnership(rel, `local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
-      return;
-    }
-    const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
-    if (!receiver?.owned) {
-      skipConfigOwnership(rel, "local common config is outside workspace ownership");
-      return;
-    }
-    const localCfg = bracketed ?? (await readConfigForPush(rel));
-    if (localCfg.status === "over-bounds") {
-      deferConfigLane(rel, `git config over wire bounds — publication disabled; carrying base verbatim (${localCfg.reason})`);
-      return;
-    }
-    if (localCfg.status === "failed") {
-      const { disposition, reason } = localCfg.fault;
-      deferConfigLane(rel, `git config ${disposition === "permanent" ? "disabled" : "deferred"} (${reason}) — carrying base verbatim`, disposition === "transient");
-      return;
-    }
-    if (!shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) return;
-    out[rel] = { ...baseSec, config: localCfg.config };
-    authoredCfgHashByRepo[rel] = localCfg.cached.hash;
-  };
-  const carryBaseConfig = (section: GitSection, baseSec: GitSection | undefined): GitSection => {
-    const carried = { ...section };
-    delete carried.config;
-    if (baseSec?.config !== undefined) carried.config = baseSec.config;
-    return carried;
-  };
-  const captureWithConfig = async (rel: string, section: GitSection): Promise<GitSection> => {
-    if (options.disableConfigLane) return carryBaseConfig(section, base[rel]);
-    configObserved.add(rel);
-    const repoDir = repoDirOf(root, rel);
-    const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-    if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
-      skipConfigOwnership(rel, `capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config`);
-      return carryBaseConfig(section, undefined);
-    }
-    let receiver: Awaited<ReturnType<typeof configReceiver>>;
-    try {
-      receiver = await configReceiver(root, diskCtx);
-    } catch (error) {
-      skipConfigOwnership(rel, `capture ownership could not be proven (${errMsg(error)})`);
-      return carryBaseConfig(section, undefined);
-    }
-    if (!receiver.owned) {
-      skipConfigOwnership(rel, "capture common config is outside workspace ownership");
-      return carryBaseConfig(section, undefined);
-    }
-
-    let localCfg: LocalCfgRead;
-    try {
-      localCfg = await readConfigForPush(rel, diskCtx);
-    } catch (error) {
-      localCfg = {
-        status: "failed",
-        fault: { disposition: "transient", reason: "read-error", error },
-      };
-    }
-    if (localCfg.status === "over-bounds") {
-      deferConfigLane(rel, `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`);
-      return carryBaseConfig(section, base[rel]);
-    }
-    if (localCfg.status === "failed") {
-      const { disposition, reason } = localCfg.fault;
-      deferConfigLane(rel, `git config ${disposition === "permanent" ? "disabled" : "deferred"} during capture (${reason}) — carrying base config`, disposition === "transient");
-      return carryBaseConfig(section, base[rel]);
-    }
-    const embedded = { ...section, config: localCfg.config };
-    authoredCfgHashByRepo[rel] = gitConfigHash(embedded.config);
-    return embedded;
-  };
-  /** Per-repo failure → defer. P always wins byte-for-byte. A forced non-P repo takes
-   *  the legacy M5 drop because its BASE references the exact blob the server lost. */
-  const deferOne = (rel: string, reason: string, typedReason?: GitDeferralReason) => {
-    const typed = typedReason ? { typedReason } : {};
-    const protectedSection = pending[rel];
-    if (protectedSection) {
-      out[rel] = protectedSection;
-      if (!carried.includes(rel)) carried.push(rel);
-      deferred.push({ relPath: rel, reason, ...typed });
-      delete authoredCfgHashByRepo[rel];
-      return;
-    }
-    // A forced repair may drop an ordinary failed section because its referenced
-    // blobs are known missing server-side. An unreadable ref store is different:
-    // treating that failed observation as a repository omission would turn local
-    // corruption into deletion authority, so the active BASE must still carry.
-    if (force.has(rel) && typedReason !== "ref-read-unreadable") {
-      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)`, ...typed });
-      return;
-    }
-    const b = base[rel];
-    if (b) out[rel] = b; // defer-with-base-carry: never regress a synced repo (§6.4)
-    if (b && !carried.includes(rel)) carried.push(rel);
-    deferred.push({ relPath: rel, reason, ...typed });
-  };
-  const pendingPointerPreSkips: Array<{ relPath: string; parentRel: string; admissionAlreadyCounted: boolean }> = [];
-  const processRepoSlowPath = async (
-    rel: string,
-    kind: GitRepoKind | undefined,
-    baseSec: GitSection | undefined,
-    fastLookup?: FingerprintHitProbeResult,
-    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolution?: boolean } = {}
-  ): Promise<void> => {
-    stats.spawnedRepos++;
-    const probeBeforeFingerprint = fastLookup?.fingerprint
-      ?? await gitFingerprint(fingerprintRun, root, rel);
-    const recomputeCacheProbe = async (): Promise<DivergenceCacheProbeSnapshot> => {
-      const beforeFingerprint = await gitFingerprint(fingerprintRun, root, rel);
-      if (await isGitBusy(repoDirOf(root, rel))) {
-        const { probe } = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx);
-        return { beforeFingerprint, probe, kind };
-      }
-      const pf = await gitPreflight(repoDirOf(root, rel));
-      const { probe } = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx, pf);
-      return { beforeFingerprint, probe, kind: pf.kind ?? kind };
-    };
-
-    // Quiescence before ANY identity-based decision (mirrors the pull side): a lock
-    // makes write-tree fail → raw-index identity fallback, which would spuriously
-    // CLEAR a needsResolution suppression (republishing the conflicted state — the
-    // exact [v2, M2] hazard) or a removal memory (resurrection), or re-capture a
-    // mid-operation repo. Busy → defer with base carry; next cycle re-examines.
-    if (await isGitBusy(repoDirOf(root, rel))) {
-      const { probe } = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx);
-      await writeDivergenceCacheEntry(
-        fingerprintRun,
-        root,
-        rel,
-        cache,
-        probe,
-        kind,
-        probeBeforeFingerprint,
-        recomputeCacheProbe,
-        () => noteCredentialSkip(rel),
-        options.disableConfigLane
-      ).catch(() => undefined);
-      deferOne(rel, "git busy (lock present)");
-      return;
-    }
-
-    // Removal memory [v2, B4]: a leftover whose identity still equals the memory is the
-    // untouched residue of a remote deletion — NOT re-added. Identity changed → the
-    // user worked there → re-adding is intentional; clear the memory and fall through.
-    // An UNREADABLE leftover (dangling pointer, transient) keeps its guard and is
-    // skipped — clearing on a transient would re-add unchanged git once it heals.
-    if (!baseSec && removedMem[rel] !== undefined && !opts.resolution) {
-      const id = await gitIdentity(repoDirOf(root, rel));
-      if (!id || gitIdentityKey(id) === removedMem[rel]) return;
-      delete removedMem[rel];
-    }
-
-    // needsResolution [v2, M2]: carry the checkpointed base until the local identity
-    // CHANGES from the recorded conflict-time value (republish must be intentional).
-    if (needsRes[rel] !== undefined && !opts.resolution) {
-      const id = await gitIdentity(repoDirOf(root, rel));
-      if (gitIdentityKey(id) === needsRes[rel]) {
-        const carry = pending[rel] ?? baseSec;
-        if (carry) {
-          out[rel] = carry;
-          carried.push(rel);
-        }
-        return;
-      }
-      delete needsRes[rel];
-    }
-
-    const precomputedPendingProbe = opts.forceCapture && fastLookup?.status === "hit"
-      && fastLookup.probe.preflightOk && !fastLookup.probe.preflightStructural
-      ? fastLookup.probe
-      : undefined;
-    const pf = precomputedPendingProbe
-      ? { ok: true as const, kind: precomputedPendingProbe.preflightKind }
-      : await gitPreflight(repoDirOf(root, rel));
-    if (!pf.ok) {
-      const builtProbe = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
-      if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
-      const probe = builtProbe.probe;
-      await writeDivergenceCacheEntry(
-        fingerprintRun,
-        root,
-        rel,
-        cache,
-        probe,
-        pf.kind ?? kind,
-        probeBeforeFingerprint,
-        recomputeCacheProbe,
-        () => noteCredentialSkip(rel),
-        options.disableConfigLane
-      ).catch(() => undefined);
-      // STRUCTURAL refusal (shallow/bare/alternates/…): the shape can't sync and won't
-      // heal by waiting — DROP the section instead of carrying it. Carrying would be
-      // permanent poison: identity can't see the structural property, so a base section
-      // authored before the shape was detected (e.g. a shallow clone's incomplete
-      // bundle, found by live validation) would carry — and fail-close on every
-      // receiver — forever. Dropping self-heals: receivers clean their bookkeeping via
-      // absence (never touching local .git), and when the user fixes the shape a fresh
-      // preflight passes with no base tie to the old bad section.
-      if (pf.structural) {
-        if (pending[rel]) {
-          deferOne(rel, `${pf.reason ?? "structural preflight refusal"} — carrying pending section`);
-          return;
-        }
-        if (baseSec) removed.push(rel);
-        if (baseSec || repoRecordsForState(state)[rel] !== undefined) repoAbsent[rel] = true;
-        deferred.push({ relPath: rel, reason: `${pf.reason} — section ${baseSec ? "dropped" : "not captured"}` });
-        delete needsRes[rel];
-        return;
-      }
-      deferOne(rel, pf.reason ?? "preflight failed");
-      return;
-    }
-    const builtProbe = precomputedPendingProbe && fastLookup
-      ? {
-          probe: precomputedPendingProbe,
-          diskCtx: fastLookup.fingerprint.diskCtx,
-          parentRel: precomputedPendingProbe.parentRel,
-        }
-      : await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
-    if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
-    const idKey = builtProbe.probe.identityKey;
-    const liveKind = pf.kind ?? kind;
-    const probe = builtProbe.probe;
-    const cacheWrite = await writeDivergenceCacheEntry(
-      fingerprintRun,
-      root,
-      rel,
-      cache,
-      probe,
-      liveKind,
-      probeBeforeFingerprint,
-      recomputeCacheProbe,
-      () => noteCredentialSkip(rel),
-      options.disableConfigLane
-    ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind, stable: false }));
-    if (idKey === "none") {
-      // empty repo (no commits yet): nothing to capture; keep any synced base.
-      const carry = pending[rel] ?? baseSec;
-      if (carry) {
-        out[rel] = carry;
-        carried.push(rel);
-      }
-      return;
-    }
-
-    // §7 capture-side carry-forward — the normative shape×scope matrix [v3; v4]:
-    //   dir/all-base      → carry on full-identity match (design-02 semantics)
-    //   dir/scoped-base   → ALWAYS capture fresh (a projected compare would hide a
-    //                       genuinely new local branch forever)
-    //   pointer/scoped    → carry on scoped-identity match
-    //   pointer/all-base  → the explicit wider-carry exception: carry when the base's
-    //                       SCOPED PROJECTION matches (terminates the convergence loop)
-    if (baseSec && !mustCapture(rel) && !opts.forceCapture) {
-      if (!isGitRepoKind(liveKind)) {
-        deferOne(rel, "preflight did not report a usable git repo kind");
-        return;
-      }
-      const carry = carryMatrixMatches(baseSec, liveKind, idKey);
-      if (carry) {
-        await carryOwnedWithConfig(rel, baseSec, cacheWrite.localCfg, builtProbe.diskCtx);
-        if (cacheWrite.stable) stableCarryHygiene.add(rel);
-        return;
-      }
-    }
-    if (!baseSec) {
-      if (!opts.admissionAlreadyCounted) {
-        if (admitted >= cap) {
-          deferred.push({ relPath: rel, reason: `over the ${cap}-repo cap — new repo not captured this cycle` });
-          return;
-        }
-        admitted++;
-      }
-    }
-    toCapture.push(rel);
-  };
-
-  for (const rel of keys) {
-    const kind = kindByPath.get(rel);
-    const baseSec = base[rel];
-    const pend = pending[rel];
-    let fastLookup: FingerprintHitProbeResult | undefined;
-
-    const recoveryReason = recoveryBlocked.get(rel);
-    if (recoveryReason) {
-      if (pend) {
-        const rider = options.resolution?.repo === rel ? options.resolution : undefined;
-        deferred.push({ relPath: rel, reason: recoveryReason });
-        // P remains authoritative until an accepted ACK, including a forced 422
-        // recapture. Recovery refusal is a typed keep-mine disposition and must
-        // never make the protected section disappear from the retry manifest.
-        out[rel] = pend;
-        carried.push(rel);
-        if (rider) resolutionDisposition = { outcome: "refused", reason: recoveryReason };
-        continue;
-      }
-      deferOne(rel, recoveryReason);
-      continue;
-    }
-
-    // Pending remains exact and authoritative until accepted ACK. The pre-probe
-    // only admits a provisional candidate; final normalized-candidate proof below
-    // decides whether publication is permitted.
-    if (pend) {
-      const rider = options.resolution?.repo === rel ? options.resolution : undefined;
-      if (rider) {
-        if (options.degradedMutex) {
-          out[rel] = pend;
-          carried.push(rel);
-          const reason = "workspace locking is degraded; keep-mine publication requires safe serialization";
-          deferred.push({ relPath: rel, reason });
-          resolutionDisposition = { outcome: "refused", reason };
-          continue;
-        }
-        resolutionCandidates.add(rel);
-        await processRepoSlowPath(rel, kind, baseSec, undefined, {
-          forceCapture: true,
-          admissionAlreadyCounted: true,
-          resolution: true,
-        });
-        continue;
-      }
-      if (recoveryAllowsSupersession.get(rel) === false || !gitPendingSupersedeEnabled()) {
-        out[rel] = pend;
-        carried.push(rel);
-        continue;
-      }
-      const probe = await pendingSupersessionPreProbe(root, rel, pend, baseSec, (fingerprint) =>
-        cachedSupersessionRefusal(cache, rel, fingerprint, supersessionMemoKeys(pend, baseSec)));
-      if (probe.status === "carry") {
-        out[rel] = pend;
-        carried.push(rel);
-        // A recorded refusal re-emits the deferral its discarded capture produced.
-        if (probe.busy || probe.refused) deferred.push({ relPath: rel, reason: probe.reason });
-        // Field-forensics lesson (Mac wedge, 2026-07-21): a silent carry made the
-        // no-heal diagnosis require SSH log archaeology. One bounded line per push.
-        else logOnce(pendingCarryLogged, rel, `git-sync pending carry ${rel}: ${probe.reason}. Your local Git work is safe while rbox retries.`);
-        continue;
-      }
-      pendingSupersessionCandidates.add(rel);
-      supersessionProbeEvidence.set(rel, {
-        fingerprint: probe.fastLookup.fingerprint,
-        identityKey: probe.fastLookup.probe.identityKey,
-        kind: probe.fastLookup.kind,
-      });
-      await options.afterPendingPreProbe?.(rel);
-      await processRepoSlowPath(rel, kind, baseSec, probe.fastLookup, { forceCapture: true });
-      continue;
-    }
-
-    if (!kind) {
-      if (!baseSec) continue; // never synced, nothing local → nothing to do
-      const dirPresent = await fs
-        .lstat(repoDirOf(root, rel))
-        .then((s) => s.isDirectory())
-        .catch((e) => {
-          // Only genuine absence drops the section; a permission/IO fault carries the base
-          // (design 108 — a chmod-000 hiccup must not propagate a git-section removal).
-          return isPresentButUnreadableError(e) ? undefined : false;
-        });
-      if (dirPresent === undefined) {
-        deferOne(rel, "repo dir unreadable (permission/IO fault) — carrying base");
-        continue;
-      }
-      if (!dirPresent) {
-        // §9: repo dir GONE ENTIRELY → the pusher drops the section (receivers drop
-        // their base entry but never touch local .git).
-        removed.push(rel);
-        repoAbsent[rel] = true;
-        delete needsRes[rel];
-        continue;
-      }
-      const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
-      if (dotGit && rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) {
-        out[rel] = baseSec;
-        skipped.push({ relPath: rel, reason: "gitignored by discovery pruning — carrying base" });
-        continue;
-      }
-      deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
-      continue;
-    }
-
-    // §3.3 fast-path guards:
-    // 1 !mustCapture(rel) (422 force or #526 republish)
-    // 2 no pending, needs-resolution, or removed-memory suppression
-    // 3 repo was discovered this run
-    // 4 base section exists
-    // 5 trusted fingerprint hit with a probe
-    // 6 probe is plannable-clean with a valid preflight kind
-    // 7 design-43 §7 carry matrix reaches carry
-    if (!mustCapture(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
-      fastLookup = await measure(
-        "fingerprintMs",
-        () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
-      );
-      if (fastLookup.status === "untrusted") {
-        stats.fpUntrusted++;
-      } else if (fastLookup.status === "hit") {
-        const probe = fastLookup.probe;
-        const pfKind = probe.preflightKind;
-        const baseHeadMissing = Object.keys(baseSec.refs).some((ref) =>
-          ref.startsWith("refs/heads/") && probe.identityRefs?.[ref] === undefined);
-        if (!baseHeadMissing && !probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && carryMatrixMatches(baseSec, pfKind, probe.identityKey)) {
-          // A trusted summary can prove a verbatim carry. If publication is due,
-          // fall through: the wire needs the canonical config, not merely its hash.
-          if (options.disableConfigLane || (fastLookup.cachedLocalCfg && !shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced))) {
-            out[rel] = baseSec;
-            carried.push(rel);
-            if (!options.disableConfigLane) configObserved.add(rel);
-            fastPathParentRel.set(rel, probe.parentRel);
-            stats.fpHits++;
-            stableCarryHygiene.add(rel);
-            continue;
-          }
-        }
-        stats.fpMisses++;
-      } else {
-        stats.fpMisses++;
-      }
-    }
-
-    // §3.8 post-gate extension: a baseless in-tree worktree pointer can only be
-    // skipped after `sectioned` is known, but a trusted cached parentRel lets us
-    // defer that decision without paying the identity/preflight spawn floor.
-    if (!mustCapture(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
-      fastLookup = await measure(
-        "fingerprintMs",
-        () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
-      );
-      if (fastLookup.status === "untrusted") {
-        stats.fpUntrusted++;
-      } else if (fastLookup.status === "hit") {
-        const probe = fastLookup.probe;
-        const pfKind = probe.preflightKind;
-        if (!probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && probe.parentRel) {
-          if (admitted < cap) {
-            admitted++;
-            pendingPointerPreSkips.push({ relPath: rel, parentRel: probe.parentRel, admissionAlreadyCounted: true });
-            continue;
-          }
-          stats.fpMisses++;
-        } else {
-          stats.fpMisses++;
-        }
-      } else {
-        stats.fpMisses++;
-      }
-    }
-
-    await processRepoSlowPath(rel, kind, baseSec, fastLookup);
-  }
-
-  // Design 68 §3.3 — base-carry POLICY SKIP for in-tree linked-worktree pointers. A pointer
-  // whose owning main clone is (a) an in-tree linked-worktree parent AND (b) itself authored
-  // a section THIS cycle skips its own full-store capture: the shared history already rides
-  // the main clone's `--single-worktree --all` bundle, so capturing the pointer would upload
-  // the same object store again. Skip is BASE-CARRY, never a drop: an existing
-  // section is carried forward unchanged (the remote never observes an absence → no removal
-  // memory is stamped, sync-git.ts:443/:231 untouched), and a repo with no base is simply
-  // never authored. `sectioned` is snapshotted BEFORE mutating toCapture — parents are dir
-  // repos, never pointers, so removing a pointer can't change any parent's membership.
-  const sectioned = new Set([...Object.keys(out), ...toCapture]);
-  const skippedRelPaths = new Set<string>();
-  const skipLinkedWorktreePointer = (rel: string, parentRel: string) => {
-    skippedRelPaths.add(rel);
-    // Ownership is known only now. Undo any provisional slow-carry lane result:
-    // linked pointers are non-owned and therefore carry their base verbatim.
-    delete authoredCfgHashByRepo[rel];
-    for (let i = deferred.length - 1; i >= 0; i--) {
-      if (deferred[i]!.relPath === rel && configLaneItems.has(deferred[i]!)) deferred.splice(i, 1);
-    }
-    const b = base[rel];
-    if (b) out[rel] = b; // base-carry: never a remote absence, never a removal memory
-    else delete out[rel]; // fresh pointer: never authored
-    skipped.push({ relPath: rel, reason: `linked worktree of in-tree repo ${parentRel} — history travels with the main clone` });
-  };
-  for (const { relPath: rel, parentRel, admissionAlreadyCounted } of pendingPointerPreSkips) {
-    if (sectioned.has(parentRel)) {
-      skipLinkedWorktreePointer(rel, parentRel);
-      stats.pointerPreSkips++;
-    } else {
-      stats.fpMisses++;
-      await processRepoSlowPath(rel, kindByPath.get(rel), base[rel], undefined, { admissionAlreadyCounted });
-    }
-  }
-  for (const rel of [...toCapture, ...carried]) {
-    if (mustCapture(rel)) continue; // 422 recapture / #526 republish must capture, not base-carry via policy skip
-    if (kindByPath.get(rel) !== "pointer" || pending[rel] || needsRes[rel] !== undefined) continue;
-    let parentRel: string | undefined;
-    if (fastPathParentRel.has(rel)) {
-      parentRel = fastPathParentRel.get(rel);
-      stats.parentRelCached++;
-    } else {
-      parentRel = await inTreeWorktreeParentRel(root, repoDirOf(root, rel));
-    }
-    if (!parentRel || !sectioned.has(parentRel)) continue; // out-of-tree/submodule/uncaptured parent → unchanged
-    skipLinkedWorktreePointer(rel, parentRel);
-  }
-  if (skippedRelPaths.size > 0) {
-    toCapture = toCapture.filter((rel) => !skippedRelPaths.has(rel));
-    carried = carried.filter((rel) => !skippedRelPaths.has(rel));
-  }
-
-  // Design 204 §5.4: the read-stage ctx memo must never cross into capture
-  // or any later mutation/proof stage.
-  preCaptureCtx.clear();
-  await options.beforeCapturePool?.();
-  timings.carryMs += performance.now() - carryStartedAt - (timings.fingerprintMs - carryFingerprintStartedAt);
-
+  const { attempts, toCapture } = await classifyGitRepositories({
+    accumulator,
+    root,
+    state,
+    kindByPath,
+    keys,
+    recoveryBlocked,
+    recoveryAllowsSupersession,
+    matcher,
+    force,
+    republish,
+    cache,
+    fingerprintRun,
+    options,
+    preCaptureRepoCtx,
+    clearPreCaptureCtx: () => preCaptureCtx.clear(),
+  });
   // Changed repos: bounded-concurrency capture. Any per-repo failure defers THAT repo
   // (base carry) — the push itself always proceeds (PR #38 churn discipline). Progress
   // is a monotonic completed-count (captures run concurrently, so a settle counter is
   // the only truthful "done") with the just-settled repo's name as the display detail.
-  const captureStartedAt = performance.now();
-  const repoCount = toCapture.length;
-  let captureDone = 0;
-  let gitBytesDone = 0;
-  const repoByteAbs = new Map<string, number>();
-  const noteRepoBytes = (rel: string, abs: number) => {
-    const prev = repoByteAbs.get(rel) ?? 0;
-    if (abs < prev) {
-      repoByteAbs.set(rel, abs);
-      return;
-    }
-    gitBytesDone += abs - prev;
-    repoByteAbs.set(rel, abs);
-    onProgress?.(captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : rel, { bytesDone: gitBytesDone });
-  };
-  const uploadsDir = path.join(root, ".rbox", "state", "uploads");
-  // Design 226: retained ciphertext lives under the gitcap scratch root, whose crash
-  // reaper already sweeps `rbox-gitcap-*` dirs with a dead or absent `owner.pid`. NOT
-  // `.rbox/state/uploads` — that is the persistent resumable-multipart token dir.
-  if (toCapture.length > 0) retention.dir = await makeGitCaptureDir(root);
-  const retainDir = retention.dir;
-  const retained = new Map<string, string>();
-  const pendingUploadsByRepo = new Map<string, PendingGitUpload[]>();
-  const flushedEncShas = new Set<string>();
-  // Fresh-candidate index projections (`finalResolutionReport`, `provePendingSupersession`)
-  // resolve retained bytes locally; pending/pack-chain artifacts still come from the server.
-  // Built on first use: a plan that captures nothing never touches the store at all.
-  let readThrough: GitArtifactReadStore | undefined;
-  const artifactStore = (): GitArtifactReadStore => (readThrough ??= planReadThroughStore(api.blobStore(), retained, glog));
-  await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
-    options.onCaptureQueued?.(rel);
-    try {
-      const { section: sec, reason, pendingUploads } = await capturePlannedGitSection(
-        root, rel, cfg, base[rel], api, kek, uploadsDir, mustCapture(rel), backoff,
-        (abs) => noteRepoBytes(rel, abs), resolutionCandidates.has(rel),
-        resolutionCandidates.has(rel) ? options.resolutionCaptureTestHooks : undefined,
-        retainDir, options.ownedRefMutationBoundary,
-      );
-      if (sec) {
-        pendingUploadsByRepo.set(rel, pendingUploads ?? []);
-        for (const artifact of pendingUploads ?? []) retained.set(artifact.encSha, artifact.ciphertextPath);
-        commitCapture(rel, await captureWithConfig(rel, sec));
-      } else {
-        deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
-      }
-    } catch (e) {
-      const reason = e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`;
-      deferOne(rel, reason, reason.startsWith("ref-read-unreadable:") ? "ref-read-unreadable" : undefined);
-    } finally {
-      // Root repo (rel ".") shows the workspace folder name rather than a bare ".".
-      onProgress?.(
-        ++captureDone,
-        repoCount,
-        "gitcap",
-        rel === "." ? path.basename(root) : rel,
-        gitBytesDone > 0 ? { bytesDone: gitBytesDone } : undefined
-      );
-    }
+  await captureAndAuthorizeRepositories({
+    accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, backoff,
   });
+  await finalizeCandidates({ accumulator, root, state, artifacts, cache, kek, options, attempts });
 
-  // Design 200 W/L/D: observe the packed-refs mtime baseline on captured and
-  // carried dir repos regardless of the kill switch. A strict capture may turn
-  // a BASE-positive branch into an omission only after the full witness and a
-  // prepared verify-only lock.
-  const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
-  for (const rel of [...new Set([...captured, ...carried])].sort()) {
-      const candidate = out[rel];
-      if (!candidate) continue;
-      const record = repoRecordsForState(state)[rel];
-      // A hidden BASE is provenance, never W/L/D refusal authority. A fresh
-      // repository at the same path must flow through the normal re-add path.
-      if (record?.repoAbsent === true || record?.removedKey !== undefined) continue;
-      const baseSection = record?.base ?? base[rel];
-      // W/L/D and absence proofs are CAPTURE authority only. A carried pending
-      // section legitimately omits held BASE heads (it is protected inbound
-      // state, not this cycle's evidence) — carried repos take the packed-refs
-      // baseline observation below and nothing else.
-      const missing = !captured.includes(rel) ? [] : Object.entries(baseSection?.refs ?? {})
-        .filter(([ref]) => ref.startsWith("refs/heads/"))
-        .filter(([ref]) => candidate.refs[ref] === undefined);
+  await cleanAndRefreshPlan({ accumulator, root, cache, fingerprintRun, kindByPath, keys, options });
 
-      if (absenceCaptureEnabled && missing.length > 0) await options.beforeAbsenceWitness?.(rel);
-      /** One branch-deletion refusal: name it, drop this cycle's proofs, and fall back
-       *  to the protected pending section or the BASE that was carrying before. */
-      const refuseBranchDeletion = (reason: string, typed: GitDeferralReason): void => {
-        glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
-        delete absentBranchProofs[rel];
-        const fallback = pending[rel] ?? baseSection;
-        if (fallback) revertCapture(rel, fallback, reason, typed);
-      };
-      let ctx: RepoCtx | undefined;
-      let ctxFailure: unknown;
-      try {
-        ctx = await repoCtxFromDisk(repoDirOf(root, rel));
-      } catch (error) {
-        ctxFailure = error;
-      }
-      if (!ctx) {
-        if (absenceCaptureEnabled && missing.length > 0) {
-          refuseBranchDeletion(`repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`, "unreadable");
-        }
-        continue;
-      }
-      if (ctx.kind !== "dir") continue;
-
-      const packedObservation = await observePackedRefsIdentity(ctx.commonDir);
-      const previousPacked = record?.packedRefsIdentity;
-      const packedRegressed = packedRefsMtimeRegressed(previousPacked, packedObservation);
-      if (packedObservation.status === "absent") {
-        packedRefsIdentity[rel] = null;
-      } else if (packedObservation.status === "present"
-        && !packedRegressed) {
-        packedRefsIdentity[rel] = packedObservation.identity;
-      }
-
-      if (!absenceCaptureEnabled || missing.length === 0) continue;
-
-      let refusal: string | undefined = packedObservation.status === "unreadable"
-        ? `packed-refs baseline could not be read: ${errMsg(packedObservation.error)}`
-        : packedRegressed
-          ? "packed-refs mtime regressed while a BASE branch was absent"
-          : undefined;
-      let refusalType: GitDeferralReason | undefined =
-        packedObservation.status === "unreadable" ? "unreadable" : undefined;
-      const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
-      if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
-      const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
-        workspaceRoot: root, relPath: rel, state, ctx, record,
-        base: baseSection, incoming: candidate, liveRefs: candidate.refs,
-      });
-      if (protocol?.status !== "ready") refusal ??= protocol?.reason ?? "BASE artifact/lineage proof unavailable";
-      const readyProtocol = protocol?.status === "ready" ? protocol.protocol : undefined;
-      const binding = publisherAckBindings[rel];
-      if (readyProtocol && (!binding
-        || binding.lineageHash !== readyProtocol.lineageHash
-        || binding.repositoryIdentityHash !== readyProtocol.repositoryIdentityHash)) {
-        refusal ??= "publisher repository binding changed before absence proof";
-      }
-      let busy = false;
-      let preflight: Awaited<ReturnType<typeof gitPreflight>> = { ok: true };
-      let owned = new Map<string, string>();
-      let head = "";
-      if (!refusal) {
-        try {
-          await options.beforeAbsencePreflight?.(rel);
-          const [busyRead, preflightRead, ownedRead, headRead] = await Promise.all([
-            isGitBusy(ctx.repoDir),
-            gitPreflight(ctx.repoDir),
-            branchesCheckedOutElsewhereStrict(ctx),
-            readHead(ctx),
-          ]);
-          if (ownedRead.status === "unreadable") throw ownedRead.cause;
-          busy = busyRead;
-          preflight = preflightRead;
-          owned = ownedRead.owned;
-          head = headRead;
-        } catch (error) {
-          refusal = `branch deletion authorization evidence could not be read: ${errMsg(error)}`;
-          refusalType = "unreadable";
-        }
-      }
-      if (busy) refusal ??= "repository operation began before absence proof";
-      if (!preflight.ok) refusal ??= preflight.reason;
-      const collisions = receiverEquivalentCollisionNames([
-        ...Object.keys(baseSection?.refs ?? {}),
-        ...Object.keys(candidate.refs),
-        ...owned.keys(),
-      ]);
-      const proofs: Record<string, { priorOid: string }> = {};
-
-      for (const [ref, priorOid] of missing) {
-        if (refusal) break;
-        const origin = record?.branchBaseOrigins?.[ref];
-        const artifacts = readyProtocol!.artifacts[ref];
-        const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
-          && artifacts.present === "absent"
-          && artifacts.keeps === "clear"
-          && artifacts.settledAbsence === "absent");
-        const witnessRefusals = [
-          ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
-          ...(!branchBaseOriginMatches(origin, priorOid) ? ["origin-mismatch"] : []),
-          ...(branchBaseOriginMatches(origin, priorOid) && origin.lineageHash !== readyProtocol!.lineageHash ? ["lineage-changed"] : []),
-          ...(!artifactsClear ? ["artifacts-standing"] : []),
-          ...(owned.has(ref) ? ["worktree-owned"] : []),
-          ...(collisions.has(ref) ? ["name-collision"] : []),
-          ...(head === `ref: ${ref}` ? ["head-symref"] : []),
-        ];
-        if (witnessRefusals.length > 0) {
-          refusal = `branch deletion witness refused ${ref} (${witnessRefusals.join("+")})`;
-          break;
-        }
-        try {
-          const verification = await planAbsentBranchVerification(ctx.repoDir, ref);
-          await commitAbsentBranchVerification(verification);
-          proofs[ref] = { priorOid };
-        } catch (error) {
-          refusal = errMsg(error);
-          break;
-        }
-      }
-
-      if (!refusal && Object.keys(proofs).length === missing.length) {
-        absentBranchProofs[rel] = proofs;
-        continue;
-      }
-
-      const reason = refusal ?? "branch deletion proof unavailable";
-      refuseBranchDeletion(reason, refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"));
-  }
-
-  timings.captureMs += performance.now() - captureStartedAt;
-  const projectionStartedAt = performance.now();
-  const normalized = normalizeCurrentOutgoing();
-  for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
-  finalizedOutgoing = normalized.sections;
-  for (const [rel, proofs] of Object.entries(absentBranchProofs)) {
-    const section = finalizedOutgoing[rel];
-    const exact = section !== undefined && Object.entries(proofs).every(([ref, proof]) =>
-      section.refTombstones?.[ref]?.some((entry) => entry.oid === proof.priorOid) === true);
-    if (exact) continue;
-    delete absentBranchProofs[rel];
-    const fallback = pending[rel] ?? base[rel];
-    if (fallback) revertCapture(
-      rel,
-      fallback,
-      "proof-backed tombstone could not be authored exactly",
-      "deletion-pending",
-    );
-  }
-  timings.projectionMs += performance.now() - projectionStartedAt;
-  const finalizeStartedAt = performance.now();
-  // Design 226 flush point 1. Every revert that can reach a repo in NEITHER candidate
-  // set — unreadable, absence-witness, tombstone-exactness — has now run, so these
-  // sections are final and their bytes are owed. Bounds retained disk without narrowing
-  // the retained SET, which those three reverts would have leaked past.
-  const decidedLate = new Set([...pendingSupersessionCandidates, ...resolutionCandidates]);
-  const flushPending = async (rels: readonly string[]): Promise<void> => {
-    const owed = rels.flatMap((rel) => pendingUploadsByRepo.get(rel) ?? []);
-    if (owed.length > 0) await flushGitArtifacts(api.blobStore(), owed, flushedEncShas);
-  };
-  await flushPending(captured.filter((rel) => !decidedLate.has(rel)));
-
-  for (const rel of [...resolutionCandidates].sort()) {
-    const rider = options.resolution?.repo === rel ? options.resolution : undefined;
-    const p = pending[rel];
-    const candidate = finalizedOutgoing[rel];
-    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-    if (!rider || !p || !candidate || !ctx || !captured.includes(rel)) {
-      const reason = deferred.find((item) => item.relPath === rel)?.reason
-        ?? "keep-mine capture did not produce a final candidate";
-      if (p && candidate !== p) revertCapture(rel, p, reason);
-      resolutionDisposition = { outcome: "refused", reason };
-      continue;
-    }
-    const report = await finalResolutionReport({ ctx, pending: p, candidate, store: artifactStore(), kek });
-    if (!reportAuthorized(rider.authorizedLanes, report)) {
-      const reason = report.lanes.some((lane) => lane.disposition === "indeterminate")
-        ? "keep-mine final discard report was indeterminate"
-        : "keep-mine final candidate would discard a lane that was not confirmed — review and confirm again";
-      revertCapture(rel, p, reason);
-      resolutionDisposition = { outcome: "refused", reason };
-      continue;
-    }
-    const reachable: string[] = [];
-    for (const oid of discardedIncomingOids(report)) {
-      if (await git(ctx.repoDir, ["cat-file", "-e", `${oid}^{object}`]).then(() => true, () => false)) reachable.push(oid);
-    }
-    if (reachable.length > 0) {
-      await pinDisplaced(ctx.repoDir, reachable, {
-        ref: `keep-mine:${rel}`,
-        episode: resolutionReportHash(rider.confirmedReport),
-        time: (options.now?.() ?? new Date()).toISOString(),
-        class: "human",
-      });
-    }
-    resolvedPending.add(rel);
-    resolutionDisposition = {
-      outcome: "published",
-      confirmedReportHash: resolutionReportHash(rider.confirmedReport),
-    };
-  }
-  for (const rel of [...pendingSupersessionCandidates].sort()) {
-    const p = pending[rel];
-    const candidate = finalizedOutgoing[rel];
-    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-    const binding = publisherAckBindings[rel];
-    const candidateProduced = captured.includes(rel) && p !== undefined && candidate !== undefined
-      && ctx !== undefined && binding !== undefined;
-    const proven = candidateProduced
-      && await provePendingSupersession({
-        ctx, pending: p, candidate, store: artifactStore(), kek,
-        base: base[rel], absentBranchProofs: absentBranchProofs[rel],
-      })
-      && pendingSupersessionAckConverges({
-        previousBase: base[rel],
-        previousOrigins: repoRecordsForState(state)[rel]?.branchBaseOrigins,
-        candidate,
-        binding,
-        absentBranchProofs: absentBranchProofs[rel],
-      });
-    if (proven) {
-      supersededPending.add(rel);
-      const candidateKey = gitIncomingKey(candidate!);
-      supersessionIdentityKeys[rel] = {
-        pending: gitIncomingKey(p!),
-        candidate: candidateKey,
-        // Admission proved order-insensitive deep equality with the exact
-        // composer output, so its section identity is necessarily identical.
-        composed: candidateKey,
-      };
-      continue;
-    }
-    if (!p) continue;
-    // Only a candidate that reached the proof is evidence about the repository
-    // state; a transport or context fault says nothing and must re-run (#573).
-    const evidence = supersessionProbeEvidence.get(rel);
-    if (candidateProduced && evidence) {
-      recordSupersessionRefusal(cache, rel, evidence.fingerprint, evidence.identityKey, {
-        ...supersessionMemoKeys(p, base[rel]),
-        reason: SUPERSESSION_REFUSED_REASON,
-      }, evidence.kind);
-    }
-    revertCapture(rel, p, SUPERSESSION_REFUSED_REASON);
-  }
-
-  // Design 226 flush point 2, and the invariant this whole design exists to hold:
-  // planGitSections returns only after every fresh artifact referenced by its final
-  // captured sections is either already remotely satisfied or successfully flushed.
-  // All-or-nothing — a failure here rejects the push rather than publishing a section
-  // whose bytes are missing (the repos past commitAbsentBranchVerification/pinDisplaced
-  // cannot be reverted, and the set is not statically known at this point).
-  await flushPending(captured);
-  timings.finalizeMs += performance.now() - finalizeStartedAt;
-
-  // Design 174 D: independently bounded scratch-ref hygiene. Only an exact
-  // stable carry or a successful final capture qualifies; an unconditional P,
-  // needs-resolution, policy, or failure carry never spends this authority.
-  let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
-  const cleanedCommonDirs = new Set<string>();
-  const postCleanupCacheRefresh = new Set(captured);
-  await measure("hygieneMs", async () => {
-    for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
-      .filter((candidate) => !resolutionCandidates.has(candidate))
-      .sort()) {
-      if (conflictDeleteBudget === 0) break;
-      const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-      options.onHygieneCtx?.(rel, ctx);
-      if (!ctx) continue;
-      const commonDir = path.resolve(ctx.commonDir);
-      if (cleanedCommonDirs.has(commonDir)) continue;
-      cleanedCommonDirs.add(commonDir);
-      const result = await pruneConflictRefs(repoDirOf(root, rel), {
-        limit: conflictDeleteBudget,
-        ctx,
-        onBatch: async () => {
-          for (const cachedRel of [...cache.repos.keys()]) {
-            const cachedCtx = await repoCtxFromDisk(repoDirOf(root, cachedRel)).catch(() => undefined);
-            if (cachedCtx && path.resolve(cachedCtx.commonDir) === commonDir) {
-              postCleanupCacheRefresh.add(cachedRel);
-              cache.repos.delete(cachedRel);
-            }
-          }
-          cache.dirty = true;
-          fingerprintRun.commonDirFingerprints.delete(commonDir);
-        },
-      }).catch(() => undefined);
-      conflictDeleteBudget -= result?.deleted ?? 0;
-    }
-  });
-
-  // Refresh captured entries only after every capture-side cleanup, including
-  // conflict-ref pruning above. A per-repo fingerprint run avoids reusing the
-  // full-plan common-dir memo that predates capture scratch refs.
-  const divergenceCacheStartedAt = performance.now();
-  const divergenceCacheFingerprintStartedAt = timings.fingerprintMs;
-  const refreshOrder = [...postCleanupCacheRefresh].sort();
-  for (const rel of refreshOrder) {
-    cache.repos.delete(rel);
-    cache.dirty = true;
-    try {
-      const postCaptureFingerprintRun = gitFingerprintRun("per-decision");
-      const beforeFingerprint = await measure(
-        "fingerprintMs",
-        () => gitFingerprint(postCaptureFingerprintRun, root, rel),
-      );
-      const pf = await gitPreflight(repoDirOf(root, rel));
-      const built = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx, pf);
-      await writeDivergenceCacheEntry(
-        postCaptureFingerprintRun,
-        root,
-        rel,
-        cache,
-        built.probe,
-        pf.kind ?? kindByPath.get(rel),
-        beforeFingerprint,
-        undefined,
-        () => noteCredentialSkip(rel),
-        options.disableConfigLane,
-      );
-    } catch {
-      // Cache absence is the safe fallback; it is never correctness-bearing.
-    }
-  }
-
-  const liveKeys = new Set(keys);
-  for (const rel of [...cache.repos.keys()]) {
-    if (!liveKeys.has(rel)) {
-      cache.repos.delete(rel);
-      cache.dirty = true;
-    }
-  }
-  await saveGitDivergenceCache(root, cache).catch(() => {});
-  timings.divergenceCacheMs += performance.now() - divergenceCacheStartedAt
-    - (timings.fingerprintMs - divergenceCacheFingerprintStartedAt);
-
-  return plan();
+  return accumulator.plan();
 }
 
 /** Format the §10 forensic push line:

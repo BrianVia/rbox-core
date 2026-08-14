@@ -89,7 +89,7 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   // MOVE can retire this entry; it needs a real refactor with its own design doc.
   // Measurements and the plan: docs/design/notes/sync-git-decompose.md.
   ["src/cli/sync-git/follow.ts", "1183 nonblank lines after the domain split — residual is publishRefPlane + followDivergedRepo, each over the gate alone"],
-  ["src/cli/sync-git/plan.ts", "pending split — 1447 nonblank lines and 71.9 KiB when the gate landed"],
+  ["src/cli/sync-git/plan.ts", "1213 nonblank / 57.8 KiB after the three-owner git-plan decomposition; residual is cohesive composition stages plus public contracts/formatters"],
   ["src/cli/sync-git/state-cas-locks.ts", "pending split — 572 nonblank lines when the gate landed"],
   ["src/cli/sync-recovery.ts", "pending split — 542 nonblank lines and 26.9 KiB when the gate landed"],
   ["src/cli/sync-state-model.ts", "pending split — 446 nonblank lines when the gate landed"],
@@ -173,7 +173,7 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/sync-git/base-composer.ts", { nonblank: 611, bytes: 28706 }],
   ["src/cli/sync-git/deferral-hygiene.ts", { nonblank: 507, bytes: 24777 }],
   ["src/cli/sync-git/follow.ts", { nonblank: 1183, bytes: 61997 }],
-  ["src/cli/sync-git/plan.ts", { nonblank: 1447, bytes: 73664 }],
+  ["src/cli/sync-git/plan.ts", { nonblank: 1213, bytes: 59144 }],
   ["src/cli/sync-git/state-cas-locks.ts", { nonblank: 572, bytes: 23935 }],
   ["src/cli/sync-recovery.ts", { nonblank: 542, bytes: 27521 }],
   ["src/cli/sync-state-model.ts", { nonblank: 446, bytes: 23328 }],
