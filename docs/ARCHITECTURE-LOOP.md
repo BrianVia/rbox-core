@@ -30,7 +30,9 @@ retired.
   2026-08-14; opus only as the two-strikes fallback when codex's output
   misses the bar twice with corrective feedback. Reviews stay multi-model.
 - Behavior-preserving only; move-fidelity audit where code moves.
-- Touched files get ALL anti-slop warnings fixed (whole files, not new lines).
+- Touched files get ALL anti-slop warnings fixed (whole files, not new
+  lines) — triggers on SUBSTANTIVE changes; import-line-only touches are
+  exempt, but grab cheap fixes opportunistically (founder ruling 08-14).
 - Size-gate trips get decomposition, never re-pins.
 - Sync-plane batches close out with BEFORE/AFTER field checks on BOTH lanes.
 - Codex adversarial review for daemon/sync-git/state planes; merge on
