@@ -15,6 +15,24 @@ export const SYNC_PHASE_NAMES = [
   "commit", "download", "decrypt", "apply", "git-apply", "cache-save", "state-save",
 ] as const;
 export type SyncPhaseName = (typeof SYNC_PHASE_NAMES)[number];
+export const SYNC_PHASE_GAP_TRANSITIONS = [
+  "start→state-load", "start→validate",
+  "state-load→scan", "scan→state-load", "state-load→git-plan",
+  "git-plan→state-save", "state-save→state-save", "state-save→address",
+  "git-plan→address", "address→encrypt", "address→upload",
+  "encrypt→missing", "missing→upload", "upload→commit",
+  "upload→state-load", "commit→state-load", "commit→state-save",
+  "commit→validate", "state-load→latest", "latest→validate",
+  "validate→scan", "scan→reconcile", "state-save→state-load",
+  "reconcile→apply", "apply→cache-save", "cache-save→git-apply",
+  "git-apply→state-save",
+] as const;
+export type SyncPhaseGapKey = `gap:${(typeof SYNC_PHASE_GAP_TRANSITIONS)[number]}` | "tailMs";
+export const SYNC_PHASE_GAP_KEYS = [
+  ...SYNC_PHASE_GAP_TRANSITIONS.map((transition) => `gap:${transition}` as const),
+  "tailMs",
+] as const satisfies readonly SyncPhaseGapKey[];
+export const SYNC_PHASE_GAP_CARDINALITY = SYNC_PHASE_GAP_KEYS.length;
 export const SYNC_PHASE_OPS = ["pull", "push"] as const;
 export const TRANSPORTS = ["batch", "pack", "single"] as const;
 export type LaneTransport = (typeof TRANSPORTS)[number];
@@ -23,6 +41,8 @@ export type FillVersion = (typeof FILL_VERSIONS)[number];
 export const SAFETY_EVENT_TYPES = ["mass_delete_breaker", "scan_fault"] as const;
 export type SafetyEventType = (typeof SAFETY_EVENT_TYPES)[number];
 export const TELEMETRY_BATCH_CAP = 64;
+export const TELEMETRY_DROP_POINT_BUDGET = 6;
+export const TELEMETRY_POINT_BUDGET = TELEMETRY_BATCH_CAP * (1 + SYNC_PHASE_GAP_CARDINALITY) + TELEMETRY_DROP_POINT_BUDGET;
 
 export function telemetryEnabled(): boolean {
   return process.env.RBOX_TELEMETRY !== "0";
@@ -99,12 +119,28 @@ export const TELEMETRY_SAMPLE_SCHEMAS = {
     },
     enums: { op: SYNC_PHASE_OPS },
     numericRecords: { phases: { keys: SYNC_PHASE_NAMES, domain: MS_DOMAIN } },
+    pointRecords: { gaps: {
+      keys: SYNC_PHASE_GAP_KEYS,
+      domain: MS_DOMAIN,
+      maxEntries: SYNC_PHASE_GAP_CARDINALITY,
+      index: "client.sync_phase.gap",
+      blobFields: ["op"],
+      when: { field: "op", value: "push" },
+    } },
   },
 } as const satisfies Record<string, {
   readonly numbers: Readonly<Record<string, NumericDomain>>;
   readonly enums: Readonly<Record<string, readonly string[]>>;
   readonly optionalNumbers?: Readonly<Record<string, NumericDomain>>;
   readonly numericRecords?: Readonly<Record<string, { readonly keys: readonly string[]; readonly domain: NumericDomain }>>;
+  readonly pointRecords?: Readonly<Record<string, {
+    readonly keys: readonly string[];
+    readonly domain: NumericDomain;
+    readonly maxEntries: number;
+    readonly index: string;
+    readonly blobFields: readonly string[];
+    readonly when: { readonly field: string; readonly value: string };
+  }>>;
 }>;
 
 export type TelemetryKind = keyof typeof TELEMETRY_SAMPLE_SCHEMAS;
@@ -160,7 +196,8 @@ export interface SyncPhaseSample {
   kind: "sync_phase";
   op: "pull" | "push";
   wallMs: number;
-  phases: Record<string, number>;
+  phases: Partial<Record<SyncPhaseName, number>>;
+  gaps?: Partial<Record<SyncPhaseGapKey, number>>;
   gitApplyMaxRepoMs?: number;
   gitApplySkippedHeld?: number;
   prologue_ms?: number;

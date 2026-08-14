@@ -9,10 +9,11 @@ import type { JsonObject, JsonValue } from "../../../src/json.js";
 
 const BODY_CAP_BYTES = 32 * 1024;
 export const TELEMETRY_BATCH_CAP = 64;
+export const TELEMETRY_DROP_POINT_BUDGET = 6;
 const SYNC_STATE_BATCH_CAP = 32;
 
-/** Low-cardinality drops enum: unknown_kind|unknown_field|bad_number|bad_enum|batch_cap|body_cap|bad_state|unauthorized. */
-type DropReason = "unknown_kind" | "unknown_field" | "bad_number" | "bad_enum" | "batch_cap" | "body_cap" | "bad_state" | "unauthorized";
+/** Low-cardinality drops enum: unknown_kind|unknown_field|bad_number|bad_enum|batch_cap|body_cap|point_cap|bad_state|unauthorized. */
+type DropReason = "unknown_kind" | "unknown_field" | "bad_number" | "bad_enum" | "batch_cap" | "body_cap" | "point_cap" | "bad_state" | "unauthorized";
 interface NumericDomain { readonly min: number; readonly max: number; readonly integer: boolean }
 interface NumberField extends NumericDomain { readonly field: string }
 interface EnumField { readonly field: string; readonly values: readonly string[] }
@@ -22,6 +23,12 @@ interface SampleSchema {
   readonly enums: readonly EnumField[];
   readonly optionalNumbers?: readonly NumberField[];
   readonly numericRecords?: readonly NumericRecordField[];
+  readonly pointRecords?: readonly (NumericRecordField & {
+    readonly maxEntries: number;
+    readonly index: "client.sync_phase.gap";
+    readonly blobFields: readonly string[];
+    readonly when: { readonly field: string; readonly value: string };
+  })[];
 }
 
 const MS = { min: 0, max: 604_800_000, integer: true } as const;
@@ -31,7 +38,24 @@ export const SERVER_SYNC_PHASE_NAMES = [
   "latest", "state-load", "scan", "git-plan", "address", "encrypt", "missing", "upload",
   "commit", "download", "decrypt", "apply", "git-apply", "cache-save", "state-save",
 ] as const;
-const SERVER_SYNC_PHASE_GAP_ENDPOINTS = new Set<string>(["start", "validate", "reconcile", ...SERVER_SYNC_PHASE_NAMES]);
+export const SERVER_SYNC_PHASE_GAP_TRANSITIONS = [
+  "start→state-load", "start→validate",
+  "state-load→scan", "scan→state-load", "state-load→git-plan",
+  "git-plan→state-save", "state-save→state-save", "state-save→address",
+  "git-plan→address", "address→encrypt", "address→upload",
+  "encrypt→missing", "missing→upload", "upload→commit",
+  "upload→state-load", "commit→state-load", "commit→state-save",
+  "commit→validate", "state-load→latest", "latest→validate",
+  "validate→scan", "scan→reconcile", "state-save→state-load",
+  "reconcile→apply", "apply→cache-save", "cache-save→git-apply",
+  "git-apply→state-save",
+] as const;
+export const SERVER_SYNC_PHASE_GAP_KEYS = [
+  ...SERVER_SYNC_PHASE_GAP_TRANSITIONS.map((transition) => `gap:${transition}`),
+  "tailMs",
+] as const;
+export const SERVER_SYNC_PHASE_GAP_CARDINALITY = SERVER_SYNC_PHASE_GAP_KEYS.length;
+export const TELEMETRY_POINT_BUDGET = TELEMETRY_BATCH_CAP * (1 + SERVER_SYNC_PHASE_GAP_CARDINALITY) + TELEMETRY_DROP_POINT_BUDGET;
 
 /** Runtime duplicate of the client contract. A test imports both copies and prevents drift.
  * Field declaration order IS the positional AE doubles order and feeds normalizeSample
@@ -104,6 +128,15 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
     ],
     enums: [{ field: "op", values: ["pull", "push"] }],
     numericRecords: [{ field: "phases", keys: SERVER_SYNC_PHASE_NAMES, domain: MS }],
+    pointRecords: [{
+      field: "gaps",
+      keys: SERVER_SYNC_PHASE_GAP_KEYS,
+      domain: MS,
+      maxEntries: SERVER_SYNC_PHASE_GAP_CARDINALITY,
+      index: "client.sync_phase.gap",
+      blobFields: ["op"],
+      when: { field: "op", value: "push" },
+    }],
   },
 } as const satisfies Record<string, SampleSchema>;
 
@@ -143,6 +176,7 @@ const ALLOWED_SAMPLE_KEYS = new Map<ClientTelemetryKind, ReadonlySet<string>>(
       ...schema.enums.map((field) => field.field),
       ...(schema.optionalNumbers ?? []).map((field) => field.field),
       ...(schema.numericRecords ?? []).map((field) => field.field),
+      ...(schema.pointRecords ?? []).map((field) => field.field),
     ]),
   ]),
 );
@@ -170,6 +204,10 @@ function hasOnlyKeys(value: JsonObject, allowed: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return Boolean(value) && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
 function validNumber(value: unknown, domain: NumericDomain): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= domain.min && value <= domain.max && (!domain.integer || Number.isInteger(value));
 }
@@ -178,15 +216,7 @@ function corpusBucket(fileCount: number): (typeof SERVER_CORPUS_BUCKETS)[number]
   return SERVER_CORPUS_BUCKETS.find((entry) => entry.maxFileCount === null || fileCount <= entry.maxFileCount)!.bucket;
 }
 
-function syncPhaseGapKey(key: string): boolean {
-  if (key === "tailMs") return true;
-  if (!key.startsWith("gap:")) return false;
-  const [from, to, extra] = key.slice(4).split("→");
-  return extra === undefined && from !== undefined && to !== undefined
-    && SERVER_SYNC_PHASE_GAP_ENDPOINTS.has(from) && SERVER_SYNC_PHASE_GAP_ENDPOINTS.has(to);
-}
-
-function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClientMetric; extras?: readonly NormalizedClientMetric[] } | { ok: false; reason: DropReason } {
+function normalizeSample(value: JsonValue): { ok: true; points: readonly NormalizedClientMetric[] } | { ok: false; reason: DropReason } {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || typeof value.kind !== "string"
     || !isClientTelemetryKind(value.kind)) {
@@ -211,23 +241,31 @@ function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClient
     canonicalEnums.push(canonical);
   }
   const recordNumbers: number[] = [];
-  const syncPhaseGaps: NormalizedClientMetric[] = [];
   for (const field of schema.numericRecords ?? []) {
     const raw = sample[field.field];
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "bad_number" };
+    if (!isJsonObject(raw)) return { ok: false, reason: "bad_number" };
     const allowed = new Set(field.keys);
-    const extraEntries = Object.entries(raw).filter(([key]) => !allowed.has(key));
-    if (extraEntries.length > 0 && (kind !== "sync_phase" || sample.op !== "push" || field.field !== "phases")) return { ok: false, reason: "unknown_field" };
-    for (const [key, item] of extraEntries) {
-      if (!syncPhaseGapKey(key)) return { ok: false, reason: "unknown_field" };
-      if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
-      syncPhaseGaps.push({ index: "client.sync_phase.gap", blobs: [String(sample.op), key], doubles: [item] });
-    }
+    if (Object.keys(raw).some((key) => !allowed.has(key))) return { ok: false, reason: "unknown_field" };
     for (const key of field.keys) {
       const item = raw[key];
       if (item === undefined) recordNumbers.push(0);
       else if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
       else recordNumbers.push(item);
+    }
+  }
+  const pointRecords: NormalizedClientMetric[] = [];
+  for (const field of schema.pointRecords ?? []) {
+    const raw = sample[field.field];
+    if (raw === undefined) continue;
+    if (sample[field.when.field] !== field.when.value) return { ok: false, reason: "unknown_field" };
+    if (!isJsonObject(raw)) return { ok: false, reason: "bad_number" };
+    const entries = Object.entries(raw);
+    if (entries.length > field.maxEntries) return { ok: false, reason: "point_cap" };
+    const allowed = new Set(field.keys);
+    for (const [key, item] of entries) {
+      if (!allowed.has(key)) return { ok: false, reason: "unknown_field" };
+      if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
+      pointRecords.push({ index: field.index, blobs: [...field.blobFields.map((blobField) => String(sample[blobField])), key], doubles: [item] });
     }
   }
   const optionalNumbers: number[] = [];
@@ -239,30 +277,35 @@ function normalizeSample(value: JsonValue): { ok: true; metric: NormalizedClient
   }
 
   if (kind === "first_publish") {
-    return { ok: true, metric: { index: "client.first_publish", blobs: [corpusBucket(wireNumbers[2]!)], doubles: wireNumbers } };
+    return { ok: true, points: [{ index: "client.first_publish", blobs: [corpusBucket(wireNumbers[2]!)], doubles: wireNumbers }] };
   }
   if (kind === "upload_lane") {
     const [bytes, uploadMs, opCount] = wireNumbers as [number, number, number];
     if (bytes > 0 && uploadMs === 0) return { ok: false, reason: "bad_number" };
     const mbps = uploadMs === 0 ? 0 : 8 * bytes / (uploadMs / 1000) / 1_000_000;
     if (!Number.isFinite(mbps) || mbps > 100_000) return { ok: false, reason: "bad_number" };
-    return { ok: true, metric: { index: "client.upload_lane", blobs: canonicalEnums, doubles: [mbps, bytes, uploadMs, opCount] } };
+    return { ok: true, points: [{ index: "client.upload_lane", blobs: canonicalEnums, doubles: [mbps, bytes, uploadMs, opCount] }] };
   }
   if (kind === "ws_health" && wireNumbers[1]! > wireNumbers[0]!) {
     return { ok: false, reason: "bad_number" };
   }
   if (kind === "sync_phase") {
-    return { ok: true, metric: {
+    return { ok: true, points: [{
       index: "client.sync_phase",
       blobs: canonicalEnums,
       doubles: [...wireNumbers, ...recordNumbers, ...optionalNumbers],
-    }, extras: syncPhaseGaps };
+    }, ...pointRecords] };
   }
-  return { ok: true, metric: { index: `client.${kind}`, blobs: canonicalEnums, doubles: wireNumbers } };
+  return { ok: true, points: [{ index: `client.${kind}`, blobs: canonicalEnums, doubles: wireNumbers }] };
+}
+
+function dropMetric(reason: DropReason, count: number): NormalizedClientMetric | undefined {
+  return count > 0 ? { index: "client.telemetry.drops", blobs: [reason], doubles: [count] } : undefined;
 }
 
 function emitDrop(env: Env, reason: DropReason, count: number): void {
-  if (count > 0) emitClientMetric(env, { index: "client.telemetry.drops", blobs: [reason], doubles: [count] });
+  const metric = dropMetric(reason, count);
+  if (metric) emitClientMetric(env, metric);
 }
 
 async function parsedEnvelope(req: Request, env: Env): Promise<{ value: JsonValue } | { response: Response }> {
@@ -305,8 +348,9 @@ export async function ingestTelemetry(req: Request, env: Env, p: Principal): Pro
   const samples = opened.items;
   let accepted = 0;
   let dropped = Math.max(0, samples.length - TELEMETRY_BATCH_CAP);
-  emitDrop(env, "batch_cap", dropped);
   const reasons = new Map<DropReason, number>();
+  if (dropped > 0) reasons.set("batch_cap", dropped);
+  const samplePoints: NormalizedClientMetric[] = [];
   for (const sample of samples.slice(0, TELEMETRY_BATCH_CAP)) {
     const normalized = normalizeSample(sample);
     if (!normalized.ok) {
@@ -314,11 +358,19 @@ export async function ingestTelemetry(req: Request, env: Env, p: Principal): Pro
       reasons.set(normalized.reason, (reasons.get(normalized.reason) ?? 0) + 1);
       continue;
     }
-    emitClientMetric(env, normalized.metric);
-    for (const metric of normalized.extras ?? []) emitClientMetric(env, metric);
+    samplePoints.push(...normalized.points);
     accepted++;
   }
-  for (const [reason, count] of reasons) emitDrop(env, reason, count);
+  const dropPoints = [...reasons].flatMap(([reason, count]) => {
+    const metric = dropMetric(reason, count);
+    return metric ? [metric] : [];
+  });
+  const writePlan = [...samplePoints, ...dropPoints];
+  if (writePlan.length > TELEMETRY_POINT_BUDGET) {
+    emitDrop(env, "point_cap", samples.length);
+    return json({ accepted: 0, dropped: samples.length }, 202);
+  }
+  for (const metric of writePlan) emitClientMetric(env, metric);
   return json({ accepted, dropped }, 202);
 }
 
