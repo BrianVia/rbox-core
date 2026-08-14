@@ -4096,6 +4096,60 @@ test("design 174 B: a ref reset between maybe-probe and capture fails final cand
   expect(await retainedGitCiphertext(rootA)).toEqual([]);
 }, 20_000);
 
+test("#573: a refused supersession is not re-captured every push, and any change re-captures it", async () => {
+  const rel = "supersede-refusal-memo";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "base.txt", "base", "base");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const pending = state.lastSyncedManifest.gitRepos![rel]!;
+
+  // Diverge main off the pending tip: presence-only pre-probe admits it, the final
+  // proof's fast-forward requirement refuses it — the field shape of #573.
+  await git(repo, "switch", "--orphan", "refusal-unrelated");
+  await commitFile(repo, "other.txt", "other", "unrelated");
+  const unrelated = await git(repo, "rev-parse", "HEAD");
+  await git(repo, "switch", "-q", "main");
+  await git(repo, "branch", "-D", "refusal-unrelated");
+  await git(repo, "update-ref", "refs/heads/main", unrelated);
+
+  const planOnce = async (): Promise<{ plan: GitPushPlan; queued: string[]; writes: number }> => {
+    const queued: string[] = [];
+    const counted = countingGitRemote(remote);
+    const plan = await planGitSections(
+      rootA, cfgA, { ...state, gitPendingRemote: { [rel]: pending } }, counted.api,
+      new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff,
+      { onCaptureQueued: (candidate) => queued.push(candidate) },
+    );
+    return { plan, queued, writes: counted.writes() };
+  };
+
+  const first = await planOnce();
+  expect(first.queued).toEqual([rel]);
+  expect(first.plan.supersededPending).toEqual([]);
+  expect(first.plan.gitRepos?.[rel]).toEqual(pending);
+
+  await markDivergenceCacheTrusted(rootA);
+  const second = await planOnce();
+  expect(second.queued).toEqual([]); // the whole capture, not just its uploads
+  expect(second.writes).toBe(0);
+  // Every push-visible outcome is identical to the capture-and-revert it replaced,
+  // except that a capture that never ran observes no config. That observation is inert
+  // for this repo: a protected-pending repo is skipped by the durable deferral writer.
+  expect(second.plan.protectedPending).toContain(rel);
+  expect({ ...gitPlanSurface(second.plan), configObserved: first.plan.configObserved })
+    .toEqual(gitPlanSurface(first.plan));
+  expect(second.plan.deferred.some((entry) =>
+    entry.relPath === rel && entry.reason.includes("did not supersede"))).toBe(true);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
+
+  // Invalidation: the repository moved, so the recorded verdict is no longer evidence.
+  await commitFile(repo, "moved.txt", "moved", "moved");
+  const third = await planOnce();
+  expect(third.queued).toEqual([rel]);
+}, 30_000);
+
 test("design 83: plan cache invalidates paused rebase op-state instead of fast-carrying", async () => {
   const rel = "d83-rebase-plan";
   const repo = path.join(rootA, rel);

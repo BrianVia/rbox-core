@@ -33,18 +33,44 @@ for (const [consumer, relative, markers] of CONSUMER_FREEZE) {
   });
 }
 
-test("design 176 log-language pass is exactly twelve ignored-suffix additions", () => {
-  const source = [
-    "src/cli/sync-git/apply.ts",
-    "src/cli/sync-git/plan.ts",
-    "src/cli/sync-git/received-git-config.ts",
-    "src/cli/sync-git/remote-repository-deletion.ts",
-    "src/cli/sync/push.ts",
-    "src/cli/sync/publisher-ack-transition.ts",
-  ].map((relative) => fs.readFileSync(path.join(ROOT, relative), "utf8")).join("\n");
-  const occurrences = (clause: string): number => source.split(clause).length - 1;
+const LOG_LANGUAGE_SOURCES = [
+  "src/cli/sync-git/apply.ts",
+  "src/cli/sync-git/plan.ts",
+  "src/cli/sync-git/received-git-config.ts",
+  "src/cli/sync-git/remote-repository-deletion.ts",
+  "src/cli/sync/push.ts",
+  "src/cli/sync/publisher-ack-transition.ts",
+] as const;
 
-  expect(occurrences("rbox left shared Git settings alone; Git history can still sync.")).toBe(7);
+/**
+ * The census counts EMISSIONS, not source copies. When five identical
+ * config-ownership skips shared one sentence verbatim, five literals and five
+ * emissions were the same number, so counting literals was enough.
+ *
+ * 2026-08-14 (#573): plan.ts's five config-ownership skips were deduped into one
+ * `skipConfigOwnership(rel, why)` emitter — the composed sentence is byte-identical
+ * (verified against every pre-dedup literal), but the literal now appears once for
+ * five emissions. So the shared clause is pinned as literal × call sites, and the
+ * total stays twelve. This is a re-pin, not a relaxation: adding, dropping or
+ * rewording a skip site still fails, and the emitter's own template is pinned
+ * whole below so the suffix cannot drift off the human clause.
+ */
+const PLAN_CONFIG_SKIP_EMITTER =
+  "`git-sync config skipped ${rel}: ${why}. rbox left shared Git settings alone; Git history can still sync.`";
+
+test("design 176 log-language pass is exactly twelve ignored-suffix additions", () => {
+  const byFile = new Map(LOG_LANGUAGE_SOURCES.map((relative) =>
+    [relative, fs.readFileSync(path.join(ROOT, relative), "utf8")] as const));
+  const source = [...byFile.values()].join("\n");
+  const occurrences = (clause: string, text = source): number => text.split(clause).length - 1;
+
+  const plan = byFile.get("src/cli/sync-git/plan.ts")!;
+  expect(plan).toContain(PLAN_CONFIG_SKIP_EMITTER);
+  const sharedClause = "rbox left shared Git settings alone; Git history can still sync.";
+  expect(occurrences(sharedClause, plan)).toBe(1); // the one emitter…
+  expect(occurrences("skipConfigOwnership(rel, ", plan)).toBe(5); // …used five times
+  expect(occurrences(sharedClause)).toBe(3); // 1 emitter + 2 direct, for 7 emissions
+
   expect(occurrences("Your local Git work is safe; inspect the preserved incoming state before resolving.")).toBe(2);
   expect(occurrences("Your local Git repository is safe.")).toBe(1);
   expect(occurrences("Your local Git work is safe while rbox retries.")).toBe(1);

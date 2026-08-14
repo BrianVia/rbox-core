@@ -21,6 +21,13 @@ export interface CachedDivergenceProbe {
   parentRel?: string;
 }
 
+/** Opaque to this store; `pending-supersession.ts` owns what it means (#573). */
+export interface GitSupersessionRefusal {
+  pendingKey: string;
+  baseKey: string;
+  reason: string;
+}
+
 export interface GitDivergenceCacheEntry {
   fingerprint: string;
   writtenAtMs: number;
@@ -28,6 +35,7 @@ export interface GitDivergenceCacheEntry {
   kind?: GitRepoKind;
   probe?: CachedDivergenceProbe;
   cachedLocalCfg?: CachedLocalCfg;
+  supersessionRefusal?: GitSupersessionRefusal;
 }
 
 export interface GitDivergenceCache {
@@ -39,23 +47,28 @@ export type GitDivergenceRepoSource = readonly GitDivergenceRepoHint[] | AsyncIt
 
 export const isGitRepoKind = (v: unknown): v is GitRepoKind => v === "dir" || v === "pointer";
 
+const isString = (v: unknown): v is string => typeof v === "string";
+
 function isCacheEntry(v: unknown): v is GitDivergenceCacheEntry {
   if (v === null || typeof v !== "object") return false;
   const e = v as GitDivergenceCacheEntry;
-  if (typeof e.fingerprint !== "string" || typeof e.writtenAtMs !== "number" || typeof e.identityKey !== "string") return false;
+  if (!isString(e.fingerprint) || typeof e.writtenAtMs !== "number" || !isString(e.identityKey)) return false;
   if (e.kind !== undefined && !isGitRepoKind(e.kind)) return false;
   if (
     e.cachedLocalCfg !== undefined &&
     (e.cachedLocalCfg === null ||
       typeof e.cachedLocalCfg !== "object" ||
-      typeof e.cachedLocalCfg.hash !== "string" ||
+      !isString(e.cachedLocalCfg.hash) ||
       typeof e.cachedLocalCfg.nonEmpty !== "boolean")
   ) return false;
   if (e.probe !== undefined) {
     const p = e.probe as CachedDivergenceProbe;
     if (p === null || typeof p !== "object") return false;
-    if (typeof p.busy !== "boolean" || typeof p.preflightOk !== "boolean" || typeof p.identityKey !== "string") return false;
+    if (typeof p.busy !== "boolean" || typeof p.preflightOk !== "boolean" || !isString(p.identityKey)) return false;
   }
+  const refusal = e.supersessionRefusal as GitSupersessionRefusal | null | undefined;
+  if (refusal !== undefined
+    && !(!!refusal && isString(refusal.pendingKey) && isString(refusal.baseKey) && isString(refusal.reason))) return false;
   return true;
 }
 
@@ -109,7 +122,9 @@ export async function saveGitDivergenceCache(root: string, cache: GitDivergenceC
   await writeFileAtomic(abs, JSON.stringify({ version: GIT_DIVERGENCE_CACHE_VERSION, repos }));
   cache.dirty = false;
 }
-function trustedGitFingerprintHit(fresh: GitFingerprint, entry: GitDivergenceCacheEntry): boolean {
+/** Whether an entry may be believed for `fresh`: same fingerprint, and outside
+ *  git's racy-clean window. Every consumer of a cached decision goes through it. */
+export function trustedGitFingerprintHit(fresh: GitFingerprint, entry: GitDivergenceCacheEntry): boolean {
   return entry.fingerprint === fresh.hash && fresh.maxTsMs < entry.writtenAtMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS;
 }
 type PlanProbeBuild = {
