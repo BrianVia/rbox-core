@@ -12,7 +12,7 @@ import { BlobRetryLaterError, isRetryLater } from "../errors.js";
 import { transferTimeoutMs } from "../resilient.js";
 import { fileStream } from "../stream.js";
 import { LANE_TIMING, recordPackBuilt, recordPackFallback, recordPackSent, uploadLaneTiming, type PackFallbackReason } from "../../upload-lane-timing.js";
-import { recordLaneSettlement } from "../../telemetry/lane-accumulator.js";
+import { recordLaneSettlement } from "../../push-spans.js";
 import { PACK_FILL_ABSOLUTE_MS, PACK_FILL_QUIET_MS, packUploadConfig, type PackConfig } from "./config.js";
 import { disablePackUploadForProcess, onPackUploadDisabled, packUploadDisabled, type UploadSlotArbiter } from "./gate.js";
 import { buildPack, type BuiltPack } from "./packer.js";

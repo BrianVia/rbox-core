@@ -284,7 +284,7 @@ test("a no-op push renders NO FirstPublishStats", async () => {
 // headline timeToFilesSyncedMs on the successful attempt even though its retry
 // re-uploaded nothing — the files DID sync, on the earlier 409'd attempt.) The FAILED
 // attempt must render none and must not
-// leak the timing singleton.
+// leak timing state into the next operation.
 test("409-then-success emits exactly ONE FirstPublishStats (headline KPI) and leaves timing disabled", async () => {
   process.env.RBOX_FILES_FIRST = "1";
   await repoWithFile();
@@ -308,7 +308,7 @@ test("a failed/no-upload push does not leak timing into a later unrelated push",
   await repoWithFile();
   await push(root, cfg, deps); // commit 1 (files-first)
   await push(root, cfg, deps); // commit 2 (git attach)
-  // Timing must be disabled between pushes — no leaked singleton state.
+  // Timing must be disabled between pushes — no leaked operation state.
   expect(firstPublishTiming.enabled).toBe(false);
   const r = await push(root, cfg, deps); // no-op
   expect(r.committed).toBe(false);

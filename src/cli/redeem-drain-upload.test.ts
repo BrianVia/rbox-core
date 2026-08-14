@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -10,7 +10,8 @@ import type { E2eeApi, E2eeContext, PinStore } from "./e2ee-remote-types.js";
 import type { SyncRemote } from "./remote.js";
 import type { ReceiptRedeemResult } from "./remote/commits.js";
 import { encryptAndUpload } from "./sync-recovery.js";
-import { beginFirstPublishTiming, firstPublishTiming, uploadActiveOverlapMs } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, uploadActiveOverlapMs } from "./upload-lane-timing.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
 
 const savedEnv = {
   RBOX_REDEEM_DRAIN: process.env.RBOX_REDEEM_DRAIN,
@@ -19,6 +20,9 @@ const savedEnv = {
   RBOX_CRYPTO_FUSE: process.env.RBOX_CRYPTO_FUSE,
   RBOX_METRICS: process.env.RBOX_METRICS,
 };
+
+let firstPublishTiming: FirstPublishTiming;
+beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 
 afterEach(() => {
   beginFirstPublishTiming(false);

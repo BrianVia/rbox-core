@@ -164,7 +164,6 @@ src/cli/daemon/drift-audit.ts — watcher-drift measurement contracts, persisten
 src/cli/telemetry/contract.ts — client/server telemetry wire schemas (including fixed sync-phase axes), numeric/enum domains, corpus buckets, fleet sync-state contract, and RBOX_TELEMETRY enablement. Never: queueing, transport, or measurement.
 src/cli/telemetry/queue.ts — best-effort bounded in-memory sample coalescing/rings (including sync-phase), single-flight flush, backoff, rejection/drop handling, and TelemetryRecorder/Transport contracts. Never: producing measurements or sync-state summaries.
 src/cli/telemetry/sync-state.ts — privacy-bounded fleet sync-state projection plus daemon change/heartbeat reporting with stable binding identity and serialized best-effort sends. Never: alert evaluation or sync-state mutation.
-src/cli/telemetry/lane-accumulator.ts — AsyncLocalStorage-scoped per-push upload-lane byte/time/op accumulation and completion samples. Never: upload scheduling, transport selection, or network I/O.
 src/cli/telemetry/sync-phase.ts — per-daemon independent pull/push cadence and tail sampling plus privacy-bounded PhaseReport projection. Never: sync execution, queue transport, or repo identifiers.
 ```
 
@@ -303,8 +302,8 @@ src/cli/daemon/log-reader.ts  — daemon log discovery, bounded tails, chronolog
 src/cli/git/deferrals-command.ts — `rbox git deferrals` projection, remediation copy, resolve-offer policy. Never: resolution transactions or presentation bodies.
 src/cli/git/resolve-command.ts — `rbox git resolve` snapshot/confirm/discard workflow, manual-protocol preflight/settlement, refusal semantics. Never: deferrals policy or output formatting bodies.
 src/cli/git/resolve-presentation.ts — resolve output rendering, human/JSON emission, root scrubbing. Never: state machines or filesystem access.
-src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming + batch-dispatch/pack-lane telemetry accumulators, overlap math, summary formatters. Never: network or file I/O.
-src/cli/push-tail-timing.ts — AsyncLocalStorage-scoped missing/commit chunk timing and exact request-payload byte accumulation for one complete push retry loop. Never: retry, request, or upload policy.
+src/cli/push-spans.ts — the one operation-scoped PushSpans owner: PhaseReport sink facade, first-publish field, upload-lane accumulator, missing/commit tail samples, and their single async-local carrier. Never: phase/gap/rendering authority, retry policy, upload scheduling, transport selection, network I/O, or durable transitions.
+src/cli/upload-lane-timing.ts — flag-gated upload-lane, batch-dispatch, and pack sweep counters plus first-publish producer helpers and exact summary formatters backed by the active PushSpans. Never: measurement state ownership, network, or file I/O.
 src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
 src/cli/e2ee-remote-types.ts  — pure shared contracts: E2eeApi, AccountKeysDTO, WsKeyDTO, CommitChainResult, VersionInfo, VerifiedSuffixEntry, HeadPin, PinStore, E2eeContext, CurrentWriteKek. Never: behavior, policy constants.
 src/cli/e2ee-client.ts        — atomic genesis orchestration, verified enrollment classification consumption, exact-attempt replay/completion, plus pairing/recovery/web-delivery admission glue. Never: raw HTTP transport or generic workspace sync policy.

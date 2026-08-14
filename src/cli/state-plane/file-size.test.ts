@@ -179,7 +179,7 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/sync-state-model.ts", { nonblank: 446, bytes: 23328 }],
   ["src/cli/sync-state.ts", { nonblank: 599, bytes: 31488 }],
   ["src/cli/sync/pull.ts", { nonblank: 465, bytes: 25252 }],
-  ["src/cli/sync/push.ts", { nonblank: 949, bytes: 51561 }],
+  ["src/cli/sync/push.ts", { nonblank: 940, bytes: 49750 }],
   ["src/cli/upgrade-cmd.ts", { nonblank: 499, bytes: 23827 }],
   ["src/engine/apply-receipt.ts", { nonblank: 689, bytes: 30017 }],
   ["src/engine/apply.ts", { nonblank: 488, bytes: 23221 }],

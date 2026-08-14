@@ -1,14 +1,16 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   beginFirstPublishTiming,
-  firstPublishTiming,
   firstPublishUploadEnd,
   firstPublishUploadStart,
   intervalUnionOverlapMs,
   uploadActiveOverlapMs,
 } from "./upload-lane-timing.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
 
-afterEach(() => beginFirstPublishTiming(false)); // the timing accumulator is a process-global singleton
+let firstPublishTiming: FirstPublishTiming;
+beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
+afterEach(() => beginFirstPublishTiming(false));
 
 test("intervalUnionOverlapMs intersects a drain with the upload interval union", () => {
   const intervals = [{ start: 10, end: 20 }, { start: 30, end: 40 }];

@@ -9,7 +9,7 @@ import { FILL_ABSOLUTE_MS, FILL_QUIET_MS } from "./config.js";
 import { resetBatchBlobStateForTests } from "./gate.js";
 import { setUploaderClockForTests } from "./uploader.js";
 import { BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT } from "./wire.js";
-import { withPushLaneAccumulator } from "../../telemetry/lane-accumulator.js";
+import { withPushLaneAccumulator } from "../../push-spans.js";
 
 const ENV_KEYS = [
   "RBOX_BATCH_FILL", "RBOX_BATCH_RECORDS", "RBOX_UPLOAD_SLOTS",

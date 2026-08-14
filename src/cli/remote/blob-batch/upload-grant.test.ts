@@ -17,6 +17,7 @@ import {
   beginFirstPublishTiming,
   finishFirstPublishStats,
 } from "../../upload-lane-timing.js";
+import { enterPushSpansForTest } from "../../push-spans.js";
 
 const originalFetch = globalThis.fetch;
 const originalDateNow = Date.now;
@@ -62,6 +63,11 @@ function uploader(ctx: RemoteContext): BlobBatchUploader {
   const value = new BlobBatchUploader(ctx);
   uploaders.push(value);
   return value;
+}
+
+function beginScopedFirstPublishTiming(): void {
+  enterPushSpansForTest();
+  beginFirstPublishTiming(true);
 }
 
 function batchOk(recordSha: string, sizeBytes: number, authPath?: "grant" | "bearer"): Response {
@@ -120,7 +126,7 @@ afterEach(async () => {
     Promise.all(uploaders.map((value) => value.close(new Error("test cleanup")).catch(() => {}))),
     new Promise((resolve) => setTimeout(resolve, 2_000)),
   ]);
-  // Reset the process-global measurement singleton even when an assertion failed.
+  // Disarm the operation-scoped measurement even when an assertion failed.
   finishFirstPublishStats();
   globalThis.fetch = originalFetch;
   Date.now = originalDateNow;
@@ -374,7 +380,7 @@ describe("upload grants", () => {
       return batchOk(payload.sha, payload.bytes.byteLength, "grant");
     }) as typeof fetch;
 
-    beginFirstPublishTiming(true);
+    beginScopedFirstPublishTiming();
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
     const stats = finishFirstPublishStats()!;
     expect(stats.authCallCount).toBe(0);
@@ -406,7 +412,7 @@ describe("upload grants", () => {
       });
     }) as typeof fetch;
 
-    beginFirstPublishTiming(true);
+    beginScopedFirstPublishTiming();
     const value = uploader(ctx);
     const pending = payloads.map((payload) => value.putFile(payload.sha, payload.path, payload.bytes.byteLength));
     const deadline = performance.now() + 1_000;
@@ -445,7 +451,7 @@ describe("upload grants", () => {
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
 
-    beginFirstPublishTiming(true);
+    beginScopedFirstPublishTiming();
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
     const stats = finishFirstPublishStats()!;
     expect(batchAttempts).toBe(1);

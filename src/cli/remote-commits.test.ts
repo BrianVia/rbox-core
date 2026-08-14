@@ -1,10 +1,11 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type { SignedCommit } from "../engine/e2ee/index.js";
 import { CommitRejectedError } from "./remote.js";
 import { RemoteContext } from "./remote/context.js";
 import { commitSigned, RECEIPT_REDEEM_BATCH_MAX, redeemReceipts } from "./remote/commits.js";
-import { beginFirstPublishTiming, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart } from "./upload-lane-timing.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const commit: SignedCommit = { body: "{}", commitHash: "a".repeat(64), sig: "sig" };
@@ -12,7 +13,9 @@ const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const serverTimings = { totalMs: 7, envelopeMs: 1, accountingMs: 2, sidecarMs: 0, commitMs: 1, mirrorMs: 2, responseMs: 0 };
 
-afterEach(() => beginFirstPublishTiming(false)); // the first-publish timing accumulator is a process-global singleton
+let firstPublishTiming: FirstPublishTiming;
+beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
+afterEach(() => beginFirstPublishTiming(false));
 
 test("redeemReceipts drains 12,001 receipts in 5k batches and clears each successful batch", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
