@@ -530,3 +530,10 @@ removed; the redacted result is retained at
   recurs, reproduce under shard ordering (the file's contention tests share
   real lock files; a co-scheduled shard neighbor holding the fence is the
   first suspect), and check whether the design-242 leak classes cover it.
+- SECOND SIGHTING 2026-08-14, PR #689 (also instrumentation-only; touches
+  push/daemon spans, not credentials), `tests · shard 3/6` attempt 1: same
+  test, same 15000.45ms ceiling. Two sightings on two different shards
+  within 24h, both on diffs that cannot influence it — this now clears the
+  recurrence bar: next session should run the shard-ordering reproduction
+  and either fix the shared-lock contention or quarantine the test with an
+  owner note.
