@@ -806,13 +806,13 @@ export class RboxDaemon {
   private probeHalt?: NonNullable<DaemonActivity["halt"]>;
 
   /** The daemon's side of the scheduler: what an operation boundary admits, what each
-   *  dequeued operation DOES, and the exit-time persistence. Which operation runs, and
+   *  dequeued operation DOES, and its boundary persistence. Which operation runs, and
    *  whether it may run at all, is the scheduler's. */
   private readonly operationExecutor: DaemonOperationExecutor = {
     openOperationBoundary: (syncMutex) => this.openOperationBoundary(syncMutex),
     beginOperation: (op) => this.beginPumpOperation(op),
     runOperation: (op, syncMutex) => this.runPumpOperation(op, syncMutex),
-    settleAfterDrain: () => this.settleAfterDrain(),
+    settleOperationBoundary: () => this.settleOperationBoundary(),
   };
 
   async start(): Promise<void> {
@@ -1818,15 +1818,16 @@ export class RboxDaemon {
     }
   }
 
-  private async settleAfterDrain(): Promise<void> {
+  private async settleOperationBoundary(): Promise<void> {
     const settleT0 = performance.now();
     try {
       await this.cache.save(this.root);
       this.writeAmbientStatus();
-      // Settle the sidecar: all wants are drained here, so re-render if
-      // the state CHANGED from the last write — the mid-pump write said `pending`
-      // (push still queued) and the no-op push wrote nothing; an idle workspace must
-      // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
+      // Settle the sidecar: re-render if the state CHANGED from the last write —
+      // the mid-pump write said `pending` (push still queued) and the no-op push
+      // wrote nothing; an idle workspace must read `ok`. State-compared, so a
+      // boundary that changed nothing (including one with work still queued behind
+      // it) writes nothing extra.
       const settledNow = this.localSettled();
       if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
     } finally {
@@ -1838,7 +1839,7 @@ export class RboxDaemon {
           pending.report.appendDetails("state-load", { prologue_ms: pending.prologueMs, settle_ms: settleMs }, formatPushResiduals(pending.prologueMs, settleMs));
           this.syncPhaseSampler.recordCompleted(pending.report, "push", this.telemetry, { prologue_ms: pending.prologueMs, settle_ms: settleMs });
           pending.metricsReport?.logSummaryTo(this.log);
-        } catch { /* Observation cannot replace the drain result. */ }
+        } catch { /* Observation cannot replace the settled result. */ }
       }
     }
   }

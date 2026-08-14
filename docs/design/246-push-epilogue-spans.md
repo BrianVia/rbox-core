@@ -112,6 +112,13 @@ local type. CODEMAP ownership does not change.
 | Split durable refresh and metrics save into separate spans | More port surface and cross-module timing plumbing | Both are already ordered effects under one transition owner; the immediate question is whether the daemon transition owns the residue | Keep one deep `publish_transition_ms` span | Decided by max-three/plain-name constraint |
 | Emit a report immediately after each push | Scheduler/report lifecycle behavior change and different wall semantics | Current reports deliberately settle after the queue and final cache/status persistence | Preserve behavior; name `drain_wait_ms` | Not approved |
 
+Amended 2026-08-14 (#661): the span this slice added convicted that last row's
+preserved behavior — `drain_wait_ms=50.8` on a content push, the sender waiting
+out a 47s pull it had itself provoked. Settlement now runs at each completed
+operation's boundary (`settleOperationBoundary`) rather than once the whole
+queue is empty; `drain_wait_ms` keeps its name and its meaning, and now measures
+the small real wait.
+
 ## 5. Validation
 
 - Before assertions: run the existing phase-report and sync test files and

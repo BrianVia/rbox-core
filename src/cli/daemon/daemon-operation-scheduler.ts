@@ -76,8 +76,9 @@ export interface DaemonOperationExecutor {
   beginOperation?(op: PumpOperation): void;
   /** Run the dequeued operation with its own bookkeeping and failure classification. */
   runOperation(op: PumpOperation, mutex: WorkspaceSyncMutex): Promise<void>;
-  /** Exit-time persistence, once per drained loop. */
-  settleAfterDrain(): Promise<void>;
+  /** Persistence and report settlement at a completed operation's boundary, and
+   *  once for a loop that completed none. */
+  settleOperationBoundary(): Promise<void>;
 }
 
 export interface DaemonSchedulerDrainReceipt {
@@ -354,6 +355,7 @@ export class DaemonOperationScheduler {
     // would hot-loop against the same refusal with the wants unconsumed.
     let parked = false;
     let noProgress = 0;
+    let settled = false;
     try {
       while (!this.ports.isStopped()) {
         // Resolve WHICH op this iteration runs up front — the executor's halt
@@ -398,8 +400,13 @@ export class DaemonOperationScheduler {
         } finally {
           await this.ports.releaseMutex(syncMutex);
         }
+        // The lane has handed off, so settle HERE and not once the whole queue is
+        // empty: a completed push's report used to wait out every later queued
+        // operation — in the field, a 47s pull it had itself provoked (#661).
+        await executor.settleOperationBoundary();
+        settled = true;
       }
-      await executor.settleAfterDrain();
+      if (!settled) await executor.settleOperationBoundary();
     } finally {
       this.pumping = false;
       // A timer/watcher can queue work after the loop observes no operation but

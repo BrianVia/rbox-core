@@ -91,7 +91,7 @@ function rig(root = "/nonexistent-rig-root"): Rig {
       state.serviced.push(op);
       await state.onOperation?.(op);
     },
-    settleAfterDrain: async () => {
+    settleOperationBoundary: async () => {
       state.drains += 1;
       state.onDrain?.();
     },
@@ -222,10 +222,29 @@ test("contract: single-flight — a second service call joins rather than starti
   release();
   await Promise.all([first, second]);
   expect(r.serviced).toEqual(["pull", "push"]);
-  expect(r.drains).toBe(1);
+  expect(r.drains).toBe(2); // one settlement per completed operation, none spare
 });
 
-test("contract: a wakeup arriving during exit-time settlement is not lost", async () => {
+test("contract: a completed operation settles at its own boundary, before later queued work", async () => {
+  const r = rig();
+  const timeline: string[] = [];
+  r.onOperation = (op) => {
+    timeline.push(`run:${op}`);
+    // Exactly the field shape (#661): the push provokes a pull that the same loop
+    // then services. The push's settlement must not wait for it.
+    if (op === "push") r.scheduler.queue("pull");
+  };
+  r.onDrain = () => void timeline.push("settle");
+  r.scheduler.request("push");
+  await r.service();
+  expect(timeline).toEqual(["run:push", "settle", "run:pull", "settle"]);
+  // The next operation follows its predecessor's settlement inside the same loop:
+  // nothing waits on a timer, and the loop drains without a redundant settlement.
+  expect(r.timers).toEqual([]);
+  expect(r.drains).toBe(2);
+});
+
+test("contract: a wakeup arriving during settlement is serviced by the same loop", async () => {
   const r = rig();
   r.scheduler.queue("pull");
   r.onDrain = () => {
@@ -239,13 +258,15 @@ test("contract: a wakeup arriving during exit-time settlement is not lost", asyn
 
 test("contract: exit-time re-entry is refused while the daemon is not ready to service", async () => {
   const r = rig();
-  r.scheduler.queue("pull");
+  // A loop that completes no operation still settles once, and that settlement is
+  // the exit seam a wakeup can arrive on.
   r.onDrain = () => {
     r.reentryReady = false;
     r.scheduler.queue("push");
   };
   await r.service();
-  expect(r.serviced).toEqual(["pull"]);
+  expect(r.serviced).toEqual([]);
+  expect(r.drains).toBe(1);
   expect(r.scheduler.wants.push).toBe(true);
 });
 
