@@ -117,19 +117,19 @@ retired.
 
 | metric | baseline (2026-08-14) | current | target |
 |---|---:|---:|---:|
-| anti-slop warnings, repo-wide | 3,421 | **3,260** | 0 |
-| — no-runtime-typeof | — | 982 | 0 |
-| — no-conditional-empty-object-spread | — | 620 | 0 |
-| — no-unknown-parameters | — | 537 | 0 |
-| — no-shape-in-symbol-names | — | 447 | 0 |
-| — no-chained-type-assertions | — | 418 | 0 |
-| — no-known-value-widening | — | 287 | 0 |
-| — no-unsafe-dictionary-type / no-object-parameters | — | 40 | 0 |
-| CODEMAP.md size (lines) | 460 | 456 | **deleted** |
-| size-gate allowlist entries | 69 | 67 | 0 |
-| local branches | ~300 | 53 | ~10 |
+| anti-slop warnings, repo-wide | 3,421 | **2,523** | 0 |
+| — no-runtime-typeof | — | 851 | 0 |
+| — no-conditional-empty-object-spread | — | 555 | 0 |
+| — no-shape-in-symbol-names | — | 424 | 0 |
+| — no-unknown-parameters | — | 304 | 0 |
+| — no-chained-type-assertions | — | 213 | 0 |
+| — no-known-value-widening | — | 148 | 0 |
+| — no-unsafe-dictionary-type / no-object-parameters | — | 28 | 0 |
+| CODEMAP.md size (lines) | 460 | 460 | **deleted** |
+| size-gate allowlist entries | 69 | 65 | 0 |
+| local branches | ~300 | 57 | ~10 |
 | worktrees | 61 | 34 | active-only |
-| loop tasks complete | 0/12 | **9/12** (#31-38) | 12/12 |
+| loop tasks complete | 0/12 | **11/12** (#31-38, #40-41) | 12/12 |
 
 Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| grep -oE 'anti-slop\([a-z-]+\)' \| sort \| uniq -c`; allowlist `grep -cE '^  \["' src/cli/state-plane/file-size.test.ts` (÷2).
 
@@ -162,3 +162,22 @@ Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| 
   census; zero production regressions reached main. Burn-down 3,260. Fleet
   on 0a1e16d. NEXT: batch 4 — #40 (RefPlaneTransaction) + #41 (engine/git
   merge), then capstones #39 + #42 (needs founder support-window sign-off).
+- 2026-08-14 (cont.): **BATCH 4 COMPLETE** — #710 (#40 RefPlaneTransaction:
+  follow.ts 1,210→247 nonblank, its allowlist + ratchet entries DELETED;
+  review added single-capture authority + detached-progress hardening w/ 2
+  regression tests) + #717 (#41: src/engine/git/ GONE — lockfile.ts +
+  git-spawn.ts promoted to engine proper, 24 git-state modules folded into
+  sync-git beside their only consumers; CODEMAP engine/git section + 25
+  entries deleted; git-state.ts pin TIGHTENED 735/33,479→528/24,345; 185
+  warnings→0 in moved production files; review residuals were 4 stale
+  INVARIANTS links + 2 EOF blanks, fixed + self-certified). Parallel opus
+  type-slop lanes #711-716, #718-720 (nine PRs): true-type fixes across
+  engine/daemon, apps/api ×3, remote/genesis, codecs/config, journals ×2,
+  cli-misc — ~600 warnings of the four type rules with zero faked types;
+  honest leftovers documented per PR. Burn-down 3,260 → **2,523** (−898
+  from baseline, 26%). REMAINING: capstone #39 (Publication module) + #42
+  (migration-tree retirement, AWAITING founder support-window sign-off);
+  type-rule mass now concentrated in migration tests (#42 would erase 90),
+  standing-branch-proof contract test, prompt-ink leftover, and the two
+  structural campaigns (no-runtime-typeof parse-at-boundary; shape-names
+  rename decision).
