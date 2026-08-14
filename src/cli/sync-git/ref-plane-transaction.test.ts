@@ -7,7 +7,10 @@ import { promisify } from "node:util";
 import { ownershipProofContext, type GitSection } from "../../engine/index.js";
 import { repoCtx } from "../../engine/git/shared.js";
 import { checkoutJournalBinding } from "./follow-journal.js";
+import { classifyCheckout } from "./follow-classify.js";
 import { readLive } from "./follow-live.js";
+import { effectiveRefs } from "./follow-ref-witness.js";
+import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { RefPlaneTransaction } from "./ref-plane-transaction.js";
 import type { CheckoutClassification, FollowIntended, FollowOptions, StagedIncoming } from "./follow-types.js";
 
@@ -85,7 +88,14 @@ async function transactionOptions(overrides: Partial<FollowOptions> = {}) {
   return {
     live,
     opts,
-    transaction: new RefPlaneTransaction(opts, live, Object.values(live.refs), await ownershipProofContext(ctx)),
+    transaction: new RefPlaneTransaction(
+      opts,
+      live,
+      Object.values(live.refs),
+      await ownershipProofContext(ctx),
+      effectiveRefs(ctx, incoming),
+      live.currentRef,
+    ),
   };
 }
 
@@ -99,6 +109,22 @@ const staged = (indexPath: string, indexProjection?: string): StagedIncoming => 
   cleanupRefs: async () => {},
   cleanup: async () => {},
 });
+
+function branchProtocol(logicalBaseRefs: Record<string, string>): FollowerBranchProtocol {
+  const lineageHash = "1".repeat(64);
+  const repositoryIdentityHash = "2".repeat(64);
+  return {
+    binding: { lineageHash, repositoryIdentityHash },
+    lineageHash,
+    repositoryIdentityHash,
+    logicalBaseRefs,
+    attestations: { incomingKey: "test-incoming", entries: {} },
+    artifacts: {},
+    presentArtifacts: [],
+    unmaterializedAbsenceRefs: new Set(),
+    absenceWitnesses: {},
+  };
+}
 
 test("publication burns prepared-old authority before its first await", async () => {
   let enter!: () => void;
@@ -152,4 +178,124 @@ test("returned publication receipt cannot alter the retained checkout proof", as
 
   expect(proofChanges).toEqual([]);
   expect(result.status).toBe("committed");
+});
+
+test("checkout uses the ref candidate captured before the initial classifier await", async () => {
+  const base = await git("rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "candidate A\n");
+  await git("add", "tracked.txt");
+  await git("commit", "-qm", "candidate A");
+  const candidateA = await git("rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "candidate B\n");
+  await git("add", "tracked.txt");
+  await git("commit", "-qm", "candidate B");
+  const candidateB = await git("rev-parse", "HEAD");
+  await git("reset", "--hard", "-q", base);
+
+  const candidateIndex = path.join(root, "candidate-index");
+  await git("read-tree", candidateA);
+  await fs.copyFile(path.join(repo, ".git", "index"), candidateIndex);
+  await git("reset", "--hard", "-q", base);
+
+  let classifierEntered!: () => void;
+  let releaseClassifier!: () => void;
+  const entered = new Promise<void>((resolve) => { classifierEntered = resolve; });
+  const held = new Promise<void>((resolve) => { releaseClassifier = resolve; });
+  const { live, opts } = await transactionOptions({
+    oracle: {
+      proveRepo: async () => {
+        classifierEntered();
+        await held;
+        return { kind: "match" };
+      },
+      reproveRepo: async () => ({ kind: "match" }),
+      receiptHash: () => "receipt",
+    },
+  });
+  const currentRef = live.currentRef!;
+  opts.incoming.refs[currentRef] = candidateA;
+  opts.branchProtocol = branchProtocol({ [currentRef]: base });
+  const roots = [base, candidateA, candidateB];
+  const ownershipContext = await ownershipProofContext(opts.ctx);
+  const transaction = new RefPlaneTransaction(
+    opts,
+    live,
+    roots,
+    ownershipContext,
+    effectiveRefs(opts.ctx, opts.incoming),
+    currentRef,
+  );
+  const input = staged(candidateIndex, live.indexProjection);
+  const progress = await transaction.publishIndependentRefs(input, live.indexProjection);
+
+  const classifying = classifyCheckout({
+    opts,
+    live,
+    incomingProjection: live.indexProjection,
+    baseProjection: live.indexProjection,
+    roots,
+    boundary: false,
+    heldRefs: progress.heldRefs,
+    ownershipContext,
+  });
+  await entered;
+  opts.incoming.refs[currentRef] = candidateB;
+  releaseClassifier();
+  const first = await classifying;
+  expect(first.safe).toBe(true);
+
+  const result = await transaction.commitCheckout({ staged: input, first, checkoutRoots: roots, baseProjection: live.indexProjection });
+
+  expect(result.status).toBe("committed");
+  expect(await git("rev-parse", "HEAD")).toBe(candidateA);
+});
+
+test("makeIntended cannot remove a held ref from the checkout boundary proof", async () => {
+  const base = await git("rev-parse", "HEAD");
+  const tree = await git("rev-parse", "HEAD^{tree}");
+  const heldBefore = await git("commit-tree", tree, "-p", base, "-m", "held before");
+  const heldAfter = await git("commit-tree", tree, "-p", heldBefore, "-m", "held after");
+  const heldRef = "refs/heads/held";
+  await git("update-ref", heldRef, heldBefore);
+  const intended = { record: {}, expectedRepoGen: 0, relPath: "repo" } as FollowIntended;
+  let callbackSawHeldRef = false;
+  const { live, opts } = await transactionOptions({
+    makeIntended: async (progress) => {
+      callbackSawHeldRef = progress.heldRefs[heldRef] !== undefined;
+      delete progress.heldRefs[heldRef];
+      await git("update-ref", heldRef, heldAfter);
+      return intended;
+    },
+  });
+  delete opts.incoming.refs[heldRef];
+  opts.branchProtocol = branchProtocol({ [live.currentRef!]: base, [heldRef]: heldBefore });
+  const roots = [base];
+  const transaction = new RefPlaneTransaction(
+    opts,
+    live,
+    roots,
+    await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming),
+    live.currentRef,
+  );
+  const candidateIndex = path.join(root, "candidate-index");
+  await fs.copyFile(path.join(opts.ctx.gitDir, "index"), candidateIndex);
+  const input = staged(candidateIndex, live.indexProjection);
+  const progress = await transaction.publishIndependentRefs(input, live.indexProjection);
+  expect(progress.heldRefs[heldRef]).toBe("local-commits");
+  const first: CheckoutClassification = {
+    safe: true,
+    breadcrumbMismatches: [],
+    breadcrumbWaived: false,
+    blockers: [],
+  };
+
+  const result = await transaction.commitCheckout({ staged: input, first, checkoutRoots: roots, baseProjection: live.indexProjection });
+
+  expect(callbackSawHeldRef).toBe(true);
+  expect(result.status).toBe("defer");
+  if (result.status === "defer") {
+    expect(result.result.reason).toBe("local-commits");
+    expect(result.result.detail).toBe(`held ref changed at ${heldRef}`);
+  }
 });

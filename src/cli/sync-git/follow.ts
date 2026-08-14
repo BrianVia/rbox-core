@@ -100,6 +100,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       ownershipProofContext(opts.ctx));
     const effectiveBaseIndexProjection = indexArtifact(opts.base) ? baseProjection : null;
     const effective = effectiveRefs(opts.ctx, opts.incoming);
+    const incomingHeadRef = headBranchOf(opts.incoming.head);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
     const roots = incomingOwnershipRoots(ownershipSection, { prefix: staged.incomingNs, opState: staged.opBytes });
     // R2-3 adjudication: safe-ref publication intentionally precedes the state
@@ -107,7 +108,14 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // displaced value is incoming-owned, remains reachable, and the design's
     // idempotency clause covers the retry. Do not move this behind the checkout
     // journal absent a new normative design change.
-    const refTransaction = new RefPlaneTransaction(opts, liveBefore, roots, initialOwnershipContext);
+    const refTransaction = new RefPlaneTransaction(
+      opts,
+      liveBefore,
+      roots,
+      initialOwnershipContext,
+      effective,
+      incomingHeadRef,
+    );
     let refProgress: Awaited<ReturnType<RefPlaneTransaction["publishIndependentRefs"]>>;
     try {
       refProgress = await refTransaction.publishIndependentRefs(staged, baseProjection);
@@ -136,7 +144,6 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // Scratch refs and held incoming values are not durable roots. Authorize
     // checkout only from incoming refs that are already published (plus the
     // current ref value that this checkout transaction itself will publish).
-    const incomingHeadRef = headBranchOf(opts.incoming.head);
     const durableIncomingRefs = Object.fromEntries(Object.entries(progress.appliedRefs).flatMap(([ref, value]) => {
       const terminal = appliedTerminalOid(value);
       return terminal ? [[ref, terminal] as const] : [];

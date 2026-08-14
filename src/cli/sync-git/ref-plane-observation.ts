@@ -51,8 +51,10 @@ export async function observeRefPlane(
   roots: readonly string[],
   ownershipContext: OwnershipProofContext,
   classifyOnly: boolean,
+  capturedEffective?: ReturnType<typeof effectiveRefs>,
+  capturedIncomingHeadRef?: string,
 ): Promise<RefPlaneObservation> {
-  const effective = effectiveRefs(opts.ctx, opts.incoming);
+  const effective = capturedEffective ?? effectiveRefs(opts.ctx, opts.incoming);
   const owned = classifyOnly
     ? await addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhere(opts.ctx))
     : await (async () => {
@@ -73,7 +75,7 @@ export async function observeRefPlane(
   let checkoutRefDetail: string | undefined;
   let checkoutRefReasonFromIndeterminate = false;
   const manualProtected = new Set(opts.manualResolution?.protectedOids ?? []);
-  const incomingHeadRef = headBranchOf(opts.incoming.head);
+  const incomingHeadRef = capturedEffective ? capturedIncomingHeadRef : headBranchOf(opts.incoming.head);
   const ambiguousRefs = receiverEquivalentCollisionNames([
     ...Object.keys(effective.refs),
     ...Object.keys(live.refs),

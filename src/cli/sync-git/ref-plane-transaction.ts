@@ -17,7 +17,6 @@ import {
 } from "../../engine/index.js";
 import { addTimedMs } from "../../engine/git/chain-timings.js";
 import { humanDisplacementOrigin, prepareDisplacementPins } from "../../engine/git/keep-pins.js";
-import { headBranchOf } from "../../engine/git/shared.js";
 import type { GitDeferralReason } from "../config.js";
 import type { LockedBranchProof } from "./base-composer.js";
 import {
@@ -62,21 +61,7 @@ export interface CheckoutCommitInput {
 }
 
 function copyProgress(source: FollowProgress): FollowProgress {
-  const copy: FollowProgress = {
-    appliedRefs: { ...source.appliedRefs },
-    heldRefs: { ...source.heldRefs },
-    blockers: [...source.blockers],
-    configApplied: source.configApplied,
-  };
-  if (source.consultedReflogPaths) copy.consultedReflogPaths = [...source.consultedReflogPaths];
-  if (source.incomingIndexProjection !== undefined) copy.incomingIndexProjection = source.incomingIndexProjection;
-  if (source.derivedBaseIndexProjection !== undefined) copy.derivedBaseIndexProjection = source.derivedBaseIndexProjection;
-  if (source.branchWitnesses) copy.branchWitnesses = { ...source.branchWitnesses };
-  if (source.branchLockedProofs) copy.branchLockedProofs = { ...source.branchLockedProofs };
-  if (source.safeRefWitnesses) copy.safeRefWitnesses = { ...source.safeRefWitnesses };
-  if (source.manualBranchTerminals) copy.manualBranchTerminals = { ...source.manualBranchTerminals };
-  if (source.tombstonePrunedThisCycle) copy.tombstonePrunedThisCycle = true;
-  return copy;
+  return structuredClone(source);
 }
 
 function copyPublication(source: RefPlaneProgress): RefPlaneProgress {
@@ -92,12 +77,21 @@ export class RefPlaneTransaction {
   private checkoutStarted = false;
 
   constructor(private readonly opts: FollowOptions, private readonly liveBefore: LiveMetadata,
-    private readonly roots: readonly string[], private readonly ownershipContext: OwnershipProofContext) {}
+    private readonly roots: readonly string[], private readonly ownershipContext: OwnershipProofContext,
+    private readonly effective: ReturnType<typeof effectiveRefs>, private readonly incomingHeadRef: string | undefined) {}
 
   async publishIndependentRefs(staged: StagedIncoming, baseProjection?: string): Promise<Readonly<RefPlaneProgress>> {
     if (this.publicationStarted) throw new Error("ref plane publication already started");
     this.publicationStarted = true;
-    const observation = await observeRefPlane(this.opts, this.liveBefore, this.roots, this.ownershipContext, false);
+    const observation = await observeRefPlane(
+      this.opts,
+      this.liveBefore,
+      this.roots,
+      this.ownershipContext,
+      false,
+      this.effective,
+      this.incomingHeadRef,
+    );
     const published = await publishObservedRefPlane(observation);
     published.consultedReflogPaths = [
       ...(this.opts.ctx.kind === "dir" ? ["logs/refs/stash"] : []),
@@ -128,8 +122,7 @@ export class RefPlaneTransaction {
     if (!refProgress || !progress) throw new Error("independent ref plane has not been published");
     const { opts, liveBefore } = this;
     const { staged, first, checkoutRoots } = input;
-    const effective = effectiveRefs(opts.ctx, opts.incoming);
-    const incomingHeadRef = headBranchOf(opts.incoming.head);
+    const { effective, incomingHeadRef } = this;
 
     let origHeadPreservation: OrigHeadPreservation | undefined;
     if (first.breadcrumbWaived) {
@@ -299,7 +292,7 @@ export class RefPlaneTransaction {
       expectedNew,
       binding: opts.binding,
       createdFresh: false,
-      intended: await opts.makeIntended(postProgress),
+      intended: await opts.makeIntended(copyProgress(postProgress)),
     };
     if (opts.manualResolution) this.journal.episode = { verb: "take-theirs", snapshotId: opts.manualResolution.snapshotId };
     await addTimedMs(opts.chainTimings, "journalMs", () => writeCheckoutJournal(opts.workspaceRoot, opts.relPath, this.journal!, {
@@ -396,7 +389,7 @@ export class RefPlaneTransaction {
     if (this.checkoutBranchPlan) {
       if (!checkoutBranchLockedProof) throw new Error("checkout branch committed without locked proof receipt");
       postProgress.branchLockedProofs![this.checkoutBranchPlan.ref] = checkoutBranchLockedProof;
-      this.journal.intended = await opts.makeIntended(postProgress);
+      this.journal.intended = await opts.makeIntended(copyProgress(postProgress));
       await addTimedMs(opts.chainTimings, "journalMs", () => updateCheckoutJournal(opts.workspaceRoot, opts.relPath, this.journal!));
     }
     await addTimedMs(opts.chainTimings, "journalMs", () => markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath));
