@@ -24,6 +24,7 @@ import {
   type CaseFoldCollisionGroup,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
+import type { HashCachePolicy } from "../../engine/hashcache.js";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
@@ -131,7 +132,6 @@ import {
 } from "./policy.js";
 import {
   gitReposMatcherKey,
-  gitTopologyChanged,
   patchManifestFromPull,
   pullTrustWatcherEnabled,
   type TrustedPullViewResult,
@@ -143,17 +143,21 @@ import {
   type DaemonSchedulerPorts,
 } from "./daemon-operation-scheduler.js";
 import { LocalAuthority } from "./local-observation-transition.js";
-import { classifyPublishOutcome, PublishLocalWorkspaceTransition } from "./daemon-publish-transition.js";
+import {
+  classifyPublishOutcome,
+  PublishLocalWorkspaceTransition,
+} from "./daemon-publish-transition.js";
 import {
   ApplyRemoteWorkspaceTransition,
   buildTrustedPullView,
   classifyPullOutcome,
-  type PullTrustFacts,
+  type PullTrustAfterDrain,
+  type PullTrustBeforeDrain,
 } from "./daemon-pull-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
-import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled, type GitCaptureSample } from "../telemetry/contract.js";
+import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { formatPushResiduals, formatPushSpan } from "../sync/format.js";
@@ -203,9 +207,7 @@ function sameReloadStatToken(a: ReloadStatToken | null | undefined, b: ReloadSta
 }
 
 function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceConfig, observedRoot: string): boolean {
-  const bindingRoot = (binding: WorkspaceConfig): string => typeof binding.rootPath === "string"
-    ? path.resolve(binding.rootPath)
-    : path.resolve(observedRoot);
+  const bindingRoot = (binding: WorkspaceConfig): string => path.resolve(binding.rootPath ?? observedRoot);
   return boot.schema === loaded.schema
     && boot.remoteWorkspaceId === loaded.remoteWorkspaceId
     && boot.projectId === loaded.projectId
@@ -213,22 +215,26 @@ function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceCo
     && bindingRoot(boot) === bindingRoot(loaded);
 }
 
+export type DaemonTimerHandle = ReturnType<typeof setTimeout> | number;
 export interface GitBusyRetryClock {
-  setTimeout(fn: () => void, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
+  setTimeout(fn: () => void, ms: number): DaemonTimerHandle;
+  clearTimeout(handle: DaemonTimerHandle): void;
 }
 export interface RecoveryProbeClock extends GitBusyRetryClock {}
 export interface CursorClock extends GitBusyRetryClock {}
 /** Superset of #403's SafetyCadenceClock: t3's pull-only deep-scan cadence
  * needs injectable setInterval too, so one seam drives both timers. */
 export interface ScanCadenceClock extends GitBusyRetryClock {
-  setInterval(fn: () => void, ms: number): unknown;
-  clearInterval(handle: unknown): void;
+  setInterval(fn: () => void, ms: number): DaemonTimerHandle;
+  clearInterval(handle: DaemonTimerHandle): void;
 }
 export interface DaemonShutdownClock extends GitBusyRetryClock {}
 class RecoveryProbePreflightError extends Error {
-  constructor(readonly cause: unknown) {
-    super(cause instanceof Error ? cause.message : String(cause));
+  readonly cause: Error;
+  constructor(cause: unknown) {
+    const normalized = cause instanceof Error ? cause : new Error(String(cause));
+    super(normalized.message);
+    this.cause = normalized;
     this.name = "RecoveryProbePreflightError";
   }
 }
@@ -242,19 +248,14 @@ type ClassifiedOperationFailure =
   | { kind: "quota"; error: QuotaExceededError }
   | {
     kind: "halt";
-    error: unknown;
+    error: Error;
     typedReason?: NonNullable<DaemonActivity["halt"]>["typedReason"];
     terminal?: { fingerprint: string };
     blocked: boolean;
   };
 export type PushProvenance = Readonly<{ signal: boolean; candidate: boolean; scan: boolean; other: boolean }>;
 
-export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCaptureSample | undefined {
-  if (provenance.signal) return { kind: "git_capture", signalPushes: 1, candidatePushes: 0, scanPushes: 0 };
-  if (provenance.candidate) return { kind: "git_capture", signalPushes: 0, candidatePushes: 1, scanPushes: 0 };
-  if (provenance.scan) return { kind: "git_capture", signalPushes: 0, candidatePushes: 0, scanPushes: 1 };
-  return undefined;
-}
+export { gitCaptureSampleForProvenance } from "./daemon-publish-transition.js";
 
 interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
 type FullScanReceipt = ScanCoverage & WatcherRecoveryScanReceipt;
@@ -276,7 +277,7 @@ export function caseCollisionEventsRequireScan(
     }));
   });
 }
-const CARRIER_PRECEDENCE: Readonly<Record<Carrier, number>> = { none: 0, backstop: 1, cursor: 2, notify: 3 };
+const CARRIER_PRECEDENCE = { none: 0, backstop: 1, cursor: 2, notify: 3 } as const satisfies Record<Carrier, number>;
 
 export interface GitDeferralLogSeen { reason: string; boundary: string }
 
@@ -388,7 +389,6 @@ export class RboxDaemon {
   /** The `nativePruneGlobs` output the live parcel subscription was created with —
    *  backend state no facade can retro-fix (design 206 §3b). */
   private watcherNativePruneKey = "";
-  private activeCaseCollisions: CaseFoldCollisionGroup[] = [];
   private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
   private resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping" = "ready";
@@ -408,14 +408,14 @@ export class RboxDaemon {
     log: (line) => this.log(line),
   });
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
-  private gitBusyEpisode?: { timers: unknown[]; queuedStages: number[] };
+  private gitBusyEpisode?: { timers: DaemonTimerHandle[]; queuedStages: number[] };
 
   private readonly watcherSessions: WatcherSessionSupervisor;
   private watcherSessionIdOverride?: string;
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
   private wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
-  private cursorTimer?: unknown;
+  private cursorTimer?: DaemonTimerHandle;
   private cursorEpoch = 0;
   private cursorAbortController?: AbortController;
   private cursorReplyResolve?: (head: number) => void;
@@ -451,8 +451,8 @@ export class RboxDaemon {
   private wsGeneration = 0;
   private pendingCatchUpGeneration?: number;
   private lastWsKeepaliveWrite = 0;
-  private safetyTimer?: unknown;
-  private deepTimer?: unknown;
+  private safetyTimer?: DaemonTimerHandle;
+  private deepTimer?: DaemonTimerHandle;
   private updateCheckTimer?: ReturnType<typeof setInterval>;
   private telemetryFlushTimer?: ReturnType<typeof setInterval>;
   private capabilityInitialTimer?: ReturnType<typeof setTimeout>;
@@ -504,12 +504,9 @@ export class RboxDaemon {
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
   private errRepeat = 0;
-  private pushTerminalBlocked = false;
-  private lastTerminalBlockFingerprint = "";
   /** Foreign-device chain HALTs are terminal for a verified head. Avoid repeatedly
    * attempting repair (and repeating the same HALT) until the authenticated pin moves. */
   private readonly chainRepairPolicy: DaemonChainRepairPolicy;
-  private lastLoggedSeq?: number;
   /** While quota-blocked, only a safety full-scan arms one upload probe. */
   private outOfStorageProbeArmed = false;
   /** The watcher factory. Real native-backed `startWatcher` by default; an injectable seam
@@ -529,7 +526,9 @@ export class RboxDaemon {
   /** Sole owner of the wakeup queue, the recovery episode, mutex backoff/starvation,
    *  the active operation, and the single-flight/drain state. */
   private readonly scheduler: DaemonOperationScheduler;
-  private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
+  private readonly publishTransition: PublishLocalWorkspaceTransition;
+  private readonly pullTransition: ApplyRemoteWorkspaceTransition;
+  private readonly metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
   /** In-memory activity record mirrored to `.rbox/state/activity.json` (design 45) —
    *  what `rbox status` reads for the health verdict, last-sync trail, live transfer
    *  progress, and (crucially) the mass-delete-guard halt warning. */
@@ -607,7 +606,7 @@ export class RboxDaemon {
     this.mutationGate = new ShutdownMutationGate(() => this.writeAmbientStatus());
     this.gitBusyRetryClock = opts.gitBusyRetryClock ?? {
       setTimeout: (fn, ms) => setTimeout(fn, ms),
-      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      clearTimeout: (handle) => clearTimeout(handle),
     };
     this.onStopped = opts.onStopped;
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
@@ -662,7 +661,7 @@ export class RboxDaemon {
         handle.unref?.();
         return handle;
       },
-      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      clearTimeout: (handle) => clearTimeout(handle),
     };
     this.cursorClock = opts.cursorClock ?? {
       setTimeout: (fn, ms) => {
@@ -670,11 +669,11 @@ export class RboxDaemon {
         handle.unref?.();
         return handle;
       },
-      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+      clearTimeout: (handle) => globalThis.clearTimeout(handle),
     };
     this.scanCadenceClock = opts.scanCadenceClock ?? {
       setTimeout: (fn, ms) => setTimeout(fn, ms),
-      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      clearTimeout: (handle) => clearTimeout(handle),
       setInterval: (fn, ms) => setInterval(fn, ms),
       clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
     };
@@ -783,6 +782,47 @@ export class RboxDaemon {
       wake: () => void this.pump(),
     };
     this.scheduler = new DaemonOperationScheduler(ports);
+    this.publishTransition = new PublishLocalWorkspaceTransition({
+      root: this.root,
+      local: this.local,
+      retries: this.retryQueue,
+      activity: this.activity,
+      metrics: this.metrics,
+      telemetry: this.telemetry,
+    }, {
+      log: this.log,
+      refreshDurableState: async () => { this.emitDurableGitDeferrals(await this.loadSyncBase()); },
+    });
+    this.pullTransition = new ApplyRemoteWorkspaceTransition({
+      root: this.root,
+      local: this.local,
+      metrics: this.metrics,
+      telemetry: this.telemetry,
+      chainRepairPolicy: this.chainRepairPolicy,
+      publishTransition: this.publishTransition,
+      now: this.now,
+    }, {
+      log: this.log,
+      refreshMatcher: async () => {
+        this.rebuildMatcher(await this.loadSyncBase());
+        this.rulesChangedSinceDeepScan = true;
+      },
+      loadAndSurfacePostBase: async () => {
+        const base = await this.loadSyncBase();
+        this.emitDurableGitDeferrals(base);
+        return base;
+      },
+      installPullPatch: (view, actions, postBase, generation) =>
+        this.installPullPatch(view.manifest, actions, postBase, generation),
+      scanLocal: async (previous) => {
+        await this.localObserver.observe({
+          kind: "scan",
+          cache: this.cache,
+          previous,
+          mode: this.watcherScanMode(),
+        });
+      },
+    });
   }
 
   // ---- scheduler-owned state, as the daemon's test-visible surface -----------
@@ -804,6 +844,19 @@ export class RboxDaemon {
   private set watcher(value: Watcher | undefined) { this.watcherSessions.installForTest(value, this.watcherSessionIdOverride); }
   private get watcherSessionId(): string | undefined { return this.watcherSessionIdOverride ?? this.watcherSessions.sessionId; }
   private set watcherSessionId(value: string | undefined) { this.watcherSessionIdOverride = value; }
+
+  private get activeCaseCollisions(): readonly CaseFoldCollisionGroup[] { return this.publishTransition.activeCaseCollisions; }
+  private set activeCaseCollisions(groups: readonly CaseFoldCollisionGroup[]) {
+    this.publishTransition.adoptCollisionObservation(groups, this.local.observationComplete);
+  }
+  private get pushTerminalBlocked(): boolean { return this.publishTransition.isTerminalBlocked; }
+  private set pushTerminalBlocked(blocked: boolean) {
+    if (!blocked) this.publishTransition.clearTerminalBlock();
+  }
+  private get lastLoggedSeq(): number | undefined { return this.publishTransition.lastPublishedSequence; }
+  private set lastLoggedSeq(sequence: number | undefined) {
+    if (sequence !== undefined) this.publishTransition.adoptPublishedSequence(sequence);
+  }
 
   /** The halt record the dequeued probe was armed against, handed from the operation's
    *  own prologue to its body (the record itself is never the scheduler's). */
@@ -837,7 +890,13 @@ export class RboxDaemon {
     if (!(await this.writeStartupBinding())) return;
 
     this.cache = await HashCache.load(this.root, this.hashCachePolicy());
-    this.metrics = await loadMetrics(this.root);
+    const loadedMetrics = await loadMetrics(this.root);
+    this.metrics.syncs = loadedMetrics.syncs;
+    this.metrics.commitConflicts409 = loadedMetrics.commitConflicts409;
+    this.metrics.fileConflicts = loadedMetrics.fileConflicts;
+    this.metrics.lockStarved = loadedMetrics.lockStarved;
+    if (loadedMetrics.lastConflictAt === undefined) delete this.metrics.lastConflictAt;
+    else this.metrics.lastConflictAt = loadedMetrics.lastConflictAt;
     const persistedActivity = await loadActivity(this.root);
     if (persistedActivity) {
       if (persistedActivity.halt?.typedReason?.kind === "folder-admission") {
@@ -1096,7 +1155,7 @@ export class RboxDaemon {
   }
 
   private async recoverStateCasWithGate(commonDir?: string): Promise<Awaited<ReturnType<typeof recoverStateCasLocks>>> {
-    const lease = this.mutationGate.enter({ phase: "state-cas", ...(commonDir ? { repository: commonDir } : {}) });
+    const lease = this.mutationGate.enter({ phase: "state-cas", repository: commonDir });
     try {
       if (!lease.beginCommit()) throw new MutationGateClosedError();
       return await recoverStateCasLocks(this.root, commonDir ? { commonDir } : {});
@@ -1198,14 +1257,9 @@ export class RboxDaemon {
     return snapshot;
   }
 
-  private recordGitCaptureSuccess(provenance: PushProvenance): void {
-    const sample = gitCaptureSampleForProvenance(provenance);
-    if (sample) this.telemetry.record(sample);
-  }
-
   private noteGitBusyDeferred(): void {
     if (this.stopped || this.gitBusyEpisode) return;
-    const episode = { timers: [] as unknown[], queuedStages: [] as number[] };
+    const episode: NonNullable<RboxDaemon["gitBusyEpisode"]> = { timers: [], queuedStages: [] };
     this.gitBusyEpisode = episode;
     const schedule = (stage: number, delayMs: number) => {
       const timer = this.gitBusyRetryClock.setTimeout(() => {
@@ -1393,11 +1447,11 @@ export class RboxDaemon {
 
   private recordRecoveryFailure(
     op: keyof Wants,
-    error: unknown,
+    error: Error,
     typedReason?: NonNullable<DaemonActivity["halt"]>["typedReason"],
     terminal?: { fingerprint: string },
   ): void {
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = error.message;
     const now = this.now();
     const prior = this.activity.halt;
     const same = prior?.op === op && (prior.typedReason && typedReason
@@ -1407,7 +1461,7 @@ export class RboxDaemon {
     const consecutiveFailures = same ? (prior.consecutiveFailures ?? prior.count) + 1 : 1;
     const lastFailureAt = new Date(now).toISOString();
     const nextProbeAt = new Date(now + recoveryProbeDelayMs(consecutiveFailures, this.recoveryRandom)).toISOString();
-    this.activity.halt = {
+    const halt: NonNullable<DaemonActivity["halt"]> = {
       at: firstFailureAt,
       reason,
       count: consecutiveFailures,
@@ -1417,17 +1471,18 @@ export class RboxDaemon {
       consecutiveFailures,
       nextProbeAt,
       recoveryState: this.pullOnly && op === "push" ? "suspended" : "armed",
-      ...(prior?.lastProbeAt ? { lastProbeAt: prior.lastProbeAt } : {}),
-      ...(typedReason ? { typedReason } : {}),
-      ...(terminal ? { terminal } : {}),
     };
+    halt.lastProbeAt = prior?.lastProbeAt;
+    halt.typedReason = typedReason;
+    halt.terminal = terminal;
+    this.activity.halt = halt;
     if (!(this.pullOnly && op === "push")) this.scheduler.queue(op);
     this.scheduler.disarmRecoveryDue();
     this.armStandingRecovery();
     this.writeActivity();
   }
 
-  private classifyOperationFailure(error: unknown): ClassifiedOperationFailure {
+  private classifyOperationFailure(error: Error): ClassifiedOperationFailure {
     const actual = error instanceof RecoveryProbePreflightError ? error.cause : error;
     if (actual instanceof QuotaExceededError) return { kind: "quota", error: actual };
     if (actual instanceof CommitRejectedError) {
@@ -1436,13 +1491,14 @@ export class RboxDaemon {
         : actual.reason === "body_too_large"
           ? { kind: "body-too-large" }
           : undefined;
-      return {
+      const failure: Extract<ClassifiedOperationFailure, { kind: "halt" }> = {
         kind: "halt",
         error: actual,
         typedReason,
-        ...(actual.fingerprint ? { terminal: { fingerprint: actual.fingerprint } } : {}),
         blocked: true,
       };
+      if (actual.fingerprint) failure.terminal = { fingerprint: actual.fingerprint };
+      return failure;
     }
     if (actual instanceof RecoveryConditionPersistsError) {
       return {
@@ -1740,9 +1796,12 @@ export class RboxDaemon {
         this.lastErrMsg = "";
         this.errRepeat = 0;
       }
-      if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
+      if (cleared || this.activityDirty || this.publishTransition.activityDirty || Date.now() - this.lastActivityWrite > 30_000) {
+        this.writeActivity();
+      }
     } catch (e) {
-      if (e instanceof MutationGateClosedError && this.stopped) {
+      const error = e instanceof Error ? e : new Error(String(e));
+      if (error instanceof MutationGateClosedError && this.stopped) {
         // Cooperative shutdown cancellation is not an operation failure:
         // no durable halt, retry counter, or misleading error surface.
         return;
@@ -1762,17 +1821,17 @@ export class RboxDaemon {
       // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
       // first hit and every 10th after, with the running count — so the log stays
       // readable while still showing exactly how long the failure has persisted.
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = error.message;
       this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
       this.lastErrMsg = msg;
       const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
       if (op === "recoveryProbe") {
         const standing = this.activity.halt;
         if (standing) {
-          const failure = this.classifyOperationFailure(e);
+          const failure = this.classifyOperationFailure(error);
           if ((standing.typedReason?.kind === "push-conflict"
             || (standing.op === "push" && !standing.typedReason && !standing.terminal))
-            && e instanceof RecoveryProbePreflightError
+            && error instanceof RecoveryProbePreflightError
             && failure.kind === "halt"
             && !failure.typedReason
             && !failure.terminal) {
@@ -1797,7 +1856,7 @@ export class RboxDaemon {
         if (shouldLogRepeat) this.log(`recovery probe failed: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
         return;
       }
-      const failure = this.classifyOperationFailure(e);
+      const failure = this.classifyOperationFailure(error);
       const recorded = this.recordClassifiedFailure(op, failure);
       if (recorded.kind === "quota") {
         if (shouldLogRepeat) this.log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
@@ -1859,6 +1918,7 @@ export class RboxDaemon {
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
     const receipt = await this.publishTransition.publish(provenance, {
+      appliedBase: this.syncBase?.lastSyncedManifest,
       execute: (request) => classifyPublishOutcome(request, () => pushManifest(this.root, this.cfg, request.manifest, {
         ...this.e2ee,
         cache: this.cache,
@@ -1893,66 +1953,14 @@ export class RboxDaemon {
     this.propagationTrace?.publishReceipt(receipt.sequence);
   }
 
-  private readonly publishTransition = new PublishLocalWorkspaceTransition({
-    sealAttemptInputs: () => ({
-      manifest: this.local.manifest,
-      appliedBase: this.syncBase?.lastSyncedManifest,
-      gcFencedPaths: this.retryQueue.gcFencedPaths,
-      observationComplete: this.local.observationComplete,
-      caseCollisions: this.activeCaseCollisions,
-      blockedFingerprint: this.terminalPushBlock(),
-    }),
-    lastPublishedSequence: () => this.lastLoggedSeq,
-    noteTerminalBlock: (fingerprint) => {
-      this.pushTerminalBlocked = true;
-      this.logTerminalPushBlocked(fingerprint);
-    },
-    recordGitCaptureSuccess: (provenance) => this.recordGitCaptureSuccess(provenance),
-    commitPublishedSubset: (next, deferred) => {
-      this.local.commitPatch(next, { kind: "partial", source: "push-committed", paths: new Set(deferred) }, { add: deferred });
-    },
-    adoptCollisionObservation: (groups, observationComplete) => {
-      this.activeCaseCollisions = groups.map((group) => ({ paths: [...group.paths] }));
-      this.local.setObservationComplete(observationComplete);
-    },
-    log: (line) => this.log(line),
-    notePublishedSequence: (sequence) => { this.lastLoggedSeq = sequence; },
-    recordPublishActivity: (files, sequence) => {
-      // The status trail: "last push: 2m ago — N files → sequence S" (design 45).
-      // Its own slot — it must never mask what a recovery pull applied.
-      this.activity.lastPush = { at: new Date().toISOString(), files, sequence };
-      this.activityDirty = true;
-    },
-    scheduleWriteFinish: (paths) => this.retryQueue.scheduleWriteFinish(new Set(paths)),
-    scheduleGcFence: (paths) => this.retryQueue.scheduleGcFence(new Set(paths)),
-    refreshDurableState: async () => { this.emitDurableGitDeferrals(await this.loadSyncBase()); },
-    recordSyncMetric: async () => {
-      this.metrics.syncs += 1;
-      await saveMetrics(this.root, this.metrics);
-    },
-  });
-
-  private terminalPushBlock(): string | undefined {
-    const halt = this.activity.halt;
-    if (!halt || halt.op !== "push") return undefined;
-    return halt.terminal?.fingerprint;
-  }
-
-  private logTerminalPushBlocked(fingerprint: string | undefined): void {
-    if (!fingerprint || this.lastTerminalBlockFingerprint === fingerprint) return;
-    this.lastTerminalBlockFingerprint = fingerprint;
-    const reason = this.activity.halt?.reason ?? "push is blocked";
-    this.log(`push blocked: ${reason} — change the workspace or raise limits`);
-  }
-
   private recordOutOfStorage(e: QuotaExceededError, op: keyof Wants): boolean {
     const next: NonNullable<DaemonActivity["outOfStorage"]> = {
       at: new Date().toISOString(),
       kind: e.kind,
-      ...(e.used !== undefined ? { used: e.used } : {}),
-      ...(e.cap !== undefined ? { cap: e.cap } : {}),
-      ...(e.reason === "no_plan" ? { reason: e.reason } : {}),
     };
+    next.used = e.used;
+    next.cap = e.cap;
+    next.reason = e.reason === "no_plan" ? e.reason : undefined;
     const prev = this.activity.outOfStorage;
     const clearsStaleQuotaHalt =
       this.activity.halt !== undefined &&
@@ -2048,29 +2056,33 @@ export class RboxDaemon {
     return this.local.observationComplete && this.activeCaseCollisions.length === 0;
   }
 
-  /** The daemon-state readings design 202's trust predicate P is evaluated over.
-   *  `deferred` aliases the live unsettled set deliberately: it is read-only to
-   *  `pull()` (ReadonlySet) and every writer of that set is pump-owned code that cannot
-   *  run while this op's `pull()` is in flight — watcher callbacks only enqueue events,
-   *  and the pump is single-flight. The op therefore sees one consistent snapshot
-   *  without copying it. */
-  private pullTrustFacts(base: SyncState): PullTrustFacts {
+  private pullTrustBeforeDrain(base: SyncState): PullTrustBeforeDrain {
     return {
-      killSwitchOff: () => !pullTrustWatcherEnabled(),
-      watcherTrusted: () => this.watcherTrustedForPull(),
-      manifestSettled: () => this.manifestSettledForPull(),
-      fullWorkspaceSinceSeed: () => this.local.fullWorkspaceSinceSeed,
-      resetReady: () => this.resetLifecycle === "ready",
-      matcherMatchesBase: () => this.matcherGitReposKey === gitReposMatcherKey(base),
-      matcherObservationCurrent: () => this.local.observedMatcherGeneration === this.matcherGeneration,
-      drainPendingEvents: () => this.applyPendingWatchEvents(),
-      pendingEmpty: () => this.pendingEvents.length === 0,
+      killSwitchOff: !pullTrustWatcherEnabled(),
+      watcherTrusted: this.watcherTrustedForPull(),
+      manifestSettled: this.manifestSettledForPull(),
+      fullWorkspaceSinceSeed: this.local.fullWorkspaceSinceSeed,
+      resetReady: this.resetLifecycle === "ready",
+      matcherMatchesBase: this.matcherGitReposKey === gitReposMatcherKey(base),
+      matcherObservationCurrent: this.local.observedMatcherGeneration === this.matcherGeneration,
+    };
+  }
+
+  private pullTrustAfterDrain(): PullTrustAfterDrain {
+    return {
+      pendingEmpty: this.pendingEvents.length === 0,
+      watcherTrusted: this.watcherTrustedForPull(),
+      manifestSettled: this.manifestSettledForPull(),
       trustedView: () => ({ manifest: this.local.trustedProjection(), deferred: this.local.unsettledPaths }),
     };
   }
 
   private buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
-    return buildTrustedPullView(this.pullTrustFacts(base));
+    return buildTrustedPullView(
+      this.pullTrustBeforeDrain(base),
+      () => this.applyPendingWatchEvents(),
+      () => this.pullTrustAfterDrain(),
+    );
   }
 
   /**
@@ -2146,8 +2158,15 @@ export class RboxDaemon {
         // before the post-pull install; the pre-op base is F2's "before" side.
         const watcherErrorGeneration = this.watcherErrorGeneration;
         const preBase = this.syncBase ?? await this.loadSyncBase();
-        return { trust: await this.buildTrustedPullView(preBase), preBase, watcherErrorGeneration, notifyPendingAt };
+        return {
+          beforeDrain: this.pullTrustBeforeDrain(preBase),
+          preBase,
+          watcherErrorGeneration,
+          notifyPendingAt,
+        };
       },
+      drainPendingEvents: () => this.applyPendingWatchEvents(),
+      afterDrain: () => this.pullTrustAfterDrain(),
       open: () => {
         const metricsReport = beginReport("pull");
         const report = metricsReport ?? (telemetryEnabled() || this.propagationTrace ? PhaseReport.pull() : undefined);
@@ -2189,38 +2208,6 @@ export class RboxDaemon {
       },
     });
   }
-
-  private readonly pullTransition = new ApplyRemoteWorkspaceTransition({
-    clearChainRepair: () => this.chainRepairPolicy.clear(),
-    recordPropagation: (pendingAt) => {
-      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, this.now() - pendingAt) });
-    },
-    recordFileConflicts: async (count) => {
-      this.metrics.fileConflicts += count;
-      this.metrics.lastConflictAt = new Date().toISOString();
-      await saveMetrics(this.root, this.metrics);
-    },
-    refreshMatcher: async () => {
-      this.rebuildMatcher(await this.loadSyncBase());
-      this.rulesChangedSinceDeepScan = true;
-    },
-    adoptPostBase: async () => {
-      const base = await this.loadSyncBase();
-      this.emitDurableGitDeferrals(base);
-      this.lastLoggedSeq = base.lastSyncedSequence;
-      return base;
-    },
-    gitTopologyChanged: (before, after) => gitTopologyChanged(before, after),
-    // The scan does NOT realign matcher provenance — the guarded rebuild in
-    // `loadSyncBase` already did that (design 206 §1), so it runs under a current
-    // matcher and its install re-stamps the observation generation.
-    scanLocal: async (previous) => {
-      await this.localObserver.observe({ kind: "scan", cache: this.cache, previous, mode: this.watcherScanMode() });
-    },
-    installPullPatch: (view, actions, postBase, generation) =>
-      this.installPullPatch(view.manifest, actions, postBase, generation),
-    log: (line) => this.log(line),
-  });
 
   private bumpConflict(_kind: "commit"): void {
     this.metrics.commitConflicts409 += 1;
@@ -2440,7 +2427,7 @@ export class RboxDaemon {
       changed: manifestDiff.changed.length,
       deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,
       settled,
-      ...(this.strandedIgnored === undefined ? {} : { strandedIgnored: this.strandedIgnored }),
+      strandedIgnored: this.strandedIgnored,
       sourceVersion: 1,
     };
   }
@@ -2451,7 +2438,7 @@ export class RboxDaemon {
     // most specific active lease rather than masking it with its outer scope.
     const mutations = this.mutationGate.snapshot();
     const activeMutation = mutations[mutations.length - 1];
-    return {
+    const status: RboxBarAmbientStatus = {
       ...projectAmbientDaemonStatus({
         activity: snapshot,
         settled,
@@ -2471,17 +2458,16 @@ export class RboxDaemon {
       mode: this.pullOnly ? "pull-only" : "read-write",
       bootId: this.bootId,
       workspaceRoot: this.root,
-      ...(this.mutationGate.closed ? {
-        shutdown: {
-          gateClosed: true as const,
-          ...(activeMutation ? {
-            phase: activeMutation.phase,
-            repository: activeMutation.repository,
-            committed: activeMutation.committed,
-          } : {}),
-        },
-      } : {}),
     };
+    if (this.mutationGate.closed) {
+      status.shutdown = {
+        gateClosed: true,
+        phase: activeMutation?.phase,
+        repository: activeMutation?.repository,
+        committed: activeMutation?.committed,
+      };
+    }
+    return status;
   }
 
   private activitySnapshot(): DaemonActivity {
@@ -2489,16 +2475,17 @@ export class RboxDaemon {
     // via persistence — ERASED by a folder-admission halt; admission is the
     // secondary condition and only surfaces when nothing stronger is live.
     const visibleHalt = this.activity.halt ?? this.folderAdmissionActivityHalt;
+    const halt = visibleHalt ? {
+      ...visibleHalt,
+      typedReason: visibleHalt.typedReason ? { ...visibleHalt.typedReason } : undefined,
+      terminal: visibleHalt.terminal ? { ...visibleHalt.terminal } : undefined,
+    } : undefined;
     return {
       ...this.activity,
       local: this.activity.local ? { ...this.activity.local } : undefined,
       ws: this.activity.ws ? { ...this.activity.ws } : undefined,
       active: this.activity.active ? { ...this.activity.active } : undefined,
-      halt: visibleHalt ? {
-        ...visibleHalt,
-        ...(visibleHalt.typedReason ? { typedReason: { ...visibleHalt.typedReason } } : {}),
-        ...(visibleHalt.terminal ? { terminal: { ...visibleHalt.terminal } } : {}),
-      } : undefined,
+      halt,
     };
   }
 
@@ -2578,6 +2565,7 @@ export class RboxDaemon {
     if (bumpHeartbeat) {
       this.activity.at = new Date().toISOString();
       this.activityDirty = false;
+      this.publishTransition.acknowledgeActivityWrite();
       this.lastActivityWrite = Date.now();
     }
     // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
@@ -2798,10 +2786,11 @@ export class RboxDaemon {
     total: number,
     phase: TransferPhase,
     detailOrBytes?: string | TransferProgressBytes,
-    maybeBytes?: TransferProgressBytes
+    maybeBytes?: TransferProgressBytes,
   ): void {
-    const detail = typeof detailOrBytes === "string" ? detailOrBytes : undefined;
-    const bytes = typeof detailOrBytes === "string" ? maybeBytes : detailOrBytes;
+    const byteOnly = detailOrBytes instanceof Object;
+    const detail = byteOnly ? undefined : detailOrBytes;
+    const bytes = byteOnly ? detailOrBytes : maybeBytes;
     const now = Date.now();
     const final = total > 0 && done >= total;
     const phaseChanged = phase !== this.lastProgressPhase;
@@ -2821,10 +2810,11 @@ export class RboxDaemon {
       phase,
       done,
       total,
-      ...(detail !== undefined ? { detail } : {}),
-      ...(bytes ? { bytesDone: bytes.bytesDone, ...(bytes.bytesTotal !== undefined ? { bytesTotal: bytes.bytesTotal } : {}) } : {}),
-      ...(bytes?.bytesPerSecond !== undefined ? { bytesPerSecond: bytes.bytesPerSecond } : {}),
-      ...(bytes?.etaSeconds !== undefined ? { etaSeconds: bytes.etaSeconds } : {}),
+      detail,
+      bytesDone: bytes?.bytesDone,
+      bytesTotal: bytes?.bytesTotal,
+      bytesPerSecond: bytes?.bytesPerSecond,
+      etaSeconds: bytes?.etaSeconds,
     };
     this.writeActivity();
   }
@@ -3002,7 +2992,7 @@ export class RboxDaemon {
           // The same retained-expected mismatch must survive; healed scan churn is dropped.
           if (candidateStillMismatch(candidate, current)) {
             const originUntrusted = candidate.originUntrusted || auditContaminated;
-            survivors.push({ ...candidate, quiescentAtScan: quiescent, ...(originUntrusted ? { originUntrusted: true } : {}) });
+            survivors.push({ ...candidate, quiescentAtScan: quiescent, originUntrusted: originUntrusted || undefined });
           }
         }
         const held: DriftCandidate[] = [];
@@ -3291,7 +3281,7 @@ export class RboxDaemon {
     }
   }
 
-  private hashCachePolicy(): { syncGit: boolean; incremental: boolean } {
+  private hashCachePolicy(): HashCachePolicy {
     return { syncGit: this.cfg.syncGit === true, incremental: this.cfg.git?.incremental !== false };
   }
 
@@ -3304,9 +3294,7 @@ export class RboxDaemon {
       caughtUp: false,
       bootId: this.bootId,
       pid: process.pid,
-      ...(this.activity.ws?.lastBroadcastSequence !== undefined
-        ? { lastBroadcastSequence: this.activity.ws.lastBroadcastSequence }
-        : {}),
+      lastBroadcastSequence: this.activity.ws?.lastBroadcastSequence,
     };
   }
 
@@ -3405,9 +3393,9 @@ export class RboxDaemon {
     }
     if (this.resetLifecycle !== "ready") return;
     try {
-      const m = JSON.parse(data) as { type?: string; sequence?: unknown };
+      const m = JSON.parse(data) as Partial<{ type: string; sequence: number }>;
       if (m.type === "committed") {
-        const sequence = typeof m.sequence === "number" ? m.sequence : -1;
+        const sequence = Number.isFinite(m.sequence) ? Number(m.sequence) : -1;
         if (this.ws) this.resetCursorSchedule(this.ws);
         this.recordCommittedFrame(sequence);
         if (sequence >= 0) this.propagationTrace?.wsCommittedFrame(sequence);
@@ -3514,7 +3502,7 @@ export class RboxDaemon {
     const controller = new AbortController();
     this.cursorAbortController = controller;
     const timeoutMs = Math.min(10_000, Math.max(1, this.cursorCheckMs - 1));
-    let timeout: unknown;
+    let timeout: DaemonTimerHandle | undefined;
     const reply = new Promise<number>((resolve, reject) => {
       this.cursorReplyResolve = resolve;
       controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
@@ -3600,7 +3588,7 @@ export class RboxDaemon {
     try {
       // Bun's WebSocket client accepts a `{ headers }` option (verified) that the
       // standard lib types omit; declare that signature rather than cast to a lie.
-      const BunWebSocket = WebSocket as unknown as {
+      const BunWebSocket = WebSocket as {
         new (url: string, opts: { headers: Record<string, string> }): WebSocket;
       };
       ws = new BunWebSocket(url, { headers: { Authorization: `Bearer ${this.cfg.token}` } });
@@ -3654,16 +3642,16 @@ export function createDaemonShutdownHandler(deps: {
 }): () => void {
   const clock = deps.clock ?? {
     setTimeout: (fn, ms) => setTimeout(fn, ms),
-    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    clearTimeout: (handle) => clearTimeout(handle),
   };
   const kill = deps.kill ?? (() => process.kill(process.pid, "SIGKILL"));
   let signals = 0;
   let finished = false;
-  let shutdownDeadline: unknown;
+  let shutdownDeadline: DaemonTimerHandle | undefined;
   const armDeadline = () => {
     if (finished || shutdownDeadline !== undefined) return;
     shutdownDeadline = clock.setTimeout(kill, 60_000);
-    (shutdownDeadline as { unref?: () => void } | undefined)?.unref?.();
+    (shutdownDeadline as ReturnType<typeof setTimeout>).unref?.();
   };
   return () => {
     signals++;

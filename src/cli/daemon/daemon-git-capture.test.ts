@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { HashCache, scanManifest, type BlobStore, type Manifest } from "../../engine/index.js";
+import { type SyncDeps } from "../sync.js";
 import { type SyncState, type WorkspaceConfig } from "../config.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import { GIT_BUSY_RETRY_DELAYS_MS, RboxDaemon, gitCaptureSampleForProvenance, type GitBusyRetryClock } from "./daemon.js";
@@ -75,7 +76,9 @@ class FakeBusyClock implements GitBusyRetryClock {
     this.timers.set(id, { at: this.now + delay, fn });
     return id;
   };
-  clearTimeout = (handle: unknown): void => { this.timers.delete(handle as number); };
+  clearTimeout = (handle: ReturnType<GitBusyRetryClock["setTimeout"]>): void => {
+    this.timers.delete(Number(handle));
+  };
   async advanceTo(target: number): Promise<void> {
     while (true) {
       const due = [...this.timers.entries()].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
@@ -126,6 +129,11 @@ interface EpisodeDaemon {
   loadSyncBase(): Promise<SyncState>;
   pump(): Promise<void>;
   stop(): Promise<void>;
+}
+
+interface ProvenanceDaemon {
+  requestPush(reason: "signal" | "candidate" | "scan" | "other"): void;
+  takePushProvenance(): { signal: boolean; candidate: boolean; scan: boolean; other: boolean };
 }
 
 async function waitFor(predicate: () => boolean, message: string, timeoutMs = 10_000): Promise<void> {
@@ -182,7 +190,7 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
       bootId: `episode-${variant}`,
       gitBusyRetryClock: clock,
       log: () => {},
-    }) as unknown as EpisodeDaemon;
+    }) as EpisodeDaemon;
     let signalBatches = 0;
     const debouncer = createSignalDebouncer((batch) => {
       signalBatches++;
@@ -299,11 +307,8 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
 
 test("push provenance snapshots at dequeue and preserves later reasons for the next push", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-provenance-")));
-  const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  const daemon = new RboxDaemon(root, cfg as never, {} as never) as unknown as {
-    requestPush(reason: "signal" | "candidate" | "scan" | "other"): void;
-    takePushProvenance(): { signal: boolean; candidate: boolean; scan: boolean; other: boolean };
-  };
+  const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" } satisfies WorkspaceConfig;
+  const daemon = new RboxDaemon(root, cfg, {} as SyncDeps) as ProvenanceDaemon;
   try {
     daemon.requestPush("signal");
     expect(daemon.takePushProvenance()).toEqual({ signal: true, candidate: false, scan: false, other: false });
@@ -314,22 +319,15 @@ test("push provenance snapshots at dequeue and preserves later reasons for the n
   }
 });
 
-test("every raw want.push assignment is owned by requestPush and terminal recording is at the normal return boundary", () => {
+test("every raw want.push assignment is owned by requestPush and publish settlement has no effect membrane", () => {
   const source = fs.readFileSync(fileURLToPath(new URL("./daemon.ts", import.meta.url)), "utf8");
   // The queue moved into DaemonOperationScheduler; the ownership rule did not —
   // exactly one literal push request exists and requestPush is where it lives.
   expect(source.match(/this\.scheduler\.request\("push"\)/g)).toHaveLength(1);
   const requestPush = source.slice(source.indexOf("private requestPush"), source.indexOf("private takePushProvenance"));
   expect(requestPush).toContain('this.scheduler.request("push")');
-  expect(source.match(/this\.recordGitCaptureSuccess\(provenance\)/g)).toHaveLength(1);
-  // The ordering this gate froze now lives in the publish reducer that owns it: a
-  // terminal refusal returns before any capture credit, and credit precedes the
-  // committed-subset bookkeeping.
-  const reducer = fs.readFileSync(fileURLToPath(new URL("./daemon-publish-transition.ts", import.meta.url)), "utf8");
-  const terminal = reducer.indexOf('if (outcome.kind === "terminal-block")');
-  const recorded = reducer.indexOf('"record-git-capture-success"', terminal);
-  const bookkeeping = reducer.indexOf('"commit-published-subset"', recorded);
-  expect(terminal).toBeGreaterThan(0);
-  expect(terminal).toBeLessThan(recorded);
-  expect(recorded).toBeLessThan(bookkeeping);
+  const transition = fs.readFileSync(fileURLToPath(new URL("./daemon-publish-transition.ts", import.meta.url)), "utf8");
+  expect(transition).not.toContain("DaemonPublishEffect");
+  expect(transition).not.toContain("DaemonPublishEffects");
+  expect(transition).not.toContain("reduceDaemonPublishOutcome");
 });

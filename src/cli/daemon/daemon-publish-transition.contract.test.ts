@@ -1,25 +1,34 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { CaseFoldCollisionGroup, Manifest } from "../../engine/index.js";
+import type { DaemonActivity } from "../activity.js";
+import { loadMetrics, type SyncMetrics } from "../metrics.js";
 import { CommitRejectedError } from "../remote.js";
 import type { PushResult } from "../sync/push.js";
+import type { TelemetrySample } from "../telemetry/contract.js";
+import type { TelemetryRecorder } from "../telemetry/queue.js";
+import type { PushProvenance } from "./daemon.js";
 import {
   PublishLocalWorkspaceTransition,
   classifyPublishOutcome,
-  reduceDaemonPublishOutcome,
   sealPublishRequest,
-  type DaemonPublishEffect,
-  type DaemonPublishEffects,
   type DaemonPushOutcome,
   type PublishAttemptInputs,
   type PushTransitionPort,
   type SealedPublishRequest,
 } from "./daemon-publish-transition.js";
-import type { PushProvenance } from "./daemon.js";
+import { LocalAuthority } from "./local-observation-transition.js";
+import type { LocalRetryQueuePort } from "./local-workspace-observer.js";
 
 const PROVENANCE: PushProvenance = { signal: false, candidate: false, scan: true, other: false };
 
-function manifest(files: string[], generatedAt = "2026-07-26T00:00:00.000Z"): Manifest {
-  return { generatedAt, files: files.map((path) => ({ path, size: 1, mtime: 0, hash: `h-${path}` })) } as Manifest;
+function manifest(files: string[]): Manifest {
+  return {
+    generatedAt: "2026-07-26T00:00:00.000Z",
+    files: files.map((filePath) => ({ path: filePath, size: 1, mtime: 0, hash: `h-${filePath}` })),
+  } as Manifest;
 }
 
 function inputs(overrides: Partial<PublishAttemptInputs> = {}): PublishAttemptInputs {
@@ -45,333 +54,255 @@ function pushResult(overrides: Partial<PushResult> = {}): PushResult {
   };
 }
 
-class RecordingEffects implements DaemonPublishEffects, PushTransitionPort {
-  readonly calls: string[] = [];
-  publishTransitionMs: number | undefined;
-  requests: SealedPublishRequest[] = [];
-  outcomeFor: (request: SealedPublishRequest) => Promise<DaemonPushOutcome> = async (request) =>
-    ({ kind: "committed", attemptId: request.attemptId, result: pushResult() });
-  lastSequence: number | undefined = undefined;
-  attemptInputs: PublishAttemptInputs = inputs();
+class RecordingLocal extends LocalAuthority {
+  constructor(private readonly calls: string[]) { super(); }
 
-  constructor(overrides: Partial<RecordingEffects> = {}) {
-    Object.assign(this, overrides);
+  override commitPatch(...args: Parameters<LocalAuthority["commitPatch"]>): void {
+    this.calls.push("commit-local");
+    super.commitPatch(...args);
   }
-
-  sealAttemptInputs(): PublishAttemptInputs { this.calls.push("seal-inputs"); return this.attemptInputs; }
-  lastPublishedSequence(): number | undefined { return this.lastSequence; }
-  async execute(request: SealedPublishRequest): Promise<DaemonPushOutcome> {
-    this.requests.push(request);
-    this.calls.push("execute");
-    return this.outcomeFor(request);
-  }
-  settleReport(publishTransitionMs: number): void {
-    this.publishTransitionMs = publishTransitionMs;
-    this.calls.push("settle-report");
-  }
-  noteTerminalBlock(fingerprint: string | undefined): void { this.calls.push(`terminal-block:${fingerprint}`); }
-  recordGitCaptureSuccess(provenance: PushProvenance): void { this.calls.push(`capture-success:${provenance.scan}`); }
-  commitPublishedSubset(next: Manifest, deferred: readonly string[]): void {
-    this.calls.push(`commit-subset:${next.files.length}:${deferred.join(",")}`);
-  }
-  adoptCollisionObservation(groups: readonly CaseFoldCollisionGroup[], complete: boolean): void {
-    this.calls.push(`collisions:${groups.length}:${complete}`);
-  }
-  log(line: string): void { this.calls.push(`log:${line}`); }
-  notePublishedSequence(sequence: number): void { this.calls.push(`seq:${sequence}`); }
-  recordPublishActivity(files: number, sequence: number): void { this.calls.push(`activity:${files}:${sequence}`); }
-  scheduleWriteFinish(paths: readonly string[]): void { this.calls.push(`write-finish:${paths.join(",")}`); }
-  scheduleGcFence(paths: readonly string[]): void { this.calls.push(`gc-fence:${paths.join(",")}`); }
-  async refreshDurableState(): Promise<void> { this.calls.push("refresh-durable"); }
-  async recordSyncMetric(): Promise<void> { this.calls.push("sync-metric"); }
 }
 
-const kinds = (effects: readonly DaemonPublishEffect[]): string[] => effects.map((effect) => effect.kind);
+class RecordingRetries implements LocalRetryQueuePort {
+  readonly deferredPaths = new Set<string>();
+  readonly gcFencedPaths = new Set<string>();
+  readonly writeFinish: string[][] = [];
+  readonly gcFence: string[][] = [];
+  constructor(private readonly calls: string[]) {}
+  scheduleWriteFinish(paths: Set<string>): void {
+    this.calls.push("schedule-write-finish");
+    this.writeFinish.push([...paths]);
+  }
+  scheduleGcFence(paths: Set<string>): void {
+    this.calls.push("schedule-gc-fence");
+    this.gcFence.push([...paths]);
+  }
+  settle(): void {}
+  stop(): void {}
+}
 
-describe("sealPublishRequest", () => {
-  test("carries the local manifest verbatim when no path is GC-fenced", () => {
-    const request = sealPublishRequest("attempt-1", inputs());
-    expect(request.attemptId).toBe("attempt-1");
-    expect(request.manifest.files.map((f) => f.path)).toEqual(["a.txt", "b.txt"]);
-    expect(request.localFileObservation).toEqual({ authority: "authoritative" });
-    expect(request.blockedFingerprint).toBeUndefined();
+class RecordingTelemetry implements TelemetryRecorder {
+  readonly samples: TelemetrySample[] = [];
+  constructor(private readonly calls: string[]) {}
+  record(sample: TelemetrySample): void {
+    this.calls.push("capture-telemetry");
+    this.samples.push(sample);
+  }
+}
+
+async function harness(options: {
+  result?: (request: SealedPublishRequest) => DaemonPushOutcome;
+  metrics?: SyncMetrics;
+  failAt?: "refresh-durable" | "settle-report";
+} = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-publish-transition-"));
+  const calls: string[] = [];
+  const local = new RecordingLocal(calls);
+  local.seed(manifest(["a.txt", "old.txt"]));
+  local.setObservationComplete(true);
+  const retries = new RecordingRetries(calls);
+  const activity: DaemonActivity = { at: "2026-07-26T00:00:00.000Z" };
+  const metrics = options.metrics ?? { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
+  const telemetry = new RecordingTelemetry(calls);
+  const logs: string[] = [];
+  const requests: SealedPublishRequest[] = [];
+  const observed = { durableRefreshed: false, reportEnqueued: false };
+  const transition = new PublishLocalWorkspaceTransition({ root, local, retries, activity, metrics, telemetry }, {
+    log: (line) => { calls.push("log"); logs.push(line); },
+    refreshDurableState: async () => {
+      calls.push("refresh-durable");
+      if (options.failAt === "refresh-durable") throw new Error("injected durable refresh failure");
+      observed.durableRefreshed = true;
+    },
   });
+  const port: PushTransitionPort = {
+    appliedBase: manifest(["a.txt"]),
+    execute: async (request) => {
+      calls.push("execute");
+      requests.push(request);
+      return options.result?.(request)
+        ?? { kind: "committed", attemptId: request.attemptId, result: pushResult() };
+    },
+    settleReport: () => {
+      calls.push("settle-report");
+      if (options.failAt === "settle-report") throw new Error("injected report enqueue failure");
+      observed.reportEnqueued = true;
+    },
+  };
+  return { root, calls, local, retries, activity, metrics, telemetry, logs, requests, observed, transition, port };
+}
 
-  test("defers GC-fenced paths onto the applied base", () => {
-    const request = sealPublishRequest("attempt-1", inputs({ gcFencedPaths: new Set(["b.txt"]) }));
-    expect(request.manifest.files.map((f) => f.path)).toEqual(["a.txt"]);
-  });
-
-  test("without an applied base a GC fence cannot defer anything", () => {
-    const request = sealPublishRequest("attempt-1", inputs({ appliedBase: undefined, gcFencedPaths: new Set(["b.txt"]) }));
-    expect(request.manifest.files.map((f) => f.path)).toEqual(["a.txt", "b.txt"]);
-  });
-
-  test("an incomplete observation publishes in preserve mode carrying its collisions", () => {
-    const collisions: CaseFoldCollisionGroup[] = [{ paths: ["A.txt", "a.txt"] }];
-    const request = sealPublishRequest("attempt-1", inputs({ observationComplete: false, caseCollisions: collisions }));
-    expect(request.localFileObservation).toEqual({ authority: "preserve", caseCollisions: collisions });
-  });
-
-  test("the terminal fingerprint is carried into the request", () => {
+describe("publish request and outcome classification", () => {
+  test("sealing preserves authoritative LOCAL and terminal identity", () => {
     const request = sealPublishRequest("attempt-1", inputs({ blockedFingerprint: "fp-1" }));
+    expect(request.manifest.files.map((file) => file.path)).toEqual(["a.txt", "b.txt"]);
+    expect(request.localFileObservation).toEqual({ authority: "authoritative" });
     expect(request.blockedFingerprint).toBe("fp-1");
   });
-});
 
-describe("classifyPublishOutcome", () => {
-  const request = sealPublishRequest("attempt-9", inputs());
-
-  test("a sequence-advancing result is committed", async () => {
-    const outcome = await classifyPublishOutcome(request, async () => pushResult({ committed: true }));
-    expect(outcome.kind).toBe("committed");
-    expect(outcome.attemptId).toBe("attempt-9");
+  test("GC-fenced paths carry BASE, while missing BASE cannot invent one", () => {
+    const fenced = new Set(["b.txt"]);
+    expect(sealPublishRequest("a", inputs({ gcFencedPaths: fenced })).manifest.files.map((file) => file.path))
+      .toEqual(["a.txt"]);
+    expect(sealPublishRequest("b", inputs({ gcFencedPaths: fenced, appliedBase: undefined })).manifest.files.map((file) => file.path))
+      .toEqual(["a.txt", "b.txt"]);
   });
 
-  test("a no-op result is not-committed", async () => {
-    const outcome = await classifyPublishOutcome(request, async () => pushResult({ committed: false }));
-    expect(outcome.kind).toBe("not-committed");
+  test("incomplete observation carries collision evidence in preserve mode", () => {
+    const collisions: CaseFoldCollisionGroup[] = [{ paths: ["A.txt", "a.txt"] }];
+    expect(sealPublishRequest("a", inputs({ observationComplete: false, caseCollisions: collisions })).localFileObservation)
+      .toEqual({ authority: "preserve", caseCollisions: collisions });
   });
 
-  test("a still-blocked commit rejection is a terminal block carrying its fingerprint", async () => {
-    const outcome = await classifyPublishOutcome(request, async () => {
+  test("classification binds committed, no-op, and repeated terminal outcomes", async () => {
+    const request = sealPublishRequest("attempt-9", inputs());
+    expect((await classifyPublishOutcome(request, async () => pushResult())).kind).toBe("committed");
+    expect((await classifyPublishOutcome(request, async () => pushResult({ committed: false }))).kind).toBe("not-committed");
+    expect(await classifyPublishOutcome(request, async () => {
       throw new CommitRejectedError("too_many_refs", 1, 2, "fp-terminal", true);
-    });
-    expect(outcome).toEqual({ kind: "terminal-block", attemptId: "attempt-9", fingerprint: "fp-terminal" });
+    })).toEqual({ kind: "terminal-block", attemptId: "attempt-9", fingerprint: "fp-terminal" });
   });
 
-  test("a commit rejection that is NOT still blocked propagates", async () => {
+  test("first terminal and unrelated failures propagate", async () => {
+    const request = sealPublishRequest("attempt-9", inputs());
     await expect(classifyPublishOutcome(request, async () => {
       throw new CommitRejectedError("body_too_large", 1, 2, "fp", false);
     })).rejects.toThrow(CommitRejectedError);
-  });
-
-  test("any other failure propagates unclassified", async () => {
     await expect(classifyPublishOutcome(request, async () => { throw new Error("network"); }))
       .rejects.toThrow("network");
   });
 });
 
-describe("reduceDaemonPublishOutcome", () => {
-  const attemptId = "attempt-1";
-
-  test("a terminal block adopts the durable nonce and does nothing else", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "terminal-block", attemptId, fingerprint: "fp-1" },
-      { lastPublishedSequence: 3 },
-    );
-    expect(kinds(effects)).toEqual(["terminal-block", "refresh-durable-state"]);
-    expect(kinds(effects)).not.toContain("settle-report");
-  });
-
-  test("a committed publication orders capture, subset, collisions, log, sequence, activity, durable, metric", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ sequence: 7 }) },
-      { lastPublishedSequence: 6 },
-    );
-    expect(kinds(effects)).toEqual([
-      "record-git-capture-success",
-      "commit-published-subset",
-      "adopt-collision-observation",
-      "log",
-      "note-published-sequence",
-      "record-publish-activity",
-      "refresh-durable-state",
-      "record-sync-metric",
-      "settle-report",
-    ]);
-  });
-
-  test("a repeated sequence is not logged again but is still noted", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ sequence: 7 }) },
-      { lastPublishedSequence: 7 },
-    );
-    expect(kinds(effects)).not.toContain("log");
-    expect(effects).toContainEqual({ kind: "note-published-sequence", sequence: 7 });
-  });
-
-  test("a no-op push logs nothing and records no publish activity", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "not-committed", attemptId, result: pushResult({ committed: false, sequence: 4 }) },
-      { lastPublishedSequence: 3 },
-    );
-    expect(kinds(effects)).toEqual([
-      "record-git-capture-success",
-      "commit-published-subset",
-      "adopt-collision-observation",
-      "note-published-sequence",
-      "refresh-durable-state",
-      "record-sync-metric",
-      "settle-report",
-    ]);
-  });
-
-  test("the committed subset carries the deferred paths as unsettled", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ deferred: ["x.bin"] }) },
-      { lastPublishedSequence: undefined },
-    );
-    expect(effects).toContainEqual({
-      kind: "commit-published-subset",
-      manifest: expect.anything(),
-      deferred: ["x.bin"],
-    });
-  });
-
-  test("deferred paths split into write-finish and GC-fence retries", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ deferred: ["churn.txt", "fenced.bin"], retryLater: ["fenced.bin"] }) },
-      { lastPublishedSequence: undefined },
-    );
-    expect(effects).toContainEqual({ kind: "schedule-write-finish", paths: ["churn.txt"] });
-    expect(effects).toContainEqual({ kind: "schedule-gc-fence", paths: ["fenced.bin"] });
-    const order = kinds(effects);
-    expect(order.indexOf("schedule-write-finish")).toBeLessThan(order.indexOf("schedule-gc-fence"));
-    expect(order.indexOf("schedule-gc-fence")).toBeLessThan(order.indexOf("refresh-durable-state"));
-  });
-
-  test("no deferrals schedules no retry at all", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ deferred: [] }) },
-      { lastPublishedSequence: undefined },
-    );
-    expect(kinds(effects)).not.toContain("schedule-write-finish");
-    expect(kinds(effects)).not.toContain("schedule-gc-fence");
-  });
-
-  test("collision authority downgrades completeness; a clean authoritative push restores it", () => {
-    const preserved = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ localFileObservationAuthority: "preserve" }) },
-      { lastPublishedSequence: undefined },
-    );
-    expect(preserved).toContainEqual({ kind: "adopt-collision-observation", groups: [], observationComplete: false });
-
-    const collided = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ caseCollisions: [{ paths: ["A", "a"] }] }) },
-      { lastPublishedSequence: undefined },
-    );
-    expect(collided).toContainEqual({
-      kind: "adopt-collision-observation",
-      groups: [{ paths: ["A", "a"] }],
-      observationComplete: false,
-    });
-
-    const clean = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult() },
-      { lastPublishedSequence: undefined },
-    );
-    expect(clean).toContainEqual({ kind: "adopt-collision-observation", groups: [], observationComplete: true });
-  });
-
-  test("adopted collision groups are copies, not the push result's arrays", () => {
-    const groups: CaseFoldCollisionGroup[] = [{ paths: ["A", "a"] }];
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ caseCollisions: groups }) },
-      { lastPublishedSequence: undefined },
-    );
-    const adopted = effects.find((effect) => effect.kind === "adopt-collision-observation");
-    expect(adopted).toBeDefined();
-    const adoptedGroups = (adopted as { groups: CaseFoldCollisionGroup[] }).groups;
-    expect(adoptedGroups[0]).not.toBe(groups[0]);
-    expect(adoptedGroups[0]!.paths).not.toBe(groups[0]!.paths);
-  });
-
-  test("the publication log names the sequence, file count, and bounded deferral sample", () => {
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ sequence: 12, deferred: ["one.txt", "two.txt"] }) },
-      { lastPublishedSequence: 11 },
-    );
-    const line = effects.find((effect) => effect.kind === "log");
-    expect(line).toEqual({ kind: "log", line: "push: published sequence 12 (2 files; deferred 2: one.txt two.txt)" });
-  });
-
-  test("a deferral sample never renders more than the log path cap", () => {
-    const deferred = Array.from({ length: 60 }, (_, i) => `f${i}.txt`);
-    const effects = reduceDaemonPublishOutcome(
-      { kind: "committed", attemptId, result: pushResult({ sequence: 12, deferred }) },
-      { lastPublishedSequence: 11 },
-    );
-    const line = effects.find((effect) => effect.kind === "log") as { line: string };
-    expect(line.line).toContain("deferred 60: ");
-    expect(line.line).toContain("f49.txt");
-    expect(line.line).not.toContain("f50.txt");
-  });
-});
-
 describe("PublishLocalWorkspaceTransition", () => {
-  test("seals inputs, executes once, and applies the reduced effects in order", async () => {
-    const effects = new RecordingEffects({ lastSequence: 6 });
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    const receipt = await transition.publish(PROVENANCE, effects);
-    expect(effects.calls).toEqual([
-      "seal-inputs",
-      "execute",
-      "capture-success:true",
-      "commit-subset:2:",
-      "collisions:0:true",
-      "log:push: published sequence 7 (2 files)",
-      "seq:7",
-      "activity:2:7",
-      "refresh-durable",
-      "sync-metric",
-      "settle-report",
+  test("settles a commit through owned state and narrow ports", async () => {
+    const h = await harness({ metrics: { syncs: 8, commitConflicts409: 3, fileConflicts: 2, lockStarved: 1, lastConflictAt: "then" } });
+    const receipt = await h.transition.publish(PROVENANCE, h.port);
+    expect(receipt).toMatchObject({ outcome: "committed", sequence: 7 });
+    expect(h.local.manifest.files.map((file) => file.path)).toEqual(["a.txt", "b.txt"]);
+    expect(h.transition.lastPublishedSequence).toBe(7);
+    expect(h.activity.lastPush).toMatchObject({ files: 2, sequence: 7 });
+    expect(h.transition.activityDirty).toBe(true);
+    expect(h.telemetry.samples).toContainEqual({ kind: "git_capture", signalPushes: 0, candidatePushes: 0, scanPushes: 1 });
+    expect(h.metrics).toEqual({ syncs: 9, commitConflicts409: 3, fileConflicts: 2, lockStarved: 1, lastConflictAt: "then" });
+    expect(await loadMetrics(h.root)).toEqual(h.metrics);
+    expect(h.calls).toEqual([
+      "execute", "capture-telemetry", "commit-local", "log", "refresh-durable", "settle-report",
     ]);
-    expect(receipt.outcome).toBe("committed");
-    expect(receipt.sequence).toBe(7);
-    expect(receipt.attemptId).toBe(effects.requests[0]!.attemptId);
-    expect(effects.publishTransitionMs).toBeGreaterThanOrEqual(0);
   });
 
-  test("provenance is consumed exactly once per publication", async () => {
-    const effects = new RecordingEffects();
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    await transition.publish(PROVENANCE, effects);
-    await transition.publish(PROVENANCE, effects);
-    expect(effects.calls.filter((call) => call.startsWith("capture-success"))).toHaveLength(2);
+  test("a no-op adopts sequence and LOCAL without logging or activity", async () => {
+    const h = await harness({ result: (request) => ({
+      kind: "not-committed",
+      attemptId: request.attemptId,
+      result: pushResult({ committed: false, sequence: 4 }),
+    }) });
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.transition.lastPublishedSequence).toBe(4);
+    expect(h.activity.lastPush).toBeUndefined();
+    expect(h.logs).toEqual([]);
+    expect(h.calls.at(-1)).toBe("settle-report");
   });
 
-  test("each attempt is sealed under a fresh identity", async () => {
-    const effects = new RecordingEffects();
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    await transition.publish(PROVENANCE, effects);
-    await transition.publish(PROVENANCE, effects);
-    expect(effects.requests[0]!.attemptId).not.toBe(effects.requests[1]!.attemptId);
+  test("deferred paths stay unsettled and partition into retry owners", async () => {
+    const h = await harness({ result: (request) => ({
+      kind: "committed",
+      attemptId: request.attemptId,
+      result: pushResult({ deferred: ["churn.txt", "fenced.bin"], retryLater: ["fenced.bin"] }),
+    }) });
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.local.unsettledPaths).toEqual(new Set(["churn.txt", "fenced.bin"]));
+    expect(h.retries.writeFinish).toEqual([["churn.txt"]]);
+    expect(h.retries.gcFence).toEqual([["fenced.bin"]]);
+    expect(h.calls.indexOf("schedule-gc-fence")).toBeLessThan(h.calls.indexOf("refresh-durable"));
   });
 
-  test("a terminal block adopts the durable nonce and records no capture success", async () => {
-    const effects = new RecordingEffects({
-      outcomeFor: async (request) => ({ kind: "terminal-block", attemptId: request.attemptId, fingerprint: "fp-2" }),
-    });
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    const receipt = await transition.publish(PROVENANCE, effects);
-    expect(effects.calls).toEqual(["seal-inputs", "execute", "terminal-block:fp-2", "refresh-durable"]);
-    expect(effects.calls).not.toContain("settle-report");
-    expect(receipt.outcome).toBe("terminal-block");
-    expect(receipt.sequence).toBeUndefined();
-  });
-
-  test("an outcome bound to another attempt performs NO transition", async () => {
-    const effects = new RecordingEffects({
-      outcomeFor: async () => ({ kind: "committed", attemptId: "someone-else", result: pushResult() }),
-    });
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    await expect(transition.publish(PROVENANCE, effects)).rejects.toThrow(/attempt/);
-    expect(effects.calls).toEqual(["seal-inputs", "execute"]);
-  });
-
-  test("a busy-retry deferral schedule survives the reduction", async () => {
-    const effects = new RecordingEffects({
-      outcomeFor: async (request) => ({
+  test("durable refresh failure leaves sequence, activity, and retries applied but stops metrics and report", async () => {
+    const h = await harness({
+      failAt: "refresh-durable",
+      result: (request) => ({
         kind: "committed",
         attemptId: request.attemptId,
-        result: pushResult({ deferred: ["a", "b"], retryLater: ["b"] }),
+        result: pushResult({ deferred: ["churn.txt", "fenced.bin"], retryLater: ["fenced.bin"] }),
       }),
     });
-    const transition = new PublishLocalWorkspaceTransition(effects);
-    await transition.publish(PROVENANCE, effects);
-    expect(effects.calls).toContain("write-finish:a");
-    expect(effects.calls).toContain("gc-fence:b");
-    expect(effects.calls.indexOf("write-finish:a")).toBeLessThan(effects.calls.indexOf("refresh-durable"));
+    await expect(h.transition.publish(PROVENANCE, h.port)).rejects.toThrow("injected durable refresh failure");
+    expect(h.transition.lastPublishedSequence).toBe(7);
+    expect(h.activity.lastPush).toMatchObject({ files: 2, sequence: 7 });
+    expect(h.transition.activityDirty).toBe(true);
+    expect(h.local.unsettledPaths).toEqual(new Set(["churn.txt", "fenced.bin"]));
+    expect(h.retries.writeFinish).toEqual([["churn.txt"]]);
+    expect(h.retries.gcFence).toEqual([["fenced.bin"]]);
+    expect(h.metrics.syncs).toBe(0);
+    expect((await loadMetrics(h.root)).syncs).toBe(0);
+    expect(h.observed).toEqual({ durableRefreshed: false, reportEnqueued: false });
+  });
+
+  test("report enqueue failure observes already-refreshed durable state and persisted metrics", async () => {
+    const h = await harness({ failAt: "settle-report" });
+    await expect(h.transition.publish(PROVENANCE, h.port)).rejects.toThrow("injected report enqueue failure");
+    expect(h.observed).toEqual({ durableRefreshed: true, reportEnqueued: false });
+    expect(h.metrics.syncs).toBe(1);
+    expect((await loadMetrics(h.root)).syncs).toBe(1);
+  });
+
+  test("collision observations are copied and completeness follows authority", async () => {
+    const groups: CaseFoldCollisionGroup[] = [{ paths: ["A", "a"] }];
+    const h = await harness({ result: (request) => ({
+      kind: "committed",
+      attemptId: request.attemptId,
+      result: pushResult({ caseCollisions: groups }),
+    }) });
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.transition.activeCaseCollisions).toEqual(groups);
+    expect(h.transition.activeCaseCollisions[0]).not.toBe(groups[0]);
+    expect(h.local.observationComplete).toBe(false);
+    h.transition.adoptCollisionObservation([], true);
+    expect(h.local.observationComplete).toBe(true);
+  });
+
+  test("duplicate sequences stay silent and deferral samples remain bounded", async () => {
+    const h = await harness({ result: (request) => ({
+      kind: "committed",
+      attemptId: request.attemptId,
+      result: pushResult({ sequence: 12, deferred: Array.from({ length: 60 }, (_, index) => `f${index}.txt`) }),
+    }) });
+    h.transition.adoptPublishedSequence(11);
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.logs[0]).toContain("deferred 60:");
+    expect(h.logs[0]).toContain("f49.txt");
+    expect(h.logs[0]).not.toContain("f50.txt");
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.logs).toHaveLength(1);
+  });
+
+  test("terminal repeat owns the halt episode and refreshes nothing else", async () => {
+    const h = await harness({ result: (request) => ({
+      kind: "terminal-block",
+      attemptId: request.attemptId,
+      fingerprint: "fp-2",
+    }) });
+    h.activity.halt = { at: "now", reason: "too many refs", count: 1, op: "push", terminal: { fingerprint: "fp-2" } };
+    const receipt = await h.transition.publish(PROVENANCE, h.port);
+    expect(receipt).toEqual({ attemptId: h.requests[0]!.attemptId, outcome: "terminal-block" });
+    expect(h.transition.isTerminalBlocked).toBe(true);
+    expect(h.calls).toEqual(["execute", "log", "refresh-durable"]);
+    expect(h.metrics.syncs).toBe(0);
+  });
+
+  test("mismatched identity performs no transition", async () => {
+    const h = await harness({ result: () => ({ kind: "committed", attemptId: "someone-else", result: pushResult() }) });
+    await expect(h.transition.publish(PROVENANCE, h.port)).rejects.toThrow(/attempt/);
+    expect(h.calls).toEqual(["execute"]);
+    expect(h.transition.lastPublishedSequence).toBeUndefined();
+    expect(h.activity.lastPush).toBeUndefined();
+  });
+
+  test("attempt identities advance and activity dirtiness is explicitly acknowledged", async () => {
+    const h = await harness();
+    await h.transition.publish(PROVENANCE, h.port);
+    h.transition.acknowledgeActivityWrite();
+    expect(h.transition.activityDirty).toBe(false);
+    await h.transition.publish(PROVENANCE, h.port);
+    expect(h.requests[0]!.attemptId).not.toBe(h.requests[1]!.attemptId);
   });
 });
