@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import type { BlobStore } from "../../engine/blobstore.js";
 import { flushGitArtifact, type GitArtifactReadStore, type PendingGitUpload } from "../../engine/git/shared.js";
+import { makeGitCaptureDir } from "../../engine/git/capture.js";
 import { errMsg } from "./shared.js";
 
 // ---- design 226: plan-lifetime git artifact retention ------------------------------
@@ -23,8 +24,8 @@ export function planReadThroughStore(
   retained: ReadonlyMap<string, string>,
   onLog: (line: string) => void,
 ): GitArtifactReadStore {
-  const loud = (encSha: string, at: string, error: unknown): Error => {
-    const line = `git-sync retained artifact unreadable: encSha ${encSha} at ${at}: ${errMsg(error)}`;
+  const loud = (encSha: string, at: string, message: string): Error => {
+    const line = `git-sync retained artifact unreadable: encSha ${encSha} at ${at}: ${message}`;
     onLog(line);
     return new Error(line);
   };
@@ -35,7 +36,7 @@ export function planReadThroughStore(
       try {
         return await fs.readFile(at);
       } catch (error) {
-        throw loud(encSha, at, error);
+        throw loud(encSha, at, errMsg(error));
       }
     },
   };
@@ -49,7 +50,7 @@ export function planReadThroughStore(
       try {
         await fs.copyFile(at, destPath);
       } catch (error) {
-        throw loud(encSha, at, error);
+        throw loud(encSha, at, errMsg(error));
       }
     };
   }
@@ -72,5 +73,47 @@ export async function flushGitArtifacts(
     if (flushed.has(artifact.encSha)) continue;
     await flushGitArtifact(store, artifact);
     flushed.add(artifact.encSha);
+  }
+}
+
+/** Owns every plan-lifetime transition of captured ciphertext. A caller names the
+ * repository whose artifacts survived; it never coordinates retained paths, remote
+ * read-through, or flush identities itself. */
+export class PlanArtifactLifecycle {
+  private dir: string | undefined;
+  private readonly retained = new Map<string, string>();
+  private readonly pendingByRepo = new Map<string, readonly PendingGitUpload[]>();
+  private readonly flushed = new Set<string>();
+  private readThrough: GitArtifactReadStore | undefined;
+
+  constructor(
+    private readonly root: string,
+    private readonly remoteStore: () => BlobStore,
+    private readonly onLog: (line: string) => void,
+  ) {}
+
+  async startIfNeeded(needed: boolean): Promise<string | undefined> {
+    if (needed && this.dir === undefined) this.dir = await makeGitCaptureDir(this.root);
+    return this.dir;
+  }
+
+  retain(rel: string, uploads: readonly PendingGitUpload[]): void {
+    this.pendingByRepo.set(rel, uploads);
+    for (const artifact of uploads) this.retained.set(artifact.encSha, artifact.ciphertextPath);
+  }
+
+  store(): GitArtifactReadStore {
+    this.readThrough ??= planReadThroughStore(this.remoteStore(), this.retained, this.onLog);
+    return this.readThrough;
+  }
+
+  async flush(rels: readonly string[]): Promise<void> {
+    const owed = rels.flatMap((rel) => this.pendingByRepo.get(rel) ?? []);
+    if (owed.length > 0) await flushGitArtifacts(this.remoteStore(), owed, this.flushed);
+  }
+
+  async dispose(): Promise<void> {
+    if (this.dir === undefined) return;
+    await fs.rm(this.dir, { recursive: true, force: true }).catch(() => undefined);
   }
 }

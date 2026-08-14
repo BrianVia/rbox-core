@@ -35,9 +35,11 @@ for (const [consumer, relative, markers] of CONSUMER_FREEZE) {
 
 const LOG_LANGUAGE_SOURCES = [
   "src/cli/sync-git/apply.ts",
+  "src/cli/sync-git/plan-accumulator.ts",
   "src/cli/sync-git/plan.ts",
   "src/cli/sync-git/received-git-config.ts",
   "src/cli/sync-git/remote-repository-deletion.ts",
+  "src/cli/sync-git/repo-capture-attempt.ts",
   "src/cli/sync/push.ts",
   "src/cli/sync/publisher-ack-transition.ts",
 ] as const;
@@ -54,9 +56,31 @@ const LOG_LANGUAGE_SOURCES = [
  * total stays twelve. This is a re-pin, not a relaxation: adding, dropping or
  * rewording a skip site still fails, and the emitter's own template is pinned
  * whole below so the suffix cannot drift off the human clause.
+ *
+ * 2026-08-14 (#37): the three-owner git-plan decomposition moved config-skip
+ * decisions into repo-capture-attempt.ts and the one-shot log sink into
+ * plan-accumulator.ts. Two paired carry/capture decisions now share ternary
+ * enqueue sites, so three command sites still represent the same five exact
+ * reasons. The final template in plan.ts now consumes `command.reason`; all five
+ * composed sentences remain byte-identical to the pre-decomposition emissions.
  */
 const PLAN_CONFIG_SKIP_EMITTER =
-  "`git-sync config skipped ${rel}: ${why}. rbox left shared Git settings alone; Git history can still sync.`";
+  "`git-sync config skipped ${rel}: ${command.reason}. rbox left shared Git settings alone; Git history can still sync.`";
+
+const PLAN_ACCUMULATOR_LOG_ONCE_EMITTER = `logOnce(seen: Set<string>, rel: string, line: string): void {
+    const key = \`\${this.root}\\0\${rel}\`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    this.glog(line);
+  }`;
+
+const REPO_CAPTURE_CONFIG_SKIP_REASONS = [
+  "`local ${repoKind} shape does not own the common config`",
+  "`capture repository is ${repoKind}/scoped and does not own the common config`",
+  "`capture ownership could not be proven (${errMsg(error)})`",
+  '"local common config is outside workspace ownership"',
+  '"capture common config is outside workspace ownership"',
+] as const;
 
 test("design 176 log-language pass is exactly twelve ignored-suffix additions", () => {
   const byFile = new Map(LOG_LANGUAGE_SOURCES.map((relative) =>
@@ -65,10 +89,15 @@ test("design 176 log-language pass is exactly twelve ignored-suffix additions", 
   const occurrences = (clause: string, text = source): number => text.split(clause).length - 1;
 
   const plan = byFile.get("src/cli/sync-git/plan.ts")!;
+  const accumulator = byFile.get("src/cli/sync-git/plan-accumulator.ts")!;
+  const captureAttempt = byFile.get("src/cli/sync-git/repo-capture-attempt.ts")!;
   expect(plan).toContain(PLAN_CONFIG_SKIP_EMITTER);
+  expect(accumulator).toContain(PLAN_ACCUMULATOR_LOG_ONCE_EMITTER);
+  expect(occurrences('kind: "config-skip"', captureAttempt)).toBe(4); // 1 command variant + 3 enqueue sites
+  for (const reason of REPO_CAPTURE_CONFIG_SKIP_REASONS) expect(captureAttempt).toContain(reason);
   const sharedClause = "rbox left shared Git settings alone; Git history can still sync.";
-  expect(occurrences(sharedClause, plan)).toBe(1); // the one emitter…
-  expect(occurrences("skipConfigOwnership(rel, ", plan)).toBe(5); // …used five times
+  expect(occurrences(sharedClause, plan)).toBe(1); // the one final template…
+  expect(REPO_CAPTURE_CONFIG_SKIP_REASONS).toHaveLength(5); // …fed by five byte-frozen reasons
   expect(occurrences(sharedClause)).toBe(3); // 1 emitter + 2 direct, for 7 emissions
 
   expect(occurrences("Your local Git work is safe; inspect the preserved incoming state before resolving.")).toBe(2);

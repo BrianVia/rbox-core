@@ -228,7 +228,8 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/received-git-transition-commit.ts": 1,
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
-    "src/cli/sync-git/plan.ts": 2,
+    "src/cli/sync-git/plan-accumulator.ts": 1,
+    "src/cli/sync-git/plan.ts": 3,
     // Three sites left with the legacy-manifest adoption they belonged to.
     "src/cli/sync-state-model.ts": 8,
     // T1.1 moved the JSON CAS here; the proof-selection hoist is count-neutral.

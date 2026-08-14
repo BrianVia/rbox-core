@@ -24,6 +24,7 @@ const TEST_GIT_ENV = {
   GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
   GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
   GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+  GIT_AUTHOR_DATE: "2026-08-14T12:00:00Z", GIT_COMMITTER_DATE: "2026-08-14T12:00:00Z",
 };
 const runGit = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString().trim());
 
@@ -45,7 +46,7 @@ function stateWith(section: GitSection, cfgSynced?: string): SyncState {
         sourceSeq: 1,
         base: section,
         advertised,
-        ...(cfgSynced === undefined ? {} : { cfgSynced }),
+        cfgSynced,
       },
     },
   };
@@ -550,3 +551,109 @@ test("capture refreshes a reusable post-cleanup divergence-cache entry", async (
   expect(next.captured).toEqual([]);
   expect(next.changed).toBe(false);
 }, 20_000);
+
+test("repo capture attempt uses one config operation for carry and capture", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:dedup.git");
+  const carried = await plan();
+  const captured = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+  );
+
+  for (const result of [carried, captured]) {
+    expect(result.gitRepos?.["."]?.config?.["remote.origin.url"]).toEqual(["git@example.com:dedup.git"]);
+    expect(result.authoredCfgHashByRepo["."]).toBe(gitConfigHash(result.gitRepos!["."]!.config!));
+    expect(result.configObserved).toEqual(["."]);
+    expect(result.configDeferrals).toEqual({});
+  }
+  expect(carried.carried).toEqual(["."]);
+  expect(captured.captured).toEqual(["."]);
+}, 20_000);
+
+test("one-commit owned-config planner surface matches the pre-refactor golden", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:golden.git");
+  const store = new LocalBlobStore(path.join(root, ".rbox", "golden-blobs"));
+  let writes = 0;
+  const countedStore = {
+    has: store.has.bind(store),
+    get: store.get.bind(store),
+    getToFile: store.getToFile.bind(store),
+    put: async (sha: string, bytes: Uint8Array) => {
+      writes++;
+      await store.put(sha, bytes);
+    },
+    putFile: async (sha: string, source: string, size: number) => {
+      writes++;
+      await store.putFile(sha, source, size);
+    },
+  };
+  const fresh: SyncState = {
+    stream: "test",
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  };
+  const planned = await planGitSections(
+    root,
+    cfg,
+    fresh,
+    { blobStore: () => countedStore } as SyncRemote,
+    new Set(),
+    buildIgnoreMatcher(root),
+  );
+  const canonical = JSON.parse(JSON.stringify(planned)) as typeof planned;
+  delete canonical.gitPlanStats;
+  const section = canonical.gitRepos!["."]!;
+  section.bundleSha = "sha-1";
+  section.bundleEncSha = "sha-2";
+  section.refs["refs/heads/master"] = "oid-3";
+  section.indexSha = "sha-4";
+  section.indexEncSha = "sha-5";
+  section.indexTree = "oid-6";
+  section.generatedAt = "<time>";
+  canonical.authoredCfgHashByRepo["."] = "sha-7";
+  expect({ plan: canonical, writes }).toEqual({
+    plan: {
+      gitRepos: {
+        ".": {
+          bundleSha: "sha-1",
+          bundleEncSha: "sha-2",
+          bundleCipherSize: 347,
+          head: "ref: refs/heads/master",
+          refs: { "refs/heads/master": "oid-3" },
+          indexSha: "sha-4",
+          indexEncSha: "sha-5",
+          indexCipherSize: 161,
+          indexTree: "oid-6",
+          refScope: "all",
+          generatedAt: "<time>",
+          config: {
+            "remote.origin.fetch": ["+refs/heads/*:refs/remotes/origin/*"],
+            "remote.origin.url": ["git@example.com:golden.git"],
+          },
+          refTombstones: {},
+          refTombstoneGeneration: 0,
+        },
+      },
+      changed: true,
+      authoredCfgHashByRepo: { ".": "sha-7" },
+      captured: ["."],
+      carried: [],
+      supersededPending: [],
+      resolvedPending: [],
+      protectedPending: [],
+      deferred: [],
+      captureDeferrals: {},
+      configDeferrals: {},
+      captureObserved: ["."],
+      configObserved: ["."],
+      skipped: [],
+      removed: [],
+      packedRefsIdentity: { ".": null },
+    },
+    writes: 2,
+  });
+});
