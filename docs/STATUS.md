@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_MIDDAY CAP (2026-08-14, fleet on **e63c116**): #692 merged (thermo #691
+findings 2-5: divergenceNeedsPush one-owner routing — pending-carry can no
+longer reach doPush via recovery; candidate_projection_ms DELETED;
+truthful span labels; last anti-slop line fixed). FINAL SLICE MAP posted
+on #661, every number field-measured: desktop content push 7.0s; Mac
+no-op cycle 7.8s = scan gap 2.9s (CONVICTED by elimination) + git-plan
+4.6s (cy/f/cp). drain_wait 0.1s fleet-wide. Mac RSS 12.4GB fresh boot
+(was 21.1 pre-restart). BUILD ORDER to ≤10s: (1) trusted-view push,
+(2) post-publish pull git-apply 42s/ownership 33s (#573/#670 — largest
+number left), (3) git-plan slimming many-repo hosts, (4) commit leg only
+after the 101/110-114 corpus read. Open follow-ups: #691 finding 1
+(telemetry write amplification), #28 credentials flake (2 sightings),
+#664 RSS bar, Mac ignore-counter divergence (no purge from Mac)._
+
 _MORNING: TAIL KILLED (2026-08-14, #690 merged, desktop on 674a2cf): push
 wall **58.5s → 7.0s** field-verified (drain_wait_ms 50.8→0.1). Root cause
 was NOT a timer: settlement waited at queue-empty behind the 47s pull the
