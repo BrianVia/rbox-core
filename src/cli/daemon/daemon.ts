@@ -156,7 +156,7 @@ import { TelemetryQueue } from "../telemetry/queue.js";
 import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled, type GitCaptureSample } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
-import { formatPushResiduals } from "../sync/format.js";
+import { formatPushResiduals, formatPushSpan } from "../sync/format.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
@@ -367,7 +367,7 @@ export class RboxDaemon {
   private readonly api: RboxApi;
   private readonly telemetry: TelemetryQueue;
   private readonly syncPhaseSampler = new SyncPhaseSampler();
-  private readonly pendingPushReports: Array<{ report: PhaseReport; metricsReport?: PhaseReport; prologueMs: number }> = [];
+  private readonly pendingPushReports: Array<{ report: PhaseReport; metricsReport?: PhaseReport; prologueMs: number; queuedAt: number }> = [];
   private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   /** Design 224 §2.3: last observed stranded-ignored count from a push projection.
@@ -1833,6 +1833,8 @@ export class RboxDaemon {
       const settleMs = performance.now() - settleT0;
       for (const pending of this.pendingPushReports.splice(0)) {
         try {
+          const drainWaitMs = Math.max(0, settleT0 - pending.queuedAt);
+          pending.report.appendDetails("state-load", { drain_wait_ms: drainWaitMs }, formatPushSpan("drain_wait_ms", drainWaitMs));
           pending.report.appendDetails("state-load", { prologue_ms: pending.prologueMs, settle_ms: settleMs }, formatPushResiduals(pending.prologueMs, settleMs));
           this.syncPhaseSampler.recordCompleted(pending.report, "push", this.telemetry, { prologue_ms: pending.prologueMs, settle_ms: settleMs });
           pending.metricsReport?.logSummaryTo(this.log);
@@ -1873,10 +1875,14 @@ export class RboxDaemon {
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
         onStrandedIgnoredObserved: (count) => { this.strandedIgnored = count; },
       }, { localFileObservation: request.localFileObservation })),
-      settleReport: () => {
-        if (report) this.pendingPushReports.push(metricsReport
-          ? { report, metricsReport, prologueMs }
-          : { report, prologueMs });
+      settleReport: (publishTransitionMs) => {
+        if (report) {
+          report.appendDetails("state-save", { publish_transition_ms: publishTransitionMs }, formatPushSpan("publish_transition_ms", publishTransitionMs));
+          const queuedAt = performance.now();
+          this.pendingPushReports.push(metricsReport
+            ? { report, metricsReport, prologueMs, queuedAt }
+            : { report, prologueMs, queuedAt });
+        }
       },
     });
     this.propagationTrace?.publishReceipt(receipt.sequence);

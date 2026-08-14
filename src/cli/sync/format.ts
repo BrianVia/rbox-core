@@ -50,9 +50,9 @@ export const formatCasSteps = (steps: Record<string, number>): string | undefine
   return parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
 };
 export const formatPushSpan = (
-  name: "candidate_projection_ms" | "delta_base_ms" | "state_lineage_ms" | "matcher_ms",
+  name: "ack_ms" | "candidate_projection_ms" | "delta_base_ms" | "drain_wait_ms" | "matcher_ms" | "publish_transition_ms" | "state_lineage_ms",
   ms: number,
-): string =>
-  `${name}=${fmtDetailSeconds(ms)}`;
+): string | undefined =>
+  ms > 0 ? `${name}=${fmtDetailSeconds(ms)}` : undefined;
 export const formatPushResiduals = (prologueMs: number, settleMs: number): string =>
   `prologue_ms=${fmtDetailSeconds(prologueMs)} settle_ms=${fmtDetailSeconds(settleMs)}`;

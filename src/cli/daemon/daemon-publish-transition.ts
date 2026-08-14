@@ -54,7 +54,7 @@ export interface PushTransitionPort {
   execute(request: SealedPublishRequest): Promise<DaemonPushOutcome>;
   /** Close out that attempt's report. A terminal refusal never reaches it — the
    *  attempt published nothing to sample or summarize. */
-  settleReport(): void;
+  settleReport(publishTransitionMs: number): void;
 }
 
 export type DaemonPublishEffect =
@@ -186,11 +186,12 @@ export class PublishLocalWorkspaceTransition {
   async publish(provenance: PushProvenance, port: PushTransitionPort): Promise<DaemonPublishReceipt> {
     const request = sealPublishRequest(`publish-${++this.attempts}`, this.effects.sealAttemptInputs());
     const outcome = await port.execute(request);
+    const publishTransitionT0 = performance.now();
     if (outcome.attemptId !== request.attemptId) {
       throw new Error(`publish transition: outcome for attempt ${outcome.attemptId} does not match ${request.attemptId}`);
     }
     const plan = reduceDaemonPublishOutcome(outcome, { lastPublishedSequence: this.effects.lastPublishedSequence() });
-    for (const effect of plan) await this.apply(effect, provenance, port);
+    for (const effect of plan) await this.apply(effect, provenance, port, publishTransitionT0);
     return {
       attemptId: request.attemptId,
       outcome: outcome.kind,
@@ -199,7 +200,7 @@ export class PublishLocalWorkspaceTransition {
     };
   }
 
-  private async apply(effect: DaemonPublishEffect, provenance: PushProvenance, port: PushTransitionPort): Promise<void> {
+  private async apply(effect: DaemonPublishEffect, provenance: PushProvenance, port: PushTransitionPort, publishTransitionT0: number): Promise<void> {
     switch (effect.kind) {
       case "terminal-block": this.effects.noteTerminalBlock(effect.fingerprint); return;
       case "record-git-capture-success": this.effects.recordGitCaptureSuccess(provenance); return;
@@ -212,7 +213,7 @@ export class PublishLocalWorkspaceTransition {
       case "schedule-gc-fence": this.effects.scheduleGcFence(effect.paths); return;
       case "refresh-durable-state": await this.effects.refreshDurableState(); return;
       case "record-sync-metric": await this.effects.recordSyncMetric(); return;
-      case "settle-report": port.settleReport(); return;
+      case "settle-report": port.settleReport(Math.max(0, performance.now() - publishTransitionT0)); return;
     }
   }
 }

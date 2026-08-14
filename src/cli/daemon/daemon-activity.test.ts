@@ -989,6 +989,9 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   expect(pushSummary).toContain("settle_ms=");
   expect(pushSummary).toContain("candidate_projection_ms=");
   expect(pushSummary).toContain("delta_base_ms=");
+  expect(pushSummary).toContain("ack_ms=");
+  expect(pushSummary).toContain("publish_transition_ms=");
+  expect(pushSummary).toContain("drain_wait_ms=");
 
   daemon.want.push = true; // steady state: no changes → no-op → trail unchanged
   await daemon.pump();
