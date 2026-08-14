@@ -113,12 +113,18 @@ function ownershipOf(snapshot: DaemonObservationSnapshot): DaemonOwnership {
   return "owned";
 }
 
+/** The trust verdict plus the status it vouches for, when it vouches for one. */
+interface AmbientTrustVerdict {
+  trust: DaemonAmbientTrust;
+  status?: AmbientDaemonStatusV1;
+}
+
 function ambientTrustOf(
   ownership: DaemonOwnership,
   pid: DaemonPidRecord,
   ambient: AmbientDaemonStatusRecord,
   now: number,
-): { trust: DaemonAmbientTrust; status?: AmbientDaemonStatusV1 } {
+): AmbientTrustVerdict {
   if (ambient.kind === "absent") return { trust: "absent" };
   if (ambient.kind === "corrupt") return { trust: "corrupt" };
   if (ownership === "stopped") return { trust: "daemon-stopped" };
@@ -200,11 +206,13 @@ export function observeDaemon(
  * Compatibility projection for process-control callers. The truth calculation
  * remains in `observeDaemon`; this shape is retained for supported imports.
  */
-export function daemonBindingStatus(root: string, workspaceId: string): {
+export interface DaemonBindingStatus {
   alive: { running: boolean; pid?: number; bootId?: string };
   bound?: string;
   stale: boolean;
-} {
+}
+
+export function daemonBindingStatus(root: string, workspaceId: string): DaemonBindingStatus {
   const observation = observeDaemon(root, workspaceId);
   return {
     alive: observation.running

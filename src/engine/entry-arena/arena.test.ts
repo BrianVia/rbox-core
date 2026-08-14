@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { JsonValue } from "../../json.js";
 import type { FileEntry } from "../types.js";
 import { EntryArena, MAX_EXTENSION_DEPTH, canonicalEntryKey, defaultFingerprint, sameEntryExact } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";
@@ -11,6 +12,12 @@ function entry(overrides: Partial<FileEntry> = {}): FileEntry {
 interface FutureFileEntry extends FileEntry { futureField: string | number; }
 interface ExtrasFileEntry<T> extends FileEntry { extras: T; }
 interface CyclicFixture { self?: CyclicFixture; }
+
+/** An entry carrying an extension member the wire may add later. `ExtrasFileEntry`
+ * extends `FileEntry`, so fixtures reach the arena as the type they really are. */
+function entryWithExtras<T>(extras: T): ExtrasFileEntry<T> {
+  return { ...entry(), extras };
+}
 
 test("internExact returns one shared frozen object for identical field sets", () => {
   const arena = new EntryArena();
@@ -91,8 +98,8 @@ test("extension members participate in exact interning", () => {
 
 test("REGRESSION (r2 finding 7): structurally equal extras intern together regardless of key order", () => {
   const arena = new EntryArena();
-  const first = arena.internExact({ ...entry(), extras: { b: [1, { z: 1, y: 2 }], a: "x" } } as unknown as FileEntry);
-  const second = arena.internExact({ ...entry(), extras: { a: "x", b: [1, { y: 2, z: 1 }] } } as unknown as FileEntry);
+  const first = arena.internExact(entryWithExtras({ b: [1, { z: 1, y: 2 }], a: "x" }));
+  const second = arena.internExact(entryWithExtras({ a: "x", b: [1, { y: 2, z: 1 }] }));
   expect(second).toBe(first);
   expect(Object.is(second.entry, first.entry)).toBe(true);
   arena.release(first);
@@ -104,10 +111,10 @@ test("REGRESSION (r2 finding 7): absent, null, {} and [] extras are four distinc
   const arena = new EntryArena();
   const slots = [
     arena.internExact(entry()),
-    arena.internExact({ ...entry(), extras: null } as unknown as FileEntry),
-    arena.internExact({ ...entry(), extras: undefined } as unknown as FileEntry),
-    arena.internExact({ ...entry(), extras: {} } as unknown as FileEntry),
-    arena.internExact({ ...entry(), extras: [] } as unknown as FileEntry),
+    arena.internExact(entryWithExtras(null)),
+    arena.internExact(entryWithExtras(undefined)),
+    arena.internExact(entryWithExtras({})),
+    arena.internExact(entryWithExtras([])),
   ];
   expect(new Set(slots.map((slot) => slot.id)).size).toBe(5);
   expect(arena.stats().liveSlots).toBe(5);
@@ -118,7 +125,7 @@ test("REGRESSION (r2 finding 7): absent, null, {} and [] extras are four distinc
 test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras", () => {
   const arena = new EntryArena();
   const extras = { nested: { list: [1, 2] } };
-  const slot = arena.internExact({ ...entry(), extras } as unknown as FileEntry);
+  const slot = arena.internExact(entryWithExtras(extras));
   const interned = (slot.entry as ExtrasFileEntry<{ nested: { list: number[] } }>).extras;
   expect(interned).not.toBe(extras);
   extras.nested.list.push(3);
@@ -134,11 +141,11 @@ test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras",
 test("values JSON cannot produce, and unbounded nesting, are refused", () => {
   const arena = new EntryArena();
   for (const value of [() => 1, Symbol("x"), 1n]) {
-    expect(() => arena.internExact({ ...entry(), extras: value } as unknown as FileEntry)).toThrow(EntryShapeError);
+    expect(() => arena.internExact(entryWithExtras(value))).toThrow(EntryShapeError);
   }
-  let deep: unknown = 1;
+  let deep: JsonValue = 1;
   for (let i = 0; i <= MAX_EXTENSION_DEPTH + 1; i++) deep = { deep };
-  expect(() => arena.internExact({ ...entry(), extras: deep } as unknown as FileEntry)).toThrow(EntryShapeError);
+  expect(() => arena.internExact(entryWithExtras(deep))).toThrow(EntryShapeError);
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
@@ -246,7 +253,7 @@ test("REGRESSION (r3 finding 3): cyclic extras hit the depth bound, never a stac
   const arena = new EntryArena();
   const cyclic: CyclicFixture = {};
   cyclic.self = cyclic;
-  expect(() => arena.internExact({ ...entry(), extras: cyclic } as unknown as FileEntry)).toThrow(EntryShapeError);
+  expect(() => arena.internExact(entryWithExtras(cyclic))).toThrow(EntryShapeError);
 
   // Shallow-then-cyclic accessor: the single read wins, so the arena stores the
   // shallow value and the later cyclic one is never reachable.
@@ -257,9 +264,9 @@ test("REGRESSION (r3 finding 3): cyclic extras hit the depth bound, never a stac
       return reads++ === 0 ? { ok: 1 } : cyclic;
     },
   };
-  const slot = arena.internExact(shallowThenCyclic as unknown as FileEntry);
+  const slot = arena.internExact(shallowThenCyclic);
   expect((slot.entry as ExtrasFileEntry<unknown>).extras).toEqual({ ok: 1 });
-  expect(canonicalEntryKey(slot.entry)).toBe(canonicalEntryKey({ ...entry(), extras: { ok: 1 } } as unknown as FileEntry));
+  expect(canonicalEntryKey(slot.entry)).toBe(canonicalEntryKey(entryWithExtras({ ok: 1 })));
   arena.release(slot);
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });

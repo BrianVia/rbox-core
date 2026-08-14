@@ -23,7 +23,7 @@ import {
   type Wrap,
 } from "../../engine/e2ee/index.js";
 import type { HeadPin } from "../e2ee-keystore.js";
-import type { JsonObject } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../json.js";
 import { loadDevice, loadPin } from "../e2ee-keystore.js";
 import type { AccountKeysDTO } from "../e2ee-remote.js";
 import {
@@ -83,7 +83,7 @@ export interface KeyDeliveryPreferenceOverride {
 }
 
 export interface KeyDeliveryFulfillmentApi {
-  fetch(body: KeyDeliveryFetchBody, signal: AbortSignal): Promise<unknown>;
+  fetch(body: KeyDeliveryFetchBody, signal: AbortSignal): Promise<JsonValue>;
   getAccountKeys(signal: AbortSignal): Promise<AccountKeysDTO | null>;
   publish(
     body: {
@@ -92,7 +92,7 @@ export interface KeyDeliveryFulfillmentApi {
     },
     signal: AbortSignal,
   ): Promise<{ ok: boolean; conflict?: boolean }>;
-  submit(body: KeyDeliverySubmitBody, signal: AbortSignal): Promise<unknown>;
+  submit(body: KeyDeliverySubmitBody, signal: AbortSignal): Promise<JsonValue>;
 }
 
 export interface KeyDeliveryFlightPort {
@@ -167,7 +167,9 @@ export class KeyDeliveryHttpError extends Error {
   }
 }
 
-const plain = (value: unknown): value is JsonObject =>
+/** Proves a value is a plain (non-array, non-null) object while keeping whatever
+ *  type the caller already established for it. */
+const plain = <T>(value: T): value is T & JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const exactKeys = (value: JsonObject, expected: readonly string[]): boolean => {
@@ -175,10 +177,17 @@ const exactKeys = (value: JsonObject, expected: readonly string[]): boolean => {
   return actual.length === expected.length && actual.every((key) => expected.includes(key));
 };
 
-const safeInteger = (value: unknown): value is number =>
+const safeInteger = (value: JsonValue | undefined): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-function decodeCanonicalBase64url(value: unknown): Uint8Array {
+/** A wire field proven to be canonical base64url, carried with its decoded bytes so
+ *  callers keep the established `string` type instead of re-asserting it. */
+interface CanonicalBase64url {
+  value: string;
+  bytes: Uint8Array;
+}
+
+function decodeCanonicalBase64url(value: JsonValue | undefined): CanonicalBase64url {
   if (typeof value !== "string" || !B64URL_RE.test(value)) {
     throw new KeyDeliveryValidationError("key-delivery public key is not canonical base64url");
   }
@@ -191,7 +200,7 @@ function decodeCanonicalBase64url(value: unknown): Uint8Array {
   if (toB64url(decoded) !== value) {
     throw new KeyDeliveryValidationError("key-delivery public key is not canonical base64url");
   }
-  return decoded;
+  return { value, bytes: decoded };
 }
 
 function assertRsa3072Spki(spki: Uint8Array): void {
@@ -229,7 +238,7 @@ async function requestDigest(request: KeyDeliveryRequest): Promise<string> {
 }
 
 export async function validateKeyDeliveryFetchResponse(
-  value: unknown,
+  value: JsonValue,
   nudgedRequestId: string | undefined,
   now: number,
 ): Promise<ValidatedRequest | null> {
@@ -289,8 +298,10 @@ export async function validateKeyDeliveryFetchResponse(
   ) {
     throw new KeyDeliveryValidationError("key-delivery approval is expired or not fresh");
   }
-  const encPubKeyBytes = decodeCanonicalBase64url(request.encPubKey);
-  const sigPubKeyBytes = decodeCanonicalBase64url(request.sigPubKey);
+  const encPubKey = decodeCanonicalBase64url(request.encPubKey);
+  const sigPubKey = decodeCanonicalBase64url(request.sigPubKey);
+  const encPubKeyBytes = encPubKey.bytes;
+  const sigPubKeyBytes = sigPubKey.bytes;
   if (sigPubKeyBytes.byteLength !== 32) {
     throw new KeyDeliveryValidationError("key-delivery signing key must be 32-byte Ed25519");
   }
@@ -299,13 +310,27 @@ export async function validateKeyDeliveryFetchResponse(
     throw new KeyDeliveryValidationError("key-delivery public-key hash binding mismatch");
   }
   const fingerprint = toB64url(await sha256(utf8(canonicalString({
-    encPubKeySpki: request.encPubKey,
-    sigPubKey: request.sigPubKey,
+    encPubKeySpki: encPubKey.value,
+    sigPubKey: sigPubKey.value,
   }))));
   if (fingerprint !== request.pubkeyFingerprint) {
     throw new KeyDeliveryValidationError("key-delivery public-key fingerprint mismatch");
   }
-  return { ...(request as unknown as KeyDeliveryRequest), encPubKeyBytes, sigPubKeyBytes };
+  return {
+    requestId: request.requestId,
+    targetDeviceId: request.targetDeviceId,
+    encPubKey: encPubKey.value,
+    sigPubKey: sigPubKey.value,
+    encPubKeyHash: request.encPubKeyHash,
+    sigPubKeyHash: request.sigPubKeyHash,
+    pubkeyFingerprint: request.pubkeyFingerprint,
+    approvalTokenHash: request.approvalTokenHash,
+    accountEpoch: request.accountEpoch,
+    approvedAt: request.approvedAt,
+    expiresAt: request.expiresAt,
+    encPubKeyBytes,
+    sigPubKeyBytes,
+  };
 }
 
 function assertAccountId(accountId: string): void {
@@ -341,7 +366,7 @@ async function readBoundedRegular(file: string, maxBytes: number): Promise<strin
 }
 
 function parsePreference(raw: string, accountId: string, deviceId: string): KeyDeliveryDaemonPreference {
-  const value = JSON.parse(raw) as unknown;
+  const value = JSON.parse(raw) as JsonValue;
   if (
     !plain(value)
     || !exactKeys(value, ["version", "accountId", "deviceId", "keyReleaseOptIn", "fulfillmentEnabled"])
@@ -353,7 +378,13 @@ function parsePreference(raw: string, accountId: string, deviceId: string): KeyD
   ) {
     throw new Error("invalid key-delivery daemon preference");
   }
-  return value as unknown as KeyDeliveryDaemonPreference;
+  return {
+    version: 1,
+    accountId,
+    deviceId,
+    keyReleaseOptIn: value.keyReleaseOptIn,
+    fulfillmentEnabled: value.fulfillmentEnabled,
+  };
 }
 
 export async function loadKeyDeliveryDaemonPreference(
@@ -407,7 +438,7 @@ export function keyDeliveryPreferenceOverrideFromEnv(
 }
 
 function parseStage(raw: string, accountId: string, requestId: string): FulfillmentStage {
-  const value = JSON.parse(raw) as unknown;
+  const value = JSON.parse(raw) as JsonValue;
   if (
     !plain(value)
     || !exactKeys(value, [
@@ -435,7 +466,18 @@ function parseStage(raw: string, accountId: string, requestId: string): Fulfillm
   ) {
     throw new Error("invalid key-delivery fulfillment journal");
   }
-  return value as unknown as FulfillmentStage;
+  return {
+    version: 1,
+    accountId,
+    requestId,
+    requestDigest: value.requestDigest,
+    targetDeviceId: value.targetDeviceId,
+    accountEpoch: value.accountEpoch,
+    mkWrapDevice: value.mkWrapDevice,
+    signedRoster: value.signedRoster,
+    rosterVersion: value.rosterVersion,
+    stagedAt: value.stagedAt,
+  };
 }
 
 async function loadStage(accountId: string, request: ValidatedRequest): Promise<FulfillmentStage | undefined> {
@@ -621,7 +663,7 @@ function assertDeviceWrapBinding(wrap: Wrap, request: ValidatedRequest, accountI
   ) {
     throw new KeyDeliveryValidationError("key-delivery wrap has the wrong persisted device context");
   }
-  const ciphertext = decodeCanonicalBase64url(wrap.ct);
+  const ciphertext = decodeCanonicalBase64url(wrap.ct).bytes;
   if (ciphertext.byteLength !== 384) {
     throw new KeyDeliveryValidationError("key-delivery wrap has invalid RSA ciphertext length");
   }
@@ -724,7 +766,7 @@ async function verifyStageForPublish(
   }
 }
 
-function parseSubmitSuccess(value: unknown, requestId: string): void {
+function parseSubmitSuccess(value: JsonValue, requestId: string): void {
   if (!plain(value)) throw new KeyDeliveryValidationError("malformed key-delivery submit response");
   const valid = exactKeys(value, ["ok", "requestId"])
     || exactKeys(value, ["ok", "requestId", "alreadyFulfilled"]);
@@ -738,10 +780,10 @@ function parseSubmitSuccess(value: unknown, requestId: string): void {
   }
 }
 
-async function responseJson(response: Response, operation: string): Promise<unknown> {
-  let body: unknown;
+async function responseJson(response: Response, operation: string): Promise<JsonValue> {
+  let body: JsonValue;
   try {
-    body = await response.json();
+    body = await response.json() as JsonValue;
   } catch {
     throw new KeyDeliveryHttpError(response.status, undefined, `${operation} returned malformed JSON`);
   }
@@ -1060,7 +1102,7 @@ export class KeyDeliveryFulfillmentFlight implements KeyDeliveryFlightPort {
 
 export function parseKeyDeliveryNudge(data: string): string | undefined {
   try {
-    const value = JSON.parse(data) as unknown;
+    const value = JSON.parse(data) as JsonValue;
     if (
       !plain(value)
       || !exactKeys(value, ["type", "requestId"])
