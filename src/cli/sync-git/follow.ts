@@ -39,9 +39,8 @@ import {
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
+import { addClassifyTimedMs, addTimedMs } from "../../engine/git/chain-timings.js";
 import {
-  addClassifyTimedMs,
-  addTimedMs,
   git,
   headBranchOf,
   readHead,

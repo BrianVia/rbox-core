@@ -7,7 +7,7 @@
 ## 1. Protected contract
 
 `src/cli/sync-git/apply.ts` remains the pull-side materialization owner and
-`src/engine/git/shared.ts` remains the `GitChainTimings` owner. The patch must
+`src/engine/git/chain-timings.ts` is the `GitChainTimings` owner. The patch must
 preserve every apply result, blocker, held-attempt decision, before/after
 fingerprint bracket, standing-proof retry/repair transition, index projection,
 crash boundary, compatibility path, and fast path. Timings remain an exclusive
@@ -87,4 +87,3 @@ Crash, compatibility, and behavior validation are supplied by the existing
 focused suites because the wrapped functions and ordering remain byte-for-byte
 inside their original call sites. Performance validation is the timing test
 itself plus the newly exposed leaves; no fast path is removed.
-

@@ -14,8 +14,8 @@ import {
 } from "../../engine/index.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
 import { listRefs } from "../../engine/git/refs.js";
+import { addTimedMs } from "../../engine/git/chain-timings.js";
 import {
-  addTimedMs,
   clearIndexResolveUndo,
   getGitArtifact,
   git,
