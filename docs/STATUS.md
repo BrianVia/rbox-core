@@ -5,6 +5,23 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_MORNING: TAIL KILLED (2026-08-14, #690 merged, desktop on 674a2cf): push
+wall **58.5s → 7.0s** field-verified (drain_wait_ms 50.8→0.1). Root cause
+was NOT a timer: settlement waited at queue-empty behind the 47s pull the
+push itself provoked; fix = settle at each operation boundary
+(settleOperationBoundary, red→green proven, codex ALIGNED 0 findings,
+design 246 amended). THERMO SWEEP RAN (task #15 → #691, 5 new findings):
+telemetry write amplification (High, own slice), pending-carry still
+reaches doPush via recovery probes (High — catch on our own #685!), false
+candidate_projection_ms bucket (delete), _ms labels render seconds, one
+real anti-slop line; findings 2-5 cleanup PR in flight (codex). rbox-home
+#14 MERGED — next/install.sh serves the real installer again (verified
+200 text/x-shellscript). RboxBar signing DEFERRED (no Apple dev account).
+Commit-leg guard pinned on task #17: designs 101/110/111/112/114/103
+already own payload/parallelism — corpus read required before any new
+investigation there. Next sender slices: trusted-view push, git-plan
+cy/f/cp, post-publish pull git-apply 42s/ownership 33s (#573/#670)._
+
 _TAIL CONVICTED (2026-08-14 ~06:40Z, #689 merged, desktop on 65e6f60): the
 constant ~51s push tail is **drain_wait_ms=50.8** — report/metrics settlement
 queued until the NEXT PUMP TICK (≈60s scan floor − op work); ack_ms=0.0 and
