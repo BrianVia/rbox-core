@@ -6,10 +6,9 @@ import { receiverEquivalentCollisionNames } from "../apply-receipt.js";
 import { writeFileAtomic } from "../fsutil.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitSection } from "../types.js";
+import { addTimedMs, type GitChainTimings } from "./chain-timings.js";
 import {
-  addTimedMs,
   HEX40,
-  type GitChainTimings,
   type RepoCtx,
   clearIndexResolveUndo,
   detectGitKind,

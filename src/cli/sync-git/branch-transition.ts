@@ -12,8 +12,9 @@ import {
 } from "../../engine/index.js";
 import type { GitPartialApply } from "../config.js";
 import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
+import { addTimedMs, type GitChainTimings } from "../../engine/git/chain-timings.js";
 import { readAllRefsStrict } from "../../engine/git/refs.js";
-import { addTimedMs, readHead, repoCtx, type GitChainTimings } from "../../engine/git/shared.js";
+import { readHead, repoCtx } from "../../engine/git/shared.js";
 import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;

@@ -39,8 +39,8 @@ import {
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
+import { addClassifyTimedMs, addTimedMs } from "../../engine/git/chain-timings.js";
 import {
-  addTimedMs,
   git,
   headBranchOf,
   readHead,
@@ -731,7 +731,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       { prefix: staged.incomingNs, opState: staged.opBytes },
     );
 
-    const first = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
+    const first = await addClassifyTimedMs(opts.chainTimings, () => classifyCheckout({
       opts,
       live: liveBefore,
       incomingProjection: effectiveIncomingIndexProjection ?? undefined,
@@ -997,7 +997,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
             return false;
           }
         }
-        const proof = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
+        const proof = await addClassifyTimedMs(opts.chainTimings, () => classifyCheckout({
           opts,
           live,
           incomingProjection: staged.incomingIndexProjection,
@@ -1190,7 +1190,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const finalLive = await readLive(opts.ctx, opts.chainTimings);
       if (finalLive) {
         const finalRef = await publishRefPlane(opts, finalLive, roots, finalOwnershipContext, true);
-        const finalCheckout = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
+        const finalCheckout = await addClassifyTimedMs(opts.chainTimings, () => classifyCheckout({
           opts,
           live: finalLive,
           incomingProjection: finalIncomingProjection ?? undefined,

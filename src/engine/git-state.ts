@@ -8,8 +8,10 @@
 // validates gitRepos values, and manifest-validate must stay node:*-free for the Worker).
 export { isSyncableRef, validateGitSection, validateRefTombstones } from "./manifest-validate.js";
 
-export type { GitBusyInspection, GitBusyLock, GitBusySharedInspection, GitChainTimings, GitRepoKind, RepoCtx } from "./git/shared.js";
-export { finalizeGitChainTimings, gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, inspectGitBusy, inspectGitBusyShared, repoCtxFromDisk, setGitSpawnObserver, zeroGitChainTimings } from "./git/shared.js";
+export type { GitBusyInspection, GitBusyLock, GitBusySharedInspection, GitRepoKind, RepoCtx } from "./git/shared.js";
+export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, inspectGitBusy, inspectGitBusyShared, repoCtxFromDisk, setGitSpawnObserver } from "./git/shared.js";
+export type { GitChainTimings } from "./git/chain-timings.js";
+export { finalizeGitChainTimings, zeroGitChainTimings } from "./git/chain-timings.js";
 export { gitPreflight, gitRefStorage, isGitBusy, type GitPreflightResult } from "./git/preflight.js";
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
 export {

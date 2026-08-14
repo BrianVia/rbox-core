@@ -2,10 +2,11 @@
  * the index projection, and operation state. Moved verbatim out of follow.ts. */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { indexIdentityV2, type GitChainTimings } from "../../engine/index.js";
+import { indexIdentityV2 } from "../../engine/index.js";
+import { addTimedMs, type GitChainTimings } from "../../engine/git/chain-timings.js";
 import { hashFile } from "../../engine/hash.js";
 import { readAllRefs, readOpStateSnapshot } from "../../engine/git/refs.js";
-import { addTimedMs, git, type RepoCtx } from "../../engine/git/shared.js";
+import { git, type RepoCtx } from "../../engine/git/shared.js";
 import type { LiveMetadata } from "./follow-types.js";
 
 export async function readLive(

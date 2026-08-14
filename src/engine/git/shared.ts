@@ -10,64 +10,11 @@ import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { encryptFileToTemp, decryptFileToPath } from "../crypto.js";
 import { hashFile } from "../hash.js";
 import type { GitArtifactRef, GitPackLink, GitSection } from "../types.js";
+import { addTimedMs, type GitChainTimings } from "./chain-timings.js";
 
 /** Repo shape: "dir" = ordinary repo (`.git` directory); "pointer" = worktree/submodule
  *  checkout (`.git` gitfile whose state lives in the main clone's gitdir). */
 export type GitRepoKind = "dir" | "pointer";
-
-export interface GitChainTimings {
-  chainLength: number;
-  fetchDecryptMs: number;
-  bundleVerifyMs: number;
-  gitImportMs: number;
-  refTxnExclusiveMs: number;
-  ownershipMs: number;
-  reflogMs: number;
-  connectivityProofMs: number;
-  indexOpStateMs: number;
-  /** Checkout ownership-journal durable writes, marker observations, and fsyncs. */
-  journalMs: number;
-  /** Nested parent: reported separately and never added to exclusive leaves. */
-  classifyMs: number;
-  residualMs: number;
-}
-
-export function zeroGitChainTimings(): GitChainTimings {
-  return {
-    chainLength: 0,
-    fetchDecryptMs: 0,
-    bundleVerifyMs: 0,
-    gitImportMs: 0,
-    refTxnExclusiveMs: 0,
-    ownershipMs: 0,
-    reflogMs: 0,
-    connectivityProofMs: 0,
-    indexOpStateMs: 0,
-    journalMs: 0,
-    classifyMs: 0,
-    residualMs: 0,
-  };
-}
-
-type GitTimedField = Exclude<keyof GitChainTimings, "chainLength" | "residualMs">;
-
-export async function addTimedMs<T>(timings: GitChainTimings | undefined, field: GitTimedField, fn: () => T | Promise<T>): Promise<T> {
-  if (!timings) return fn();
-  const t0 = performance.now();
-  try {
-    return await fn();
-  } finally {
-    timings[field] += performance.now() - t0;
-  }
-}
-
-/** Close the explicit residual against the exact per-repo wall interval. */
-export function finalizeGitChainTimings(timings: GitChainTimings, repoWallMs: number): void {
-  const attributed = timings.fetchDecryptMs + timings.bundleVerifyMs + timings.gitImportMs
-    + timings.refTxnExclusiveMs + timings.ownershipMs + timings.reflogMs
-    + timings.connectivityProofMs + timings.indexOpStateMs + timings.journalMs;
-  timings.residualMs = Math.max(0, repoWallMs - attributed);
-}
 
 const exec = promisify(execFile);
 
@@ -108,11 +55,8 @@ export async function readRegularFileNoFollow(abs: string): Promise<RegularFileR
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    // Reflog writes (`update-ref --create-reflog`, including transactional
-    // reflog creation) require a committer ident. An identity-less receiver —
-    // for example a fresh machine or a daemon started before Git is configured —
-    // must not defer stash-carrying sections. This synthetic ident is local
-    // forensic text only; rbox never uses it to author commits for the user.
+    // Reflog writes require an identity even on fresh receivers. This fallback
+    // is local forensic text only; rbox never authors user commits with it.
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "rbox",
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "rbox@local",
     GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "rbox",
@@ -245,9 +189,7 @@ async function gitRawLegacy(root: string, args: string[], opts: GitRunOptions = 
   }
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
-    // Strip every repo-redirecting env var: rbox may be invoked from a git hook or wrapper,
-    // and a leaked GIT_COMMON_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would point commonDir (now
-    // load-bearing for the apply shape refusal + gitBusy) at a FOREIGN repo.
+    // Never let a hook or wrapper redirect this operation into a foreign repo.
     env: cleanGitEnv(opts.env),
   });
   return stdout.toString();
@@ -257,22 +199,25 @@ export type GitRunResult =
   | { status: "ok"; stdout: string }
   | { status: "failed"; exit: number | null; stdout: string; stderr: string; cause: unknown };
 
+type GitLegacyFailure = { code?: number | null; stdout?: string | Buffer; stderr?: string | Buffer };
+
+function gitFailureOutput(output: string | Buffer | undefined): string {
+  return Buffer.isBuffer(output) ? output.toString() : output ?? "";
+}
+
 /** Structured Git runner for evidence-sensitive reads. Every outcome is data,
  * and `cause` is the exact object the legacy throwing runner produced. */
 export async function gitStatus(root: string, args: string[], opts: GitRunOptions = {}): Promise<GitRunResult> {
   try {
     return { status: "ok", stdout: await gitRawLegacy(root, args, opts) };
   } catch (cause) {
-    const error = cause as { code?: unknown; stdout?: unknown; stderr?: unknown };
+    // Decode Node's process failure shape while preserving the exact cause.
+    const error = cause as GitLegacyFailure;
     return {
       status: "failed",
-      exit: typeof error?.code === "number" && Number.isInteger(error.code) ? error.code : null,
-      stdout: typeof error?.stdout === "string"
-        ? error.stdout
-        : Buffer.isBuffer(error?.stdout) ? error.stdout.toString() : "",
-      stderr: typeof error?.stderr === "string"
-        ? error.stderr
-        : Buffer.isBuffer(error?.stderr) ? error.stderr.toString() : "",
+      exit: Number.isInteger(error.code) ? error.code ?? null : null,
+      stdout: gitFailureOutput(error.stdout),
+      stderr: gitFailureOutput(error.stderr),
       cause,
     };
   }
@@ -420,14 +365,9 @@ export async function readHead(ctx: RepoCtx): Promise<string> {
   return (await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8")).trim();
 }
 
-/** Design 68 §3.3 — for a repo dir, the POSIX relPath (from `root`) of the in-tree MAIN
- *  CLONE that owns it as a LINKED worktree, or undefined when it is NOT an in-tree linked
- *  worktree: an ordinary dir repo, a submodule checkout, or a worktree whose main clone
- *  lives outside `root`. Submodules are EXEMPT (V14): their `commonDir` resolves into
- *  `.git/modules/…` (basename is the module name, never a bare `.git`), and the superproject
- *  stays structurally refused, so no parent bundle would carry the module store — skipping
- *  them would regress design-43 support. Used to policy-skip the pointer's full-store
- *  capture (its history rides the in-tree main clone's bundle instead). */
+/** Design 68 §3.3: find the in-tree main clone that carries a linked worktree's
+ * history. Ordinary repos, submodules (`.git/modules/...`), and out-of-tree main
+ * clones return undefined and retain their existing capture behavior. */
 export async function inTreeWorktreeParentRel(root: string, repoDir: string): Promise<string | undefined> {
   const ctx = await repoCtx(repoDir);
   return inTreeWorktreeParentRelFromCtx(root, ctx);
@@ -745,12 +685,10 @@ export interface PutGitArtifactOptions {
   onBytes?: ByteProgressCallback;
 }
 
-const isBlobShaMismatchError = (e: unknown): boolean => e instanceof Error && e.name === "BlobShaMismatchError";
+const isBlobShaMismatchError = (cause: unknown): boolean => cause instanceof Error && cause.name === "BlobShaMismatchError";
 
-/** Design 226: an encrypted-but-not-yet-uploaded git artifact. The ciphertext lives at
- *  `ciphertextPath` — a path unique per ENCRYPT CALL, never keyed by content, because
- *  encryption is convergent and two captures of the same staged file collapse to one
- *  encSha (keying by encSha deletes a still-referenced capture's bytes). */
+/** Design 226: retained ciphertext uses a per-encryption path, never an encSha
+ * path that concurrent convergent captures could share and prematurely delete. */
 export interface PendingGitUpload {
   encSha: string;
   ciphertextPath: string;
@@ -761,12 +699,8 @@ export interface PendingGitUpload {
   backoff?: (attempt: number) => Promise<void>;
 }
 
-/** §28 + design 226 step 1: ENCRYPT a staged plaintext artifact under the workspace KEK into
- *  `retainDir` and return the (plaintext sha, encSha, cipherSize) ref plus the handle naming
- *  the retained ciphertext. No store is touched: the ref is built entirely from the local
- *  encryption result, which is what lets a caller decide the section's fate before spending
- *  bytes on the wire. The ciphertext outlives this call — `retainDir` must not be the
- *  caller's per-capture temp dir unless the caller flushes and cleans up itself. */
+/** §28/design 226: encrypt locally without touching the store, retaining the
+ * ciphertext until the caller decides the section's fate and cleans it up. */
 export async function encryptGitArtifact(
   kek: Buffer,
   srcPath: string,
@@ -790,13 +724,8 @@ export async function encryptGitArtifact(
   };
 }
 
-/** §28 + design 226 step 2: upload a retained CIPHERTEXT by its encSha, skipping the PUT if
- *  the account already has the blob (entitled+present). On a typed sha-mismatch the SAME
- *  retained bytes are re-sent after a local `hashFile` re-verification — the staged plaintext
- *  is long gone by the flush, so re-encrypting is impossible; a ciphertext that no longer
- *  hashes to its encSha FAILS CLOSED rather than shipping bytes under a claimed address.
- *  Performs NO cleanup of `ciphertextPath`: retained artifacts collapse across repos by
- *  encSha, so per-file reclamation can delete bytes another repo still reads. */
+/** §28/design 226: upload retained ciphertext, retrying a typed SHA mismatch
+ * only after local re-verification. Cleanup remains the retention owner's job. */
 export async function flushGitArtifact(store: BlobStore, pending: PendingGitUpload): Promise<void> {
   for (let attempt = 0; attempt < pending.attempts; attempt++) {
     try {
@@ -839,11 +768,8 @@ export async function putGitArtifact(
   }
 }
 
-/** The store surface a git-artifact FETCH needs, and nothing more. Narrow on purpose:
- *  design 226's plan-local read-through store serves fresh, not-yet-uploaded candidate
- *  bytes, and a `has` answered from that local retention would report an artifact the
- *  server has never seen as satisfied. Every consumer of `getGitArtifact` declares this
- *  type; a full `BlobStore` stays assignable, so no caller is affected. */
+/** Fetch excludes `has`: a plan-local retained artifact must not be mistaken
+ * for an artifact already present on the server (design 226). */
 export type GitArtifactReadStore = Pick<BlobStore, "get" | "getToFile">;
 
 async function getBlobToFile(store: GitArtifactReadStore, sha: string, destPath: string): Promise<void> {
@@ -852,17 +778,13 @@ async function getBlobToFile(store: GitArtifactReadStore, sha: string, destPath:
   else await fs.writeFile(destPath, await store.get(sha));
 }
 
-/** §28: fetch a git artifact's CIPHERTEXT by encSha, then decrypt+verify (GCM tag + plaintext-sha)
- *  to `destPath`. Throws on any fetch/decrypt/verify failure — callers run this into temp files
- *  BEFORE mutating the gitdir, so a bad/ swapped/ corrupt blob never half-applies. */
+/** Fetch, decrypt, and verify into a pre-mutation temp path; fail closed. */
 export async function getGitArtifact(store: GitArtifactReadStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
   const ct = path.join(tmpDir, `ct-${ref.encSha}`);
   await getBlobToFile(store, ref.encSha, ct);
   await fs.mkdir(path.dirname(destPath), { recursive: true });
-  // No maxPlaintextBytes cap here: GitArtifactRef has no plaintext-size field, and capture
-  // never compresses git artifacts (design 79 keeps the git lane raw), so `comp` is
-  // structurally absent today. A future git-lane-compression design MUST add a declared
-  // plaintext size to GitArtifactRef and cap here, as apply.ts does with entry.size.
+  // Git artifacts are currently uncompressed. Compression requires adding a
+  // declared plaintext size to GitArtifactRef and enforcing it here.
   await decryptFileToPath(ct, kek, ref.sha, destPath, { comp: ref.comp, payloadSha: ref.payloadSha });
   await fs.rm(ct, { force: true });
 }
