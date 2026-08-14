@@ -4,7 +4,7 @@ import type { CommitChainResult } from "../e2ee-remote.js";
 import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
-import { timePushTailRequest } from "../push-tail-timing.js";
+import { timePushTailRequest } from "../push-spans.js";
 import { errorCode, NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { readNumericFields } from "./timings.js";
 

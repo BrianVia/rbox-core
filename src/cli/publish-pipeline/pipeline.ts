@@ -29,7 +29,7 @@ import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
 import { TransferRateSampler } from "../transfer-rate.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
-import { timeMissingBlobs } from "../push-tail-timing.js";
+import { timeMissingBlobs } from "../push-spans.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
 import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./receipt-drainer.js";

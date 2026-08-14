@@ -15,14 +15,17 @@ import {
 import type { WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { encryptAndUpload } from "../sync-recovery.js";
-import { beginFirstPublishTiming, firstPublishTiming } from "../upload-lane-timing.js";
+import { beginFirstPublishTiming } from "../upload-lane-timing.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "../push-spans.js";
 import { runPublishPipeline } from "./pipeline.js";
 import { CipherDescriptorWriter } from "./shared.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+let firstPublishTiming: FirstPublishTiming;
 
 beforeEach(() => {
+  firstPublishTiming = enterPushSpansForTest().firstPublish;
   delete process.env.RBOX_PREFLIGHT_DELTA;
   delete process.env.RBOX_PREFLIGHT_FULL;
 });

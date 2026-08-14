@@ -6,7 +6,7 @@
  * commits, keys) reads and mutates ONE instance held by `RboxApi`.
  */
 import { translateRemoteError } from "./errors.js";
-import { timePushTailRequest } from "../push-tail-timing.js";
+import { timePushTailRequest } from "../push-spans.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 import { RBOX_VERSION } from "../version.js";
 import { debugEnabled } from "../debug.js";

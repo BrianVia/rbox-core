@@ -6,7 +6,7 @@ import { putBlobFile } from "../blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
 import { firstPublishAuthDispatchStart, firstPublishAuthSettle, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
-import { recordLaneSettlement } from "../../telemetry/lane-accumulator.js";
+import { recordLaneSettlement } from "../../push-spans.js";
 import { SingleGate, UploadSlotArbiter, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount, packUploadDisabled } from "./gate.js";
 import { uploadBatchConfig, packUploadConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig, type PackConfig } from "./config.js";
 import { BlobPackUploader } from "./pack-uploader.js";

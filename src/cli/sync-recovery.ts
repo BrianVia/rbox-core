@@ -22,7 +22,7 @@ import { UploadByteTracker } from "./upload-byte-tracker.js";
 import { TransferRateSampler } from "./transfer-rate.js";
 import { beginFirstPublishTiming, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 import { metricsEnabled } from "./metrics.js";
-import { timeMissingBlobs } from "./push-tail-timing.js";
+import { timeMissingBlobs } from "./push-spans.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
 import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./publish-pipeline/receipt-drainer.js";
 import { createRunTempDir } from "./publish-pipeline/stale-temp.js";

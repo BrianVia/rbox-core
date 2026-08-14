@@ -1,7 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { RemoteContext } from "./remote/context.js";
 import { RECEIPT_REDEEM_BATCH_MAX, RECEIPT_REDEEM_REQUEST_BYTES_MAX, initialReceiptSendCap, redeemReceipts } from "./remote/commits.js";
-import { beginFirstPublishTiming, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
 
 const originalSendCap = process.env.RBOX_RECEIPT_SEND_CAP;
 const json = (status: number, body: unknown) =>
@@ -19,6 +20,9 @@ const resetFirstPublishStats = () => {
   beginFirstPublishTiming(true);
   beginFirstPublishTiming(false);
 };
+
+let firstPublishTiming: FirstPublishTiming;
+beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 
 afterEach(() => {
   resetFirstPublishStats();

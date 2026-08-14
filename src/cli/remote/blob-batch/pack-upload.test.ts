@@ -19,7 +19,7 @@ import { UploadSlotArbiter, onPackUploadDisabled, packUploadDisabled, resetBatch
 import { BlobPackUploader } from "./pack-uploader.js";
 import { buildPack } from "./packer.js";
 import { BlobBatchUploader, setUploaderClockForTests } from "./uploader.js";
-import { withPushLaneAccumulator } from "../../telemetry/lane-accumulator.js";
+import { withPushLaneAccumulator } from "../../push-spans.js";
 
 const ENV_KEYS = [
   "RBOX_BLOB_PACK", "RBOX_PACK_STREAMS", "RBOX_PACK_CUTOFF_BYTES",

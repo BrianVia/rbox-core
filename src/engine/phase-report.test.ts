@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { PhaseReport } from "./phase-report.js";
 import {
   beginFirstPublishTiming,
@@ -6,12 +6,15 @@ import {
   firstPublishAuthDispatchStart,
   firstPublishAuthSettle,
   firstPublishReady,
-  firstPublishTiming,
   firstPublishUploadEnd,
   firstPublishUploadStart,
   formatFirstPublishStats,
 } from "../cli/upload-lane-timing.js";
 import { formatPushResiduals } from "../cli/sync/format.js";
+import { enterPushSpansForTest, type FirstPublishTiming } from "../cli/push-spans.js";
+
+let firstPublishTiming: FirstPublishTiming;
+beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 
 describe("PhaseReport", () => {
   test("accumulates ms + bytes + count per phase across repeated hits", async () => {

@@ -1,7 +1,6 @@
 import {
   canonicalManifestHashStreaming,
   diffManifests,
-  PhaseReport,
   scanManifest,
   validateManifest,
   manifestRequiresSchema4,
@@ -33,12 +32,11 @@ import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
 import { assertMayPublish } from "../scope/binding-scope.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, saveStateSource } from "../sync-state.js";
-import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
+import { beginFirstPublishTiming, finishFirstPublishStats, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
-import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
-import { withPushTailTiming } from "../push-tail-timing.js";
+import { PushSpans } from "../push-spans.js";
 import { savePathWarnings } from "../path-warnings.js";
-import { formatCommitTimings, formatPushSpan, formatScanStats, scanDetailsOf } from "./format.js";
+import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, PUSH_CONFLICT_SURRENDER_MS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
@@ -87,6 +85,7 @@ export function stampManifestSchemaForCommit(manifest: Manifest, base?: Manifest
   }
   return { ...normalized, manifestSchema: schema };
 }
+
 /**
  * Scan and push. Convenience wrapper for CLI one-shots — the daemon uses
  * {@link pushManifest} directly with its incrementally-patched in-memory manifest.
@@ -110,7 +109,8 @@ export async function push(
   };
   const reconciliation = await reconcileResolutionReceipt(root, cfg, deps);
   surfaceResolutionReceiptReconciliation(reconciliation, deps);
-  const report = deps.report ?? PhaseReport.disabled("push");
+  const spans = PushSpans.from(deps);
+  const report = spans.report;
   deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
@@ -134,14 +134,16 @@ export async function push(
       report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
   }
-  const { sequence, committed, gitDeferred, caseCollisions } = await pushManifest(root, cfg, local, deps, {
+  const { sequence, committed, gitDeferred, caseCollisions } = await pushManifestWithSpans(root, cfg, local, deps, {
     purgeIgnored,
     // Any unrelated deferral makes this scan non-authoritative, so a discovered
     // collision is still returned/printed but not persisted to the sidecar until
     // the next clean push authors durable truth.
     localFileObservation: localFileObservationForScan(scanDeferred.size === 0),
-  });
-  return { sequence, committed, caseCollisions, ...(gitDeferred ? { gitDeferred } : {}) };
+  }, spans);
+  return gitDeferred
+    ? { sequence, committed, caseCollisions, gitDeferred: true }
+    : { sequence, committed, caseCollisions };
 }
 
 /** What a push commit reports back to callers holding an in-memory manifest.
@@ -165,21 +167,9 @@ export class PushConflictExhaustedError extends Error {
   readonly name = "PushConflictExhaustedError";
 }
 
-/**
- * The one typed recovery structure behind pushManifest's bounded retry loop. A failed
- * commit attempt classifies into exactly one of these, and the loop applies it — this
- * unifies what were four ad-hoc retry paths (409-conflict, 422-unsatisfied, per-file
- * churn defer, and blob-sha mismatch) into a single sequencing point:
- *  - `pull-first` — a 409 parent-sequence conflict: PULL (absorb the remote change) then
- *    RE-SCAN (disk moved under us) and retry with a fresh manifest and no git force.
- *  - `epoch-stale` — the account rotated under this push: refresh the write context,
- *    RE-SCAN under the new KEK/cache binding, and retry with no git force.
- *  - `reupload` — a 422 unsatisfied-blobs bounce: retry the SAME manifest (no pull, no
- *    re-scan), forcing a git recapture for exactly the referenced repos (§6 [v2, M5]).
- * (The per-file churn defer + blob-sha-mismatch recovery live one layer down, inside
- *  encryptAndUpload: they resolve WITHIN an attempt by committing the stable subset and
- *  deferring the file that won't settle — never a whole-attempt retry.)
- */
+/** One typed transition behind the bounded retry loop: 409 pulls and rescans,
+ * epoch-stale refreshes and rescans, while 422 retries the same manifest and
+ * recaptures only referenced repos. Per-file churn remains inside upload. */
 type RecoveryAction =
   | { kind: "pull-first" }
   | { kind: "repair-conflict" }
@@ -223,38 +213,24 @@ function reuploadOutcome(committed: Manifest, blobs: readonly string[], total?: 
   const missing = new Set(unsatisfiedBlobs);
   const forceSnapshot = attemptedChain.some((sha) => missing.has(sha)) ||
     (attemptedChain.length > 0 && total !== undefined && total > unsatisfiedBlobs.length);
+  const action: Extract<RecoveryAction, { kind: "reupload" }> = {
+    kind: "reupload",
+    forceGitRecapture: gitForceForMissingBlobs(committed.gitRepos, new Set(unsatisfiedBlobs)),
+    localForRetry: committed,
+    unsatisfiedTotal: total,
+    unsatisfiedBlobs,
+  };
+  if (forceSnapshot) action.forceSnapshot = true;
   return {
     done: false,
-    action: {
-      kind: "reupload",
-      forceGitRecapture: gitForceForMissingBlobs(committed.gitRepos, new Set(unsatisfiedBlobs)),
-      localForRetry: committed,
-      unsatisfiedTotal: total,
-      unsatisfiedBlobs,
-      ...(forceSnapshot ? { forceSnapshot: true } : {}),
-    },
+    action,
     exhaustedError: "push: server keeps reporting missing blobs after re-upload",
   };
 }
 
-/**
- * Push a pre-computed manifest: upload missing blobs, commit. Short-circuits to a
- * no-op (no upload, no commit) when nothing changed vs the last-synced manifest —
- * this is what keeps continuous bidirectional sync from echo-storming (a pull
- * writes exactly the last-synced bytes, so the next push sees no diff). A 409
- * conflict pulls, RE-SCANS (disk changed), and retries (bounded, backed off); a
- * 422 re-uploads the named blobs and retries. A file that keeps changing under the
- * push (never producing a hash-matching ciphertext) is DEFERRED rather than aborting
- * the whole push: the stable subset commits, and the deferred paths are returned so
- * the daemon can re-queue them once they settle. Returns the sequence now in effect,
- * the manifest that reflects it (so a caller holding an in-memory manifest can keep it
- * fresh even across a conflict re-scan), and the deferred paths (empty when none).
- *
- * The retry itself is a bounded LOOP (not recursion): each iteration runs one attempt
- * and, on a classified failure, applies the {@link RecoveryAction} — sharing the single
- * MAX_ATTEMPTS budget, backing off only before a 409 pull (never a 422 re-upload), and
- * preserving the exact interleaving of the original recursive form.
- */
+/** Upload and commit a precomputed manifest. No-op avoids echo storms; changing
+ * files defer without aborting stable work; 409 pulls/rescans and 422 reuploads.
+ * The bounded loop owns the shared attempt budget and only backs off for 409. */
 export interface PushManifestOptions {
   purgeIgnored?: boolean;
   forceGitRecapture?: ReadonlySet<string>;
@@ -284,19 +260,27 @@ export async function pushManifest(
   deps: SyncDeps = {},
   options: PushManifestOptions = {}
 ): Promise<PushResult> {
-  const report = deps.report ?? PhaseReport.disabled("push");
-  return withPushTailTiming(report, () => withPushLaneAccumulator(
-      () => pushManifestInner(root, cfg, local, deps, options),
-      (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
-    ));
+  return pushManifestWithSpans(root, cfg, local, deps, options, PushSpans.from(deps));
+}
+
+function pushManifestWithSpans(
+  root: string,
+  cfg: WorkspaceConfig,
+  local: Manifest,
+  deps: SyncDeps,
+  options: PushManifestOptions,
+  spans: PushSpans,
+): Promise<PushResult> {
+  return spans.run(() => pushManifestInner(root, cfg, local, deps, options, spans));
 }
 
 async function pushManifestInner(
   root: string,
   cfg: WorkspaceConfig,
   local: Manifest,
-  deps: SyncDeps = {},
-  options: PushManifestOptions = {}
+  deps: SyncDeps,
+  options: PushManifestOptions,
+  spans: PushSpans,
 ): Promise<PushResult> {
   const { purgeIgnored = false, repair, resolution } = options;
   // Design 212 §3.1b layer 1. This is the shared publication boundary: ignore purge,
@@ -306,7 +290,7 @@ async function pushManifestInner(
   // tree, and every one of those steps reads that partial tree as the whole truth.
   await assertMayPublish(root);
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
-  const report = deps.report ?? PhaseReport.disabled("push");
+  const report = spans.report;
   deps = withReportScanStats(deps, report);
   const backoff = deps.backoff ?? defaultBackoff;
   const now = deps.now ?? Date.now;
@@ -342,9 +326,9 @@ async function pushManifestInner(
     forceSnapshot: repair !== undefined,
     filesFirstAborted: false,
     filesFirstFallbackUsed: false,
-    ...(repair ? { repair } : {}),
-    ...(resolution ? { resolution } : {}),
   };
+  if (repair) state.repair = repair;
+  if (resolution) state.resolution = resolution;
   let previousUnsatisfiedTotal: number | undefined;
   const baseIntegrityByMeta = new Map<string, boolean>();
   // Shared "discard the attempt, rebuild from disk truth" reset — used by the
@@ -373,7 +357,7 @@ async function pushManifestInner(
     if (firstConflictAt !== undefined && now() - firstConflictAt > PUSH_CONFLICT_SURRENDER_MS) {
       throw new PushConflictExhaustedError("push: too many conflicts, remote is moving faster than we can reconcile");
     }
-    const outcome = await runPushAttempt(root, cfg, deps, backoff, state, baseIntegrityByMeta);
+    const outcome = await runPushAttempt(root, cfg, deps, backoff, state, baseIntegrityByMeta, spans);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
@@ -435,12 +419,7 @@ async function pushManifestInner(
   }
 }
 
-/**
- * Run ONE push attempt: forward-only ignore carry, git-section plan, no-op short-circuit,
- * encrypt+upload (with per-file churn defer), and commit — then classify the commit into
- * a done result or a {@link RecoveryAction} for the loop to apply. Attempt-agnostic: the
- * MAX_ATTEMPTS budget and backoff live in {@link pushManifest}'s loop.
- */
+/** Run one attempt and classify its result; the outer loop owns retry policy. */
 /** The loop-carried state of {@link pushManifest}'s bounded retry loop — one
  *  object instead of seven positionals, mutated by the RecoveryAction arms. */
 interface PushAttemptState {
@@ -503,6 +482,7 @@ async function runPushAttempt(
   backoff: (attempt: number) => Promise<void>,
   attemptState: PushAttemptState,
   baseIntegrityByMeta: Map<string, boolean>,
+  spans: PushSpans,
 ): Promise<AttemptOutcome> {
   const { purgeIgnored, forceGitRecapture, recoverAddresses, forceFullAudit, forceSnapshot, filesFirstAborted, repair, resolution } = attemptState;
   let local = attemptState.local;
@@ -510,22 +490,15 @@ async function runPushAttempt(
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
-  // Needed before the no-op short-circuit (state-load/git-plan are phased, design 82
-  // §4); §35's "a no-op tick allocates nothing" still holds — disabled() is a shared
-  // free singleton, not a per-attempt allocation.
-  const report = deps.report ?? PhaseReport.disabled("push");
-  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
-  const stateLineageT0 = performance.now();
-  state = await ensureCapableStateLineage(root, state);
-  const stateLineageMs = performance.now() - stateLineageT0;
+  const report = spans.report;
+  let state = await spans.span("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  state = await spans.span("state_lineage_ms", () => ensureCapableStateLineage(root, state));
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
   const appliedSequence = state.lastSyncedSequence;
   const appliedBase = state.lastSyncedManifest;
-  const matcherT0 = performance.now();
-  const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
-  const matcherMs = performance.now() - matcherT0;
+  const matcher = spans.span("matcher_ms", () => matcherForState(root, cfg, state, { purgeSafety: purgeIgnored })); // shared: forward-only ignore carry + git discovery
   const projectionT0 = report.enabled ? performance.now() : 0;
   const scannedFilePaths = attemptState.rawScannedFilePaths;
   let projectionSpans: (LocalManifestProjectionSpans & { projection_diff_ms: number; projection_ms: number }) | undefined;
@@ -535,7 +508,7 @@ async function runPushAttempt(
   // planner is registered conservatively under one commit lease and a stop drains
   // any read phase that can later reach one.
   const capture: GitCapturePort = {
-    execute: (plan) => report.phase("git-plan", async () => {
+    execute: (plan) => spans.span("git-plan", async () => {
       const lease = deps.mutationBoundary?.enter({ phase: "git-commit" });
       try {
         if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
@@ -577,7 +550,7 @@ async function runPushAttempt(
           },
           changedRepos: (values) => changedSidecarRepoKeys(state, values),
           save: async (write) => {
-            state = await report.phase("state-save", () => saveStateSource(root, state, {
+            state = await spans.span("state-save", () => saveStateSource(root, state, {
               expectedStream: syncStreamId(cfg),
               sourceGlobalSeq: write.acceptedSequence,
               observedRepos: write.observedRepos,
@@ -617,7 +590,7 @@ async function runPushAttempt(
           receipt.plan.publisherAckBindings?.[relPath]?.lineageHash,
         ),
       ]));
-      await report.phase("state-save", () => saveStateSource(root, state, {
+      await spans.span("state-save", () => saveStateSource(root, state, {
         expectedStream: syncStreamId(cfg),
         sourceGlobalSeq: carrySequence,
         observedRepos: changedRepos,
@@ -638,6 +611,19 @@ async function runPushAttempt(
     };
   }
 
+  const candidateOptions = {
+    purgeIgnored,
+    repairing: repair !== undefined,
+    syncGit: cfg.syncGit === true,
+    filesFirstEnabled: filesFirstFlagEnabled(),
+    filesFirstAborted,
+    streamMismatch: stateWasStreamMismatch(state),
+    forceGitRecapture,
+    allowMassDelete: deps.allowMassDeletePush === true,
+    onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
+  };
+  if (resolution) Object.assign(candidateOptions, { resolution });
+  if (deps.massDeleteHint !== undefined) Object.assign(candidateOptions, { massDeleteHint: deps.massDeleteHint });
   const sealed = await preparePublishCandidate(
     { acceptedSequence: appliedSequence, appliedBase },
     {
@@ -670,39 +656,24 @@ async function runPushAttempt(
       },
     },
     capture,
-    {
-      purgeIgnored,
-      // NEVER defer git under chain-repair: a repair supersede posts
-      // repair.parentSequence (≠ appliedSequence) and must republish git verbatim.
-      repairing: repair !== undefined,
-      syncGit: cfg.syncGit === true,
-      filesFirstEnabled: filesFirstFlagEnabled(),
-      filesFirstAborted,
-      streamMismatch: stateWasStreamMismatch(state),
-      forceGitRecapture,
-      ...(resolution ? { resolution } : {}),
-      // Op-scoped consent only (allowMassDeletePush / RBOX_ALLOW_MASS_DELETE handled
-      // at the CLI boundary) — the daemon never consents, so a runaway wipe halts
-      // background push instead of publishing.
-      allowMassDelete: deps.allowMassDeletePush === true,
-      ...(deps.massDeleteHint !== undefined ? { massDeleteHint: deps.massDeleteHint } : {}),
-      onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
-    },
+    candidateOptions,
   );
   if (projectionSpans) {
-    report.appendDetails("git-plan", { projection_ms: projectionSpans.projection_ms }, formatPushSpan("projection_ms", projectionSpans.projection_ms));
-    report.appendDetails("git-plan", { projection_ignore_carry_ms: projectionSpans.projection_ignore_carry_ms }, formatPushSpan("projection_ignore_carry_ms", projectionSpans.projection_ignore_carry_ms));
-    report.appendDetails("git-plan", { projection_casefold_ms: projectionSpans.projection_casefold_ms }, formatPushSpan("projection_casefold_ms", projectionSpans.projection_casefold_ms));
-    report.appendDetails("git-plan", { projection_sort_ms: projectionSpans.projection_sort_ms }, formatPushSpan("projection_sort_ms", projectionSpans.projection_sort_ms));
-    report.appendDetails("git-plan", { projection_diff_ms: projectionSpans.projection_diff_ms }, formatPushSpan("projection_diff_ms", projectionSpans.projection_diff_ms));
+    spans.note("projection_ms", projectionSpans.projection_ms);
+    spans.note("projection_ignore_carry_ms", projectionSpans.projection_ignore_carry_ms);
+    spans.note("projection_casefold_ms", projectionSpans.projection_casefold_ms);
+    spans.note("projection_sort_ms", projectionSpans.projection_sort_ms);
+    spans.note("projection_diff_ms", projectionSpans.projection_diff_ms);
   }
-  report.appendDetails("git-plan", { state_lineage_ms: stateLineageMs }, formatPushSpan("state_lineage_ms", stateLineageMs));
-  report.appendDetails("git-plan", { matcher_ms: matcherMs }, formatPushSpan("matcher_ms", matcherMs));
+  spans.note("state_lineage_ms");
+  spans.note("matcher_ms");
   const publication = sealed.publication;
   local = sealed.candidate;
   if (sealed.admission === "no-op") {
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
-    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState), ...(publication.resolution ? { resolution: publication.resolution } : {}) } };
+    const result: PushResult = { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState) };
+    if (publication.resolution) result.resolution = publication.resolution;
+    return { done: true, result };
   }
   const gitUnchanged = sealed.gitUnchanged;
 
@@ -711,24 +682,21 @@ async function runPushAttempt(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
-  // (design 108): everything from encryptAndUpload (which ARMS the
-  // module-global firstPublishTiming singleton) onward runs inside this try. Its finally
-  // disables the singleton on EVERY exit that did not finalize it — a reupload /
-  // no-advance return, an epoch/409/422 return, or a thrown encrypt/commit/state-save
-  // error. The success path needs no flag: finishFirstPublishStats itself disables the
-  // singleton, so `enabled` in the finally means exactly "exited without finalizing".
+  // Design 108: upload arms the operation sink; every unfinished exit disarms it.
+  // Finalization disarms itself, so enabled in finally means unsuccessful exit.
   try {
     // Missing or scan-mismatched sources defer immediately; ciphertext upload
     // mismatches retry within a bounded per-file budget. Only the stable subset is
     // committed, and watcher/safety scans re-queue deferred paths once they settle.
-    const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+    const uploadOptions: Parameters<typeof encryptAndUpload>[8] = {
       encryptFileToTemp: deps.encryptFileToTemp,
       encryptCacheFlushMs: deps.encryptCacheFlushMs,
       pruneLivePaths: scannedFilePaths,
       recoverAddresses,
       forceFullAudit,
-      ...(deps.warningSink ? { warningSink: deps.warningSink } : {}),
-    });
+    };
+    if (deps.warningSink) uploadOptions.warningSink = deps.warningSink;
+    const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, uploadOptions);
 
     // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
     // if it was previously synced we carry its base entry forward (mirrors the forward-only
@@ -763,7 +731,9 @@ async function runPushAttempt(
           return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
         }
         reportDeferred(deferred, deps.warningSink);
-        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...resultCollisionMetadata(attemptState), ...(publication.resolution ? { resolution: publication.resolution } : {}) } };
+        const result: PushResult = { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...resultCollisionMetadata(attemptState) };
+        if (publication.resolution) result.resolution = publication.resolution;
+        return { done: true, result };
       }
     }
 
@@ -772,39 +742,39 @@ async function runPushAttempt(
     // Under the master kill (or with deltas killed) NOTHING is reconstructed: the
     // meta validate + manifestFromMeta + O(N) validateManifest + O(N) canonical
     // hash below are pure waste for a base the writer would immediately discard.
-    const deltaBaseT0 = performance.now();
     let deltaBase: { manifest: Manifest; meta: GlobalManifestMeta } | undefined;
     let deltaBaseRejection: "no-base" | "integrity" | undefined;
-    if (mdeWritePolicy().delta && !forceSnapshot) {
-      const manifestMeta = validManifestMeta(state.manifestMeta);
-      const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
-      if (!manifestMeta || !reconstructedBase || !validateManifest(reconstructedBase).ok || state.lastSyncedSequence !== appliedSequence) {
-        deltaBaseRejection = "no-base";
-      } else {
-        const integrityKey = JSON.stringify([
-          appliedSequence,
-          manifestMeta.encManifestSha,
-          manifestMeta.manifestHash,
-        ]);
-        let integrityOk = baseIntegrityByMeta.get(integrityKey);
-        if (integrityOk === undefined) {
-          integrityOk = canonicalManifestHashStreaming(reconstructedBase) === manifestMeta.manifestHash;
-          baseIntegrityByMeta.set(integrityKey, integrityOk);
-        }
-        if (!integrityOk) {
-        // §4.2 base-integrity precondition (REVIEW-204 A7): validManifestMeta
-        // validates SHAPE only. A structurally valid but stale/mismatched meta
-        // publishes a delta whose base no reader can reproduce — and readers only
-        // discover that AFTER the head commits. Bind the meta's manifestHash to
-        // the base we actually reconstructed; any mismatch snapshots instead,
-        // which rewrites the meta and self-heals the next push.
-          deltaBaseRejection = "integrity";
+    spans.span("delta_base_ms", () => {
+      if (mdeWritePolicy().delta && !forceSnapshot) {
+        const manifestMeta = validManifestMeta(state.manifestMeta);
+        const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
+        if (!manifestMeta || !reconstructedBase || !validateManifest(reconstructedBase).ok || state.lastSyncedSequence !== appliedSequence) {
+          deltaBaseRejection = "no-base";
         } else {
-          deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+          const integrityKey = JSON.stringify([
+            appliedSequence,
+            manifestMeta.encManifestSha,
+            manifestMeta.manifestHash,
+          ]);
+          let integrityOk = baseIntegrityByMeta.get(integrityKey);
+          if (integrityOk === undefined) {
+            integrityOk = canonicalManifestHashStreaming(reconstructedBase) === manifestMeta.manifestHash;
+            baseIntegrityByMeta.set(integrityKey, integrityOk);
+          }
+          if (!integrityOk) {
+          // §4.2 base-integrity precondition (REVIEW-204 A7): validManifestMeta
+          // validates SHAPE only. A structurally valid but stale/mismatched meta
+          // publishes a delta whose base no reader can reproduce — and readers only
+          // discover that AFTER the head commits. Bind the meta's manifestHash to
+          // the base we actually reconstructed; any mismatch snapshots instead,
+          // which rewrites the meta and self-heals the next push.
+            deltaBaseRejection = "integrity";
+          } else {
+            deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+          }
         }
       }
-    }
-    const deltaBaseMs = performance.now() - deltaBaseT0;
+    });
     const parentSequence = repair?.parentSequence ?? appliedSequence;
     let keepMineArm: GitResolutionPublicationReceipt | undefined;
     if (resolution && publication.resolution?.outcome === "published") {
@@ -841,15 +811,7 @@ async function runPushAttempt(
         state = installed.state;
       },
       commit: async ({ parentSequence: parent, manifest, options }) => {
-        const commitStatsToken = firstPublishMeasurementToken();
-        const commitStatsT0 = commitStatsToken ? performance.now() : 0;
-        const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
-        const response = await report.phase("commit", () => api.commit(parent, cfg.deviceId, manifest, options));
-        if (firstPublishMeasurementLive(commitStatsToken)) {
-          const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
-          firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
-        }
-        return response;
+        return spans.span("commit", () => api.commit(parent, cfg.deviceId, manifest, options));
       },
       reportCommitTimings: (timings) => report.recordDetails("commit", { ...timings }, formatCommitTimings(timings)),
       disarmKeepMine: async (receipt) => {
@@ -869,26 +831,23 @@ async function runPushAttempt(
         return { sequence: postPull.lastSyncedSequence, manifest: postPull.lastSyncedManifest };
       },
     };
-    const commitReceipt = await executeManifestCommit(
-      {
-        identity: sealed.identity,
-        manifest: committed,
-        parentSequence,
-        ...(deltaBase ? { deltaBase } : {}),
-        ...(deltaBaseRejection ? { deltaBaseRejection } : {}),
-        // The 422 chain-link arm (`attemptState.forceSnapshot`) already withheld
-        // deltaBase above; forwarding the flag is behaviour-neutral there and is
-        // what lets the writer log §7's `force` instead of a misleading `no-base`.
-        forceSnapshot: repair !== undefined || forceSnapshot,
-        ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
-        reportTimings: report.enabled,
-        ...(keepMineArm ? { keepMineArm } : {}),
-        resolutionRider: resolution !== undefined,
-      },
-      commitPort,
-    );
-    report.appendDetails("commit", { delta_base_ms: deltaBaseMs }, formatPushSpan("delta_base_ms", deltaBaseMs));
-
+    const commitPlan = {
+      identity: sealed.identity,
+      manifest: committed,
+      parentSequence,
+      // The 422 chain-link arm (`attemptState.forceSnapshot`) already withheld
+      // deltaBase above; forwarding the flag is behaviour-neutral there and is
+      // what lets the writer log §7's `force` instead of a misleading `no-base`.
+      forceSnapshot: repair !== undefined || forceSnapshot,
+      reportTimings: report.enabled,
+      resolutionRider: resolution !== undefined,
+    };
+    if (deltaBase) Object.assign(commitPlan, { deltaBase });
+    if (deltaBaseRejection) Object.assign(commitPlan, { deltaBaseRejection });
+    if (deps.blockedFingerprint !== undefined) Object.assign(commitPlan, { blockedFingerprint: deps.blockedFingerprint });
+    if (keepMineArm) Object.assign(commitPlan, { keepMineArm });
+    const commitReceipt = await executeManifestCommit(commitPlan, commitPort);
+    spans.note("delta_base_ms");
     if (commitReceipt.kind === "ack-uncertain") {
       return { done: true, result: {
         sequence: appliedSequence,
@@ -939,24 +898,18 @@ async function runPushAttempt(
     const acceptedSequence = commitReceipt.sequence;
     await settleRepublish(root, cfg, deps, committed.gitRepos);
 
-    // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
-    // this accepted commit response; the START is init's command milestone (before scan).
-    // Scoped to init (which sets filesFirstStartedAt) — a daemon/CLI push without it leaves
-    // the KPI 0 so it never forces a FirstPublishStats render on a non-init push, and the
-    // value survives across a 409/422 retry (it is the command wall, not a per-attempt one).
-    if (firstPublishTiming.enabled && deps.filesFirstStartedAt !== undefined) {
-      firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
+    // Design 108 §3.6: init's command-wall KPI ends at the accepted response and
+    // survives retries; ordinary pushes leave it zero and do not force rendering.
+    if (spans.firstPublish.enabled && deps.filesFirstStartedAt !== undefined) {
+      spans.firstPublish.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
     }
 
-    let stateSaveMs = 0;
     const transitionPort: RepoTransitionPort = {
       records: repoRecordsForState(state),
       observedRepos: (values) => observedRepoKeys(state, committed.gitRepos, values),
       announce: (line) => { (deps.onGitLog ?? ((l: string) => console.error(l)))(line); },
       save: async (write) => {
-        const stateSaveT0 = performance.now();
-        try {
-          await report.phase("state-save", () => saveStateSource(root, state, {
+        await spans.span("state-save", () => saveStateSource(root, state, {
             expectedStream: syncStreamId(cfg),
             sourceGlobalSeq: write.acceptedSequence,
             globalManifest: write.globalManifest,
@@ -969,13 +922,9 @@ async function runPushAttempt(
             allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
             forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
           }));
-        } finally {
-          stateSaveMs += performance.now() - stateSaveT0;
-        }
       },
     };
-    const acknowledgementT0 = performance.now();
-    const acknowledgement = await acknowledgePublishedGitTransitions(
+    const acknowledgement = await spans.span("ack_ms", () => acknowledgePublishedGitTransitions(
       {
         identity: sealed.identity,
         manifest: committed,
@@ -984,9 +933,7 @@ async function runPushAttempt(
       },
       commitReceipt,
       transitionPort,
-    );
-    const acknowledgementMs = Math.max(0, performance.now() - acknowledgementT0 - stateSaveMs);
-    report.appendDetails("state-save", { ack_ms: acknowledgementMs }, formatPushSpan("ack_ms", acknowledgementMs));
+    ));
     if (acknowledgement.kind === "accepted-state-pending") {
       // An unarmed publication keeps the pre-seam contract: the state-save error
       // is the caller's, not a soft "landed but unrecorded" result.
@@ -1000,9 +947,7 @@ async function runPushAttempt(
       } };
     }
 
-    // Finalize AFTER the fully-persisted commit — a failed attempt never appends a
-    // success KPI, and a retry never double-appends. finishFirstPublishStats disables
-    // the singleton (even when it returns no stats), so the finally below no-ops here.
+    // Only a fully persisted commit finalizes and appends this operation's KPI.
     const firstPublish = finishFirstPublishStats();
     if (firstPublish) {
       report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
@@ -1016,12 +961,14 @@ async function runPushAttempt(
     }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
-    return { done: true, result: { sequence: acceptedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(publication.filesFirstDeferred ? { gitDeferred: true } : {}), ...(publication.resolution ? { resolution: {
-      outcome: publication.resolution.outcome,
-      ...(publication.resolution.reason ? { reason: publication.resolution.reason } : {}),
-      sequence: acceptedSequence,
-    } } : {}) } };
+    const result: PushResult = { sequence: acceptedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState) };
+    if (publication.filesFirstDeferred) result.gitDeferred = true;
+    if (publication.resolution) {
+      result.resolution = { outcome: publication.resolution.outcome, sequence: acceptedSequence };
+      if (publication.resolution.reason) result.resolution.reason = publication.resolution.reason;
+    }
+    return { done: true, result };
   } finally {
-    if (firstPublishTiming.enabled) beginFirstPublishTiming(false);
+    if (spans.firstPublish.enabled) beginFirstPublishTiming(false);
   }
 }

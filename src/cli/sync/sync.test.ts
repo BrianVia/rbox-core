@@ -34,6 +34,7 @@ import { setClassifyCacheHitObserverForTest } from "../publish-pipeline/shared.j
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { listTrash } from "../../engine/trash.js";
 import { projectLocalManifest } from "../local-file-projection.js";
+import { currentPushSpans, recordLaneSettlement } from "../push-spans.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -312,6 +313,7 @@ class FakeRemote implements SyncRemote {
   forceShaMismatchOnce?: string;
   forceShaMismatchAlways?: string;
   forceRetryLater?: string;
+  instrumentPushSpans = false;
 
   /** Encrypt + seed a blob (as the uploading client would); return its FileEntry. */
   async seedEntry(rel: string, content: string): Promise<FileEntry> {
@@ -357,9 +359,11 @@ class FakeRemote implements SyncRemote {
     const bytes = await fs.readFile(absPath); // ciphertext; encSha = sha256(ciphertext)
     if (shaBytes(bytes) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
     this.blobs.set(sha256, bytes);
+    if (this.instrumentPushSpans) recordLaneSettlement("single", bytes.byteLength, 1);
   }
   async commit(parentSequence: number, _deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult> {
     this.commitCalls += 1;
+    if (this.instrumentPushSpans) currentPushSpans()?.recordTail("commit", 1, 17);
     if (this.beforeCommit) await this.beforeCommit();
     if (parentSequence !== this.head) return { conflict: true, head: this.head };
     // Blob-existence is checked against the STORED address: encSha (ciphertext).
@@ -952,9 +956,28 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
   const remote = new FakeRemote();
   await write("x.txt", "payload\n");
   remote.forceUnsatisfiedOnce = true;
-  const { sequence: seq } = await push(root, cfg, deps(remote));
-  expect(seq).toBe(1);
+  remote.instrumentPushSpans = true;
+  const report = PhaseReport.push();
+  const samples: Array<{ kind: string; opCount?: number }> = [];
+  const priorMetrics = process.env.RBOX_METRICS;
+  process.env.RBOX_METRICS = "1";
+  try {
+    const { sequence: seq } = await push(root, cfg, {
+      ...deps(remote),
+      report,
+      telemetry: { record: (sample) => { samples.push(sample); } },
+    });
+    expect(seq).toBe(1);
+  } finally {
+    if (priorMetrics === undefined) delete process.env.RBOX_METRICS;
+    else process.env.RBOX_METRICS = priorMetrics;
+  }
   expect(remote.commitCalls).toBe(2); // 422 then success
+  expect(samples.filter((sample) => sample.kind === "upload_lane")).toEqual([
+    expect.objectContaining({ kind: "upload_lane", transport: "single", opCount: 2 }),
+  ]);
+  expect(samples.filter((sample) => sample.kind === "first_publish")).toHaveLength(1);
+  expect(report.toJSON().phases.commit?.details).toMatchObject({ chunks: 2, payloadBytes: 34 });
 });
 
 test("delta preflight threads the unsatisfied address through a 422 retry", async () => {

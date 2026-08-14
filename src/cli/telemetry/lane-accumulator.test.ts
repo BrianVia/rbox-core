@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { recordLaneSettlement, withPushLaneAccumulator } from "./lane-accumulator.js";
+import { recordLaneSettlement, withPushLaneAccumulator } from "../push-spans.js";
 
 test("lane settlements are request-counted and reset unconditionally between push scopes", async () => {
   const priorFill = process.env.RBOX_BATCH_FILL;

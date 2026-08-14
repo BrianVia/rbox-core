@@ -4,7 +4,7 @@ import type { SignedCommit } from "../engine/e2ee/index.js";
 import { RemoteContext } from "./remote/context.js";
 import { commitSigned, redeemReceipts } from "./remote/commits.js";
 import { missingBlobsChunked } from "./sync-recovery.js";
-import { missingPayloadBytes, timeMissingBlobs, timePushTailRequest, withPushTailTiming } from "./push-tail-timing.js";
+import { missingPayloadBytes, timeMissingBlobs, timePushTailRequest, withPushTailTiming } from "./push-spans.js";
 
 test("push-tail detail accumulates all missing and commit chunks with exact payload bytes", async () => {
   const report = PhaseReport.push();
