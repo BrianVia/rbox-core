@@ -37,6 +37,7 @@ import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from
 import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { opStateDetailToken } from "./follow-classify.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
+import { heldBlockersAllowSkip } from "./held-skip.js";
 import { planGitSections } from "./plan.js";
 import { GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { fingerprintHitProbe, type GitDivergenceCache } from "./divergence-cache.js";
@@ -2244,6 +2245,71 @@ test("design 176 v6: index repair after classification records no stale attempt"
   });
   expect(seamCalls).toBe(1);
   expect(first.outcome.attempt?.repo).toBeNull();
+  const saved = await landOutcome(state, first.outcome, 2);
+  let capabilityCalls = 0;
+  const retried = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+});
+
+test("#573: a receiver branch with no BASE authority holds as local-commits, never an untyped checkout blocker", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  // Receiver-only branch at a tip the incoming refs still reach: displacement
+  // pins succeed, so publication reaches the branch transition, which has no
+  // BASE authority for this ref (absent from BASE and from incoming).
+  await git(receiver, "update-ref", "refs/heads/side-at-base", await git(receiver, "rev-parse", "refs/heads/main"));
+
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  const blockers = first.outcome.attempt?.repo?.blockers ?? [];
+  expect(blockers).not.toHaveLength(0);
+  expect(blockers.filter((blocker) => blocker.reason === "other")).toEqual([]);
+  expect(blockers).toContainEqual({
+    provenance: "ref-plane", reason: "local-commits", ref: "refs/heads/side-at-base",
+  });
+  expect(heldBlockersAllowSkip(blockers)).toBe(true);
+
+  const saved = await landOutcome(state, first.outcome, 2);
+  let capabilityCalls = 0;
+  const skipped = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(capabilityCalls).toBe(0);
+});
+
+test("#573: a genuinely untypeable publication failure stays reason other and never held-skips", async () => {
+  // A tag the publisher dropped: BASE authorizes the receiver's value, so
+  // publication proceeds and the injected failure is a genuinely unclassified
+  // one — it must stay `other` and stay held-skip ineligible.
+  await commit("one\n", "tag-c1");
+  await git(sender, "tag", "dropped-tag");
+  const base = await capture();
+  await materialize(base);
+  await git(sender, "tag", "-d", "dropped-tag");
+  await commit("two\n", "tag-c2");
+  const incoming = await capture();
+  const state = stateWith(base);
+
+  const first = await applyIncoming(state, incoming, matchingOracle, {
+    collectMetrics: true,
+    afterBranchPinsPrepared: (ref: string) => {
+      if (ref === "refs/tags/dropped-tag") throw new Error("injected unclassifiable publication failure");
+    },
+  });
+  const blockers = first.outcome.attempt?.repo?.blockers ?? [];
+  expect(blockers).toContainEqual({
+    provenance: "checkout",
+    reason: "other",
+    detail: "publishing ref refs/tags/dropped-tag failed: injected unclassifiable publication failure",
+  });
+  expect(heldBlockersAllowSkip(blockers)).toBe(false);
+
   const saved = await landOutcome(state, first.outcome, 2);
   let capabilityCalls = 0;
   const retried = await applyIncoming(saved, incoming, matchingOracle, {
