@@ -5,6 +5,19 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_TAIL CONVICTED (2026-08-14 ~06:40Z, #689 merged, desktop on 65e6f60): the
+constant ~51s push tail is **drain_wait_ms=50.8** — report/metrics settlement
+queued until the NEXT PUMP TICK (≈60s scan floor − op work); ack_ms=0.0 and
+publish_transition_ms=0.1 innocent. NOT user-visible propagation: server
+published 2350 at 06:36:04, FM adopted +3s, report printed +51s — the bench's
+64s sender hop was mostly this artifact (real probe e2e ~15s). Still real:
+settlement serializes the lane under sustained writes (bench 10→20→32s
+degradation). NEXT SESSION FIRST ITEM: wake the settle path on lane drain
+(scheduler-owned, small), re-run 30-attempt bench — expect sender hop ~7-8s;
+then trusted-view push + git-plan cy/f/cp. ALSO: credentials fence-timeout
+flake hit AGAIN (#689 shard 3, 2nd sighting in 24h, registry says recurrence
+bar cleared — owes shard-ordering repro + fix/quarantine)._
+
 _POST-MIDNIGHT BENCH VERDICT (2026-08-14 ~05:30Z, fleet on 26a4de7 + RBOX_TRACE_PROPAGATION=1 restarts; Mac = #664 boot 5): 30-attempt
 traced propagation run — **receiver + scheduling SOLVED** (write→settle
 491ms, settle→push-begin 200ms, WS→dequeue ≤170ms, apply 3.3s FM / 9.3s
