@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { JsonValue } from "../../json.js";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
 import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";
@@ -76,7 +77,7 @@ export interface AmbientDaemonStatusV1 {
   };
 }
 
-export function validDaemonVersion(value: unknown): value is string {
+export function validDaemonVersion(value: string | undefined): value is string {
   if (typeof value !== "string" || value.length > 80) return false;
   try {
     parseSemver(value);
@@ -134,8 +135,8 @@ const WATCHER_TRUST = new Set<AmbientWatcherTrust>(["suspect", "fused"]);
 const PHASES = new Set<TransferPhase>(["scan", "gitcap", "encrypt", "upload", "download"]);
 const MUTATION_PHASES = new Set<MutationPhase>(["file-apply", "git-prepare", "git-commit", "state-cas"]);
 
-const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
-const uint = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const finite = (v: number | null | undefined): v is number => typeof v === "number" && Number.isFinite(v);
+const uint = (v: number | null | undefined): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 function newestIso(a: string | undefined, b: string | undefined): string | null {
   if (!a) return b ?? null;
@@ -159,16 +160,16 @@ function boundedAmbientText(value: string, maxScalars: number): string {
   return [...clean].slice(0, maxScalars).join("");
 }
 
-function ambientIso(value: unknown): value is string {
+function ambientIso(value: JsonValue | undefined): value is string {
   return typeof value === "string"
     && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)
     && Number.isFinite(Date.parse(value));
 }
 
-function ambientCheckout(value: unknown): AmbientGitDeferral["checkout"] | undefined | null {
+function ambientCheckout(value: JsonValue | undefined): AmbientGitDeferral["checkout"] | undefined | null {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const checkout = value as Partial<Record<"kind" | "label", unknown>>;
+  const checkout = value;
   if (checkout.kind === "detached") return { kind: "detached" };
   if (checkout.kind !== "branch") return null;
   if (checkout.label !== undefined && typeof checkout.label !== "string") return null;
@@ -178,9 +179,9 @@ function ambientCheckout(value: unknown): AmbientGitDeferral["checkout"] | undef
   };
 }
 
-function parseAmbientDeferral(value: unknown): AmbientGitDeferral | undefined {
+function parseAmbientDeferral(value: JsonValue): AmbientGitDeferral | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const item = value as Partial<Record<keyof AmbientGitDeferral, unknown>>;
+  const item = value;
   if (typeof item.repo !== "string" || typeof item.reason !== "string"
     || typeof item.reasonLabel !== "string" || typeof item.reasonText !== "string"
     || typeof item.remediationClass !== "string"
@@ -349,9 +350,13 @@ function filePresent(p: string): boolean {
   }
 }
 
+/** The on-disk record as read back: writer-stamped scalar fields, but `deferrals`
+ * stays raw JSON until `parseAmbientDeferral` establishes each entry's contract. */
+type AmbientStatusWire = Partial<Omit<AmbientDaemonStatusV1, "deferrals">> & { deferrals?: JsonValue };
+
 function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
   try {
-    const j = JSON.parse(raw) as Partial<AmbientDaemonStatusV1>;
+    const j = JSON.parse(raw) as AmbientStatusWire;
     if (j.schemaVersion !== 1 || !STATES.has(j.state as AmbientDaemonState)) return undefined;
     if (!ambientIso(j.heartbeatAt)) return undefined;
     if (!(j.sequence === null || uint(j.sequence))) return undefined;

@@ -6,6 +6,7 @@ import path from "node:path";
 import { setCryptoPoolSelectorForProcess, type DecryptFileOptions, type EncryptedBlob, type EncryptFileOptions } from "../crypto.js";
 import type {
   CryptoWorkerEncryptBatchResult,
+  CryptoWorkerMessage,
   FusedResult,
   CryptoWorkerJobMessage as WorkerMessage,
   CryptoWorkerResponse as WorkerResponse,
@@ -43,12 +44,16 @@ import {
 import { cleanupEmbeddedWorker, setWorkerPathOverrideForTests, workerSpecifier } from "../crypto-worker-files.js";
 
 type BunWorker = {
-  postMessage(message: unknown): void;
+  postMessage(message: CryptoWorkerMessage): void;
   terminate(): void | Promise<void>;
   onmessage: ((event: { data: WorkerResponse }) => void) | null;
   onerror: ((event: { message?: string; error?: unknown }) => void) | null;
-  addEventListener?: (type: "close" | "error" | "messageerror", listener: (event: unknown) => void) => void;
+  addEventListener?: (type: "close" | "error" | "messageerror", listener: (event: { message?: string }) => void) => void;
 };
+
+/** Whatever the worker actually returned for a completed job: the protocol's own
+ *  result field, still unvalidated until `validFusedResults` establishes it. */
+type WorkerJobResult = Extract<WorkerResponse, { ok: true }>["result"];
 
 declare const Worker: { new (specifier: string | URL): BunWorker };
 
@@ -61,12 +66,30 @@ type JobRecord<T = unknown> = {
   message: WorkerMessage;
   attempts: number;
   health?: boolean;
-  resolve: (value: unknown) => void;
+  resolve: (value: WorkerJobResult) => void;
   reject: (err: unknown) => void;
   fused?: boolean;
 };
 
 type QueueWaiter = { resolve: () => void; reject: (err: unknown) => void };
+
+/** Cancellation handle handed back by {@link CryptoPool.encryptStream}. */
+export interface CryptoStreamHandle {
+  cancel(): void;
+}
+
+export interface CryptoPoolFusedStats {
+  used: number;
+  highWater: number;
+  spilledFiles: number;
+  spilledBytes: number;
+}
+
+export interface CryptoPoolStats {
+  workers: number;
+  inFlight: number;
+  queue: number;
+}
 
 let activePool: CryptoPool | undefined;
 let disabledReason: string | undefined;
@@ -89,7 +112,7 @@ class CryptoWorkerSlot {
   constructor(readonly pool: CryptoPool, readonly worker: BunWorker) {
     worker.onmessage = (event) => this.handleMessage(event.data);
     worker.onerror = (event) => this.handleCrash(event.message ?? "worker error");
-    worker.addEventListener?.("error", (event) => this.handleCrash((event as { message?: string }).message ?? "worker error"));
+    worker.addEventListener?.("error", (event) => this.handleCrash(event.message ?? "worker error"));
     worker.addEventListener?.("close", () => {
       if (!this.closing) this.handleCrash("worker closed");
     });
@@ -241,7 +264,7 @@ export class CryptoPool {
   encryptStream<T>(
     items: { ref: T; srcPath: string; size: number; opts: EncryptFileOptions; tmpDir?: string }[],
     handlers: { onReady: (ref: T, blob: CoalescedBlob) => void | Promise<void> }
-  ): { cancel(): void } {
+  ): CryptoStreamHandle {
     let cancelled = false;
     const owner = Symbol("crypto-stream");
     const err = streamCancelledError();
@@ -267,7 +290,7 @@ export class CryptoPool {
     } };
   }
 
-  fusedStatsForTest(): { used: number; highWater: number; spilledFiles: number; spilledBytes: number } {
+  fusedStatsForTest(): CryptoPoolFusedStats {
     return { used: this.budget.used, highWater: this.budget.highWater, spilledFiles: this.spilledFiles, spilledBytes: this.spilledBytes };
   }
 
@@ -365,7 +388,7 @@ export class CryptoPool {
     } finally { this.fusedPumping = false; }
   }
 
-  private validFusedResults(value: unknown, job: FusedJob): FusedResult[] | undefined {
+  private validFusedResults(value: WorkerJobResult, job: FusedJob): FusedResult[] | undefined {
     if (!value || typeof value !== "object" || !("results" in value) || !Array.isArray((value as CryptoWorkerEncryptBatchResult).results)) return undefined;
     const results = (value as CryptoWorkerEncryptBatchResult).results;
     if (results.length !== job.files.length) return undefined;
@@ -390,7 +413,7 @@ export class CryptoPool {
     return total <= JOB_RESERVE ? results : undefined;
   }
 
-  private async handleFusedResult(job: FusedJob, value: unknown): Promise<void> {
+  private async handleFusedResult(job: FusedJob, value: WorkerJobResult): Promise<void> {
     this.fusedInFlight--;
     if (this.closed) {
       if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
@@ -666,7 +689,7 @@ export class CryptoPool {
     return true;
   }
 
-  statsForTest(): { workers: number; inFlight: number; queue: number } {
+  statsForTest(): CryptoPoolStats {
     return {
       workers: this.workers.length,
       inFlight: this.workers.reduce((n, w) => n + w.inFlight.size, 0),
