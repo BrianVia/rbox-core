@@ -15,6 +15,7 @@ import { finishLoginAttempt, generateLoginAttemptKeys, LoginAttemptAccountClaime
 
 
 import { acknowledgeKeyDeliveryAuth, bootstrapDeviceAuth, pollDeviceAuth, startDeviceAuth } from "../remote/auth-command-wire.js";
+import type { JsonValue } from "../../json.js";
 import { runGenesisEnrollment, type GenesisApi } from "./genesis-command.js";
 import { NO_KIT } from "./recovery-kit-flow.js";
 import { redeemPair } from "./pairing-command.js";
@@ -169,16 +170,14 @@ interface LoginDeps {
   onWebDeliveryBoundary?: (boundary: WebDeliveryBoundary) => void | Promise<void>;
 }
 
-interface KeyDeliveryPoll {
+type KeyDeliveryPoll = {
   status: "pending" | "ready" | "delivered" | "expired";
   requestId: string;
   expiresAt: number;
   mkWrapDevice?: string;
   publishedRosterVersion?: number;
   accountEpoch?: number;
-}
-
-type KeyDeliveryPollCandidate = Partial<Record<keyof KeyDeliveryPoll, unknown>>;
+};
 
 interface DevicePoll {
   status: string;
@@ -231,10 +230,10 @@ function recordKeys(value: object): string[] {
   return Object.keys(value).sort();
 }
 
-function parseKeyDelivery(value: unknown, requestId: string): KeyDeliveryPoll | null | undefined {
+function parseKeyDelivery(value: JsonValue | undefined, requestId: string): KeyDeliveryPoll | null | undefined {
   if (value === undefined || value === null) return value;
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("malformed keyDelivery response");
-  const delivery = value as KeyDeliveryPollCandidate;
+  const delivery = value;
   if (delivery.requestId !== requestId
     || typeof delivery.expiresAt !== "number"
     || !Number.isSafeInteger(delivery.expiresAt)
@@ -254,7 +253,7 @@ function parseKeyDelivery(value: unknown, requestId: string): KeyDeliveryPoll | 
       || delivery.accountEpoch < 0) {
       throw new Error("malformed ready keyDelivery response");
     }
-    return delivery as unknown as KeyDeliveryPoll;
+    return delivery as KeyDeliveryPoll;
   }
   if (!["pending", "delivered", "expired"].includes(String(delivery.status))
     || canonicalString(recordKeys(delivery)) !== canonicalString([
@@ -262,7 +261,7 @@ function parseKeyDelivery(value: unknown, requestId: string): KeyDeliveryPoll | 
     ])) {
     throw new Error("malformed keyDelivery response");
   }
-  return delivery as unknown as KeyDeliveryPoll;
+  return delivery as KeyDeliveryPoll;
 }
 
 interface ClaimedLogin {

@@ -35,7 +35,11 @@ export class PromptCancelledError extends Error {
 }
 
 type Submit<T> = (value: T, answer: string) => void;
+/** A rejected promise or a React render throw: `unknown` by language rule —
+ *  every consumer re-throws it, none decodes it. */
 type Fail = (error: unknown) => void;
+/** What every prompt component may do to end its prompt. */
+type PromptHandlers<T> = { submit: Submit<T>; fail: Fail; cancel: () => void };
 export interface PromptStreams {
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
@@ -160,18 +164,15 @@ export function splitKeystrokeChunk(chunk: string, state: { inPaste: boolean }):
   return parts;
 }
 
+/** The keystroke-splitting stdin handed to Ink, plus the teardown that stops
+ * mirroring the real stream. */
+type PromptStdinWrap = { wrapped: NodeJS.ReadStream; detach: () => void };
+
 /** Present Ink a stdin whose chunks are one key each: split parts are re-emitted
  * on separate ticks so React commits state between keystrokes. Raw-mode,
  * ref/unref, and flow control delegate to the real stream. */
-function wrapPromptStdin(source: NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown }): {
-  wrapped: NodeJS.ReadStream;
-  detach: () => void;
-} {
-  const wrapped = new PassThrough() as unknown as NodeJS.ReadStream & {
-    isRaw: boolean;
-    setRawMode: (mode: boolean) => unknown;
-    write: (chunk: string) => boolean;
-  };
+function wrapPromptStdin(source: NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown }): PromptStdinWrap {
+  const wrapped = new PassThrough() as PassThrough & NodeJS.ReadStream;
   wrapped.isTTY = source.isTTY;
   wrapped.isRaw = source.isRaw ?? false;
   wrapped.setRawMode = (mode: boolean) => {
@@ -251,12 +252,15 @@ function Frame({ message, inline, children, hint, error }: {
   );
 }
 
-class SafeBoundary extends React.Component<{ fail: Fail; children: React.ReactNode }, { failed: boolean }> {
+/** The boundary's only state: has a descendant already thrown? */
+type SafeBoundaryState = { failed: boolean };
+
+class SafeBoundary extends React.Component<{ fail: Fail; children: React.ReactNode }, SafeBoundaryState> {
   state = { failed: false };
-  static getDerivedStateFromError(): { failed: boolean } {
+  static getDerivedStateFromError(): SafeBoundaryState {
     return { failed: true };
   }
-  componentDidCatch(error: unknown): void {
+  componentDidCatch(error: Error): void {
     queueMicrotask(() => this.props.fail(error));
   }
   render(): React.ReactNode {
@@ -369,7 +373,10 @@ function CheckboxPrompt<V>({ config, submit, fail, cancel }: {
   );
 }
 
-export function editBuffer(value: string, cursor: number, input: string, key: Partial<Key>): { value: string; cursor: number } {
+/** A single-line edit buffer: its text and the caret offset within it. */
+export type EditBufferState = { value: string; cursor: number };
+
+export function editBuffer(value: string, cursor: number, input: string, key: Partial<Key>): EditBufferState {
   const characters = Array.from(value);
   if (key.leftArrow) return { value, cursor: Math.max(0, cursor - 1) };
   if (key.rightArrow) return { value, cursor: Math.min(characters.length, cursor + 1) };
@@ -721,7 +728,7 @@ async function mountPrompt<T>(args: {
   signal?: AbortSignal;
   stdin?: NodeJS.ReadStream;
   output?: NodeJS.WriteStream;
-  component: (handlers: { submit: Submit<T>; fail: Fail; cancel: () => void }) => React.ReactNode;
+  component: (handlers: PromptHandlers<T>) => React.ReactNode;
 }): Promise<T> {
   if (args.signal?.aborted) throw new DOMException("prompt aborted", "AbortError");
   const source = (args.stdin ?? process.stdin) as NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown };
@@ -793,7 +800,7 @@ async function mountPrompt<T>(args: {
 
       abort = () => settle({ kind: "error", error: new DOMException("prompt aborted", "AbortError") });
       args.signal?.addEventListener("abort", abort, { once: true });
-      const handlers: { submit: Submit<T>; fail: Fail; cancel: () => void } = {
+      const handlers: PromptHandlers<T> = {
         submit: (value, answer) => settle({ kind: "value", value, answer }),
         fail: (error) => settle({ kind: "error", error }),
         cancel: () => settle({ kind: "cancel" }),

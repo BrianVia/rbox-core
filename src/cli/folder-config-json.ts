@@ -8,6 +8,7 @@ import {
 } from "./folder-config.js";
 import type { FolderAdmission, FolderInventoryRow } from "./folder-inventory.js";
 import { folderCatalogPath } from "./rbox-paths.js";
+import type { JsonObject, JsonValue } from "../json.js";
 
 export interface FolderConfigJsonFolderV1 {
   path: string;
@@ -27,31 +28,32 @@ export interface FolderConfigJsonV1 {
   folders: FolderConfigJsonFolderV1[];
 }
 
-type UnknownRecord = { [key: string]: unknown };
+/** One field read out of a parsed JSON object: a JSON value, or absent. */
+type JsonField = JsonValue | undefined;
 
-function record(value: unknown, at: string): UnknownRecord {
+function record(value: JsonField, at: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${at} must be an object`);
-  return value as UnknownRecord;
+  return value;
 }
 
-function closed(value: UnknownRecord, keys: readonly string[], at: string): void {
+function closed(value: JsonObject, keys: readonly string[], at: string): void {
   const unknown = Object.keys(value).find((key) => !keys.includes(key));
   if (unknown !== undefined) throw new Error(`${at}.${unknown} is not supported`);
 }
 
-function string(value: unknown, at: string): string {
+function string(value: JsonField, at: string): string {
   if (typeof value !== "string") throw new Error(`${at} must be a string`);
   return value;
 }
 
-function boundedInteger(value: unknown, max: number, at: string): number {
+function boundedInteger(value: JsonField, max: number, at: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > max) {
     throw new Error(`${at} must be an integer from 0 through ${max}`);
   }
   return value;
 }
 
-function options(value: unknown, at: string, resolved: boolean): FolderOptions | ResolvedFolderPolicy {
+function options(value: JsonField, at: string, resolved: boolean): FolderOptions | ResolvedFolderPolicy {
   const raw = record(value, at);
   closed(raw, ["syncGit", "git", "respectGitignore", "noDrift", "trash"], at);
   for (const key of ["syncGit", "respectGitignore", "noDrift"] as const) {
@@ -81,7 +83,7 @@ function options(value: unknown, at: string, resolved: boolean): FolderOptions |
 
 /** Runtime decoder keeps this machine surface closed across future refactors. */
 export function parseFolderConfigJson(bytes: string): FolderConfigJsonV1 {
-  const top = record(JSON.parse(bytes), "$");
+  const top = record(JSON.parse(bytes) as JsonValue, "$");
   closed(top, ["schemaVersion", "catalogPath", "globalOptions", "folders"], "$");
   if (top.schemaVersion !== 1) throw new Error("$.schemaVersion must be 1");
   const catalogPath = string(top.catalogPath, "$.catalogPath");

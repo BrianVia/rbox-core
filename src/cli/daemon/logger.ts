@@ -18,10 +18,14 @@ const LINK_CHECK_RECORDS = 512;
 
 /** Sanitized error identifier for measurement-failure log lines. Node fs errors
  *  embed absolute paths in `message` — only the errno code may be emitted (the
- *  founder's no-raw-filenames rule covers failure lines too, D2-R3). */
+ *  founder's no-raw-filenames rule covers failure lines too, D2-R3).
+ *  The parameter is a caught exception: `unknown` by language rule, and this
+ *  function IS its decoder. */
 export const errCode = (e: unknown): string =>
   e && typeof e === "object" && "code" in e && typeof (e as { code?: unknown }).code === "string" ? (e as { code: string }).code : "unknown";
 
+/** Same caught-exception decoder for this file's own `catch` blocks: the input
+ *  is `unknown` by language rule and becomes an errno string here. */
 function errno(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String((error as NodeJS.ErrnoException).code)
@@ -41,7 +45,11 @@ function utcDayNumber(date: Date): number {
   return Math.floor(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) / 86_400_000);
 }
 
-export function parseDaemonLogRetentionDays(value: string | undefined): { days: number; warning?: string } {
+/** Retention window in days plus, when the configured value was rejected, the
+ *  one warning line the daemon logs about falling back to the default. */
+export type DaemonLogRetention = { days: number; warning?: string };
+
+export function parseDaemonLogRetentionDays(value: string | undefined): DaemonLogRetention {
   if (value === undefined) return { days: DEFAULT_RETENTION_DAYS };
   if (!/^[0-9]+$/.test(value)) return { days: DEFAULT_RETENTION_DAYS, warning: `invalid RBOX_LOG_RETENTION_DAYS=${JSON.stringify(value)}; using ${DEFAULT_RETENTION_DAYS}` };
   const parsed = Number(value);

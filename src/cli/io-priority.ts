@@ -38,9 +38,12 @@ const IOPRIO_CLASS_SHIFT = 13;
 /** The packed ioprio value we set (exported for the selftest/test probes). */
 export const LINUX_IOPRIO_BE7 = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_LOWEST;
 
+/** Syscall numbers per CPU architecture; absent where rbox has no number for it. */
+type ArchSyscallNumbers = Partial<Record<NodeJS.Architecture, number>>;
+
 /** __NR_ioprio_set / __NR_ioprio_get — x64 from unistd_64.h, arm64 from asm-generic/unistd.h. */
-const LINUX_NR_IOPRIO_SET: Partial<Record<string, number>> = { x64: 251, arm64: 30 };
-const LINUX_NR_IOPRIO_GET: Partial<Record<string, number>> = { x64: 252, arm64: 31 };
+const LINUX_NR_IOPRIO_SET: ArchSyscallNumbers = { x64: 251, arm64: 30 };
+const LINUX_NR_IOPRIO_GET: ArchSyscallNumbers = { x64: 252, arm64: 31 };
 
 /** Variadic syscall(2) declared with fixed integer args — integer args ride the
  *  same registers on both SysV x64 and AAPCS64, so this arity is safe. */
@@ -79,13 +82,15 @@ export function lowerIoPriority(): string {
   }
 }
 
+export type IoPriorityVerdict = { ok: boolean; detail: string };
+
 /**
  * Read back the policy via the platform getter and confirm lowerIoPriority took.
  * Shared by the release smoke (`__watcher-selftest`, which runs NATIVELY on every
  * release target — PR CI only covers linux-x64) and the unit-test probes.
  * Unsupported platforms report ok (nothing was promised there).
  */
-export function verifyIoPriority(): { ok: boolean; detail: string } {
+export function verifyIoPriority(): IoPriorityVerdict {
   try {
     if (process.platform === "darwin") {
       const lib = dlopen("libSystem.B.dylib", {

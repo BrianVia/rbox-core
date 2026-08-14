@@ -17,12 +17,17 @@ import { repoRecordsForState, type RepoRecord, type SyncState } from "./sync-sta
 import { projectGitDeferralRepos } from "./status-view.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { RBOX_DIR } from "./workspace-config.js";
+import type { JsonValue } from "../json.js";
+
+/** One field read out of the parsed sidecar: a JSON value, or absent. The file
+ *  is daemon-written but user-editable, so every slot is validated on read. */
+type JsonField = JsonValue | undefined;
 
 /** The transfer phases the activity sidecar accepts. The daemon only ever writes a
  *  subset (it never emits `scan` — its full/deep scans don't wire progress), but a
  *  forward-compatible read must not drop a phase a newer writer might land. */
 const TRANSFER_PHASES: readonly TransferPhase[] = ["scan", "gitcap", "encrypt", "upload", "download"];
-const isTransferPhase = (v: unknown): v is TransferPhase => TRANSFER_PHASES.includes(v as TransferPhase);
+const isTransferPhase = (v: JsonField): v is TransferPhase => TRANSFER_PHASES.includes(v as TransferPhase);
 
 export interface DaemonRecoveryHalt {
   at: string;
@@ -122,10 +127,10 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
   try {
     const raw = JSON.parse(await fs.readFile(activityPath(root), "utf8")) as Partial<DaemonActivity>;
     if (typeof raw?.at !== "string") return undefined;
-    const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
-    const uint = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
-    const positiveInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) > 0;
-    const timestamp = (v: unknown): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
+    const num = (v: JsonField): v is number => typeof v === "number" && Number.isFinite(v);
+    const uint = (v: JsonField): v is number => Number.isInteger(v) && (v as number) >= 0;
+    const positiveInt = (v: JsonField): v is number => Number.isInteger(v) && (v as number) > 0;
+    const timestamp = (v: JsonField): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
     const a: DaemonActivity = { at: raw.at };
     const local = raw.local;
     if (
