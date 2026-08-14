@@ -5,6 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_AFTERNOON CAP (2026-08-14, fleet on **e5c1f3f**, session PRs #684-#696):
+**Desktop git-apply 45.3s → 1.3s FIELD-VERIFIED** (#696/#573 fix 1: typed
+checkout blockers — receiver-only branch publications failing BASE pre-state
+were `other` via cross-contaminated ??= vars, one untyped blocker killed
+held-skip; skippedHeld=1 live). **Mac slice-1 window FULLY named** (#694
+spans): 2.8s = matcher construction 1.7s + projection 1.0s (ignore-carry
+0.9) — the old "matcher=1.8ms" read was the _ms-renders-seconds deception
+(#692 finding 4); matcher was never exonerated. Both cacheable/delta-able.
+DESIGN 247 (trusted-view push) REJECTED round-1 by BOTH reviewers (premise
+false: daemon push already consumes local.manifest; view would publish
+deletions per deferred path) — kill reasons in the doc; replacement shipped
+(#694) + standing safety finding: publish path has NO trust gate (recorded
+deliberate). Also merged: #693 (telemetry write cap 326→29/sample, #691
+finding 1 — #691 CLOSED), #695 (FLAKE-008 credentials fence-timeout: CPU
+starvation not neighbor-lock, deterministic seam, prod 80×25ms untouched).
+#668 CLOSED (installer live). PROCESS NOTE: #695 merged while shard 3 red —
+merge tooling doesn't refuse; new rule: verify rollup==0 before merge (done
+for #696). New SUSPECTED: design-202 conflict-copy test (trusted-pull
+family, 2nd sighting class; registry). IN FLIGHT: #666 --trace flag PR,
+#573 fix 3 residual accounting. NEXT BUILDS (all convicted): matcher cache
++ delta ignore-carry (Mac 2.7s), git-plan cy/f/cp, noDropProof batching
+(#573 fix 2, design-219 template). Mac RSS 15.0GB (#664)._
+
 _MIDDAY CAP (2026-08-14, fleet on **e63c116**): #692 merged (thermo #691
 findings 2-5: divergenceNeedsPush one-owner routing — pending-carry can no
 longer reach doPush via recovery; candidate_projection_ms DELETED;
