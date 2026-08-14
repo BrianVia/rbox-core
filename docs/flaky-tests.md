@@ -528,3 +528,18 @@ removed; the redacted result is retained at
   write earlier in `start()` and this test drives pull trust. If it recurs,
   suspect that interaction first and reproduce under shard ordering
   (`bun test --shard`), not the file alone.
+
+## SUSPECTED: design-202 stale-trusted-entry conflict-copy test (2nd trusted-pull-family sighting)
+
+- 2026-08-14, PR #695 (`credentials.ts`/test/docs only — cannot influence this
+  file), `tests · shard 3/6`: `(fail) design 202: a stale trusted entry
+  degrades to a conflict copy — never loss — and the base still advances
+  [181.53ms]`. Same-SHA rerun dispatched; locally green in isolation (34/34)
+  AND with the new credentials neighbor co-scheduled (83 tests green).
+- Second sighting in the trusted-pull family (see the design-206 SIGHTING
+  above, `daemon-trusted-pull.test.ts`). If it recurs, this family earns the
+  shard-ordering reproduction treatment FLAKE-008 just got.
+- Process note: PR #695 was merged while this shard was red (merge tooling
+  did not refuse; operator error compounded it). The failure was triaged
+  post-merge and does not reproduce; the same-SHA rerun is the outstanding
+  witness.
