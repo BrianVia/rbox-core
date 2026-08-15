@@ -11,13 +11,13 @@ export { statePath, stateLockPath } from "./state-plane/paths.js";
  * (design 222 §1.2 A-2); everything below it is JSON-only by construction. */
 export {
   applyStateSavePacket,
+  ensureCapableStateLineage,
   loadRawState,
   loadState,
 } from "./state-plane/adapters/whole-state-compat.js";
 export {
   StreamMismatchError,
   assertResetIncarnationMarkerNormalized,
-  ensureCapableStateLineage,
   ensureTelemetryBindingId,
   installGenesisResetStateUnderHeldLock,
   saveState,

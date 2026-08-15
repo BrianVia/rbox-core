@@ -210,39 +210,6 @@ export async function applyLegacyJsonSavePacket(root: string, packet: StateSaveP
 }
 
 /**
- * Establish the durable lineage boundary before a first Git mutation. Only a
- * physically absent, semantically empty state may be initialized here; an
- * existing legacy baseline remains legacy-untrusted and must be migrated by an
- * explicit confirmed workflow. The empty packet uses the ordinary state CAS,
- * so concurrent initialization chooses exactly one nonce.
- */
-export async function ensureCapableStateLineage(root: string, state: SyncState): Promise<SyncState> {
-  if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) return state;
-  const existing = await loadRawLegacyJsonState(root);
-  if (existing) return state;
-  const records = repoRecordsForState(state);
-  const manifestGit = state.lastSyncedManifest.gitRepos;
-  if (state.lastSyncedSequence !== 0 || state.lastSyncedManifest.files.length !== 0
-    || Object.keys(records).length !== 0 || Object.keys(manifestGit ?? {}).length !== 0
-    || Object.keys(state.gitPendingRemote ?? {}).length !== 0
-    || Object.keys(state.gitReposRemoved ?? {}).length !== 0) {
-    throw new Error("refusing to manufacture a capable lineage over non-genesis sync state");
-  }
-  const result = await applyLegacyJsonSavePacket(root, {
-    expectedStream: state.stream ?? "",
-    expectedNonce: "legacy",
-    sourceGlobalSeq: 0,
-    repos: [],
-  });
-  if (result.status === "accepted") return result.state;
-  if (result.status === "rejected" && (result.reason === "nonce" || result.reason === "repo-generation")) {
-    const raced = await loadRawLegacyJsonState(root);
-    if (raced && raced.stream === state.stream && /^[0-9a-f]{32}$/.test(raced.stateNonce ?? "")) return raced;
-  }
-  throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
-}
-
-/**
  * Load the sync state (the reconcile base) for `workspaceId`. A MISSING file is
  * the expected first-run case → empty base. A CORRUPT file is NOT silently treated
  * as empty: resetting the base to empty would make the next reconcile see every

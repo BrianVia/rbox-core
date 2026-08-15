@@ -12,8 +12,9 @@
  * express it.
  */
 import { randomBytes } from "node:crypto";
+import type { WorkspaceSyncMutex } from "../sync-mutex.js";
+import { classifyStateFormat, readAuthorityMarkerId } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
-import * as genesis from "./genesis.js";
 import type { GenesisIds, GenesisInspection, GenesisOutcome } from "./genesis.js";
 // Not from `genesis.js`: the fence's reachable graph must contain no SQLite.
 import { readGenesisIntent } from "./genesis-intent.js";
@@ -39,6 +40,71 @@ export type MigrationDriver = (root: string, entry: EntryProof) => Promise<Migra
 export type AuthorityOutcome =
   | { readonly domain: "genesis"; readonly outcome: GenesisOutcome }
   | { readonly domain: "migration"; readonly outcome: MigrationOutcome };
+
+/** The durable state backend selected from `.rbox/state.json` alone. */
+export type StateAuthoritySelection =
+  | {
+      readonly kind: "legacy-json-store";
+      readonly format: "absent" | "json" | "foreign";
+    }
+  | {
+      readonly kind: "sqlite-store";
+      readonly format: "authority-marker";
+      readonly authorityId: string;
+    };
+
+/**
+ * Observe the state authority without taking locks, opening SQLite, or reading
+ * admission records. Only an exact authority marker selects the store.
+ */
+export async function selectStateAuthority(root: string): Promise<StateAuthoritySelection> {
+  const format = await classifyStateFormat(statePath(root));
+  if (format !== "authority-marker") return { kind: "legacy-json-store", format };
+  const authorityId = await readAuthorityMarkerId(statePath(root));
+  if (authorityId === undefined) {
+    throw new StateAuthorityCorruptError(
+      statePath(root),
+      "the authority marker changed while it was being read",
+    );
+  }
+  return { kind: "sqlite-store", format, authorityId };
+}
+
+/**
+ * Complete genesis admission for a caller that already owns the workspace
+ * mutex. The handle is borrowed, and the returned selection is always a fresh
+ * observation of the durable authority bytes.
+ */
+export async function admitGenesisAuthority(
+  root: string,
+  heldMutex: WorkspaceSyncMutex,
+): Promise<StateAuthoritySelection> {
+  const intent = readGenesisIntent(root);
+  const selection = await selectStateAuthority(root);
+  if (intent === undefined && selection.format !== "absent") return selection;
+
+  const [{ withGenesisAdmissionLocks }, genesis] = await Promise.all([
+    import("./locks.js"),
+    import("./genesis.js"),
+  ]);
+  return withGenesisAdmissionLocks(root, heldMutex, async (locks) => {
+    const lockedIntent = readGenesisIntent(root);
+    const lockedSelection = await selectStateAuthority(root);
+    if (lockedIntent === undefined && lockedSelection.format !== "absent") return lockedSelection;
+
+    const outcome = await genesis.establish(root, mintIds, locks);
+    const fresh = await selectStateAuthority(root);
+    const survivingIntent = readGenesisIntent(root);
+    if ((outcome.kind === "established" || outcome.kind === "already-established")
+      && (fresh.kind !== "sqlite-store" || survivingIntent !== undefined)) {
+      throw new StateAuthorityCorruptError(
+        statePath(root),
+        "genesis completed without publishing a settled SQLite authority",
+      );
+    }
+    return fresh;
+  });
+}
 
 /**
  * The one thing both entry points call, under an already-held lock bundle
@@ -98,6 +164,7 @@ export function assertAuthorityWritable(root: string): void {
 async function dispatch(
   root: string, entry: EntryProof, runMigration: MigrationDriver,
 ): Promise<AuthorityOutcome> {
+  const genesis = await import("./genesis.js");
   if (claimsGenesis(root, await genesis.inspect(root, entry.locks))) {
     return { domain: "genesis", outcome: await genesis.establish(root, mintIds, entry.locks) };
   }

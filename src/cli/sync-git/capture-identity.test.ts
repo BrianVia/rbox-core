@@ -719,9 +719,13 @@ test("capture with an absent index never creates the live index", async () => {
   await commitFile(A, "tracked.txt", "base\n", "base");
   await fs.rm(path.join(A, ".git", "index"));
 
-  await captureGitState(A, store, KEK, { workspaceRoot: A });
+  const section = await captureGitState(A, store, KEK, { workspaceRoot: A });
 
   await expect(fs.lstat(path.join(A, ".git", "index"))).rejects.toThrow();
+  expect(section).toBeDefined();
+  for (const absent of ["indexSha", "indexEncSha", "indexCipherSize", "opState"] as const) {
+    expect(Object.hasOwn(section!, absent), absent).toBeFalse();
+  }
 });
 
 test("gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers", async () => {

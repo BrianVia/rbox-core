@@ -23,11 +23,14 @@
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
-import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
-import type {
-  StateSaveOptions, StateSavePacket, StateSaveResult, SyncState,
+import { workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "../../sync-mutex.js";
+import {
+  repoRecordsForState,
+  type StateSaveOptions,
+  type StateSavePacket,
+  type StateSaveResult,
+  type SyncState,
 } from "../../sync-state-model.js";
-import { classifyStateFormat, readAuthorityMarkerId } from "../authority-marker.js";
 import {
   StateAuthorityCorruptError, StateStoreOpenError, StreamMismatchError,
 } from "../errors.js";
@@ -51,18 +54,19 @@ interface SqliteAuthority {
 
 type StoreFacade = typeof import("../store-facade.js");
 
-/**
- * The one selection, from the state document's bytes. `undefined` means the
- * legacy JSON store is authority — which includes `absent` and `foreign`, whose
- * meanings the JSON store already owns.
- */
-async function selectSqliteAuthority(root: string): Promise<SqliteAuthority | undefined> {
-  if (await classifyStateFormat(statePath(root)) !== "authority-marker") return undefined;
-  const authorityId = await readAuthorityMarkerId(statePath(root));
-  if (authorityId === undefined) {
-    throw new StateAuthorityCorruptError(statePath(root), "the authority marker changed while it was being read");
-  }
-  return { authorityId, file: sqliteResetPaths.active(root) };
+const sqliteAuthority = (
+  root: string,
+  selection: { readonly authorityId: string },
+): SqliteAuthority => ({ authorityId: selection.authorityId, file: sqliteResetPaths.active(root) });
+
+async function selectAuthority(
+  root: string,
+  heldMutex?: WorkspaceSyncMutex,
+) {
+  const coordinator = await import("../authority-bootstrap.js");
+  return heldMutex && !workspaceSyncMutexDegraded(heldMutex)
+    ? coordinator.admitGenesisAuthority(root, heldMutex)
+    : coordinator.selectStateAuthority(root);
 }
 
 async function openAuthorityStore(
@@ -95,8 +99,9 @@ async function openAuthorityStore(
  * on either backend: under `Q` an unreadable authority is corruption, not a
  * first run. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
-  const authority = await selectSqliteAuthority(root);
-  if (!authority) return loadRawLegacyJsonState(root);
+  const selection = await selectAuthority(root);
+  if (selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
+  const authority = sqliteAuthority(root, selection);
   const { store, facade } = await openAuthorityStore(authority, true);
   try {
     return facade.loadRawStateFromStore(store);
@@ -119,8 +124,9 @@ export async function loadState(
   warningSink: (line: string) => void = console.error,
   heldMutex?: WorkspaceSyncMutex,
 ): Promise<SyncState> {
-  const authority = await selectSqliteAuthority(root);
-  if (!authority) return loadLegacyJsonState(root, stream, warningSink, heldMutex);
+  const selection = await selectAuthority(root, heldMutex);
+  if (selection.kind === "legacy-json-store") return loadLegacyJsonState(root, stream, warningSink, heldMutex);
+  const authority = sqliteAuthority(root, selection);
   // Recovery cannot change the answer above: a standing reset under `Q` is
   // recovered by the SQLite reset plane, which republishes `Q`.
   await recoverStandingResetJournal(root, stream, heldMutex);
@@ -135,6 +141,35 @@ export async function loadState(
   return markResetLineageProvenance(root, state);
 }
 
+/** Establish the first durable state nonce through the selected backend's
+ * ordinary CAS. Existing JSON remains legacy-untrusted; a genesis SQLite store
+ * is already authoritative and may initialize its empty global record. */
+export async function ensureCapableStateLineage(root: string, state: SyncState): Promise<SyncState> {
+  if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) return state;
+  const selection = await selectAuthority(root);
+  if (selection.kind === "legacy-json-store" && await loadRawLegacyJsonState(root)) return state;
+  const records = repoRecordsForState(state);
+  const manifestGit = state.lastSyncedManifest.gitRepos;
+  if (state.lastSyncedSequence !== 0 || state.lastSyncedManifest.files.length !== 0
+    || Object.keys(records).length !== 0 || Object.keys(manifestGit ?? {}).length !== 0
+    || Object.keys(state.gitPendingRemote ?? {}).length !== 0
+    || Object.keys(state.gitReposRemoved ?? {}).length !== 0) {
+    throw new Error("refusing to manufacture a capable lineage over non-genesis sync state");
+  }
+  const result = await applyStateSavePacket(root, {
+    expectedStream: state.stream ?? "",
+    expectedNonce: "legacy",
+    sourceGlobalSeq: 0,
+    repos: [],
+  });
+  if (result.status === "accepted") return result.state;
+  if (result.status === "rejected" && (result.reason === "nonce" || result.reason === "repo-generation")) {
+    const raced = await loadRawState(root);
+    if (raced && raced.stream === state.stream && /^[0-9a-f]{32}$/.test(raced.stateNonce ?? "")) return raced;
+  }
+  throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
+}
+
 /** Apply one generation-CAS packet under `<state>.lock`. Rejection is
  * whole-packet on both backends. */
 export async function applyStateSavePacket(
@@ -142,7 +177,9 @@ export async function applyStateSavePacket(
   packet: StateSavePacket,
   options: StateSaveOptions = {},
 ): Promise<StateSaveResult> {
-  if (!await selectSqliteAuthority(root)) return applyLegacyJsonSavePacket(root, packet, options);
+  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+    return applyLegacyJsonSavePacket(root, packet, options);
+  }
   return saveThroughStore(root, packet, options);
 }
 
@@ -171,15 +208,16 @@ async function saveThroughStore(
     // The state-plane write fence, once per save, under the held state lock.
     // A-2 holds no opinion about migration or genesis: the coordinator owns the
     // predicate and is the only module allowed to import both domains (§7.9).
-    const { assertAuthorityWritable } = await import("../authority-bootstrap.js");
-    assertAuthorityWritable(root);
+    const coordinator = await import("../authority-bootstrap.js");
+    coordinator.assertAuthorityWritable(root);
     // Re-selected under the lock: the pre-lock selection only routed, and the
     // authority may have flipped while this save waited for the lock. This is
     // the SQLite analogue of the JSON path's pre-rename `assertStatePublishable`.
-    const authority = await selectSqliteAuthority(root);
-    if (!authority) {
+    const selection = await coordinator.selectStateAuthority(root);
+    if (selection.kind === "legacy-json-store") {
       throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
     }
+    const authority = sqliteAuthority(root, selection);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
       return translateCasResult(await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)), store, facade);
@@ -206,7 +244,7 @@ type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["r
  * mismatch. Exported so every row — including the four a test cannot reach
  * through the CAS — is pinned rather than merely compiled.
  */
-export const LEGACY_REJECTION_REASON: Record<CasRejectionReason, LegacyRejectionReason> = {
+export const LEGACY_REJECTION_REASON = {
   lineage: "nonce",
   stream: "stream",
   nonce: "nonce",
@@ -216,7 +254,7 @@ export const LEGACY_REJECTION_REASON: Record<CasRejectionReason, LegacyRejection
   "repo-generation": "repo-generation",
   "global-sequence": "global-sequence",
   "owner-lost": "owner-lost",
-};
+} satisfies Record<CasRejectionReason, LegacyRejectionReason>;
 
 function translateCasResult(result: CasResult, store: StateStoreHandle, facade: StoreFacade): StateSaveResult {
   switch (result.status) {

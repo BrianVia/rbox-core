@@ -6,6 +6,7 @@
  */
 import { GUEST } from "../lib/config.js";
 import type { Device } from "../lib/device.js";
+import { readDeviceSyncState } from "../lib/state-view.js";
 import { createRecorder, errMsg } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
@@ -40,8 +41,7 @@ interface AdoptionStatus {
 const repoPath = (rel: string) => `${GUEST.workDir}/${rel}`;
 
 async function readSyncState(device: Device): Promise<SyncStateView> {
-  const raw = JSON.parse(await device.readFile(`${GUEST.workDir}/.rbox/state.json`)) as SyncStateView & { syncState?: SyncStateView };
-  return raw.repoRecords ? raw : raw.syncState ?? raw;
+  return readDeviceSyncState(device, GUEST.workDir);
 }
 
 function recordSettled(state: SyncStateView, rel = REPO): boolean {

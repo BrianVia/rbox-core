@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -7,13 +7,22 @@ import os from "node:os";
 import path from "node:path";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import {
+  acquireWorkspaceSyncMutex,
+  releaseWorkspaceSyncMutex,
+  type WorkspaceSyncMutex,
+} from "../sync-mutex.js";
+import {
+  admitGenesisAuthority,
+  type AuthorityOutcome,
   assertAuthorityWritable,
   establishStateAuthority,
+  selectStateAuthority,
   type MigrationDriver,
 } from "./authority-bootstrap.js";
+import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis.js";
-import type { EntryProof, HeldStatePlaneLocks } from "./locks.js";
+import { withStatePlaneLocks } from "./locks.js";
 import type { MigrationOutcome } from "./migration/authority.js";
 import {
   MIGRATION_PHASES, encodeMigrationControl,
@@ -22,8 +31,7 @@ import {
 } from "./migration/control-codec.js";
 import { genesisPaths, migrationPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { createStateStore, openStateStore, stateStoreDatabase } from "./store/open.js";
-
-const ENTRY: EntryProof = { entry: "foreground-migrate", locks: {} as HeldStatePlaneLocks };
+import { rboxResiduePaths } from "./migration/fault-rig.js";
 
 async function workspace(): Promise<string> {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-u3-2d-bootstrap-"));
@@ -51,6 +59,16 @@ function driver(): MigrationDriver & { calls: number } {
   }) as MigrationDriver & { calls: number };
   run.calls = 0;
   return run;
+}
+
+async function establishWithRealLocks(
+  root: string,
+  runMigration: MigrationDriver,
+): Promise<AuthorityOutcome> {
+  const result = await withStatePlaneLocks(root, (locks) =>
+    establishStateAuthority(root, { entry: "foreground-migrate", locks }, runMigration));
+  if (!result.held) throw new Error(`unexpected lock refusal: ${result.refusal.detail}`);
+  return result.value;
 }
 
 // --- control fixtures (shape mirrors `migration/control.test.ts`) ------------
@@ -107,9 +125,20 @@ function plantControl(root: string, phase: MigrationPhase): void {
   fs.writeFileSync(migrationPaths.control(root), encodeMigrationControl(controlFor(phase)));
 }
 
+async function plantLegacyState(root: string): Promise<void> {
+  await fsp.writeFile(statePath(root), JSON.stringify({
+    stream: "s",
+    stateNonce: "d".repeat(32),
+    stateRevision: 0,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+    repoRecords: {},
+  }));
+}
+
 /** Every byte under a directory, sidecars included — the snapshot 163 uses to
  * prove an observation wrote nothing. */
-function snapshot(dir: string): Record<string, string> {
+function snapshot(dir: string) {
   const out: Record<string, string> = {};
   for (const name of fs.readdirSync(dir).sort()) {
     const file = path.join(dir, name);
@@ -147,7 +176,7 @@ test("the fence admits a control past the flip", async () => {
 test("the fence refuses an unretired genesis intent under the same reason", async () => {
   const root = await workspace();
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toMatchObject({ domain: "genesis" });
+  expect(await establishWithRealLocks(root, run)).toMatchObject({ domain: "genesis" });
   expect(readGenesisIntent(root)).toBeUndefined();
   expect(() => assertAuthorityWritable(root)).not.toThrow();
 
@@ -271,10 +300,101 @@ test("a symlink or an oversized file at the intent path refuses", async () => {
 
 // --- dispatch ---------------------------------------------------------------
 
+test("the file-level selector preserves absent, JSON, foreign, and exact-Q routing", async () => {
+  const root = await workspace();
+  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "absent" });
+
+  await plantLegacyState(root);
+  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "json" });
+
+  await fsp.writeFile(statePath(root), "not an rbox state document\n");
+  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "foreign" });
+
+  const authorityId = "9".repeat(32);
+  await fsp.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+  expect(await selectStateAuthority(root)).toEqual({
+    kind: "sqlite-store", format: "authority-marker", authorityId,
+  });
+});
+
+test("settled authority returns before validating or loading borrowed-lock machinery", async () => {
+  const root = await workspace();
+  await plantLegacyState(root);
+  const unusable = {
+    root: `${root}-wrong`, incarnation: "never-owned", released: true,
+  } as WorkspaceSyncMutex;
+
+  expect(await admitGenesisAuthority(root, unusable))
+    .toEqual({ kind: "legacy-json-store", format: "json" });
+
+  const source = fs.readFileSync(path.join(import.meta.dir, "authority-bootstrap.ts"), "utf8");
+  const admission = source.slice(
+    source.indexOf("export async function admitGenesisAuthority"),
+    source.indexOf("/**\n * The one thing both entry points call"),
+  );
+  expect(admission.indexOf("if (intent === undefined && selection.format !== \"absent\") return selection"))
+    .toBeGreaterThan(-1);
+  expect(admission.indexOf('import("./locks.js")')).toBeGreaterThan(admission.indexOf("return selection"));
+  expect(admission.indexOf('import("./genesis.js")')).toBeGreaterThan(admission.indexOf("return selection"));
+  expect(admission).not.toContain("MigrationDriver");
+  expect(admission).not.toContain("EntryProof");
+});
+
+for (const format of ["absent", "q-intent"] as const) {
+  test(`${format} admission completes with the whole-state inventory replaced by a throwing sentinel`, () => {
+    const fixture = path.join(import.meta.dir, "genesis-admission-recursion.fixture.js");
+    const output = execFileSync(process.execPath, [fixture, format], { encoding: "utf8" });
+    expect(JSON.parse(output)).toEqual({ format, kind: "sqlite-store", intent: false });
+  });
+}
+
+test("two concurrent real held-mutex entries publish exactly one genesis authority", async () => {
+  const root = await workspace();
+  let waits = 0;
+  let stagedClaims = 0;
+  const originalOpen = fsp.open;
+  const observedOpen = spyOn(fsp, "open").mockImplementation(((file, flags, ...args) => {
+    if (String(file).includes("state.db.genesis.") && (Number(flags) & fs.constants.O_EXCL) !== 0) {
+      stagedClaims += 1;
+    }
+    return originalOpen(file, flags, ...args);
+  }) as typeof fsp.open);
+  const enter = async () => {
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli", {
+      attempts: 500,
+      retryDelayMs: 1,
+      onWait: () => { waits += 1; },
+    });
+    try {
+      return await admitGenesisAuthority(root, mutex);
+    } finally {
+      await releaseWorkspaceSyncMutex(mutex);
+    }
+  };
+
+  const [first, second] = await Promise.all([enter(), enter()]).finally(() => observedOpen.mockRestore());
+  expect(first.kind).toBe("sqlite-store");
+  expect(second).toEqual(first);
+  expect(waits).toBeGreaterThan(0);
+  expect(stagedClaims).toBe(1);
+  expect(readGenesisIntent(root)).toBeUndefined();
+  expect(rboxResiduePaths(root)).toEqual(["state.json", "state/state.db", "workspace.json"]);
+
+  const store = openStateStore(sqliteResetPaths.active(root), { readonly: true });
+  try {
+    expect(store.header.authority_id).toBe(first.kind === "sqlite-store" ? first.authorityId : "unreachable");
+    expect(stateStoreDatabase(store).query(
+      "SELECT origin_kind,entry_count,repo_count FROM migration_completion WHERE singleton=1",
+    ).all()).toEqual([{ origin_kind: "genesis", entry_count: 0, repo_count: 0 }]);
+  } finally {
+    store.close();
+  }
+});
+
 test("a fresh workspace dispatches to genesis and never runs migration", async () => {
   const root = await workspace();
   const run = driver();
-  const outcome = await establishStateAuthority(root, ENTRY, run);
+  const outcome = await establishWithRealLocks(root, run);
   expect(outcome.domain).toBe("genesis");
   expect(outcome).toMatchObject({ outcome: { kind: "established" } });
   expect(run.calls).toBe(0);
@@ -284,15 +404,15 @@ test("a workspace carrying a migration control dispatches to migration", async (
   const root = await workspace();
   plantControl(root, "M0");
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
+  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
 });
 
 test("legacy JSON dispatches to migration without genesis claiming it", async () => {
   const root = await workspace();
-  await fsp.writeFile(statePath(root), JSON.stringify({ version: 1, entries: {} }));
+  await plantLegacyState(root);
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
+  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
 });
 
@@ -313,7 +433,7 @@ test("an intent claims genesis even when a migration control exists", async () =
   plantControl(root, "M0");
   const run = driver();
 
-  const outcome = await establishStateAuthority(root, ENTRY, run);
+  const outcome = await establishWithRealLocks(root, run);
   expect(outcome.domain).toBe("genesis");
   expect(run.calls).toBe(0);
 });
@@ -323,7 +443,7 @@ test("a genesis refusal that is not legacy-present returns directly, with no re-
   await fsp.rm(path.join(root, ".rbox", "workspace.json"));   // no fenced evidence
   const run = driver();
 
-  expect(await establishStateAuthority(root, ENTRY, run))
+  expect(await establishWithRealLocks(root, run))
     .toEqual({ domain: "genesis", outcome: { kind: "refused", reason: "evidence-missing" } });
   expect(run.calls, "only legacy-present may re-dispatch").toBe(0);
 });
@@ -331,13 +451,13 @@ test("a genesis refusal that is not legacy-present returns directly, with no re-
 test("C8: a genesis intent that finds an L refuses, retires, and migration runs in the same pass", async () => {
   const root = await workspace();
   await plantIntent(root);
-  await fsp.writeFile(statePath(root), JSON.stringify({ version: 1, entries: {} }));
+  await plantLegacyState(root);
   // The premise, stated rather than assumed: nothing holds the staged path, so
   // the intent's recorded inode cannot match and no removal depends on it.
   expect(fs.lstatSync(genesisPaths.staged(root, "a".repeat(32)), { throwIfNoEntry: false })).toBeUndefined();
 
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
+  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
   expect(readGenesisIntent(root)).toBeUndefined();
   // The re-inspect is bounded: writes flow again the moment the intent is gone.
@@ -427,6 +547,45 @@ function reachableFrom(seeds: string[]): Set<string> {
   }
   return seen;
 }
+
+/** Runtime-static imports only. Admission's genesis/lock imports are
+ * deliberately excluded: settled selection returns before evaluating them. */
+function staticValueSpecifiers(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    if (/^\s*(import|export)\s+type\s/.test(line)) continue;
+    const from = /\bfrom\s+"([^"]+)"/.exec(line)?.[1];
+    const sideEffect = /^\s*import\s+"([^"]+)"/.exec(line)?.[1];
+    if (from) out.push(from);
+    if (sideEffect) out.push(sideEffect);
+  }
+  return out;
+}
+
+function staticallyReachableFrom(seed: string): Set<string> {
+  const seen = new Set<string>();
+  const queue = [seed];
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (seen.has(file) || !file.endsWith(".ts")) continue;
+    seen.add(file);
+    for (const spec of staticValueSpecifiers(fs.readFileSync(file, "utf8"))) {
+      const resolved = resolveSpecifier(file, spec);
+      if (resolved.endsWith(".ts")) queue.push(resolved);
+      else seen.add(resolved);
+    }
+  }
+  return seen;
+}
+
+test("settled selection's static coordinator closure is SQLite/genesis/lock free", () => {
+  const reachable = staticallyReachableFrom(BOOTSTRAP);
+  const names = [...reachable];
+  expect(names.some((name) => name.endsWith(`${path.sep}genesis.ts`))).toBeFalse();
+  expect(names.some((name) => name.endsWith(`${path.sep}locks.ts`))).toBeFalse();
+  expect(names.some((name) => name.endsWith(`${path.sep}store-facade.ts`))).toBeFalse();
+  expect(names).not.toContain("bun:sqlite");
+});
 
 test("the fence calls only its two bounded readers and its own refusal", () => {
   expect(fenceCallees(fs.readFileSync(BOOTSTRAP, "utf8")).sort())

@@ -4,6 +4,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { JsonValue } from "../../json.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import { AUTHORITY_MARKER_MAGIC } from "./authority-marker.js";
 import { StateAuthorityCorruptError } from "./errors.js";
@@ -17,7 +19,8 @@ import {
   type HeldStatePlaneLocks,
 } from "./genesis.js";
 import { genesisPaths, migrationPaths, sqliteResetPaths, statePath } from "./paths.js";
-import { createStateStore, openStateStore, stateStoreDatabase } from "./store/open.js";
+import { createStateStore, openStateStore, stateStoreDatabase, type ClaimedInode } from "./store/open.js";
+import { withGenesisAdmissionLocks } from "./locks.js";
 
 const LOCKS = {} as HeldStatePlaneLocks;
 const IDS: GenesisIds = { authorityId: "a".repeat(32), lineageId: "b".repeat(32) };
@@ -43,23 +46,35 @@ function markerBytes(authorityId: string): Buffer {
   return Buffer.from(`${AUTHORITY_MARKER_MAGIC}\n${authorityId}\n`, "latin1");
 }
 
-function inodeOf(file: string): { dev: number; ino: number } {
+function inodeOf(file: string): ClaimedInode {
   const stat = fs.lstatSync(file);
   return { dev: stat.dev, ino: stat.ino };
 }
 
 /** A complete genesis database, built the way `installGenesisLineage` builds it. */
-function plantStore(file: string, stream: string, ids: GenesisIds): { dev: number; ino: number } {
+function plantStore(file: string, stream: string, ids: GenesisIds): ClaimedInode {
   createStateStore(file, { stream, createdBy: "genesis-v1", ...ids }).close();
   return inodeOf(file);
 }
 
-async function plantIntent(root: string, intent: GenesisIntent): Promise<void> {
+async function plantIntent(root: string, intent: GenesisIntent | JsonValue): Promise<void> {
   await fsp.writeFile(genesisPaths.intent(root), JSON.stringify(intent));
 }
 
-async function run(root: string, ids: GenesisIds = IDS, faults = {}) {
-  return establish(root, () => ids, LOCKS, faults);
+function publicationLocks(
+  root: string,
+  mutexOwned = async () => true,
+  stateOwned = async () => true,
+): HeldStatePlaneLocks {
+  return {
+    mutex: { root, incarnation: "genesis-test", released: false, lock: { isOwner: mutexOwned } },
+    stateLock: { isOwner: stateOwned },
+    underRepositoryFence: true,
+  } as HeldStatePlaneLocks;
+}
+
+async function run(root: string, ids: GenesisIds = IDS, faults = {}, locks = publicationLocks(root)) {
+  return establish(root, () => ids, locks, faults);
 }
 
 async function listing(dir: string): Promise<string[]> {
@@ -219,6 +234,62 @@ test("G4: the intent survives past the authority rename and case 1 retires it", 
   expect(readGenesisIntent(root)).toBeUndefined();
 });
 
+test("Q publication independently revalidates mutex and state-lock ownership", async () => {
+  for (const lost of ["mutex", "state-lock"] as const) {
+    const root = await workspace();
+    let mutexOwned = true;
+    let stateOwned = true;
+    const locks = publicationLocks(root, async () => mutexOwned, async () => stateOwned);
+    await expect(run(root, IDS, {
+      afterQPrepared: async () => {
+        if (lost === "mutex") mutexOwned = false;
+        else stateOwned = false;
+      },
+    }, locks), lost).rejects.toThrow(lost === "mutex" ? /mutex ownership was lost/ : /state lock ownership was lost/);
+
+    expect(fs.existsSync(statePath(root)), lost).toBeFalse();
+    expect(readGenesisIntent(root)?.authorityId, lost).toBe(IDS.authorityId);
+    expect(fs.existsSync(sqliteResetPaths.active(root)), lost).toBeTrue();
+    expect(await run(root), lost).toEqual({ kind: "established", authorityId: IDS.authorityId });
+    expect(readGenesisIntent(root), lost).toBeUndefined();
+  }
+});
+
+test("real post-entry lock-marker loss leaves retry authority for a later owner", async () => {
+  for (const lost of ["mutex", "state-lock"] as const) {
+    const root = await workspace();
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+    try {
+      await expect(withGenesisAdmissionLocks(root, mutex, (locks) => establish(root, () => IDS, locks, {
+        afterQPrepared: async () => {
+          const marker = lost === "mutex" ? mutex.lock?.path : locks.stateLock.path;
+          if (!marker) throw new Error("test requires real lock markers");
+          await fsp.rm(marker);
+        },
+      })), lost).rejects.toThrow(/ownership was lost/);
+    } finally {
+      await releaseWorkspaceSyncMutex(mutex).catch(() => {});
+    }
+
+    expect(fs.existsSync(statePath(root)), lost).toBeFalse();
+    expect(readGenesisIntent(root)?.authorityId, lost).toBe(IDS.authorityId);
+    const recoveryMutex = await acquireWorkspaceSyncMutex(root, "cli");
+    try {
+      expect(await withGenesisAdmissionLocks(root, recoveryMutex, (locks) => establish(root, () => OTHER, locks)), lost)
+        .toEqual({ kind: "established", authorityId: IDS.authorityId });
+    } finally {
+      await releaseWorkspaceSyncMutex(recoveryMutex);
+    }
+    expect(readGenesisIntent(root), lost).toBeUndefined();
+  }
+});
+
+test("publication checks precede the final holder read, which stays adjacent to rename", async () => {
+  const source = await fsp.readFile(new URL("./genesis.ts", import.meta.url), "utf8");
+  expect(source).toMatch(/assertHealthyOwnedSyncMutex\(locks\.mutex, root\)[\s\S]*locks\.stateLock\.isOwner\(\)[\s\S]*classifyStateFormat\(statePath\(root\)\)/);
+  expect(source).toMatch(/const holder = await classifyStateFormat\(statePath\(root\)\);\n  if \(holder === "json"\)[\s\S]*if \(holder !== "absent"\)[^\n]*\n  await fsp\.rename\(sibling, statePath\(root\)\);/);
+});
+
 test("G5: a genesis database copied from another workspace never publishes Q", async () => {
   const root = await workspace();
   plantStore(sqliteResetPaths.active(root), "some-other-stream", OTHER);
@@ -360,7 +431,8 @@ test("case 6: a non-string incarnation is refused, never coerced", async () => {
   const evidence = await evidenceOf(root);
   const base = { version: 1, ...IDS, evidence, staging: { dev: 1, ino: 2 } };
   for (const incarnation of [["absent"], [["absent"]], { toString: "x" }, "Absent", null, 1]) {
-    await plantIntent(root, { ...base, evidence: { ...evidence, incarnation } } as unknown as GenesisIntent);
+    const malformedIntent = { ...base, evidence: { ...evidence, incarnation } } satisfies JsonValue;
+    await plantIntent(root, malformedIntent);
     expect(() => readGenesisIntent(root), `incarnation ${JSON.stringify(incarnation)} was admitted`)
       .toThrow(StateAuthorityCorruptError);
   }

@@ -678,3 +678,16 @@ not claim the state plane is finished; it makes finishing and recovering
 genesis possible while preserving the JSON authority semantics that still
 carry the fleet and accounting honestly for both their extra intent read and
 their cold selector-import cost.
+
+## Measured A/B record (R2-confirm finding closed; via-desktop, Ryzen 5950X, bun 1.4.0, 25 samples)
+
+| load | baseline (main 540e224+) p50/p95 ms | SP-1 candidate p50/p95 ms | delta |
+|---|---|---|---|
+| settled-JSON warm | 0.443 / 0.585 | 0.452 / 0.562 | +0.009 p50 — the one bounded intent-existence read |
+| settled-JSON cold | 9.589 / 11.051 | 11.239 / 13.187 | +1.65 p50 — the pre-accepted dynamic-import/module-eval cost |
+| settled-Q warm | 1.394 / 2.155 | 1.678 / 2.291 | within run-to-run noise |
+| settled-Q cold | 17.438 / 19.251 | 18.993 / 21.178 | within run-to-run noise |
+
+Harness: scripts/bench/genesis-admission-loads.ts, run by the orchestrator on
+both trees (producer≠verifier). Both deltas fall inside the protected-ledger
+envelope; no hot-path regression.

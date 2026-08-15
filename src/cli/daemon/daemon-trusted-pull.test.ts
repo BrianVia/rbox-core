@@ -20,7 +20,8 @@ import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js
 import { watcherTrustLine } from "../status-view.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
-import type { SyncState, WorkspaceConfig } from "../config.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 
 const KEK = Buffer.alloc(32, 7);
 const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -126,6 +127,7 @@ interface DaemonInternals {
   doFullScan(): Promise<unknown>;
   startLiveWatch(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
+  openOperationBoundary(syncMutex: WorkspaceSyncMutex): Promise<boolean>;
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
   buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult>;
   stop(): Promise<void>;
@@ -159,7 +161,11 @@ beforeEach(async () => {
   delete process.env.RBOX_WATCHER_RETRUST;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
-  await prepareDaemonFolderAdmission(root, testConfig());
+  const cfg = testConfig();
+  await prepareDaemonFolderAdmission(root, cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   await daemon?.stop().catch(() => {});
@@ -445,16 +451,15 @@ test("design 202 F2: a pull that changes the base gitRepos set falls back to the
     applySnapshot: async () => {},
     upsert: async (repos: { relPath: string }[]) => { for (const r of repos) upserted.push(r.relPath); },
   };
-  // The pre-op base carries a repo the post-pull base will not: exactly the shape
-  // F2 detects when a pull materializes or drops a repo.
-  const base = await d.loadSyncBase();
+  // Stage the resident pre-op topology immediately after the new held-mutex
+  // boundary refresh. It is absent on disk and from the remote result; the real
+  // repo below remains available for the healing scan to discover.
   const section: GitSection = {
     bundleSha: "1".repeat(64), bundleEncSha: "2".repeat(64), bundleCipherSize: 1,
     head: "ref: refs/heads/main\n", refs: {}, refScope: "all", generatedAt: "2026-07-26T00:00:00.000Z",
   };
-  d.syncBase = { ...base, lastSyncedManifest: { ...base.lastSyncedManifest, gitRepos: { repo: section }, manifestSchema: 2 } };
-  d.matcherGitReposKey = "repo"; // P7 is measured against that same pre-op base
-  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
+  stagePreOpTopologyChange(d, { ghost: section });
+  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")], {});
 
   d.want.pull = true;
   await d.pump();
@@ -550,11 +555,24 @@ const withRepos = (base: SyncState, gitRepos: Record<string, GitSection>): SyncS
   lastSyncedManifest: { ...base.lastSyncedManifest, gitRepos, manifestSchema: 2 },
 });
 
-/** The pre-op base carries a repo key the post-pull base will not — the shape a
- *  clone/publish/delete sequence produces, with the matcher current for THAT base. */
-async function stagePreOpTopologyChange(d: DaemonInternals): Promise<void> {
-  d.syncBase = withRepos(await d.loadSyncBase(), { repo: REPO_SECTION });
-  d.matcherGitReposKey = "repo"; // P7 is measured against that same pre-op base
+/** Install a one-shot test seam after the real held-mutex boundary reload and
+ * before operation selection. This preserves the original F2 topology: the
+ * resident pre-op base has a repo key the durable post-pull base will not. */
+function stagePreOpTopologyChange(
+  d: DaemonInternals,
+  gitRepos: Record<string, GitSection> = { ghost: REPO_SECTION },
+): void {
+  const original = d.openOperationBoundary.bind(d);
+  d.openOperationBoundary = async (syncMutex) => {
+    const admitted = await original(syncMutex);
+    d.openOperationBoundary = original;
+    if (!admitted) return false;
+    if (!d.syncBase) throw new Error("operation boundary did not refresh the durable base");
+    d.syncBase = withRepos(d.syncBase, gitRepos);
+    d.matcherGitReposKey = Object.keys(gitRepos).sort().join("\0");
+    d.local.observedGeneration = d.matcherGeneration;
+    return true;
+  };
 }
 
 // ── 206 test 1 + 10: the #464 regression ──────────────────────────────────────
@@ -562,13 +580,13 @@ test("design 206 (#464): a git-topology pull falls back once, then the NEXT pull
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
-  await stagePreOpTopologyChange(d);
-  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
+  stagePreOpTopologyChange(d);
+  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")], {});
 
   d.want.pull = true;
   await d.pump();
   expect(pullLine()).toBe("pull local=trusted fallback=git-topology");
-  // Test 10: the healing scan ran under a matcher whose provenance is the POST-pull
+  // The healing scan ran under a matcher whose provenance is the post-pull
   // base, and its install stamped that observation as current.
   const base = await d.loadSyncBase();
   expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(base));

@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { HashCache, scanManifest, type BlobStore, type Manifest } from "../../engine/index.js";
 import { type SyncDeps } from "../sync.js";
-import { type SyncState, type WorkspaceConfig } from "../config.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import { GIT_BUSY_RETRY_DELAYS_MS, RboxDaemon, gitCaptureSampleForProvenance, type GitBusyRetryClock } from "./daemon.js";
 import { GitRefWatchRegistry, type GitRefWatchHandle, type GitRefWatchMode } from "./git-ref-watch.js";
@@ -186,6 +186,9 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
     await git(root, "init", "-qb", "main");
     await git(root, "commit", "--allow-empty", "-qm", "baseline");
     await prepareDaemonFolderAdmission(root, cfg);
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
     const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
       bootId: `episode-${variant}`,
       gitBusyRetryClock: clock,

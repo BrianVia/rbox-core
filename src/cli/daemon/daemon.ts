@@ -1542,12 +1542,16 @@ export class RboxDaemon {
     if (!await this.refreshScopeAuthority()) return false;
     if (!await this.resetOperationBoundary(syncMutex)) return false;
     if (this.stopped) return false;
-    if (!await this.folderOperationBoundary()) return false;
+    // The contended-start path reaches genesis here, under the scheduler's
+    // already-held mutex, before any adoption or folder-policy scan. Keep this
+    // unconditional: a resident base may predate a surviving genesis intent.
+    await this.loadSyncBase(syncMutex);
+    if (!await this.folderOperationBoundary(syncMutex)) return false;
     await this.recoverOwnedLocksAtBoundary();
     if (this.stopped) return false;
     await this.adoptionCacheGenerationBoundary();
-    if (!await this.acknowledgeFolderPolicyRecycle()) return false;
-    const binding = this.syncBase ?? await this.loadSyncBase();
+    if (!await this.acknowledgeFolderPolicyRecycle(syncMutex)) return false;
+    const binding = this.syncBase ?? await this.loadSyncBase(syncMutex);
     const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
     if (!bindingMatches) {
       this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
@@ -2796,7 +2800,7 @@ export class RboxDaemon {
     this.log(`adoption cache generation ${record.generation} acknowledged after full scan`);
   }
 
-  private async reloadWorkspaceConfigIfChanged(): Promise<void> {
+  private async reloadWorkspaceConfigIfChanged(heldMutex?: WorkspaceSyncMutex): Promise<void> {
     const workspaceFile = path.join(this.root, ".rbox", "workspace.json");
     const [workspaceToken, catalogToken] = await Promise.all([
       reloadStatToken(workspaceFile),
@@ -2839,7 +2843,7 @@ export class RboxDaemon {
       if (wasRespecting !== (this.cfg.respectGitignore === true)) {
         this.folderMatcherRebuildPending = true;
         try {
-          this.rebuildMatcher(await this.loadSyncBase());
+          this.rebuildMatcher(await this.loadSyncBase(heldMutex));
           this.folderMatcherRebuildPending = false;
           this.log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
         } catch (error) {
@@ -2882,19 +2886,19 @@ export class RboxDaemon {
     this.writeActivity();
   }
 
-  private async folderOperationBoundary(): Promise<boolean> {
-    await this.reloadWorkspaceConfigIfChanged();
+  private async folderOperationBoundary(heldMutex?: WorkspaceSyncMutex): Promise<boolean> {
+    await this.reloadWorkspaceConfigIfChanged(heldMutex);
     return this.folderAdmissionHaltReason === undefined;
   }
 
   /** Git policy changes invalidate resident scan hints. The boundary owns one
    * uncached, unpruned scan and clears the recycle flag only after its cache is
    * durable, so a failed acknowledgement is retried before any operation. */
-  private async acknowledgeFolderPolicyRecycle(): Promise<boolean> {
+  private async acknowledgeFolderPolicyRecycle(heldMutex?: WorkspaceSyncMutex): Promise<boolean> {
     if (!this.folderPolicyRecyclePending && !this.folderMatcherRebuildPending) return true;
     try {
       if (this.folderMatcherRebuildPending) {
-        this.rebuildMatcher(this.syncBase ?? await this.loadSyncBase());
+        this.rebuildMatcher(this.syncBase ?? await this.loadSyncBase(heldMutex));
         this.folderMatcherRebuildPending = false;
       }
       if (this.folderPolicyRecyclePending) {

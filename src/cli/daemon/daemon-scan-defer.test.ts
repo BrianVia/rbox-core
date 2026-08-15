@@ -7,6 +7,7 @@ import { realHashFileForTests, overrideHashFileForTests } from "../../engine/has
 import { HashCache, scanManifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { RboxDaemon } from "../daemon.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 // Design 85 P-1 regression: a path that churns during the
@@ -137,7 +138,10 @@ test("a freshly pulled path deferred during the post-pull rescan carries the pul
   await fs.writeFile(path.join(root, "f.txt"), "one");
   const cfg = testConfig();
   await prepareDaemonFolderAdmission(root, cfg);
-  daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId: "boot-defer" }) as unknown as DaemonInternals;
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+  daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId: "boot-defer" }) as DaemonInternals;
   daemon.cache = new HashCache();
   daemon.local.head = await scanManifest(root); // pre-pull in-memory truth: f.txt only, no g.txt
   await daemon.loadSyncBase();
