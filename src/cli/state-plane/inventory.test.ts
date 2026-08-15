@@ -84,6 +84,10 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // marker rather than refuse it, so its guard is the classifier that decides
   // the format, not the barrier that throws on it.
   { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
+  // FLAKE-009: the reset fence fingerprints the document on every ordinary load,
+  // unlocked, so a writer's atomic republish can land inside it. The guard is the
+  // retry that re-runs the whole identity tuple rather than reporting corruption.
+  { file: "src/cli/reset-journal-inspection.ts", symbol: "artifactIdentity", kind: "read", sites: 1, guards: ["retryOnIdentityRace", "assertUnmovedSince"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.

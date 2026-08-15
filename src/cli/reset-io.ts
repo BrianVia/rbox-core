@@ -117,8 +117,8 @@ export interface BoundedStreamOptions {
   onChunk?: (chunk: Uint8Array, bytesRead: number) => void | Promise<void>;
 }
 
-function absent(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === "ENOENT";
+function absent(error: NodeJS.ErrnoException): boolean {
+  return error.code === "ENOENT";
 }
 
 function identity(stat: Awaited<ReturnType<typeof fs.lstat>>): BoundedIdentity {
@@ -149,7 +149,7 @@ export async function boundedStream(
   try {
     beforeStat = await fs.lstat(file);
   } catch (error) {
-    if (absent(error)) return undefined;
+    if (absent(error as NodeJS.ErrnoException)) return undefined;
     throw error;
   }
   if (!beforeStat.isFile() || beforeStat.isSymbolicLink()) throw unsafe(file, "unsafe non-regular reset file");
@@ -183,7 +183,7 @@ export async function boundedStream(
     try {
       afterPathStat = await fs.lstat(file);
     } catch (error) {
-      if (absent(error)) throw unsafe(file, "reset file disappeared while reading", "identity-race");
+      if (absent(error as NodeJS.ErrnoException)) throw unsafe(file, "reset file disappeared while reading", "identity-race");
       throw error;
     }
     const afterPath = identity(afterPathStat);
@@ -200,19 +200,29 @@ export async function boundedStream(
   }
 }
 
-export async function boundedRead(file: string, cap: number, options: BoundedStreamOptions = {}): Promise<Buffer | undefined> {
-  const retries = options.identityRetries ?? 2;
+/** An atomically republished file is a settled writer, not corruption: the next
+ * attempt reads the successor whole. Exhausting the budget still surfaces the
+ * race. Scope is deliberately narrow — `boundedRead` and the ordinary-load reset
+ * fence only. Standing-reset inspection keeps reading without this retry: on the
+ * destructive plane, an artifact republished mid-inspection must fail closed. */
+export async function retryOnIdentityRace<T>(attempt: () => Promise<T>, retries = 2): Promise<T> {
   if (!Number.isSafeInteger(retries) || retries < 0 || retries > 8) throw new RangeError("bounded read retry count is invalid");
-  for (let attempt = 0;; attempt++) {
-    const chunks: Buffer[] = [];
+  for (let tries = 0;; tries++) {
     try {
-      const result = await boundedStream(file, cap, (chunk) => { chunks.push(Buffer.from(chunk)); }, options);
-      return result ? Buffer.concat(chunks, result.bytesRead) : undefined;
+      return await attempt();
     } catch (error) {
       const changed = error instanceof ResetCorruptionError && error.kind === "identity-race";
-      if (!changed || attempt >= retries) throw error;
+      if (!changed || tries >= retries) throw error;
     }
   }
+}
+
+export async function boundedRead(file: string, cap: number, options: BoundedStreamOptions = {}): Promise<Buffer | undefined> {
+  return retryOnIdentityRace(async () => {
+    const chunks: Buffer[] = [];
+    const result = await boundedStream(file, cap, (chunk) => { chunks.push(Buffer.from(chunk)); }, options);
+    return result ? Buffer.concat(chunks, result.bytesRead) : undefined;
+  }, options.identityRetries ?? 2);
 }
 
 export async function boundedHash(file: string, cap = RESET_STREAM_BYTE_LIMIT): Promise<string | undefined> {
@@ -355,7 +365,7 @@ export async function boundedJsonRead<T>(
   try {
     preflight = await fs.lstat(file);
   } catch (error) {
-    if (absent(error)) return undefined;
+    if (absent(error as NodeJS.ErrnoException)) return undefined;
     throw error;
   }
   if (!preflight.isFile() || preflight.isSymbolicLink()) throw unsafe(file, "unsafe non-regular reset file");

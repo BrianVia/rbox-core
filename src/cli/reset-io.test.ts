@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ import {
   boundedJsonRead,
   boundedRead,
   boundedStream,
+  retryOnIdentityRace,
   RESET_MATERIALIZED_BYTE_LIMIT,
   RESET_STREAM_BYTE_LIMIT,
 } from "./reset-io.js";
@@ -84,6 +86,53 @@ describe("design 138 bounded reset I/O", () => {
       message: expect.stringContaining("changed while reading"),
     });
   });
+
+  test("retryOnIdentityRace re-reads through one rename replacement and keeps every other failure", async () => {
+    const file = path.join(dir, "republished");
+    const replacement = path.join(dir, "successor");
+    await fs.writeFile(file, "1234");
+    await fs.writeFile(replacement, "abcd");
+    let replaced = false;
+    const seen: string[] = [];
+    const hash = await retryOnIdentityRace(() => boundedHashWitness(file, seen, async () => {
+      if (replaced) return;
+      replaced = true;
+      await fs.rename(replacement, file);
+    }));
+    expect(replaced).toBe(true);
+    expect(seen).toEqual(["1234", "abcd"]);
+    expect(hash).toBe(await boundedHash(file, 16));
+
+    let attempts = 0;
+    await expect(retryOnIdentityRace(async () => {
+      attempts++;
+      throw new ResetCorruptionError("torn state", { kind: "corruption" });
+    })).rejects.toThrow("torn state");
+    expect(attempts).toBe(1);
+
+    let races = 0;
+    await expect(retryOnIdentityRace(async () => {
+      races++;
+      throw new ResetCorruptionError("still moving", { kind: "identity-race" });
+    })).rejects.toThrow("still moving");
+    expect(races).toBe(3);
+  });
+
+  /** Hash `file` whole, recording the bytes each attempt saw, with a hook that can
+   *  replace the file mid-read the way an atomic republish does. */
+  async function boundedHashWitness(file: string, seen: string[], onChunk: () => Promise<void>): Promise<string> {
+    let body = "";
+    try {
+      const result = await boundedStream(file, 16, (chunk) => { body += Buffer.from(chunk).toString(); }, {
+        chunkBytes: 2,
+        onChunk,
+      });
+      if (!result) throw new Error("witness file disappeared");
+      return crypto.createHash("sha256").update(body).digest("hex");
+    } finally {
+      seen.push(body);
+    }
+  }
 
   test("streaming hash, byte equality, file equality, and copy do not need whole-source reads", async () => {
     const source = path.join(dir, "source");
