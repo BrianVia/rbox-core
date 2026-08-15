@@ -9,19 +9,23 @@ let counter = 0;
 
 /** The errno string of a Node filesystem error, or undefined for a value that
  *  is not an errno-bearing exception. Single source for the per-file errno
- *  classification hand-rolled across the engine. */
+ *  classification hand-rolled across the engine.
+ *  The parameter is a caught exception: `unknown` by language rule, and this
+ *  function IS its decoder (same leftover as `daemon/logger.ts`'s `errCode`). */
 export function errCode(e: unknown): string | undefined {
   return (e as NodeJS.ErrnoException | undefined)?.code;
 }
 
 /** The target does not exist: ENOENT, or ENOTDIR when a parent component is a
- *  file (or was evicted). Both mean "not there" to a caller resolving a path. */
+ *  file (or was evicted). Both mean "not there" to a caller resolving a path.
+ *  Caught-exception input, decoded through {@link errCode}. */
 export function isAbsent(e: unknown): boolean {
   const code = errCode(e);
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-/** A name-claim collided: the destination already exists (EEXIST). */
+/** A name-claim collided: the destination already exists (EEXIST).
+ *  Caught-exception input, decoded through {@link errCode}. */
 export function isEEXIST(e: unknown): boolean {
   return errCode(e) === "EEXIST";
 }

@@ -15,14 +15,19 @@ export type RecoveryClipboardResult =
   | { ok: true; command: string }
   | { ok: false; reason: RecoveryClipboardFailure };
 
+/** The child's stdin as this module uses it — the subset of `node:stream`'s
+ *  `Writable` that a clipboard write needs. `error` carries Node's `Error`, the
+ *  type the stream's own `once("error", …)` overload declares. */
 export interface RecoveryClipboardStdin {
-  once(event: "error", listener: (error: unknown) => void): unknown;
+  once(event: "error", listener: (error: Error) => void): unknown;
   end(chunk: Uint8Array, callback: () => void): unknown;
 }
 
+/** The subset of `node:child_process`'s `ChildProcess` this module uses; a real
+ *  `ChildProcess` satisfies it structurally (see {@link realSpawner}). */
 export interface RecoveryClipboardChild {
   stdin: RecoveryClipboardStdin | null;
-  once(event: "error", listener: (error: unknown) => void): unknown;
+  once(event: "error", listener: (error: Error) => void): unknown;
   once(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
   kill(signal?: NodeJS.Signals | number): boolean;
 }
@@ -44,7 +49,7 @@ export interface RecoveryClipboardDeps {
 type ClipboardCommand = readonly [command: string, args: readonly string[]];
 
 const realSpawner: RecoveryClipboardSpawner = (command, args, options) =>
-  spawn(command, [...args], options) as unknown as RecoveryClipboardChild;
+  spawn(command, [...args], options);
 
 function commandsFor(platform: NodeJS.Platform): ClipboardCommand[] {
   if (platform === "darwin") return [["pbcopy", []]];

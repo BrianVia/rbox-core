@@ -27,10 +27,16 @@ export interface DriftCandidate {
    *  feed the design's drop-rate gate (§5 P0.3 filter c). */
   quiescentAtScan: boolean;
 }
+/** Candidates the apply path resolved since the last audit emission: `lateCovered`
+ *  saw the covering event land on the same bytes, `coveredAmbiguous` did not. */
+export interface DriftResolutionCounters {
+  lateCovered: number;
+  coveredAmbiguous: number;
+}
 export interface DriftAuditState {
   version: 1;
   pending: DriftCandidate[];
-  resolvedSinceLastAudit: { lateCovered: number; coveredAmbiguous: number };
+  resolvedSinceLastAudit: DriftResolutionCounters;
 }
 export interface ContinuityContext { bootId: string; watcherSessionId?: string; errorGeneration: number; watcherUnhealthySince: boolean }
 
@@ -87,7 +93,13 @@ export function snapshotAtPath(manifest: Manifest, p: string): EntrySnapshot | n
   return null;
 }
 
-export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEvent[], deferred: ReadonlySet<string>, manifest: Manifest): { pending: DriftCandidate[]; lateCovered: number; coveredAmbiguous: number } {
+/** The still-pending candidates after an apply, plus the resolutions that apply
+ *  attributed — the two counters fold straight into `resolvedSinceLastAudit`. */
+export interface CoveredAtApplyResolution extends DriftResolutionCounters {
+  pending: DriftCandidate[];
+}
+
+export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEvent[], deferred: ReadonlySet<string>, manifest: Manifest): CoveredAtApplyResolution {
   let lateCovered = 0, coveredAmbiguous = 0;
   const kept = pending.filter((candidate) => {
     if (deferred.has(candidate.path) || !eventsCoverPath(events, candidate.path)) return true;
@@ -129,11 +141,13 @@ export async function loadDriftAudit(root: string): Promise<DriftAuditState> {
     const x = JSON.parse(await fs.readFile(auditPath(root), "utf8")) as DriftAuditState;
     const counters = x?.resolvedSinceLastAudit;
     const validCounters = counters && Number.isFinite(counters.lateCovered) && counters.lateCovered >= 0 && Number.isFinite(counters.coveredAmbiguous) && counters.coveredAmbiguous >= 0;
-    const validSnapshot = (snapshot: unknown): snapshot is EntrySnapshot | null => {
+    // Each validator below re-verifies, field by field, the shape this function
+    // CLAIMED when it read the sidecar; the claim only becomes true once every
+    // check passes, and a failed check falls back to the empty state.
+    const validSnapshot = (snapshot: EntrySnapshot | null): boolean => {
       if (snapshot === null) return true;
       if (!snapshot || typeof snapshot !== "object") return false;
-      const s = snapshot as Partial<EntrySnapshot>;
-      return (s.type === "file" || s.type === "symlink") && typeof s.sha256 === "string" && typeof s.size === "number" && typeof s.mode === "number" && (s.symlinkTarget === undefined || typeof s.symlinkTarget === "string");
+      return (snapshot.type === "file" || snapshot.type === "symlink") && typeof snapshot.sha256 === "string" && typeof snapshot.size === "number" && typeof snapshot.mode === "number" && (snapshot.symlinkTarget === undefined || typeof snapshot.symlinkTarget === "string");
     };
     const validPending = Array.isArray(x?.pending) && x.pending.every((candidate) =>
       candidate && typeof candidate.path === "string" &&
