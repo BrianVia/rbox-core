@@ -201,7 +201,7 @@ function staticRemote(section: GitSection, sequence = 2): SyncRemote {
   return {
     latest: async () => ({ sequence, manifest: manifest(section) }),
     blobStore: () => store,
-  } as unknown as SyncRemote;
+  } as SyncRemote;
 }
 
 async function installUpgradeState(section: GitSection, cfg: WorkspaceConfig, sourceSeq = 1): Promise<SyncState> {

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import type { GitSection } from "../../engine/types.js";
+import type { JsonValue } from "../../json.js";
 import { boundedJsonRead } from "../reset-io.js";
 import { assertHealthyOwnedSyncMutex, assertSyncMutex, type WorkspaceSyncMutex } from "../sync-mutex.js";
 
@@ -61,40 +62,43 @@ export const republishRequestsPath = (root: string): string =>
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
-const validRelPath = (value: unknown): value is string =>
+const validRelPath = (value: JsonValue | undefined): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 1024
   && !value.startsWith("/") && !value.includes("\0")
   && (value === "." || (!value.startsWith("./") && value !== ".." && !value.startsWith("../") && !value.includes("/../") && !value.endsWith("/..")));
 
-const validTimestamp = (value: unknown): value is string =>
+const validTimestamp = (value: JsonValue | undefined): value is string =>
   typeof value === "string" && !Number.isNaN(Date.parse(value));
 
 const sorted = (requests: readonly RepublishRequest[]): RepublishRequest[] =>
   [...requests].sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
 
-function validate(value: unknown): RepublishRequestsV1 | undefined {
+function validate(value: JsonValue): RepublishRequestsV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Partial<RepublishRequestsV1>;
-  if (record.v !== 1 || typeof record.stream !== "string" || record.stream.length === 0) return undefined;
-  if (!Array.isArray(record.requests) || record.requests.length === 0 || record.requests.length > REPUBLISH_REQUESTS_MAX) return undefined;
+  const record = value;
+  const stream = record.stream;
+  if (record.v !== 1 || typeof stream !== "string" || stream.length === 0) return undefined;
+  const rawRequests = record.requests;
+  if (!Array.isArray(rawRequests) || rawRequests.length === 0 || rawRequests.length > REPUBLISH_REQUESTS_MAX) return undefined;
   const seen = new Set<string>();
   const requests: RepublishRequest[] = [];
-  for (const raw of record.requests) {
+  for (const raw of rawRequests) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-    const entry = raw as Partial<RepublishRequest>;
+    const entry = raw;
     if (!validRelPath(entry.relPath) || !validTimestamp(entry.requestedAt)) return undefined;
-    if (typeof entry.baseBundleSha !== "string" || !HEX64.test(entry.baseBundleSha)) return undefined;
+    const baseBundleSha = entry.baseBundleSha;
+    if (typeof baseBundleSha !== "string" || !HEX64.test(baseBundleSha)) return undefined;
     if (!validTimestamp(entry.baseGeneratedAt)) return undefined;
     if (seen.has(entry.relPath)) return undefined;
     seen.add(entry.relPath);
     requests.push({
       relPath: entry.relPath,
       requestedAt: entry.requestedAt,
-      baseBundleSha: entry.baseBundleSha,
+      baseBundleSha,
       baseGeneratedAt: entry.baseGeneratedAt,
     });
   }
-  return { v: 1, stream: record.stream, requests: sorted(requests) };
+  return { v: 1, stream, requests: sorted(requests) };
 }
 
 /** Classify the store. `corrupt` is distinct from `absent` so a writer refuses
@@ -104,9 +108,9 @@ function validate(value: unknown): RepublishRequestsV1 | undefined {
  *  state no longer is, so it carries no authority to force or settle anything
  *  here and is replaced rather than merged. */
 async function readStoreFile(root: string): Promise<RepublishStoreRead> {
-  let raw: unknown;
+  let raw: JsonValue | undefined;
   try {
-    raw = await boundedJsonRead(republishRequestsPath(root), REPUBLISH_REQUESTS_MAX_BYTES);
+    raw = await boundedJsonRead<JsonValue>(republishRequestsPath(root), REPUBLISH_REQUESTS_MAX_BYTES);
   } catch {
     return { status: "corrupt" };
   }

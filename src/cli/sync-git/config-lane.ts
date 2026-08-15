@@ -6,10 +6,12 @@ import { canonicalizeGitConfig, type GitConfig } from "./config-sync.js";
 import { readStableParsedConfigSnapshot, type ConfigFault, type GitConfigRunner } from "./config-txn.js";
 import { type ConfigShapeIdentity } from "../config.js";
 import { repoDirOf } from "./shared.js";
-export interface CachedLocalCfg {
+/** `type`, not `interface`, so it keeps its implicit index signature and stays
+ * comparable with `JsonValue` — it is embedded in the decoded divergence cache. */
+export type CachedLocalCfg = {
   hash: string;
   nonEmpty: boolean;
-}
+};
 
 export type LocalCfgRead =
   | { status: "ok"; config: GitConfig; cached: CachedLocalCfg }

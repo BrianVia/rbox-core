@@ -1,12 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { classifyDivergenceCacheEntry } from "../src/cli/sync-git.js";
+import type { JsonValue } from "../src/json.js";
 
 const CACHE_REL = ".rbox/state/git-divergence.json";
 const CACHE_VERSION = 3;
 
 type CacheLoad =
-  | { ok: true; version: number | "unknown"; repos: Map<string, unknown> }
+  | { ok: true; version: number | "unknown"; repos: Map<string, JsonValue> }
   | { ok: false; reason: string };
 
 type Counts = {
@@ -27,11 +28,11 @@ function show(v: string | undefined): string {
   return v === undefined ? "<undefined>" : JSON.stringify(v);
 }
 
-function repoEntries(repos: Map<string, unknown>): Array<[string, unknown]> {
+function repoEntries(repos: Map<string, JsonValue>): Array<[string, JsonValue]> {
   return [...repos.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
-function parseRepos(v: unknown): Map<string, unknown> | undefined {
+function parseRepos(v: JsonValue | undefined): Map<string, JsonValue> | undefined {
   if (v === null || typeof v !== "object" || Array.isArray(v)) return undefined;
   return new Map(Object.entries(v));
 }
@@ -45,7 +46,7 @@ async function loadRawCache(root: string): Promise<CacheLoad> {
     return { ok: false, reason: `missing or unreadable cache at ${cachePath}: ${errMsg(e)}` };
   }
 
-  let parsed: unknown;
+  let parsed: JsonValue;
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
@@ -55,12 +56,11 @@ async function loadRawCache(root: string): Promise<CacheLoad> {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, reason: "cache root is not an object" };
   }
-  const rootObj = parsed as { version?: unknown; repos?: unknown };
-  const repos = parseRepos(rootObj.repos);
+  const repos = parseRepos(parsed.repos);
   if (!repos) return { ok: false, reason: "cache repos field is not an object" };
   return {
     ok: true,
-    version: typeof rootObj.version === "number" ? rootObj.version : "unknown",
+    version: typeof parsed.version === "number" ? parsed.version : "unknown",
     repos,
   };
 }
@@ -82,7 +82,7 @@ function printSummary(counts: Counts): void {
   );
 }
 
-async function classifyV3Entry(root: string, rel: string, rawEntry: unknown, counts: Counts): Promise<void> {
+async function classifyV3Entry(root: string, rel: string, rawEntry: JsonValue, counts: Counts): Promise<void> {
   const result = await classifyDivergenceCacheEntry(root, rel, rawEntry);
   switch (result.verdict) {
     case "hit-ok":

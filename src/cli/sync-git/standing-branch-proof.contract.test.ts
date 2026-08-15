@@ -16,10 +16,10 @@ import {
 
 const REL = "repo";
 const INCOMING_KEY = "incoming-key-1";
-const BINDING = { lineageHash: "l".repeat(64), repositoryIdentityHash: "r".repeat(64) } as unknown as ArtifactBinding;
+const BINDING: ArtifactBinding = { lineageHash: "l".repeat(64), repositoryIdentityHash: "r".repeat(64) };
 
 function section(refScope: GitSection["refScope"], head = "a".repeat(40)): GitSection {
-  return { head, refs: {}, refScope } as unknown as GitSection;
+  return { head, refs: {}, refScope } as GitSection;
 }
 
 function preparedRef(ref: string): PreparedProtocolRef<BasePresentPayload> {
@@ -28,7 +28,7 @@ function preparedRef(ref: string): PreparedProtocolRef<BasePresentPayload> {
     targetOid: "0".repeat(40),
     payload: { ref, episode: "e".repeat(32), priorOid: null, nextOid: "1".repeat(40) },
     payloadBytes: new Uint8Array(),
-  } as unknown as PreparedProtocolRef<BasePresentPayload>;
+  } as PreparedProtocolRef<BasePresentPayload>;
 }
 
 function protocol(overrides: Partial<FollowerBranchProtocol> = {}): FollowerBranchProtocol {
@@ -51,7 +51,7 @@ function exactDisposition(): FollowerBranchProtocol["artifacts"][string] {
 }
 
 function state(revision: number, stream = "stream-1"): SyncState {
-  return { stream, stateRevision: revision, lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "now", files: [] } } as unknown as SyncState;
+  return { stream, stateRevision: revision, lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "now", files: [] } };
 }
 
 function record(base: GitSection | undefined, pRepaired?: Record<string, PRepairReceipt>): RepoRecord {
@@ -60,11 +60,11 @@ function record(base: GitSection | undefined, pRepaired?: Record<string, PRepair
     sourceSeq: 1,
     ...(base ? { base } : {}),
     ...(pRepaired ? { partial: { incomingKey: INCOMING_KEY, appliedRefs: {}, heldRefs: {}, configApplied: true, pRepaired } } : {}),
-  } as unknown as RepoRecord;
+  } as RepoRecord;
 }
 
 function receipt(ref: string): PRepairReceipt {
-  return { ref, episode: "e".repeat(32) } as unknown as PRepairReceipt;
+  return { ref, episode: "e".repeat(32) } as PRepairReceipt;
 }
 
 interface Trace {
@@ -85,7 +85,7 @@ function port(overrides: Partial<StandingProofPort> = {}): StandingProofPort & {
     resumeAcceptedRepair: async () => ({ status: "hold", reason: "unexpected resume" }),
     refreshAcceptedRepair: async () => ({ status: "hold", reason: "unexpected refresh" }),
     runRepairAttempt: async () => ({ status: "hold", reason: "unexpected attempt" }),
-    readStandingArtifact: async () => ({ status: "absent" } as unknown as ArtifactReadResult<BasePresentPayload>),
+    readStandingArtifact: async (): Promise<ArtifactReadResult<BasePresentPayload>> => ({ status: "absent" }),
     reloadState: async () => state(2),
     refreshProtocol: async () => ({ status: "ready", protocol: protocol() } satisfies FollowerBranchProtocolResult),
     ...overrides,
@@ -168,7 +168,7 @@ describe("SettleStandingBranchProof", () => {
     const reloaded = record(section("branches"));
     const effects = port({
       inspectTerminalReceipt: async () => ({ action: "compact-and-restart" }),
-      reloadState: async () => ({ ...state(2), repoRecords: { [REL]: reloaded } }) as unknown as SyncState,
+      reloadState: async () => ({ ...state(2), repoRecords: { [REL]: reloaded } }),
     });
     const result = await settleStandingBranchProof(
       input({ record: record(section("all"), { "refs/heads/main": receipt("refs/heads/main") }), serializedBase: section("all") }),
@@ -191,7 +191,7 @@ describe("SettleStandingBranchProof", () => {
         inspected += 1;
         return { action: "compact-and-restart" as never };
       },
-      reloadState: async () => ({ ...state(1 + inspected), repoRecords: { [REL]: reloaded } }) as unknown as SyncState,
+      reloadState: async () => ({ ...state(1 + inspected), repoRecords: { [REL]: reloaded } }),
     });
     await settleStandingBranchProof(
       input({
@@ -397,7 +397,7 @@ describe("SettleStandingBranchProof", () => {
       settleExactArtifact: async () => {
         settled += 1;
         return settled === 1
-          ? { status: "settled", state: { ...state(2), repoRecords: { [REL]: record(undefined, { "refs/heads/main": accepted }) } } as unknown as SyncState, ref: "refs/heads/main" }
+          ? { status: "settled", state: { ...state(2), repoRecords: { [REL]: record(undefined, { "refs/heads/main": accepted }) } }, ref: "refs/heads/main" }
           : { status: "moved", reason: "live" };
       },
       refreshProtocol: async () => ({ status: "ready", protocol: standing }),
@@ -447,7 +447,7 @@ describe("SettleStandingBranchProof", () => {
     const settled = state(7);
     const reloaded = record(section("branches"));
     const effects = port({
-      settleExactArtifact: async () => ({ status: "settled", state: { ...settled, repoRecords: { [REL]: reloaded } } as unknown as SyncState, ref: "refs/heads/main" }),
+      settleExactArtifact: async () => ({ status: "settled", state: { ...settled, repoRecords: { [REL]: reloaded } }, ref: "refs/heads/main" }),
       refreshProtocol: async () => ({ status: "hold", reason: "malformed, colliding, or unclassifiable BASE artifact" }),
     });
     const result = await settleStandingBranchProof(
@@ -465,7 +465,7 @@ describe("SettleStandingBranchProof", () => {
 
   test("the refreshed protocol is planned against the reloaded state, record, and BASE", async () => {
     const reloaded = record(section("branches"));
-    const settled = { ...state(4), repoRecords: { [REL]: reloaded } } as unknown as SyncState;
+    const settled: SyncState = { ...state(4), repoRecords: { [REL]: reloaded } };
     const effects = port({ settleExactArtifact: async () => ({ status: "settled", state: settled, ref: "refs/heads/main" }) });
     await settleStandingBranchProof(
       input({ protocol: protocol({ presentArtifacts: [preparedRef("refs/heads/main")] }), serializedBase: section("all"), record: record(section("all")) }),
@@ -527,7 +527,7 @@ describe("SettleStandingBranchProof", () => {
   });
 
   test("the settlement binding is the freshest protocol's binding, never the artifact payload", async () => {
-    const refreshed = { lineageHash: "n".repeat(64), repositoryIdentityHash: "m".repeat(64) } as unknown as ArtifactBinding;
+    const refreshed: ArtifactBinding = { lineageHash: "n".repeat(64), repositoryIdentityHash: "m".repeat(64) };
     const effects = port({
       settleExactArtifact: async () => ({ status: "settled", state: state(3), ref: "x" }),
       refreshProtocol: async () => ({ status: "ready", protocol: protocol({ binding: refreshed, presentArtifacts: [preparedRef("refs/heads/two")] }) }),
@@ -551,7 +551,7 @@ describe("SettleStandingBranchProof", () => {
       const effects = port({
         settleExactArtifact: async () => ({ status: "moved", reason: "live" }),
         readStandingArtifact: async () => overrides.artifact
-          ?? ({ status: "valid", artifact: { targetOid: p.targetOid, payload: p.payload } } as unknown as ArtifactReadResult<BasePresentPayload>),
+          ?? ({ status: "valid", artifact: { targetOid: p.targetOid, payload: p.payload } } as ArtifactReadResult<BasePresentPayload>),
         runRepairAttempt: async (attempt) => {
           captured = attempt.validateArtifacts;
           return { status: "hold", reason: "stop" };
@@ -577,12 +577,12 @@ describe("SettleStandingBranchProof", () => {
     });
 
     test("rejects an artifact that no longer reads valid", async () => {
-      expect(await validate({ artifact: { status: "absent" } as unknown as ArtifactReadResult<BasePresentPayload> })).toBe(false);
+      expect(await validate({ artifact: { status: "absent" } })).toBe(false);
     });
 
     test("rejects an artifact that moved off the prepared target", async () => {
       expect(await validate({
-        artifact: { status: "valid", artifact: { targetOid: "9".repeat(40) } } as unknown as ArtifactReadResult<BasePresentPayload>,
+        artifact: { status: "valid", artifact: { targetOid: "9".repeat(40) } } as ArtifactReadResult<BasePresentPayload>,
       })).toBe(false);
     });
 
