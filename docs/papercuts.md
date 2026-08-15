@@ -591,3 +591,8 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
   reused" ×4 and "local commits changed while the checkout was being
   confirmed" ×1 — resolve UX cannot batch even with the daemon stopped.
   Both need a rig scenario (two-device rebuild) before the next fleet op.
+- SECOND merged-while-red incident (PR #740, 2026-08-15): the merge command
+  ran unconditionally in a chained pipeline instead of gating on the review
+  verdict — same class as the #695 note. Residual was docs-only this time.
+  Rule reinforced: NEVER chain `gh pr merge` after a review/CI read in one
+  command; read the verdict, then merge as a separate decision.
