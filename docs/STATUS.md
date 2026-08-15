@@ -5,6 +5,23 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_MORNING CAP (2026-08-15): **STATE-PLANE FORK DECIDED — FINISH SQLITE.**
+262's round-1 reviews (4 blockers) proved the SQLite plane UNFINISHED (JSON
+still owns degraded sync writes, reset/rebind, telemetry binding; genesis
+unreachable from the selector; post-Q crash would strand after deletion).
+Founder chose finish-first: 262 v2 is now the parent plan for a 4-slice
+"finish the state plane" loop (SP-1 genesis admission → SP-2 port the three
+JSON-owned behaviors → SP-3 default flip + fleet cutover incl. FM rejoin →
+SP-4 the deletion, closes arch-#42). Tasks #43-46. SP-1 design (263) is
+being drafted by codex in worktree arch-42. FLEET: desktop clean/canonical;
+Mac converged to 6 residual git deferrals whose take-theirs batch REFUSES
+("could not complete safely" ×4, "local commits changed while confirming",
+2nd "P settlement BASE disappeared" sighting) — parked as a named defect
+needing a two-device-rebuild rig scenario (papercuts logged); FM parked
+until SP-3. Sync echo-clobbered the desktop checkout TWICE during the
+rebuild (restored from main both times; conflict-copy litter deleted; the
+2nd wave self-corrected). Wire-rename candidates doc now has 5 entries._
+
 _LATE-NIGHT CAP 2 (2026-08-15, same session, PRs #703-#732 = 30 merged):
 **Slop 3,421 → 2,216 (−35%)**; waves 5-6 + first two shape-names lanes
 merged (#725-#732; shape campaign is CODE-SYMBOL-ONLY by founder ruling —
