@@ -286,7 +286,7 @@ export const UNKNOWN_GIT_DEFERRAL_PRESENTATION: GitDeferralReasonPresentation = 
   transient: false,
 };
 
-const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonPresentation> = {
+const DEFERRAL_REASON_PRESENTATION = {
   "local-edits": { label: "local edits", text: "Working files changed here.", repair: "Stop Git and file changes, then let normal sync retry.", transient: true },
   "local-index": { label: "local index changes", text: "The Git index changed here.", repair: "Stop Git and file changes, then let normal sync retry.", transient: true },
   "local-operation": { label: "local Git operation", text: "A Git operation is active or changed here.", repair: "Finish or stop the Git operation, then let normal sync retry.", transient: true },
@@ -305,7 +305,7 @@ const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonP
   containment: { label: "repository containment", text: "Repository containment could not be proved.", repair: "Repair the repository or worktree layout so it stays within the workspace, then let sync retry.", transient: false },
   unsupported: { label: "unsupported git state", text: "This Git version or repository shape is unsupported.", repair: "Upgrade Git or repair the repository shape, then let sync retry.", transient: false },
   other: { label: "other git issue", text: "Git sync is deferred by another known condition.", repair: "Inspect rbox status and the daemon logs, repair the reported condition, then let sync retry.", transient: false },
-};
+} satisfies Record<GitDeferralReason, GitDeferralReasonPresentation>;
 
 export function gitDeferralReasonPresentation(reason: string): GitDeferralReasonPresentation {
   return DEFERRAL_REASON_PRESENTATION[reason as GitDeferralReason] ?? UNKNOWN_GIT_DEFERRAL_PRESENTATION;

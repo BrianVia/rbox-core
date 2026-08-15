@@ -29,7 +29,7 @@ function state(sequence = 7): SyncState {
     lastSyncedSequence: sequence,
     lastSyncedManifest: { generatedAt: AT, files: [] },
     repoRecords: {},
-  } as unknown as SyncState;
+  };
 }
 
 function trustedActivity(): DaemonActivity {
@@ -373,7 +373,7 @@ test("each mode performs only its admitted probes", async () => {
 
 test("a probe port bound to another mode is refused before any read", async () => {
   const { port, calls } = readPort("json");
-  const mismatched = { ...port, probes: probePort("verbose", calls) } as unknown as StatusReadPort<"json">;
+  const mismatched: StatusReadPort<"json"> = { ...port, probes: probePort("verbose", calls) };
 
   await expect(projectWorkspaceStatusDetail(ROOT, { mode: "json" }, mismatched, {
     refresh: async (_cfg, next) => refreshed(next),

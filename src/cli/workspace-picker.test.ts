@@ -117,17 +117,13 @@ test("filterWorkspaceChoices: case-insensitive substring; blank term keeps all",
 // ── fetch paging (injected fetch — no server) ──────────────────────────────────
 
 /** A fetch stub that replays a scripted sequence of pages by cursor. */
-function pagedFetch(pages: Array<{ workspaces: AccountWorkspace[]; nextCursor: string | null }>): {
-  fetchFn: typeof fetch;
-  calls: string[];
-} {
+function pagedFetch(pages: Array<{ workspaces: AccountWorkspace[]; nextCursor: string | null }>) {
   const calls: string[] = [];
   let i = 0;
-  const fetchFn = (async (url: string) => {
-    calls.push(url);
-    const body = pages[i++]!;
-    return { ok: true, status: 200, json: async () => body, text: async () => "" } as Response;
-  }) as unknown as typeof fetch;
+  const fetchFn: typeof fetch = async (url) => {
+    calls.push(String(url));
+    return Response.json(pages[i++]!);
+  };
   return { fetchFn, calls };
 }
 
@@ -156,7 +152,7 @@ test("fetchAccountWorkspaces is bounded by maxPages (won't spin on an endless cu
 });
 
 test("fetchAccountWorkspaces throws on a non-2xx (callers degrade to manual entry)", async () => {
-  const fetchFn = (async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => "boom" }) as Response) as unknown as typeof fetch;
+  const fetchFn: typeof fetch = async () => new Response("boom", { status: 500 });
   await expect(fetchAccountWorkspaces("https://api", "tok", 10, fetchFn)).rejects.toThrow(/servers are having trouble/);
 });
 

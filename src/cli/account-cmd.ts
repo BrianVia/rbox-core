@@ -1,3 +1,4 @@
+import type { JsonValue } from "../json.js";
 import { loadCredentials, requireCredentials, type CredentialLoadResult } from "./credentials.js";
 import { emitJson } from "./json.js";
 import { style } from "./style.js";
@@ -45,7 +46,7 @@ export interface AccountStatus {
 }
 
 function accountStatusFromResponse(body: unknown): AccountStatus {
-  const value = body as { accountId: string; linked: boolean; plan?: string; email?: unknown; signInMethod?: unknown };
+  const value = body as { accountId: string; linked: boolean; plan?: string; email?: JsonValue; signInMethod?: JsonValue };
   const email = identityField(value.email);
   const signInMethod = identityField(value.signInMethod);
   return {

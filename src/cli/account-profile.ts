@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { JsonValue } from "../json.js";
 import { rboxDir } from "./rbox-paths.js";
 
 /** Non-secret, best-effort display metadata cached outside credentials.json. */
@@ -16,13 +17,22 @@ const CONTROL_CHAR = /[\u0000-\u001f\u007f-\u009f]/;
 export const accountProfilePath = (): string => path.join(rboxDir(), "account-profile.json");
 
 /** A renderable identity field, or null for absent/malformed/terminal-unsafe input. */
-export function identityField(value: unknown): string | null {
+export function identityField(value: JsonValue | undefined): string | null {
   return typeof value === "string" && value.length > 0 && !CONTROL_CHAR.test(value) ? value : null;
 }
 
-export function validateProfile(value: unknown): AccountProfile | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Partial<AccountProfile>;
+/** The four identity fields as they arrive from either producer: a decoded
+ *  account-profile.json record, or an in-process write from the account command. */
+interface ProfileFields {
+  accountId?: JsonValue;
+  email?: JsonValue;
+  signInMethod?: JsonValue;
+  plan?: JsonValue;
+}
+
+export function validateProfile(value: JsonValue | AccountProfileWrite): AccountProfile | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate: ProfileFields = value;
   const accountId = identityField(candidate.accountId);
   const email = candidate.email === null ? null : identityField(candidate.email);
   const signInMethod = candidate.signInMethod === null ? null : identityField(candidate.signInMethod);
