@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { RepoRecord, RepoRecordInput } from "../../sync-state-model.js";
 import type { RepoBaseProof } from "../../sync-git/base-composer.js";
+import type { JsonObject, JsonValue } from "../../../json.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 import {
@@ -255,15 +256,72 @@ const digestRow = (row: TransitionRowShape) => ({
   canonicalEvidenceBindings: row.evidence_cjson,
 });
 
+/**
+ * The persisted spelling of a payload this seam admitted at put time.
+ * `parseCanonicalJson` refuses non-canonical bytes; this re-establishes the JSON
+ * container. What a payload MEANS stays with `transition-admission`, whose rules
+ * run on every decoded row through `revalidate` and own the named refusals — a
+ * proofless BASE must surface as a ProoflessBaseError, never as a decode
+ * TypeError.
+ */
+/** The one container test every persisted-payload decode in this seam shares. */
+export const isJsonObject = (value: JsonValue | undefined): value is JsonObject =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+function persistedObject(field: string, text: string): JsonObject {
+  const value = parseCanonicalJson(text);
+  if (!isJsonObject(value)) throw new TypeError(`transition ${field} is not a JSON object`);
+  return value;
+}
+
+/** `sourceSeq` is RepoRecordInput's one required member; every other member is
+ * optional and is re-established by `encodeRepoRecord` at the authority write. */
+function assertRecordInput(value: JsonObject): asserts value is JsonObject & RepoRecordInput {
+  if (typeof value.sourceSeq !== "number") throw new TypeError("transition record has no sourceSeq");
+}
+
+function assertBaseProofPayload(value: JsonObject): asserts value is JsonObject & RepoBaseProof {
+  // A proof's authority kind, its migration reservation, and prooflessness itself
+  // stay with assertBaseProof; only the two members that make the value a proof
+  // at all are established here.
+  if (!isJsonObject(value.authority)) throw new TypeError("transition baseProof has no authority");
+  if (!isJsonObject(value.lockedProof)) throw new TypeError("transition baseProof has no lockedProof");
+}
+
+function assertEvidenceBindings(value: JsonObject): asserts value is JsonObject & TransitionEvidenceBindings {
+  if (!Array.isArray(value.sourceStages)) throw new TypeError("transition evidence has no sourceStages");
+}
+
+/** The record a transition carries, as persisted. */
+export function decodeTransitionRecord(text: string): RepoRecordInput {
+  const value = persistedObject("record", text);
+  assertRecordInput(value);
+  return value;
+}
+
+/** The explicit BASE authority proof a transition carries, as persisted. */
+export function decodeTransitionBaseProof(text: string): RepoBaseProof {
+  const value = persistedObject("baseProof", text);
+  assertBaseProofPayload(value);
+  return value;
+}
+
+/** The source-stage evidence a transition row carries, as persisted. */
+export function decodeTransitionEvidence(text: string): TransitionEvidenceBindings {
+  const value = persistedObject("evidenceBindings", text);
+  assertEvidenceBindings(value);
+  return value;
+}
+
 function decodeRow(row: TransitionRowShape): TransitionRow {
   return {
     relPath: row.rel_path,
     expectedRepoGen: row.expected_repo_gen,
-    newRecord: parseCanonicalJson(row.record_cjson) as unknown as RepoRecordInput,
+    newRecord: decodeTransitionRecord(row.record_cjson),
     ...(row.base_proof_cjson === null
       ? {}
-      : { baseProof: parseCanonicalJson(row.base_proof_cjson) as unknown as RepoBaseProof }),
-    evidenceBindings: parseCanonicalJson(row.evidence_cjson) as unknown as TransitionEvidenceBindings,
+      : { baseProof: decodeTransitionBaseProof(row.base_proof_cjson) }),
+    evidenceBindings: decodeTransitionEvidence(row.evidence_cjson),
   };
 }
 
@@ -301,14 +359,17 @@ export function openSealedRepoTransitionStage(
     if (!meta || meta.stage_id !== ref.stageId || meta.state !== "sealed") {
       throw new StageChangedError(ref.stageId, "sealed transition identity does not match its ref");
     }
-    const sealedGlobal = meta.global_binding_cjson === null
-      ? undefined
-      : parseCanonicalJson(meta.global_binding_cjson) as unknown as SourceStageBinding;
+    // The sealed bytes must be canonical, and canonical bytes are the value's one
+    // spelling — so comparing them to the ref's spelling below is the whole
+    // identity check. What the sealed global binding IS therefore comes from the
+    // ref, which the caller already holds as a typed binding.
+    if (meta.global_binding_cjson !== null) parseCanonicalJson(meta.global_binding_cjson);
     if (meta.snapshot_cjson !== canonicalJson(ref.snapshotToken)
       || meta.source_bindings_cjson !== canonicalJson(ref.sourceStageBindings)
-      || canonicalJson(sealedGlobal ?? null) !== canonicalJson(ref.globalBinding ?? null)) {
+      || (meta.global_binding_cjson ?? canonicalJson(null)) !== canonicalJson(ref.globalBinding ?? null)) {
       throw new StageChangedError(ref.stageId, "sealed transition snapshot, source bindings, or global binding do not match its ref");
     }
+    const sealedGlobal = ref.globalBinding;
     const digest = new RepoTransitionDigestBuilder(ref.snapshotToken, ref.sourceStageBindings, sealedGlobal);
     streamRows<TransitionRowShape>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId], (row) => {
       revalidate(row, ref.sourceStageBindings, meta.importer, sealedGlobal);

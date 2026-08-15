@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   StatusDetailProjection,
+  StatusHaltProbes,
   StatusHaltProjection,
   StatusMode,
   StatusModeProbes,
@@ -21,7 +22,12 @@ const ROOT = "/tmp/rbox-status-render";
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const AT = new Date(NOW - 90_000).toISOString();
 
-const PROBES: { [M in StatusMode]: Extract<StatusModeProbes, { mode: M }> } = {
+/** One probe receipt per mode — the exact member `WorkspaceStatusProjection<M>`
+ *  demands, so a renderer never sees another mode's probes. */
+type DetailProbesByMode = { [M in StatusMode]: Extract<StatusModeProbes, { mode: M }> };
+type HaltProbesByMode = { [M in StatusMode]: Extract<StatusHaltProbes, { mode: M }> };
+
+const PROBES: DetailProbesByMode = {
   json: { mode: "json", account: { plan: null, usedBytes: null, capBytes: null } },
   verbose: {
     mode: "verbose",
@@ -83,22 +89,25 @@ function base(): Omit<StatusDetailProjection, "probes"> {
     },
     hygieneDetails: new Map(),
     now: NOW,
-  } as unknown as Omit<StatusDetailProjection, "probes">;
+  };
 }
 
 function detail<M extends StatusMode>(
   mode: M,
   over: Partial<StatusDetailProjection> = {},
 ): Extract<WorkspaceStatusProjection<M>, { kind: "detail" }> {
-  return { ...base(), ...over, probes: PROBES[mode] } as unknown as Extract<
-    WorkspaceStatusProjection<M>,
-    { kind: "detail" }
-  >;
+  return { ...base(), ...over, probes: PROBES[mode] };
 }
+
+const HALT_PROBES: HaltProbesByMode = {
+  json: { mode: "json" },
+  verbose: { mode: "verbose" },
+  brief: { mode: "brief", account: { state: "signed-out" } },
+  git: { mode: "git", account: { state: "signed-out" } },
+};
 
 function halt<M extends StatusMode>(mode: M): Extract<WorkspaceStatusProjection<M>, { kind: "reset-halt" }> {
   const { workspace, daemon, credentials, bookkeeping } = base();
-  const probes = mode === "json" ? { mode } : mode === "verbose" ? { mode } : { mode, account: { state: "signed-out" } };
   return {
     kind: "reset-halt",
     reason: "unreadable-journal",
@@ -106,8 +115,8 @@ function halt<M extends StatusMode>(mode: M): Extract<WorkspaceStatusProjection<
     daemon,
     credentials,
     bookkeeping,
-    probes,
-  } as unknown as Extract<WorkspaceStatusProjection<M>, { kind: "reset-halt" }>;
+    probes: HALT_PROBES[mode],
+  };
 }
 
 const withDeferral = () => ({
@@ -141,7 +150,7 @@ test("rendering emits nothing: stdout stays untouched for every surface", () => 
   const realLog = console.log;
   const realWrite = process.stdout.write.bind(process.stdout);
   console.log = (...args: unknown[]) => void writes.push(args);
-  process.stdout.write = ((chunk: unknown) => {
+  process.stdout.write = ((chunk: string | Uint8Array) => {
     writes.push(chunk);
     return true;
   }) as typeof process.stdout.write;
@@ -240,7 +249,7 @@ test("the halt surface for every mode reports the daemon the projection carries"
 test("StatusHaltProjection and StatusDetailProjection are the only accepted inputs", () => {
   // The renderers accept their mode's projection only; this is the runtime
   // witness that a halt projection never reaches a detail renderer.
-  const haltProjection = halt("json") as unknown as StatusHaltProjection;
+  const haltProjection: StatusHaltProjection = halt("json");
   expect(haltProjection.kind).toBe("reset-halt");
   expect(renderWorkspaceStatusSurface(halt("json")).surface).toBe("json");
 });

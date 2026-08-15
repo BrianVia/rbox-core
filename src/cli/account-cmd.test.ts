@@ -38,7 +38,7 @@ async function captureStdout(fn: () => Promise<void>): Promise<string> {
 }
 
 function stub(responder: (url: string) => { status: number; body?: unknown }): void {
-  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+  globalThis.fetch = (async (url, init) => {
     calls.push({ url: String(url), init });
     const r = responder(String(url));
     return {
@@ -47,7 +47,7 @@ function stub(responder: (url: string) => { status: number; body?: unknown }): v
       json: async () => r.body ?? {},
       text: async () => JSON.stringify(r.body ?? {}),
     } as Response;
-  }) as unknown as typeof fetch;
+  }) as typeof fetch;
 }
 
 beforeEach(async () => {
@@ -66,7 +66,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await flushAccountProfileWrites();
   globalThis.fetch = origFetch;
-  (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origAbortSignalTimeout;
+  AbortSignal.timeout = origAbortSignalTimeout;
   console.log = origLog;
   process.stdout.write = origStdout;
   for (const [key, value] of Object.entries(savedEnv)) {
@@ -210,7 +210,7 @@ describe("rbox status — account section", () => {
   test("graceful degradation: a thrown fetch resolves to `unavailable`, never rejects", async () => {
     globalThis.fetch = (async () => {
       throw new Error("ENETUNREACH");
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
     const summary = await fetchAccountSummary();
     expect(summary).toEqual({ state: "unavailable" });
     expect(plain(formatAccountSummary(summary).join("\n")).toLowerCase()).toContain("unavailable");
@@ -226,12 +226,12 @@ describe("rbox status — account section", () => {
   test("timeout: a hung request aborts and resolves to `unavailable` within the budget", async () => {
     // A fetch that never resolves on its own — only the AbortSignal ends it. If the
     // timeout weren't wired up this test would hang, so it also guards against a hang.
-    globalThis.fetch = ((_url: string, init?: RequestInit) =>
+    globalThis.fetch = ((_url, init) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-      })) as unknown as typeof fetch;
+      })) as typeof fetch;
     let timeoutBudget: number | undefined;
-    (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = ((ms: number) => {
+    AbortSignal.timeout = ((ms: number) => {
       timeoutBudget = ms;
       const controller = new AbortController();
       queueMicrotask(() => controller.abort());

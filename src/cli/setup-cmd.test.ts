@@ -671,7 +671,7 @@ test("create rebind mints Stage A at confirm, narrows Stage B under the held mut
         promptConfirm: async () => { events.push("confirm"); return true; },
         acquireMutex: async () => { events.push("acquire"); return fakeMutex(root); },
         createWorkspace: async () => { events.push("create"); return "ws_new"; },
-        continueInit: async (_flags: unknown, _opts: unknown, continuation: { resetConsent?: ResetConsentWitness }) => {
+        continueInit: async (_flags, _opts, continuation) => {
           events.push("continue");
           expect(inspectResetConsent(continuation.resetConsent!)).toMatchObject({
             nextStream: "https://api.test::ws_new::root",
@@ -706,7 +706,7 @@ test("marker-only lineage reaches create confirmation and receives an authorized
       baseCreateDeps(root, {
         promptConfirm: async () => { confirms++; return true; },
         createWorkspace: async () => { creates++; return "ws_new"; },
-        continueInit: async (_flags: unknown, _opts: unknown, continuation: { resetConsent?: ResetConsentWitness }) => {
+        continueInit: async (_flags, _opts, continuation) => {
           expect(inspectResetConsent(continuation.resetConsent!)).toMatchObject({
             nextStream: "https://api.test::ws_new::root",
             consentKind: "setup-create",
@@ -1051,7 +1051,7 @@ test("mutex is acquired before one mint and held through continuation", async ()
     baseCreateDeps(root, {
       acquireMutex: async () => { events.push("acquire"); return fakeMutex(root); },
       createWorkspace: async () => { events.push("mint"); return "ws_one"; },
-      continueInit: async (_flags: unknown, _opts: unknown, input: { workspaceId: string }) => {
+      continueInit: async (_flags, _opts, input) => {
         events.push(`continue:${input.workspaceId}`);
         events.push("release");
         return { workspaceId: "ws_one", deviceId: "dev", root };
@@ -1163,12 +1163,12 @@ test("Step-2 menu alone loops and consumes a preselected kind; terminal never lo
   const outcome = await runWorkspaceStepLoop(
     { cwd: "/cwd", defaultRemote: "https://api.test" },
     { header: "Workspace", preselectedKind: "new" },
-    (async (_opts: unknown, setup: { preselectedKind?: string }) => {
+    async (_opts, setup) => {
       seen.push(setup.preselectedKind);
       return seen.length === 1
         ? { kind: "menu" }
         : { kind: "completed", outcome: { workspaceId: "ws", deviceId: "dev", root: "/cwd" } };
-    }) as never
+    }
   );
   expect(outcome?.workspaceId).toBe("ws");
   expect(seen).toEqual(["new", undefined]);
