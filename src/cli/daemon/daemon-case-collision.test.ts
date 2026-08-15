@@ -22,23 +22,23 @@ test("daemon path-warning episodes dedupe, transition, clear, and reappear", asy
     remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root,
     remoteUrl: "https://example.invalid", token: "", encrypted: true,
   };
-  const daemon = new RboxDaemon(root, cfg as never, {}, { log: (line) => lines.push(line) }) as unknown as {
-    observeCaseCollisions(observation: { authority: "authoritative"; caseCollisions: Array<{ paths: string[] }> }): Promise<void>;
-  };
+  // Element access reaches the daemon's private members with their REAL
+  // declared signatures — no assertion, so a drift in daemon.ts breaks here.
+  const daemon = new RboxDaemon(root, cfg as never, {}, { log: (line) => lines.push(line) });
   const a = [{ paths: ["A", "a"] }];
   const b = [{ paths: ["B", "b"] }];
   try {
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: a });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: a });
     const firstInode = (await fs.stat(path.join(root, ".rbox", "state", "path-warnings.json"))).ino;
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: a });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: a });
     expect((await fs.stat(path.join(root, ".rbox", "state", "path-warnings.json"))).ino).toBe(firstInode);
     await savePathWarnings(root, b); // foreground writer changes durable truth
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: a });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: a });
     expect((await readPathWarnings(root))?.collisions).toEqual(a);
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: b });
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: [] });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: b });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: [] });
     expect(await readPathWarnings(root)).toBeUndefined();
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: a });
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: a });
     expect(lines.filter((line) => line.startsWith("path warning:"))).toHaveLength(4);
     expect((await readPathWarnings(root))?.groupCount).toBe(1);
   } finally {
@@ -52,23 +52,19 @@ test("failed-attempt observations conservatively retain incomplete authority", a
     remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root,
     remoteUrl: "https://example.invalid", token: "", encrypted: true,
   };
-  const daemon = new RboxDaemon(root, cfg as never, {}, { log: () => {} }) as unknown as {
-    local: { complete: boolean };
-    activeCaseCollisions: Array<{ paths: string[] }>;
-    observeCaseCollisions(observation: { authority: "authoritative" | "preserve"; caseCollisions: Array<{ paths: string[] }> }): Promise<void>;
-  };
+  const daemon = new RboxDaemon(root, cfg as never, {}, { log: () => {} });
   try {
     await savePathWarnings(root, groups);
-    expect(daemon.local.complete).toBe(true);
+    expect(daemon["local"]["complete"]).toBe(true);
 
-    await daemon.observeCaseCollisions({ authority: "preserve", caseCollisions: groups });
-    expect(daemon.local.complete).toBe(false);
-    expect(daemon.activeCaseCollisions).toEqual(groups);
+    await daemon["observeCaseCollisions"]({ authority: "preserve", caseCollisions: groups });
+    expect(daemon["local"]["complete"]).toBe(false);
+    expect(daemon["activeCaseCollisions"]).toEqual(groups);
     expect((await readPathWarnings(root))?.collisions).toEqual(groups);
 
-    await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: [] });
-    expect(daemon.local.complete).toBe(false);
-    expect(daemon.activeCaseCollisions).toEqual([]);
+    await daemon["observeCaseCollisions"]({ authority: "authoritative", caseCollisions: [] });
+    expect(daemon["local"]["complete"]).toBe(false);
+    expect(daemon["activeCaseCollisions"]).toEqual([]);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

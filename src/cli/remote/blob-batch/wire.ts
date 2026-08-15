@@ -107,6 +107,10 @@ export function framedBytes(payloadBytes: number): number {
   return BATCH_FRAME_HEADER_BYTES + payloadBytes;
 }
 
+/** Decode the batch-PUT response body. The parameter is `unknown` because that
+ *  is exactly what the producer hands over — undici types `Response.json()` as
+ *  `Promise<unknown>` — and this function IS the parser at that boundary, the
+ *  earliest point where the bytes become `BatchPutResponseRecord[]`. */
 export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] | null {
   if (!body || typeof body !== "object" || !Array.isArray((body as { results?: unknown }).results)) return null;
   const out: BatchPutResponseRecord[] = [];
@@ -126,6 +130,8 @@ export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] |
   return out;
 }
 
+/** The server's advertised record cap from an over-cap 400 body. Same
+ *  `Response.json(): Promise<unknown>` boundary as {@link parseBatchPutResponse}. */
 export function parseBatchPutErrorMax(body: unknown): number | undefined {
   if (!body || typeof body !== "object") return undefined;
   const error = body as { error?: unknown; max?: unknown };
