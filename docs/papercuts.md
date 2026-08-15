@@ -584,3 +584,10 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
 - A live daemon plus 100+ carried-pending git sections converged only after
   the competing publishers were removed; with all three devices active the
   fresh device's 942-change re-baseline starved indefinitely.
+- Second sighting of "P settlement BASE disappeared" (Mac rebuild, rbox-core
+  repo; first was desktop first-sync same night). Reproduces in the
+  fresh-join re-baseline flow. Also: take-theirs batch on the Mac refused
+  with "resolution could not complete safely; no confirmation can be
+  reused" ×4 and "local commits changed while the checkout was being
+  confirmed" ×1 — resolve UX cannot batch even with the daemon stopped.
+  Both need a rig scenario (two-device rebuild) before the next fleet op.
