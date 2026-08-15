@@ -1,4 +1,5 @@
 import { metricsEnabled } from "../metrics.js";
+import type { JsonValue } from "../../json.js";
 import { readNumericFields } from "./timings.js";
 
 export const multipartMetricsEnabled = (): boolean => metricsEnabled();
@@ -12,7 +13,7 @@ export interface MultipartServerTimings {
 
 const SERVER_TIMING_KEYS = ["totalMs", "assembleMs", "rereadPutMs", "accountingMs"] as const;
 
-export function readMultipartServerTimings(value: unknown): MultipartServerTimings | undefined {
+export function readMultipartServerTimings(value: JsonValue | undefined): MultipartServerTimings | undefined {
   return readNumericFields(value, SERVER_TIMING_KEYS);
 }
 
