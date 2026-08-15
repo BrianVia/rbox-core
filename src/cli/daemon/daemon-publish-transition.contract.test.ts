@@ -150,8 +150,13 @@ describe("publish request and outcome classification", () => {
 
   test("incomplete observation carries collision evidence in preserve mode", () => {
     const collisions: CaseFoldCollisionGroup[] = [{ paths: ["A.txt", "a.txt"] }];
-    expect(sealPublishRequest("a", inputs({ observationComplete: false, caseCollisions: collisions })).localFileObservation)
-      .toEqual({ authority: "preserve", caseCollisions: collisions });
+    const sealed = sealPublishRequest("a", inputs({ observationComplete: false, caseCollisions: collisions }));
+    collisions[0]!.paths[0] = "mutated.txt";
+    collisions.push({ paths: ["B.txt", "b.txt"] });
+    expect(sealed.localFileObservation).toEqual({
+      authority: "preserve",
+      caseCollisions: [{ paths: ["A.txt", "a.txt"] }],
+    });
   });
 
   test("classification binds committed, no-op, and repeated terminal outcomes", async () => {

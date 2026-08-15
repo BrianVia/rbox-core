@@ -34,10 +34,11 @@ const SRC = path.resolve(import.meta.dir, "../../..", "src");
 const MAX_NONBLANK_LINES = 400;
 const MAX_BYTES = 25 * 1024;
 
-/** The debt that predates the gate. 163 stated the law and nothing enforced it,
+/** The debt and audited exceptions that predate the gate. 163 stated the law and nothing enforced it,
  * so 69 modules drifted past it — this list is the measured tree on the day the
- * gate landed, not a policy. Every entry records what it was over by, so the
- * next reader can see the size of the split it is waiting on.
+ * gate landed, not a policy. Debt entries record the split they await; an
+ * "audited cohesive (design N)" entry records why size alone must not prescribe
+ * a shallow split.
  *
  * The entries are self-expiring: the gate fails if an allowlisted file has been
  * split (or deleted) and no longer needs the excuse, the same way the
@@ -89,7 +90,7 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/sync-state-model.ts", "pending split — 446 nonblank lines when the gate landed"],
   ["src/cli/sync-state.ts", "pending split — 599 nonblank lines and 30.8 KiB when the gate landed"],
   ["src/cli/sync/pull.ts", "pending split — 465 nonblank lines when the gate landed"],
-  ["src/cli/sync/push.ts", "pending split — 944 nonblank lines and 50.1 KiB when the gate landed"],
+  ["src/cli/sync/push.ts", "audited cohesive (design 261): the Publication attempt loop; decomposition would require changing deep-owner interfaces or guard-pinned residence — do not split on size alone"],
   ["src/cli/upgrade-cmd.ts", "pending split — 453 nonblank lines when the gate landed"],
   ["src/engine/apply-receipt.ts", "pending split — 689 nonblank lines and 29.3 KiB when the gate landed"],
   ["src/engine/apply.ts", "pending split — 488 nonblank lines when the gate landed"],
@@ -270,9 +271,12 @@ describe("module size", () => {
     for (const [file, ceiling] of RATCHET) {
       const m = sizeOf(file, fs.readFileSync(path.resolve(SRC, "..", file), "utf8"));
       if (m.nonblankLines > ceiling.nonblank * RATCHET_SLACK || m.bytes > ceiling.bytes * RATCHET_SLACK) {
+        const remedy = ALLOWED.get(file)?.startsWith("audited cohesive (design ")
+          ? "Shrink it back or re-audit the cohesion verdict."
+          : "Split it, or shrink it back.";
         over.push(file + ": " + m.nonblankLines + " nonblank / " + m.bytes + " bytes exceeds its"
           + " recorded ceiling of " + ceiling.nonblank + " / " + ceiling.bytes + " by more than 10%"
-          + " — an allowlist entry is a debt record, not a license to grow. Split it, or shrink it back.");
+          + " — an allowlist entry is not a license to grow. " + remedy);
       }
     }
     expect(over).toEqual([]);
