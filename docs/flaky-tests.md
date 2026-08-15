@@ -543,3 +543,14 @@ removed; the redacted result is retained at
   did not refuse; operator error compounded it). The failure was triaged
   post-merge and does not reproduce; the same-SHA rerun is the outstanding
   witness.
+
+## SUSPECTED: daemon-activity "pr8: production pull-only timers remint discovery and clear a ghost without pushing"
+
+- 2026-08-14, PR #725 (type-only lint diff in remote/context + e2ee-client —
+  no daemon code touched), tests shard 1/6, run 31854379274 attempt 1.
+- Proof: failed on attempt 1; the full daemon-activity file is green in
+  isolation on the same-day main (65/65 locally on via-desktop); the
+  `--failed` rerun of the same run went green and the PR merged on it.
+- Third distinct flaky test in daemon-activity.test.ts (see the two FIXED
+  entries above). If it recurs, the file earns the shard-ordering
+  reproduction treatment rather than another single-test fix.
