@@ -25,6 +25,13 @@ const SHA_B = "b".repeat(64);
 const SHA_C = "c".repeat(64);
 const utf8 = new TextEncoder();
 
+/** A well-formed section, so a `gitRepos` fixture's only bad Unicode is its KEY. */
+const MINIMAL_GIT_SECTION: GitSection = {
+  bundleSha: SHA_A, bundleEncSha: SHA_B, bundleCipherSize: 1,
+  head: "ref: refs/heads/main", refs: { "refs/heads/main": "1".repeat(40) },
+  refScope: "all", generatedAt: "now",
+};
+
 function entry(path: string, n = 1): FileEntry {
   return { path, sha256: n.toString(16).padStart(64, "0"), size: n, mode: 0o644, mtimeMs: 1_700_000_000_000.9016, type: "file", encSha: SHA_A };
 }
@@ -139,9 +146,9 @@ describe("canonical form and pure folding", () => {
       };
       expect(canonicalManifestHashStreaming(m)).toBe(hashBytes(canonicalManifestBytes(m)));
     }
-    const badValue = { generatedAt: "bad-\ud800", files: [] } as Manifest;
-    const badKey = { generatedAt: "bad", files: [], gitRepos: { "bad-\udfff": {} } } as unknown as Manifest;
-    const hiddenBadKey = { generatedAt: "bad", files: [], ["bad-\ud800"]: undefined } as unknown as Manifest;
+    const badValue: Manifest = { generatedAt: "bad-\ud800", files: [] };
+    const badKey: Manifest = { generatedAt: "bad", files: [], gitRepos: { "bad-\udfff": MINIMAL_GIT_SECTION } };
+    const hiddenBadKey: Manifest & { "bad-\ud800": undefined } = { generatedAt: "bad", files: [], "bad-\ud800": undefined };
     for (const bad of [badValue, badKey, hiddenBadKey]) {
       expect(() => canonicalManifestBytes(bad)).toThrow("well-formed Unicode");
       expect(() => canonicalManifestHashStreaming(bad)).toThrow("well-formed Unicode");
@@ -293,7 +300,7 @@ describe("review round-2 protocol boundary hardening", () => {
   });
 
   test("lone surrogate in an object member NAME fails canonicalization closed", () => {
-    const m = { generatedAt: "now", files: [], gitRepos: { "repo-\ud800": {} } } as unknown as Manifest;
+    const m: Manifest = { generatedAt: "now", files: [], gitRepos: { "repo-\ud800": MINIMAL_GIT_SECTION } };
     expect(() => canonicalManifestBytes(m)).toThrow("well-formed Unicode");
   });
 });

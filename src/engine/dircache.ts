@@ -3,13 +3,14 @@ import path from "node:path";
 import type { Stats } from "node:fs";
 import { writeFileAtomic } from "./fsutil.js";
 import { isSafeRelPath } from "./manifest-validate.js";
+import type { JsonValue } from "../json.js";
 
 export const RACY_MARGIN_MS = 2_000;
 export const UNPRUNED_DEADLINE_MS = 30 * 60_000;
 
 export type ChildType = "file" | "dir" | "symlink" | "other";
-export interface DirCacheChild { name: string; type: ChildType; }
-export interface DirCacheEntry { mtimeMs: number; ctimeMs: number; children: DirCacheChild[]; }
+export type DirCacheChild = { name: string; type: ChildType };
+export type DirCacheEntry = { mtimeMs: number; ctimeMs: number; children: DirCacheChild[] };
 export type RuleFileRecord =
   | { relPath: string; size: number; mtimeMs: number; ctimeMs: number }
   | { relPath: string; absent: true };
@@ -28,7 +29,7 @@ export interface DirCacheFile {
 
 const CACHE_REL = ".rbox/state/dircache.json";
 
-function validNumber(value: unknown): value is number {
+function validNumber(value: JsonValue | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
@@ -45,21 +46,22 @@ export function dirListingReusable(liveMtimeMs: number, liveCtimeMs: number, cac
   return liveMtimeMs === cachedMtimeMs && liveCtimeMs === cachedCtimeMs && cachedMtimeMs < cutoff && cachedCtimeMs < cutoff;
 }
 
-function validRuleFile(value: unknown): value is RuleFileRecord {
-  if (!value || typeof value !== "object" || typeof (value as { relPath?: unknown }).relPath !== "string" || !validRel((value as { relPath: string }).relPath)) return false;
-  const record = value as Partial<{ relPath: string; absent: true; size: number; mtimeMs: number; ctimeMs: number }>;
-  return record.absent === true
-    ? Object.keys(record).every((key) => key === "relPath" || key === "absent")
-    : validNumber(record.size) && validNumber(record.mtimeMs) && validNumber(record.ctimeMs);
+function validRuleFile(value: JsonValue | undefined): value is RuleFileRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (typeof value["relPath"] !== "string" || !validRel(value["relPath"])) return false;
+  return value["absent"] === true
+    ? Object.keys(value).every((key) => key === "relPath" || key === "absent")
+    : validNumber(value["size"]) && validNumber(value["mtimeMs"]) && validNumber(value["ctimeMs"]);
 }
 
-function validEntry(value: unknown): value is DirCacheEntry {
-  if (!value || typeof value !== "object") return false;
-  const entry = value as Partial<DirCacheEntry>;
-  return validNumber(entry.mtimeMs) && validNumber(entry.ctimeMs) && Array.isArray(entry.children) && entry.children.every((child) => {
-    if (!child || typeof child !== "object") return false;
-    const c = child as Partial<DirCacheChild>;
-    return typeof c.name === "string" && c.name !== "" && c.name !== "." && c.name !== ".." && !c.name.includes("/") && (c.type === "file" || c.type === "dir" || c.type === "symlink" || c.type === "other");
+function validEntry(value: JsonValue | undefined): value is DirCacheEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const children = value["children"];
+  return validNumber(value["mtimeMs"]) && validNumber(value["ctimeMs"]) && Array.isArray(children) && children.every((child) => {
+    if (!child || typeof child !== "object" || Array.isArray(child)) return false;
+    const name = child["name"];
+    const type = child["type"];
+    return typeof name === "string" && name !== "" && name !== "." && name !== ".." && !name.includes("/") && (type === "file" || type === "dir" || type === "symlink" || type === "other");
   });
 }
 
@@ -100,13 +102,25 @@ export class DirCache {
 
   static async load(root: string): Promise<DirCache> {
     try {
-      const parsed: unknown = JSON.parse(await fs.readFile(path.join(root, CACHE_REL), "utf8"));
-      if (!parsed || typeof parsed !== "object") return new DirCache();
-      const file = parsed as Partial<DirCacheFile>;
-      if (file.version !== 2 || !validNumber(file.lastScanStartMs) || !validNumber(file.lastUnprunedScanAtMs) ||
-          !Array.isArray(file.ruleFiles) || !file.ruleFiles.every(validRuleFile) || !file.entries || typeof file.entries !== "object") return new DirCache();
-      if (!Object.keys(file.entries).every(validRel) || !Object.values(file.entries).every(validEntry)) return new DirCache();
-      return new DirCache(file as DirCacheFile);
+      const parsed: JsonValue = JSON.parse(await fs.readFile(path.join(root, CACHE_REL), "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new DirCache();
+      const lastScanStartMs = parsed["lastScanStartMs"];
+      const lastUnprunedScanAtMs = parsed["lastUnprunedScanAtMs"];
+      const rawRuleFiles = parsed["ruleFiles"];
+      const rawEntries = parsed["entries"];
+      if (parsed["version"] !== 2 || !validNumber(lastScanStartMs) || !validNumber(lastUnprunedScanAtMs) ||
+          !Array.isArray(rawRuleFiles) || !rawEntries || typeof rawEntries !== "object" || Array.isArray(rawEntries)) return new DirCache();
+      const ruleFiles: RuleFileRecord[] = [];
+      for (const record of rawRuleFiles) {
+        if (!validRuleFile(record)) return new DirCache();
+        ruleFiles.push(record);
+      }
+      const entries: Record<string, DirCacheEntry> = {};
+      for (const [key, entry] of Object.entries(rawEntries)) {
+        if (!validRel(key) || !validEntry(entry)) return new DirCache();
+        entries[key] = entry;
+      }
+      return new DirCache({ version: 2, lastScanStartMs, lastUnprunedScanAtMs, ruleFiles, entries });
     } catch {
       return new DirCache();
     }

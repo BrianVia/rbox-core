@@ -5,11 +5,11 @@ import {
   isSourceChangedError,
 } from "./crypto.js";
 import fs from "node:fs/promises";
-import { FUSE_MAX_FILE_BYTES, type CryptoWorkerEncryptBatchResult, type CryptoWorkerJobMessage, type CryptoWorkerMessage, type SerializedError } from "./crypto-worker-protocol.js";
+import { FUSE_MAX_FILE_BYTES, type CryptoWorkerEncryptBatchResult, type CryptoWorkerJobMessage, type CryptoWorkerMessage, type CryptoWorkerResponse, type SerializedError } from "./crypto-worker-protocol.js";
 
 declare const self: {
   onmessage: ((event: { data: CryptoWorkerMessage }) => void | Promise<void>) | null;
-  postMessage(message: unknown, transfer?: ArrayBuffer[]): void;
+  postMessage(message: CryptoWorkerResponse, transfer?: ArrayBuffer[]): void;
 };
 
 let kek: Buffer | undefined;
@@ -39,6 +39,7 @@ function copyNodeErrorFields(out: SerializedError, err: Error): void {
   if (nodeError.dest !== undefined) out.dest = nodeError.dest;
 }
 
+// `err` and `cause` are caught-exception values: `unknown` is their true type.
 function serializeError(err: unknown, depth = 0): SerializedError {
   const message = err instanceof Error ? err.message : String(err);
   const out: SerializedError = { message };

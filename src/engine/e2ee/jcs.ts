@@ -12,6 +12,12 @@
  * codec exists to exclude. There is no float-formatting code here on purpose.
  */
 
+/* `value` stays `unknown` deliberately. This is a leaf primitive: naming its real
+ * inputs would mean importing ~20 signed-record types from the modules that
+ * depend on it, and none of those interfaces is assignable to `JcsObject`
+ * anyway. The one honest narrow type — the parsed JSON `parseStrict` hands
+ * back — is exactly what `write` already refuses to guess about. */
+
 /** Serialize a value to RFC 8785 canonical JSON bytes (UTF-8). */
 export function canonicalize(value: unknown): Uint8Array {
   return new TextEncoder().encode(canonicalString(value));
