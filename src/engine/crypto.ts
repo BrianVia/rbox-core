@@ -138,7 +138,7 @@ export function kekFromPhrase(phrase: string): Buffer {
  *  one shared label for this scheme (constant AAD + domain-separated derivation).
  *  The info is the sha256 of the exact payload bytes fed to AES-GCM: plaintext for
  *  raw blobs, compressed payload for zstd blobs. */
-function deriveKeyNonce(kek: Buffer, payloadSha: string): { dek: Buffer; nonce: Buffer } {
+function deriveKeyNonce(kek: Buffer, payloadSha: string) {
   const out = Buffer.from(hkdfSync("sha256", kek, AAD, Buffer.from(payloadSha, "hex"), 44));
   return { dek: out.subarray(0, 32), nonce: out.subarray(32, 44) };
 }
@@ -163,11 +163,12 @@ const SOURCE_CHANGED_ERROR_CODE = "RBOX_SOURCE_CHANGED";
 type SourceChangedError = Error & { readonly code: typeof SOURCE_CHANGED_ERROR_CODE };
 
 function sourceChangedError(srcPath: string): SourceChangedError {
-  const tag: { readonly code: typeof SOURCE_CHANGED_ERROR_CODE } = { code: SOURCE_CHANGED_ERROR_CODE };
+  const tag = { code: SOURCE_CHANGED_ERROR_CODE } as const;
   return Object.assign(new Error(`source changed while encrypting: ${srcPath}`), tag);
 }
 
-/** Source-change classification must survive crypto-worker serialization. */
+/** Source-change classification must survive crypto-worker serialization. `error` is a
+ *  caught throw value (or a structured-clone of one), so `unknown` is its true type. */
 export function isSourceChangedError(error: unknown): error is { readonly code: typeof SOURCE_CHANGED_ERROR_CODE } {
   return typeof error === "object" && error !== null && "code" in error && error.code === SOURCE_CHANGED_ERROR_CODE;
 }

@@ -12,6 +12,7 @@ import { sign, verify, type SignKeyPair } from "./asym.js";
 import { canonicalString, verifyRoundTrip } from "./jcs.js";
 import { fromB64url, fromHex, sha256Hex, toB64url, utf8 } from "./primitives.js";
 import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain } from "../manifest-chain.js";
+import type { JsonObject, JsonValue } from "../../json.js";
 export { MAX_MANIFEST_DELTA_CHAIN } from "../manifest-chain.js";
 
 export const GENESIS_PARENT_HASH = "0".repeat(64);
@@ -26,11 +27,11 @@ export interface BlobRef {
  *  full unique sorted ref set); `count`/`totalBytes` are ADVISORY (cheap reject + a
  *  post-fetch descriptor match) — never billed. The signature commits to `sidecarSha`, so
  *  the ref set can't be swapped. */
-export interface BlobRefset {
+export type BlobRefset = {
   sidecarSha: string;
   count: number;
   totalBytes: number;
-}
+};
 
 interface CommitBodyBase {
   type: "rbox/commit/v1";
@@ -67,8 +68,9 @@ export interface SignedCommit {
 }
 
 const SHA_RE = /^[0-9a-f]{64}$/;
+const isNonNegativeSafeInteger = (v: JsonValue | undefined): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 
-export function validateManifestChain(v: unknown, encManifestSha?: string): string[] {
+export function validateManifestChain(v: JsonValue | undefined, encManifestSha?: string): string[] {
   const chain = readManifestChain(v, encManifestSha ?? "");
   if (chain === null) throw new Error("manifestChain malformed");
   return chain;
@@ -80,7 +82,7 @@ export function normalizeBlobRefs(refs: BlobRef[]): BlobRef[] {
   const byEnc = new Map<string, BlobRef>();
   for (const r of refs) {
     if (!SHA_RE.test(r.encSha)) throw new Error(`blobRef encSha malformed: ${r.encSha}`);
-    if (!Number.isSafeInteger(r.size) || r.size < 0) throw new Error(`blobRef size invalid: ${r.size}`);
+    if (!isNonNegativeSafeInteger(r.size)) throw new Error(`blobRef size invalid: ${r.size}`);
     if (byEnc.has(r.encSha)) throw new Error(`duplicate blobRef encSha: ${r.encSha}`);
     byEnc.set(r.encSha, { encSha: r.encSha, size: r.size });
   }
@@ -89,13 +91,18 @@ export function normalizeBlobRefs(refs: BlobRef[]): BlobRef[] {
 
 /** Structurally validate a sidecar descriptor (NOT the sidecar bytes — the server fetches
  *  + hashes those). `count`/`totalBytes` are bounded non-negative safe integers. */
-export function validateBlobRefset(rs: unknown): BlobRefset {
+export function validateBlobRefset(rs: JsonValue | undefined): BlobRefset {
   if (!rs || typeof rs !== "object") throw new Error("blobRefset not an object");
-  const r = rs as Partial<BlobRefset>;
-  if (typeof r.sidecarSha !== "string" || !SHA_RE.test(r.sidecarSha)) throw new Error("blobRefset.sidecarSha malformed");
-  if (!Number.isSafeInteger(r.count) || (r.count as number) < 0) throw new Error("blobRefset.count invalid");
-  if (!Number.isSafeInteger(r.totalBytes) || (r.totalBytes as number) < 0) throw new Error("blobRefset.totalBytes invalid");
-  return { sidecarSha: r.sidecarSha, count: r.count as number, totalBytes: r.totalBytes as number };
+  // An array carries none of the descriptor fields, so it fails the sidecarSha check
+  // below — the same rejection (and message) it got before this signature was narrowed.
+  const r: JsonObject = Array.isArray(rs) ? {} : rs;
+  const sidecarSha = r["sidecarSha"];
+  const count = r["count"];
+  const totalBytes = r["totalBytes"];
+  if (typeof sidecarSha !== "string" || !SHA_RE.test(sidecarSha)) throw new Error("blobRefset.sidecarSha malformed");
+  if (!isNonNegativeSafeInteger(count)) throw new Error("blobRefset.count invalid");
+  if (!isNonNegativeSafeInteger(totalBytes)) throw new Error("blobRefset.totalBytes invalid");
+  return { sidecarSha, count, totalBytes };
 }
 
 interface CommitFieldsBase {
@@ -167,6 +174,10 @@ export function parseCommit(c: SignedCommit): CommitBody {
     validateBlobRefset(body.blobRefset);
   }
   // Absence is normalized for all pre-84 commits without changing their signed bytes.
+  // The assertion is the jcs boundary leftover: `verifyRoundTrip` hands back `unknown`,
+  // and the spread deliberately carries forward every field of the signed body — including
+  // ones this version does not know — so the value cannot be rebuilt field-by-field
+  // without changing what parsed commits contain.
   return { ...body, manifestChain } as unknown as CommitBody;
 }
 

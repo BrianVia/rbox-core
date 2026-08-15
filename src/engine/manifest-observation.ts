@@ -7,7 +7,9 @@ import type { HashCache } from "./hashcache.js";
 import type { FileEntry } from "./types.js";
 
 /** errno codes for a per-file fault we DEFER (carry the last-synced entry forward,
- * retry next scan) rather than abort the whole scan on. */
+ * retry next scan) rather than abort the whole scan on. Both classifiers take
+ * `unknown` because their only input is a caught throw value, which JS gives no
+ * narrower type. */
 const DEFERRABLE_FILE_ERRNOS = new Set(["EACCES", "EPERM", "EIO", "ENOENT"]);
 export function isDeferrableFileError(e: unknown): e is NodeJS.ErrnoException {
   const code = errCode(e);
