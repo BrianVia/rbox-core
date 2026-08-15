@@ -1,6 +1,6 @@
 # 266 — Genesis is the absent-state default
 
-Status: **DRAFT v3 (round-2 folded)**
+Status: **ALIGNED v4** — R3 closed all substantive findings; editorial residuals (STATUS staleness, literal hash command) fixed and self-certified by the orchestrator
 
 Founder decision (2026-08-15, pinned): a fresh workspace that cannot prove the
 locking required by SQLite refuses immediately. There is no log-only phase,
