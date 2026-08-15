@@ -3,11 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HashCache } from "../../engine/index.js";
-import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { saveConfig, saveStateUnsafeLegacyOrTest, stateLockPath, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { beginResetJournal, resetJournalPath } from "../reset-journal.js";
 import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
+import { acquireLock } from "../../engine/lockfile.js";
 
 interface HaltInternals {
   cache: HashCache;
@@ -116,15 +117,18 @@ test("forensic foreign-next v1 halts, journal-only quarantine, then heals end to
   d.syncBase = state;
   d.want.fullScan = true;
   const oldBytes = await fs.readFile(path.join(root, ".rbox", "state.json"));
+  const stateLock = await acquireLock(stateLockPath(root));
+  if (stateLock.status !== "acquired") throw new Error(`test state lock unavailable: ${stateLock.status}`);
   await beginResetJournal(root, "foreign-next-stream", oldBytes, state, [], {
     version: 2,
     authorizedNextStream: "foreign-next-stream",
     consentKind: "setup-rebind",
     mintedAtRevision: 1,
-  }, {
+  }, stateLock.lock, {
     now: () => new Date("2026-07-17T10:00:00.000Z"),
     randomBytes: (size) => Buffer.alloc(size, 0x44),
   });
+  await stateLock.lock.release();
   const v2 = JSON.parse(await fs.readFile(resetJournalPath(root), "utf8"));
   delete v2.authorization;
   v2.v = 1;

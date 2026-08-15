@@ -22,11 +22,14 @@ import { recordLastWriterWitness } from "../migration/last-writer-witness.js";
  * filesystem offers no lock primitive at all, which is the only condition under
  * which an unlocked publication is authorized.
  *
- * `beforeRename` is the sole publication-abort seam `writeFileAtomic` exposes,
- * so both the barrier read and the lease re-assertion live there: a marker or a
- * stolen lease aborts before the rename rather than racing it.
+ * The asynchronous slot owns the barrier read and early lease check; the
+ * syscall-adjacent synchronous slot re-asserts the lease with no await before
+ * rename. A marker or stolen lease therefore aborts publication.
  */
 export async function publishWholeState(file: string, body: string, lock: OwnedLock | undefined): Promise<void> {
+  if (lock && path.resolve(lock.path) !== path.resolve(`${file}.lock`)) {
+    throw new StateWriteRefusedError("state-lock-unavailable", file, "held lock has the wrong canonical path");
+  }
   let leaseHeld = true;
   await writeFileAtomic(file, body, {
     beforeRename: async () => {
@@ -35,6 +38,11 @@ export async function publishWholeState(file: string, body: string, lock: OwnedL
       leaseHeld = await lock.isOwner();
       return leaseHeld;
     },
+    beforeRenameSync: lock
+      ? () => {
+          if (!lock.isOwnerSync()) throw new StateWriteRefusedError("state-lock-lease-lost", file);
+        }
+      : undefined,
   });
   if (!leaseHeld) throw new StateWriteRefusedError("state-lock-lease-lost", file);
   await fsyncDirectory(path.dirname(file));
@@ -45,8 +53,14 @@ export async function publishWholeState(file: string, body: string, lock: OwnedL
  * for the bytes just published, and make sure the migration reserve exists.
  * Neither may fail a state write that is already durable.
  */
-export async function afterStatePublication(root: string, file: string, stream: string, body: string): Promise<void> {
-  await recordLastWriterWitness(root, file, body);
+export async function afterStatePublication(
+  root: string,
+  file: string,
+  stream: string,
+  body: string,
+  heldLock?: OwnedLock,
+): Promise<void> {
+  await recordLastWriterWitness(root, file, body, Date.now, heldLock);
   if (typeof stream === "string" && stream.length > 0) {
     await ensureStateReserve(root, stream).catch(() => undefined);
   }

@@ -11,14 +11,33 @@ import {
 } from "../../reset-quarantine.js";
 import { sqliteResetFacade } from "./index.js";
 import { sqliteResetPaths, stableDbHash } from "./artifacts.js";
+import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
+import { stateLockPath } from "../paths.js";
+import type { ResetJournalAuthorization } from "../../reset-journal-codec.js";
 
-const beginSqliteReset = sqliteResetFacade.begin;
-const recoverSqliteReset = sqliteResetFacade.recover;
+const beginSqliteResetUnderLock = sqliteResetFacade.begin;
+const recoverSqliteResetUnderLock = sqliteResetFacade.recover;
 
 const roots: string[] = [];
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
+
+async function withStateLock<T>(root: string, fn: (lock: OwnedLock) => Promise<T>): Promise<T> {
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  try { return await fn(acquired.lock); } finally { await acquired.lock.release(); }
+}
+
+async function beginSqliteReset(root: string, nextStream: string, authorization: ResetJournalAuthorization) {
+  return withStateLock(root, (lock) => beginSqliteResetUnderLock(
+    root, nextStream, { stream: "old", stateNonce: "1".repeat(32) }, [], authorization, lock,
+  ));
+}
+
+async function recoverSqliteReset(root: string, stream: string) {
+  return withStateLock(root, (lock) => recoverSqliteResetUnderLock(root, stream, lock));
+}
 
 async function sqliteFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-u2-sqlite-quarantine-"));
@@ -34,7 +53,7 @@ async function sqliteFixture() {
     stateRevision: 1,
     createdBy: "test",
   }).close();
-  const journal = await beginSqliteReset(root, "next", [], {
+  const journal = await beginSqliteReset(root, "next", {
     version: 2,
     authorizedNextStream: "next",
     consentKind: "setup-rebind",

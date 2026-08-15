@@ -12,7 +12,6 @@ import {
   type ModeledResetRow,
 } from "./crash-rig-model.js";
 import {
-  createSqliteResetRecoveryFs,
   type SqliteResetFsTraceEvent,
 } from "./recovery.js";
 import { Database } from "bun:sqlite";
@@ -21,15 +20,42 @@ import { createStateStore } from "../store/open.js";
 import { sqliteResetPaths } from "./artifacts.js";
 import { sqliteResetFacade } from "./index.js";
 import { fsyncDirectory } from "../../../engine/fsutil.js";
+import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
+import { stateLockPath } from "../paths.js";
+import type { ResetJournalAuthorization } from "../../reset-journal-codec.js";
+import type { ResetZEntry } from "../../reset-z.js";
+import type { SqliteResetHooks } from "./recovery.js";
 
-const beginSqliteReset = sqliteResetFacade.begin;
+const beginSqliteResetUnderLock = sqliteResetFacade.begin;
 const inspectSqliteReset = sqliteResetFacade.inspect;
-const recoverSqliteReset = sqliteResetFacade.recover;
+const recoverSqliteResetUnderLock = sqliteResetFacade.recover;
 
 const roots: string[] = [];
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
+
+async function withStateLock<T>(root: string, fn: (lock: OwnedLock) => Promise<T>): Promise<T> {
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  try { return await fn(acquired.lock); } finally { await acquired.lock.release(); }
+}
+
+async function beginSqliteReset(
+  root: string,
+  nextStream: string,
+  z: ResetZEntry[],
+  authorization: ResetJournalAuthorization,
+  hooks: SqliteResetHooks = {},
+) {
+  return withStateLock(root, (lock) => beginSqliteResetUnderLock(
+    root, nextStream, { stream: "old", stateNonce: "1".repeat(32) }, z, authorization, lock, hooks,
+  ));
+}
+
+async function recoverSqliteReset(root: string, stream: string, hooks: SqliteResetHooks = {}) {
+  return withStateLock(root, (lock) => recoverSqliteResetUnderLock(root, stream, lock, hooks));
+}
 
 const QUARANTINE_BOUNDARIES = [
   "after-manifest-publish",
@@ -289,7 +315,6 @@ describe("U2 modeled durable power cuts", () => {
           for (const directory of event.created) durableDirectories.add(path.resolve(directory));
         }
       };
-      const recordingFs = createSqliteResetRecoveryFs(observe);
       const crashAt = (point: string): void => {
         if (point === boundary) throw new Error(point);
       };
@@ -297,10 +322,10 @@ describe("U2 modeled durable power cuts", () => {
         await expect(beginSqliteReset(root, "next", [], {
           version: 2, authorizedNextStream: "next",
           consentKind: "setup-rebind", mintedAtRevision: 1,
-        }, { recoveryFs: recordingFs, crashAt })).rejects.toThrow(boundary);
+        }, { observeFs: observe, crashAt })).rejects.toThrow(boundary);
       } else {
         await expect(recoverSqliteReset(root, "old", {
-          recoveryFs: recordingFs,
+          observeFs: observe,
           crashAt,
         })).rejects.toThrow(boundary);
       }

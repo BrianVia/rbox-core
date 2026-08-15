@@ -254,6 +254,9 @@ export interface BoundedCopyOptions {
       | "parent-synced"
       | "created-ancestors-synced",
   ) => void | Promise<void>;
+  /** Synchronous final assertion after all awaited preparation and immediately
+   * before the destination rename. */
+  beforeRenameSync?: () => void;
 }
 
 /** Stream-copy a stable source to an atomically published destination. */
@@ -267,6 +270,7 @@ export async function boundedCopy(
   const created = await ensureDirectoryChain(parent, "bounded-copy destination");
   const tmp = path.join(parent, `${RBOX_TMP_PREFIX}${process.pid}-${crypto.randomBytes(8).toString("hex")}-${path.basename(destination)}`);
   let output: fs.FileHandle | undefined;
+  let preserveTemp = false;
   try {
     output = await fs.open(tmp, "wx", 0o600);
     await options.onStep?.("temp-opened");
@@ -281,6 +285,12 @@ export async function boundedCopy(
     output = undefined;
     await options.onStep?.("temp-closed");
     await options.onStep?.("before-rename");
+    try {
+      options.beforeRenameSync?.();
+    } catch (error) {
+      preserveTemp = true;
+      throw error;
+    }
     await fs.rename(tmp, destination);
     await options.onStep?.("after-rename");
     await fsyncDirectory(parent);
@@ -293,7 +303,7 @@ export async function boundedCopy(
       await output.close().catch(() => {});
       await options.onStep?.("temp-closed");
     }
-    await fs.rm(tmp, { force: true }).catch(() => {});
+    if (!preserveTemp) await fs.rm(tmp, { force: true }).catch(() => {});
   }
 }
 

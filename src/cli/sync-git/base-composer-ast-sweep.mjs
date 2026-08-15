@@ -67,8 +67,17 @@ const STATE_ORDER_OWNERS = new Map([
     "ensureTelemetryBindingId",
     "loadRawState",
     "loadState",
+    "replaceResetLineageStream",
     "saveThroughStore",
     "selectAuthority",
+  ])],
+  ["src/cli/reset-journal-inspection.ts", new Set(["observeLegacyResetPhysical"])],
+  ["src/cli/reset-journal.ts", new Set([
+    "beginSelectedReset",
+    "inspectResetFenceInventory",
+    "recoverResetJournalUnderHeldFence",
+    "settleStandingReset",
+    "settleStandingResetUnderHeldFence",
   ])],
   ["src/cli/state-plane/genesis.ts", new Set(["finishWithQ"])],
   // Design 163's authority flip. It reaches `.rbox/state.json` through a local
@@ -107,6 +116,9 @@ const STATE_ORDER_CALLEES = new Set([
   "handle.stat",
   "isOwner",
   "isSymbolicLink",
+  "inventoryResetNamespace",
+  "inspectResetFenceInventory",
+  "inspectStanding",
   // The authority flip's own obligations (design 163 M6).
   "requireSibling",
   "observeQSibling",
@@ -119,6 +131,10 @@ const STATE_ORDER_CALLEES = new Set([
   "publishWholeState",
   "recordLastWriterWitness",
   "recoverResetJournalUnderHeldFence",
+  "assertResetOwner",
+  "assertResetProtocolFence",
+  "replaceStreamAndApplySavePacketToStore",
+  "stableDbHash",
   "writeFileAtomic",
 ]);
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;

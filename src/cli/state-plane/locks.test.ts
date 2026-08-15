@@ -12,9 +12,10 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
-import { AUTHORITY_MARKER_MAGIC, classifyStateFormat } from "./authority-marker.js";
+import { AUTHORITY_MARKER_MAGIC, authorityMarkerBytes, classifyStateFormat } from "./authority-marker.js";
 import { withGenesisAdmissionLocks, withStatePlaneLocks, type StatePlaneLockStage } from "./locks.js";
 import { sqliteResetPaths, stateLockPath, statePath } from "./paths.js";
+import { createStateStore } from "./store/open.js";
 
 async function workspace(prefix: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -260,4 +261,45 @@ test("a standing reset journal is recovered to completion before the body runs",
   // Fail-closed: an undecodable standing transaction refuses; it is never
   // stepped over so the body can start on a half-completed reset.
   await expect(withStatePlaneLocks(root, async () => "never")).rejects.toThrow();
+});
+
+test("paired JSON no-reset inventory reaches the body without settlement", async () => {
+  const root = await workspace("rbox-locks-json-inventory-");
+  let bodies = 0;
+  expect(await withStatePlaneLocks(root, async () => void (bodies += 1))).toEqual({ held: true, value: undefined });
+  expect(bodies).toBe(1);
+});
+
+test("paired exact-Q S0 inventory reaches the body without writable reset open", async () => {
+  const root = await workspace("rbox-locks-q-inventory-");
+  const authorityId = "a".repeat(32);
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId, lineageId: "b".repeat(32), stream: "stream", createdBy: "test",
+    stateNonce: "c".repeat(32), stateRevision: 0,
+  }).close();
+  await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+  let bodies = 0;
+  expect(await withStatePlaneLocks(root, async () => void (bodies += 1))).toEqual({ held: true, value: undefined });
+  expect(bodies).toBe(1);
+  expect(await fs.readdir(path.dirname(sqliteResetPaths.active(root)))).toContain("state.db");
+});
+
+test("reset-fence observation drift restarts and refuses before the body", async () => {
+  const root = await workspace("rbox-locks-reset-drift-");
+  let bodies = 0;
+  await expect(withStatePlaneLocks(root, async () => void (bodies += 1), {
+    attempts: 1,
+    onStage: async (stage) => {
+      if (stage === "fence") await fs.writeFile(resetJournalPath(root), "{ malformed");
+    },
+  })).rejects.toThrow();
+  expect(bodies).toBe(0);
+});
+
+test("a format-neutral halt row never reaches the borrowed body", async () => {
+  const root = await workspace("rbox-locks-reset-halt-row-");
+  await fs.writeFile(resetJournalPath(root), "{ malformed");
+  let bodies = 0;
+  await expect(withStatePlaneLocks(root, async () => void (bodies += 1))).rejects.toThrow();
+  expect(bodies).toBe(0);
 });

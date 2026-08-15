@@ -16,7 +16,7 @@ import {
   writeGuidedGenesisPullNotice,
   runInit,
 } from "./init-cmd.js";
-import { saveConfig } from "./config.js";
+import { loadState, saveConfig } from "./config.js";
 import type { InitPlan } from "./init-plan.js";
 import { resolveInitPlan } from "./init-plan.js";
 import { mintSetupCreateConsent, mintSetupExistingConsent } from "./reset-consent.js";
@@ -24,6 +24,9 @@ import { promptPath } from "./prompt.js";
 import { formatGitPushLine, type GitPushPlan } from "./sync-git.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveDevice } from "./e2ee-keystore.js";
+import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
+import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
+import { createStateStore } from "./state-plane/store/open.js";
 
 function gitPushPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
   return {
@@ -260,6 +263,35 @@ test("direct init refuses a differing existing binding; setup witness passes pre
     await expect(preflightInitRebind(next, consent)).resolves.toBeUndefined();
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("init preflight accepts a setup witness against a real selected SQLite authority", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-init-sqlite-consent-"));
+  const oldStream = "https://old.test::ws_old::root";
+  const nonce = "c".repeat(32);
+  const authorityId = "a".repeat(32);
+  try {
+    await saveConfig(root, {
+      schema: "e2ee/v1", remoteUrl: "https://old.test", remoteWorkspaceId: "ws_old",
+      projectId: "root", rootPath: root, deviceId: "dev_old", token: "",
+    });
+    await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+    createStateStore(sqliteResetPaths.active(root), {
+      authorityId, lineageId: "b".repeat(32), stream: oldStream, createdBy: "test",
+      stateNonce: nonce, stateRevision: 4,
+    }).close();
+    await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+    const next = plan(root, { kind: "join", id: "ws_new", project: "root" });
+    const consent = mintSetupExistingConsent({
+      root, observedOldStream: oldStream, observedOldNonce: nonce, mintedAtRevision: 4,
+      remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+    });
+
+    await expect(preflightInitRebind(next, consent)).resolves.toBeUndefined();
+    expect(await loadState(root, oldStream)).toMatchObject({ stream: oldStream, stateRevision: 4 });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 

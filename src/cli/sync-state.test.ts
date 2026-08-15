@@ -108,6 +108,45 @@ describe("design 93 §6 sync-point truth table", () => {
 });
 
 describe("design 93 §6 transactional unit", () => {
+  async function markedResetState(): Promise<SyncState> {
+    await saveStateUnsafeLegacyOrTest(root, baseState());
+    const archive = path.join(root, ".rbox", "state", "lineages", "b".repeat(32), `${"c".repeat(64)}.json`);
+    await fs.mkdir(path.dirname(archive), { recursive: true });
+    await fs.writeFile(archive, "reset provenance\n");
+    return loadState(root, stream);
+  }
+
+  for (const [caller, source] of [
+    ["pull", { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("pull"), observedRepos: [], values: {} }],
+    ["push-observation", { expectedStream: stream, sourceGlobalSeq: 0, observedRepos: ["r"], values: { partial: { r: null } } }],
+    ["push-carry", { expectedStream: stream, sourceGlobalSeq: 0, observedRepos: ["r"], values: { pending: { r: section("carry") } } }],
+    ["push-acknowledgement", { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: manifest("ack"), observedRepos: [], values: {} }],
+  ] as const) {
+    test(`L7 ${caller} keeps the authorized reset-stream replacement branch`, async () => {
+      const snapshot = await markedResetState();
+      const saved = await saveStateSource(root, snapshot, source, {
+        allowLegacyStreamReplacement: true,
+        apply: async () => ({ status: "rejected", reason: "stream", state: { ...snapshot, stream: "old-stream" } }),
+      });
+      expect(saved.stream).toBe(stream);
+      expect(saved.stateNonce).toBeUndefined();
+      expect(JSON.parse(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8")).stream).toBe(stream);
+    });
+  }
+
+  for (const caller of ["track", "scope"] as const) {
+    test(`L7 ${caller} remains unauthorized for stream replacement`, async () => {
+      const snapshot = await markedResetState();
+      const before = await fs.readFile(path.join(root, ".rbox", "state.json"));
+      await expect(saveStateSource(root, snapshot, {
+        expectedStream: stream, sourceGlobalSeq: 0, observedRepos: [], values: {},
+      }, {
+        apply: async () => ({ status: "rejected", reason: "stream", state: { ...snapshot, stream: "old-stream" } }),
+      })).rejects.toThrow("sync state changed during operation (stream)");
+      expect(await fs.readFile(path.join(root, ".rbox", "state.json"))).toEqual(before);
+    });
+  }
+
   test("design 177 strips a <=1.7.18 intent and an unrelated repository save drops it from disk", async () => {
     const raw = baseState({
       old: {

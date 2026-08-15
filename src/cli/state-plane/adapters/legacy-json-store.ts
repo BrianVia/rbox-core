@@ -398,12 +398,18 @@ export async function installGenesisResetStateUnderHeldLock(
   };
   const body = JSON.stringify(genesis, null, 2);
   await publishWholeState(statePath(root), body, heldLock);
-  await afterStatePublication(root, statePath(root), genesis.stream, body);
+  await afterStatePublication(root, statePath(root), genesis.stream, body, heldLock);
   await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({
     stream: genesis.stream,
     stateNonce: genesis.stateNonce,
     stateRevision: 0,
-  }, null, 2));
+  }, null, 2), {
+    beforeRenameSync: () => {
+      if (!heldLock.isOwnerSync()) {
+        throw new StateWriteRefusedError("state-lock-lease-lost", stateIncarnationPath(root));
+      }
+    },
+  });
   await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
   return genesis;
 }
