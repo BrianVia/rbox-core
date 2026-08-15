@@ -42,6 +42,9 @@ export interface GitRunOptions {
   stdin?: string;
   /** Streams stdout without retaining it in the runner's result buffer. */
   onStdoutChunk?: (chunk: string) => void;
+  /** Synchronous assertion after awaited process preparation and immediately
+   * before the child process is spawned. */
+  beforeSpawn?: () => void;
 }
 
 async function gitRawLegacy(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
@@ -57,6 +60,7 @@ async function gitRawLegacy(root: string, args: string[], opts: GitRunOptions = 
         stdinFile = await fs.open(stdinPath, "r");
       }
       return await new Promise<string>((resolve, reject) => {
+        opts.beforeSpawn?.();
         const child = spawn("git", ["-C", root, ...args], {
           env: cleanGitEnv(opts.env),
           stdio: [stdinFile?.fd ?? "pipe", "pipe", "pipe"],
@@ -145,6 +149,7 @@ async function gitRawLegacy(root: string, args: string[], opts: GitRunOptions = 
       if (stdinDir) await fs.rm(stdinDir, { recursive: true, force: true });
     }
   }
+  opts.beforeSpawn?.();
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
     // Never let a hook or wrapper redirect this operation into a foreign repo.

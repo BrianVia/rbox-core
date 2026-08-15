@@ -1,13 +1,24 @@
+import path from "node:path";
 import {
   readRepoIdentityV1,
   repositoryIdentityHash,
 } from "../cli/sync-git/repo-lineage.js";
 import { gitRaw } from "../engine/git-spawn.js";
+import type { OwnedLock } from "../engine/lockfile.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import type { PrefixDisposition } from "./reset-journal-classifier.js";
 import type { ResetZEntry } from "./reset-z.js";
+import { StateWriteRefusedError } from "./state-plane/errors.js";
+import { stateLockPath } from "./state-plane/paths.js";
 
 const corruption = (message: string): ResetCorruptionError => new ResetCorruptionError(message);
+
+function assertResetOwner(root: string, lock: OwnedLock): void {
+  if (path.resolve(lock.path) !== path.resolve(stateLockPath(root))) {
+    throw new StateWriteRefusedError("state-lock-unavailable", stateLockPath(root), "held lock has the wrong canonical path");
+  }
+  if (!lock.isOwnerSync()) throw new StateWriteRefusedError("state-lock-lease-lost", stateLockPath(root));
+}
 
 async function readRef(entry: ResetZEntry, ref: string): Promise<string | undefined> {
   try {
@@ -73,14 +84,18 @@ export async function exactResetRecoveryRefs(entries: readonly ResetZEntry[]): P
   return existing;
 }
 
-export async function deleteExactResetRecoveryRef(entry: ResetZEntry): Promise<void> {
+export async function deleteExactResetRecoveryRef(root: string, entry: ResetZEntry, heldLock: OwnedLock): Promise<void> {
   await verifyIdentity(entry);
-  await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", "-d", entry.recoveryRef, entry.targetOid]);
+  await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", "-d", entry.recoveryRef, entry.targetOid], {
+    beforeSpawn: () => assertResetOwner(root, heldLock),
+  });
 }
 
 export async function createResetRecoveryRefs(
+  root: string,
   entries: readonly ResetZEntry[],
   start: number,
+  heldLock: OwnedLock,
   crashAt?: (point: string) => void | Promise<void>,
 ): Promise<void> {
   for (let index = start; index < entries.length; index++) {
@@ -89,14 +104,18 @@ export async function createResetRecoveryRefs(
     if (await readRef(entry, entry.activeRef) !== entry.targetOid) throw corruption(`active Z changed ${entry.activeRef}`);
     const recovery = await readRef(entry, entry.recoveryRef);
     if (recovery !== undefined && recovery !== entry.targetOid) throw corruption(`wrong recovery Z target ${entry.recoveryRef}`);
-    if (recovery === undefined) await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", entry.recoveryRef, entry.targetOid, ""]);
+    if (recovery === undefined) await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", entry.recoveryRef, entry.targetOid, ""], {
+      beforeSpawn: () => assertResetOwner(root, heldLock),
+    });
     await crashAt?.(`after-recovery-ref-${index + 1}`);
   }
 }
 
 export async function retireResetActiveGroups(
+  root: string,
   entries: readonly ResetZEntry[],
   start: number,
+  heldLock: OwnedLock,
   crashAt?: (point: string) => void | Promise<void>,
 ): Promise<void> {
   const groups = new Map<string, ResetZEntry[]>();
@@ -115,7 +134,10 @@ export async function retireResetActiveGroups(
     if (present.some(Boolean) && !present.every(Boolean)) throw corruption(`physically impossible mixed Z retirement in ${commonDir}`);
     if (present.every(Boolean)) {
       const stdin = group.map((entry) => `delete ${entry.activeRef} ${entry.targetOid}`).join("\n") + "\n";
-      await gitRaw(commonDir, ["update-ref", "--stdin"], { stdin });
+      await gitRaw(commonDir, ["update-ref", "--stdin"], {
+        stdin,
+        beforeSpawn: () => assertResetOwner(root, heldLock),
+      });
     }
     await crashAt?.(`after-active-group-${index + 1}`);
   }

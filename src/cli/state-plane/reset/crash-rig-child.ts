@@ -16,6 +16,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createStateBackupPublisher } from "../backup/publish.js";
 import { AUTHORITY_MARKER_MAGIC } from "../authority-marker.js";
+import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
+import { stateLockPath } from "../paths.js";
 
 const beginSqliteReset = sqliteResetFacade.begin;
 const recoverSqliteReset = sqliteResetFacade.recover;
@@ -36,6 +38,16 @@ const authorityMarker = (authorityId: string): string =>
 async function syncDir(directory: string): Promise<void> {
   const handle = await fs.open(directory, "r");
   try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function withCanonicalStateLock<T>(fn: (lock: OwnedLock) => Promise<T>): Promise<T> {
+  const acquired = await acquireLock(stateLockPath(root!));
+  if (acquired.status !== "acquired") throw new Error(`crash rig state lock unavailable: ${acquired.status}`);
+  try {
+    return await fn(acquired.lock);
+  } finally {
+    await acquired.lock.release();
+  }
 }
 
 async function publish(file: string, bytes: string): Promise<void> {
@@ -96,7 +108,7 @@ if (command === "w1-prepare") {
 }
 
 if (command === "w1-takeover") {
-  await recoverSqliteReset(root, "old", { crashAt: killAt });
+  await withCanonicalStateLock((lock) => recoverSqliteReset(root, "old", lock, { crashAt: killAt }));
   process.stderr.write(`boundary was not reached: ${boundary}\n`);
   process.exit(65);
 }
@@ -137,12 +149,14 @@ if (command === "reset-production-p0a") {
   await fs.mkdir(path.dirname(archive), { recursive: true });
   await fs.copyFile(sqliteResetPaths.active(root), archive);
   await syncDir(path.dirname(archive));
-  await beginSqliteReset(root, "next", [], {
+  await withCanonicalStateLock((lock) => beginSqliteReset(root, "next", {
+    stream: "old", stateNonce: "1".repeat(32),
+  }, [], {
     version: 2,
     authorizedNextStream: "next",
     consentKind: "setup-rebind",
     mintedAtRevision: 1,
-  }, { crashAt: killAt });
+  }, lock, { crashAt: killAt }));
   process.stderr.write(`boundary was not reached: ${boundary}\n`);
   process.exit(65);
 }
@@ -161,13 +175,15 @@ if (command === "reset-production") {
   });
   store.close();
   const z = [await zFixture("repo-a", "a"), await zFixture("repo-b", "b")];
-  await beginSqliteReset(root, "next", z, {
+  await withCanonicalStateLock((lock) => beginSqliteReset(root, "next", {
+    stream: "old", stateNonce: "1".repeat(32),
+  }, z, {
     version: 2,
     authorizedNextStream: "next",
     consentKind: "setup-rebind",
     mintedAtRevision: 1,
-  }, { crashAt: killAt });
-  await recoverSqliteReset(root, "old", { crashAt: killAt });
+  }, lock, { crashAt: killAt }));
+  await withCanonicalStateLock((lock) => recoverSqliteReset(root, "old", lock, { crashAt: killAt }));
   process.stderr.write(`boundary was not reached: ${boundary}\n`);
   process.exit(65);
 }

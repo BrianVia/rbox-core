@@ -14,7 +14,11 @@ import { acquireLock, type OwnedLock } from "../../engine/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../cli/sync-git/protocol-locks.js";
 import { repositoryIdentityForContext, repositoryIdentityHash } from "../../cli/sync-git/repo-lineage.js";
 import { ResetMemoryAdmissionError } from "../reset-io.js";
-import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-journal.js";
+import {
+  inspectResetFenceInventory,
+  settleStandingResetUnderHeldFence,
+  type ResetFenceObservation,
+} from "../reset-journal.js";
 import { repoRecordsForState } from "../sync-state-model.js";
 import {
   acquireWorkspaceSyncMutex,
@@ -106,14 +110,15 @@ interface RepositoryRequest extends RepositoryProtocolFenceRequest {
 interface Inventory {
   readonly requests: readonly RepositoryRequest[];
   readonly stream: string | undefined;
-  readonly standingResetJournal: boolean;
+  readonly resetSettlement: "none" | "required";
+  readonly resetObservation: ResetFenceObservation;
 }
 
 const inventoryFingerprint = (inventory: Inventory): string => JSON.stringify([
   inventory.requests.map((request) =>
     [request.relPath, request.commonDir, request.identityHash, [...request.reflogRefs ?? []], request.origins === true]),
   inventory.stream ?? null,
-  inventory.standingResetJournal,
+  inventory.resetSettlement,
 ]);
 
 /**
@@ -167,6 +172,7 @@ async function inspectInventory(root: string): Promise<Inventory> {
   // step.
   const config = await loadConfigIfPresent(root).catch(() => undefined);
   const stream = config ? syncStreamId(config) : undefined;
+  const reset = await inspectResetFenceInventory(root, stream);
   const state = fencedUnderMarker(await classifyStateFormat(statePath(root)), root)
     ? undefined
     : await loadRawState(root);
@@ -189,21 +195,19 @@ async function inspectInventory(root: string): Promise<Inventory> {
     });
   }
 
-  const journal = await readResetJournal(root);
-  for (const entry of journal?.old.z ?? []) {
-    const relPath = `reset:${entry.repositoryIdentity.commonDirReal}`;
+  for (const request of reset.requests) {
+    const relPath = `reset:${request.commonDir}`;
     requests.set(relPath, {
       relPath,
-      commonDir: entry.repositoryIdentity.commonDirReal,
-      reflogRefs: [entry.activeRef, entry.recoveryRef].sort(),
-      origins: true,
-      identityHash: repositoryIdentityHash(entry.repositoryIdentity),
+      ...request,
+      identityHash: relPath,
     });
   }
   return {
     requests: [...requests.values()].sort((a, b) => a.relPath < b.relPath ? -1 : 1),
     stream,
-    standingResetJournal: journal !== undefined,
+    resetSettlement: reset.settlement,
+    resetObservation: reset.observation,
   };
 }
 
@@ -212,20 +216,19 @@ async function inspectInventory(root: string): Promise<Inventory> {
 async function inspectResetInventory(root: string): Promise<Inventory> {
   const config = await loadConfigIfPresent(root).catch(() => undefined);
   const stream = config ? syncStreamId(config) : undefined;
-  const journal = await readResetJournal(root);
+  const reset = await inspectResetFenceInventory(root, stream);
   const requests = new Map<string, RepositoryRequest>();
-  for (const entry of journal?.old.z ?? []) {
-    const relPath = `reset:${entry.repositoryIdentity.commonDirReal}`;
+  for (const request of reset.requests) {
+    const relPath = `reset:${request.commonDir}`;
     requests.set(relPath, {
-      relPath, commonDir: entry.repositoryIdentity.commonDirReal,
-      reflogRefs: [entry.activeRef, entry.recoveryRef].sort(), origins: true,
-      identityHash: repositoryIdentityHash(entry.repositoryIdentity),
+      relPath, ...request, identityHash: relPath,
     });
   }
   return {
     requests: [...requests.values()].sort((a, b) => a.relPath < b.relPath ? -1 : 1),
     stream,
-    standingResetJournal: journal !== undefined,
+    resetSettlement: reset.settlement,
+    resetObservation: reset.observation,
   };
 }
 
@@ -255,10 +258,11 @@ async function readInventory(root: string): Promise<Inventory> {
 
 /** Finish any standing reset transaction before the caller observes the
  * workspace: a migration may not begin on a half-completed reset. */
-async function completeStandingReset(root: string, inventory: Inventory, stateLock: OwnedLock): Promise<void> {
-  if (!inventory.standingResetJournal) return;
+async function completeStandingReset(root: string, inventory: Inventory, stateLock: OwnedLock): Promise<boolean> {
+  if (inventory.resetSettlement === "none") return false;
   if (!inventory.stream) throw new Error("state-plane locks refused: reset recovery needs the durable config stream");
-  await recoverResetJournalUnderHeldFence(root, inventory.stream, {}, stateLock);
+  await settleStandingResetUnderHeldFence(root, inventory.stream, inventory.resetObservation, stateLock);
+  return true;
 }
 
 type LockAttempt<T> = { readonly restart: true } | { readonly restart: false; readonly value: T };
@@ -289,7 +293,7 @@ async function runLockAttempt<T>(
       await options.onStage?.("state-lock");
       if (inventoryFingerprint(await read(root)) !== inventoryFingerprint(inventory)) return { restart: true };
       await options.onStage?.("fenced-recheck");
-      await completeStandingReset(root, inventory, stateLock);
+      if (await completeStandingReset(root, inventory, stateLock)) return { restart: true };
       await options.onStage?.("reset-recovery");
       if (!await stateLock.isOwner()) throw new Error("state-plane locks refused: state lock ownership was lost");
       await options.onStage?.("body");

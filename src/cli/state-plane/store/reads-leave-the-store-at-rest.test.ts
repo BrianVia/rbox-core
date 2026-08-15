@@ -29,13 +29,14 @@ import type { StateSavePacket } from "../../sync-state-model.js";
 import { saveStateUnsafeLegacyOrTest } from "../../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
 import { materializeManifestFromStore } from "../adapters/read-only.js";
-import { applyStateSavePacket, loadRawState, loadState } from "../adapters/whole-state-compat.js";
+import { applyStateSavePacket, loadRawState, loadState, replaceResetLineageStream } from "../adapters/whole-state-compat.js";
 import { establishStateAuthority } from "../authority-bootstrap.js";
 import { StateWriteRefusedError } from "../errors.js";
 import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
 import { runMigration } from "../migration/authority.js";
 import { sqliteResetPaths } from "../paths.js";
-import { openStateStore } from "./open.js";
+import { stableDbHash } from "../reset/artifacts.js";
+import { openStateStore, stateStoreDatabase } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
 
 process.env.RBOX_HOME = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-at-rest-home-"));
@@ -138,6 +139,28 @@ test("applyStateSavePacket leaves the committed store at rest", async () => {
     expect(fs.existsSync(`${sqliteResetPaths.active(root)}-shm`)).toBe(false);
     expect((await inspectResetJournal(root, stream(root))).status).toBe("none");
   }
+});
+
+test("reset-lineage replacement closes its writer at exact S0", async () => {
+  const root = await migratedWorkspace();
+  const active = sqliteResetPaths.active(root);
+  const archiveHash = (await stableDbHash(active)).sha256;
+  const archive = sqliteResetPaths.archive(root, "d".repeat(32), archiveHash);
+  await fsp.mkdir(path.dirname(archive), { recursive: true });
+  await fsp.copyFile(active, archive);
+  const authorized = await loadState(root, stream(root));
+  const writer = openStateStore(active);
+  stateStoreDatabase(writer).run("UPDATE state_lineage SET stream='old-stream'");
+  writer.close();
+  const rejected = (await loadRawState(root))!;
+  const applied = await replaceResetLineageStream(root, authorized, rejected, {
+    expectedStream: stream(root), expectedNonce: NONCE, sourceGlobalSeq: 5,
+    global: { manifest: { generatedAt: "2026-08-15T00:00:00.000Z", files: [] } }, repos: [],
+  }, authorized, authorized);
+  expect(applied.stream).toBe(stream(root));
+  expect(fs.existsSync(`${active}-wal`)).toBe(false);
+  expect(fs.existsSync(`${active}-shm`)).toBe(false);
+  expect((await inspectResetJournal(root, stream(root))).status).toBe("none");
 });
 
 test("unsupported Q save opens no store and leaves the complete workspace at rest", async () => {

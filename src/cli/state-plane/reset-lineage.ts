@@ -9,7 +9,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { recoverResetJournal } from "../reset-journal.js";
+import { inspectResetFenceInventory, settleStandingReset } from "../reset-journal.js";
 import {
   acquireWorkspaceSyncMutex,
   assertSyncMutex,
@@ -18,7 +18,6 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import type { SyncState } from "../sync-state-model.js";
-import { sqliteResetPaths } from "./paths.js";
 import { RBOX_DIR } from "../workspace-config.js";
 
 /**
@@ -38,7 +37,7 @@ export async function recoverStandingResetJournal(
   stream: string,
   heldMutex?: WorkspaceSyncMutex,
 ): Promise<void> {
-  if (!await standingResetJournal(root)) return;
+  if ((await inspectResetFenceInventory(root, stream)).settlement === "none") return;
   let recoveryMutex = heldMutex;
   let releaseRecoveryMutex = false;
   if (!recoveryMutex) {
@@ -48,20 +47,10 @@ export async function recoverStandingResetJournal(
   assertSyncMutex(recoveryMutex, root);
   if (workspaceSyncMutexDegraded(recoveryMutex)) throw new Error("reset journal recovery requires a non-degraded workspace fence");
   try {
-    await recoverResetJournal(root, stream);
+    await settleStandingReset(root, recoveryMutex, stream);
   } finally {
     if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
   }
-}
-
-/** Presence only, and never through a symlink: whether this workspace has a
- * reset journal at all, in either format. */
-async function standingResetJournal(root: string): Promise<boolean> {
-  const observed = await fs.lstat(sqliteResetPaths.journal(root)).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-    throw error;
-  });
-  return observed !== undefined;
 }
 
 const streamMismatchFreshStates = new WeakSet<SyncState>();

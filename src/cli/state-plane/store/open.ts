@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { StateStoreOpenError } from "../errors.js";
 import {
   applySchemaV1,
@@ -372,6 +373,28 @@ export function openStateStore(file: string, options: { readonly?: boolean } = {
     try { db?.close(); } catch {}
     throw error;
   }
+}
+
+export interface ImmutableStoreLineage {
+  authorityId: string;
+  stream: string;
+  stateNonce: string;
+  stateRevision: number;
+}
+
+/** Read the main-file lineage without allowing SQLite to create or touch WAL/SHM. */
+export function readImmutableStoreLineage(file: string): ImmutableStoreLineage {
+  requireOwnedStateStoreFile(file);
+  // SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOFOLLOW.
+  const immutableReadFlags = 1 | 64 | 16_777_216;
+  const db = new Database(`${pathToFileURL(file).href}?immutable=1`, immutableReadFlags);
+  try {
+    const header = validateOpen(db, file);
+    const row = selectRow<{ stream: string; stateNonce: string | null; stateRevision: number | null }>(db,
+      "SELECT stream,state_nonce AS stateNonce,state_revision AS stateRevision FROM state_lineage WHERE lineage_id=(SELECT active_lineage_id FROM store_meta WHERE singleton=1)");
+    if (!row?.stateNonce || row.stateRevision === null) throw new StateStoreOpenError("structural-invariant", file, "active lineage is incomplete");
+    return { authorityId: header.authority_id, stream: row.stream, stateNonce: row.stateNonce, stateRevision: row.stateRevision };
+  } finally { db.close(); }
 }
 
 /**

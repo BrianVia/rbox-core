@@ -35,23 +35,23 @@ import {
   StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";
 import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
+import { stableDbHash } from "../reset/artifacts.js";
 import type { CasRejectionReason, CasResult } from "../ports.js";
 import type { StateStoreHandle } from "../store/open.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
-import { markResetLineageProvenance, recoverStandingResetJournal } from "../reset-lineage.js";
+import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
+import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
 import {
   applyLegacyJsonSavePacket,
   ensureJsonTelemetryId,
   loadLegacyJsonState,
   loadRawLegacyJsonState,
+  saveStateUnsafeLegacyOrTest,
   stateLockBusyDetail,
 } from "./legacy-json-store.js";
 
 /** `.rbox/state.json` carries `Q`, and this is the database it names. */
-interface SqliteAuthority {
-  authorityId: string;
-  file: string;
-}
+interface SqliteAuthority { authorityId: string; file: string }
 
 type StoreFacade = typeof import("../store-facade.js");
 
@@ -60,32 +60,25 @@ const sqliteAuthority = (
   selection: { readonly authorityId: string },
 ): SqliteAuthority => ({ authorityId: selection.authorityId, file: sqliteResetPaths.active(root) });
 
-async function selectAuthority(
-  root: string,
-  heldMutex?: WorkspaceSyncMutex,
-) {
+function translateStoreOpenError<T>(file: string, read: () => T): T {
+  try { return read(); } catch (error) {
+    if (error instanceof StateStoreOpenError) throw new StateAuthorityCorruptError(file, `${error.reason}: ${error.message}`);
+    throw error;
+  }
+}
+
+async function selectAuthority(root: string, heldMutex?: WorkspaceSyncMutex) {
   const coordinator = await import("../authority-bootstrap.js");
   return heldMutex && !workspaceSyncMutexDegraded(heldMutex)
     ? coordinator.admitGenesisAuthority(root, heldMutex)
     : coordinator.selectStateAuthority(root);
 }
 
-async function openAuthorityStore(
-  authority: SqliteAuthority,
-  readonly: boolean,
-): Promise<{ store: StateStoreHandle; facade: StoreFacade }> {
+async function openAuthorityStore(authority: SqliteAuthority, readonly: boolean): Promise<{ store: StateStoreHandle; facade: StoreFacade }> {
   const facade = await import("../store-facade.js");
-  let store: StateStoreHandle;
-  try {
-    store = facade.openStateStore(authority.file, { readonly });
-  } catch (error) {
-    // Absent, not a database, foreign, or the wrong schema — all decided from
-    // the header bytes before any connection, so this refusal wrote nothing.
-    if (error instanceof StateStoreOpenError) {
-      throw new StateAuthorityCorruptError(authority.file, `${error.reason}: ${error.message}`);
-    }
-    throw error;
-  }
+  // Absent, foreign, malformed, or the wrong schema are all zero-write
+  // authority contradictions rather than backend-specific open failures.
+  const store = translateStoreOpenError(authority.file, () => facade.openStateStore(authority.file, { readonly }));
   if (store.header.authority_id !== authority.authorityId) {
     store.close();
     throw new StateAuthorityCorruptError(
@@ -109,6 +102,17 @@ export async function loadRawState(root: string): Promise<SyncState | undefined>
   } finally {
     store.close();
   }
+}
+
+export async function selectedStateForResetConsent(root: string): Promise<Pick<SyncState, "stream" | "stateNonce" | "stateRevision"> | undefined> {
+  const selection = await selectAuthority(root);
+  if (selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
+  const facade = await import("../store-facade.js");
+  const file = sqliteResetPaths.active(root);
+  const lineage = translateStoreOpenError(file, () => facade.readImmutableStoreLineage(file));
+  if (lineage.authorityId !== selection.authorityId) throw new StateAuthorityCorruptError(statePath(root),
+    "the immutable reset-consent snapshot has the wrong authority");
+  return lineage;
 }
 
 /**
@@ -282,6 +286,92 @@ async function saveThroughStore(
   }
 }
 
+/** Complete the already-authorized reset-lineage stream replacement through the
+ * selected authority. JSON retains its historical whole-document projection;
+ * SQLite changes the stream and applies the packet in one transaction. */
+export async function replaceResetLineageStream(
+  root: string,
+  authorizedSnapshot: SyncState,
+  rejectedState: SyncState,
+  packet: StateSavePacket,
+  acceptedProjection: SyncState,
+  legacyReplacement: SyncState,
+): Promise<SyncState> {
+  if (!stateWasStreamMismatch(authorizedSnapshot) || authorizedSnapshot.lastSyncedSequence !== 0) {
+    throw new Error("sync state stream replacement lacks reset provenance");
+  }
+  if (packet.expectedStream !== authorizedSnapshot.stream
+    || packet.expectedNonce !== authorizedSnapshot.stateNonce) {
+    throw new Error("sync state stream replacement packet is not bound to the authorized snapshot");
+  }
+  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+    await saveStateUnsafeLegacyOrTest(root, legacyReplacement);
+    return legacyReplacement;
+  }
+
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") {
+    throw new StateWriteRefusedError("state-lock-unavailable", statePath(root), acquired.status === "held" ? stateLockBusyDetail(acquired) : String(acquired.error));
+  }
+  try {
+    if (!acquired.lock.isOwnerSync()) {
+      throw new StateWriteRefusedError("state-lock-lease-lost", statePath(root));
+    }
+    const coordinator = await import("../authority-bootstrap.js");
+    coordinator.assertAuthorityWritable(root);
+    const selection = await coordinator.selectStateAuthority(root);
+    if (selection.kind === "legacy-json-store") throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
+    const inventory = await inventoryResetNamespace(root);
+    let exactResetArchive = false;
+    for (const archive of inventory.archives) {
+      if (archive.main !== "regular" || archive.sidecarVector !== "S0" || archive.stateSha256 === undefined) continue;
+      if ((await stableDbHash(archive.path)).sha256 === archive.stateSha256) {
+        exactResetArchive = true;
+        break;
+      }
+    }
+    if (!exactResetArchive) {
+      throw new Error("sync state stream replacement lacks an exact SQLite reset archive");
+    }
+    const authority = sqliteAuthority(root, selection);
+    const { store, facade } = await openAuthorityStore(authority, false);
+    try {
+      // Authorized-replacement L4 contract: the tuple must be re-read after the
+      // canonical lock is held. The lineage table is sufficient; projecting all
+      // files and repositories here would add no stronger mutation authority.
+      const live = facade.readReplacementLineage(store);
+      if (live.stream !== rejectedState.stream
+        || live.stateNonce !== rejectedState.stateNonce
+        || live.stateRevision !== rejectedState.stateRevision
+        || live.lastSyncedSequence !== 0
+        || live.stateNonce !== packet.expectedNonce) {
+        throw new Error("sync state stream replacement lineage changed under the canonical lock");
+      }
+      const result = await facade.replaceStreamAndApplySavePacketToStore(
+        store, packet, rejectedState.stream!, casOwnerTokenFromLock(acquired.lock),
+      );
+      if (result.status === "accepted") {
+        // Accepted-result contract: combine the CAS token with the caller's
+        // already-composed projection; do not walk the DB after mutation.
+        return facade.projectAcceptedSavePacket(acceptedProjection, result.token);
+      }
+      if (result.status === "rejected") {
+        try {
+          throw new Error(`sync state changed during authorized replacement (${LEGACY_REJECTION_REASON[result.reason]})`);
+        } finally {
+          result.retry.close();
+        }
+      }
+      if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
+      throw result.error;
+    } finally {
+      store.close();
+    }
+  } finally {
+    await acquired.lock.release();
+  }
+}
+
 type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["reason"];
 
 /**
@@ -298,15 +388,9 @@ type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["r
  * through the CAS — is pinned rather than merely compiled.
  */
 export const LEGACY_REJECTION_REASON = {
-  lineage: "nonce",
-  stream: "stream",
-  nonce: "nonce",
-  "state-revision": "nonce",
-  "base-generation": "global-sequence",
-  "local-revision": "nonce",
-  "repo-generation": "repo-generation",
-  "global-sequence": "global-sequence",
-  "owner-lost": "owner-lost",
+  lineage: "nonce", stream: "stream", nonce: "nonce",
+  "state-revision": "nonce", "base-generation": "global-sequence", "local-revision": "nonce",
+  "repo-generation": "repo-generation", "global-sequence": "global-sequence", "owner-lost": "owner-lost",
 } satisfies Record<CasRejectionReason, LegacyRejectionReason>;
 
 function translateCasResult(result: CasResult, store: StateStoreHandle, facade: StoreFacade): StateSaveResult {

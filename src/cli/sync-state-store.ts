@@ -15,6 +15,7 @@ export {
   ensureTelemetryBindingId,
   loadRawState,
   loadState,
+  selectedStateForResetConsent,
 } from "./state-plane/adapters/whole-state-compat.js";
 export {
   StreamMismatchError,

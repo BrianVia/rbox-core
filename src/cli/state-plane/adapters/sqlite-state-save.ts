@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { StateSavePacket } from "../../sync-state-model.js";
-import type { CasResult, ManifestHeader } from "../ports.js";
+import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
+import type { CasResult, LineageSnapshot, ManifestHeader } from "../ports.js";
 import { beginGeneration, type GenerationBuilder } from "../store/generations.js";
 import type { OwnedLockCasToken } from "../store/owner-token.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
@@ -18,7 +18,8 @@ import {
   type SealedRepoTransitionRef,
 } from "../store/transition-stages.js";
 import { applyCasPacket } from "../store/write-packet.js";
-import type { StateStoreHandle } from "../store/open.js";
+import { stateStoreDatabase, type StateStoreHandle } from "../store/open.js";
+import { selectRow } from "../store/statements.js";
 
 
 function deleteStage(directory: string, ref: SealedArtifactRef): void {
@@ -49,10 +50,57 @@ function manifestHeader(packet: StateSavePacket): ManifestHeader {
   return { ...header, complete: true };
 }
 
+export interface ReplacementLineage { stream: string; stateNonce: string; stateRevision: number; lastSyncedSequence: number }
+
+export function readReplacementLineage(store: StateStoreHandle): ReplacementLineage {
+  const row = selectRow<{
+    stream: string;
+    stateNonce: string | null;
+    stateRevision: number | null;
+    lastSyncedSequence: number;
+  }>(stateStoreDatabase(store), `SELECT stream,state_nonce AS stateNonce,
+    state_revision AS stateRevision,last_synced_sequence AS lastSyncedSequence
+    FROM state_lineage WHERE lineage_id=(SELECT active_lineage_id FROM store_meta WHERE singleton=1)`);
+  if (!row?.stateNonce || row.stateRevision === null) throw new Error("SQLite replacement lineage is incomplete");
+  return { ...row, stateNonce: row.stateNonce, stateRevision: row.stateRevision };
+}
+
+/** Add store-generated identity to the caller's already-composed projection. */
+export function projectAcceptedSavePacket(projection: SyncState, token: LineageSnapshot): SyncState {
+  const result: SyncState = {
+    ...projection,
+    stream: token.stream,
+    lastSyncedSequence: token.lastSyncedSequence,
+  };
+  if (token.nonce === undefined) delete result.stateNonce; else result.stateNonce = token.nonce;
+  if (token.stateRevision === undefined) delete result.stateRevision; else result.stateRevision = token.stateRevision;
+  if (token.telemetryBindingId === undefined) delete result.telemetryBindingId; else result.telemetryBindingId = token.telemetryBindingId;
+  return result;
+}
+
 export async function applySavePacketToStore(
   store: StateStoreHandle,
   packet: StateSavePacket,
   ownerToken: OwnedLockCasToken,
+): Promise<CasResult> {
+  return translateSavePacket(store, packet, ownerToken);
+}
+
+/** Apply a reset-provenance stream replacement and its packet in one CAS. */
+export async function replaceStreamAndApplySavePacketToStore(
+  store: StateStoreHandle,
+  packet: StateSavePacket,
+  replacementOldStream: string,
+  ownerToken: OwnedLockCasToken,
+): Promise<CasResult> {
+  return translateSavePacket(store, packet, ownerToken, replacementOldStream);
+}
+
+async function translateSavePacket(
+  store: StateStoreHandle,
+  packet: StateSavePacket,
+  ownerToken: OwnedLockCasToken,
+  replacementOldStream?: string,
 ): Promise<CasResult> {
   const directory = path.dirname(store.file);
   const token = openReadSnapshot(store).token;
@@ -129,6 +177,7 @@ export async function applySavePacketToStore(
           }
         : {}),
       repoTransitions: transitions,
+      replacementOldStream,
       ownerToken,
     });
     applied = result.status === "accepted" || result.status === "rejected";

@@ -10,6 +10,8 @@ export {
   openStateStore,
   openStateStoreForWalTakeover,
   ownedStateStoreWriterForReset,
+  readImmutableStoreLineage,
+  type ImmutableStoreLineage,
   type ResetCheckpointResult,
   StateStoreHandle,
   stateStoreDatabase,
@@ -22,7 +24,12 @@ export {
   loadRawStateFromStore,
   materializeManifestFromStore,
 } from "./adapters/read-only.js";
-export { applySavePacketToStore } from "./adapters/sqlite-state-save.js";
+export {
+  applySavePacketToStore,
+  projectAcceptedSavePacket,
+  readReplacementLineage,
+  replaceStreamAndApplySavePacketToStore,
+} from "./adapters/sqlite-state-save.js";
 export { publishStateBackup, type StateBackupOptions, type StateBackupResult } from "./backup/publish.js";
 export { beginGeneration, collectUnreferencedEntryValues, type GenerationBuilder } from "./store/generations.js";
 export {

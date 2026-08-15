@@ -10,6 +10,9 @@ import { resetQuarantineRoot } from "./reset-quarantine.js";
 import { setProtocolLockTraceForTests, type ProtocolLockTraceEvent } from "../cli/sync-git/protocol-locks.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import crypto from "node:crypto";
+import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
+import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
+import { createStateStore } from "./state-plane/store/open.js";
 
 let root = "";
 let cfg: WorkspaceConfig;
@@ -117,4 +120,20 @@ test("quarantine and restore use the complete repository-order fence", async () 
     expect(acquired).toEqual(["operation", "reflog", "origin", "git", "reservation", "orig-head", "index", "state"]);
     expect(operation).toMatch(/quarantine|restore/);
   }
+});
+
+test("doctor reports no standing reset through a real selected SQLite authority", async () => {
+  const authorityId = "a".repeat(32);
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId,
+    lineageId: "b".repeat(32),
+    stream: syncStreamId(cfg),
+    createdBy: "test",
+    stateNonce: "c".repeat(32),
+    stateRevision: 0,
+  }).close();
+  await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+
+  expect(await capture(() => resetJournalDoctorCmd(root))).toBe("reset journal: none");
 });

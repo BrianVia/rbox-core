@@ -27,6 +27,21 @@ beforeEach(async () => { dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-res
 afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }); });
 
 describe("design 138 bounded reset I/O", () => {
+  for (const lossPoint of ["temp-written", "before-rename"] as const) {
+    test(`boundedCopy refuses authority loss at the ${lossPoint} adjacency`, async () => {
+      const source = path.join(dir, "source-adjacent");
+      const destination = path.join(dir, "destination-adjacent");
+      await fs.writeFile(source, "new-bytes\n");
+      await fs.writeFile(destination, "accepted-bytes\n");
+      let owner = true;
+      await expect(boundedCopy(source, destination, 64, {
+        onStep(point) { if (point === lossPoint) owner = false; },
+        beforeRenameSync() { if (!owner) throw new Error("owner lost at boundedCopy rename"); },
+      })).rejects.toThrow("owner lost at boundedCopy rename");
+      expect(await fs.readFile(destination, "utf8")).toBe("accepted-bytes\n");
+    });
+  }
+
   test("boundedRead refuses symlinks and non-regular inputs", async () => {
     const file = path.join(dir, "state.json");
     const link = path.join(dir, "state-link.json");

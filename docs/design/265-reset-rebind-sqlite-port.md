@@ -456,12 +456,12 @@ Production baselines are nonblank lines / bytes.
 
 | Module | Baseline | Acceptance |
 |---|---:|---|
-| `reset-state.ts` | 462 / 25,389 | shrinks; raw JSON/parser and both journal gates gone |
+| `reset-state.ts` | 462 / 25,389 | landed 461 / 25,974; raw JSON/parser and both journal gates gone |
 | `reset-journal.ts` | 460 / 26,286 | format-neutral operations; hard 560 / 32,768 |
 | `reset-z-runtime.ts` | 113 / 6,014 | mandatory held-lock syscall checks; hard 150 / 8,192 |
 | `reset-lineage.ts` / `locks.ts` | 98 / 4,472; 353 / 16,640 | presence lstat gone; two inventory replacements, locks <= baseline + 8 lines |
-| whole-state / legacy JSON Adapters | 319 / 14,164; 392 / 20,038 | selected replacement; JSON byte behavior, fallback, and closure retained; hard 400 each |
-| **`sqlite-state-save.ts`** | **140 / 5,081** | owns packet-to-sealed/CAS translation for lineage replacement; hard 190 / 8,192; no duplicate translator |
+| whole-state / legacy JSON Adapters | 319 / 14,164; 392 / 20,038 | whole-state landed 399 / 19,118; selected replacement; JSON byte behavior, fallback, and closure retained; hard 400 each |
+| **`sqlite-state-save.ts`** | **140 / 5,081** | landed 184 / 7,316; owns packet-to-sealed/CAS translation, locked replacement tuple, and accepted projection identity; hard 190 / 8,192; no duplicate translator |
 | reset recovery / lifecycle | 460 / 21,410; 169 / 6,950 | passed canonical lock and active+seed checks; hard 520 / 28,672 and 230 / 12,800 |
 | **`trace-fs.ts`** | **132 / 5,756** | owns real SQLite reset rename/unlink checks; hard 180 / 10,240 |
 | **`reset-io.ts` / `engine/fsutil.ts`** | **335 / 15,752; 251 / 10,015** | synchronous pre-rename slot; non-reset behavior unchanged; hard 370 / 20,480 and 280 / 14,336 |
@@ -558,3 +558,75 @@ cannot erase a competing accepted write. It fails if ownership is checked only
 outside the actual syscall owner, E0 genesis or the last-writer witness can
 rename after losing ownership, the seed writer opens without authority, `Q`
 reaches JSON I/O, or any SP-4 behavior disappears.
+
+
+## Performance acceptance record (orchestrator-run, via-desktop Ryzen 5950X, bun 1.4.0, 20 samples/op)
+
+Harness: `scripts/bench/reset-sqlite-port.ts`; raw JSON is archived in the PR
+discussion. Design 265 specifies measurements but no numeric latency ceiling or
+baseline-delta threshold. Consequently this record does not claim that latency
+is “within bounds”: it is the SP-3 baseline against which a later stated budget
+or differential run can be evaluated.
+
+Corrective-round before/after (same host/runtime/sample count):
+
+| op | prior p50 / p95 ms | SP-3 p50 / p95 ms | whole-state projections before -> after |
+|---|---:|---:|---:|
+| P1 (Q) | 190.113 / 200.787 | 204.417 / 235.154 | 5 -> 1 |
+| L1 (Q) | 14.544 / 17.104 | 14.446 / 16.570 | 3 -> 1 |
+
+Complete corrected latency baseline:
+
+| op (authority) | p50 / p95 ms |
+|---|---:|
+| P1 (JSON) | 16.992 / 23.888 |
+| P1 (Q) | 204.417 / 235.154 |
+| S0 (JSON) | 0.280 / 0.676 |
+| S1 (Q) | 0.616 / 0.673 |
+| W1 (Q) | 3.820 / 4.301 |
+| L1 (JSON) | 2.876 / 4.607 |
+| L1 (Q) | 14.446 / 16.570 |
+
+Opens are itemized rather than collapsed. `projection RO` / `save RW` are the
+whole-state Adapter opens; begin and recovery are distinct lifecycle owners.
+
+| op | projection RO | save RW | begin active RW | begin seed create | recovery WAL takeover |
+|---|---:|---:|---:|---:|---:|
+| P1 (JSON) | 0 | 0 | 0 | 0 | 0 |
+| P1 (Q) | 1 | 0 | 1 | 1 | 0 |
+| S0 (JSON) | 0 | 0 | 0 | 0 | 0 |
+| S1 (Q) | 0 | 0 | 0 | 0 | 0 |
+| W1 (Q) | 0 | 0 | 0 | 0 | 1 |
+| L1 (JSON) | 0 | 0 | 0 | 0 | 0 |
+| L1 (Q) | 0 | 2 | 0 | 0 | 0 |
+
+Reads and namespace walks are likewise itemized. The immutable reads are the
+consent/locked reset tuple checks; begin, replacement-lock, and W1 SQL reads are
+reported separately.
+
+| op | immutable lineage | whole projection | begin lineage SQL | locked lineage SQL | recovery lineage SQL | namespace walks |
+|---|---:|---:|---:|---:|---:|---:|
+| P1 (JSON) | 0 | 0 | 0 | 0 | 0 | 0 |
+| P1 (Q) | 4 | 1 | 1 | 0 | 0 | 12 |
+| S0 (JSON) | 0 | 0 | 0 | 0 | 0 | 0 |
+| S1 (Q) | 0 | 0 | 0 | 0 | 0 | 1 |
+| W1 (Q) | 0 | 0 | 0 | 0 | 1 | 4 |
+| L1 (JSON) | 0 | 0 | 0 | 0 | 0 | 0 |
+| L1 (Q) | 0 | 1 | 0 | 1 | 0 | 1 |
+
+The harness now runs every JSON row before constructing/importing the SQLite
+fixtures. SQLite module evaluations before those rows: **0**; evaluations inside
+each JSON measured row: **0**. This makes the JSON no-evaluation claim observable
+rather than hiding an eager import in fixture setup.
+
+
+### Post-fix measurement (orchestrator-run, same host/method)
+
+After the 5→1 / 3→1 projection reduction: P1(Q) 194.5/215.7ms p50/p95 (opens
+itemized 3, reads 6 incl. newly instrumented namespace walks + lineage), L1(Q)
+12.4/15.4ms. **Latency is unchanged — the cost was never the duplicate
+projections; it is the durability fsync sequence, which a destructive reset
+must pay.** The §8 fix stands on contract and simplicity grounds (one
+materialization, cheaper rechecks), not a latency win; the earlier causal
+attribution of 190ms to the projections was wrong and is corrected here.
+This table is the SP-3 baseline.

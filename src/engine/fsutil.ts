@@ -42,6 +42,9 @@ export async function writeFileAtomic(
   opts: {
     beforeTempCreate?: () => void | Promise<void>;
     beforeRename?: () => boolean | Promise<boolean>;
+    /** Synchronous final assertion at the publication syscall. Runs after every
+     * awaited hook and immediately before rename. */
+    beforeRenameSync?: () => void;
     mode?: number;
     flag?: string;
     /** Opt-in exact mode enforcement for secret material; ordinary callers keep umask semantics. */
@@ -82,8 +85,9 @@ export async function writeFileAtomic(
     await fs.rm(tmp, { force: true }).catch(() => {});
     return;
   }
+  await opts.onStep?.("before-rename");
+  opts.beforeRenameSync?.();
   try {
-    await opts.onStep?.("before-rename");
     await fs.rename(tmp, absPath);
     await opts.onStep?.("after-rename");
   } catch (error) {

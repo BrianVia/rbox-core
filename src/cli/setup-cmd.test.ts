@@ -34,7 +34,7 @@ import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } 
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { promptPath } from "./prompt.js";
 import { LEGACY_GENESIS_SERVICE_MESSAGE, LegacyGenesisServiceError, NetworkError, WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
-import { loadRawState, loadState, resetSyncState, saveConfig, StreamMismatchError } from "./config.js";
+import { loadRawState, loadState, resetSyncState, saveConfig, stateLockPath, StreamMismatchError } from "./config.js";
 import { inspectResetConsent, type ResetConsentWitness } from "./reset-consent.js";
 import { beginResetJournal, recoverResetJournal, resetArchivePath, resetJournalPath } from "./reset-journal.js";
 import { resetJournalDoctorCmd } from "./reset-journal-doctor.js";
@@ -44,6 +44,10 @@ import { saveDevice } from "./e2ee-keystore.js";
 import { genesisPaths, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
 import { loadCredentials, saveCredentials } from "./credentials.js";
+import { acquireLock } from "../engine/lockfile.js";
+import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
+import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
+import { createStateStore } from "./state-plane/store/open.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -833,12 +837,15 @@ test("v2 transaction quarantine composes end to end with the next setup rebind",
     const oldBytes = await fs.readFile(path.join(root, ".rbox", "state.json"));
     const oldHash = createHash("sha256").update(oldBytes).digest("hex");
     const archive = resetArchivePath(root, oldState!.stateNonce!, oldHash);
+    const stateLock = await acquireLock(stateLockPath(root));
+    if (stateLock.status !== "acquired") throw new Error(`test state lock unavailable: ${stateLock.status}`);
     await beginResetJournal(root, "quarantined-next", oldBytes, oldState!, [], {
       version: 2, authorizedNextStream: "quarantined-next", consentKind: "setup-rebind", mintedAtRevision: 4,
-    }, {
+    }, stateLock.lock, {
       now: () => new Date("2026-07-17T12:00:00.000Z"),
       randomBytes: (size) => Buffer.alloc(size, 0x33),
     });
+    await stateLock.lock.release();
     await expect(recoverResetJournal(root, oldStream, { crashAt: (point) => {
       if (point === "after-ready") throw new Error(point);
     } })).rejects.toThrow("after-ready");
@@ -865,6 +872,48 @@ test("v2 transaction quarantine composes end to end with the next setup rebind",
     expect(result.kind).toBe("completed");
     expect(await loadState(root, nextStream)).toMatchObject({ stream: nextStream, stateRevision: 5 });
     expect(await fs.lstat(resetJournalPath(root)).catch(() => undefined)).toBeUndefined();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("setup rebind resets a real selected SQLite authority", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-sqlite-rebind-"));
+  const oldStream = "https://api.test::ws_old::root";
+  const nextStream = "https://api.test::ws_new::root";
+  const authorityId = "a".repeat(32);
+  try {
+    await saveConfig(root, {
+      schema: "e2ee/v1", remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old",
+      projectId: "root", rootPath: root, deviceId: "dev_old", token: "",
+    });
+    await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+    createStateStore(sqliteResetPaths.active(root), {
+      authorityId, lineageId: "b".repeat(32), stream: oldStream, createdBy: "test",
+      stateNonce: "c".repeat(32), stateRevision: 4,
+    }).close();
+    await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "existing", header: "Workspace" },
+      {
+        loadCredentials: validSetupCredentials,
+        promptWorkspacePick: async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } }),
+        promptPath: async () => root,
+        loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+        promptConfirm: async () => true,
+        runInit: async (_flags, initOpts) => {
+          await resetSyncState(root, nextStream, undefined, initOpts.resetConsent);
+          return { workspaceId: "ws_new", deviceId: "dev_new", root };
+        },
+        writeStderr: () => undefined,
+      },
+    );
+
+    expect(result.kind).toBe("completed");
+    expect(await loadState(root, nextStream)).toMatchObject({ stream: nextStream, stateRevision: 5 });
+    expect(await fs.readFile(statePath(root))).toEqual(authorityMarkerBytes(authorityId));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

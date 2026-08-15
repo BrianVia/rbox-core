@@ -15,7 +15,7 @@ import type { OwnedLockCasToken } from "./owner-token.js";
 import { buildCasRetryView } from "./cas-retry-view.js";
 import {
   Rejected, applyGlobal, applyTransitions, checkPredicates, copyTransitionRowsIntoTemp,
-  createTransitionTemp, dropTransitionTemp, freezeValue, rebuildManifestProjection, reject,
+  createTransitionTemp, dropTransitionTemp, freezeGlobalManifestMeta, rebuildManifestProjection, reject,
   type FrozenCasInputs,
 } from "./cas-steps.js";
 import { copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp } from "./generations.js";
@@ -41,6 +41,8 @@ export interface CasPacket {
   sourceGlobalSeq: number;
   global?: { stage: SealedStageRef; fileHeader: ManifestHeader; manifestMeta?: GlobalManifestMeta };
   repoTransitions: SealedRepoTransitionRef;
+  /** Reset-provenance stream observed before the packet's target stream. */
+  replacementOldStream?: string;
   /** Only a branded token minted from a held `OwnedLock` (or the test-only seam)
    * can authorize a commit; a bare `{ isOwner }` is rejected at this boundary. */
   ownerToken: OwnedLockCasToken;
@@ -150,16 +152,17 @@ export function applyCasPacket(
     // Everything the transaction reads is copied here, out of the verified
     // artifact and the packet scalars, once and for all.
     const frozen: FrozenCasInputs = {
-      expected: freezeValue(packet.expected),
+      expected: { ...packet.expected },
       sourceGlobalSeq: packet.sourceGlobalSeq,
       hasGlobal: packet.global !== undefined,
-      ...(sealedHeader === undefined ? {} : { globalHeader: freezeValue(sealedHeader) }),
-      ...(packet.global?.manifestMeta === undefined
-        ? {}
-        : { globalManifestMeta: freezeValue(packet.global.manifestMeta) }),
-      ...(packet.repoTransitions.globalBinding === undefined
-        ? {}
-        : { globalBinding: freezeValue(packet.repoTransitions.globalBinding) }),
+      globalHeader: sealedHeader,
+      globalManifestMeta: packet.global?.manifestMeta === undefined
+        ? undefined
+        : freezeGlobalManifestMeta(packet.global.manifestMeta),
+      globalBinding: packet.repoTransitions.globalBinding === undefined
+        ? undefined
+        : { ...packet.repoTransitions.globalBinding },
+      replacementOldStream: packet.replacementOldStream,
       ownerToken: packet.ownerToken,
     };
     const result = runTransaction(db, stageDirectory, frozen, verified, hooks);
@@ -235,6 +238,7 @@ function runTransaction(
   verified: ReadonlySet<string>,
   hooks: CasInternalHooks,
 ): CasResult {
+  if (!frozen.ownerToken.isOwner()) return buildRejection(db, stageDirectory, "owner-lost", hooks);
   try {
     db.exec("BEGIN IMMEDIATE");
   } catch (error) {
@@ -247,6 +251,9 @@ function runTransaction(
   try {
     checkPredicates(db, frozen, verified);
     const lineageId = frozen.expected.lineageId;
+    if (frozen.replacementOldStream !== undefined) {
+      runStatement(db, "UPDATE state_lineage SET stream=? WHERE lineage_id=?", frozen.expected.stream, lineageId);
+    }
     if (frozen.hasGlobal) applyGlobal(db, frozen, lineageId);
     applyTransitions(db, lineageId);
     const generation = frozen.expected.baseGeneration + (frozen.hasGlobal ? 1 : 0);

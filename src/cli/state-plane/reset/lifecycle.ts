@@ -13,6 +13,9 @@ import {
 } from "../store-facade.js";
 import { readAuthorityMarkerId } from "../authority-marker.js";
 import { fsyncDirectory } from "../../../engine/fsutil.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
+import { StateWriteRefusedError } from "../errors.js";
+import { stateLockPath } from "../paths.js";
 import {
   fsyncDbAndParent,
   readExactDbSeed,
@@ -34,16 +37,24 @@ export interface PreparedResetDbSeed {
   stateRevision: number;
 }
 
+function assertResetOwner(root: string, heldLock: OwnedLock, target: string): void {
+  if (path.resolve(heldLock.path) !== path.resolve(stateLockPath(root))) {
+    throw new StateWriteRefusedError("state-lock-unavailable", target, "held lock has the wrong canonical path");
+  }
+  if (!heldLock.isOwnerSync()) throw new StateWriteRefusedError("state-lock-lease-lost", target);
+}
+
 export async function readSqliteAuthorityId(root: string): Promise<string> {
   const authorityId = await readAuthorityMarkerId(sqliteResetPaths.authorityMarker(root));
   if (authorityId === undefined) throw new Error("SQLite reset requires the exact authority marker");
   return authorityId;
 }
 
-export async function quiesceActiveDbForReset(root: string): Promise<SqliteResetLineage> {
+export async function quiesceActiveDbForReset(root: string, heldLock: OwnedLock): Promise<SqliteResetLineage> {
   const authorityId = await readSqliteAuthorityId(root);
   const file = sqliteResetPaths.active(root);
   closeOwnedStateStoreReadersForReset(file);
+  assertResetOwner(root, heldLock, file);
   const store = ownedStateStoreWriterForReset(file) ?? openStateStore(file);
   let lineage: (SqliteResetLineage & { authorityId: string }) | undefined;
   try {
@@ -64,12 +75,14 @@ export async function quiesceActiveDbForReset(root: string): Promise<SqliteReset
       stateRevision: row.stateRevision,
       ...(row.telemetryBindingId === null ? {} : { telemetryBindingId: row.telemetryBindingId }),
     };
+    assertResetOwner(root, heldLock, file);
     checkpointStateStoreForReset(store);
   } finally {
     store.close();
   }
   if (!lineage || lineage.authorityId !== authorityId) throw new Error("SQLite reset authority/DB identity mismatch");
   await requireDbArtifactS0(file);
+  assertResetOwner(root, heldLock, file);
   await fsyncDbAndParent(file);
   await requireDbArtifactS0(file);
   return {
@@ -83,12 +96,14 @@ export async function quiesceActiveDbForReset(root: string): Promise<SqliteReset
 /** W1 is the only path allowed to open an active DB carrying WAL/SHM. */
 export async function recoverOrdinaryWalCrash(
   root: string,
+  heldLock: OwnedLock,
   expected?: Partial<SqliteResetLineage>,
   hooks: { crashAt?: (point: string) => void | Promise<void> } = {},
 ): Promise<SqliteResetLineage> {
   const authorityId = await readSqliteAuthorityId(root);
   const file = sqliteResetPaths.active(root);
   closeOwnedStateStoreReadersForReset(file);
+  assertResetOwner(root, heldLock, file);
   const store = openStateStoreForWalTakeover(file);
   let observed: SqliteResetLineage & { authorityId: string };
   try {
@@ -114,12 +129,14 @@ export async function recoverOrdinaryWalCrash(
     if (expected?.stateNonce !== undefined && expected.stateNonce !== observed.stateNonce) throw new Error("W1 nonce mismatch");
     if (expected?.stateRevision !== undefined && expected.stateRevision !== observed.stateRevision) throw new Error("W1 revision mismatch");
     await hooks.crashAt?.("before-w1-checkpoint");
+    assertResetOwner(root, heldLock, file);
     checkpointStateStoreForReset(store);
     await hooks.crashAt?.("after-w1-checkpoint");
   } finally {
     store.close();
   }
   await requireDbArtifactS0(file);
+  assertResetOwner(root, heldLock, file);
   await fsyncDbAndParent(file);
   if (await readSqliteAuthorityId(root) !== authorityId) throw new Error("W1 authority changed after checkpoint");
   return {
@@ -134,8 +151,10 @@ export async function prepareEmptyResetDbSeed(
   root: string,
   next: SqliteResetLineage,
   authorityId: string,
+  heldLock: OwnedLock,
 ): Promise<PreparedResetDbSeed> {
   const directory = path.join(sqliteResetPaths.stateRoot(root), "reset-candidates");
+  assertResetOwner(root, heldLock, directory);
   await fs.mkdir(directory, { recursive: true });
   const basename = `seed-${next.stateNonce}.db`;
   const temp = path.join(
@@ -144,6 +163,7 @@ export async function prepareEmptyResetDbSeed(
   );
   let created = false;
   try {
+    assertResetOwner(root, heldLock, temp);
     const store = createStateStore(temp, {
       stream: next.stream,
       authorityId,
@@ -154,8 +174,12 @@ export async function prepareEmptyResetDbSeed(
       createdBy: "reset-v1/sqlite",
     });
     created = true;
-    try { checkpointStateStoreForReset(store); } finally { store.close(); }
+    try {
+      assertResetOwner(root, heldLock, temp);
+      checkpointStateStoreForReset(store);
+    } finally { store.close(); }
     await requireDbArtifactS0(temp);
+    assertResetOwner(root, heldLock, temp);
     await fsyncDbAndParent(temp);
     const bytes = await readExactDbSeed(temp);
     return {
@@ -165,10 +189,12 @@ export async function prepareEmptyResetDbSeed(
       stateRevision: next.stateRevision,
     };
   } finally {
-    if (created) {
+    if (created && heldLock.isOwnerSync()) {
       for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+        assertResetOwner(root, heldLock, `${temp}${suffix}`);
         await fs.rm(`${temp}${suffix}`, { force: true }).catch(() => undefined);
       }
+      assertResetOwner(root, heldLock, directory);
       await fsyncDirectory(directory).catch(() => undefined);
     }
   }
