@@ -10,8 +10,19 @@ import { timePushTailRequest } from "../push-spans.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 import { RBOX_VERSION } from "../version.js";
 import { debugEnabled } from "../debug.js";
+import type { JsonValue } from "../../json.js";
 
 const authGrantEnabled = (): boolean => process.env.RBOX_AUTH_GRANT !== "0";
+
+/** Bearer + client version — on every control-plane request this context issues. */
+type AuthHeaders = { authorization: string; "x-rbox-version": string };
+/** `AuthHeaders` plus the §27 download grant, present only while one is held. */
+type DownloadAuthHeaders = { authorization: string; "x-rbox-version": string; "x-rbox-download-grant"?: string };
+/** `AuthHeaders` plus the §23 upload-receipts protocol tag. */
+type ProtoAuthHeaders = { authorization: string; "x-rbox-version": string; "x-rbox-protocol": string };
+/** `ProtoAuthHeaders` plus the §109 upload grant, present only while one is fresh. */
+type BatchPutAuthHeaders = { authorization: string; "x-rbox-version": string; "x-rbox-protocol": string; "x-rbox-upload-grant"?: string };
+
 export const UPLOAD_GRANT_ATTACH_WINDOW_MS = 270_000;
 export const UPLOAD_GRANT_REFRESH_AFTER_MS = 240_000;
 export const UPLOAD_GRANT_RETRY_INTERVAL_MS = 15_000;
@@ -53,11 +64,11 @@ export class RemoteContext {
   private uploadGrantRefresh?: Promise<void>;
   private uploadGrantRetryBlockedUntilMs = 0;
 
-  get auth(): Record<string, string> {
+  get auth(): AuthHeaders {
     return { authorization: `Bearer ${this.token}`, "x-rbox-version": RBOX_VERSION };
   }
   /** `auth` plus the §27 download grant when held (so blob GETs skip the D1 read). */
-  get authDownload(): Record<string, string> {
+  get authDownload(): DownloadAuthHeaders {
     return this.downloadGrant ? { ...this.auth, "x-rbox-download-grant": this.downloadGrant } : this.auth;
   }
   /** Capture a §27 grant from a `/latest` response body (no-op when absent — old server). */
@@ -67,11 +78,11 @@ export class RemoteContext {
       this.downloadGrantCapturedAtMs = Date.now();
     }
   }
-  get protoAuth(): Record<string, string> {
+  get protoAuth(): ProtoAuthHeaders {
     return { ...this.auth, "x-rbox-protocol": RemoteContext.PROTO };
   }
   /** Bearer is always present; the grant is only a server verification fast path. */
-  get batchPutAuth(): Record<string, string> {
+  get batchPutAuth(): BatchPutAuthHeaders {
     // A grant expiring mid-flight is correctness-harmless because the server falls
     // back to this bearer; the conservative attach margin only keeps that rare.
     if (
@@ -131,7 +142,10 @@ export class RemoteContext {
     return fetchResilient(url, init, opts);
   }
 
-  async postJson(path: string, body: unknown, opts: ResilientOpts = {}): Promise<Response> {
+  /** `body` is whatever JSON this control call sends: either an already-`JsonValue`
+   *  payload, or an object whose own properties are all `JsonValue` (the constraint
+   *  `RboxApi.postJson` forwards). Both are exactly what `JSON.stringify` can encode. */
+  async postJson<Body extends JsonValue | Partial<Record<keyof Body, JsonValue>>>(path: string, body: Body, opts: ResilientOpts = {}): Promise<Response> {
     return this.fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.auth, "content-type": "application/json" }, body: JSON.stringify(body) }, opts);
   }
 

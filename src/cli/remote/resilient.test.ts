@@ -198,7 +198,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
     globalThis.fetch = (async () => {
       calls++;
       return new Response(JSON.stringify({ head: 7 }), { status: 409 });
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
     const res = await fetchResilient("https://api.test/manifests", { method: "POST" }, { retries: 3, sleep: noSleep });
     expect(res.status).toBe(409);
     expect(calls).toBe(1); // a Response is not a fault → no retry
@@ -210,7 +210,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
       calls++;
       if (calls === 1) throw socketClosed();
       return new Response("ok", { status: 200 });
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
     const res = await fetchResilient("https://api.test/blobs/x", { method: "PUT" }, { retries: 2, sleep: noSleep });
     expect(res.status).toBe(200);
     expect(calls).toBe(2);
@@ -222,12 +222,12 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
     let calls = 0;
     const timeoutBudgets: number[] = [];
     try {
-      (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = ((ms: number) => {
+      AbortSignal.timeout = (ms: number) => {
         timeoutBudgets.push(ms);
         const ctrl = new AbortController();
         queueMicrotask(() => ctrl.abort(new DOMException("control request black-holed", "TimeoutError")));
         return ctrl.signal;
-      }) as typeof AbortSignal.timeout;
+      };
       globalThis.fetch = (async (_url: string, init?: RequestInit) => {
         calls++;
         if (calls <= 2) {
@@ -239,7 +239,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
           });
         }
         return new Response("ok", { status: 200 });
-      }) as unknown as typeof fetch;
+      }) as typeof fetch;
 
       const res = await fetchResilient("https://api.test/manifests", { method: "POST" }, { retries: 2, sleep: noSleep, op: "publishing your changes" });
 
@@ -248,7 +248,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
       expect(timeoutBudgets).toEqual([SMALL_CONTROL_TIMEOUT_MS, SMALL_CONTROL_TIMEOUT_MS, SMALL_CONTROL_TIMEOUT_MS]);
     } finally {
       globalThis.fetch = origFetch;
-      (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origTimeout;
+      AbortSignal.timeout = origTimeout;
     }
   });
 
@@ -257,7 +257,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
     globalThis.fetch = (async () => {
       calls++;
       throw socketClosed();
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
     const err = await fetchResilient("https://api.test/complete", { method: "POST" }, { retries: 0, sleep: noSleep, op: "finalizing upload" }).catch((e) => e);
     expect(calls).toBe(1); // no retry
     expect(err).toBeInstanceOf(NetworkError);
@@ -280,7 +280,7 @@ describe("live socket-close (real Bun fault, not a stub)", () => {
       if ((e as { code?: unknown }).code === "EPERM") return; // local TCP listen denied by the sandbox
       throw e;
     }
-    const port = (server as unknown as { port: number }).port;
+    const port = server.port;
     try {
       // First: confirm the predicate matches the genuine thrown error.
       const raw = await fetch(`http://127.0.0.1:${port}/`).catch((e) => e);

@@ -673,6 +673,14 @@ export async function enrollViaRecoveryWithPhraseInput(readPhrase:()=>Promise<st
   finally{await pair.account.release();await pair.global.release();}
 }
 
+/** Everything `admitWithRetry` needs, built once before admission so a pre-admission
+ *  failure is reported as `RecoveryPreAdmissionError` rather than an admission fault. */
+interface PreparedAdmission {
+  deviceId: string;
+  initial: RedeemResult;
+  build: (curDto: AccountKeysDTO) => Promise<RedeemResult>;
+}
+
 /** Recovery continuation for callers that already passed the local BIP39 gate. */
 export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number, loaded?: CredentialLoadResult): Promise<{ accountId: string; deviceId: string }> {
   const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
@@ -684,7 +692,7 @@ export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number,
 }
 
 async function enrollViaPrevalidatedRecoveryLocked(rk:Uint8Array,now:number,creds:NonNullable<ReturnType<typeof credentialsForStrictFlow>>,accountId:string,api:RboxApi):Promise<{accountId:string;deviceId:string}>{
-  let prepared: { deviceId: string; initial: RedeemResult; build: (curDto: AccountKeysDTO) => Promise<RedeemResult> };
+  let prepared: PreparedAdmission;
   try {
     const dto = await api.getAccountKeys();
     if (!dto) throw new Error("account has no key material (fatal)");
