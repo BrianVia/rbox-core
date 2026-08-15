@@ -554,3 +554,12 @@ removed; the redacted result is retained at
 - Third distinct flaky test in daemon-activity.test.ts (see the two FIXED
   entries above). If it recurs, the file earns the shard-ordering
   reproduction treatment rather than another single-test fix.
+
+## THIRD SIGHTING (trusted-pull family): "design 202: an armed daemon logs pull local=trusted and refreshes with the O(applied) patch"
+
+- 2026-08-15, PR #737 (SP-2 state-plane change), tests shard 2/6, attempt 1.
+- Proof: failed on attempt 1; 34/34 green in isolation on the same tree;
+  --failed rerun green and the PR merged on it.
+- Third distinct sighting in the trusted-pull family (see the two SUSPECTED
+  entries above). Per the standing bar this family NOW EARNS the
+  shard-ordering reproduction treatment (FLAKE-008 style) — queued.
