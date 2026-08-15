@@ -1,5 +1,7 @@
 # 266 — Genesis is the absent-state default
 
+Founder decision (2026-08-15, pinned): the lock-capable-filesystem boundary is APPROVED as 'refuse upfront' — clear setup-time error, telemetry counts occurrences, no log-only phase, no degraded path.
+
 Status: DRAFT v3 — SP-3 of design 262 v2; engineering ALIGNED after the capped
 three review rounds. The filesystem product boundary and exact user copy in §1
 still require founder sign-off. SP-2b/design 265 is still in flight. SP-2.5 may
