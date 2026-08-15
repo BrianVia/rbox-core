@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../../src/json.js";
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { cappedJson, exactObject, json, sha256Hex, utf8Bytes } from "./util.js";
@@ -29,7 +30,7 @@ export const LINK_START_MAX_BYTES = 128 * 1024;
 export const LINK_CONFIRM_MAX_BYTES = 128 * 1024;
 export const LINK_REDEEM_MAX_BYTES = 1024;
 
-export function validateLinkStartBody(value: unknown): { clerkToken: string } | null {
+export function validateLinkStartBody(value: JsonValue): { clerkToken: string } | null {
   return exactObject(value, ["clerkToken"])
     && typeof value.clerkToken === "string"
     && utf8Bytes(value.clerkToken) <= 16_384
@@ -38,7 +39,7 @@ export function validateLinkStartBody(value: unknown): { clerkToken: string } | 
     : null;
 }
 
-export function validateLinkConfirmBody(value: unknown): { clerkToken: string; pollKey: string } | null {
+export function validateLinkConfirmBody(value: JsonValue): { clerkToken: string; pollKey: string } | null {
   return exactObject(value, ["clerkToken", "pollKey"])
     && typeof value.clerkToken === "string"
     && utf8Bytes(value.clerkToken) <= 16_384
@@ -49,7 +50,7 @@ export function validateLinkConfirmBody(value: unknown): { clerkToken: string; p
     : null;
 }
 
-export function validateLinkRedeemBody(value: unknown): { code: string } | null {
+export function validateLinkRedeemBody(value: JsonValue): { code: string } | null {
   if (!exactObject(value, ["code"]) || typeof value.code !== "string") return null;
   const code = value.code.startsWith(LINK_PREFIX) ? value.code.slice(LINK_PREFIX.length) : value.code;
   return CODE_RE.test(code) ? { code: value.code } : null;

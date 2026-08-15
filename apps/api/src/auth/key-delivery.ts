@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../../../src/json.js";
 import type { Env } from "../env.js";
 import type { Principal } from "../authz.js";
 import { dbFor, dirDb } from "../db.js";
@@ -319,7 +320,7 @@ interface FetchBody {
   keyReleaseOptIn: boolean;
 }
 
-export function validateKeyDeliveryFetchBody(value: unknown): FetchBody | null {
+export function validateKeyDeliveryFetchBody(value: JsonValue): FetchBody | null {
   if (!objectWithKeys(value, ["keyReleaseOptIn", "requestId"], ["keyReleaseOptIn"])) return null;
   if (typeof value.keyReleaseOptIn !== "boolean") return null;
   if (value.requestId !== undefined && (typeof value.requestId !== "string" || !REQUEST_ID_RE.test(value.requestId))) return null;
@@ -440,13 +441,18 @@ interface SubmitBody {
   accountEpoch: number;
 }
 
-export function validateKeyDeliverySubmitBody(value: unknown): SubmitBody | null {
+export function validateKeyDeliverySubmitBody(value: JsonValue): SubmitBody | null {
   if (!exactObject(value, ["requestId", "mkWrapDevice", "publishedRosterVersion", "accountEpoch"])) return null;
   if (typeof value.requestId !== "string" || !REQUEST_ID_RE.test(value.requestId)) return null;
   if (typeof value.mkWrapDevice !== "string" || value.mkWrapDevice.length === 0 || utf8Bytes(value.mkWrapDevice) > KEY_DELIVERY_WRAP_MAX_BYTES) return null;
   if (typeof value.publishedRosterVersion !== "number" || !Number.isSafeInteger(value.publishedRosterVersion) || value.publishedRosterVersion < 0) return null;
   if (typeof value.accountEpoch !== "number" || !Number.isSafeInteger(value.accountEpoch) || value.accountEpoch < 0) return null;
-  return value as unknown as SubmitBody;
+  return {
+    requestId: value.requestId,
+    mkWrapDevice: value.mkWrapDevice,
+    publishedRosterVersion: value.publishedRosterVersion,
+    accountEpoch: value.accountEpoch,
+  };
 }
 
 /** Single fulfillment CAS. The roster/device rows must already be committed and
@@ -541,7 +547,7 @@ interface AckBody {
   requestId: string;
 }
 
-export function validateKeyDeliveryAckBody(value: unknown): AckBody | null {
+export function validateKeyDeliveryAckBody(value: JsonValue): AckBody | null {
   return exactObject(value, ["requestId"])
     && typeof value.requestId === "string"
     && REQUEST_ID_RE.test(value.requestId)

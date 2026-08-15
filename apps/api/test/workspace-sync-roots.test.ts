@@ -27,14 +27,41 @@ if (!("WebSocketRequestResponsePair" in globalThis)) {
 
 interface StorageWrites { kv: number; transactions: number; alarms: number }
 
+/** The members WorkspaceSync touches, each widened so the real Cloudflare type
+ *  stays assignable to the double — hence the single downcast at the end. */
+interface FakeSqlStorage {
+  exec(query: string, ...bindings: unknown[]): { toArray(): Array<Record<string, SqlStorageValue>> };
+}
+
+interface FakeKvStorage {
+  get(key: string): unknown;
+  put<T>(key: string, value: T): void;
+  delete(key: string): boolean;
+  list(): Iterable<[string, unknown]>;
+}
+
+interface FakeStorage {
+  sql: FakeSqlStorage;
+  kv: FakeKvStorage;
+  transactionSync(fn: () => void): void;
+  getAlarm(): Promise<number | null>;
+  setAlarm(at: number): void;
+}
+
+interface FakeDurableObjectState {
+  storage: FakeStorage;
+  getWebSockets(): WebSocket[];
+  setWebSocketAutoResponse(): void;
+}
+
 function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: () => boolean, writes?: StorageWrites): DurableObjectState {
   let alarm: number | null = null;
-  return {
+  const state: FakeDurableObjectState = {
     storage: {
       sql,
       kv: {
         get: (key: string) => kv.get(key),
-        put: (key: string, value: unknown) => { if (writes) writes.kv++; return kv.set(key, value); },
+        put: (key, value) => { if (writes) writes.kv++; kv.set(key, value); },
         delete: (key: string) => { if (writes) writes.kv++; return kv.delete(key); },
         list: () => new Map(),
       },
@@ -51,12 +78,13 @@ function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: 
           throw new Error("injected transaction crash");
         }
       },
-      getAlarm: () => alarm,
+      getAlarm: async () => alarm,
       setAlarm: (at: number) => { if (writes) writes.alarms++; alarm = at; },
     },
     getWebSockets: () => [],
     setWebSocketAutoResponse: () => {},
-  } as unknown as DurableObjectState;
+  };
+  return state as DurableObjectState;
 }
 
 function signed(seq: number, refs: { inline: string[] } | { sidecarSha: string; count: number }, manifestChain?: string[]) {
@@ -418,8 +446,11 @@ describe("design 142 read-only retained-roots inspection", () => {
     const kv = new Map<string, unknown>();
     const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
     let sqlCalls = 0;
-    const sql = { exec: () => { sqlCalls++; throw new Error("SQL must not be touched"); } };
-    const sync = new WorkspaceSync(fakeCtx(kv, sql as ReturnType<typeof fakeDoSql>, undefined, writes), {} as never);
+    const sql: ReturnType<typeof fakeDoSql> = {
+      __dropped: new Map(), __seqRoots: new Map(),
+      exec: () => { sqlCalls++; throw new Error("SQL must not be touched"); },
+    };
+    const sync = new WorkspaceSync(fakeCtx(kv, sql, undefined, writes), {} as never);
     const res = await sync.fetch(new Request("https://do/roots-inspect?ws=cold&proj=root"));
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: "index_unavailable", reason: "uninitialized" });
@@ -449,14 +480,14 @@ describe("design 142 read-only retained-roots inspection", () => {
     ]);
     const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
     const queries: string[] = [];
-    const sql = {
+    const sql: ReturnType<typeof fakeDoSql> = {
       __dropped: new Map(), __seqRoots: new Map(),
       exec(query: string) { queries.push(query); throw new Error("no such table: dropped_index"); },
     };
     const logged: string[] = [];
     const consoleError = vi.spyOn(console, "error").mockImplementation((line) => { logged.push(String(line)); });
     try {
-      const sync = new WorkspaceSync(fakeCtx(kv, sql as unknown as ReturnType<typeof fakeDoSql>, undefined, writes), {} as never);
+      const sync = new WorkspaceSync(fakeCtx(kv, sql, undefined, writes), {} as never);
       const res = await sync.fetch(new Request("https://do/roots-inspect"));
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: "index_unavailable", reason: "storage_unreadable" });
@@ -508,7 +539,7 @@ describe("design 84 — refSetAt ordering invariant", () => {
       },
     } as never;
     const sync = new WorkspaceSync(fakeCtx(kv), env);
-    const result = await (sync as unknown as { refSetAt(seq: number): Promise<{ refs: Set<string> } | null> }).refSetAt(1);
+    const result = await sync["refSetAt"](1);
     expect(result).not.toBeNull();
     const iterated = [...result!.refs];
     expect(iterated).toEqual([...iterated].sort());
