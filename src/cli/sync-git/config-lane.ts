@@ -4,7 +4,7 @@ import { hashBytes } from "../../engine/index.js";
 import { repoCtxFromDisk, type RepoCtx } from "./git-state.js";
 import { canonicalizeGitConfig, type GitConfig } from "./config-sync.js";
 import { readStableParsedConfigSnapshot, type ConfigFault, type GitConfigRunner } from "./config-txn.js";
-import { type ConfigShapeIdentity } from "../config.js";
+import { type ConfigStoreIdentity } from "../config.js";
 import { repoDirOf } from "./shared.js";
 /** `type`, not `interface`, so it keeps its implicit index signature and stays
  * comparable with `JsonValue` — it is embedded in the decoded divergence cache. */
@@ -80,7 +80,7 @@ export async function readLocalGitConfig(
   };
 }
 
-export function sameConfigShape(a: ConfigShapeIdentity | undefined, b: ConfigShapeIdentity | undefined): boolean {
+export function sameConfigStoreIdentity(a: ConfigStoreIdentity | undefined, b: ConfigStoreIdentity | undefined): boolean {
   return a !== undefined && b !== undefined && a.shape === b.shape &&
     a.commonDir.realpath === b.commonDir.realpath && a.commonDir.dev === b.commonDir.dev &&
     a.commonDir.ino === b.commonDir.ino && a.commonDir.birthtime === b.commonDir.birthtime;
@@ -88,7 +88,7 @@ export function sameConfigShape(a: ConfigShapeIdentity | undefined, b: ConfigSha
 
 /** Design 93 §9 receiver ownership: only a standalone dir repo whose common
  * store is contained by this workspace owns its local config lane. */
-export async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owned: boolean; shape: ConfigShapeIdentity; configPath: string }> {
+export async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owned: boolean; storeIdentity: ConfigStoreIdentity; configPath: string }> {
   const [rootReal, gitReal, commonReal, stat] = await Promise.all([
     fs.realpath(root),
     fs.realpath(ctx.gitDir),
@@ -97,7 +97,7 @@ export async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owne
   ]);
   const relative = path.relative(rootReal, commonReal);
   const contained = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-  const shape: ConfigShapeIdentity = {
+  const storeIdentity: ConfigStoreIdentity = {
     shape: ctx.kind,
     commonDir: {
       realpath: commonReal,
@@ -106,5 +106,5 @@ export async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owne
       birthtime: stat.birthtimeNs > 0n ? stat.birthtimeNs.toString() : "0",
     },
   };
-  return { owned: ctx.kind === "dir" && gitReal === commonReal && contained, shape, configPath: path.join(ctx.commonDir, "config") };
+  return { owned: ctx.kind === "dir" && gitReal === commonReal && contained, storeIdentity, configPath: path.join(ctx.commonDir, "config") };
 }

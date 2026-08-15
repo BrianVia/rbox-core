@@ -3,7 +3,7 @@ import type { PRepairReceipt } from "../../../cli/sync-git/p-repair.js";
 import type { ConfigStatToken } from "../../../cli/sync-git/config-txn.js";
 import type { BranchBaseOrigin } from "../../sync-git/base-composer.js";
 import type {
-  ConfigShapeIdentity,
+  ConfigStoreIdentity,
   GitDeferral,
   GitHeldAttempt,
   GitPartialApply,
@@ -107,10 +107,10 @@ export const GIT_SECTION_FIELD_COVERAGE = {
   generatedAt: true,
 } as const satisfies Record<keyof GitSection, true>;
 
-export const CONFIG_SHAPE_FIELD_COVERAGE = {
+export const CONFIG_STORE_IDENTITY_FIELD_COVERAGE = {
   shape: true,
   commonDir: true,
-} as const satisfies Record<keyof ConfigShapeIdentity, true>;
+} as const satisfies Record<keyof ConfigStoreIdentity, true>;
 
 export const CONFIG_STAT_TOKEN_FIELD_COVERAGE = {
   dev: true,

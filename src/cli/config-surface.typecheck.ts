@@ -4,7 +4,7 @@ import * as model from "./sync-state-model.js";
 import * as store from "./sync-state-store.js";
 import * as workspace from "./workspace-config.js";
 import type {
-  ConfigShapeIdentity,
+  ConfigStoreIdentity,
   FileOnlyManifest,
   GitDeferral,
   GitDeferralReason,
@@ -81,7 +81,7 @@ type _OwnerValuesMatchBarrel = Assert<OwnerValues extends typeof barrel ? true :
 type _WorkspaceConfig = Assert<Equal<WorkspaceConfig, workspace.WorkspaceConfig>>;
 type _SyncState = Assert<Equal<SyncState, model.SyncState>>;
 type _GlobalManifestMeta = Assert<Equal<GlobalManifestMeta, model.GlobalManifestMeta>>;
-type _ConfigShapeIdentity = Assert<Equal<ConfigShapeIdentity, model.ConfigShapeIdentity>>;
+type _ConfigStoreIdentity = Assert<Equal<ConfigStoreIdentity, model.ConfigStoreIdentity>>;
 type _GitDeferralReason = Assert<Equal<GitDeferralReason, model.GitDeferralReason>>;
 type _GitDeferral = Assert<Equal<GitDeferral, model.GitDeferral>>;
 type _GitDeferrals = Assert<Equal<GitDeferrals, model.GitDeferrals>>;

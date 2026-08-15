@@ -9,9 +9,9 @@ import {
   type ConfigStatToken,
   type ConfigTransactionResult,
 } from "./config-txn.js";
-import type { ConfigShapeIdentity, RepoRecordInput } from "../config.js";
+import type { ConfigStoreIdentity, RepoRecordInput } from "../config.js";
 import { completeConfigApply, configLaneState, type ConfigLaneState } from "../sync-state.js";
-import { configReceiver, gitConfigHash, readLocalGitConfig, sameConfigShape } from "./config-lane.js";
+import { configReceiver, gitConfigHash, readLocalGitConfig, sameConfigStoreIdentity } from "./config-lane.js";
 import {
   configInvalidSkipLogged,
   configOwnershipSkipLogged,
@@ -33,7 +33,7 @@ interface ReceivedGitConfigInput {
   repoContext(): Promise<RepoCtx | undefined>;
   materializeFresh(incoming: GitConfig): Promise<void>;
   inspectFreshInstall(): Promise<{
-    shape: ConfigShapeIdentity;
+    storeIdentity: ConfigStoreIdentity;
     config: GitConfig;
     token: ConfigStatToken;
   }>;
@@ -47,7 +47,7 @@ interface ReceivedGitConfigInput {
 
 interface ExistingTarget {
   readonly kind: "existing";
-  readonly shape: ConfigShapeIdentity;
+  readonly storeIdentity: ConfigStoreIdentity;
   readonly configPath: string;
   readonly commonDirKey: string;
 }
@@ -91,10 +91,10 @@ function sanitationReason(
 async function ownedDirReceiver(
   root: string,
   ctx: RepoCtx | undefined,
-): Promise<{ shape: ConfigShapeIdentity; configPath: string } | undefined> {
+): Promise<{ storeIdentity: ConfigStoreIdentity; configPath: string } | undefined> {
   if (ctx?.kind !== "dir") return undefined;
   const receiver = await configReceiver(root, ctx).catch(() => undefined);
-  return receiver?.owned ? { shape: receiver.shape, configPath: receiver.configPath } : undefined;
+  return receiver?.owned ? { storeIdentity: receiver.storeIdentity, configPath: receiver.configPath } : undefined;
 }
 
 /**
@@ -127,19 +127,19 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
   const transition = (): ConfigLaneState | undefined =>
     nextLane === undefined ? undefined : configLaneState(nextLane);
 
-  const invalidateShape = (shape: ConfigShapeIdentity | undefined): RepoRecordInput => {
+  const invalidateStoreIdentity = (storeIdentity: ConfigStoreIdentity | undefined): RepoRecordInput => {
     const current = record();
-    if (sameConfigShape(current.cfgShape, shape)) return current;
+    if (sameConfigStoreIdentity(current.cfgShape, storeIdentity)) return current;
     const reset: RepoRecordInput = {
       sourceSeq: current.sourceSeq,
-      ...(shape === undefined ? {} : { cfgShape: shape }),
+      ...(storeIdentity === undefined ? {} : { cfgShape: storeIdentity }),
     };
     replace(reset);
     return reset;
   };
 
   const complete = (
-    shape: ConfigShapeIdentity,
+    storeIdentity: ConfigStoreIdentity,
     hashes: {
       pre: string;
       post: string;
@@ -149,7 +149,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
     },
   ): ConfigLaneState => replace({
     ...completeConfigApply(record(), hashes),
-    cfgShape: shape,
+    cfgShape: storeIdentity,
   });
 
   const skipOnce = (message: string): void => {
@@ -170,7 +170,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
         // Observability after the rename commit point is strictly non-fatal.
       }
     }
-    return complete(target.shape, {
+    return complete(target.storeIdentity, {
       pre: result.preHash,
       post: result.postHash,
       incoming: result.incomingHash,
@@ -208,14 +208,15 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
         );
         if (local.status !== "ok") return transition();
         const before = record();
-        const lane = invalidateShape(receiver.shape);
-        const priorBaseline = before.cfgShape === undefined || sameConfigShape(before.cfgShape, receiver.shape)
+        const lane = invalidateStoreIdentity(receiver.storeIdentity);
+        const priorBaseline = before.cfgShape === undefined
+          || sameConfigStoreIdentity(before.cfgShape, receiver.storeIdentity)
           ? before.cfgSynced
           : undefined;
         return replace({
           ...lane,
           cfgSynced: priorBaseline ?? local.cached.hash,
-          cfgShape: receiver.shape,
+          cfgShape: receiver.storeIdentity,
         });
       }
 
@@ -239,14 +240,14 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
         return { due, requiresMaterialization: false, transition: transition() };
       }
       if (!input.leftoverPresent()) {
-        invalidateShape(undefined);
+        invalidateStoreIdentity(undefined);
         target = { kind: "fresh" };
         due = true;
         return { due, requiresMaterialization: true, transition: transition() };
       }
       const diskCtx = await repoCtxFromDisk(input.repoDir).catch(() => undefined);
       if (!diskCtx) {
-        invalidateShape(undefined);
+        invalidateStoreIdentity(undefined);
         skipOnce(
           `git-sync config skipped ${input.relPath}: receiver repository shape is unreadable/non-owned. `
           + "rbox left shared Git settings alone; Git history can still sync.",
@@ -254,7 +255,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
         return { due, requiresMaterialization: false, transition: transition() };
       }
       const receiver = await configReceiver(input.root, diskCtx);
-      const lane = invalidateShape(receiver.shape);
+      const lane = invalidateStoreIdentity(receiver.storeIdentity);
       if (!receiver.owned) {
         skipOnce(
           `git-sync config skipped ${input.relPath}: receiver ${diskCtx.kind} shape does not own the common config. `
@@ -266,7 +267,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
       const token = current.ok ? current.snapshot.token : undefined;
       target = {
         kind: "existing",
-        shape: receiver.shape,
+        storeIdentity: receiver.storeIdentity,
         configPath: receiver.configPath,
         commonDirKey: path.resolve(diskCtx.commonDir),
       };
@@ -302,7 +303,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
       if (target?.kind !== "fresh") return undefined;
       await input.materializeFresh(input.incoming);
       const installed = await input.inspectFreshInstall();
-      return complete(installed.shape, {
+      return complete(installed.storeIdentity, {
         pre: gitConfigHash({}),
         post: gitConfigHash(installed.config),
         incoming: gitConfigHash(input.incoming),
