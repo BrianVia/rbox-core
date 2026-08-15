@@ -20,7 +20,7 @@ export { withCipherDescriptor, type CipherDescriptor } from "./cipher-descriptor
 export { PublishedGeneration } from "./generation.js";
 export {
   EntryLeaseError,
-  EntryShapeError,
+  EntryStructureError,
   GenerationOwnerCapabilityError,
   GenerationReplacementConflict,
   OwnerReentrancyError,

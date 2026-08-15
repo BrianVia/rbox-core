@@ -265,7 +265,7 @@ function pullOrigin(witness: Extract<BranchTransitionWitness, { kind: "present" 
   return { v: 1, oid: witness.nextOid, lineageHash: witness.lineageHash, kind: "pull-p", episode: witness.episode };
 }
 
-function validSafeShape(witness: SafeRefWitness, _logicalBefore: string | null, after: string | null): boolean {
+function safeWitnessWellFormed(witness: SafeRefWitness, _logicalBefore: string | null, after: string | null): boolean {
   if (!oid(after)) return false;
   if (witness.proof === "expected-old-transaction") {
     return oid(witness.beforeOid) && witness.afterOid === after && witness.beforeOid !== after;
@@ -273,7 +273,7 @@ function validSafeShape(witness: SafeRefWitness, _logicalBefore: string | null, 
   return witness.afterOid === after;
 }
 
-function validBranchWitnessShape(witness: BranchTransitionWitness): boolean {
+function branchWitnessWellFormed(witness: BranchTransitionWitness): boolean {
   if (!isBranch(witness.ref) || !HEX64.test(witness.lineageHash) || !HEX64.test(witness.repositoryIdentityHash)
     || !HEX40.test(witness.artifactOid)) return false;
   if (witness.kind === "absent") return HEX40.test(witness.priorOid);
@@ -289,7 +289,7 @@ function branchProofMatches(
   lineageHash: string,
   repositoryIdentityHash: string,
 ): boolean {
-  if (!witness || !validBranchWitnessShape(witness) || !locked || witness.ref !== ref || witness.lineageHash !== lineageHash
+  if (!witness || !branchWitnessWellFormed(witness) || !locked || witness.ref !== ref || witness.lineageHash !== lineageHash
     || witness.repositoryIdentityHash !== repositoryIdentityHash || !sameWitness(witness, locked.witness)
     || locked.liveOid !== after || !locked.artifactsClear || !locked.ownershipStable || !locked.reflogStable) return false;
   if (witness.kind === "absent") return after === null && before === witness.priorOid;
@@ -308,7 +308,7 @@ function branchPostStateProofMatches(
   lineageHash: string,
   repositoryIdentityHash: string,
 ): witness is Extract<BranchTransitionWitness, { kind: "present" }> {
-  return witness?.kind === "present" && validBranchWitnessShape(witness)
+  return witness?.kind === "present" && branchWitnessWellFormed(witness)
     && witness.ref === ref && witness.nextOid === value
     && witness.lineageHash === lineageHash && witness.repositoryIdentityHash === repositoryIdentityHash
     && !!locked && sameWitness(witness, locked.witness) && locked.liveOid === value
@@ -435,7 +435,7 @@ export function composeRepoBase(
       } else {
         const witness = repair.witness;
         const locked = lockedProof.branches[ref];
-        if (!validBranchWitnessShape(witness) || witness.ref !== ref || witness.lineageHash !== authority.lineageHash
+        if (!branchWitnessWellFormed(witness) || witness.ref !== ref || witness.lineageHash !== authority.lineageHash
           || witness.repositoryIdentityHash !== authority.repositoryIdentityHash
           || !locked || !sameWitness(witness, locked.witness) || !locked.artifactsClear
           || !locked.ownershipStable || !locked.reflogStable) {
@@ -485,7 +485,7 @@ export function composeRepoBase(
         const locked = lockedProof.branches[ref];
         const validArtifact = decision?.kind === "artifact"
           && decision.beforeBaseOid === before
-          && witness !== undefined && validBranchWitnessShape(witness)
+          && witness !== undefined && branchWitnessWellFormed(witness)
           && locked !== undefined && witness.ref === ref
           && witness.lineageHash === authority.lineageHash
           && witness.repositoryIdentityHash === authority.repositoryIdentityHash
@@ -565,7 +565,7 @@ export function composeRepoBase(
     const locked = lockedProof.safeRefs[ref];
     if (!incomingBoundaryMatches(authority, lockedProof)
       || !witness || !locked || !sameSafeWitness(witness, locked.witness)
-      || locked.liveOid !== after || !validSafeShape(witness, before, after)
+      || locked.liveOid !== after || !safeWitnessWellFormed(witness, before, after)
       || (ref === "refs/stash" && after !== null && locked.stashReflogReady !== true)) {
       safeRefsValid = false;
       holds.push({ ref, code: witness ? "mismatched-safe-ref-proof" : "missing-safe-ref-proof" });

@@ -3,7 +3,7 @@ import type { JsonValue } from "../../json.js";
 import type { FileEntry } from "../types.js";
 import { EntryArena, MAX_EXTENSION_DEPTH, canonicalEntryKey, defaultFingerprint, sameEntryExact } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";
-import { EntryShapeError } from "./errors.js";
+import { EntryStructureError } from "./errors.js";
 
 function entry(overrides: Partial<FileEntry> = {}): FileEntry {
   return { path: "a.txt", sha256: "aa", size: 3, mode: 0o644, mtimeMs: 1000, type: "file", ...overrides };
@@ -141,11 +141,11 @@ test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras",
 test("values JSON cannot produce, and unbounded nesting, are refused", () => {
   const arena = new EntryArena();
   for (const value of [() => 1, Symbol("x"), 1n]) {
-    expect(() => arena.internExact(entryWithExtras(value))).toThrow(EntryShapeError);
+    expect(() => arena.internExact(entryWithExtras(value))).toThrow(EntryStructureError);
   }
   let deep: JsonValue = 1;
   for (let i = 0; i <= MAX_EXTENSION_DEPTH + 1; i++) deep = { deep };
-  expect(() => arena.internExact(entryWithExtras(deep))).toThrow(EntryShapeError);
+  expect(() => arena.internExact(entryWithExtras(deep))).toThrow(EntryStructureError);
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
@@ -253,7 +253,7 @@ test("REGRESSION (r3 finding 3): cyclic extras hit the depth bound, never a stac
   const arena = new EntryArena();
   const cyclic: CyclicFixture = {};
   cyclic.self = cyclic;
-  expect(() => arena.internExact(entryWithExtras(cyclic))).toThrow(EntryShapeError);
+  expect(() => arena.internExact(entryWithExtras(cyclic))).toThrow(EntryStructureError);
 
   // Shallow-then-cyclic accessor: the single read wins, so the arena stores the
   // shallow value and the later cyclic one is never reachable.

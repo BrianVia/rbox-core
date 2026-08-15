@@ -170,4 +170,4 @@ export {
   type WorkerRegistration,
   type WorkerReplacementResult,
 } from "./entry-arena/index.js";
-export { "EntryShapeError" } from "./entry-arena/index.js";
+export { EntryStructureError } from "./entry-arena/index.js";
