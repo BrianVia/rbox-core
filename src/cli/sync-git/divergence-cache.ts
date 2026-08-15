@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import type { JsonObject, JsonValue } from "../../json.js";
 import { gitIdentity, gitIdentityKey, type GitIdentity } from "./identity.js";
 import { gitPreflight, isGitBusy, type GitPreflightResult } from "./preflight.js";
 import { inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, type GitRepoKind, type RepoCtx } from "./git-state.js";
@@ -14,7 +15,10 @@ const GIT_DIVERGENCE_CACHE_REL = ".rbox/state/git-divergence.json";
 // The file version shares the fingerprint version so stale entries are excluded
 // from fast repo discovery as well as rejected by per-repo fingerprint checks.
 const GIT_DIVERGENCE_CACHE_VERSION = GIT_FINGERPRINT_VERSION;
-export interface CachedDivergenceProbe {
+// The cache file's records below are `type`, not `interface`, so they keep
+// TypeScript's implicit index signature and stay comparable with `JsonValue` —
+// they are exactly what `JSON.parse` yields for the divergence cache bytes.
+export type CachedDivergenceProbe = {
   busy: boolean;
   preflightOk: boolean;
   preflightStructural?: boolean;
@@ -22,16 +26,16 @@ export interface CachedDivergenceProbe {
   identityKey: string;
   identityRefs?: Record<string, string>;
   parentRel?: string;
-}
+};
 
 /** Opaque to this store; `pending-supersession.ts` owns what it means (#573). */
-export interface GitSupersessionRefusal {
+export type GitSupersessionRefusal = {
   pendingKey: string;
   baseKey: string;
   reason: string;
-}
+};
 
-export interface GitDivergenceCacheEntry {
+export type GitDivergenceCacheEntry = {
   fingerprint: string;
   writtenAtMs: number;
   identityKey: string;
@@ -39,7 +43,7 @@ export interface GitDivergenceCacheEntry {
   probe?: CachedDivergenceProbe;
   cachedLocalCfg?: CachedLocalCfg;
   supersessionRefusal?: GitSupersessionRefusal;
-}
+};
 
 export interface GitDivergenceCache {
   repos: Map<string, GitDivergenceCacheEntry>;
@@ -48,30 +52,34 @@ export interface GitDivergenceCache {
 export type GitDivergenceRepoHint = { relPath: string; kind?: GitRepoKind };
 export type GitDivergenceRepoSource = readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>;
 
-export const isGitRepoKind = (v: unknown): v is GitRepoKind => v === "dir" || v === "pointer";
+/** Also reads a typed `GitRepoKind | undefined` from a probe: both a decoded
+ *  cache member and an in-memory kind are `JsonValue | undefined` here. */
+export const isGitRepoKind = (v: JsonValue | undefined): v is GitRepoKind => v === "dir" || v === "pointer";
 
-const isString = (v: unknown): v is string => typeof v === "string";
+const isString = (v: JsonValue | undefined): v is string => typeof v === "string";
+const isBoolean = (v: JsonValue | undefined): v is boolean => typeof v === "boolean";
+const isNumber = (v: JsonValue | undefined): v is number => typeof v === "number";
+/** The single decoded-JSON object gate every member check below goes through. */
+const asJsonObject = (v: JsonValue | undefined): JsonObject | undefined =>
+  v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v) ? v : undefined;
 
-function isCacheEntry(v: unknown): v is GitDivergenceCacheEntry {
-  if (v === null || typeof v !== "object") return false;
-  const e = v as GitDivergenceCacheEntry;
-  if (!isString(e.fingerprint) || typeof e.writtenAtMs !== "number" || !isString(e.identityKey)) return false;
+function isCacheEntry(v: JsonValue): v is GitDivergenceCacheEntry {
+  const e = asJsonObject(v);
+  if (!e) return false;
+  if (!isString(e.fingerprint) || !isNumber(e.writtenAtMs) || !isString(e.identityKey)) return false;
   if (e.kind !== undefined && !isGitRepoKind(e.kind)) return false;
-  if (
-    e.cachedLocalCfg !== undefined &&
-    (e.cachedLocalCfg === null ||
-      typeof e.cachedLocalCfg !== "object" ||
-      !isString(e.cachedLocalCfg.hash) ||
-      typeof e.cachedLocalCfg.nonEmpty !== "boolean")
-  ) return false;
-  if (e.probe !== undefined) {
-    const p = e.probe as CachedDivergenceProbe;
-    if (p === null || typeof p !== "object") return false;
-    if (typeof p.busy !== "boolean" || typeof p.preflightOk !== "boolean" || !isString(p.identityKey)) return false;
+  if (e.cachedLocalCfg !== undefined) {
+    const cfg = asJsonObject(e.cachedLocalCfg);
+    if (!cfg || !isString(cfg.hash) || !isBoolean(cfg.nonEmpty)) return false;
   }
-  const refusal = e.supersessionRefusal as GitSupersessionRefusal | null | undefined;
-  if (refusal !== undefined
-    && !(!!refusal && isString(refusal.pendingKey) && isString(refusal.baseKey) && isString(refusal.reason))) return false;
+  if (e.probe !== undefined) {
+    const p = asJsonObject(e.probe);
+    if (!p || !isBoolean(p.busy) || !isBoolean(p.preflightOk) || !isString(p.identityKey)) return false;
+  }
+  if (e.supersessionRefusal !== undefined) {
+    const refusal = asJsonObject(e.supersessionRefusal);
+    if (!refusal || !isString(refusal.pendingKey) || !isString(refusal.baseKey) || !isString(refusal.reason)) return false;
+  }
   return true;
 }
 
@@ -105,10 +113,10 @@ async function fastRepoAdmitted(root: string, matcher: IgnoreMatcher, rel: strin
 export async function loadGitDivergenceCache(root: string): Promise<GitDivergenceCache> {
   try {
     const raw = await fs.readFile(path.join(root, GIT_DIVERGENCE_CACHE_REL), "utf8");
-    const parsed = JSON.parse(raw) as { version?: string; repos?: Record<string, Partial<GitDivergenceCacheEntry>> };
-    if (parsed.version !== GIT_DIVERGENCE_CACHE_VERSION) return { repos: new Map(), dirty: true };
+    const parsed = asJsonObject(JSON.parse(raw));
+    if (parsed?.version !== GIT_DIVERGENCE_CACHE_VERSION) return { repos: new Map(), dirty: true };
     const repos = new Map<string, GitDivergenceCacheEntry>();
-    for (const [rel, entry] of Object.entries(parsed.repos ?? {})) {
+    for (const [rel, entry] of Object.entries(asJsonObject(parsed.repos) ?? {})) {
       if (isCacheEntry(entry)) repos.set(rel, entry);
     }
     return { repos, dirty: false };
@@ -190,7 +198,7 @@ async function freshDivergenceProbeForTooling(root: string, rel: string): Promis
   return probeDivergenceRepo(root, rel, realCtx);
 }
 
-export async function classifyDivergenceCacheEntry(root: string, rel: string, entry: unknown): Promise<
+export async function classifyDivergenceCacheEntry(root: string, rel: string, entry: JsonValue): Promise<
   | { verdict: "hit-ok"; cachedIdentityKey: string; freshIdentityKey: string; cachedParentRel?: string; freshParentRel?: string }
   | {
       verdict: "hit-mismatch";

@@ -859,7 +859,7 @@ test("validateManifest: scoped wire config is reader-tolerated as an ignorable f
 });
 
 test("validateManifest: invalid git config is never manifest-fatal", () => {
-  const check = (config: unknown) => validateManifest(m43({ ".": { ...section(), config } })).ok;
+  const check = (config: GitSection["config"]) => validateManifest(m43({ ".": { ...section(), config } })).ok;
   expect(check({ "remote.origin.url": ["https://example.com/repo.git"] })).toBe(true);
   expect(check({
     "remote.origin.url": ["https://example.com/repo.git"],

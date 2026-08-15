@@ -901,6 +901,11 @@ describe("macOS 26 process-start source", () => {
 
 
 
+  // LEFTOVER anti-slop(no-unknown-parameters), the four `(error: unknown)`
+  // rejection handlers below: a rejected promise's reason is `unknown` by
+  // language rule — TypeScript carries no rejection type, so there is no truer
+  // type to give them. Each test asserts on the reason's errno, so wrapping or
+  // narrowing before the assertion would change what is being proven.
   test("no ps failure against a live process is ever converted into proof of death", async () => {
     // `pid` is this very process, so the kernel can always contradict a wrong
     // absence claim. Every shape of failed run must stay indeterminate.

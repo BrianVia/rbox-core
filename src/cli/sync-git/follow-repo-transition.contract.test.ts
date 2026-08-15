@@ -53,7 +53,9 @@ function receipt(overrides: Partial<FollowExecutionReceipt> = {}): FollowExecuti
 
 /** A branch advance whose witness/locked proof are complete: composeRepoBase
  * reaches `terminal` and mints pull-p provenance for it. */
-function provenBranchAdvance(): { input: FollowCommitInput; progress: FollowProgress } {
+type ProvenBranchAdvance = { input: FollowCommitInput; progress: FollowProgress };
+
+function provenBranchAdvance(): ProvenBranchAdvance {
   const witness = {
     kind: "present", ref: "refs/heads/main", priorOid: OLD_OID, nextOid: NEW_OID,
     lineageHash: LINEAGE, repositoryIdentityHash: REPO_ID,
@@ -169,14 +171,14 @@ describe("follow authority composition", () => {
     const advance = provenBranchAdvance();
     const ownership = composeFollowAuthority(advance.input, proofReceipt(), progress({
       ...advance.progress, heldRefs: { "refs/heads/topic": "ownership" },
-      blockers: [{ kind: "ref", ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" } as unknown as TypedBlocker],
+      blockers: [{ ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" }],
     }), true);
     expect(ownership.ownershipOnly).toBe(true);
     const mixed = composeFollowAuthority(advance.input, proofReceipt(), progress({
       ...advance.progress,
       heldRefs: { "refs/heads/topic": "ownership", "refs/heads/other": "local-commits" },
       // Per-ref ownership blockers alone must not make a mixed hold ownership-only.
-      blockers: [{ kind: "ref", ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" } as unknown as TypedBlocker],
+      blockers: [{ ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" }],
     }), true);
     expect(mixed.ownershipOnly).toBe(false);
     expect(composeFollowAuthority(advance.input, proofReceipt(), advance.progress, true).ownershipOnly).toBe(false);
@@ -189,6 +191,12 @@ describe("follow authority composition", () => {
   });
 });
 
+// LEFTOVER anti-slop(no-chained-type-assertions), the two blockers below: both
+// are deliberately unrepresentable in `TypedBlocker` — no `ref-plane` blocker may
+// carry `local-index`, and `composer` is not a provenance at all. They pin that a
+// ref-plane blocker outranks a persisted held reason and that a non-ref-plane one
+// never classifies, so any representable shape would change what this contract
+// asserts. Typing them honestly means widening `TypedBlocker`, not editing here.
 describe("held deferral reason", () => {
   test("a ref-plane blocker classifies before any persisted held reason", () => {
     expect(followHeldDeferralReason(progress({
@@ -313,7 +321,7 @@ describe("followed transition", () => {
     const ownership = progress({
       ...advance.progress,
       heldRefs: { "refs/heads/topic": "ownership" },
-      blockers: [{ kind: "ref", ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" } as unknown as TypedBlocker],
+      blockers: [{ ref: "refs/heads/topic", reason: "worktree-ownership", provenance: "ref-plane" }],
     });
     const escalate = process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE;
     try {
