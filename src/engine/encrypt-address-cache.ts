@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "./fsutil.js";
 import { isSafeRelPath } from "./manifest-validate.js";
+import type { JsonValue } from "../json.js";
 
 export interface EncryptAddressCacheContext {
   accountId: string;
@@ -34,49 +35,59 @@ export const ENCRYPT_ADDRESS_CACHE_REL = ".rbox/state/encrypt-cache.json";
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
-const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
-const validCompressionFields = (entry: Partial<EncryptAddressCacheEntry>): boolean => {
-  if (entry.comp === undefined) return entry.payloadSha === undefined;
-  return entry.comp === "zstd" && typeof entry.payloadSha === "string" && SHA256_HEX_RE.test(entry.payloadSha);
+const isNonNegativeInteger = (v: JsonValue | undefined): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const validCompressionFields = (comp: JsonValue | undefined, payloadSha: JsonValue | undefined): boolean => {
+  if (comp === undefined) return payloadSha === undefined;
+  return comp === "zstd" && typeof payloadSha === "string" && SHA256_HEX_RE.test(payloadSha);
 };
 
 function cacheEntryBody(entry: EncryptAddressCacheEntry): EncryptAddressCacheEntry {
   return entry.comp ? { encSha: entry.encSha, cipherSize: entry.cipherSize, comp: entry.comp, payloadSha: entry.payloadSha } : { encSha: entry.encSha, cipherSize: entry.cipherSize };
 }
 
-function matchesContext(raw: StoredEncryptAddressCache, context: EncryptAddressCacheContext): boolean {
-  return (
-    raw.accountId === context.accountId &&
-    raw.workspaceId === context.workspaceId &&
-    raw.accountEpoch === context.accountEpoch &&
-    raw.keyEpoch === context.keyEpoch
-  );
+function parseStoredEntry(value: JsonValue | undefined): StoredEncryptAddressCacheEntry | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const encSha = value["encSha"];
+  const cipherSize = value["cipherSize"];
+  const comp = value["comp"];
+  const payloadSha = value["payloadSha"];
+  const rawPaths = value["paths"];
+  if (typeof encSha !== "string" || !SHA256_HEX_RE.test(encSha)) return undefined;
+  if (!isNonNegativeInteger(cipherSize)) return undefined;
+  if (!validCompressionFields(comp, payloadSha)) return undefined;
+  if (!Array.isArray(rawPaths) || rawPaths.length === 0) return undefined;
+  const paths = new Set<string>();
+  for (const p of rawPaths) {
+    if (typeof p !== "string" || !isSafeRelPath(p) || paths.has(p)) return undefined;
+    paths.add(p);
+  }
+  const sorted = [...paths].sort();
+  // validCompressionFields already tied these two together; the re-test is what carries
+  // that pairing into the type of the returned entry.
+  return comp === "zstd" && typeof payloadSha === "string"
+    ? { encSha, cipherSize, comp, payloadSha, paths: sorted }
+    : { encSha, cipherSize, paths: sorted };
 }
 
-function parseStored(raw: unknown, context: EncryptAddressCacheContext): Map<string, StoredEncryptAddressCacheEntry> | undefined {
-  if (raw == null || typeof raw !== "object") return undefined;
-  const cache = raw as Partial<StoredEncryptAddressCache>;
-  if (cache.version !== 1) return undefined;
-  if (typeof cache.accountId !== "string" || typeof cache.workspaceId !== "string") return undefined;
-  if (!isNonNegativeInteger(cache.accountEpoch) || !isNonNegativeInteger(cache.keyEpoch)) return undefined;
-  if (!cache.entries || typeof cache.entries !== "object" || Array.isArray(cache.entries)) return undefined;
-  if (!matchesContext(cache as StoredEncryptAddressCache, context)) return undefined;
+function parseStored(raw: JsonValue, context: EncryptAddressCacheContext): Map<string, StoredEncryptAddressCacheEntry> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const accountId = raw["accountId"];
+  const workspaceId = raw["workspaceId"];
+  const accountEpoch = raw["accountEpoch"];
+  const keyEpoch = raw["keyEpoch"];
+  const rawEntries = raw["entries"];
+  if (raw["version"] !== 1) return undefined;
+  if (typeof accountId !== "string" || typeof workspaceId !== "string") return undefined;
+  if (!isNonNegativeInteger(accountEpoch) || !isNonNegativeInteger(keyEpoch)) return undefined;
+  if (!rawEntries || typeof rawEntries !== "object" || Array.isArray(rawEntries)) return undefined;
+  if (accountId !== context.accountId || workspaceId !== context.workspaceId || accountEpoch !== context.accountEpoch || keyEpoch !== context.keyEpoch) return undefined;
 
   const entries = new Map<string, StoredEncryptAddressCacheEntry>();
-  for (const [plaintextSha, entry] of Object.entries(cache.entries)) {
+  for (const [plaintextSha, value] of Object.entries(rawEntries)) {
     if (!SHA256_HEX_RE.test(plaintextSha)) return undefined;
-    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
-    const e = entry as Partial<StoredEncryptAddressCacheEntry>;
-    if (typeof e.encSha !== "string" || !SHA256_HEX_RE.test(e.encSha)) return undefined;
-    if (!isNonNegativeInteger(e.cipherSize)) return undefined;
-    if (!validCompressionFields(e)) return undefined;
-    if (!Array.isArray(e.paths) || e.paths.length === 0) return undefined;
-    const paths = new Set<string>();
-    for (const p of e.paths) {
-      if (!isSafeRelPath(p) || paths.has(p)) return undefined;
-      paths.add(p);
-    }
-    entries.set(plaintextSha, { ...cacheEntryBody(e as EncryptAddressCacheEntry), paths: [...paths].sort() });
+    const entry = parseStoredEntry(value);
+    if (!entry) return undefined;
+    entries.set(plaintextSha, entry);
   }
   return entries;
 }
@@ -122,7 +133,7 @@ export class EncryptAddressCache {
     if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
     if (!SHA256_HEX_RE.test(entry.encSha)) throw new Error(`invalid ciphertext sha for encrypt cache: ${entry.encSha}`);
     if (!isNonNegativeInteger(entry.cipherSize)) throw new Error(`invalid ciphertext size for encrypt cache: ${entry.cipherSize}`);
-    if (!validCompressionFields(entry)) throw new Error("invalid compression descriptor for encrypt cache");
+    if (!validCompressionFields(entry.comp, entry.payloadSha)) throw new Error("invalid compression descriptor for encrypt cache");
     if (!isSafeRelPath(entry.path)) throw new Error(`invalid path for encrypt cache: ${entry.path}`);
 
     this.migratePath(plaintextSha, entry.path);
@@ -197,7 +208,8 @@ export class EncryptAddressCache {
   static async load(root: string, context: EncryptAddressCacheContext): Promise<EncryptAddressCache> {
     try {
       const raw = await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8");
-      const entries = parseStored(JSON.parse(raw), context);
+      const parsed: JsonValue = JSON.parse(raw);
+      const entries = parseStored(parsed, context);
       return new EncryptAddressCache(context, entries);
     } catch {
       return new EncryptAddressCache(context);
