@@ -34,7 +34,8 @@ import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./gene
 import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonForUser } from "./autostart-cmd.js";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult } from "./credentials.js";
-import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
+import { loadConfigIfPresent, syncStreamId } from "./config.js";
+import { selectedStateForResetConsent } from "./sync-state-store.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { createRemoteWorkspace, RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
@@ -659,7 +660,7 @@ interface StepWorkspaceDeps {
   promptWorkspacePick?: typeof promptWorkspacePick;
   loadCredentials?: typeof loadCredentials;
   loadConfigIfPresent?: typeof loadConfigIfPresent;
-  loadRawState?: typeof loadRawState;
+  loadRawState?: typeof selectedStateForResetConsent;
   stat?: typeof fs.stat;
   mkdir?: typeof fs.mkdir;
   realpath?: typeof fs.realpath;
@@ -694,7 +695,7 @@ export async function stepWorkspace(
   const pickWorkspace = deps.promptWorkspacePick ?? promptWorkspacePick;
   const readCredentials = deps.loadCredentials ?? loadCredentials;
   const probeConfig = deps.loadConfigIfPresent ?? loadConfigIfPresent;
-  const readRawState = deps.loadRawState ?? loadRawState;
+  const readRawState = deps.loadRawState ?? selectedStateForResetConsent;
   const stat = deps.stat ?? fs.stat;
   const mkdir = deps.mkdir ?? fs.mkdir;
   const realpath = deps.realpath ?? fs.realpath;
@@ -848,7 +849,7 @@ export async function stepWorkspace(
     }
 
     let bound: Awaited<ReturnType<typeof loadConfigIfPresent>>;
-    let raw: Awaited<ReturnType<typeof loadRawState>>;
+    let raw: Awaited<ReturnType<typeof selectedStateForResetConsent>>;
     try {
       bound = await probeConfig(dir);
       raw = await readRawState(dir);
@@ -934,6 +935,9 @@ export async function stepWorkspace(
           root: dir,
           remoteUrl: creds.remoteUrl ?? opts.defaultRemote,
           workspace: { kind: "new", project: "root", name },
+          syncGit: true,
+          respectGitignore,
+          scope: undefined,
         }, resetConsent);
         const create = async (): Promise<string> => {
           const id = await createWorkspace(creds.remoteUrl ?? opts.defaultRemote, creds.token, "root", name);

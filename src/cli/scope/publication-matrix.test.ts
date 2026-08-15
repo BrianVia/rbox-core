@@ -9,7 +9,8 @@ import os from "node:os";
 import path from "node:path";
 import { pushManifest } from "../sync/push.js";
 import { recoverWorkspaceCmd } from "../recover-cmd.js";
-import type { WorkspaceConfig } from "../workspace-config.js";
+import { syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
+import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { ScopedBindingRefusal } from "./binding-scope.js";
 
 let home: string;
@@ -23,6 +24,11 @@ beforeEach(async () => {
   process.env.RBOX_HOME = home;
   process.env.HOME = home;
   await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  const config = cfg();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(config), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 
 afterEach(async () => {

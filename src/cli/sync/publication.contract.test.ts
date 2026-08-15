@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { WorkspaceConfig } from "../config.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "../config.js";
 import type { CommitResult } from "../remote.js";
 import {
   accumulateRecoveryPage,
@@ -40,7 +40,15 @@ beforeEach(async () => {
     accountEpoch: 0,
     keyEpoch: 0,
   };
+  await seedLegacyState(root, cfg);
 });
+
+async function seedLegacyState(workspaceRoot: string, config: WorkspaceConfig): Promise<void> {
+  await saveStateUnsafeLegacyOrTest(workspaceRoot, {
+    stream: syncStreamId(config), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+}
 
 afterEach(async () => {
   if (savedPreflightDelta === undefined) delete process.env.RBOX_PREFLIGHT_DELTA;
@@ -96,6 +104,7 @@ describe("Publication bounded retry contract", () => {
     const secondRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-publication-contract-fixed-"));
     try {
       await fs.mkdir(path.join(secondRoot, ".rbox", "state"), { recursive: true });
+      await seedLegacyState(secondRoot, { ...cfg, rootPath: secondRoot });
       await fs.writeFile(path.join(secondRoot, "x.txt"), "payload\n");
       const fixed = new FakeRemote();
       fixed.forceUnsatisfiedTotals = Array.from({ length: 10 }, () => 10_000);

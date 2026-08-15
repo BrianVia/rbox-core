@@ -7,6 +7,8 @@ import { folderCatalogPath } from "../rbox-paths.js";
 import type { GitSignalBatch } from "./watcher.js";
 import { HashCache, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
 import type { WatcherTrustObservation } from "./watcher-trust.js";
+import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
+import { GenesisAdmissionRefusedError } from "../state-plane/authority-bootstrap.js";
 
 // Design 49: the safety scan heals DROPPED watcher events, and drops happen under
 // churn — so quiet intervals back the scan off (60s → 5m cap) instead of
@@ -275,6 +277,36 @@ function makeDaemon(root: string, opts: { pullOnly?: boolean; log?: (message: st
   return new RboxDaemon(root, cfg as never, {} as never, opts) as SafetyInternals;
 }
 
+test("direct fresh-state refusal precedes folder authority and every daemon sidecar", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-daemon-genesis-refusal-")));
+  const previousHome = process.env.RBOX_HOME;
+  process.env.RBOX_HOME = path.join(root, "home");
+  const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
+  const daemon = new RboxDaemon(root, cfg as never, {} as never, {
+    keyDeliveryFlight: null,
+    acquireSyncMutex: async () => ({
+      status: "acquired",
+      handle: {
+        root,
+        incarnation: "lock-unavailable",
+        released: false,
+        lockFailure: { reason: "hardlink-unsupported", error: new Error("unsupported") },
+      },
+    }),
+    log: () => {},
+  });
+  try {
+    await expect(daemon.start()).rejects.toBeInstanceOf(GenesisAdmissionRefusedError);
+    expect(fs.existsSync(folderCatalogPath())).toBe(false);
+    expect(fs.existsSync(path.join(root, ".rbox"))).toBe(false);
+  } finally {
+    await daemon.stop();
+    if (previousHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function writeFolderCatalog(root: string, respectGitignore: boolean): string {
   const file = folderCatalogPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -436,6 +468,10 @@ test("design 72: safety tick reloads workspace.json and rebuilds the matcher", a
     fs.mkdirSync(path.join(root, "pkg"), { recursive: true });
     fs.writeFileSync(path.join(root, "pkg", ".gitignore"), "ignored.txt\n");
     fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify(cfg));
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: "https://example.invalid::w::root", stateNonce: "a".repeat(32), stateRevision: 0,
+      lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
     writeFolderCatalog(root, false);
 
     await daemon.reloadWorkspaceConfigIfChanged();

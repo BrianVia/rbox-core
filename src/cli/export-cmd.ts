@@ -10,9 +10,13 @@ import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picke
 import { accountHex16, defaultKitTargetDir, displayPath, localYmd } from "./recovery-kit.js";
 import { progressLabel } from "./status-view.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { writeFileAtomic } from "../engine/fsutil.js";
+import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { spinner } from "./spinner.js";
 import { style } from "./style.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
+import { admitGenesisAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
+import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
+import { RboxApi } from "./remote.js";
 
 const MARKER_NAME = "rbox-export.json";
 
@@ -329,12 +333,24 @@ async function defaultPullWorkspace(
     ...EPHEMERAL_EXPORT_POLICY,
   };
   await saveConfig(stagingRoot, synthetic);
-  const { cfg, deps } = await buildAuthedRemote(stagingRoot);
-  deps.onProgress = onProgress;
-  // Design 93 §6 explicit mutex exemption: stagingRoot is a unique, ephemeral,
-  // process-private export tree. It cannot mutate a live workspace tree/state and
-  // is removed or atomically published after this pull.
-  await pull(stagingRoot, cfg, deps);
+  await fsyncDirectory(path.join(stagingRoot, RBOX_DIR));
+  const syncMutex = await acquireWorkspaceSyncMutex(stagingRoot, "cli");
+  try {
+    const admission = await admitGenesisAuthority(stagingRoot, syncMutex);
+    if (admission.kind === "refused") {
+      await reportGenesisLockUnsupported(
+        admission.refusal,
+        new RboxApi(creds.remoteUrl, creds.token, target.workspaceId, target.projectId),
+      );
+    }
+    requireSelected(admission);
+    const { cfg, deps } = await buildAuthedRemote(stagingRoot);
+    deps.onProgress = onProgress;
+    deps.syncMutex = syncMutex;
+    await pull(stagingRoot, cfg, deps);
+  } finally {
+    await releaseWorkspaceSyncMutex(syncMutex);
+  }
 }
 
 interface BunSpawn {

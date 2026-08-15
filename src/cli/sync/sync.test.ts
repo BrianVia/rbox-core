@@ -311,6 +311,10 @@ beforeEach(async () => {
     accountEpoch: 0,
     keyEpoch: 0,
   };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   setClassifyCacheHitObserverForTest(undefined);
@@ -714,6 +718,10 @@ test("cache mapping to an existing wrong blob is detected by pull integrity, not
   const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-pull-wrong-cache-"));
   try {
     await fs.mkdir(path.join(otherRoot, ".rbox", "state"), { recursive: true });
+    await saveStateUnsafeLegacyOrTest(otherRoot, {
+      stream: syncStreamId({ ...cfg, rootPath: otherRoot, deviceId: "devB" }),
+      lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
     await expect(pull(otherRoot, { ...cfg, rootPath: otherRoot, deviceId: "devB" }, deps(remote))).rejects.toThrow(/authenticate|integrity|decrypt/i);
   } finally {
     await fs.rm(otherRoot, { recursive: true, force: true });
@@ -1453,6 +1461,10 @@ test("scan-to-encrypt source change defers without metadata patch, then a settle
 
   const other = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-source-change-pull-"));
   try {
+    await saveStateUnsafeLegacyOrTest(other, {
+      stream: syncStreamId({ ...cfg, rootPath: other, deviceId: "settled-reader" }),
+      lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
     await pull(other, { ...cfg, rootPath: other, deviceId: "settled-reader" }, deps(remote));
     expect(Buffer.from(await fs.readFile(path.join(other, "append.log"))).equals(bytes)).toBe(true);
   } finally {

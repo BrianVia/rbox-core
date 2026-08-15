@@ -13,17 +13,12 @@ import {
 } from "../sync-mutex.js";
 import {
   admitGenesisAuthority,
-  type AuthorityOutcome,
-  assertAuthorityWritable,
-  establishStateAuthority,
-  selectStateAuthority,
-  type MigrationDriver,
+  observeStateAuthority,
 } from "./authority-bootstrap.js";
+import { assertAuthorityWritable } from "./state-write-fence.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis.js";
-import { withStatePlaneLocks } from "./locks.js";
-import type { MigrationOutcome } from "./migration/authority.js";
 import {
   MIGRATION_PHASES, encodeMigrationControl,
   type ArtifactItem, type HaltResource, type MigrationControl,
@@ -42,33 +37,6 @@ async function workspace(): Promise<string> {
   await saveConfig(root, config);
   await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
   return root;
-}
-
-/** Records every call so "exactly one migration run" is observable.
- *
- * Wave 5A collapsed 2D's generic, so the stub now returns the real
- * `MigrationOutcome`. This was invisible to both gates before — `tsconfig.json`
- * excludes `**\/*.test.ts` and Bun erases the annotation at runtime — which is the
- * same blind spot that cost lane 2B a review round. */
-const STUB_OUTCOME: MigrationOutcome = { kind: "migrated", phases: ["M7"], elapsedMs: 0 };
-
-function driver(): MigrationDriver & { calls: number } {
-  const run = (async () => {
-    run.calls += 1;
-    return STUB_OUTCOME;
-  }) as MigrationDriver & { calls: number };
-  run.calls = 0;
-  return run;
-}
-
-async function establishWithRealLocks(
-  root: string,
-  runMigration: MigrationDriver,
-): Promise<AuthorityOutcome> {
-  const result = await withStatePlaneLocks(root, (locks) =>
-    establishStateAuthority(root, { entry: "foreground-migrate", locks }, runMigration));
-  if (!result.held) throw new Error(`unexpected lock refusal: ${result.refusal.detail}`);
-  return result.value;
 }
 
 // --- control fixtures (shape mirrors `migration/control.test.ts`) ------------
@@ -175,8 +143,15 @@ test("the fence admits a control past the flip", async () => {
 
 test("the fence refuses an unretired genesis intent under the same reason", async () => {
   const root = await workspace();
-  const run = driver();
-  expect(await establishWithRealLocks(root, run)).toMatchObject({ domain: "genesis" });
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    expect(await admitGenesisAuthority(root, mutex)).toMatchObject({
+      kind: "selected",
+      authority: { kind: "sqlite-store" },
+    });
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
   expect(readGenesisIntent(root)).toBeUndefined();
   expect(() => assertAuthorityWritable(root)).not.toThrow();
 
@@ -298,46 +273,49 @@ test("a symlink or an oversized file at the intent path refuses", async () => {
   expect(() => assertAuthorityWritable(root)).toThrow(/over the .* cap/);
 });
 
-// --- dispatch ---------------------------------------------------------------
+// --- observation and ordinary admission -------------------------------------
 
-test("the file-level selector preserves absent, JSON, foreign, and exact-Q routing", async () => {
+test("file-level observation keeps absence separate from both backends", async () => {
   const root = await workspace();
-  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "absent" });
+  expect(await observeStateAuthority(root)).toEqual({ kind: "uninitialized", format: "absent" });
 
   await plantLegacyState(root);
-  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "json" });
+  expect(await observeStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "json" });
 
   await fsp.writeFile(statePath(root), "not an rbox state document\n");
-  expect(await selectStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "foreign" });
+  expect(await observeStateAuthority(root)).toEqual({ kind: "legacy-json-store", format: "foreign" });
 
   const authorityId = "9".repeat(32);
   await fsp.writeFile(statePath(root), authorityMarkerBytes(authorityId));
-  expect(await selectStateAuthority(root)).toEqual({
+  expect(await observeStateAuthority(root)).toEqual({
     kind: "sqlite-store", format: "authority-marker", authorityId,
   });
 });
 
-test("settled authority returns before validating or loading borrowed-lock machinery", async () => {
+test("settled authority is selected before borrowed-mutex validation or lock/genesis loading", async () => {
   const root = await workspace();
   await plantLegacyState(root);
   const unusable = {
     root: `${root}-wrong`, incarnation: "never-owned", released: true,
   } as WorkspaceSyncMutex;
 
-  expect(await admitGenesisAuthority(root, unusable))
-    .toEqual({ kind: "legacy-json-store", format: "json" });
+  expect(await admitGenesisAuthority(root, unusable)).toEqual({
+    kind: "selected",
+    authority: { kind: "legacy-json-store", format: "json" },
+  });
 
   const source = fs.readFileSync(path.join(import.meta.dir, "authority-bootstrap.ts"), "utf8");
   const admission = source.slice(
     source.indexOf("export async function admitGenesisAuthority"),
-    source.indexOf("/**\n * The one thing both entry points call"),
+    source.indexOf("/** Doctor's advisory"),
   );
-  expect(admission.indexOf("if (intent === undefined && selection.format !== \"absent\") return selection"))
-    .toBeGreaterThan(-1);
-  expect(admission.indexOf('import("./locks.js")')).toBeGreaterThan(admission.indexOf("return selection"));
-  expect(admission.indexOf('import("./genesis.js")')).toBeGreaterThan(admission.indexOf("return selection"));
-  expect(admission).not.toContain("MigrationDriver");
-  expect(admission).not.toContain("EntryProof");
+  const fastReturn = admission.indexOf('return { kind: "selected", authority: selection }');
+  expect(fastReturn).toBeGreaterThan(-1);
+  expect(admission.indexOf('import("./locks.js")')).toBeGreaterThan(fastReturn);
+  expect(admission.indexOf('import("./genesis.js")')).toBeGreaterThan(fastReturn);
+  for (const removed of ["MigrationDriver", "AuthorityOutcome", "establishStateAuthority", "claimsGenesis"]) {
+    expect(admission).not.toContain(removed);
+  }
 });
 
 for (const format of ["absent", "q-intent"] as const) {
@@ -373,16 +351,19 @@ test("two concurrent real held-mutex entries publish exactly one genesis authori
   };
 
   const [first, second] = await Promise.all([enter(), enter()]).finally(() => observedOpen.mockRestore());
-  expect(first.kind).toBe("sqlite-store");
+  expect(first.kind).toBe("selected");
   expect(second).toEqual(first);
   expect(waits).toBeGreaterThan(0);
   expect(stagedClaims).toBe(1);
   expect(readGenesisIntent(root)).toBeUndefined();
   expect(rboxResiduePaths(root)).toEqual(["state.json", "state/state.db", "workspace.json"]);
 
+  if (first.kind !== "selected" || first.authority.kind !== "sqlite-store") {
+    throw new Error("test requires selected SQLite authority");
+  }
   const store = openStateStore(sqliteResetPaths.active(root), { readonly: true });
   try {
-    expect(store.header.authority_id).toBe(first.kind === "sqlite-store" ? first.authorityId : "unreachable");
+    expect(store.header.authority_id).toBe(first.authority.authorityId);
     expect(stateStoreDatabase(store).query(
       "SELECT origin_kind,entry_count,repo_count FROM migration_completion WHERE singleton=1",
     ).all()).toEqual([{ origin_kind: "genesis", entry_count: 0, repo_count: 0 }]);
@@ -391,77 +372,39 @@ test("two concurrent real held-mutex entries publish exactly one genesis authori
   }
 });
 
-test("a fresh workspace dispatches to genesis and never runs migration", async () => {
+test("state-lock I/O is a typed ephemeral refusal before genesis mutation", async () => {
   const root = await workspace();
-  const run = driver();
-  const outcome = await establishWithRealLocks(root, run);
-  expect(outcome.domain).toBe("genesis");
-  expect(outcome).toMatchObject({ outcome: { kind: "established" } });
-  expect(run.calls).toBe(0);
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  const originalLink = fsp.link;
+  const failedLink = spyOn(fsp, "link").mockImplementation(async (existing, target) => {
+    if (String(target).endsWith("state.json.lock")) {
+      throw Object.assign(new Error("injected state-lock storage fault"), { code: "EIO" });
+    }
+    return originalLink(existing, target);
+  });
+  try {
+    expect(await admitGenesisAuthority(root, mutex)).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "lock-io", layer: "state" },
+    });
+    expect(readGenesisIntent(root)).toBeUndefined();
+    expect(await observeStateAuthority(root)).toEqual({ kind: "uninitialized", format: "absent" });
+    expect(rboxResiduePaths(root)).toEqual(["workspace.json"]);
+  } finally {
+    failedLink.mockRestore();
+    await releaseWorkspaceSyncMutex(mutex);
+  }
 });
 
-test("a workspace carrying a migration control dispatches to migration", async () => {
-  const root = await workspace();
-  plantControl(root, "M0");
-  const run = driver();
-  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
-  expect(run.calls).toBe(1);
-});
-
-test("legacy JSON dispatches to migration without genesis claiming it", async () => {
-  const root = await workspace();
-  await plantLegacyState(root);
-  const run = driver();
-  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
-  expect(run.calls).toBe(1);
-});
-
-/** An intent bound to this exact workspace, so §2.5.2 case 7 does not fire
- * before the case under test. */
-async function plantIntent(root: string, authorityId = "a".repeat(32)): Promise<void> {
-  const config = JSON.parse(await fsp.readFile(path.join(root, ".rbox", "workspace.json"), "utf8")) as WorkspaceConfig;
-  await fsp.writeFile(genesisPaths.intent(root), JSON.stringify({
-    version: 1, authorityId, lineageId: "b".repeat(32),
-    evidence: { root: await fsp.realpath(root), stream: syncStreamId(config), incarnation: "absent" },
-    staging: { dev: 1, ino: 1 },
-  }));
-}
-
-test("an intent claims genesis even when a migration control exists", async () => {
-  const root = await workspace();
-  await plantIntent(root);
-  plantControl(root, "M0");
-  const run = driver();
-
-  const outcome = await establishWithRealLocks(root, run);
-  expect(outcome.domain).toBe("genesis");
-  expect(run.calls).toBe(0);
-});
-
-test("a genesis refusal that is not legacy-present returns directly, with no re-dispatch", async () => {
-  const root = await workspace();
-  await fsp.rm(path.join(root, ".rbox", "workspace.json"));   // no fenced evidence
-  const run = driver();
-
-  expect(await establishWithRealLocks(root, run))
-    .toEqual({ domain: "genesis", outcome: { kind: "refused", reason: "evidence-missing" } });
-  expect(run.calls, "only legacy-present may re-dispatch").toBe(0);
-});
-
-test("C8: a genesis intent that finds an L refuses, retires, and migration runs in the same pass", async () => {
-  const root = await workspace();
-  await plantIntent(root);
-  await plantLegacyState(root);
-  // The premise, stated rather than assumed: nothing holds the staged path, so
-  // the intent's recorded inode cannot match and no removal depends on it.
-  expect(fs.lstatSync(genesisPaths.staged(root, "a".repeat(32)), { throwIfNoEntry: false })).toBeUndefined();
-
-  const run = driver();
-  expect(await establishWithRealLocks(root, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
-  expect(run.calls).toBe(1);
-  expect(readGenesisIntent(root)).toBeUndefined();
-  // The re-inspect is bounded: writes flow again the moment the intent is gone.
-  expect(() => assertAuthorityWritable(root)).not.toThrow();
+test("ordinary admission has no migration dispatch vocabulary", () => {
+  const source = fs.readFileSync(path.join(import.meta.dir, "authority-bootstrap.ts"), "utf8");
+  for (const removed of [
+    "establishStateAuthority",
+    "AuthorityOutcome",
+    "MigrationDriver",
+    "claimsGenesis",
+    "runMigration",
+  ]) expect(source).not.toContain(removed);
 });
 
 // --- the boundary the fence's home depends on (§7.9) ------------------------
@@ -495,7 +438,7 @@ const importsGenesis = (text: string): boolean =>
 const importsMigration = (text: string): boolean =>
   valueSpecifiers(text).some((spec) => /(^|\/)migration\/[^/]+\.js$/.test(spec) || STATE_PLANE_INDEX.test(spec));
 
-test("genesis and migration never import each other, and one module imports both", () => {
+test("genesis and migration never import each other or share a dispatch import boundary", () => {
   const both: string[] = [];
   for (const file of sources(SRC)) {
     const text = fs.readFileSync(file, "utf8");
@@ -509,12 +452,13 @@ test("genesis and migration never import each other, and one module imports both
     }
     if (genesisSide && migrationSide) both.push(path.relative(SRC, file));
   }
-  expect(both).toEqual([path.join("cli", "state-plane", "authority-bootstrap.ts")]);
+  expect(both).toEqual([]);
 });
 
 // --- the fence cannot reach SQLite, however anyone rewrites it --------------
 
 const BOOTSTRAP = path.join(import.meta.dir, "authority-bootstrap.ts");
+const FENCE = path.join(import.meta.dir, "state-write-fence.ts");
 
 /** The identifiers `assertAuthorityWritable` actually calls. A grep for
  * `bun:sqlite` cannot see an open reached through a re-exporting facade; the
@@ -588,18 +532,18 @@ test("settled selection's static coordinator closure is SQLite/genesis/lock free
 });
 
 test("the fence calls only its two bounded readers and its own refusal", () => {
-  expect(fenceCallees(fs.readFileSync(BOOTSTRAP, "utf8")).sort())
+  expect(fenceCallees(fs.readFileSync(FENCE, "utf8")).sort())
     .toEqual(["blocksSqliteWrites", "readCanonicalControl", "readGenesisIntent", "refuse"]);
 });
 
 test("no SQLite is reachable from anything the fence calls", () => {
-  const text = fs.readFileSync(BOOTSTRAP, "utf8");
+  const text = fs.readFileSync(FENCE, "utf8");
   const seeds: string[] = [];
   for (const callee of fenceCallees(text)) {
     if (new RegExp(`^(export )?function ${callee}\\b`, "m").test(text)) continue;   // local
     const imported = new RegExp(`import[^;]*\\b${callee}\\b[^;]*from "([^"]+)"`).exec(text);
     expect(imported, `${callee} must be imported or local`).not.toBeNull();
-    seeds.push(resolveSpecifier(BOOTSTRAP, imported![1]!));
+    seeds.push(resolveSpecifier(FENCE, imported![1]!));
   }
   expect(seeds.length).toBeGreaterThan(1);
 

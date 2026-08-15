@@ -36,6 +36,7 @@ networking actually work.
 bun run rig doctor              # host preflight (read-only; exit 1 if anything is ✗)
 bun run rig up                  # build the device image + start rig-dev-a / rig-dev-b
 bun run rig run onboard-smoke   # the PR gate: bootstrap → init → pair → join → push/pull → assert
+bun run rig run all             # FAST suite, including SQLite genesis + JSON upgrade paths
 bun run rig down                # stop+delete containers + network
 bun run rig down --all          # also delete the rig-device image + rig-* volumes
 bun run rig gc                  # scoped dangling artifacts + old runs/workload cache
@@ -60,8 +61,9 @@ prune. `up` retains the newest 30 run directories, and `gc` also enforces the wo
 5. **A** `rbox pair` → require and parse the emitted `rbox connect <token>` command.
 6. **B** execute that canonical one-shot connect path (token redacted in artifacts).
 7. **B** `rbox init --workspace <id>` + `rbox pull` (`RBOX_DOWNLOAD_CONCURRENCY=16`).
-8. **Assert** A and B trees are byte-identical (excluding `.rbox/`), file count > 90,
-   and the empty file + symlink survived.
+8. **Assert** both state stores carry a SQLite authority created by genesis (not
+   migration), then assert A and B trees are byte-identical (excluding `.rbox/`),
+   file count > 90, and the empty file + symlink survived.
 9. **Teardown** host-side `DELETE /v1/account` with A's own owner creds (a live
    exercise of the design-37 deletion cascade). Skipped with `--keep-account`.
 10. Write `report.json` + a PASS/FAIL table into the run dir.
@@ -90,6 +92,21 @@ Exit code: `0` PASS, `1` FAIL, `2` usage/unknown scenario.
 Tests (`bun test ./scripts/rig/`) cover only the pure logic: the prod refusal, the
 image-staleness hash, secret-resolution precedence + redaction, the fingerprint
 parse/compare, the pair-token parse, and report shaping.
+
+### SQLite authority dimension (SP-2.5)
+
+Every scenario in `FAST_SUITE` that uses the shared two-device preamble now reads
+state through the dual-authority state view and requires both databases to carry
+`migration_completion.origin_kind = 'genesis'`. The marker alone is not enough: a
+migrated legacy workspace also has that marker.
+
+Two FAST scenarios pin the lifecycle edges:
+
+- `sqlite-fresh-install`: bind-only `track` publishes genesis Q before sequence
+  0's first sync → pair/track/genesis a second device → converge.
+- `json-upgrade-path`: install an existing JSON-authority fixture through the
+  compatibility/test writer, sync it without conversion, pair a genesis-SQLite
+  peer on the same build, round-trip B→A, and require convergence while A remains JSON.
 
 ### `chaos-restart` (explicit-only — design 56 §9)
 
@@ -228,9 +245,18 @@ Runs persist A and B mode, SHA-256, observed `rbox --version`, and compiled host
 path in `report.json` and `report.md`. Different effective binary contents are
 refused unless the scenario explicitly declares dual-binary support; a declared
 differential also fails before scenario assertions if both guests report the same
-version. No current scenario declares support: `git-entanglement` reads the legacy
-state-file layout, while `two-device-live` does not explicitly migrate the 2.0
-side and therefore cannot yet prove design 163's mixed-authority contract.
+version. `dual-binary-state` is the one declared differential gate. Run it with
+released 1.11.4 on A and the exact candidate on B:
+
+```sh
+bun run rig run dual-binary-state \
+  --binary-a /absolute/path/rbox-1.11.4-linux \
+  --binary-b /absolute/path/rbox-candidate-linux
+```
+
+The runner persists both canonical host paths, SHA-256 values, and observed
+versions. The SP-2.5 `sqlite-fresh-install` and `json-upgrade-path` scenarios
+remain same-build gates.
 
 ## What's next
 

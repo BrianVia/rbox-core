@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -183,6 +183,43 @@ function recordFetches(): string[] {
   }) as typeof fetch;
   return calls;
 }
+
+test("configured-uninitialized doctor renders current indeterminate and I/O probes from central copy", async () => {
+  const cases = [
+    {
+      code: "EPERM",
+      id: "state-genesis/lock-indeterminate",
+      problem: "rbox couldn't create the lock it needs in this folder. Check this folder's permissions and storage or security policy, then run the same command again. If it still fails, run rbox doctor.",
+    },
+    {
+      code: "EIO",
+      id: "state-genesis/lock-io",
+      problem: "rbox couldn't complete a storage operation needed to create, verify, or clean up the lock in this folder. Check that the disk has free space and that this folder is readable and writable, then run the same command again. If it still fails, run rbox doctor.",
+    },
+  ] as const;
+  for (const row of cases) {
+    const root = await makeWorkspace();
+    const link = spyOn(fs, "link").mockRejectedValue(Object.assign(new Error(row.code), { code: row.code }));
+    try {
+      const locking = (await collectDoctorContext(root)).checks.locking;
+      expect(locking).toEqual({
+        ok: false,
+        label: "locking",
+        status: row.id,
+        message: row.problem,
+        finding: {
+          id: row.id,
+          severity: "blocked",
+          problem: row.problem,
+          safety: "Your files are safe. rbox stopped before syncing or changing any more files; synced copies on the server and other computers were not changed.",
+        },
+      });
+    } finally {
+      link.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("doctor remains available during pending genesis, reports the resume path, and refuses diagnostics upload", async () => {
   const root = await makeWorkspace();

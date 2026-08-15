@@ -18,18 +18,55 @@
  */
 import { expect, test } from "bun:test";
 import {
-  GENESIS_REFUSAL_COPY, MIGRATION_DISPOSITION_COPY, MIGRATION_HALT_COPY,
+  GENESIS_ADMISSION_REFUSAL_COPY, GENESIS_REFUSAL_COPY, MIGRATION_DISPOSITION_COPY, MIGRATION_HALT_COPY,
   MIGRATION_REFUSAL_COPY, MIGRATION_STEP_COPY, type OperatorCopy,
 } from "./state-plane-copy.js";
 import {
   describeAdmissionRefusal, describeAuthorityCorruption, describeFormatTooNew,
-  describeGenesisOutcome, describeLockRefusal, describeMigrationHalt, describeMigrationOutcome,
+  describeGenesisAdmissionRefusal, describeGenesisOutcome, describeLockRefusal, describeMigrationHalt, describeMigrationOutcome,
   describeWorkspaceBusy, operatorReportJson, renderOperatorReport, type OperatorReport,
 } from "./state-plane-report.js";
 import { RESET_MATERIALIZED_BYTE_LIMIT } from "./reset-io.js";
 import type { MigrationHalt, MigrationHaltCode } from "./state-plane/migration/health.js";
 
 const ROOT = "/tmp/rbox-report-fixture";
+
+test("fresh-genesis refusals have one exact central machine/human copy", () => {
+  const expected = {
+    "lock-unsupported": [
+      "state-genesis/lock-unsupported",
+      "rbox can't safely continue because this folder doesn't allow the locking rbox needs. Move this entire workspace folder, including its hidden .rbox folder, to a local disk, then run the same command there.",
+    ],
+    "lock-indeterminate": [
+      "state-genesis/lock-indeterminate",
+      "rbox couldn't create the lock it needs in this folder. Check this folder's permissions and storage or security policy, then run the same command again. If it still fails, run rbox doctor.",
+    ],
+    "lock-identity-unavailable": [
+      "state-genesis/lock-identity-unavailable",
+      "rbox couldn't verify this computer's identity for safe locking. Restart this computer, then run the same command again.",
+    ],
+    "lock-io": [
+      "state-genesis/lock-io",
+      "rbox couldn't complete a storage operation needed to create, verify, or clean up the lock in this folder. Check that the disk has free space and that this folder is readable and writable, then run the same command again. If it still fails, run rbox doctor.",
+    ],
+  } as const;
+  const safety = "Your files are safe. rbox stopped before syncing or changing any more files; synced copies on the server and other computers were not changed.";
+  for (const [reason, [id, problem]] of Object.entries(expected)) {
+    const copy = GENESIS_ADMISSION_REFUSAL_COPY[reason as keyof typeof expected];
+    expect(copy).toEqual({ human: { problem, safety }, machine: { id, severity: "blocked" } });
+    const report = describeGenesisAdmissionRefusal({
+      reason: reason as keyof typeof expected,
+      layer: "workspace",
+    });
+    expect(report).toMatchObject({
+      ok: false,
+      outcome: `refused:${reason}`,
+      finding: { id, severity: "blocked", problem, safety },
+      facts: [],
+    });
+    expect(report.finding.command).toBeUndefined();
+  }
+});
 
 const halt = (
   code: MigrationHaltCode, fields: Partial<MigrationHalt> = {},

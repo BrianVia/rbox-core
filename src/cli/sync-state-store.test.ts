@@ -62,6 +62,10 @@ test("seq-0 load silently skips stray legacy reset namespace entries", async () 
 
 test("ordinary state CAS preserves the canonical state.json bytes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-state-store-"));
+  await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+  await fs.writeFile(statePath(root), JSON.stringify({
+    stream: "stream", lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  }, null, 2));
   const result = await applyStateSavePacket(root, {
     expectedStream: "stream",
     expectedNonce: "legacy",

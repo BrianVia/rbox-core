@@ -7,6 +7,7 @@ import {
   type TelemetrySample,
   type WsHealthSample,
 } from "./contract.js";
+import type { GenesisAdmissionRefusal } from "../state-plane/authority-bootstrap.js";
 
 export interface TelemetryTransport {
   postJson(path: string, body: unknown, opts?: { signal?: AbortSignal; retries?: number }): Promise<Response>;
@@ -14,6 +15,24 @@ export interface TelemetryTransport {
 
 export interface TelemetryRecorder {
   record(sample: TelemetrySample): void;
+}
+
+/** Record the one safety occurrence that proves a filesystem cannot publish
+ * the hardlink locks genesis requires. All other refusal causes are neutral and
+ * intentionally produce no event. */
+export async function reportGenesisLockUnsupported(
+  refusal: GenesisAdmissionRefusal,
+  transport: TelemetryTransport,
+  queue?: TelemetryQueue,
+): Promise<void> {
+  if (refusal.reason !== "lock-unsupported") return;
+  const target = queue ?? new TelemetryQueue(transport);
+  target.record({ kind: "safety_event", eventType: "genesis_lock_unsupported", count: 1 });
+  try {
+    await target.flush(AbortSignal.timeout(1500));
+  } catch {
+    // Telemetry never changes or obscures the refusal.
+  }
 }
 
 type Family = TelemetrySample["kind"];

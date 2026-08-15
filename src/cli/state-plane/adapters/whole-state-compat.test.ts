@@ -246,10 +246,13 @@ test("settled JSON preserves wrong-root, ownership-lost, and degraded adapter be
   expect(rboxResidue(degradedState)).toEqual(degradedResidue);
 });
 
-test("an absent state document is still the JSON backend's first run", async () => {
+test("an absent state document selects no backend and direct load refuses to manufacture JSON", async () => {
   const root = await workspace("absent");
-  expect((await loadState(root, STREAM)).lastSyncedSequence).toBe(0);
+  const before = snapshot(root);
+  await expect(loadState(root, STREAM)).rejects.toThrow(/no sync-record authority/);
   expect(await loadRawState(root)).toBeUndefined();
+  expect(await fsp.lstat(statePath(root)).catch(() => undefined)).toBeUndefined();
+  expect(snapshot(root)).toEqual(before);
 });
 
 test("a healthy held-mutex load admits absent state and re-selects the genesis store", async () => {
@@ -301,7 +304,7 @@ for (const markerPublished of [true, false]) {
       await plantResumeIntent(root, authorityId!);
       if (!markerPublished) await fsp.rm(statePath(root));
 
-      const beforeResume = await import("../authority-bootstrap.js");
+      const beforeResume = await import("../state-write-fence.js");
       expect(() => beforeResume.assertAuthorityWritable(root)).toThrow(StateWriteRefusedError);
       const recovered = await loadState(root, STREAM, () => undefined, mutex);
       expect(await readAuthorityMarkerId(statePath(root))).toBe(authorityId!);

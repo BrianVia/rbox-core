@@ -40,7 +40,6 @@ import {
 import {
   applyStateSavePacket,
   assertResetIncarnationMarkerNormalized,
-  installGenesisResetStateUnderHeldLock,
   loadRawState,
   selectedStateForResetConsent,
   stateLockBusyDetail,
@@ -423,8 +422,6 @@ export async function resetSyncState(
         }
 
         if (!prior) {
-          await installGenesisResetStateUnderHeldLock(root, nextStream, acquired.lock);
-          recoveryCallerStream = nextStream;
           return;
         }
         if (!authorization) throw new RebindConsentRequiredError(root);

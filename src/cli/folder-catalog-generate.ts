@@ -127,6 +127,26 @@ export async function initializeFolderCatalog(
   return (await publishNoReplace(generated.bytes, options.publication)).snapshot;
 }
 
+/** Crash-continuation initializer for the first successfully admitted binding.
+ * Ordinary authority activation still refuses any discoverable binding. This
+ * narrower capability accepts exactly the named root and no skipped/evidence-
+ * unavailable rows, so it cannot silently regenerate an older lost catalog. */
+export async function initializeFolderCatalogAfterFirstBinding(
+  inventory: FolderGenerationInventory,
+  root: string,
+  options: { publication?: FolderCatalogPublicationOptions } = {},
+): Promise<FolderCatalogSnapshot> {
+  const expected = expandFolderPath(path.resolve(root));
+  const only = inventory.discoverableBindings.length === 1
+    ? expandFolderPath(path.resolve(inventory.discoverableBindings[0]!.root))
+    : undefined;
+  if (only !== expected || inventory.skipped.length !== 0 || (inventory.evidenceUnavailable?.length ?? 0) !== 0) {
+    throw new Error("first-binding folder configuration initialization requires exactly the admitted root");
+  }
+  const generated = generateFolderCatalog(inventory);
+  return (await publishNoReplace(generated.bytes, options.publication)).snapshot;
+}
+
 function lossFor(state: FolderCatalogState): FolderRegenerationLoss {
   return Object.freeze({
     description: "Regeneration cannot reconstruct local labels, ordering, global defaults, inheritance choices, overrides not reflected by current binding policy, or unbound and missing entries.",

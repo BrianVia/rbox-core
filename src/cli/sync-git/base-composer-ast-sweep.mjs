@@ -48,7 +48,7 @@ const STATE_ORDER_OWNERS = new Map([
   ["src/cli/state-plane/authority-marker.ts", new Set(["classifyStateFormat", "isSymbolicLinkAtPath"])],
   ["src/cli/state-plane/authority-bootstrap.ts", new Set([
     "admitGenesisAuthority",
-    "selectStateAuthority",
+    "observeStateAuthority",
   ])],
   ["src/cli/state-plane/adapters/legacy-json-publication.ts", new Set([
     "afterStatePublication",
@@ -101,7 +101,7 @@ const STATE_ORDER_CALLEES = new Set([
   "readAuthorityMarkerId",
   "readGenesisIntent",
   "selectAuthority",
-  "selectStateAuthority",
+  "observeStateAuthority",
   "withGenesisAdmissionLocks",
   "afterStatePublication",
   "assertStatePublishable",

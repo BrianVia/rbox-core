@@ -13,6 +13,8 @@ import {
   workspaceSyncMutexDegraded,
   type DaemonMutexResult,
 } from "./sync-mutex.js";
+import { saveStateUnsafeLegacyOrTest } from "./sync-state-store.js";
+import { admitGenesisAuthority } from "./state-plane/authority-bootstrap.js";
 
 let root = "";
 let tokens = 0;
@@ -36,6 +38,9 @@ afterEach(async () => fs.rm(root, { recursive: true, force: true }));
 
 describe("design 93 §6 workspace sync mutex", () => {
   test("identity unavailability is surfaced once and CLI/daemon work proceeds on the legacy path", async () => {
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: "legacy", lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
     const unavailable: LockIdentitySource = {
       current: async () => { throw new Error("no identity source"); },
       probe: async () => ({ status: "unknown" }),
@@ -64,6 +69,44 @@ describe("design 93 §6 workspace sync mutex", () => {
     expect(surfaced[0]).toContain("git config sync disabled");
     expect(surfaced[0]).toContain("legacy state saves");
     expect(await readLockingHealth(root)).toEqual({ status: "degraded-unlocked", reason: "identity-unavailable" });
+  });
+
+  test("absent-state lock failure is invocation-local and retains its closed cause", async () => {
+    const surfaced: string[] = [];
+    const cli = await acquireWorkspaceSyncMutex(root, "cli", {
+      ...options(identity()),
+      onDegraded: (message) => surfaced.push(message),
+      lock: {
+        ...options(identity()).lock,
+        hooks: {
+          link: async () => { throw Object.assign(new Error("unsupported"), { code: "EOPNOTSUPP" }); },
+        },
+      },
+    });
+    expect(workspaceSyncMutexDegraded(cli)).toBeFalse();
+    expect(cli.lockFailure?.reason).toBe("hardlink-unsupported");
+    expect(surfaced).toEqual([]);
+    expect(await readLockingHealth(root)).toEqual({ status: "ok" });
+    await releaseWorkspaceSyncMutex(cli);
+  });
+
+  test("absent-state workspace lock I/O becomes an ephemeral lock-io refusal", async () => {
+    const cli = await acquireWorkspaceSyncMutex(root, "cli", {
+      ...options(identity()),
+      lock: {
+        ...options(identity()).lock,
+        hooks: {
+          link: async () => { throw Object.assign(new Error("injected storage fault"), { code: "EIO" }); },
+        },
+      },
+    });
+    expect(cli.lockFailure?.reason).toBe("io");
+    expect(await admitGenesisAuthority(root, cli)).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "lock-io", layer: "workspace" },
+    });
+    expect(await readLockingHealth(root)).toEqual({ status: "ok" });
+    await releaseWorkspaceSyncMutex(cli);
   });
 
   test("CLI contender exits with the closed typed busy message", async () => {
@@ -180,7 +223,8 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
     for (const owner of ["chain-repair.ts", "daemon/daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "local-runtime.ts", "recover-cmd.ts"]) {
       expect(contents.get(owner), owner).toMatch(/syncMutex|WorkspaceSyncMutex/);
     }
-    expect(contents.get("export-cmd.ts")).toMatch(/explicit mutex exemption/);
+    expect(contents.get("export-cmd.ts")).toMatch(/acquireWorkspaceSyncMutex/);
+    expect(contents.get("export-cmd.ts")).toMatch(/admitGenesisAuthority/);
   });
 
   test("nested 409 recovery and sync pull→push pass the held handle without reacquiring", async () => {

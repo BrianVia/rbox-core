@@ -24,6 +24,11 @@ import { emitJson } from "./json.js";
 import { confirmDestructive } from "./prompt.js";
 import { acquireWorkspaceSyncMutexForAdopt, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 import { sync } from "./sync.js";
+import { admitGenesisAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
+import type { WorkspaceSyncMutex } from "./sync-mutex.js";
+import { loadCredentials } from "./credentials.js";
+import { RboxApi } from "./remote.js";
+import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
 
 export interface AdoptStatusReport {
   root: string;
@@ -112,37 +117,68 @@ function journalPolicy(journal: AdoptJournal): ResolvedFolderPolicy {
   return resolveFolderPolicy({}, snapshotPreCatalogPolicy(legacyBinding));
 }
 
-async function ensureJournalConfig(journal: AdoptJournal): Promise<{ generation: string; policy: ResolvedFolderPolicy }> {
-  let state = await ensureFolderAuthority({ currentRoot: journal.workspace.root });
+async function ensureJournalConfig(
+  journal: AdoptJournal,
+  mutex: WorkspaceSyncMutex,
+): Promise<{ generation: string; policy: ResolvedFolderPolicy }> {
   const current = await loadConfigIfPresent(journal.workspace.root);
   if (current) {
     if (syncStreamId(current) !== journal.workspace.stream) throw new Error("workspace config does not match adoption journal");
-    const admission = await observeFolderAdmission(journal.workspace.root, state);
-    if (admission.kind !== "admitted") throw runtimeRefusal(admission);
-    return { generation: admission.generation, policy: journalPolicy(journal) };
   }
-  const cfg: WorkspaceConfig = {
-    schema: "e2ee/v1",
-    remoteWorkspaceId: journal.workspace.workspaceId,
-    projectId: journal.workspace.projectId,
-    deviceId: journal.workspace.deviceId,
-    rootPath: journal.workspace.root,
-    remoteUrl: journal.workspace.remoteUrl,
-    token: "",
-    syncGit: journal.workspace.syncGit,
-    respectGitignore: journal.workspace.respectGitignore,
-    ...(journal.workspace.name ? { name: journal.workspace.name } : {}),
-  };
-  await saveConfig(journal.workspace.root, cfg);
-  // Design 211: a restored binding is a binding — record it like track/init do.
-  await rememberBinding(journal.workspace.root, {
-    remoteWorkspaceId: cfg.remoteWorkspaceId,
-    ...(cfg.name ? { name: cfg.name } : {}),
+  let cfg = current;
+  if (!cfg) {
+    cfg = {
+      schema: "e2ee/v1",
+      remoteWorkspaceId: journal.workspace.workspaceId,
+      projectId: journal.workspace.projectId,
+      deviceId: journal.workspace.deviceId,
+      rootPath: journal.workspace.root,
+      remoteUrl: journal.workspace.remoteUrl,
+      token: "",
+      syncGit: journal.workspace.syncGit,
+      respectGitignore: journal.workspace.respectGitignore,
+    };
+    if (journal.workspace.name) cfg.name = journal.workspace.name;
+  }
+  if (!current) await saveConfig(journal.workspace.root, cfg);
+  await fsyncDirectory(path.join(journal.workspace.root, ".rbox"));
+  const stateAdmission = await admitGenesisAuthority(journal.workspace.root, mutex);
+  if (stateAdmission.kind === "refused") {
+    try {
+      const loaded = await loadCredentials();
+      if (loaded.state === "valid") {
+        await reportGenesisLockUnsupported(
+          stateAdmission.refusal,
+          new RboxApi(
+            loaded.credentials.remoteUrl,
+            loaded.credentials.token,
+            journal.workspace.workspaceId,
+            journal.workspace.projectId,
+          ),
+        );
+      }
+    } catch {
+      // Telemetry is optional and never replaces the admission refusal.
+    }
+  }
+  requireSelected(stateAdmission);
+
+  const state = await ensureFolderAuthority({
+    currentRoot: journal.workspace.root,
+    admittedFirstBinding: !current,
   });
-  await recordFolder(journal.workspace.root, {
-    options: journalPolicy(journal),
-  });
-  state = await ensureFolderAuthority({ currentRoot: journal.workspace.root });
+
+  if (!current) {
+    // Downstream catalog effects happen only after state authority is selected.
+    const binding: Parameters<typeof rememberBinding>[1] = {
+      remoteWorkspaceId: cfg.remoteWorkspaceId,
+    };
+    if (cfg.name) binding.name = cfg.name;
+    await rememberBinding(journal.workspace.root, binding);
+    await recordFolder(journal.workspace.root, {
+      options: journalPolicy(journal),
+    });
+  }
   const admission = await observeFolderAdmission(journal.workspace.root, state);
   if (admission.kind !== "admitted") throw runtimeRefusal(admission);
   return { generation: admission.generation, policy: journalPolicy(journal) };
@@ -152,6 +188,7 @@ async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal
   if (isTerminalAdoptPhase(journal.phase)) throw new Error(`adoption is already ${journal.phase}`);
   const mutex = await acquireWorkspaceSyncMutexForAdopt(root, "resume", journal.journalId);
   try {
+    const admission = await ensureJournalConfig(journal, mutex);
     await refreshAdoptionContinuation(journal, mutex);
     if (journal.phase === "aborting") return abortAdoption(journal, mutex);
     // Only unprepared PARKED branches may be freshly classified on resume.
@@ -161,7 +198,6 @@ async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal
       repo.state = "pending";
       repo.reason = undefined;
     }
-    const admission = await ensureJournalConfig(journal);
     if (!journal.pinnedFolderPolicy) {
       await pinAdoptionFolderPolicy(journal, admission.generation, admission.policy, mutex);
     }

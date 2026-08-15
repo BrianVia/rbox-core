@@ -155,24 +155,8 @@ interface DaemonCycle {
   readonly log: (line: string) => void;
 }
 
-/**
- * One workspace's stop → convert → restart, with design 222 §3.2's
- * finally-level guarantee.
- *
- * The gap between the stop and the restart is entry point A of the state
- * plane: the one moment a fleet workspace is provably idle with a person
- * waiting. Nothing the conversion does may prevent the restart, so it runs
- * inside a `try` whose `finally` restarts unconditionally — and
- * `migrateStateInUpgradeWindow` additionally contracts never to throw, so the
- * `catch` here is the second of two independent guarantees rather than the only
- * one.
- *
- * Returns false for exactly what it returned false for before: a stop that
- * failed and a restart that failed. A conversion that did not happen is REPORTED
- * and never counted — the binary was upgraded and the background sync came back,
- * so failing the command would misreport both. §3.2's `recordWorkspaceOutcome`
- * is a line to print, not an exit code.
- */
+/** One workspace's stop → desired-state check → restart. State conversion is
+ * explicit-command-only; upgrade preserves daemon lifecycle and mode. */
 async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle): Promise<boolean> {
   try {
     await stop(root);
@@ -183,15 +167,6 @@ async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle)
   if (row.desired.state === "stopped") {
     log(`daemon ${key}: stopped (desired state is stopped)`);
     return true;
-  }
-  try {
-    const { migrateStateInUpgradeWindow } = await import("./upgrade-state-window.js");
-    for (const line of (await migrateStateInUpgradeWindow(root, key)).lines) log(line);
-  } catch (error) {
-    // The catch is total, which is what makes the restart below unconditional
-    // without a `finally`: no conversion outcome — verdict, refusal, or defect —
-    // can reach past this line, so nothing can skip the restart (§3.2).
-    log(`daemon ${key}: rbox could not convert this workspace's sync records (${error instanceof Error ? error.message : String(error)}); run rbox migrate in that workspace`);
   }
   return await restartDesiredDaemon({ root, key, row, stop, start, log });
 }

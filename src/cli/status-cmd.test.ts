@@ -125,6 +125,11 @@ beforeEach(async () => {
     encrypted: true,
   };
   await saveConfig(root, cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 
 afterEach(async () => {

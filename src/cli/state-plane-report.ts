@@ -14,7 +14,7 @@
  * that read.
  */
 import {
-  AUTHORITY_CORRUPT_COPY, GENESIS_REFUSAL_COPY, MIGRATION_DISPOSITION_COPY,
+  AUTHORITY_CORRUPT_COPY, GENESIS_ADMISSION_REFUSAL_COPY, GENESIS_REFUSAL_COPY, MIGRATION_DISPOSITION_COPY,
   FORMAT_TOO_NEW_COPY, MIGRATION_HALT_COPY, MIGRATION_REFUSAL_COPY, STATE_UNREADABLE_COPY,
   type OperatorCopy, type OperatorFinding,
 } from "./state-plane-copy.js";
@@ -22,7 +22,7 @@ import {
   RESERVED_PATH_CLASS_COPY, RESERVED_PATH_TOKEN_COPY, UNDERLYING_TOKEN_COPY,
   UNDERLYING_UNKNOWN_LINE, type ReservedPathClass,
 } from "./state-plane-detail-copy.js";
-import type { AuthorityOutcome } from "./state-plane/authority-bootstrap.js";
+import type { GenesisAdmissionRefusal } from "./state-plane/authority-bootstrap.js";
 import type { StatePlaneLockRefusal } from "./state-plane/locks.js";
 import type { GenesisOutcome } from "./state-plane/genesis.js";
 import type { MigrationOutcome } from "./state-plane/migration/authority.js";
@@ -250,6 +250,16 @@ export function describeGenesisOutcome(root: string, outcome: GenesisOutcome): O
   return { ok: false, outcome: `genesis-refused:${outcome.reason}`, finding: finding(copy), facts };
 }
 
+export function describeGenesisAdmissionRefusal(refusal: GenesisAdmissionRefusal): OperatorReport {
+  const copy = GENESIS_ADMISSION_REFUSAL_COPY[refusal.reason];
+  return {
+    ok: false,
+    outcome: `refused:${refusal.reason}`,
+    finding: finding(copy),
+    facts: [],
+  };
+}
+
 /** The lock bundle was never held, so nothing ran at all. */
 export function describeLockRefusal(refusal: StatePlaneLockRefusal): OperatorReport {
   if (refusal.code === "degraded-fence") {
@@ -286,10 +296,18 @@ export function describeWorkspaceBusy(): OperatorReport {
   };
 }
 
-export function describeAuthorityOutcome(root: string, outcome: AuthorityOutcome): OperatorReport {
-  return outcome.domain === "genesis"
-    ? describeGenesisOutcome(root, outcome.outcome)
-    : describeMigrationOutcome(root, outcome.outcome);
+export function describeNoLegacyState(): OperatorReport {
+  return {
+    ok: false,
+    outcome: "refused:no-legacy-state",
+    finding: {
+      id: "state-migration/no-legacy-state",
+      severity: "attention",
+      problem: "There is no legacy state to migrate; run track or init first.",
+      safety: "Nothing changed. This workspace still has no sync-record authority.",
+    },
+    facts: [],
+  };
 }
 
 /**

@@ -32,6 +32,7 @@ import type { AdmissionRefusal } from "./state-plane/migration/admission.js";
 import type { MigrationProgress } from "./state-plane/migration/authority.js";
 import type { MigrationHalt, MigrationHaltCode } from "./state-plane/migration/health.js";
 import type { GenesisRefusal } from "./state-plane/genesis.js";
+import type { GenesisAdmissionRefusal } from "./state-plane/authority-bootstrap.js";
 
 /**
  * One user-facing state-plane message.
@@ -55,6 +56,41 @@ export interface OperatorCopy {
 }
 
 export type OperatorFinding = TriageFinding;
+
+const GENESIS_LOCK_SAFETY = "Your files are safe. rbox stopped before syncing or changing any more files; synced copies on the server and other computers were not changed.";
+
+/** Ephemeral fresh-genesis lock refusals. These words are shared verbatim by
+ * commands, daemon logging, and the configured-uninitialized doctor probe. */
+export const GENESIS_ADMISSION_REFUSAL_COPY = {
+  "lock-unsupported": {
+    human: {
+      problem: "rbox can't safely continue because this folder doesn't allow the locking rbox needs. Move this entire workspace folder, including its hidden .rbox folder, to a local disk, then run the same command there.",
+      safety: GENESIS_LOCK_SAFETY,
+    },
+    machine: { id: "state-genesis/lock-unsupported", severity: "blocked" },
+  },
+  "lock-indeterminate": {
+    human: {
+      problem: "rbox couldn't create the lock it needs in this folder. Check this folder's permissions and storage or security policy, then run the same command again. If it still fails, run rbox doctor.",
+      safety: GENESIS_LOCK_SAFETY,
+    },
+    machine: { id: "state-genesis/lock-indeterminate", severity: "blocked" },
+  },
+  "lock-identity-unavailable": {
+    human: {
+      problem: "rbox couldn't verify this computer's identity for safe locking. Restart this computer, then run the same command again.",
+      safety: GENESIS_LOCK_SAFETY,
+    },
+    machine: { id: "state-genesis/lock-identity-unavailable", severity: "blocked" },
+  },
+  "lock-io": {
+    human: {
+      problem: "rbox couldn't complete a storage operation needed to create, verify, or clean up the lock in this folder. Check that the disk has free space and that this folder is readable and writable, then run the same command again. If it still fails, run rbox doctor.",
+      safety: GENESIS_LOCK_SAFETY,
+    },
+    machine: { id: "state-genesis/lock-io", severity: "blocked" },
+  },
+} satisfies Record<GenesisAdmissionRefusal["reason"], OperatorCopy>;
 
 const bytes = (value: number | null): string | undefined =>
   value === null || !Number.isFinite(value) ? undefined : formatDecimalBytes(value);

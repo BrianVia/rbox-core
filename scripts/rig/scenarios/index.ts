@@ -17,8 +17,11 @@ import { gitHeldLivelock } from "./git-held-livelock.js";
 import { gitStaleOpstate } from "./git-stale-opstate.js";
 import { worktreeSquashLifecycle } from "./worktree-squash-lifecycle.js";
 import { webPairing } from "./web-pairing.js";
+import { sqliteFreshInstall } from "./sqlite-fresh-install.js";
+import { jsonUpgradePath } from "./json-upgrade-path.js";
+import { dualBinaryState } from "./dual-binary-state.js";
 
-export const SCENARIOS: Record<string, Scenario> = {
+export const SCENARIOS = {
   "onboard-smoke": onboardSmoke,
   "two-device-live": twoDeviceLive,
   "web-pairing": webPairing,
@@ -36,7 +39,10 @@ export const SCENARIOS: Record<string, Scenario> = {
   "worktree-squash-lifecycle": worktreeSquashLifecycle,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
-};
+  "sqlite-fresh-install": sqliteFreshInstall,
+  "json-upgrade-path": jsonUpgradePath,
+  "dual-binary-state": dualBinaryState,
+} satisfies Record<string, Scenario>;
 
 /**
  * The FAST suite (`rig run all`) — every scenario a PR should gate on, sequentially,
@@ -68,10 +74,20 @@ export const SCENARIOS: Record<string, Scenario> = {
  * `all` — would wire a known failure into the gate. Run it on demand:
  * `bun run rig run worktree-squash-lifecycle`.
  */
-export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
+export const FAST_SUITE = [
+  "sqlite-fresh-install",
+  "json-upgrade-path",
+  "onboard-smoke",
+  "two-device-live",
+  "mass-delete-guard",
+  "type-flip",
+  "daemon-idle-cpu",
+  "git-entanglement",
+  "git-join-ahead",
+] as const;
 
 export function getScenario(name: string): Scenario | undefined {
-  return SCENARIOS[name];
+  return Object.values(SCENARIOS).find((scenario) => scenario.name === name);
 }
 
 export function scenarioNames(): string[] {

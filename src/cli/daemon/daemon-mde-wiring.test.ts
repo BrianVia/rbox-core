@@ -93,6 +93,10 @@ test("209/6 first daemon commit after a full boot scan emits one op for one real
   const remote = remoteFor(server, secrets, ACCOUNT_ID, WORKSPACE_ID, NOW + 5_000, { warningSink: sink });
   const cfg = await cfgFor(root, secrets, remote, WORKSPACE_ID);
   await prepareDaemonFolderAdmission(root, cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   const partition = path.join(root, "partition");
   await fs.mkdir(partition);
   await Promise.all(Array.from({ length: 300 }, (_, index) =>

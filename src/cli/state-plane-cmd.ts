@@ -18,19 +18,27 @@
  * rather than by a second liveness check here.
  */
 import { ResetCorruptionError } from "./reset-io.js";
-import { WorkspaceSyncBusyError, WorkspaceSyncTimeoutError } from "./sync-mutex.js";
+import {
+  acquireWorkspaceSyncMutex,
+  releaseWorkspaceSyncMutex,
+  WorkspaceSyncBusyError,
+  WorkspaceSyncTimeoutError,
+} from "./sync-mutex.js";
 import { MIGRATION_STEP_COPY, PROGRESS_ANNOUNCE_AFTER_MS } from "./state-plane-copy.js";
 import {
-  describeAuthorityCorruption, describeAuthorityOutcome, describeLockRefusal,
+  describeAuthorityCorruption, describeGenesisAdmissionRefusal, describeLockRefusal,
   describeFormatTooNew, describeMigrationOutcome, describeUnreadableState, describeWorkspaceBusy,
+  describeNoLegacyState,
   operatorReportJson, renderOperatorReport,
   type OperatorReport,
 } from "./state-plane-report.js";
-import { establishStateAuthority } from "./state-plane/authority-bootstrap.js";
-import { StateAuthorityCorruptError, StateFormatTooNewError } from "./state-plane/errors.js";
+import { admitGenesisAuthority, observeStateAuthority } from "./state-plane/authority-bootstrap.js";
+import { MigrationControlError, StateAuthorityCorruptError, StateFormatTooNewError } from "./state-plane/errors.js";
 import { withStatePlaneLocks, type EntryPoint, type EntryProof } from "./state-plane/locks.js";
 import { runMigration, type MigrationProgress } from "./state-plane/migration/authority.js";
 import { abortMigration, retryHaltedMigration } from "./state-plane/migration/halt-recovery.js";
+import { readGenesisIntent } from "./state-plane/genesis-intent.js";
+import { readCanonicalControl } from "./state-plane/migration/control-publication.js";
 
 export interface StatePlaneCmdOptions {
   readonly json?: boolean;
@@ -69,6 +77,9 @@ async function inWindow(
     if (error instanceof StateAuthorityCorruptError) {
       return emit(describeAuthorityCorruption(error.detail), options);
     }
+    if (error instanceof MigrationControlError) {
+      return emit(describeAuthorityCorruption("the migration control record is unreadable"), options);
+    }
     // Believed unreachable from here (the inventory reads through the selecting
     // seam), and caught anyway: it is the one typed state-plane error with no
     // other translation, so an unhandled one is exactly the stack trace the
@@ -96,9 +107,49 @@ async function inWindow(
 export async function migrateCmd(root: string, options: StatePlaneCmdOptions = {}): Promise<number> {
   const progress = startProgress(options);
   try {
+    // The explicit command owns the file-level fork. A surviving genesis intent
+    // is recovered through ordinary admission; raw absence is inert; every
+    // migration candidate enters the existing coordinator under its full fence.
+    let runExplicitMigration = false;
+    try {
+      const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+      try {
+        const observation = await observeStateAuthority(root);
+        const intent = readGenesisIntent(root);
+        let control;
+        try {
+          control = readCanonicalControl(root);
+        } catch (error) {
+          if (error instanceof MigrationControlError) {
+            return emit(describeAuthorityCorruption("the migration control record is unreadable"), options);
+          }
+          throw error;
+        }
+        if (intent && !control) {
+          const admitted = await admitGenesisAuthority(root, mutex);
+          return emit(
+            admitted.kind === "refused"
+              ? describeGenesisAdmissionRefusal(admitted.refusal)
+              : describeMigrationOutcome(root, { kind: "already-migrated" }),
+            options,
+          );
+        }
+        if (observation.kind === "uninitialized" && !control) {
+          return emit(describeNoLegacyState(), options);
+        }
+        runExplicitMigration = true;
+      } finally {
+        await releaseWorkspaceSyncMutex(mutex);
+      }
+    } catch (error) {
+      if (error instanceof WorkspaceSyncBusyError || error instanceof WorkspaceSyncTimeoutError) {
+        return emit(describeWorkspaceBusy(), options);
+      }
+      throw error;
+    }
+    if (!runExplicitMigration) throw new Error("migration entry classification did not settle");
     return await inWindow(root, "foreground-migrate", options, async (proof) =>
-      describeAuthorityOutcome(root, await establishStateAuthority(root, proof, (r, entry) =>
-        runMigration(r, entry, progress.observe))));
+      describeMigrationOutcome(root, await runMigration(root, proof, progress.observe)));
   } finally {
     progress.stop();
   }

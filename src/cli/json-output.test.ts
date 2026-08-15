@@ -202,6 +202,10 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     token: "",
     syncGit: false,
   });
+  await saveStateUnsafeLegacyOrTest(tmp, {
+    stream: syncStreamId(await loadConfig(tmp)), lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   await fs.mkdir(path.join(tmp, ".rbox", "state"), { recursive: true });
   await fs.writeFile(
     path.join(tmp, ".rbox", "state", "activity.json"),
@@ -239,6 +243,10 @@ test("status --json keeps machine health at halt when a fresh retry is active", 
     token: "",
     syncGit: false,
   });
+  await saveStateUnsafeLegacyOrTest(tmp, {
+    stream: syncStreamId(await loadConfig(tmp)), lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   await fs.mkdir(path.join(tmp, ".rbox", "state"), { recursive: true });
   const now = new Date().toISOString();
   await fs.writeFile(
@@ -267,6 +275,10 @@ test("status hashcache write-back is guarded by daemon pidfile presence", async 
     remoteUrl: "https://api.test",
     token: "",
     syncGit: false,
+  });
+  await saveStateUnsafeLegacyOrTest(tmp, {
+    stream: syncStreamId(await loadConfig(tmp)), lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
   });
   const cachePath = path.join(tmp, ".rbox", "state", "hashcache.json");
   await fs.mkdir(path.dirname(cachePath), { recursive: true });

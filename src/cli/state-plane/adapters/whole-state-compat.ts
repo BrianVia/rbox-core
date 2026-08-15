@@ -1,36 +1,10 @@
-/**
- * The whole-state compatibility adapter — A-2 (design 222 §1.2, design 163 U3).
- *
- * One selector sits between every whole-state caller and the two backends. It
- * decides which one is authority from the bytes at `.rbox/state.json`, keeps
- * every caller signature, and translates the store's raw `CasResult` into the
- * `StateSaveResult` the JSON CAS has always returned. Reads stay whole; writes
- * go native once `Q` is authority.
- *
- * It is INERT until M6 renames `Q` over the state document: with legacy JSON at
- * that path every call delegates to the JSON store unchanged, and the SQLite
- * half is not even loaded. That is also why the store is reached through a
- * dynamic import: the CLI's eager static graph must stay free of `bun:sqlite`
- * (`schema/inventory.test.ts`), and the same lazy-dispatch shape reset uses
- * (`reset-journal.ts`) is what keeps it that way.
- *
- * NOTHING HERE OPENS A DATABASE IT HAS NOT PROVEN IT OWNS (163 v13). Selection
- * and every refusal are decided from file-level facts — the marker's exact
- * bytes and the SQLite header `store/open.ts` reads before connecting — so a
- * workspace this adapter refuses is byte-identical afterwards, sidecars
- * included.
- */
+/** Whole-state JSON/Q adapter. File-level selection precedes every lazy SQLite
+ * import/open, so a refused authority is byte-identical afterwards. */
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
-import { workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "../../sync-mutex.js";
-import {
-  repoRecordsForState,
-  type StateSaveOptions,
-  type StateSavePacket,
-  type StateSaveResult,
-  type SyncState,
-} from "../../sync-state-model.js";
+import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
+import { repoRecordsForState, type StateSaveOptions, type StateSavePacket, type StateSaveResult, type SyncState } from "../../sync-state-model.js";
 import {
   StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";
@@ -41,14 +15,7 @@ import type { StateStoreHandle } from "../store/open.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
-import {
-  applyLegacyJsonSavePacket,
-  ensureJsonTelemetryId,
-  loadLegacyJsonState,
-  loadRawLegacyJsonState,
-  saveStateUnsafeLegacyOrTest,
-  stateLockBusyDetail,
-} from "./legacy-json-store.js";
+import { applyLegacyJsonSavePacket, ensureJsonTelemetryId, loadLegacyJsonState, loadRawLegacyJsonState, saveStateUnsafeLegacyOrTest, stateLockBusyDetail } from "./legacy-json-store.js";
 
 /** `.rbox/state.json` carries `Q`, and this is the database it names. */
 interface SqliteAuthority { authorityId: string; file: string }
@@ -69,9 +36,8 @@ function translateStoreOpenError<T>(file: string, read: () => T): T {
 
 async function selectAuthority(root: string, heldMutex?: WorkspaceSyncMutex) {
   const coordinator = await import("../authority-bootstrap.js");
-  return heldMutex && !workspaceSyncMutexDegraded(heldMutex)
-    ? coordinator.admitGenesisAuthority(root, heldMutex)
-    : coordinator.selectStateAuthority(root);
+  if (!heldMutex) return coordinator.observeStateAuthority(root);
+  return coordinator.requireSelected(await coordinator.admitGenesisAuthority(root, heldMutex));
 }
 
 async function openAuthorityStore(authority: SqliteAuthority, readonly: boolean): Promise<{ store: StateStoreHandle; facade: StoreFacade }> {
@@ -89,11 +55,10 @@ async function openAuthorityStore(authority: SqliteAuthority, readonly: boolean)
   return { store, facade };
 }
 
-/** Raw state load for the transactional writer. Never manufactures a baseline
- * on either backend: under `Q` an unreadable authority is corruption, not a
- * first run. */
+/** Raw reads never manufacture a baseline. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
   const selection = await selectAuthority(root);
+  if (selection.kind === "uninitialized") return undefined;
   if (selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
   const authority = sqliteAuthority(root, selection);
   const { store, facade } = await openAuthorityStore(authority, true);
@@ -106,6 +71,9 @@ export async function loadRawState(root: string): Promise<SyncState | undefined>
 
 export async function selectedStateForResetConsent(root: string): Promise<Pick<SyncState, "stream" | "stateNonce" | "stateRevision"> | undefined> {
   const selection = await selectAuthority(root);
+  // Absence is not a backend selection, but a standing legacy incarnation is
+  // still protected reset/rebind evidence and must remain visible to consent.
+  if (selection.kind === "uninitialized") return loadRawLegacyJsonState(root);
   if (selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
   const facade = await import("../store-facade.js");
   const file = sqliteResetPaths.active(root);
@@ -130,6 +98,16 @@ export async function loadState(
   heldMutex?: WorkspaceSyncMutex,
 ): Promise<SyncState> {
   const selection = await selectAuthority(root, heldMutex);
+  if (selection.kind === "uninitialized") {
+    // Preserve the incarnation-only mismatch/corruption evidence used by reset
+    // consent without treating absence as a selected legacy backend or running
+    // the legacy reset-recovery mutation path.
+    const incarnation = await loadRawLegacyJsonState(root);
+    if (incarnation?.stream !== undefined && incarnation.stream !== stream) {
+      throw new StreamMismatchError(root, stream, incarnation.stream, "incarnation-marker");
+    }
+    throw new StateWriteRefusedError("authority-uninitialized", statePath(root), "genesis admission requires a held workspace mutex");
+  }
   if (selection.kind === "legacy-json-store") return loadLegacyJsonState(root, stream, warningSink, heldMutex);
   const authority = sqliteAuthority(root, selection);
   // Recovery cannot change the answer above: a standing reset under `Q` is
@@ -146,12 +124,13 @@ export async function loadState(
   return markResetLineageProvenance(root, state);
 }
 
-/** Establish the first durable state nonce through the selected backend's
- * ordinary CAS. Existing JSON remains legacy-untrusted; a genesis SQLite store
- * is already authoritative and may initialize its empty global record. */
+/** Establish the first durable state nonce through the selected backend. */
 export async function ensureCapableStateLineage(root: string, state: SyncState): Promise<SyncState> {
   if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) return state;
   const selection = await selectAuthority(root);
+  if (selection.kind === "uninitialized") {
+    throw new StateWriteRefusedError("authority-uninitialized", statePath(root), "no state authority is selected");
+  }
   if (selection.kind === "legacy-json-store" && await loadRawLegacyJsonState(root)) return state;
   const records = repoRecordsForState(state);
   const manifestGit = state.lastSyncedManifest.gitRepos;
@@ -175,15 +154,17 @@ export async function ensureCapableStateLineage(root: string, state: SyncState):
   throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
 }
 
-/** Mint or reuse the telemetry identity through the authority selected from the
- * state marker. SQLite uses the same state lock and owner capability as its CAS
- * writer; JSON keeps its existing physical implementation byte-for-byte. */
+/** Mint or reuse telemetry identity through the selected authority. */
 export async function ensureTelemetryBindingId(
   root: string,
   expectedStream: string,
   randomBytes?: (size: number) => Buffer,
 ): Promise<{ state: SyncState; bindingId: string }> {
-  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+  const initial = await selectAuthority(root);
+  if (initial.kind === "uninitialized") {
+    throw new StateWriteRefusedError("authority-uninitialized", statePath(root), "no state authority is selected");
+  }
+  if (initial.kind === "legacy-json-store") {
     return ensureJsonTelemetryId(root, expectedStream, randomBytes);
   }
 
@@ -193,10 +174,13 @@ export async function ensureTelemetryBindingId(
   }
   try {
     if (!acquired.lock.isOwnerSync()) throw new Error("sync state telemetry lock ownership was lost");
-    const coordinator = await import("../authority-bootstrap.js");
-    coordinator.assertAuthorityWritable(root);
-    const selection = await coordinator.selectStateAuthority(root);
-    if (selection.kind === "legacy-json-store") {
+    const [coordinator, fence] = await Promise.all([
+      import("../authority-bootstrap.js"),
+      import("../state-write-fence.js"),
+    ]);
+    fence.assertAuthorityWritable(root);
+    const selection = await coordinator.observeStateAuthority(root);
+    if (selection.kind !== "sqlite-store") {
       throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
     }
     const authority = sqliteAuthority(root, selection);
@@ -224,7 +208,14 @@ export async function applyStateSavePacket(
   packet: StateSavePacket,
   options: StateSaveOptions = {},
 ): Promise<StateSaveResult> {
-  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+  const selection = await selectAuthority(root);
+  if (selection.kind === "uninitialized") {
+    return {
+      status: "unsupported",
+      error: new StateWriteRefusedError("authority-uninitialized", statePath(root), "no state authority is selected"),
+    };
+  }
+  if (selection.kind === "legacy-json-store") {
     return applyLegacyJsonSavePacket(root, packet, options);
   }
   return saveThroughStore(root, packet, options);
@@ -263,15 +254,18 @@ async function saveThroughStore(
   try {
     if (!lock.isOwnerSync()) return { status: "busy", detail: "state lock ownership was lost" };
     // The state-plane write fence, once per save, under the held state lock.
-    // A-2 holds no opinion about migration or genesis: the coordinator owns the
-    // predicate and is the only module allowed to import both domains (§7.9).
-    const coordinator = await import("../authority-bootstrap.js");
-    coordinator.assertAuthorityWritable(root);
+    // Its small file-level module owns the one combined recovery predicate and
+    // cannot open SQLite or dispatch either protocol.
+    const [coordinator, fence] = await Promise.all([
+      import("../authority-bootstrap.js"),
+      import("../state-write-fence.js"),
+    ]);
+    fence.assertAuthorityWritable(root);
     // Re-selected under the lock: the pre-lock selection only routed, and the
     // authority may have flipped while this save waited for the lock. This is
     // the SQLite analogue of the JSON path's pre-rename `assertStatePublishable`.
-    const selection = await coordinator.selectStateAuthority(root);
-    if (selection.kind === "legacy-json-store") {
+    const selection = await coordinator.observeStateAuthority(root);
+    if (selection.kind !== "sqlite-store") {
       throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
     }
     const authority = sqliteAuthority(root, selection);
@@ -304,7 +298,11 @@ export async function replaceResetLineageStream(
     || packet.expectedNonce !== authorizedSnapshot.stateNonce) {
     throw new Error("sync state stream replacement packet is not bound to the authorized snapshot");
   }
-  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+  const selected = await selectAuthority(root);
+  if (selected.kind === "uninitialized") {
+    throw new StateWriteRefusedError("authority-uninitialized", statePath(root), "no state authority is selected");
+  }
+  if (selected.kind === "legacy-json-store") {
     await saveStateUnsafeLegacyOrTest(root, legacyReplacement);
     return legacyReplacement;
   }
@@ -317,10 +315,13 @@ export async function replaceResetLineageStream(
     if (!acquired.lock.isOwnerSync()) {
       throw new StateWriteRefusedError("state-lock-lease-lost", statePath(root));
     }
-    const coordinator = await import("../authority-bootstrap.js");
-    coordinator.assertAuthorityWritable(root);
-    const selection = await coordinator.selectStateAuthority(root);
-    if (selection.kind === "legacy-json-store") throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
+    const [coordinator, fence] = await Promise.all([
+      import("../authority-bootstrap.js"),
+      import("../state-write-fence.js"),
+    ]);
+    fence.assertAuthorityWritable(root);
+    const selection = await coordinator.observeStateAuthority(root);
+    if (selection.kind !== "sqlite-store") throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
     const inventory = await inventoryResetNamespace(root);
     let exactResetArchive = false;
     for (const archive of inventory.archives) {

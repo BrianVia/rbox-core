@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, scanManifestForPush, sync, type SyncDeps } from "../sync.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
 import { gitResolveCmd } from "../git/resolve-command.js";
 import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
@@ -267,6 +267,12 @@ beforeEach(async () => {
   });
   cfgA = mk(rootA, "devA");
   cfgB = mk(rootB, "devB");
+  for (const [root, cfg] of [[rootA, cfgA], [rootB, cfgB]] as const) {
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+      lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
+  }
   logsA = [];
   logsB = [];
   depsA = { remote, backoff: noBackoff, onGitLog: (l) => logsA.push(l) };
@@ -1154,12 +1160,11 @@ test("design 68 V11: a skip-eligible pointer with an EXISTING captured base is C
   expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined(); // M4: base-carry, never a removal-memory stamp
   expect(logsA.some((l) => l.includes("skipped") && l.includes("wt"))).toBe(true);
 
-  // The legacy fixture has no publisher binding on its first ACK, so the new
-  // main section is conservatively pending. Once the ACK creates a capable
-  // lineage, the baseless composer proof converges it in exactly one commit.
+  // The explicit JSON fixture has a capable publisher binding, so the first
+  // ACK settles the new main section without a follow-up convergence commit.
   const head = remote.headSeq();
   await push(rootA, cfgA, depsA);
-  expect(remote.headSeq()).toBe(head + 1);
+  expect(remote.headSeq()).toBe(head);
   expect(repoRecordsForState(await st(rootA)).main?.pending).toBeUndefined();
   const converged = remote.headSeq();
   await push(rootA, cfgA, depsA);
@@ -1766,6 +1771,10 @@ test("design 174 B: real pending is superseded by an ahead main with exact off-b
 
   const rootC = path.join(tmp, "C");
   await fs.mkdir(path.join(rootC, ".rbox", "state"), { recursive: true });
+  await saveStateUnsafeLegacyOrTest(rootC, {
+    stream: syncStreamId({ ...cfgB, rootPath: rootC, deviceId: "devC" }), stateNonce: "c".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   const cfgC: WorkspaceConfig = { ...cfgA, rootPath: rootC, deviceId: "devC" };
   await pull(rootC, cfgC, { remote, backoff: noBackoff, onGitLog: () => {} });
   const c = path.join(rootC, rel);
@@ -1834,6 +1843,10 @@ test("design 177: confirmed keep-mine publishes synchronously and clears pending
 
   const rootC = path.join(tmp, "keep-mine-follower");
   await fs.mkdir(path.join(rootC, ".rbox", "state"), { recursive: true });
+  await saveStateUnsafeLegacyOrTest(rootC, {
+    stream: syncStreamId({ ...cfgB, rootPath: rootC, deviceId: "devC" }), stateNonce: "c".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   const cfgC: WorkspaceConfig = { ...cfgB, rootPath: rootC, deviceId: "devC-keep-mine" };
   await pull(rootC, cfgC, { remote, backoff: noBackoff, onGitLog: () => {} });
   const follower = path.join(rootC, rel);

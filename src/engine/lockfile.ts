@@ -64,6 +64,10 @@ export interface DarwinMountStat extends LockStorageStat {
 
 export interface LockfileHooks {
   link?: (existingPath: string, newPath: string) => Promise<void>;
+  /** Test seam for the same-directory staging-name cleanup. Production uses
+   * `unlink`; a failure is surfaced because a lock probe must not claim that
+   * its cleanup succeeded when it left a staging name behind. */
+  unlinkTemp?: (tempPath: string) => Promise<void>;
   afterTempFsync?: (tempPath: string, marker: string) => void | Promise<void>;
   /** Final cooperative-abort seam after durable staging and immediately before
    * the hardlink publishes the visible lock. */
@@ -131,8 +135,14 @@ export type LockAcquireResult =
       warningReason?: LockWarningReason;
       holderKey: string;
     }
-  | { status: "unsupported"; error: unknown }
+  | { status: "unsupported"; reason: LockUnsupportedReason; error: unknown }
   | { status: "error"; error: unknown };
+
+export type LockUnsupportedReason =
+  | "hardlink-unsupported"
+  | "indeterminate"
+  | "identity-unavailable"
+  | "link-capacity";
 
 export interface LockReleaseResult {
   released: boolean;
@@ -158,6 +168,7 @@ interface MarkerRead extends MarkerObservation {
 
 interface AtomicCreateResult {
   status: "created" | "exists" | "unsupported" | "error";
+  reason?: Exclude<LockUnsupportedReason, "identity-unavailable">;
   error?: unknown;
 }
 
@@ -171,6 +182,9 @@ type ReapResult = { status: "reaped" } | { status: "retry" } | { status: "blocke
 
 const staleOwnedMarkers = new Map<string, string>();
 const localStorageCache = new Map<string, boolean>();
+/** Invocation-local temp names whose cleanup failed. A later acquisition in
+ * this process retries those exact owned names before creating another one. */
+const ownedTempResidues = new Map<string, Set<string>>();
 const darwinFallbackOwnStart = Math.max(1, Math.floor((Date.now() - process.uptime() * 1000) * 1000)).toString();
 
 function isCallable<T>(value: T): boolean {
@@ -346,8 +360,20 @@ export async function safeBoundLockParent(
   return "safe";
 }
 
-function isLinkUnsupported(cause: unknown): boolean {
-  return ["ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV", "EMLINK", "ENOSYS"].includes(errno(cause) ?? "");
+function classifyLinkFailure(cause: unknown): Exclude<LockUnsupportedReason, "identity-unavailable"> | undefined {
+  switch (errno(cause)) {
+    case "ENOTSUP":
+    case "EOPNOTSUPP":
+    case "ENOSYS":
+    case "EXDEV":
+      return "hardlink-unsupported";
+    case "EPERM":
+      return "indeterminate";
+    case "EMLINK":
+      return "link-capacity";
+    default:
+      return undefined;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1170,10 +1196,26 @@ export async function inspectLock(
 
 async function atomicCreateMarker(lockPath: string, raw: string, hooks?: LockfileHooks, markerMode = 0o600): Promise<AtomicCreateResult> {
   const dir = path.dirname(lockPath);
+  const priorResidues = ownedTempResidues.get(lockPath);
+  if (priorResidues) {
+    for (const prior of priorResidues) {
+      try {
+        await (hooks?.unlinkTemp ?? fs.unlink)(prior);
+        priorResidues.delete(prior);
+      } catch (error) {
+        if (errno(error) === "ENOENT") priorResidues.delete(prior);
+        else return { status: "error", error };
+      }
+    }
+    if (priorResidues.size === 0) ownedTempResidues.delete(lockPath);
+  }
   const tempPath = path.join(dir, `.${path.basename(lockPath)}.${process.pid}.${crypto.randomBytes(16).toString("hex")}.tmp`);
   let handle: fs.FileHandle | undefined;
+  let tempCreated = false;
+  let result: AtomicCreateResult;
   try {
     handle = await fs.open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, markerMode);
+    tempCreated = true;
     await handle.writeFile(raw);
     await handle.chmod(markerMode);
     await handle.sync();
@@ -1183,18 +1225,42 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
     try {
       await hooks?.beforeLink?.(lockPath, raw);
       await (hooks?.link ?? fs.link)(tempPath, lockPath);
-      return { status: "created" };
+      result = { status: "created" };
     } catch (error) {
-      if (errno(error) === "EEXIST") return { status: "exists" };
-      if (isLinkUnsupported(error)) return { status: "unsupported", error };
-      return { status: "error", error };
+      if (errno(error) === "EEXIST") result = { status: "exists" };
+      else {
+        const reason = classifyLinkFailure(error);
+        result = reason
+          ? { status: "unsupported", reason, error }
+          : { status: "error", error };
+      }
     }
   } catch (error) {
-    return { status: "error", error };
+    result = { status: "error", error };
   } finally {
     await handle?.close().catch(() => {});
-    await fs.unlink(tempPath).catch(() => {});
   }
+  if (!tempCreated) return result!;
+  try {
+    await (hooks?.unlinkTemp ?? fs.unlink)(tempPath);
+  } catch (error) {
+    const residues = ownedTempResidues.get(lockPath) ?? new Set<string>();
+    residues.add(tempPath);
+    ownedTempResidues.set(lockPath, residues);
+    // If the hardlink was published, remove only the exact marker this call
+    // wrote. The bounded temp name may remain for a later retry to clean; a
+    // visible lock must not remain as invented contention after this refusal.
+    if (result!.status === "created") {
+      try {
+        if (await unlinkIfExact(lockPath, raw)) await fsyncDirectory(dir);
+      } catch {
+        // The cleanup error remains the typed result. A changed successor is
+        // deliberately never unlinked.
+      }
+    }
+    return { status: "error", error };
+  }
+  return result!;
 }
 
 /** Publish one caller-generated marker with the same durable hardlink/O_EXCL
@@ -1464,14 +1530,14 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
       ? await refreshSystemLockIdentityLedger()
       : await identity.current();
   } catch (error) {
-    return { status: "unsupported", error };
+    return { status: "unsupported", reason: "identity-unavailable", error };
   }
   const marker: LockMarker = { hostId: incarnation.hostId, bootId: incarnation.bootId, pid: incarnation.pid, startTime: incarnation.startTime, token: token() };
   let raw: string;
   try {
     raw = formatLockMarker(marker);
   } catch (error) {
-    return { status: "unsupported", error };
+    return { status: "unsupported", reason: "identity-unavailable", error };
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1481,7 +1547,13 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
       if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, finalized.observation, identity, options.hooks) };
       if (finalized.cleaned) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
       staleOwnedMarkers.set(lockPath, raw);
-    } else if (created.status === "unsupported") return { status: "unsupported", error: created.error };
+    } else if (created.status === "unsupported") {
+      return {
+        status: "unsupported",
+        reason: created.reason ?? "indeterminate",
+        error: created.error,
+      };
+    }
     else if (created.status === "error") return { status: "error", error: created.error };
 
     const inspection = await inspectLock(lockPath, identity, storageLocal);

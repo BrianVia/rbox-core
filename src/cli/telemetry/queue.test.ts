@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { TelemetryQueue } from "./queue.js";
+import { reportGenesisLockUnsupported, TelemetryQueue, type TelemetryTransport } from "./queue.js";
 import type { GitCaptureSample, TelemetryEnvelope, WsHealthSample } from "./contract.js";
 
 afterEach(() => { delete process.env.RBOX_TELEMETRY; });
@@ -35,6 +35,43 @@ const gitCaptureSample = (body: TelemetryEnvelope): GitCaptureSample =>
   body.samples.find((sample): sample is GitCaptureSample => sample.kind === "git_capture")!;
 
 describe("TelemetryQueue", () => {
+  test("fresh-genesis safety telemetry is one proven-unsupported occurrence only", async () => {
+    const bodies: TelemetryEnvelope[] = [];
+    const options: Array<{ retries?: number }> = [];
+    const transport = { postJson: async (_path: string, body: Parameters<TelemetryTransport["postJson"]>[1], opts?: { retries?: number }) => {
+      bodies.push(body as TelemetryEnvelope);
+      options.push(opts ?? {});
+      return new Response("{}", { status: 202 });
+    } };
+
+    for (const reason of ["lock-indeterminate", "lock-identity-unavailable", "lock-io"] as const) {
+      await reportGenesisLockUnsupported({ reason, layer: "workspace" }, transport);
+    }
+    expect(bodies).toEqual([]);
+
+    await reportGenesisLockUnsupported({ reason: "lock-unsupported", layer: "state" }, transport);
+    expect(bodies).toEqual([{ v: 1, samples: [{
+      kind: "safety_event",
+      eventType: "genesis_lock_unsupported",
+      count: 1,
+    }] }]);
+    expect(options[0]?.retries).toBe(0);
+  });
+
+  test("fresh-genesis telemetry opt-out and transport failure never escape", async () => {
+    let calls = 0;
+    const failing = { postJson: async () => { calls++; throw new Error("offline"); } };
+    await expect(reportGenesisLockUnsupported(
+      { reason: "lock-unsupported", layer: "workspace" },
+      failing,
+    )).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+
+    process.env.RBOX_TELEMETRY = "0";
+    await reportGenesisLockUnsupported({ reason: "lock-unsupported", layer: "workspace" }, failing);
+    expect(calls).toBe(1);
+  });
+
   test("retains and flushes sync_phase samples through the existing envelope", async () => {
     const bodies: TelemetryEnvelope[] = [];
     const queue = new TelemetryQueue({ postJson: async (_path, body) => {

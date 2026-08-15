@@ -498,7 +498,42 @@ describe("atomic lock construction and ownership", () => {
       identity: identity(),
       hooks: { link: async () => { throw Object.assign(new Error("unsupported"), { code: "EOPNOTSUPP" }); } },
     });
-    expect(acquired.status).toBe("unsupported");
+    expect(acquired).toMatchObject({ status: "unsupported", reason: "hardlink-unsupported" });
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+
+  test("hardlink policy and capacity failures keep distinct invocation-local causes", async () => {
+    for (const [code, reason] of [
+      ["EPERM", "indeterminate"],
+      ["EMLINK", "link-capacity"],
+    ] as const) {
+      const root = await tempDir();
+      const result = await acquireLock(path.join(root, "config.lock"), {
+        identity: identity(),
+        hooks: { link: async () => { throw Object.assign(new Error(code), { code }); } },
+      });
+      expect(result).toMatchObject({ status: "unsupported", reason });
+      expect(await fs.readdir(root)).toEqual([]);
+    }
+  });
+
+  test("temp-name cleanup failure is surfaced, bounds its residue, and cleans it on retry", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "cleanup.lock");
+    const result = await acquireLock(lockPath, {
+      identity: identity(),
+      hooks: { unlinkTemp: async () => { throw Object.assign(new Error("cleanup failed"), { code: "EIO" }); } },
+    });
+    expect(result.status).toBe("error");
+    expect(await fs.lstat(lockPath).catch(() => undefined)).toBeUndefined();
+    expect(await fs.readdir(root)).toEqual([
+      expect.stringMatching(/^\.cleanup\.lock\.\d+\.[0-9a-f]{32}\.tmp$/),
+    ]);
+
+    const retried = await acquireLock(lockPath, { identity: identity() });
+    expect(retried.status).toBe("acquired");
+    expect((await fs.readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    if (retried.status === "acquired") await retried.lock.release();
     expect(await fs.readdir(root)).toEqual([]);
   });
 

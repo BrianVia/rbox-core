@@ -11,7 +11,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { saveConfig, type WorkspaceConfig } from "../workspace-config.js";
-import { assertAuthorityWritable } from "./authority-bootstrap.js";
+import { assertAuthorityWritable } from "./state-write-fence.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis-intent.js";

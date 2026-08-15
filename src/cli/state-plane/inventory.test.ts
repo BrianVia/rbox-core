@@ -62,12 +62,15 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // that is already current.
   { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
 
-  // Design 263: the coordinator owns file-level selection and genesis admission;
+  // Design 266: the observer owns file-level selection and genesis admission;
   // the compatibility Adapter reaches both through one lazy selection seam and
   // opens only the backend named by the returned durable observation.
-  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "selectStateAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
-  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "admitGenesisAuthority", kind: "read", sites: 1, guards: ["readGenesisIntent", "selectStateAuthority", "withGenesisAdmissionLocks"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority", "selectStateAuthority"] },
+  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "observeStateAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
+  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "admitGenesisAuthority", kind: "read", sites: 1, guards: ["readGenesisIntent", "observeStateAuthority", "withGenesisAdmissionLocks"] },
+  // The held and observation-only branches are deliberately mutually exclusive,
+  // so pin both calls without pretending they execute in sequence.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["observeStateAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
   // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
@@ -79,6 +82,9 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // database to be at rest and an open here would deposit the sidecars that row
   // reads as corruption. The classify is the extra access site.
   { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
+  // Lock-unsupported handling must distinguish a fresh root from established
+  // JSON before choosing ephemeral refusal versus the preserved degraded row.
+  { file: "src/cli/sync-mutex.ts", symbol: "acquireWorkspaceSyncMutexInternal", kind: "read", sites: 2, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
   // The migration classifier's sole reader of the document. It must handle the
   // marker rather than refuse it, so its guard is the classifier that decides
@@ -93,9 +99,9 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // The SQLite save boundary: the lock, then the ONE write fence, then the
   // selection re-read under that lock, and only then a database open.
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectAuthority"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "selectStateAuthority", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "observeStateAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "observeStateAuthority", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "observeStateAuthority", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureJsonTelemetryId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 

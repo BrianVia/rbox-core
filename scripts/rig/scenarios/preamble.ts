@@ -13,6 +13,7 @@ import { GUEST } from "../lib/config.js";
 import { deleteAccount, grantProPlan, readCredentials } from "../lib/account.js";
 import { daemonWatcherMode, type Device } from "../lib/device.js";
 import type { RunResult } from "../lib/container.js";
+import { readDeviceStateAuthority } from "../lib/state-view.js";
 import { waitForPath } from "../lib/waiters.js";
 import type { Recorder } from "./harness.js";
 import type { RigCtx } from "./types.js";
@@ -51,6 +52,49 @@ export interface ProvisionResult {
   readonly initA: Readonly<RunResult>;
   /** init --workspace pulls/applies implicitly, even when opts.pull is false. */
   readonly initB: Readonly<RunResult>;
+}
+
+/** Account bootstrap shared by normal onboarding and authority-focused scenarios. */
+export async function bootstrapRigAccount(ctx: RigCtx, rec: Recorder): Promise<void> {
+  await rec.step("[A] login --bootstrap", async () => {
+    await ctx.a.rboxShell(
+      rigLoginShell("a", ctx.scenarioName, true),
+      { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
+    );
+  });
+
+  await rec.step("[A] grant pro plan", async () => {
+    const creds = readCredentials(await ctx.a.readFile(`${GUEST.rboxHome}/credentials.json`));
+    if (!creds.accountId) throw new Error("A credentials.json missing accountId after bootstrap");
+    const grant = await grantProPlan(ctx.apiUrl, creds.accountId, ctx.platformSecret);
+    if (!grant.ok) throw new Error(`account plan grant ${grant.status}: ${grant.body.slice(0, 200)}`);
+  });
+}
+
+/** Canonical pair-token handoff shared by normal onboarding and authority scenarios. */
+export async function connectRigDeviceB(ctx: RigCtx, rec: Recorder): Promise<void> {
+  const pairToken = await rec.step("[A] pair", async () => {
+    const res = await ctx.a.rbox(["pair"]);
+    return parsePairToken(res.stdout);
+  });
+  await rec.step("[B] connect (redeem pair)", async () => {
+    await ctx.b.rbox(["connect", pairToken, "--remote", ctx.apiUrl], { redact: [pairToken] });
+  });
+}
+
+/** Prove both stores are SQLite authorities created by genesis, not migration. */
+export async function assertGenesisAuthorityPair(ctx: RigCtx, rec: Recorder): Promise<void> {
+  const [a, b] = await rec.step("SQLite genesis authority (A + B)", async () =>
+    Promise.all([
+      readDeviceStateAuthority(ctx.a, GUEST.workDir),
+      readDeviceStateAuthority(ctx.b, GUEST.workDir),
+    ]));
+  const exactGenesis = (view: typeof a) => view.format === "authority-marker"
+    && view.originKind === "genesis"
+    && view.entryCount === 0
+    && view.repoCount === 0;
+  rec.assert("A state authority is genesis SQLite", exactGenesis(a), JSON.stringify(a));
+  rec.assert("B state authority is genesis SQLite", exactGenesis(b), JSON.stringify(b));
 }
 
 export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = false): string[] {
@@ -103,23 +147,8 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   const doPush = opts.push !== false;
   const doPull = opts.pull !== false;
 
-  // 1. A: bootstrap login (secret via env expansion, never argv).
-  await rec.step("[A] login --bootstrap", async () => {
-    await ctx.a.rboxShell(
-      rigLoginShell("a", ctx.scenarioName, true),
-      { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
-    );
-  });
-
-  // Bootstrap creates the account in the locked `none` tier (design 86). Read the
-  // account id the CLI persisted, then unlock this throwaway account before its
-  // first workspace/push. `grantProPlan` independently refuses production.
-  await rec.step("[A] grant pro plan", async () => {
-    const creds = readCredentials(await ctx.a.readFile(`${GUEST.rboxHome}/credentials.json`));
-    if (!creds.accountId) throw new Error("A credentials.json missing accountId after bootstrap");
-    const grant = await grantProPlan(ctx.apiUrl, creds.accountId, ctx.platformSecret);
-    if (!grant.ok) throw new Error(`account plan grant ${grant.status}: ${grant.body.slice(0, 200)}`);
-  });
+  // 1. A: bootstrap login + unlock the throwaway account's plan.
+  await bootstrapRigAccount(ctx, rec);
 
   // 2. A: seed corpus (optional) + any scenario-specific extra (symlink, …). The
   //    workspace dir must exist before init even when nothing is seeded.
@@ -152,19 +181,8 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
     });
   }
 
-  // 5. A: mint a pairing token.
-  const pairToken = await rec.step("[A] pair", async () => {
-    const res = await ctx.a.rbox(["pair"]);
-    return parsePairToken(res.stdout);
-  });
-
-  // 6. B: execute the canonical one-shot command printed by A. This is the
-  // design-184 contract under test: auth + E2EE enrollment through argv.
-  await rec.step("[B] connect (redeem pair)", async () => {
-    await ctx.b.rbox(["connect", pairToken, "--remote", ctx.apiUrl], {
-      redact: [pairToken],
-    });
-  });
+  // 5-6. Canonical pairing token + one-shot connect handoff.
+  await connectRigDeviceB(ctx, rec);
 
   // 7. B: join the workspace + pull (throttled).
   if (opts.beforeJoinB) {
@@ -176,6 +194,10 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
     if (doPull) await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
     return result;
   });
+
+  // SP-2.5: every scenario using the shared FAST preamble must prove its state was
+  // born through genesis. An authority marker alone would also accept migration.
+  await assertGenesisAuthorityPair(ctx, rec);
 
   return { workspaceId, initA: initialized.result, initB };
 }

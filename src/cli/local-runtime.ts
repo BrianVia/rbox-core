@@ -14,6 +14,11 @@ import { push } from "./sync/push.js";
 import { sync } from "./sync/sync.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import type { WorkspaceConfig } from "./workspace-config.js";
+import { loadConfigIfPresent } from "./workspace-config.js";
+import { admitGenesisAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
+import { loadCredentials } from "./credentials.js";
+import { RboxApi } from "./remote.js";
+import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
 
 type MassDeleteConsent = "guarded" | "allow";
 type SyncMassDeleteConsent = "guard-both" | "allow-push" | "allow-both";
@@ -106,6 +111,29 @@ export class LocalRuntime {
       ? "pull"
       : operation.kind;
     return withWorkspaceSyncMutex(this.root, async (syncMutex) => {
+      const genesisAdmission = await admitGenesisAuthority(this.root, syncMutex);
+      if (genesisAdmission.kind === "refused") {
+        try {
+          const [cfg, loaded] = await Promise.all([
+            loadConfigIfPresent(this.root),
+            loadCredentials(),
+          ]);
+          if (cfg && loaded.state === "valid") {
+            await reportGenesisLockUnsupported(
+              genesisAdmission.refusal,
+              new RboxApi(
+                loaded.credentials.remoteUrl,
+                loaded.credentials.token,
+                cfg.remoteWorkspaceId,
+                cfg.projectId,
+              ),
+            );
+          }
+        } catch {
+          // Telemetry is optional and never replaces the admission refusal.
+        }
+      }
+      requireSelected(genesisAdmission);
       const { cfg: remoteCfg, deps: remoteDeps } = await buildAuthedRemote(
         this.root,
         Date.now,

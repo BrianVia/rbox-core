@@ -370,6 +370,7 @@ describe("design 93 §6 transactional unit", () => {
       current: async () => { throw new Error("no identity source"); },
       probe: async () => ({ status: "unknown" }),
     };
+    await saveStateUnsafeLegacyOrTest(root, baseState());
     const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", {
       lock: { identity: unavailable },
       attempts: 1,
