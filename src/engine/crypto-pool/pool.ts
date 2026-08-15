@@ -62,6 +62,10 @@ export type CryptoPoolStatus =
   | { state: "disabled"; reason: string; workers: number; jobsRun: number; workerExecutions: number }
   | { state: "off"; reason?: string; workers: number; jobsRun: number; workerExecutions: number };
 
+/* Every `reject` reason below is a promise rejection reason that reaches this
+ * module through a `catch` binding (see `enqueue`, `deliverProducer`, `spill`),
+ * so `unknown` is its true type by language rule. Narrowing it to `Error` would
+ * require a runtime `instanceof` conversion — a behavior change, not a type fix. */
 type JobRecord<T = unknown> = {
   message: WorkerMessage;
   attempts: number;

@@ -62,6 +62,10 @@ export const MAX_EXTENSION_DEPTH = 32;
 type EntrySnapshotValue = null | boolean | number | string | undefined | readonly EntrySnapshotValue[] | EntrySnapshotObject;
 interface EntrySnapshotObject { [key: string]: EntrySnapshotValue; }
 
+/** Everything this snapshotter reads: the domain entry the arena interns, and the
+ *  decoded JSON its extension members carry (design 163 extras_cjson). */
+type EntrySnapshotSource = Readonly<FileEntry> | EntrySnapshotValue;
+
 function defineOwn(target: EntrySnapshotObject, key: string, value: EntrySnapshotValue): void {
   // Assignment would route an own `__proto__` key through the prototype setter
   // and silently drop a valid decoded-JSON member.
@@ -70,7 +74,7 @@ function defineOwn(target: EntrySnapshotObject, key: string, value: EntrySnapsho
 
 /** Reads each source value EXACTLY once and returns a frozen, null-prototype
  *  deep copy. Every later step reads this result, never the caller's object. */
-function snapshotValue(value: unknown, path: string, depth: number): EntrySnapshotValue {
+function snapshotValue(value: EntrySnapshotSource, path: string, depth: number): EntrySnapshotValue {
   if (depth > MAX_EXTENSION_DEPTH) throw new EntryShapeError(path, `nested deeper than ${MAX_EXTENSION_DEPTH}`);
   if (value === null) return null;
   if (typeof value !== "object") {
@@ -115,7 +119,7 @@ export interface InternedSnapshot {
 }
 
 export function snapshotEntry(entry: Readonly<FileEntry>): InternedSnapshot {
-  const snapshot = snapshotValue(entry, "", 0) as unknown as Readonly<FileEntry>;
+  const snapshot = snapshotValue(entry, "", 0) as Readonly<FileEntry>;
   return { entry: snapshot, canonical: canonicalOf(snapshot) };
 }
 
