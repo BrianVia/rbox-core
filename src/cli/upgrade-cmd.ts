@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import type { JsonValue } from "../json.js";
 import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
 import { isStandaloneBinary } from "./runtime.js";
@@ -215,7 +216,7 @@ function sameFileStat(
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
 }
 
-async function readJsonNoFollow(filePath: string, label: string): Promise<unknown | undefined> {
+async function readJsonNoFollow(filePath: string, label: string): Promise<JsonValue | undefined> {
   let before: Awaited<ReturnType<typeof fsp.lstat>>;
   try {
     before = await fsp.lstat(filePath, { bigint: true });
@@ -253,17 +254,17 @@ async function readJsonNoFollow(filePath: string, label: string): Promise<unknow
   }
 }
 
-function parseCanonicalReleaseState(value: unknown): ReleaseState {
+function parseCanonicalReleaseState(value: JsonValue): ReleaseState {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("upgrade release state is malformed");
-  const state = value as Partial<ReleaseState>;
-  if (Object.keys(state).sort().join(",") !== "phase,schema,version"
-    || state.schema !== 1
-    || (state.phase !== "pending" && state.phase !== "committed")
-    || typeof state.version !== "string") {
+  const { schema, phase, version } = value;
+  if (Object.keys(value).sort().join(",") !== "phase,schema,version"
+    || schema !== 1
+    || (phase !== "pending" && phase !== "committed")
+    || typeof version !== "string") {
     throw new Error("upgrade release state is malformed");
   }
-  parseSemver(state.version);
-  return state as ReleaseState;
+  parseSemver(version);
+  return { schema, version, phase };
 }
 
 async function readCanonicalReleaseState(ctx: UpgradeContext): Promise<ReleaseState | undefined> {

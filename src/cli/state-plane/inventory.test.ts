@@ -24,9 +24,12 @@ const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sw
 // to 28 KiB by U3 wave 4A, which enrolled `flipAuthority` — the one rename that
 // elects SQLite — as an order-tracked owner, adding roughly 1 KiB of records.
 // SP-2 adds the selected telemetry entry's ordered calls; SP-2B adds the
-// format-neutral reset inventory and selected replacement owners. This is a
-// transport bound on the sweep's stdout, not an entry-point policy.
-const AST_SWEEP_MAX_BYTES = 32 * 1024;
+// format-neutral reset inventory and selected replacement owners. Raised to
+// 40 KiB where SP-3's genesis-default entries met FLAKE-009's `artifactIdentity`
+// enrollment: each side fit under 32 KiB alone (32,536 and 32,615 bytes), their
+// union did not. This is a transport bound on the sweep's stdout, not an
+// entry-point policy.
+const AST_SWEEP_MAX_BYTES = 40 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -90,6 +93,10 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // marker rather than refuse it, so its guard is the classifier that decides
   // the format, not the barrier that throws on it.
   { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
+  // FLAKE-009: the reset fence fingerprints the document on every ordinary load,
+  // unlocked, so a writer's atomic republish can land inside it. The guard is the
+  // retry that re-runs the whole identity tuple rather than reporting corruption.
+  { file: "src/cli/reset-journal-inspection.ts", symbol: "artifactIdentity", kind: "read", sites: 1, guards: ["retryOnIdentityRace", "assertUnmovedSince"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.

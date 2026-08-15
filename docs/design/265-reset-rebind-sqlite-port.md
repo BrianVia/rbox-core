@@ -620,13 +620,13 @@ each JSON measured row: **0**. This makes the JSON no-evaluation claim observabl
 rather than hiding an eager import in fixture setup.
 
 
-### Post-fix measurement (orchestrator-run, same host/method)
+### Post-fix measurement — reconciled record
 
-After the 5→1 / 3→1 projection reduction: P1(Q) 194.5/215.7ms p50/p95 (opens
-itemized 3, reads 6 incl. newly instrumented namespace walks + lineage), L1(Q)
-12.4/15.4ms. **Latency is unchanged — the cost was never the duplicate
-projections; it is the durability fsync sequence, which a destructive reset
-must pay.** The §8 fix stands on contract and simplicity grounds (one
-materialization, cheaper rechecks), not a latency win; the earlier causal
-attribution of 190ms to the projections was wrong and is corrected here.
-This table is the SP-3 baseline.
+One baseline stands (the harness-enforced run at the table above): P1(Q)
+~204/235ms p50/p95, L1(Q) ~14.4/16.6ms; a second orchestrator run measured
+P1(Q) 194.5/215.7 — within run-to-run variance. Honest conclusion: the
+5→1/3→1 projection reduction produced NO observed latency improvement; the
+dominant cost is NOT attributed (not profiled). The reduction stands on the
+§8 contract and simplicity grounds. This reconciled record is the SP-3
+baseline. [Post-merge doc fix: the earlier fsync attribution was an
+unprofiled overclaim and is withdrawn.]

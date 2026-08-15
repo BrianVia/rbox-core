@@ -18,6 +18,7 @@ import {
   repoRecordsForState,
   syncStreamId,
   type GitDeferral,
+  type GitDeferralReason,
   type StateSaveResult,
   type SyncState,
   type WorkspaceConfig,
@@ -36,13 +37,13 @@ export type GitBusyClassification =
 export type DeferralHygieneAction = "clear" | "retain" | "upgrade" | "recover";
 
 /** One total classifier-to-action mapping shared by display and recovery. */
-export const DEFERRAL_HYGIENE_ACTION: Record<GitBusyClassification, DeferralHygieneAction> = {
+export const DEFERRAL_HYGIENE_ACTION = {
   quiescent: "clear",
   live: "retain",
   "stale-unattributed": "upgrade",
   "recoverable-rbox": "recover",
   indeterminate: "retain",
-};
+} as const satisfies Record<GitBusyClassification, DeferralHygieneAction>;
 
 export interface GitBusyDisplayDetail {
   lockCount: number;
@@ -124,7 +125,7 @@ function displayDetail(locks: readonly GitBusyLock[], now: number): GitBusyDispl
   };
 }
 
-const selectedReason = (reason: unknown): reason is "git-busy" | "stale-unattributed" =>
+const selectedReason = (reason: GitDeferralReason): reason is "git-busy" | "stale-unattributed" =>
   reason === "git-busy" || reason === "stale-unattributed";
 
 const laneKey = (repo: string, lane: GitDeferral["lane"]): string => `${repo}\0${lane}`;
@@ -220,7 +221,7 @@ export async function reconcileGitDeferrals(
   for (const [repo, record] of Object.entries(records)) {
     if (scope && scope.classifyRepo(repo) !== "in") continue;
     for (const deferral of Object.values(record.deferrals ?? {})) {
-      if (deferral && selectedReason((deferral as { reason?: unknown }).reason)) {
+      if (deferral && selectedReason(deferral.reason)) {
         const list = candidates.get(repo) ?? [];
         list.push(deferral);
         candidates.set(repo, list);
@@ -404,7 +405,11 @@ export async function reconcileGitDeferrals(
   /** Reload the durable winner of a lost CAS race, falling back to what the
    * caller already holds. A barrier refusal is terminal and must never be
    * folded into that fallback: the retry it would authorize is the write the
-   * barrier just refused. */
+   * barrier just refused.
+   *
+   * LEFTOVER (#734): the handler's parameter is a promise rejection value, which is
+   * `unknown` for the same reason a `catch` binding is — no producer establishes it.
+   * `rethrowIfStateBarrier` is the parser that classifies it. */
   const reloadWinner = async (from: SyncState, fallback: SyncState = from): Promise<SyncState> =>
     await deps.reload(root, from.stream || syncStreamId(cfg)).catch((error: unknown) => {
       rethrowIfStateBarrier(error);

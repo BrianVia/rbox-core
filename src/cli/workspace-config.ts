@@ -82,7 +82,13 @@ const TRASH_DAYS_MAX = 365;
 const TRASH_MAXBYTES_DEFAULT = 2 * 2 ** 30; // 2 GiB
 const TRASH_MAXBYTES_MAX = 2 ** 40; // 1 TiB
 
-export function trashConfig(cfg: WorkspaceConfig): { days: number; maxBytes: number } {
+/** Normalized, in-bounds trash retention — the only shape a caller may act on. */
+export interface TrashRetention {
+  days: number;
+  maxBytes: number;
+}
+
+export function trashConfig(cfg: WorkspaceConfig): TrashRetention {
   const rawDays = cfg.trash?.days;
   const days =
     typeof rawDays === "number" && Number.isFinite(rawDays)
