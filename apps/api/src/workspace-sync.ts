@@ -52,8 +52,7 @@ const HIGH_SEVERITY_FALLBACKS = new Set(["parent_unreadable", "fence_violation",
 
 type IndexState = "building" | "ready" | "lagging";
 type FoldCursor = { phase: "removed" | "added"; lastSha: string };
-type SqlValue = string | number | bigint | boolean | null | ArrayBuffer | Uint8Array;
-type SqlRow = { [column: string]: SqlValue };
+type SqlRow = Record<string, SqlStorageValue>;
 
 type CommitResponsePayload =
   | { error: "conflict"; head: number }
@@ -247,7 +246,7 @@ export class WorkspaceSync {
     this.sql().exec("CREATE TABLE IF NOT EXISTS dropped_index (sha256 TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
     this.sql().exec("CREATE INDEX IF NOT EXISTS idx_dropped_last ON dropped_index (last_seq)");
     this.sql().exec("CREATE TABLE IF NOT EXISTS seq_roots (seq INTEGER PRIMARY KEY, manifest_sha TEXT NOT NULL, carrier_sha TEXT)");
-    const rawHead = this.ctx.storage.kv.get("head") as StoredHead | number | undefined;
+    const rawHead = this.ctx.storage.kv.get<StoredHead | number>("head");
     if (typeof rawHead === "number") {
       await this.migrateNumericHead(ws, proj, rawHead);
       if (!this.repairRequired) await this.initializeIndex(rawHead, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
@@ -546,7 +545,7 @@ export class WorkspaceSync {
     // `mode` (no sidecar fetch): the count metric stays meaningful without R2.
     const earlyStaleReject = (declaredRefs: number): Response | null => {
       if (this.env.RBOX_COMMIT_EARLY_REJECT !== "1") return null;
-      const head = readHead(this.ctx.storage.kv.get("head"));
+      const head = this.storedHead();
       const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? head.sequence;
       if (parent !== head.sequence) {
         // Same equivocation signal the transaction path emits (audit Finding 2).
@@ -713,7 +712,7 @@ export class WorkspaceSync {
     try {
       let next = 0;
       this.ctx.storage.transactionSync(() => {
-        const head = readHead(this.ctx.storage.kv.get("head"));
+        const head = this.storedHead();
         const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? head.sequence;
         if (parent !== head.sequence) {
           const sameSeqHash = commitSeq <= watermark ? this.hashForSeq(commitSeq) : undefined;
@@ -788,12 +787,12 @@ export class WorkspaceSync {
     }
     isolateFoldActive = true;
     try {
-      const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+      const head = this.storedHead().sequence;
       const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
       const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
       if (synced < head) await this.foldSequence(synced + 1, head, floor);
       this.sweepIndex(floor);
-      const nowHead = readHead(this.ctx.storage.kv.get("head")).sequence;
+      const nowHead = this.storedHead().sequence;
       const nowSynced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
       if (nowSynced < nowHead) await this.armAlarm(Date.now());
     } catch (e) {
@@ -822,7 +821,7 @@ export class WorkspaceSync {
         this.ctx.storage.kv.put("index_synced_seq", seq);
         this.ctx.storage.kv.put("backfill_cursor", seq);
         this.ctx.storage.kv.put("index_generation", ((this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0) + 1);
-        if (seq === readHead(this.ctx.storage.kv.get("head")).sequence) this.ctx.storage.kv.put("index_state", "ready");
+        if (seq === this.storedHead().sequence) this.ctx.storage.kv.put("index_state", "ready");
       });
       this.foldPrevCache = { seq, value: current };
       return;
@@ -860,7 +859,7 @@ export class WorkspaceSync {
       this.ctx.storage.kv.put("backfill_cursor", seq);
       this.ctx.storage.kv.put("index_generation", ((this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0) + 1);
       this.ctx.storage.kv.delete("fold_subcursor");
-      const liveHead = readHead(this.ctx.storage.kv.get("head")).sequence;
+      const liveHead = this.storedHead().sequence;
       this.ctx.storage.kv.put("index_state", seq === liveHead ? "ready" : liveHead - seq > GAP_MAX ? "lagging" : state);
     });
     this.foldPrevCache = { seq, value: current };
@@ -897,8 +896,13 @@ export class WorkspaceSync {
     if (alarm === null || alarm > at) await this.ctx.storage.setAlarm(at);
   }
 
-  private sql(): { exec(query: string, ...bindings: unknown[]): { toArray(): SqlRow[] } } {
-    return this.ctx.storage.sql as unknown as { exec(query: string, ...bindings: unknown[]): { toArray(): SqlRow[] } };
+  private sql(): SqlStorage {
+    return this.ctx.storage.sql;
+  }
+
+  /** One reader for the durable head; a legacy numeric or missing value coerces. */
+  private storedHead(): StoredHead {
+    return readHead(this.ctx.storage.kv.get<StoredHead | number>("head"));
   }
 
   private async redeemReceipts(req: Request): Promise<Response> {
@@ -992,7 +996,7 @@ export class WorkspaceSync {
 
   /** Design 96 v2 snapshot: two independent SQL streams plus the small raw gap. */
   private async roots(url: URL): Promise<Response> {
-    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    const head = this.storedHead().sequence;
     const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const generation = (this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0;
     const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
@@ -1101,7 +1105,7 @@ export class WorkspaceSync {
       pruneFloor: floor, indexGeneration: generation,
     });
 
-    const rawHead = this.ctx.storage.kv.get("head");
+    const rawHead = this.ctx.storage.kv.get<StoredHead | number>("head");
     if (!isStoredHead(rawHead) && !(typeof rawHead === "number" && Number.isInteger(rawHead) && rawHead >= 0)) {
       const watermark = this.ctx.storage.kv.get("headWatermark");
       if (watermark !== undefined || floor > 0 || (await this.hasRetainedSeqEvidence())) {
@@ -1143,7 +1147,7 @@ export class WorkspaceSync {
   private rootsInspect(url: URL): Response {
     if (url.searchParams.has("rebuild")) return json({ error: "read_only" }, 400);
 
-    const rawHead = this.ctx.storage.kv.get("head");
+    const rawHead = this.ctx.storage.kv.get<StoredHead | number>("head");
     if (!isStoredHead(rawHead)) return json({ error: "index_unavailable", reason: "uninitialized" }, 503);
     const head = rawHead.sequence;
     const floorRaw = this.ctx.storage.kv.get("pruneFloor");
@@ -1241,7 +1245,7 @@ export class WorkspaceSync {
    *  them. Authoritative — operates on DO storage. */
   private async prune(req: Request): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as { floor?: number };
-    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    const head = this.storedHead().sequence;
     const curFloor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const target = Math.min(Number(body.floor ?? 0), head - 1); // never prune the head
     if (!Number.isFinite(target) || target <= curFloor) return json({ pruned: 0, pruneFloor: curFloor });
@@ -1276,7 +1280,7 @@ export class WorkspaceSync {
   private async commits(url: URL): Promise<Response> {
     const since = Number(url.searchParams.get("since") ?? "0");
     if (!Number.isInteger(since) || since < 0) return json({ error: "bad_request", message: "bad since" }, 400);
-    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    const head = this.storedHead().sequence;
     if (since >= head) return json({ commits: [] }); // caller already at/ahead of head
     if (head - since > MAX_COMMIT_SPAN) return json({ error: "needs_rebaseline", head, maxSpan: MAX_COMMIT_SPAN }, 409);
     const commits: SignedCommit[] = [];
@@ -1299,7 +1303,7 @@ export class WorkspaceSync {
   }
 
   private async latest(): Promise<Response> {
-    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    const head = this.storedHead().sequence;
     if (head === 0) return json({ sequence: 0, commit: null });
     const raw = this.ctx.storage.kv.get(`seq:${head}`) as string | undefined;
     if (!raw) return json({ error: "commit_pointer_missing" }, 500);
@@ -1431,7 +1435,7 @@ export class WorkspaceSync {
   // The runtime calls these by name on the instance, so they MUST live on the class.
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
     if (message !== "cursor") return;
-    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    const head = this.storedHead().sequence;
     try {
       ws.send(JSON.stringify({ head }));
     } catch {
@@ -1457,16 +1461,16 @@ interface StoredHead {
   commitHash: string;
 }
 
-function isStoredHead(v: unknown): v is StoredHead {
+function isStoredHead(v: StoredHead | number | undefined): v is StoredHead {
   return (
     typeof v === "object" &&
     v !== null &&
-    Number.isInteger((v as { sequence?: unknown }).sequence) &&
-    typeof (v as { commitHash?: unknown }).commitHash === "string"
+    Number.isInteger(v.sequence) &&
+    typeof v.commitHash === "string"
   );
 }
 
-function readHead(v: unknown): StoredHead {
+function readHead(v: StoredHead | number | undefined): StoredHead {
   if (isStoredHead(v)) return v;
   if (typeof v === "number" && Number.isInteger(v)) return { sequence: v, commitHash: v === 0 ? GENESIS_HASH : "" };
   return { sequence: 0, commitHash: GENESIS_HASH };

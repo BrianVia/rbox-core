@@ -1,6 +1,7 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
+import type { JsonValue } from "../../../src/json.js";
 import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, blobBatchPut, encodeBatchFrameHeader } from "../src/blob-batch.js";
 import { blobsCheck } from "../src/blobs.js";
 import type { Env } from "../src/env.js";
@@ -19,7 +20,10 @@ const KEY = "u".repeat(40);
 const PREV = "p".repeat(40);
 const NOW = 1_700_000_000_000;
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex");
-const bearer = (token: string, extra: Record<string, string> = {}): Record<string, string> => ({ authorization: `Bearer ${token}`, ...extra });
+/** Request header maps: an open, string-valued dictionary owned by the HTTP boundary. */
+type HeaderMap = Record<string, string>;
+
+const bearer = (token: string, extra: HeaderMap = {}): HeaderMap => ({ authorization: `Bearer ${token}`, ...extra });
 const receipts = { "x-rbox-protocol": "upload-receipts-v1" };
 
 beforeAll(async () => applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS));
@@ -34,7 +38,12 @@ async function bootstrap(name: string): Promise<{ token: string; accountId: stri
   return res.json() as Promise<{ token: string; accountId: string; deviceId: string }>;
 }
 
-function batchPutBody(content: string): { body: Uint8Array; sha256: string } {
+interface BatchPutFrame {
+  body: Uint8Array;
+  sha256: string;
+}
+
+function batchPutBody(content: string): BatchPutFrame {
   const payload = new TextEncoder().encode(content);
   const sha256 = sha(content);
   const body = new Uint8Array(BATCH_FRAME_HEADER_BYTES + payload.byteLength);
@@ -43,7 +52,7 @@ function batchPutBody(content: string): { body: Uint8Array; sha256: string } {
   return { body, sha256 };
 }
 
-async function batchPut(headers: Record<string, string>, content: string): Promise<Response> {
+async function batchPut(headers: HeaderMap, content: string): Promise<Response> {
   const { body } = batchPutBody(content);
   return SELF.fetch(`${BASE}/v1/blob-batch/put`, {
     method: "POST",
@@ -58,7 +67,7 @@ const b64url = (bytes: Uint8Array): string => {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
 
-async function signedUploadPayload(key: string, payload: unknown): Promise<string> {
+async function signedUploadPayload(key: string, payload: JsonValue): Promise<string> {
   const enc = new TextEncoder();
   const kid = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(key)))).slice(0, 8);
   const payloadB64 = b64url(enc.encode(JSON.stringify(payload)));
@@ -68,17 +77,40 @@ async function signedUploadPayload(key: string, payload: unknown): Promise<strin
   return `${body}.${b64url(enc.encode(mac))}`;
 }
 
+/** The one fence read `blobBatchPut` performs, widened so the real D1 types stay
+ *  assignable to the double. */
+interface FenceStatement {
+  bind(...values: unknown[]): FenceStatement;
+  first(): Promise<{ sha256: string } | null>;
+}
+
+interface FenceDb {
+  prepare(query: string): FenceStatement;
+}
+
+function fenceDb(fenced: boolean): D1Database {
+  const statement: FenceStatement = {
+    bind: () => statement,
+    first: async () => fenced ? { sha256: "fenced" } : null,
+  };
+  const db: FenceDb = { prepare: () => statement };
+  return db as D1Database;
+}
+
 function metricEnv(points: Array<{ indexes?: string[]; blobs?: string[] }>, opts: { fence?: boolean; flag?: string } = {}): Env {
-  return {
+  // Only the bindings this path reads; `Pick` keeps each one's real type, so the
+  // single assertion below stays a plain downcast.
+  const bindings: Pick<Env, "RBOX_AUTH_GRANT" | "RBOX_RECEIPT_KEY" | "RBOX_GRANT_KEY" | "rbox_metrics" | "rbox_dev_db" | "rbox_dev_blobs"> = {
     RBOX_AUTH_GRANT: opts.flag,
     RBOX_RECEIPT_KEY: "r".repeat(40),
     RBOX_GRANT_KEY: KEY,
-    rbox_metrics: { writeDataPoint: (point: { indexes?: string[]; blobs?: string[] }) => points.push(point) },
-    rbox_dev_db: {
-      prepare: () => ({ bind: () => ({ first: async () => opts.fence ? { sha256: "fenced" } : null }) }),
-    },
-    rbox_dev_blobs: { put: async (_key: string, body: Uint8Array) => ({ size: body.byteLength }) },
-  } as unknown as Env;
+    rbox_metrics: { writeDataPoint: (point: { indexes?: string[]; blobs?: string[] }) => points.push(point) } as AnalyticsEngineDataset,
+    rbox_dev_db: fenceDb(opts.fence === true),
+    rbox_dev_blobs: {
+      put: async (_key: string, body: Uint8Array): Promise<R2Object> => ({ size: body.byteLength }) as R2Object,
+    } as R2Bucket,
+  };
+  return bindings as Env;
 }
 
 describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () => {
@@ -147,7 +179,7 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     const wrongKey = await mintUploadGrant({ ...env, RBOX_GRANT_KEY: "x".repeat(40) } as Env, { accountId: a.accountId, nowMs: Date.now() });
     const cases: Array<string | undefined> = [undefined, "malformed", download!, expired!, wrongKey!];
     for (const [i, grant] of cases.entries()) {
-      const headers: Record<string, string> = { ...receipts };
+      const headers: HeaderMap = { ...receipts };
       if (grant) headers["x-rbox-upload-grant"] = grant;
       const res = await batchPut(bearer(a.token, headers), `fallback-${i}`);
       expect(res.status).toBe(200);
@@ -243,7 +275,7 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     expect(await reason(`${valid!.split(".")[0]}.${valid!.split(".")[1]}.bm9wZQ`)).toBe("bad_mac");
     expect(await reason((await mintUploadGrant({ RBOX_GRANT_KEY: "z".repeat(40) } as Env, { accountId: "acct", nowMs: NOW }))!)).toBe("bad_kid");
 
-    const claims: Array<[unknown, string]> = [
+    const claims: Array<[JsonValue, string]> = [
       [{ v: 2, a: "acct", t: NOW, e: NOW + 1 }, "bad_version"],
       [{ v: 1, a: "acct", t: NOW + 120_000, e: NOW + 120_001 }, "future"],
       [{ v: 1, a: "acct", t: NOW + 59_000, e: NOW + 59_000 + UPLOAD_GRANT_TTL_MS }, "future"],
