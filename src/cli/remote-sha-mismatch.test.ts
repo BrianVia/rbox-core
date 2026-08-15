@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { RboxApi, BlobShaMismatchError } from "./remote.js";
+import type { JsonValue } from "../json.js";
 
 // A live-folder edit between encrypt-time and the streamed PUT makes the ciphertext no
 // longer hash to the declared encSha; the server rejects it. It signals that SAME error
@@ -15,7 +16,7 @@ const origFetch = globalThis.fetch;
 const SHA = "a".repeat(64);
 const BIG = 100 * 1024 * 1024; // > SINGLE_PUT_MAX (90 MiB) → forces the multipart path
 
-const resp = (status: number, body: unknown): Response =>
+const resp = (status: number, body: JsonValue): Response =>
   ({
     ok: status >= 200 && status < 300,
     status,
@@ -39,7 +40,7 @@ afterEach(async () => {
 
 describe("blob PUT sha_mismatch → typed BlobShaMismatchError", () => {
   test("single-PUT 400 {error:sha_mismatch} → BlobShaMismatchError (not a generic abort)", async () => {
-    globalThis.fetch = (async () => resp(400, { error: "sha_mismatch" })) as unknown as typeof fetch;
+    globalThis.fetch = (async () => resp(400, { error: "sha_mismatch" })) as typeof fetch;
     await expect(api().putBlobFile(SHA, file, 16)).rejects.toBeInstanceOf(BlobShaMismatchError);
   });
 
@@ -52,12 +53,12 @@ describe("blob PUT sha_mismatch → typed BlobShaMismatchError", () => {
       if (u.endsWith("/complete")) return resp(412, { error: "sha_mismatch" });
       if (u.endsWith("/blobs/check")) return resp(200, { missing: [SHA] }); // still missing → not a concurrent finisher
       throw new Error(`unexpected fetch: ${method} ${u}`);
-    }) as unknown as typeof fetch;
+    }) as typeof fetch;
     await expect(api().putBlobFile(SHA, file, BIG)).rejects.toBeInstanceOf(BlobShaMismatchError);
   });
 
   test("a non-sha_mismatch 400 stays a generic error (discriminator required)", async () => {
-    globalThis.fetch = (async () => resp(400, { error: "bad_request", message: "nope" })) as unknown as typeof fetch;
+    globalThis.fetch = (async () => resp(400, { error: "bad_request", message: "nope" })) as typeof fetch;
     const err = await api()
       .putBlobFile(SHA, file, 16)
       .catch((e) => e);
