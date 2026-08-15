@@ -568,3 +568,19 @@ the oracle verdict carries a `sample: string[]` of exactly which entries
 differ. Diagnosing FM's savvy-core wedge required an out-of-band bun script
 driving `oracleFromState`+`proveRepo` against live state. Append the (capped)
 sample to the detail string. Evidence: issue #659 comment 5285598893.
+
+## 2026-08-15 — fleet start-fresh op (state rebuild)
+
+- rbox's own conflict artifact (`build.dev_*.conflict.log`) tripped the
+  "working tree differs from applied manifest" gate every cycle — the tool's
+  litter blocked the tool. Conflict artifacts should be ignored by the
+  differs-gate or written outside the synced tree.
+- `rbox stop` needed the 60s SIGKILL escalation twice tonight (desktop mid
+  conflict-retry, Mac mid idle) — both daemons had no live critical-section
+  witness; whatever they were blocked on wasn't the protected section.
+- `rbox git resolve` confirm tokens are snapshot-bound; any concurrent
+  publication (or a preceding resolve) invalidates the batch. Bulk resolve
+  needs a daemon-stopped, one-repo-at-a-time loop — or a `--all` verb.
+- A live daemon plus 100+ carried-pending git sections converged only after
+  the competing publishers were removed; with all three devices active the
+  fresh device's 942-change re-baseline starved indefinitely.
