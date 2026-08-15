@@ -188,7 +188,15 @@ function byteLen(s: string): number {
   return Buffer.byteLength(s, "utf8");
 }
 
-function capString(s: string, maxBytes = SECTION_STRING_CAP_BYTES): { value: string; truncated: boolean; originalBytes: number } {
+/** A string held to the section byte cap, with the evidence a reader needs to say
+ *  so: whether it was cut and how large the original was. */
+interface CappedString {
+  value: string;
+  truncated: boolean;
+  originalBytes: number;
+}
+
+function capString(s: string, maxBytes = SECTION_STRING_CAP_BYTES): CappedString {
   const bytes = Buffer.from(s, "utf8");
   if (bytes.byteLength <= maxBytes) return { value: s, truncated: false, originalBytes: bytes.byteLength };
   return { value: bytes.subarray(0, maxBytes).toString("utf8"), truncated: true, originalBytes: bytes.byteLength };
@@ -699,6 +707,8 @@ const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
   describeCheck("git", ({ root }) => checkGitCapability(root)),
   describeCheck("reserve", ({ root, cfg }) => checkStateReserve(root, cfg)),
   describeCheck("migration", ({ root }) => checkStateMigration(root)),
+  // The rejection reason is a caught exception: `unknown` by language rule, and
+  // this handler IS its decoder into the check's message line.
   describeCheck("chain", ({ root, loaded }) => buildAuthedRemote(root, Date.now, undefined, loaded)
     .then((built) => checkManifestChain(built.remote))
     .catch((error: unknown) => ({ ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) }))),

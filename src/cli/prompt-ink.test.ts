@@ -61,6 +61,14 @@ async function send(input: PassThrough, keys: readonly string[]): Promise<void> 
   }
 }
 
+/** Attach the rejection handler now — before the test drives the terminal — and
+ *  resolve with the reason instead. A rejection reason is `unknown` by the same
+ *  language rule that types a `catch` binding; the assertions on the awaited value
+ *  are what establish which error class actually arrived. */
+function rejection(promise: Promise<unknown>): Promise<unknown> {
+  return promise.then(() => undefined, (error: unknown) => error);
+}
+
 async function waitForOutput(h: Harness, needle: string): Promise<void> {
   for (let attempt = 0; attempt < 100 && !h.output().includes(needle); attempt++) {
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
@@ -187,10 +195,10 @@ describe("Ink prompt runtime", () => {
 
     const aborted = harness();
     const controller = new AbortController();
-    const abortResult = inkPassword(
+    const abortResult = rejection(inkPassword(
       { message: "Abort secret", signal: controller.signal },
       aborted.streams,
-    ).then(() => undefined, (error: unknown) => error);
+    ));
     await waitForOutput(aborted, "Abort secret");
     await send(aborted.input, [secret]);
     controller.abort();
@@ -198,16 +206,14 @@ describe("Ink prompt runtime", () => {
     expect(aborted.output()).not.toContain(secret);
 
     const renderFailure = harness();
-    const renderResult = inkSecretRenderFailureSelftest(renderFailure.streams)
-      .then(() => undefined, (error: unknown) => error);
+    const renderResult = rejection(inkSecretRenderFailureSelftest(renderFailure.streams));
     await waitForOutput(renderFailure, "secret render failure");
     await send(renderFailure.input, [secret, "\r"]);
     expect(await renderResult).toBeInstanceOf(Error);
     expect(renderFailure.output()).not.toContain(secret);
 
     const cancelled = harness();
-    const cancelResult = inkPassword({ message: "Cancel secret" }, cancelled.streams)
-      .then(() => undefined, (error: unknown) => error);
+    const cancelResult = rejection(inkPassword({ message: "Cancel secret" }, cancelled.streams));
     await waitForOutput(cancelled, "Cancel secret");
     await send(cancelled.input, [secret, "\x03"]);
     expect(await cancelResult).toBeInstanceOf(PromptCancelledError);
@@ -324,10 +330,7 @@ describe("Ink prompt runtime", () => {
       message: "Validate",
       validate: () => { throw new Error("validator exploded"); },
     }, inputHarness.streams);
-    const inputResult = inputPending.then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    const inputResult = rejection(inputPending);
     await waitForOutput(inputHarness, "Validate");
     await send(inputHarness.input, ["x", "\r"]);
     expect(await inputResult).toBeInstanceOf(Error);
@@ -350,10 +353,7 @@ describe("Ink prompt runtime", () => {
       message: "Validate forever",
       validate: () => new Promise(() => {}),
     }, h.streams);
-    const result = pending.then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    const result = rejection(pending);
     await waitForOutput(h, "Validate forever");
     await send(h.input, ["x", "\r", "\x03"]);
     expect(await result).toBeInstanceOf(PromptCancelledError);

@@ -54,9 +54,17 @@ function readPid(root: string): number | undefined {
   return readDaemonPidRecord(root).pid;
 }
 
+/** What the pidfile plus process-identity check say about `root`'s daemon. The
+ *  pid and boot id are present only for a live daemon we own. */
+export interface DaemonRunObservation {
+  running: boolean;
+  pid?: number;
+  bootId?: string;
+}
+
 /** Is OUR background-sync daemon currently running for `root`? Used by `status`
  *  (the folded-in `daemon status`) and `untrack` (decide whether to stop first). */
-export function isDaemonRunning(root: string): { running: boolean; pid?: number; bootId?: string } {
+export function isDaemonRunning(root: string): DaemonRunObservation {
   const rec = readDaemonPidRecord(root);
   const pid = rec.pid;
   if (pid !== undefined && isOurDaemon(pid, root)) return { running: true, pid, bootId: rec.bootId };
@@ -172,7 +180,14 @@ export function daemonVersionSkewLine(daemonVersion: string, cliVersion: string)
   return `this rbox is v${cliVersion} but the running background sync is v${daemonVersion} — restart it to catch up: rbox stop && rbox start`;
 }
 
-function liveDaemonIdentity(root: string): { version?: string; mode?: DaemonMode } {
+/** The live daemon's self-reported identity, each member present only when the
+ *  ambient status proves it for the current incarnation. */
+interface LiveDaemonIdentity {
+  version?: string;
+  mode?: DaemonMode;
+}
+
+function liveDaemonIdentity(root: string): LiveDaemonIdentity {
   const pidfile = readDaemonPidRecord(root);
   const record = readAmbientDaemonStatusRecord(root);
   if (record.kind !== "ok") return {};
