@@ -20,7 +20,17 @@ export interface PlanLimits {
 const PAID_PLAN_NAMES = ["solo", "pro", "team"] as const;
 const PAID_PLAN_SET = new Set<string>(PAID_PLAN_NAMES);
 
-export const PLANS: Record<string, PlanLimits> = {
+/**
+ * Owner contract for every plan-keyed table below. The key domain stays open on
+ * purpose: each caller looks up a plan string that arrived from D1 or Stripe, never a
+ * literal written here, and an unknown plan must simply miss — that is exactly what
+ * the `?? none` / `?? 0` fallbacks at the call sites are built on.
+ */
+export interface PlanKeyed<Value> {
+  [plan: string]: Value;
+}
+
+export const PLANS: PlanKeyed<PlanLimits> = {
   none: { storageBytes: 1, workspaces: 1, projects: 1, retentionDays: 0, manifestBytes: 16 * MiB, devices: 2 },
   solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB, devices: 10 },
   pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 365, manifestBytes: 64 * MiB, devices: 25 },
@@ -100,7 +110,7 @@ export const BILLABLE_BYTES_SQL = `MAX(0, used_bytes - CASE WHEN plan IN (${PAID
  * `team` is per-seat ($12–15); we use a conservative midpoint and treat one
  * subscription as one seat (the cockpit labels MRR an estimate).
  */
-export const PLAN_MONTHLY_CENTS: Record<string, number> = {
+export const PLAN_MONTHLY_CENTS: PlanKeyed<number> = {
   solo: 800,
   pro: 2000,
   team: 1200,
@@ -113,15 +123,15 @@ export const PLAN_MONTHLY_CENTS: Record<string, number> = {
  */
 export type BillingCadence = "monthly" | "annual";
 
-export const PLAN_LOOKUP_KEYS: Record<string, Partial<Record<BillingCadence, string>>> = {
+export const PLAN_LOOKUP_KEYS: PlanKeyed<Partial<Record<BillingCadence, string>>> = {
   solo: { monthly: "rbox_solo_monthly", annual: "rbox_solo_annual" },
   pro: { monthly: "rbox_pro_monthly", annual: "rbox_pro_annual" },
   team: { monthly: "rbox_team_seat_monthly" },
 };
-export const EXTRA_STORAGE_LOOKUP_KEYS: Record<BillingCadence, string> = {
+export const EXTRA_STORAGE_LOOKUP_KEYS = {
   monthly: "rbox_extra_100gb_monthly",
   annual: "rbox_extra_100gb_annual",
-};
+} satisfies Record<BillingCadence, string>;
 
 /**
  * Plans a checkout may actually be opened for (design 63 §C). Separate from

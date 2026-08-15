@@ -17,7 +17,20 @@ const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const EMPTY = new Set<string>();
 
-function countingDb(d1: D1Database): { db: D1Database; calls: () => number } {
+/** The one stub member `reachableFromWorkspaces` touches, widened so the real
+ *  `DurableObjectStub` satisfies it — which keeps the namespace doubles below a
+ *  single assertion away from `DurableObjectNamespace`. */
+interface FakeWorkspaceSyncStub {
+  fetch(...args: never[]): Promise<Response>;
+}
+
+/** A D1 facade that counts the statements the code under test issues. */
+interface CountingDb {
+  db: D1Database;
+  calls: () => number;
+}
+
+function countingDb(d1: D1Database): CountingDb {
   let count = 0;
   const wrapStmt = (statement: D1PreparedStatement): D1PreparedStatement =>
     new Proxy(statement, {
@@ -241,7 +254,7 @@ describe("§33 mark → grace → purge (the leak fix)", () => {
     const fakeEnv = { ...env, WORKSPACE_SYNC: { ...env.WORKSPACE_SYNC } };
     // No workspaces means per-account reachability is empty; add a focused roots fixture for live.
     await db().prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES ('w','p','a',?)").bind(NOW).run();
-    fakeEnv.WORKSPACE_SYNC = { idFromName: (n: string) => env.WORKSPACE_SYNC.idFromName(n), get: () => ({ fetch: async () => Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, indexSyncedSeq: 1, gap: [{ seq: 1, manifestSha: "live", chainRefs: [] }], droppedPage: [], seqRootsPage: [] }) }) } as unknown as DurableObjectNamespace;
+    fakeEnv.WORKSPACE_SYNC = { idFromName: (n: string) => env.WORKSPACE_SYNC.idFromName(n), get: (_id: DurableObjectId): FakeWorkspaceSyncStub => ({ fetch: async () => Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, indexSyncedSeq: 1, gap: [{ seq: 1, manifestSha: "live", chainRefs: [] }], droppedPage: [], seqRootsPage: [] }) }) } as DurableObjectNamespace;
     const audit = await phase1Audit(fakeEnv, HOUR, null, 10, NOW).then((r) => r.json()) as Record<string, number>;
     expect(audit).toMatchObject({ examined: 2, wouldResurrect: 1, wouldPurge: 1, wouldRelease: 7 });
     expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(before);
@@ -254,12 +267,12 @@ describe("§33 mark → grace → purge (the leak fix)", () => {
     await db().prepare("INSERT INTO workspaces(workspace_id, project_id, account_id, created_at) VALUES ('ws_chain', 'root', 'chain-live', ?)").bind(NOW).run();
     const rootsDO = {
       idFromName: (name: string) => env.WORKSPACE_SYNC.idFromName(name),
-      get: () => ({ fetch: async () => Response.json({
+      get: (_id: DurableObjectId): FakeWorkspaceSyncStub => ({ fetch: async () => Response.json({
         head: 1, pruneFloor: 0, indexGeneration: 1, indexSyncedSeq: 1,
         gap: [{ seq: 1, manifestSha: "manifest-live", chainRefs: chain }],
         droppedPage: [], seqRootsPage: [],
       }) }),
-    } as unknown as DurableObjectNamespace;
+    } as DurableObjectNamespace;
     const reachable = await perAccountReachable({ ...env, WORKSPACE_SYNC: rootsDO }, "chain-live");
 
     expect([...reachable]).toEqual(expect.arrayContaining(["manifest-live", ...chain]));
@@ -533,8 +546,8 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
     await addRef("bad", "b", 20, NOW - 2 * HOUR);
     const brokenDO = {
       idFromName: (name: string) => env.WORKSPACE_SYNC.idFromName(name),
-      get: () => ({ fetch: async () => Response.json({ error: "roots_too_large", retained: 65 }, { status: 503 }) }),
-    } as unknown as DurableObjectNamespace; // test double: only the two members reachableFromWorkspaces uses
+      get: (_id: DurableObjectId): FakeWorkspaceSyncStub => ({ fetch: async () => Response.json({ error: "roots_too_large", retained: 65 }, { status: 503 }) }),
+    } as DurableObjectNamespace; // test double: only the two members reachableFromWorkspaces uses
     const envBroken = { ...env, WORKSPACE_SYNC: brokenDO };
 
     // sanity: reachability for BAD throws (fail-closed), GOOD resolves empty.
