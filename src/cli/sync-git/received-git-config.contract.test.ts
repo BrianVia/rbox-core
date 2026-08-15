@@ -12,7 +12,7 @@ import {
   type ConfigStatToken,
   type ConfigTransactionResult,
 } from "./config-txn.js";
-import type { ConfigShapeIdentity, RepoRecordInput } from "../config.js";
+import type { ConfigStoreIdentity, RepoRecordInput } from "../config.js";
 import type { ConfigLaneState } from "../sync-state.js";
 import { configReceiver, gitConfigHash } from "./config-lane.js";
 import { createReceivedGitConfig } from "./received-git-config.js";
@@ -55,7 +55,7 @@ const completedTransaction = (
 let tmp = "";
 let root = "";
 let repoDir = "";
-let standalone: ConfigShapeIdentity;
+let standalone: ConfigStoreIdentity;
 
 beforeAll(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-received-config-"));
@@ -64,7 +64,7 @@ beforeAll(async () => {
   await fs.mkdir(repoDir, { recursive: true });
   await exec("git", ["-C", repoDir, "init", "-q"]);
   const ctx = await repoCtxFromDisk(repoDir);
-  standalone = (await configReceiver(root, ctx!)).shape;
+  standalone = (await configReceiver(root, ctx!)).storeIdentity;
 });
 
 afterAll(async () => fs.rm(tmp, { recursive: true, force: true }));
@@ -76,7 +76,7 @@ interface HarnessOptions {
   incomingAbsent?: boolean;
   leftoverPresent?: boolean;
   result?: ConfigTransactionResult;
-  fresh?: { shape: ConfigShapeIdentity; config: GitConfig; token: ConfigStatToken };
+  fresh?: { storeIdentity: ConfigStoreIdentity; config: GitConfig; token: ConfigStatToken };
   laneDisabled?: boolean;
   priorRecord?: () => RepoRecordInput;
   observeLeftover?: () => boolean;
@@ -159,7 +159,7 @@ test("independent retry leaves the config transition byte-exact on failure", asy
 test("fresh config is unrepresentable in existing and follow windows", async () => {
   await withHarness({
     leftoverPresent: false,
-    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+    fresh: { storeIdentity: standalone, config: INCOMING, token: token("fresh") },
   }, async ({ receiver, calls }) => {
     expect(await receiver.prepare(undefined)).toMatchObject({ due: true, requiresMaterialization: true });
     expect(await receiver.applyExisting()).toBeUndefined();
@@ -240,7 +240,7 @@ test("prepare observes recovery quarantining a partial fresh repository", async 
   let leftoverPresent = true;
   await withHarness({
     observeLeftover: () => leftoverPresent,
-    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+    fresh: { storeIdentity: standalone, config: INCOMING, token: token("fresh") },
   }, async ({ receiver, calls }) => {
     leftoverPresent = false;
     expect(await receiver.prepare(undefined)).toMatchObject({
@@ -280,7 +280,7 @@ test("after-materialization derives state from the installed config", async () =
   await withHarness({
     incoming: OTHER,
     leftoverPresent: false,
-    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+    fresh: { storeIdentity: standalone, config: INCOMING, token: token("fresh") },
   }, async ({ receiver }) => {
     await receiver.prepare({ "core.bare": ["true"] });
     expect(await receiver.applyAfterMaterialization()).toEqual({
@@ -294,7 +294,7 @@ test("after-materialization derives state from the installed config", async () =
 test("after-materialization claims authorship only when install equals incoming", async () => {
   await withHarness({
     leftoverPresent: false,
-    fresh: { shape: standalone, config: INCOMING, token: token("fresh") },
+    fresh: { storeIdentity: standalone, config: INCOMING, token: token("fresh") },
   }, async ({ receiver }) => {
     await receiver.prepare(undefined);
     expect((await receiver.applyAfterMaterialization())?.cfgSynced).toBe(gitConfigHash(INCOMING));
@@ -315,7 +315,7 @@ test("sanitize-present seeds the local hash and preserves a same-shape baseline"
 });
 
 test("sanitize-present resets a foreign shape before seeding the local hash", async () => {
-  const pointer: ConfigShapeIdentity = {
+  const pointer: ConfigStoreIdentity = {
     shape: "worktree",
     commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
   };
@@ -368,7 +368,7 @@ test("wire absence with no authorship marker is a no-op", async () => {
 });
 
 test("shape invalidation returns the existing ConfigLaneState shape exactly once", async () => {
-  const pointer: ConfigShapeIdentity = {
+  const pointer: ConfigStoreIdentity = {
     shape: "worktree",
     commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
   };

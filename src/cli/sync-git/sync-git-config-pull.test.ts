@@ -11,7 +11,7 @@ import { repoCtxFromDisk } from "./git-state.js";
 import { writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
 import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "./config-sync.js";
 import { readConfigSnapshot } from "./config-txn.js";
-import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
+import type { ConfigStoreIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
 import { applyGitSections, gitConfigHash } from "../sync-git.js";
 import { readLocalGitConfig } from "./config-lane.js";
@@ -84,7 +84,7 @@ function stateWith(section: GitSection | undefined, record: Partial<RepoRecord> 
   };
 }
 
-async function dirShape(dir = receiver): Promise<ConfigShapeIdentity> {
+async function dirStoreIdentity(dir = receiver): Promise<ConfigStoreIdentity> {
   const common = await fs.realpath(path.join(dir, ".git"));
   const stat = await fs.stat(common, { bigint: true });
   return {
@@ -118,7 +118,7 @@ beforeEach(async () => {
 afterEach(async () => fs.rm(tmp, { recursive: true, force: true }));
 
 test("pull sync-point uses BOTH pinned ownership traces and preserves an unrelated ACK", async () => {
-  const shape = await dirShape();
+  const storeIdentity = await dirStoreIdentity();
   const ours: GitConfig = { "remote.upstream.url": ["git@example.com:ours.git"] };
   const otherHash = gitConfigHash({ "remote.upstream.url": ["git@example.com:other.git"] });
 
@@ -130,7 +130,7 @@ test("pull sync-point uses BOTH pinned ownership traces and preserves an unrelat
     await git(receiver, "config", "--add", "remote.upstream.url", ours["remote.upstream.url"]![0]!);
     const baseRow = { ...base, ...(row.baseConfig === undefined ? {} : { config: row.baseConfig }) };
     const remote = { ...base, config: desired };
-    const state = stateWith(baseRow, { cfgSynced: row.cfgSynced, cfgShape: shape });
+    const state = stateWith(baseRow, { cfgSynced: row.cfgSynced, cfgShape: storeIdentity });
     state.repoRecords!.unrelated = { repoGen: 7, sourceSeq: 1, cfgSynced: "keep-me" };
     const outcome = await apply(remote, state);
 
@@ -277,8 +277,8 @@ test("grammar-invalid incoming config is ignored while Git state applies", async
 });
 
 test("config failure advances unchanged Git while an unauthorized converged branch remains pending", async () => {
-  const shape = await dirShape();
-  const oldLane = { cfgShape: shape, cfgApplied: "old-applied", cfgSynced: "old-synced" };
+  const storeIdentity = await dirStoreIdentity();
+  const oldLane = { cfgShape: storeIdentity, cfgApplied: "old-applied", cfgSynced: "old-synced" };
   const remoteSameGit = { ...base, config: desired };
   const first = await apply(remoteSameGit, stateWith(base, oldLane), { applyConfig: configFailure });
   expect(first.gitRepos?.["."]).toEqual(remoteSameGit);
@@ -292,7 +292,7 @@ test("config failure advances unchanged Git while an unauthorized converged bran
   await fs.rm(receiver, { recursive: true, force: true });
   await git(tmp, "clone", "-q", source, receiver);
   await git(receiver, "remote", "remove", "origin");
-  const convergedLane = { ...oldLane, cfgShape: await dirShape() };
+  const convergedLane = { ...oldLane, cfgShape: await dirStoreIdentity() };
   const converged = await apply(remoteNewGit, stateWith(base, convergedLane), {
     applyConfig: configFailure,
     oracle: {
@@ -321,8 +321,8 @@ test("combined config failure keeps safe Git progress and defers only config", a
   await commit(source, "two\n", "two");
   const remote = { ...(await capture()), config: desired };
   const oldHead = await git(receiver, "rev-parse", "HEAD");
-  const shape = await dirShape();
-  const lane = { cfgShape: shape, cfgApplied: "old", cfgSynced: "old" };
+  const storeIdentity = await dirStoreIdentity();
+  const lane = { cfgShape: storeIdentity, cfgApplied: "old", cfgSynced: "old" };
 
   const ordinary = await apply(remote, stateWith(base, lane), { applyConfig: configFailure });
   expect(ordinary.gitPendingRemote).toBeUndefined();

@@ -18,7 +18,7 @@ export {
   repoRecordsForState,
   stateFromRepoRecords,
   validManifestMeta,
-  type ConfigShapeIdentity,
+  type ConfigStoreIdentity,
   type FileOnlyManifest,
   type GitDeferral,
   type GitDeferralReason,

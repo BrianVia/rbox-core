@@ -36,3 +36,41 @@ Format: field — file:line — suggested name — blast radius.
   written rows, so it needs an evidence-version marker (or a reader that
   verifies old rows under the old key ordering) before any historical audit
   row can still be verified.
+## `cfgShape` (repo record config lane)
+
+- **Anchor:** `src/cli/sync-state-model.ts:323` (`RepoRecordInput.cfgShape`),
+  column mapping `cfg_shape_cjson` at
+  `src/cli/state-plane/codecs/repo-record.ts:21`.
+- **Suggested name:** `cfgStore` (column `cfg_store_cjson`) — it identifies the
+  physical Git config store the lane's baseline was taken against, not a
+  "shape".
+- **Blast radius:** durable SQLite column + codec validator
+  (`repo-record.ts:33,47,83-87`), digest grammar goldens
+  (`src/cli/state-plane/digest/grammar-goldens.test.ts:216`), codec coverage
+  (`src/cli/state-plane/codecs/coverage.ts:79`), `ConfigLaneState` projection
+  (`src/cli/sync-state.ts:34,49,430`), every sync-git config-lane reader and
+  writer, and the e2e/pull/contract test assertions. Needs a state migration
+  and a client-skew story (records written by older CLIs carry the old key).
+
+## `ConfigStoreIdentity.shape` (repo kind inside the store identity)
+
+- **Anchor:** `src/cli/sync-state-model.ts:137`, written at
+  `src/cli/sync-git/config-lane.ts:101`.
+- **Suggested name:** `repoKind` — the value is the `RepoCtx.kind`
+  (`"dir"` / `"pointer"`), which the rest of the codebase already calls
+  `repoKind`.
+- **Blast radius:** nested inside the durable `cfg_shape_cjson` JSON, so it
+  moves only with `cfgShape` above. Also pinned by the codec exact-object check
+  (`repo-record.ts:84-85`), coverage (`coverage.ts:111`), the digest grammar
+  goldens, and `sync-git-config-pull.test.ts:449`.
+
+## `GitResolutionBinding["config"].shape`
+
+- **Anchor:** `src/cli/sync-state-model.ts:285`, populated at
+  `src/cli/sync-git/resolution-intent.ts:62-67`.
+- **Suggested name:** `storeIdentity` — it is the canonicalized
+  `ConfigStoreIdentity`, matching the code-symbol name now used everywhere else.
+- **Blast radius:** hardest of the three. The binding is canonicalized and
+  hashed into resolution receipts, so renaming the key changes every binding
+  identity hash — any in-flight resolution recorded by an older CLI stops
+  matching. Requires the 2.0 receipt-format break, not a standalone rename.

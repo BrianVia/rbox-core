@@ -59,7 +59,7 @@ async function configBinding(root: string, rel: string, ctx: RepoCtx): Promise<G
   } catch {
     return { ownership: "indeterminate", read: "failed", detail: "ownership-read" };
   }
-  const shape = canonicalString(receiver.shape);
+  const shape = canonicalString(receiver.storeIdentity);
   if (!receiver.owned) return { ownership: "unowned", read: "not-owned", shape };
   const local = await readLocalGitConfig(root, rel, ctx);
   if (local.status === "ok") return { ownership: "owned", read: "ok", hash: local.cached.hash, shape };
