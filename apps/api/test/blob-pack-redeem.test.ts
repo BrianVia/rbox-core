@@ -53,20 +53,29 @@ function buildPack(payloads: Uint8Array[]): BuiltPack {
   return { id, body, sha: hash(body), entries, payloads };
 }
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
 const fakeState = () => ({
   setWebSocketAutoResponse() {},
   storage: {
-    kv: { get() {}, put() {}, delete() {} },
-    sql: { exec: () => ({ toArray: () => [] }) },
+    kv: {
+      get: <Value>(_key: string): Value | undefined => undefined,
+      put: <Value>(_key: string, _value: Value): void => {},
+      delete: (_key: string): boolean => false,
+    },
+    sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
     transactionSync(fn: () => void) { fn(); },
-    async getAlarm() { return null; },
-    async setAlarm() {},
+    async getAlarm(): Promise<number | null> { return null; },
+    async setAlarm(_scheduledTime: number | Date): Promise<void> {},
   },
-}) as unknown as DurableObjectState;
+}) as DurableObjectState;
 
 async function redeem(accountId: string, receipts: Record<string, string>): Promise<Response> {
   const sync = new WorkspaceSync(fakeState(), env);
-  return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
+  return sync["redeemReceipts"](
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-rbox-account": accountId },
@@ -134,7 +143,13 @@ async function seedReadyPack(packId: string, packSha256: string, members: Invent
   ]);
 }
 
-function countPlacementStatements(realDb: D1Database): { db: D1Database; count: () => number } {
+/** A D1 facade that counts the placement INSERTs the code under test issues. */
+interface PlacementCounter {
+  db: D1Database;
+  count: () => number;
+}
+
+function countPlacementStatements(realDb: D1Database): PlacementCounter {
   let placementStatements = 0;
   return {
     db: new Proxy(realDb, {

@@ -57,16 +57,25 @@ function buildPack(payloads: Uint8Array[]): BuiltPack {
   return { id, body, sha: hash(body), entries, payloads };
 }
 
+/** The one cursor member the DO touches; widened so `SqlStorageCursor` satisfies it. */
+interface FakeSqlCursor {
+  toArray(): unknown[];
+}
+
 const fakeState = () => ({
   setWebSocketAutoResponse() {},
   storage: {
-    kv: { get() {}, put() {}, delete() {} },
-    sql: { exec: () => ({ toArray: () => [] }) },
+    kv: {
+      get: <Value>(_key: string): Value | undefined => undefined,
+      put: <Value>(_key: string, _value: Value): void => {},
+      delete: (_key: string): boolean => false,
+    },
+    sql: { exec: (_query: string, ..._bindings: unknown[]): FakeSqlCursor => ({ toArray: () => [] }) },
     transactionSync(fn: () => void) { fn(); },
-    async getAlarm() { return null; },
-    async setAlarm() {},
+    async getAlarm(): Promise<number | null> { return null; },
+    async setAlarm(_scheduledTime: number | Date): Promise<void> {},
   },
-}) as unknown as DurableObjectState;
+}) as DurableObjectState;
 
 async function publishAndRedeem(a: { token: string; accountId: string }, pack: BuiltPack): Promise<Record<string, string>> {
   const put = await SELF.fetch(`${BASE}/v1/blob-pack/put`, {
@@ -84,7 +93,7 @@ async function publishAndRedeem(a: { token: string; accountId: string }, pack: B
   const result = await put.json() as { results: Array<{ sha256: string; receipt: string }> };
   const receipts = Object.fromEntries(result.results.map((row) => [row.sha256, row.receipt]));
   const sync = new WorkspaceSync(fakeState(), env);
-  const redeem = await (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
+  const redeem = await sync["redeemReceipts"](
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-rbox-account": a.accountId },

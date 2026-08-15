@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../../../src/json.js";
 import type { Env } from "../env.js";
 import { cappedJson, isWellFormed, json, logErr, objectWithKeys, sha256Hex, truncateCodePoints, truncateUtf8, utf8Bytes } from "../util.js";
 import type { Principal } from "../authz.js";
@@ -20,15 +21,23 @@ const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
 export const PAIR_CREATE_MAX_BYTES = 1024 * 1024;
 export const PAIR_REDEEM_MAX_BYTES = 8 * 1024;
 
-export function validatePairCreateBody(value: unknown): { mkWrap?: string; admissionGrant?: string; tokenId?: string } | null {
-  if (!objectWithKeys(value, ["mkWrap", "admissionGrant", "tokenId"])) return null;
-  if (value.mkWrap !== undefined && (typeof value.mkWrap !== "string" || utf8Bytes(value.mkWrap) > 65_536)) return null;
-  if (value.admissionGrant !== undefined && (typeof value.admissionGrant !== "string" || utf8Bytes(value.admissionGrant) > 65_536)) return null;
-  if (value.tokenId !== undefined && (typeof value.tokenId !== "string" || !PAIR_TOKEN_ID_RE.test(value.tokenId))) return null;
-  return value as { mkWrap?: string; admissionGrant?: string; tokenId?: string };
+/** The opaque E2EE material a pair/create body may carry (design 12 V4-1, C6). */
+export interface PairCreateBody {
+  mkWrap?: string;
+  admissionGrant?: string;
+  tokenId?: string;
 }
 
-export function validatePairRedeemBody(value: unknown): { token: string; label?: string } | null {
+export function validatePairCreateBody(value: JsonValue): PairCreateBody | null {
+  if (!objectWithKeys(value, ["mkWrap", "admissionGrant", "tokenId"])) return null;
+  const { mkWrap, admissionGrant, tokenId } = value;
+  if (mkWrap !== undefined && (typeof mkWrap !== "string" || utf8Bytes(mkWrap) > 65_536)) return null;
+  if (admissionGrant !== undefined && (typeof admissionGrant !== "string" || utf8Bytes(admissionGrant) > 65_536)) return null;
+  if (tokenId !== undefined && (typeof tokenId !== "string" || !PAIR_TOKEN_ID_RE.test(tokenId))) return null;
+  return { mkWrap, admissionGrant, tokenId };
+}
+
+export function validatePairRedeemBody(value: JsonValue): { token: string; label?: string } | null {
   if (!objectWithKeys(value, ["token", "label"], ["token"]) || typeof value.token !== "string") return null;
   const tokenId = value.token.startsWith(PAIR_PREFIX) ? value.token.slice(PAIR_PREFIX.length) : value.token;
   if (!PAIR_TOKEN_ID_RE.test(tokenId)) return null;

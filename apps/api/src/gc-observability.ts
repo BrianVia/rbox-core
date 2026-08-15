@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../../src/json.js";
 import type { Env } from "./env.js";
 import { logErr, objectWithKeys } from "./util.js";
 import { startOp } from "./metrics.js";
@@ -26,13 +27,15 @@ export type GcObservationStage =
   | "intent"
   | "release";
 
-export interface GcRootsSampleV1 {
+/** Type aliases, not interfaces: these records are persisted as JSON in `gc_state`,
+ *  so they must stay assignable to `JsonValue` for the parser that reads them back. */
+export type GcRootsSampleV1 = {
   value: number;
   measuredAt: string;
   lowerBound?: true;
-}
+};
 
-export interface GcObservationV1 {
+export type GcObservationV1 = {
   v: 1;
   at: string;
   outcome: GcObservationOutcome;
@@ -45,7 +48,7 @@ export interface GcObservationV1 {
   orphanRefs?: number;
   errorClass?: string;
   rootsSample: GcRootsSampleV1 | null;
-}
+};
 
 const GC_OBSERVATION_KEYS = ["gc_obs_mark", "gc_obs_purge"] as const;
 export type GcObservationKey = (typeof GC_OBSERVATION_KEYS)[number];
@@ -58,7 +61,7 @@ const GC_STAGES = new Set<GcObservationStage>([
   "state_write", "lease", "execute", "intent", "release",
 ]);
 
-function isFixedIso(value: unknown): value is string {
+function isFixedIso(value: JsonValue | undefined): value is string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
   try {
     return new Date(value).toISOString() === value;
@@ -67,7 +70,7 @@ function isFixedIso(value: unknown): value is string {
   }
 }
 
-function parseGcObservation(value: unknown): GcObservationV1 | null {
+function parseGcObservation(value: JsonValue): GcObservationV1 | null {
   if (!objectWithKeys(value,
     ["v", "at", "outcome", "stage", "status", "rows", "marked", "purged", "opened", "orphanRefs", "errorClass", "rootsSample"],
     ["v", "at", "outcome", "rootsSample"],
@@ -188,6 +191,6 @@ export function metric(env: Env, name: string, count = 0, bytes = 0, outcome = "
 }
 
 export async function readGcObservation(db: D1Database, key: GcObservationKey): Promise<GcObservationV1 | null> {
-  const raw = await readState<unknown>(db, key);
+  const raw = await readState<JsonValue>(db, key);
   return parseGcObservation(raw);
 }
