@@ -547,7 +547,7 @@ entries reach them.
 | `genesis-crash-matrix.test.ts` | **amend**: G4 does not crash during recovery; add the post-`Q` restart cells and both outcomes of each un-fsynced unlink |
 | `authority-bootstrap.test.ts` | **amend**: pin intent-first dispatch for every classified format, fresh post-operation selection, the exact final-evidence → mutex-check → state-lock-check → holder-observation → rename publication order, and zero new `migration/**` import/call edges |
 | `compat-matrix.test.ts` and `whole-state-compat.test.ts` | **amend**: record the intent-existence read on settled JSON, preserve JSON result/bytes, cover absent, JSON+intent, `Q`+intent, held/unheld/degraded handles, and preserve `whole-state-compat.test.ts:234`'s gate forbidding a static coordinator/store import |
-| `schema/inventory.test.ts` | **amend with named inventory changes**: move the selector entry from `selectSqliteAuthority` to `selectStateAuthority`, update its file/site counts and guards, add the genesis-admission/read-intent and dynamic-import sites, and preserve the real-CLI eager static-closure gate proving no `bun:sqlite`; do not weaken any existing state-path guard |
+| `state-plane/inventory.test.ts` [path corrected — the selector site-count declarations live here (inventory.test.ts:67), not in schema/inventory.test.ts, which owns DB-schema gates and is preserved unchanged] | **amend with named inventory changes**: move the selector entry from `selectSqliteAuthority` to `selectStateAuthority`, update its file/site counts and guards, add the genesis-admission/read-intent and dynamic-import sites, and preserve the real-CLI eager static-closure gate proving no `bun:sqlite`; do not weaken any existing state-path guard |
 | `locks.test.ts` and `file-size.test.ts` | **amend/preserve**: add borrowed-lock ordering and post-entry loss coverage; the existing 400/25 KiB gate stays unchanged and no allowlist entry is added |
 | daemon startup/scheduler/policy tests | **amend**: separate direct and forced-contention paths; in the contended table add distinct adoption-generation (`daemon.ts:2783`) and recycle-only (`daemon.ts:2893`) rows, each proving admission precedes scan and matcher work |
 | explicit migration authority, lock, retry/abort, and crash suites | **preserve unchanged**: SP-1 changes no migration command, behavior, production file under `migration/**`, or migration import edge |
@@ -587,7 +587,7 @@ entries reach them.
   distinguishes the pre-existing `authority-bootstrap.ts` migration imports
   used by the operator coordinator/write fence from the zero new admission
   edges. Preserve `whole-state-compat.test.ts:234`'s no-static-coordinator/store
-  gate and extend `schema/inventory.test.ts`'s real-CLI static-closure inventory:
+  gate and extend `state-plane/inventory.test.ts`'s real-CLI static-closure inventory:
   the settled-selection closure contains no `bun:sqlite`, while dynamic
   genesis/lock chunks are reachable only from the admission-required branch.
 - **Size acceptance:** record `locks.ts` at baseline 298 nonblank/14,298 bytes,
