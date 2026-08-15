@@ -21,7 +21,7 @@ import type {
 import type { SqliteResetInspection } from "./state-plane/reset/recovery.js";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
-import { boundedHash, boundedJsonRead } from "./reset-io.js";
+import { boundedHash, boundedJsonRead, retryOnIdentityRace } from "./reset-io.js";
 import { observeResetRefs } from "./reset-z-runtime.js";
 import {
   assertProtocolLockHeld,
@@ -141,20 +141,25 @@ export function resetFenceRequests(standing: StandingResetInspection): Repositor
   })).sort((a, b) => a.commonDir.localeCompare(b.commonDir));
 }
 
+/** Every ordinary state load observes this fence, so it runs unlocked against a
+ * workspace whose writers republish state.json by atomic rename. The retry makes
+ * the whole tuple — stat AND control hash — describe one settled file. */
 async function artifactIdentity(root: string, file: string): Promise<readonly unknown[]> {
-  try {
-    const s = await fs.lstat(file, { bigint: true });
-    const controlHash = file === statePath(root) || file === sqliteResetPaths.journal(root)
-      ? await boundedHash(file, 512 * 1024)
-      : undefined;
-    return [
-      s.isFile(), s.isSymbolicLink(), s.size.toString(), s.mtimeNs.toString(),
-      s.dev.toString(), s.ino.toString(), controlHash,
-    ];
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return ["absent"];
-    throw error;
-  }
+  return retryOnIdentityRace(async () => {
+    try {
+      const s = await fs.lstat(file, { bigint: true });
+      const controlHash = file === statePath(root) || file === sqliteResetPaths.journal(root)
+        ? await boundedHash(file, 512 * 1024)
+        : undefined;
+      return [
+        s.isFile(), s.isSymbolicLink(), s.size.toString(), s.mtimeNs.toString(),
+        s.dev.toString(), s.ino.toString(), controlHash,
+      ];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return ["absent"];
+      throw error;
+    }
+  });
 }
 
 export async function createResetFenceObservation(

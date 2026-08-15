@@ -124,6 +124,30 @@ Statuses used below:
 | Status / fix | **CONFIRMED — FIXED** on `credentials-flake-fix`. A process-local installer, patterned after the existing heartbeat installer, supplies a short retry delay/count while production remains 80×25 ms. The regression exhausts every configured attempt for both marker classes, asserts acquisition fails closed, and compares each live marker byte-for-byte after failure. The harness now sets and restores both `HOME` and the preferred `RBOX_HOME`; the symlink-root case redirects both. No shard serialization, timeout increase, or safety-coverage reduction. |
 | Proof | PR #682 attempt 2 passed on the same SHA; pre-fix isolation was 49/49 green in 4.6 s. Post-fix, the complete file passed in ten fresh processes (48 pass, 1 skip each; 0.493–0.610 s), plus an independent review run (48 pass, 1 skip in 0.526 s). The test's exact attempt traces are `0..3` for both main and fence markers. |
 
+### FLAKE-009 — daemon-activity load flake is one state.json republish race
+
+| Field | Record |
+|---|---|
+| Tests | `a second watcher error during the covering scan keeps status degraded`; `review M2: a busy repo is transiently unprovable and still re-arms the post-pull push`; `executeOp D1a: a successful recovery-probe fullScan clears watcher-degraded like an ordinary scan` — plus, under local load, at least nine more names in the same file |
+| File | `src/cli/daemon/daemon-activity.test.ts` |
+| First / last seen | 2026-08-15 / 2026-08-15 |
+| Failure | PR #741 (`sp25-rig`, a diff that touches no daemon code) failed `tests · shard 1/6` on three consecutive attempts of [run 31906625854](https://github.com/BrianVia/rbox-core/actions/runs/31906625854), each on a different test name. All three carry the identical body: `ResetCorruptionError: reset-corruption: reset file changed while reading /tmp/rbox-daemon-activity-*/.rbox/state.json`, `kind: "identity-race"`, thrown from `boundedStream` → `boundedHash` → `artifactIdentity` → `createResetFenceObservation` → `inspectResetFenceInventory` → `recoverStandingResetJournal` → `loadLegacyJsonState`. |
+| Root cause | Not timing sensitivity in the tests, and not three flakes: one product race, attributed by Bun to whichever test was running when the rejection surfaced. Every ordinary state load runs `recoverStandingResetJournal`, which fingerprints the workspace's physical artifacts by hashing `state.json` — unlocked, because a load must not serialize behind writers. State writers publish `state.json` by atomic rename (`writeFileAtomic`), so a republish landing inside that hash flips the file's dev/ino and `boundedStream` correctly reports an identity race. `boundedRead` already treats a settled republish as retryable (`identityRetries`, default 2); the fence's `boundedHash` had no such retry, so the benign case threw. The daemon suite hits it constantly because `SyncStateReporter` mints `telemetryBindingId` into `state.json` on each fresh test root while the pump is loading; contention widens the window, which is why it reads as a load flake. |
+| Status / fix | **CONFIRMED — FIXED** on `fix/daemon-activity-load-flake`. `reset-io` now owns one retry policy, `retryOnIdentityRace`, and both `boundedRead` and the fence's `artifactIdentity` go through it — the whole identity tuple (stat plus control hash) now describes one settled file instead of straddling a rename. No assertion was weakened, no timeout raised, no test skipped; a non-race `ResetCorruptionError` and an exhausted retry budget still throw. |
+| Proof | Local repro: 24 concurrent copies of the file × 3 rounds under 16 busy-loop stressors on a 32-core host. Pre-fix 15/72 process-runs failed, 100% of them on this race, spread across 12 distinct test names. Post-fix 0 races in 120 runs of the identical harness (72 + 48). Isolation is 65/65 and CI shard 1/6 runs 833 pass / 0 fail locally. `retryOnIdentityRace` is pinned deterministically in `src/cli/reset-io.test.ts`: a rename that lands mid-read is re-read (the witness records both the pre- and post-rename bodies), a `kind: "corruption"` failure is never retried, and an unending race still throws after exactly three attempts. |
+
+### FLAKE-010 — pr8 pull-only timers await the wrong pump
+
+| Field | Record |
+|---|---|
+| Test | `pr8: production pull-only timers remint discovery and clear a ghost without pushing` |
+| File | `src/cli/daemon/daemon-activity.test.ts` |
+| First / last seen | 2026-08-15 / 2026-08-15 (local load harness only; no CI sighting) |
+| Failure | `expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined()` received the seeded `capture` deferral. The preceding epoch assertion passed, so the deep scan had run and only the deferral hygiene behind it had not. |
+| Root cause | Suspected: after `clock.fireDeep()` the test hops one microtask (`await Promise.resolve()`) and then awaits `daemon.pumpRun`. That is not a completion signal for the pump the deep scan requested — under contention `pumpRun` can still be an earlier pump, and awaiting it returns before hygiene runs. Distinct from FLAKE-009; it survived that fix. |
+| Status / fix | **SUSPECTED — OPEN.** Not fixed here: the FLAKE-009 change is unrelated to it, and the honest repair needs a real pump-quiescence signal from `RboxDaemon` rather than another hop. Do not paper over it with a sleep or a poll on the asserted value. |
+| Proof | 1 of 72 post-FLAKE-009 process-runs under the 24-way + 16-stressor harness (`r3-p23`), and 1 of 24 in a pre-fix round. Isolation and the ordinary shard run are green. |
+
 ## Same-class audit candidates
 
 These are the actionable occurrences found by the `src/**/*.test.ts` and
