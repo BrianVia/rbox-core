@@ -91,11 +91,13 @@ export interface GitRefWatchHandle {
   on?(event: "error", listener: (error: Error) => void): unknown;
 }
 
+export type GitRefWatchTimer = ReturnType<typeof setTimeout> | number;
+
 export interface GitRefWatchClock {
   now(): number;
   random(): number;
-  setTimeout(fn: () => void, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
+  setTimeout(fn: () => void, ms: number): GitRefWatchTimer;
+  clearTimeout(handle: GitRefWatchTimer): void;
 }
 
 export interface GitRefWatchRegistryOptions {
@@ -186,7 +188,7 @@ const SYSTEM_CLOCK: GitRefWatchClock = {
   now: () => Date.now(),
   random: () => Math.random(),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
-  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  clearTimeout: (handle) => clearTimeout(handle),
 };
 
 const defaultWatch = (
@@ -227,7 +229,7 @@ export class GitRefWatchRegistry {
   #active = new Map<string, ActiveTarget>();
   #forcedTargets = new Set<string>();
   #retries = new Map<string, RetryState>();
-  #retryTimer?: unknown;
+  #retryTimer?: GitRefWatchTimer;
   #pump?: Promise<void>;
   #closingHandles: Promise<void>[] = [];
   #waiters: Array<{ generation: number; resolve: () => void }> = [];
@@ -865,7 +867,7 @@ export class GitRefWatchRegistry {
     this.#onLog?.(`git ref watcher attach failed for ${desired.canonicalRoot}: ${errorMessage(error)}`);
   }
 
-  #recordPathFailure(rawRoot: string, mode: GitRefWatchMode, owner: string, error: unknown): void {
+  #recordPathFailure(rawRoot: string, mode: GitRefWatchMode, owner: string, error: Error): void {
     const key = targetKey(path.resolve(rawRoot), mode);
     this.#recordRetry(key, new Set([owner]));
     this.#onLog?.(`git ref watcher target unavailable at ${rawRoot}: ${errorMessage(error)}`);
@@ -944,4 +946,5 @@ async function pathPresence(target: string): Promise<boolean | undefined> {
   }
 }
 
+/** Decoder for this file's caught exceptions — `unknown` by language rule. */
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);

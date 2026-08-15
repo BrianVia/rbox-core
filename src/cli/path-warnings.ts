@@ -4,6 +4,7 @@ import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { isSafeRelPath, type CaseFoldCollisionGroup } from "../engine/manifest-validate.js";
+import type { JsonValue } from "../json.js";
 import { boundedJsonRead } from "./reset-io.js";
 
 export const PATH_WARNINGS_MAX_BYTES = 64 * 1024;
@@ -25,8 +26,10 @@ export interface PathWarningsV1 {
   collisions: PathCollisionGroup[];
 }
 
-type PathWarningsCandidate = Partial<Record<keyof PathWarningsV1, unknown>>;
-type PathCollisionCandidate = Partial<Record<keyof PathCollisionGroup, unknown>>;
+/** The decoded document and its group members, keyed by the members this record
+ * owns: exactly what `boundedJsonRead` (i.e. `JSON.parse`) produced for the bytes. */
+type PathWarningsCandidate = Partial<Record<keyof PathWarningsV1, JsonValue>>;
+type PathCollisionCandidate = Partial<Record<keyof PathCollisionGroup, JsonValue>>;
 
 export const pathWarningsPath = (root: string): string =>
   path.join(root, ".rbox", "state", "path-warnings.json");
@@ -125,7 +128,10 @@ function exactKeys(value: object, expected: readonly string[]): boolean {
   return Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
 }
 
-function validate(value: unknown): PathWarningsV1 | undefined {
+/** Two producers reach this one validator: the decoded on-disk document
+ * (`JSON.parse` output, i.e. a `JsonValue`) and an in-memory record re-checked
+ * before it is written. */
+function validate(value: JsonValue | PathWarningsV1): PathWarningsV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as PathWarningsCandidate;
   if (!exactKeys(record, ["v", "fingerprint", "groupCount", "pathCount", "collisions"])) return undefined;
@@ -143,8 +149,8 @@ function validate(value: unknown): PathWarningsV1 | undefined {
     const group = raw as PathCollisionCandidate;
     if (!exactKeys(group, ["paths"]) || !Array.isArray(group.paths)
       || group.paths.length < 2 || group.paths.length > PATH_WARNINGS_MAX_PATHS_PER_GROUP) return undefined;
-    if (!group.paths.every(isSafeRelPath)) return undefined;
-    const paths = group.paths as string[];
+    if (!group.paths.every((entry): entry is string => typeof entry === "string" && isSafeRelPath(entry))) return undefined;
+    const paths = group.paths;
     for (let i = 0; i < paths.length; i++) {
       if (i > 0 && compareText(paths[i - 1]!, paths[i]!) >= 0) return undefined;
       if (paths[i]!.toLowerCase() !== paths[0]!.toLowerCase()) return undefined;
@@ -171,7 +177,8 @@ function validate(value: unknown): PathWarningsV1 | undefined {
 export async function readPathWarnings(root: string): Promise<PathWarningsV1 | undefined> {
   try {
     if (!await requirePlainWarningsParent(root)) return undefined;
-    return validate(await boundedJsonRead(pathWarningsPath(root), PATH_WARNINGS_MAX_BYTES));
+    const document = await boundedJsonRead<JsonValue>(pathWarningsPath(root), PATH_WARNINGS_MAX_BYTES);
+    return document === undefined ? undefined : validate(document);
   } catch {
     return undefined;
   }

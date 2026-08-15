@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
+import type { JsonValue } from "../json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedJsonRead } from "./reset-io.js";
 
@@ -16,7 +17,9 @@ export interface ResetHaltHealthV1 {
   haltedAt: string;
 }
 
-type ResetHaltHealthCandidate = Partial<Record<keyof ResetHaltHealthV1, unknown>>;
+/** The decoded advisory document, keyed by the members this record owns: exactly
+ * what `boundedJsonRead` (i.e. `JSON.parse`) produced for the file's bytes. */
+type ResetHaltHealthCandidate = Partial<Record<keyof ResetHaltHealthV1, JsonValue>>;
 
 export const resetHaltHealthPath = (root: string): string =>
   path.join(root, ".rbox", "state", "health-halt.json");
@@ -24,20 +27,20 @@ export const resetHaltHealthPath = (root: string): string =>
 export const resetJournalIdentity = (bytes: Uint8Array): string =>
   crypto.createHash("sha256").update(bytes).digest("hex");
 
-function isCanonicalTime(value: unknown): value is string {
+function isCanonicalTime(value: JsonValue | undefined): value is string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
-function validate(value: unknown): ResetHaltHealthV1 | undefined {
+function validate(value: JsonValue): ResetHaltHealthV1 | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as ResetHaltHealthCandidate;
+  const record: ResetHaltHealthCandidate = value;
   const keys = Object.keys(record).sort();
   if (keys.join("\0") !== ["haltedAt", "journalIdentity", "reason", "v"].sort().join("\0")) return undefined;
   if (record.v !== 1 || typeof record.reason !== "string" || Buffer.byteLength(record.reason) > MAX_REASON_BYTES || record.reason.includes("\0")) return undefined;
   if (typeof record.journalIdentity !== "string" || !HEX64.test(record.journalIdentity) || !isCanonicalTime(record.haltedAt)) return undefined;
-  return record as ResetHaltHealthV1;
+  return { v: 1, reason: record.reason, journalIdentity: record.journalIdentity, haltedAt: record.haltedAt };
 }
 
 /** Read-only by contract. Invalid or unsafe records are ignored: the standing
@@ -45,7 +48,8 @@ function validate(value: unknown): ResetHaltHealthV1 | undefined {
 export async function readResetHaltHealth(root: string): Promise<ResetHaltHealthV1 | undefined> {
   const file = resetHaltHealthPath(root);
   try {
-    return validate(await boundedJsonRead(file, MAX_HEALTH_BYTES));
+    const document = await boundedJsonRead<JsonValue>(file, MAX_HEALTH_BYTES);
+    return document === undefined ? undefined : validate(document);
   } catch {
     return undefined;
   }

@@ -7,6 +7,7 @@ import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import { currentWorkspaceId, daemonRuntimeDir, type DaemonModeIntent } from "../daemon-control.js";
 import { credentialsForStrictFlow, loadCredentials } from "../credentials.js";
 import type { DaemonMode } from "../daemon/ambient-status.js";
+import type { JsonValue } from "../../json.js";
 
 const DESIRED_FILE = "desired.json";
 
@@ -73,9 +74,14 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-function parseMaintenance(v: unknown): DaemonMaintenance | undefined {
-  if (typeof v !== "object" || v === null) return undefined;
-  const m = v as Partial<DaemonMaintenance>;
+/** The decoded `desired.json` document and its maintenance member, keyed by the
+ * members each record owns: exactly what `JSON.parse` produced for the file. */
+type DesiredDaemonStateCandidate = Partial<Record<keyof DesiredDaemonState, JsonValue>>;
+type DaemonMaintenanceCandidate = Partial<Record<keyof DaemonMaintenance, JsonValue>>;
+
+function parseMaintenance(v: JsonValue | undefined): DaemonMaintenance | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const m: DaemonMaintenanceCandidate = v;
   if (typeof m.id !== "string" || !m.id) return undefined;
   if (m.resume !== "running" && m.resume !== "stopped") return undefined;
   return { id: m.id, resume: m.resume, at: typeof m.at === "string" ? m.at : "" };
@@ -83,7 +89,9 @@ function parseMaintenance(v: unknown): DaemonMaintenance | undefined {
 
 function parseDesired(raw: string): DesiredDaemonState | undefined {
   try {
-    const v = JSON.parse(raw) as Partial<DesiredDaemonState>;
+    const document: JsonValue = JSON.parse(raw);
+    if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+    const v: DesiredDaemonStateCandidate = document;
     if (v.state !== "running" && v.state !== "stopped") return undefined;
     if (typeof v.rootPath !== "string" || !v.rootPath) return undefined;
     if (typeof v.accountId !== "string" || !v.accountId) return undefined;
@@ -178,10 +186,18 @@ export function explicitMode(deps: DesiredDeps): DaemonMode | undefined {
   return deps.pullOnly === true ? "pull-only" : undefined;
 }
 
+/** The mode a start resolves to, where the decision came from, and whether the
+ * operator asked for it on this invocation. */
+export interface StartModeDecision {
+  mode: DaemonMode;
+  intent: DaemonModeIntent;
+  explicit: boolean;
+}
+
 export function resolveStartMode(
   previous: DesiredDaemonState | undefined,
   deps: DesiredDeps,
-): { mode: DaemonMode; intent: DaemonModeIntent; explicit: boolean } {
+): StartModeDecision {
   const explicit = explicitMode(deps);
   if (explicit !== undefined) {
     return { mode: explicit, intent: previous?.pendingModeIntent === explicit ? "pending" : "explicit", explicit: true };

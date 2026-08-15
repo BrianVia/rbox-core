@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { writeFileAtomic } from "../../engine/index.js";
 import type { DaemonMutexResult, WorkspaceSyncMutex } from "../sync-mutex.js";
 import { selectPumpOperation, type PumpOperation, type Wants } from "./policy.js";
+import type { JsonValue } from "../../json.js";
 
 /**
  * `ServiceNextDaemonOperation` — the single-flight heart of the daemon (design 178).
@@ -33,9 +34,13 @@ const NO_PROGRESS_ITERATION_BOUND = 3;
  *  one: it is the scheduler's own response to a standing halt. */
 export type DaemonWakeup = keyof Wants;
 
-export interface DaemonSchedulerClock {
-  setTimeout(fn: () => void, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
+/** The recovery probe's timer seam. `THandle` is whatever the injected clock's
+ *  `setTimeout` hands back — a Node `Timeout` in production, a test clock's own
+ *  token under test. The scheduler never inspects it; it only ever returns it to
+ *  the clock that issued it, so the issuer owns the type. */
+export interface DaemonSchedulerClock<THandle = unknown> {
+  setTimeout(fn: () => void, ms: number): THandle;
+  clearTimeout(handle: THandle): void;
 }
 
 /** The standing halt, read-only: the halt RECORD is the runtime-observation owner's.
@@ -88,6 +93,13 @@ export interface DaemonSchedulerDrainReceipt {
   readonly queued: Readonly<Wants>;
 }
 
+/** One tier of the workspace-mutex backoff: how long to wait, and whether this
+ *  tier is the first observation worth logging. */
+export interface MutexBackoffStep {
+  delayMs: number;
+  shouldLog: boolean;
+}
+
 export interface LockStarvationEpisode {
   holderKey: string;
   firstSeenAt: number;
@@ -95,11 +107,13 @@ export interface LockStarvationEpisode {
   countedAt?: number;
 }
 
-type LockStarvationEpisodeCandidate = Partial<Record<keyof LockStarvationEpisode, unknown>>;
+/** The decoded episode file, keyed by the members this record owns: exactly what
+ *  `JSON.parse` produced for its bytes. */
+type LockStarvationEpisodeCandidate = Partial<Record<keyof LockStarvationEpisode, JsonValue>>;
 
 export const lockStarvationPath = (root: string): string => path.join(root, ".rbox", "state", "lock-starvation.json");
 
-const episodeTime = (value: unknown): value is number =>
+const episodeTime = (value: JsonValue | undefined): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
 export async function readLockStarvationEpisode(root: string): Promise<LockStarvationEpisode | undefined> {
@@ -241,7 +255,7 @@ export class DaemonOperationScheduler {
     this.mutexBackoffController?.abort();
   }
 
-  mutexDelay(holderKey: string): { delayMs: number; shouldLog: boolean } {
+  mutexDelay(holderKey: string): MutexBackoffStep {
     if (this.mutexHolderKey !== holderKey) {
       this.mutexHolderKey = holderKey;
       this.mutexBackoffTier = 0;
