@@ -63,10 +63,14 @@ import { homeDir } from "./rbox-paths.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { resolveFolderPolicy } from "./folder-config.js";
 
+/** The parsed CLI flag namespace `runInit` consumes — the same open string map
+ *  the argv parser hands every command. */
+export type InitFlags = Parameters<typeof runInit>[0];
+
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
-export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string; respectGitignore?: boolean }): Record<string, string> {
-  const flags: Record<string, string> = { root: plan.root, project: "root", "no-interactive": "true" };
+export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string; respectGitignore?: boolean }): InitFlags {
+  const flags: InitFlags = { root: plan.root, project: "root", "no-interactive": "true" };
   if (plan.kind === "new") flags.new = "true";
   else flags.workspace = plan.workspace ?? "";
   // On a CREATE the name is sent to the server (createRemoteWorkspace); on a JOIN it's
@@ -98,7 +102,9 @@ export const START_SYNC_CHOICES = [
  *  pinned by a unit test without driving the TUI widget (mirrors `workspaceFlags`
  *  and `authorizePath`). "both" starts the daemon AND enables autostart; "start" starts
  *  the daemon only; "none" does neither. */
-export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
+export type StartSyncActions = { startDaemon: boolean; enableAutostart: boolean };
+
+export function startSyncActions(choice: StartSyncChoice): StartSyncActions {
   return { startDaemon: choice !== "none", enableAutostart: choice === "both" };
 }
 
@@ -110,7 +116,9 @@ export const SETUP_COMPLETION_CHOICES = [
   { name: "Exit", value: "exit" },
 ] as const satisfies ReadonlyArray<{ name: string; value: SetupCompletionChoice }>;
 
-export function setupCompletionActions(choice: SetupCompletionChoice): { createPairingToken: boolean } {
+export type SetupCompletionActions = { createPairingToken: boolean };
+
+export function setupCompletionActions(choice: SetupCompletionChoice): SetupCompletionActions {
   return { createPairingToken: choice === "pair" };
 }
 

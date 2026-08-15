@@ -33,17 +33,26 @@ const JSON_FIELDS = [
   "cfgToken", "cfgShape", "deferrals", "partial", "attempt", "resolutionReceipt",
 ] as const satisfies readonly (keyof RepoRecord)[];
 
-function counter(value: unknown, field: string): asserts value is number {
+function counter(value: number, field: string): void {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${field} must be a nonnegative safe integer`);
   }
 }
 
+/** The RepoRecord members whose exact key set this codec re-establishes. Each is
+ * named by the record itself, so the admitted domain cannot drift from it. */
+type RepoRecordFixedMember =
+  | NonNullable<RepoRecord["packedRefsIdentity"]>
+  | NonNullable<RepoRecord["cfgToken"]>
+  | NonNullable<RepoRecord["cfgShape"]>
+  | NonNullable<RepoRecord["cfgShape"]>["commonDir"]
+  | NonNullable<RepoRecord["resolutionReceipt"]>;
+
 function exactObject(
-  value: unknown,
+  value: RepoRecordFixedMember,
   field: string,
   keys: readonly string[],
-): asserts value is object {
+): void {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${field} must be an object`);
   }
@@ -54,7 +63,7 @@ function exactObject(
   }
 }
 
-function textMembers(value: object, field: string, keys: readonly string[]): void {
+function textMembers(value: RepoRecordFixedMember, field: string, keys: readonly string[]): void {
   for (const key of keys) {
     if (typeof Reflect.get(value, key) !== "string") throw new TypeError(`${field}.${key} must be text`);
   }
@@ -177,7 +186,7 @@ export function decodeRepoRecord(row: RepoRecordRow): RepoRecord {
     ...spreadExtras(row.extras_cjson),
     repoGen: row.repo_gen,
     sourceSeq: row.source_seq,
-  };
+  } satisfies RepoRecord;
   for (const field of JSON_FIELDS) {
     const text = row[REPO_RECORD_COLUMN_BY_FIELD[field]];
     if (text !== null) Object.assign(record, { [field]: parseCanonicalJson(text) });
@@ -187,7 +196,7 @@ export function decodeRepoRecord(row: RepoRecordRow): RepoRecord {
     const member = row[REPO_RECORD_COLUMN_BY_FIELD[field]];
     if (member !== null) Object.assign(record, { [field]: member });
   }
-  const decoded = record as unknown as RepoRecord;
+  const decoded: RepoRecord = record;
   const encoded = encodeRepoRecord(row.rel_path, decoded);
   if (encoded.canonicalBytes !== row.canonical_bytes || encoded.retainedEstimate !== row.retained_estimate) {
     throw new Error(`structural corruption in RepoRecord ${row.rel_path}`);

@@ -19,11 +19,13 @@ import type { CasRejectionReason, ManifestHeader } from "../ports.js";
 import { internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
 import { runStatement, selectRow, streamRows, withStatement } from "./statements.js";
 import {
-  canonicalEvidenceOf, type SealedTransitionReader, type TransitionEvidenceBindings,
+  canonicalEvidenceOf, decodeTransitionBaseProof, decodeTransitionEvidence, decodeTransitionRecord,
+  isJsonObject, type SealedTransitionReader,
 } from "./transition-stages.js";
 import type { SourceStageBinding } from "../digest/repo-transition-v1.js";
 import type { CasOwnerToken } from "../ports.js";
 import type { CasExpectation } from "./write-packet.js";
+import type { JsonValue } from "../../../json.js";
 
 
 /**
@@ -46,7 +48,14 @@ export interface FrozenCasInputs {
 }
 
 /** Structural deep copy through the canonical codec: the result shares no object
- * identity with the caller's packet, so later mutation cannot reach it. */
+ * identity with the caller's packet, so later mutation cannot reach it.
+ *
+ * The assertion is a documented leftover of the same boundary `digest/codecs.ts`
+ * records: the canonical round trip IS the validator, and TypeScript cannot state
+ * that a `JsonValue` is structurally the caller's `T`. Constraining `T` to
+ * `JsonValue` would reject every interface-typed caller (`CasExpectation`,
+ * `ManifestHeader`, `GlobalManifestMeta`), because an interface carries no index
+ * signature — so the copy is typed from the input it was made of. */
 export const freezeValue = <T>(value: T): T =>
   value === undefined ? value : parseCanonicalJson(canonicalJson(value)) as unknown as T;
 
@@ -101,8 +110,7 @@ function assertEvidenceAgainstVerified(
 ): void {
   streamRows<{ rel_path: string; evidence_cjson: string }>(
     db, `SELECT rel_path,evidence_cjson FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`, [], (row) => {
-      const evidence = parseCanonicalJson(row.evidence_cjson) as unknown as TransitionEvidenceBindings;
-      const named = evidence?.sourceStages ?? [];
+      const named = decodeTransitionEvidence(row.evidence_cjson).sourceStages;
       if (verified.size > 0 && named.length === 0) {
         throw new StageChangedError(row.rel_path, "transition row names no verified source stage");
       }
@@ -191,7 +199,7 @@ export function applyTransitions(db: Database, lineageId: string): void {
       streamRows<{ rel_path: string; expected_repo_gen: number; record_cjson: string; base_proof_cjson: string | null }>(
         db, `SELECT rel_path,expected_repo_gen,record_cjson,base_proof_cjson
         FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`, [], (row) => {
-          const candidate = parseCanonicalJson(row.record_cjson) as unknown as RepoRecordInput;
+          const candidate = decodeTransitionRecord(row.record_cjson);
           const before = previous.get(lineageId, row.rel_path) as {
             base_cjson: string | null; branch_base_origins_cjson: string | null;
           } | null;
@@ -205,6 +213,33 @@ export function applyTransitions(db: Database, lineageId: string): void {
         });
     });
   });
+}
+
+/**
+ * The persisted `branch_base_origins_cjson` column: a record's own branch
+ * provenance, re-established as the v1 union `composeRepoBase` decides against.
+ * The parsed object itself is returned, so members this rule cannot see ride
+ * along into the recomposed record exactly as they were stored.
+ */
+const isText = (value: JsonValue | undefined): value is string => typeof value === "string";
+
+function assertBranchBaseOrigins(value: JsonValue): asserts value is JsonValue & Record<string, BranchBaseOrigin> {
+  if (!isJsonObject(value)) throw new TypeError("branchBaseOrigins is not a JSON object");
+  for (const [ref, origin] of Object.entries(value)) {
+    if (!isJsonObject(origin) || origin.v !== 1 || !isText(origin.oid) || !isText(origin.lineageHash)) {
+      throw new TypeError(`branchBaseOrigins.${ref} is not a v1 branch origin`);
+    }
+    const named = origin.kind === "publisher-ack"
+      ? Number.isSafeInteger(origin.sourceSeq) && isText(origin.incomingKey)
+      : (origin.kind === "pull-p" || origin.kind === "manual") && isText(origin.episode);
+    if (!named) throw new TypeError(`branchBaseOrigins.${ref} has no known origin kind`);
+  }
+}
+
+function decodeBranchBaseOrigins(text: string): Record<string, BranchBaseOrigin> {
+  const value = parseCanonicalJson(text);
+  assertBranchBaseOrigins(value);
+  return value;
 }
 
 /** Step 2. A record that asks for BASE without an explicit proof never reaches an
@@ -230,7 +265,7 @@ function recomposeBase(
       ? {}
       : {
         branchBaseOrigins: decodeAuthorityRow("repoRecord", relPath,
-          () => parseCanonicalJson(before.branch_base_origins_cjson!) as unknown as Record<string, BranchBaseOrigin>),
+          () => decodeBranchBaseOrigins(before.branch_base_origins_cjson!)),
       }),
   };
   if (baseProofCjson === null) {
@@ -249,7 +284,7 @@ function recomposeBase(
     }
     return candidate;
   }
-  const proof = parseCanonicalJson(baseProofCjson) as unknown as RepoBaseProof;
+  const proof = decodeTransitionBaseProof(baseProofCjson);
   const composed = composeRepoBase(
     previous,
     { base: candidate.base, branchBaseOrigins: candidate.branchBaseOrigins },
