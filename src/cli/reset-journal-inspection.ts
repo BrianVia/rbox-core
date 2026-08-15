@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue } from "../json.js";
@@ -21,7 +22,7 @@ import type {
 import type { SqliteResetInspection } from "./state-plane/reset/recovery.js";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
-import { boundedHash, boundedJsonRead, retryOnIdentityRace } from "./reset-io.js";
+import { boundedHash, boundedJsonRead, ResetCorruptionError, retryOnIdentityRace } from "./reset-io.js";
 import { observeResetRefs } from "./reset-z-runtime.js";
 import {
   assertProtocolLockHeld,
@@ -142,15 +143,18 @@ export function resetFenceRequests(standing: StandingResetInspection): Repositor
 }
 
 /** Every ordinary state load observes this fence, so it runs unlocked against a
- * workspace whose writers republish state.json by atomic rename. The retry makes
- * the whole tuple — stat AND control hash — describe one settled file. */
+ * workspace whose writers republish state.json by atomic rename. The tuple must
+ * describe ONE settled file: `boundedHash` guards only its own read, so a rename
+ * completing between the outer lstat and that read would pair old metadata with
+ * a new hash without either noticing. Re-stating afterwards turns that window
+ * into an identity race the retry re-runs from the top. */
 async function artifactIdentity(root: string, file: string): Promise<readonly unknown[]> {
   return retryOnIdentityRace(async () => {
     try {
       const s = await fs.lstat(file, { bigint: true });
-      const controlHash = file === statePath(root) || file === sqliteResetPaths.journal(root)
-        ? await boundedHash(file, 512 * 1024)
-        : undefined;
+      const hashed = file === statePath(root) || file === sqliteResetPaths.journal(root);
+      const controlHash = hashed ? await boundedHash(file, 512 * 1024) : undefined;
+      if (hashed) await assertUnmovedSince(file, s);
       return [
         s.isFile(), s.isSymbolicLink(), s.size.toString(), s.mtimeNs.toString(),
         s.dev.toString(), s.ino.toString(), controlHash,
@@ -160,6 +164,24 @@ async function artifactIdentity(root: string, file: string): Promise<readonly un
       throw error;
     }
   });
+}
+
+/** Fail as an identity race — never as ENOENT — when the hashed artifact moved
+ * under the tuple; the retry's next attempt settles a vanished file to "absent". */
+async function assertUnmovedSince(file: string, before: BigIntStats): Promise<void> {
+  let after: BigIntStats;
+  try {
+    after = await fs.lstat(file, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new ResetCorruptionError(`reset file changed while reading ${file}`, { kind: "identity-race" });
+    }
+    throw error;
+  }
+  if (after.dev !== before.dev || after.ino !== before.ino
+    || after.size !== before.size || after.mtimeNs !== before.mtimeNs) {
+    throw new ResetCorruptionError(`reset file changed while reading ${file}`, { kind: "identity-race" });
+  }
 }
 
 export async function createResetFenceObservation(

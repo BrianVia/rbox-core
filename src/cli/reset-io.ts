@@ -201,8 +201,10 @@ export async function boundedStream(
 }
 
 /** An atomically republished file is a settled writer, not corruption: the next
- * attempt reads the successor whole. Every unlocked reader of a live artifact
- * shares this one retry policy; exhausting it still surfaces the race. */
+ * attempt reads the successor whole. Exhausting the budget still surfaces the
+ * race. Scope is deliberately narrow — `boundedRead` and the ordinary-load reset
+ * fence only. Standing-reset inspection keeps reading without this retry: on the
+ * destructive plane, an artifact republished mid-inspection must fail closed. */
 export async function retryOnIdentityRace<T>(attempt: () => Promise<T>, retries = 2): Promise<T> {
   if (!Number.isSafeInteger(retries) || retries < 0 || retries > 8) throw new RangeError("bounded read retry count is invalid");
   for (let tries = 0;; tries++) {
