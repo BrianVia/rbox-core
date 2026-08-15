@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import type { JsonObject, JsonValue } from "../../../src/json.js";
 import { json, logErr } from "./util.js";
 import { PLAN_MONTHLY_CENTS } from "./plans.js";
 import { dbFor, dirDb } from "./db.js";
@@ -47,8 +48,13 @@ function b64urlToBytes(s: string): Uint8Array {
 }
 const b64urlToStr = (s: string): string => new TextDecoder().decode(b64urlToBytes(s));
 
+/** A JWKS entry that survived normalization: parsed JSON that carries a string `kid`
+ *  and is handed to WebCrypto verbatim as a JWK. `importKey` is the only component that
+ *  interprets the remaining members, so nothing here re-parses a key it never inspects. */
+export type SigningKey = JsonObject & JsonWebKey & { kid: string };
+
 interface JwksCache {
-  keys: JsonWebKey[];
+  keys: SigningKey[];
   fetchedAt: number;
 }
 let jwksCache: JwksCache | null = null;
@@ -61,9 +67,9 @@ const JWKS_REFETCH_MIN_MS = 30 * 1000; // throttle forced (unknown-kid) refetche
  *  ENTRY (e.g. `{"keys":[null]}`) is dropped — so a bad JWKS shape can never reach the
  *  `.find` predicate's `k.kid` deref and throw a 500; it just yields no matching signing
  *  key → 401. Exported for direct testing. */
-export function normalizeJwks(keys: unknown): JsonWebKey[] {
+export function normalizeJwks(keys: JsonValue | undefined): SigningKey[] {
   if (!Array.isArray(keys)) return [];
-  return keys.filter((k): k is JsonWebKey => !!k && typeof k === "object" && typeof (k as { kid?: unknown }).kid === "string");
+  return keys.filter((k): k is SigningKey => !!k && typeof k === "object" && !Array.isArray(k) && typeof k.kid === "string");
 }
 
 /** Whether a cached JWKS may still be served: only while WITHIN its TTL. Past TTL it's
@@ -85,11 +91,11 @@ export function isJwksFresh(cache: JwksCache | null, now: number, ttlMs: number)
  * malformed JWKS body can't throw. An unknown kid triggers AT MOST one throttled refetch.
  * `now` is injected so the TTL logic is deterministic (defaults to Date.now()).
  */
-async function accessJwks(env: Env, force = false, now: number = Date.now()): Promise<JsonWebKey[]> {
+async function accessJwks(env: Env, force = false, now: number = Date.now()): Promise<SigningKey[]> {
   // Hermetic override (tests / pinned keys): use the provided JWKS verbatim (normalized).
   if (env.CF_ACCESS_JWKS) {
     try {
-      return normalizeJwks((JSON.parse(env.CF_ACCESS_JWKS) as { keys?: unknown }).keys);
+      return normalizeJwks((JSON.parse(env.CF_ACCESS_JWKS) as { keys?: JsonValue }).keys);
     } catch {
       return [];
     }
@@ -105,7 +111,7 @@ async function accessJwks(env: Env, force = false, now: number = Date.now()): Pr
     const res = await fetch(url, { cf: { cacheTtl: 3600 } } as RequestInit);
     // Fail closed: serve the cache ONLY if still within TTL, else no keys (→ 401).
     if (!res.ok) return fresh ? jwksCache!.keys : [];
-    const body = (await res.json()) as { keys?: unknown };
+    const body = (await res.json()) as { keys?: JsonValue };
     jwksCache = { keys: normalizeJwks(body.keys), fetchedAt: now };
     return jwksCache.keys;
   } catch {
@@ -147,8 +153,8 @@ export async function verifyAccessJwt(env: Env, token: string, nowS: number): Pr
   // Signature: match kid exactly (one forced refetch on miss), verify over raw segments.
   // `nowS*1000` drives the JWKS TTL so a stale cache is never served on a refetch failure.
   const nowMs = nowS * 1000;
-  let key = (await accessJwks(env, false, nowMs)).find((k) => (k as { kid?: string }).kid === header.kid);
-  if (!key) key = (await accessJwks(env, true, nowMs)).find((k) => (k as { kid?: string }).kid === header.kid);
+  let key = (await accessJwks(env, false, nowMs)).find((k) => k.kid === header.kid);
+  if (!key) key = (await accessJwks(env, true, nowMs)).find((k) => k.kid === header.kid);
   if (!key) return null;
   try {
     const cryptoKey = await crypto.subtle.importKey("jwk", key, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
@@ -357,7 +363,7 @@ export interface ServerMetrics {
 
 /** AE returns UInt64 counts as JSON strings and quantiles as numbers; coerce either to a
  *  finite number (NaN/undefined → 0) so the payload is always clean numerics. */
-function num(v: unknown): number {
+function num(v: AeSqlValue | undefined): number {
   const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
   return Number.isFinite(n) ? n : 0;
 }

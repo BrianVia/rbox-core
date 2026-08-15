@@ -47,7 +47,7 @@ test("multipart COMPLETE retry_later removes its token and does not probe or re-
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   let initCalls = 0;
   let missingCalls = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url) => {
+  ctx.fetch = async (url) => {
     if (url.endsWith("/multipart")) {
       initCalls++;
       return new Response(JSON.stringify({ uploadId: "up1", partSize: 4 }), { status: 200 });
@@ -55,7 +55,7 @@ test("multipart COMPLETE retry_later removes its token and does not probe or re-
     if (url.endsWith("/complete")) return retryLater();
     throw new Error(`unexpected request ${url}`);
   };
-  (ctx as unknown as { missingBlobs: RemoteContext["missingBlobs"] }).missingBlobs = async () => {
+  ctx.missingBlobs = async () => {
     missingCalls++;
     return [sha];
   };

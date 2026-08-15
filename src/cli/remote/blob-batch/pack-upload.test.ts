@@ -11,6 +11,7 @@ import {
   PACK_TARGET_PAYLOAD_BYTES,
   parsePack,
 } from "../../../engine/blob-pack.js";
+import type { JsonValue } from "../../../json.js";
 import { RemoteContext } from "../context.js";
 import { BlobRetryLaterError } from "../errors.js";
 import { getPackUploadTiming, resetPackUploadTimingForTests } from "../../upload-lane-timing.js";
@@ -31,6 +32,7 @@ const savedEnv = new Map<string, string | undefined>();
 const originalFetch = globalThis.fetch;
 let tmpDir = "";
 let uploaders: BlobBatchUploader[] = [];
+const uploaderContexts = new WeakMap<BlobBatchUploader, RemoteContext>();
 let packCalls: CapturedCall[] = [];
 let batchCalls = 0;
 let singleCalls = 0;
@@ -251,14 +253,22 @@ describe("client pack writer", () => {
     const arbiter = new UploadSlotArbiter(1);
     const uploader = makeUploader("token", arbiter);
     let batchTimer: (() => void) | undefined;
+    // A real timer, cancelled the moment it is minted, supplies a genuine handle identity;
+    // the callback only ever runs when this test fires it by hand.
+    let batchHandle: ReturnType<typeof setTimeout> | undefined;
     setUploaderClockForTests({
       now: () => 0,
       setTimeout: (fn) => {
         batchTimer = fn;
-        return fn as unknown as ReturnType<typeof setTimeout>;
+        batchHandle = globalThis.setTimeout(() => {}, 0);
+        globalThis.clearTimeout(batchHandle);
+        return batchHandle;
       },
       clearTimeout: (handle) => {
-        if (handle === batchTimer as unknown as ReturnType<typeof setTimeout>) batchTimer = undefined;
+        if (handle === batchHandle) {
+          batchTimer = undefined;
+          batchHandle = undefined;
+        }
       },
     });
     let releasePack!: () => void;
@@ -286,6 +296,7 @@ describe("client pack writer", () => {
       expect(batchTimer).toBeDefined();
       const fireBatchTimer = batchTimer!;
       batchTimer = undefined;
+      batchHandle = undefined;
       fireBatchTimer();
       expect(batchCalls).toBe(0);
       releasePack();
@@ -717,13 +728,17 @@ function configureCorpus(): void {
 }
 
 function makeUploader(token = "token", arbiter?: UploadSlotArbiter): BlobBatchUploader {
-  const uploader = new BlobBatchUploader(new RemoteContext("https://example.test", token, "ws", "project"), arbiter);
+  const ctx = new RemoteContext("https://example.test", token, "ws", "project");
+  const uploader = new BlobBatchUploader(ctx, arbiter);
   uploaders.push(uploader);
+  uploaderContexts.set(uploader, ctx);
   return uploader;
 }
 
 function contextOf(uploader: BlobBatchUploader): RemoteContext {
-  return (uploader as unknown as { ctx: RemoteContext }).ctx;
+  const ctx = uploaderContexts.get(uploader);
+  if (!ctx) throw new Error("contextOf: uploader was not built by makeUploader");
+  return ctx;
 }
 
 async function defaultHandler(url: string, init: RequestInit, body: Uint8Array): Promise<Response> {
@@ -763,7 +778,7 @@ async function readBody(body: BodyInit | null | undefined): Promise<Uint8Array> 
   return new Uint8Array(await new Response(body).arrayBuffer());
 }
 
-function json(status: number, value: unknown): Response {
+function json(status: number, value: JsonValue): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 

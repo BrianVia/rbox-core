@@ -6,6 +6,7 @@ import type { RemoteContext } from "./context.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
 import { timePushTailRequest } from "../push-spans.js";
 import { errorCode, NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
+import type { JsonValue } from "../../json.js";
 import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
@@ -96,7 +97,7 @@ export interface ServerTimings {
 
 const SERVER_TIMING_KEYS = ["totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs"] as const;
 
-function readServerTimings(value: unknown): ServerTimings | undefined {
+function readServerTimings(value: JsonValue | undefined): ServerTimings | undefined {
   return readNumericFields(value, SERVER_TIMING_KEYS);
 }
 
@@ -344,7 +345,7 @@ export async function commitSigned(
     body: requestBody,
   }, { op: "publishing your changes" }));
   if (r.status === 409) {
-    const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number; serverTimings?: unknown };
+    const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number; serverTimings?: JsonValue };
     const serverTimings = readServerTimings(b.serverTimings);
     if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0, ...(serverTimings ? { serverTimings } : {}) };
     return { conflict: true, head: b.head, ...(serverTimings ? { serverTimings } : {}) };
@@ -373,7 +374,7 @@ export async function commitSigned(
     if (quota) throw quota;
     throw new Error(translateRemoteError(r.status, "commit failed", text, "workspace not found — check you're in the right directory"));
   }
-  const body = (await r.json()) as { sequence: number; serverTimings?: unknown };
+  const body = (await r.json()) as { sequence: number; serverTimings?: JsonValue };
   const seq = body.sequence;
   const serverTimings = readServerTimings(body.serverTimings);
   ctx.receipts.clear(); // published → receipts consumed

@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
+import type { JsonValue } from "../../json.js";
 import type { RemoteContext } from "./context.js";
 import { BlobRetryLaterError, BlobShaMismatchError, QuotaExceededError, isRetryLater, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
@@ -200,14 +201,14 @@ async function multipartAttempt(
 
 const SERVER_TIMINGS_READ_MS = 10_000;
 
-async function readBodyBounded(res: Response): Promise<{ serverTimings?: unknown }> {
+async function readBodyBounded(res: Response): Promise<{ serverTimings?: JsonValue }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const gaveUp = new Promise<Record<string, never>>((resolve) => {
     timer = setTimeout(() => resolve({}), SERVER_TIMINGS_READ_MS);
     timer.unref?.();
   });
   try {
-    return (await Promise.race([res.json().catch(() => ({})), gaveUp])) as { serverTimings?: unknown };
+    return (await Promise.race([res.json().catch(() => ({})), gaveUp])) as { serverTimings?: JsonValue };
   } finally {
     clearTimeout(timer);
   }
