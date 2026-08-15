@@ -1,4 +1,4 @@
-import type { GitSection, Manifest } from "../../../engine/index.js";
+import type { Manifest } from "../../../engine/index.js";
 import {
   stateFromRepoRecords,
   stripObsoleteResolutionIntents,
@@ -14,8 +14,8 @@ import type {
 import { openReadSnapshot } from "../store/read-snapshot.js";
 import type { StateStoreHandle } from "../store/open.js";
 
-function collectGit(snapshot: ReadSnapshot, role: "meta-wire" | "manifest-projection"): Record<string, GitSection> {
-  const result: Record<string, GitSection> = {};
+function collectGit(snapshot: ReadSnapshot, role: "meta-wire" | "manifest-projection"): GlobalManifestMeta["gitRepos"] {
+  const result: GlobalManifestMeta["gitRepos"] = {};
   let after: string | undefined;
   for (;;) {
     const page = role === "meta-wire"
@@ -69,6 +69,13 @@ function manifestMeta(snapshot: ReadSnapshot): GlobalManifestMeta | undefined {
   } as GlobalManifestMeta;
 }
 
+/** Drop the members a projection left explicitly `undefined`. An optional member
+ * that is absent and one that is present-but-undefined are the same value to
+ * this type, so the record's own type survives the filter. */
+function withoutUndefinedMembers<T extends object>(record: T): T {
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)) as T;
+}
+
 export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
   const guard = openReadSnapshot(store);
   const token = guard.token;
@@ -93,12 +100,8 @@ export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
     repoRecords: records,
   };
   const normalized = stripObsoleteResolutionIntents(stateFromRepoRecords(base, records));
-  const cleanManifest = Object.fromEntries(
-    Object.entries(normalized.lastSyncedManifest).filter(([, value]) => value !== undefined),
-  ) as unknown as Manifest;
-  const cleanState = Object.fromEntries(
-    Object.entries({ ...normalized, lastSyncedManifest: cleanManifest }).filter(([, value]) => value !== undefined),
-  ) as unknown as SyncState;
+  const cleanManifest = withoutUndefinedMembers<Manifest>(normalized.lastSyncedManifest);
+  const cleanState = withoutUndefinedMembers<SyncState>({ ...normalized, lastSyncedManifest: cleanManifest });
   const result = token.manifestGitReposPresent && cleanState.lastSyncedManifest.gitRepos === undefined
     ? { ...cleanState, lastSyncedManifest: { ...cleanState.lastSyncedManifest, gitRepos: {} } }
     : cleanState;

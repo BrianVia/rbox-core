@@ -6,6 +6,7 @@
  * column. The verified sealed header is part of the ref, which is what makes it
  * the header that later commits to authority. */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
+import type { JsonObject, JsonValue } from "../../../json.js";
 import { decodeFileEntry, encodeFileEntry, type EncodedFileEntry } from "../codecs/file-entry.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
@@ -74,7 +75,7 @@ function deriveStageRef(
   if (meta.stage_id !== stageId || meta.state !== "sealed") {
     throw new StageChangedError(stageId, "sealed stage identity does not match its ref");
   }
-  const header = parseCanonicalJson(meta.header_cjson) as unknown as ManifestHeader;
+  const header = decodeSealedHeader(stageId, meta.header_cjson);
   const digest = new StageDigestBuilder(meta.stage_id, meta.plane, header);
   streamRows<{ entry_cjson: string }>(
     accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
@@ -87,9 +88,61 @@ function deriveStageRef(
       WHERE stage_id=? ORDER BY role,path_order`,
     [stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
   const counts = digest.counts;
-  const logicalDigest = digest.seal(parseCanonicalJson(meta.counts_cjson) as unknown as StageCounts);
+  const logicalDigest = digest.seal(decodeSealedCounts(stageId, meta.counts_cjson));
   if (meta.digest !== logicalDigest) throw new StageChangedError(stageId, "sealed stage digest column is stale");
   return { stageId, plane: meta.plane, header, logicalDigest, physicalSha256, bytes, counts };
+}
+
+/** The one container test every persisted-bytes decode in this seam shares. */
+function jsonObject(value: JsonValue): JsonObject | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+
+/**
+ * The persisted spelling of a sealed stage's own metadata. `stage-semantic-v1`
+ * already binds these exact bytes, so `stage_meta` that no longer decodes to the
+ * required members of its type is a mutated sealed stage — the same class as
+ * every other verification failure here. The parsed value itself is returned, so
+ * members these rules cannot see ride along exactly as they were sealed.
+ */
+function isManifestHeader(value: JsonValue): value is JsonObject & ManifestHeader {
+  const object = jsonObject(value);
+  return object !== undefined
+    && typeof object.generatedAt === "string" && typeof object.complete === "boolean";
+}
+
+function decodeSealedHeader(stageId: string, text: string): ManifestHeader {
+  const value = parseCanonicalJson(text);
+  if (!isManifestHeader(value)) {
+    throw new StageChangedError(stageId, "sealed stage header is not a manifest header");
+  }
+  return value;
+}
+
+function isStageCounts(value: JsonValue): value is JsonObject & StageCounts {
+  const object = jsonObject(value);
+  return object !== undefined
+    && typeof object.files === "number" && typeof object.gitSections === "number";
+}
+
+function decodeSealedCounts(stageId: string, text: string): StageCounts {
+  const value = parseCanonicalJson(text);
+  if (!isStageCounts(value)) {
+    throw new StageChangedError(stageId, "sealed stage counts are not stage counts");
+  }
+  return value;
+}
+
+/** A stage entry's persisted canonical bytes. `encodeFileEntry`'s admission is
+ * the validator; only the JSON object container is re-established here. */
+function isFileEntry(value: JsonValue): value is JsonObject & FileEntry {
+  return jsonObject(value) !== undefined;
+}
+
+function decodeStageEntryBytes(text: string): FileEntry {
+  const value = parseCanonicalJson(text);
+  if (!isFileEntry(value)) throw new TypeError("stage entry is not a JSON object");
+  return value;
 }
 
 /**
@@ -179,7 +232,7 @@ class SqliteSealedStage implements SealedStageReader {
       [this.ref.stageId, after, batchSize], visit),
       batchSize,
       (row) => {
-        encoded = encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry);
+        encoded = encodeFileEntry(decodeStageEntryBytes(row.entry_cjson));
         return encoded.retainedEstimate;
       },
       () => decodeStageEntry(encoded!),

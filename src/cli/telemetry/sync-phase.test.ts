@@ -70,7 +70,7 @@ test("sync_phase always emits strict tail outliers and projects path-free git ag
   const sampler = new SyncPhaseSampler();
   const samples: TelemetrySample[] = [];
   const report = PhaseReport.pull();
-  (report as unknown as { startedAt: number }).startedAt = Date.now() - 20_001;
+  Reflect.set(report, "startedAt", Date.now() - 20_001);
   report.recordDetails("git-apply", { gitApply: {
     repoTimings: [{ relPath: "/private/repo", wallMs: 31 }, { wallMs: 47 }],
     results: { skipped: 3 },
@@ -90,10 +90,10 @@ test("sync_phase uses strict per-op thresholds and emits once when cadence and o
     const exactSampler = new SyncPhaseSampler();
     const exact: TelemetrySample[] = [];
     const pull = PhaseReport.pull();
-    (pull as unknown as { startedAt: number }).startedAt = 80_000;
+    Reflect.set(pull, "startedAt", 80_000);
     exactSampler.recordCompleted(pull, "pull", { record: (sample) => exact.push(sample) });
     const push = PhaseReport.push();
-    (push as unknown as { startedAt: number }).startedAt = 85_000;
+    Reflect.set(push, "startedAt", 85_000);
     exactSampler.recordCompleted(push, "push", { record: (sample) => exact.push(sample) });
     expect(exact).toEqual([]);
 
@@ -101,7 +101,7 @@ test("sync_phase uses strict per-op thresholds and emits once when cadence and o
     const samples: TelemetrySample[] = [];
     for (let i = 0; i < 7; i++) sampler.recordCompleted(PhaseReport.push(), "push", { record: (sample) => samples.push(sample) });
     const outlier = PhaseReport.push();
-    (outlier as unknown as { startedAt: number }).startedAt = 84_999;
+    Reflect.set(outlier, "startedAt", 84_999);
     sampler.recordCompleted(outlier, "push", { record: (sample) => samples.push(sample) });
     expect(samples).toHaveLength(1);
     expect(samples[0]).toMatchObject({ kind: "sync_phase", op: "push", wallMs: 15_001 });
