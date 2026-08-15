@@ -181,7 +181,11 @@ async function pendingOpStateOids(ctx: RepoCtx, pending: GitSection, store: GitA
   }
 }
 
-function exactLane(lane: string, pending: unknown, candidate: unknown, incomingOids?: string[]): ResolutionLaneReport {
+/** What one exact lane compares: the projection each side canonicalizes — an oid
+ * or hash, an op-state map, or the index lane's projected value. */
+type ExactLaneValue = string | Record<string, string> | { kind: string; value?: string };
+
+function exactLane(lane: string, pending: ExactLaneValue | undefined, candidate: ExactLaneValue | undefined, incomingOids?: string[]): ResolutionLaneReport {
   const pendingCanonical = canonicalString(pending === undefined ? null : pending);
   const candidateCanonical = canonicalString(candidate === undefined ? null : candidate);
   const equal = pendingCanonical === candidateCanonical;

@@ -30,7 +30,7 @@ beforeEach(() => {
   delete process.env.RBOX_PREFLIGHT_FULL;
 });
 
-class PipelineRemote {
+class PipelineRemote implements SyncRemote {
   readonly blobs = new Map<string, Buffer>();
   readonly puts: string[] = [];
   readonly checks: string[][] = [];
@@ -61,6 +61,11 @@ class PipelineRemote {
     return result;
   } }; }
   async closeUploader(): Promise<void> { await this.closeHook?.(); }
+  /** Never reached: the publish pipeline only uploads. Present so the double
+   * IS a `SyncRemote` instead of being asserted into one. */
+  latest(): never { throw new Error("PipelineRemote: latest is not part of the publish path"); }
+  commit(): never { throw new Error("PipelineRemote: commit is not part of the publish path"); }
+  blobStore(): never { throw new Error("PipelineRemote: blobStore is not part of the publish path"); }
 }
 
 async function fixture(count: number, duplicate = false) {
@@ -104,7 +109,7 @@ async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemo
   const cache = options.cache ?? new EncryptAddressCache({ accountId: "a", workspaceId: "w", accountEpoch: 1, keyEpoch: 1 });
   const toEncrypt = options.toEncrypt ?? fx.local.files;
   return runPublishPipeline({
-    api: remote as unknown as SyncRemote,
+    api: remote,
     root: fx.root,
     kek: generateKek(),
     tmpDir: fx.tmpDir,
@@ -178,7 +183,7 @@ test("publish pipeline releases duplicate and server-satisfied ciphertext temps"
     const toEncrypt: FileEntry[] = [];
     const cache = new EncryptAddressCache({ accountId: "a", workspaceId: "w", accountEpoch: 1, keyEpoch: 1 });
     await runPublishPipeline({
-      api: remote as unknown as SyncRemote, root: satisfiedFx.root, kek: generateKek(), tmpDir: satisfiedFx.tmpDir,
+      api: remote, root: satisfiedFx.root, kek: generateKek(), tmpDir: satisfiedFx.tmpDir,
       toEncrypt, local: satisfiedFx.local, entries: trackEntries(satisfiedFx.local.files, toEncrypt), encryptCache: cache,
       cacheWriter: new EncryptAddressCacheWriter(satisfiedFx.root, cache), encryptOpts: { compress: false },
       encryptFileToTemp, report: PhaseReport.disabled(), backoff: async () => {}, pool: undefined,
@@ -345,7 +350,7 @@ test("encryptAndUpload routes flag-off and small pushes to legacy, large pushes 
         sawRunTemp ||= entries.some((entry) => entry.startsWith("enc-"));
       };
       await withEnv({ RBOX_PUBLISH_PIPELINE: flag, RBOX_CRYPTO_FUSE: "0" }, async () => {
-        await encryptAndUpload(remote as unknown as SyncRemote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {});
+        await encryptAndUpload(remote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {});
       });
       if (pipeline) expect(remote.checks.length).toBeGreaterThanOrEqual(1);
       else expect(remote.checks.length).toBe(1);
@@ -374,7 +379,7 @@ test("pipeline preflight defaults to introduced-only and =0 restores the carried
         RBOX_PREFLIGHT_DELTA: deltaFlag,
       }, async () => {
         await encryptAndUpload(
-          remote as unknown as SyncRemote,
+          remote,
           fx.root,
           configFor(fx.root, generateKek()),
           fx.local,
@@ -483,7 +488,7 @@ test("pipeline run reclaims repeated-kill temp directories", async () => {
     const remote = new PipelineRemote();
     remote.checkHook = async () => { during = (await fs.readdir(parent)).filter((name) => name.startsWith("enc-")).length; };
     await withEnv({ RBOX_PUBLISH_PIPELINE: "1", RBOX_CRYPTO_FUSE: "0" }, async () => {
-      await encryptAndUpload(remote as unknown as SyncRemote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {});
+      await encryptAndUpload(remote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {});
     });
     expect(during).toBe(1);
     expect((await fs.readdir(parent)).filter((name) => name.startsWith("enc-"))).toEqual([]);

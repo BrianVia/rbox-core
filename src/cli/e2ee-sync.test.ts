@@ -17,7 +17,7 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitSectionBlobRefs } from "./sync-git/git-state.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
@@ -1297,7 +1297,11 @@ async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T
   }
 }
 
-function hasKeyDeep(value: unknown, keys: ReadonlySet<string>): boolean {
+/** What this walker actually sees: the manifest's entry list, one entry, or one
+ * of an entry's own member values. */
+type FileEntryMember = readonly FileEntry[] | FileEntry | FileEntry[keyof FileEntry];
+
+function hasKeyDeep(value: FileEntryMember, keys: ReadonlySet<string>): boolean {
   if (Array.isArray(value)) return value.some((v) => hasKeyDeep(v, keys));
   if (value === null || typeof value !== "object") return false;
   for (const [key, child] of Object.entries(value)) {
@@ -1698,7 +1702,7 @@ test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapsh
     server.store.getCalls = [];
     const error = await peer
       .latest({ fastFoldBase: { manifest: m3, meta: third.manifestMeta! } })
-      .then(() => { throw new Error("expected chain failure"); }, (e: unknown) => e);
+      .then(() => { throw new Error("expected chain failure"); }, (e: Error) => e);
     expect(error).toBeInstanceOf(ManifestChainError);
     // The cold walk ran (chain blobs fetched) — the fast path did not accept.
     expect(server.store.getCalls).toContain(substitute.encManifestSha);
@@ -1945,7 +1949,7 @@ test("204/6 the contradictory kill-switch pair warns exactly once per process", 
   resetMdeWritePolicyWarnOnceForTests();
   const written: string[] = [];
   const original = process.stderr.write.bind(process.stderr);
-  process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
     written.push(String(chunk));
     return (original as (...args: never[]) => boolean)(...([chunk, ...rest] as never[]));
   }) as typeof process.stderr.write;

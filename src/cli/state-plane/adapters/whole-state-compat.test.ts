@@ -79,10 +79,13 @@ function packet(overrides: Partial<StateSavePacket> = {}): StateSavePacket {
   };
 }
 
-/** Every byte under the state directory, sidecars included. */
-function snapshot(root: string): Record<string, string> {
+/** Every byte under the state directory, sidecars included: entry name → its
+ * base64 bytes, or `<dir>`. */
+type StateDirectoryBytes = Record<string, string>;
+
+function snapshot(root: string): StateDirectoryBytes {
   const dir = sqliteResetPaths.stateRoot(root);
-  const out: Record<string, string> = {};
+  const out: StateDirectoryBytes = {};
   for (const name of fs.readdirSync(dir).sort()) {
     const entry = path.join(dir, name);
     out[name] = fs.statSync(entry).isDirectory() ? "<dir>" : fs.readFileSync(entry).toString("base64");
@@ -148,7 +151,7 @@ test("a standing SQLite reset is recovered by the read, not reported as corrupti
   // Gating this recovery on the LEGACY journal decoder threw
   // `ResetCorruptionError` here: a `Q` workspace's journal is `sqlite/v1`, the
   // one format that decoder refuses. The read must recover instead.
-  const outcome = await loadState(root, STREAM).catch((error: unknown) => error);
+  const outcome = await loadState(root, STREAM).catch((error: Error) => error);
   expect(outcome, String(outcome)).toBeInstanceOf(StreamMismatchError); // the reset rebound the stream
   expect(fs.existsSync(sqliteResetPaths.journal(root))).toBe(false);
   expect((await loadState(root, "next")).stream).toBe("next");
@@ -221,7 +224,7 @@ test("an unretired genesis intent refuses the save before anything opens the dat
     version: 1, authorityId: "e".repeat(32), lineageId: "f".repeat(32),
     evidence: { root, stream: STREAM, incarnation: "absent" }, staging: { dev: 1, ino: 2 },
   }));
-  const refusal = await applyStateSavePacket(root, packet()).catch((error: unknown) => error);
+  const refusal = await applyStateSavePacket(root, packet()).catch((error: Error) => error);
   expect(refusal).toBeInstanceOf(StateWriteRefusedError);
   expect((refusal as StateWriteRefusedError).reason).toBe("authority-recovery-pending");
   // Byte-identical apart from the intent this test planted: no `-wal`, no
@@ -342,7 +345,7 @@ test("a marker with no database at all refuses and repairs nothing", async () =>
  * reach zero by U4f. The table is exact so a new reader cannot arrive quietly;
  * shrink an entry and update it in the same change.
  */
-const LOAD_STATE_SITES: Readonly<Record<string, number>> = {
+const LOAD_STATE_SITES = {
   "cli/chain-repair.ts": 3,
   "cli/daemon/daemon.ts": 2,
   "cli/doctor-cmd.ts": 4,
@@ -357,7 +360,7 @@ const LOAD_STATE_SITES: Readonly<Record<string, number>> = {
   "cli/sync/pull.ts": 6,
   "cli/sync/push.ts": 6,
   "cli/track-cmd.ts": 2,
-};
+} satisfies Readonly<Record<string, number>>;
 
 /** The adapter and the two facades that only re-export it. */
 const LOAD_STATE_SEAM = new Set([
