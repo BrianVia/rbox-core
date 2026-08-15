@@ -321,7 +321,7 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
         deviceId: "dev_1",
       },
       checks,
-      workspaceShape: { fileCount: 2, totalBytes: 99 },
+      workspaceSize: { fileCount: 2, totalBytes: 99 },
       observation: await observeWorkspace(root, { depth: "local" }),
       ...emptyWorktrees,
     };
@@ -345,7 +345,7 @@ test("diagnostics emits no sidecar bytes when local observation denies attributi
       root,
       cfg,
       checks,
-      workspaceShape: { fileCount: 0, totalBytes: 0 },
+      workspaceSize: { fileCount: 0, totalBytes: 0 },
       observation,
       ...emptyWorktrees,
     };
@@ -429,7 +429,7 @@ test("design 200 P2: doctor prints absolute leftover paths but the bundle contai
       root,
       cfg,
       checks,
-      workspaceShape: { fileCount: 1, totalBytes: 4 },
+      workspaceSize: { fileCount: 1, totalBytes: 4 },
       observation: contextObservation(root, "other-workspace"),
       localOnly: { leftoverWorktrees: worktrees.localOnly },
       diagnostics: { leftoverWorktrees: worktrees.diagnostics },
@@ -562,7 +562,7 @@ test("207.7: repo residue is local-only, verdicts are neutral, and quarantine si
       root,
       cfg,
       checks,
-      workspaceShape: { fileCount: 3, totalBytes: 1 },
+      workspaceSize: { fileCount: 3, totalBytes: 1 },
       observation: contextObservation(root, "other-workspace"),
       localOnly,
       diagnostics: {
@@ -610,7 +610,7 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
         deviceId: "dev_1",
       },
       checks: { ...checks, daemon: { ok: false, label: "background sync", message: "stopped", status: "stopped" } },
-      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      workspaceSize: { fileCount: 1, totalBytes: 42 },
       // The REAL observation, reading the real records written above: the
       // exclusion has to come from production authorization, not a fixture.
       observation: await observeWorkspace(root, { depth: "local" }),
@@ -690,7 +690,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
         deviceId: "dev_1",
       },
       checks: { ...checks, daemon: { ok: true, label: "background sync", message: "running", status: "running" } },
-      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      workspaceSize: { fileCount: 1, totalBytes: 42 },
       observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
@@ -724,7 +724,7 @@ test("a byte-truncated Git log record cannot leak a continuation", async () => {
         remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
       },
       checks,
-      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      workspaceSize: { fileCount: 1, totalBytes: 42 },
       observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
@@ -752,7 +752,7 @@ test("diagnostics merges bounded dated and crash channels before redaction", asy
         remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
       },
       checks,
-      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      workspaceSize: { fileCount: 1, totalBytes: 42 },
       observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };
@@ -777,7 +777,7 @@ test("diagnostics retains the bounded tail of an oversized daemon source", async
         remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
       },
       checks,
-      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      workspaceSize: { fileCount: 1, totalBytes: 42 },
       observation: contextObservation(root, "absent"),
       ...emptyWorktrees,
     };

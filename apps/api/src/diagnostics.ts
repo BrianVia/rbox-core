@@ -23,7 +23,7 @@ const CHECK_RESULT_KEYS = ["ok", "label", "message", "hint", "latencyMs", "statu
 const PLATFORM_KEYS = ["os", "arch"] as const;
 const METRICS_KEYS = ["syncs", "commitConflicts409", "fileConflicts", "lockStarved", "lastConflictAt", "excluded", "truncated", "originalBytes"] as const;
 const ACTIVITY_KEYS = ["at", "lastPush", "lastPull", "active", "halt", "excluded", "truncated", "originalBytes"] as const;
-const WORKSPACE_SHAPE_KEYS = ["fileCount", "totalBytes"] as const;
+const WORKSPACE_SIZE_KEYS = ["fileCount", "totalBytes"] as const;
 
 type ValidationResult<T> = { ok: true; value: T } | { ok: false; message: string };
 
@@ -61,7 +61,7 @@ export interface DiagnosticsActivity {
   truncated?: boolean;
   originalBytes?: number;
 }
-export interface DiagnosticsWorkspaceShape { fileCount: number; totalBytes: number }
+export interface DiagnosticsWorkspaceSize { fileCount: number; totalBytes: number }
 export interface DiagnosticsBundle {
   version: string;
   platform: DiagnosticsPlatform;
@@ -70,7 +70,7 @@ export interface DiagnosticsBundle {
   daemonLogTail: string | DiagnosticsExcluded;
   metrics: DiagnosticsMetrics | DiagnosticsExcluded;
   activity: DiagnosticsActivity | DiagnosticsExcluded;
-  workspaceShape: DiagnosticsWorkspaceShape;
+  workspaceShape: DiagnosticsWorkspaceSize;
 }
 
 export interface DiagnosticsDeps {
@@ -83,7 +83,7 @@ export const REAL_DIAGNOSTICS_DEPS: DiagnosticsDeps = {
   deleteReport: (env, key) => env.rbox_dev_blobs.delete(key).then(() => undefined),
 };
 
-function badShape(message: string): Response {
+function invalidBody(message: string): Response {
   return json({ error: "bad_shape", message }, 400);
 }
 
@@ -297,9 +297,9 @@ function validateDaemonLogTail(v: JsonValue): ValidationResult<string | Diagnost
   return { ok: false, message: "daemonLogTail must be a string or excluded object" };
 }
 
-function validateWorkspaceShape(v: JsonValue): ValidationResult<DiagnosticsWorkspaceShape> {
-  if (!objectWithKeys(v, WORKSPACE_SHAPE_KEYS, WORKSPACE_SHAPE_KEYS)) return { ok: false, message: "workspaceShape must be an object" };
-  const unknown = assertOnlyKeys(v, WORKSPACE_SHAPE_KEYS, "workspaceShape") ?? requireKeys(v, WORKSPACE_SHAPE_KEYS, "workspaceShape");
+function validateWorkspaceSize(v: JsonValue): ValidationResult<DiagnosticsWorkspaceSize> {
+  if (!objectWithKeys(v, WORKSPACE_SIZE_KEYS, WORKSPACE_SIZE_KEYS)) return { ok: false, message: "workspaceShape must be an object" };
+  const unknown = assertOnlyKeys(v, WORKSPACE_SIZE_KEYS, "workspaceShape") ?? requireKeys(v, WORKSPACE_SIZE_KEYS, "workspaceShape");
   if (unknown) return { ok: false, message: unknown };
   const fileCount = safeNumber(v.fileCount, "workspaceShape.fileCount");
   if (!fileCount.ok) return fileCount;
@@ -327,8 +327,8 @@ export function validateDiagnosticsBundle(parsed: JsonValue): ValidationResult<D
   if (!metrics.ok) return metrics;
   const activity = validateActivity(parsed.activity);
   if (!activity.ok) return activity;
-  const workspaceShape = validateWorkspaceShape(parsed.workspaceShape);
-  if (!workspaceShape.ok) return workspaceShape;
+  const workspaceSize = validateWorkspaceSize(parsed.workspaceShape);
+  if (!workspaceSize.ok) return workspaceSize;
 
   return {
     ok: true,
@@ -340,7 +340,7 @@ export function validateDiagnosticsBundle(parsed: JsonValue): ValidationResult<D
       daemonLogTail: daemonLogTail.value,
       metrics: metrics.value,
       activity: activity.value,
-      workspaceShape: workspaceShape.value,
+      workspaceShape: workspaceSize.value,
     },
   };
 }
@@ -360,10 +360,10 @@ export async function createDiagnosticsReport(
   try {
     parsed = raw ? JSON.parse(raw) : null;
   } catch {
-    return badShape("body must be valid JSON");
+    return invalidBody("body must be valid JSON");
   }
   const validated = validateDiagnosticsBundle(parsed);
-  if (!validated.ok) return badShape(validated.message);
+  if (!validated.ok) return invalidBody(validated.message);
 
   const reportId = `diag_${crypto.randomUUID().replace(/-/g, "")}`;
   const r2Key = `diagnostics/${p.accountId}/${reportId}.json`;
