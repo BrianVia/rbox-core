@@ -10,7 +10,7 @@ import { recordLaneSettlement } from "../../push-spans.js";
 import { SingleGate, UploadSlotArbiter, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount, packUploadDisabled } from "./gate.js";
 import { uploadBatchConfig, packUploadConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig, type PackConfig } from "./config.js";
 import { BlobPackUploader } from "./pack-uploader.js";
-import { framedBytes, parseBatchPutErrorMax, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
+import { framedBytes, parseBatchPutErrorMax, parseBatchPutResponse, readBatchResponseJson, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
 
 interface UploaderClock {
   now(): number;
@@ -35,6 +35,10 @@ export interface BatchPutWaiter {
   uploadsDir?: string;
   onBytes?: ByteProgressCallback;
   resolve: () => void;
+  /** LEFTOVER (#734): the caller's `Promise` rejection sink. Its widest producer is
+   *  the single-upload `catch` in `dispatchSingleGroup`, where a thrown value is
+   *  `unknown` by construction; narrowing here would fabricate a contract the
+   *  throw site never established. */
   reject: (e: unknown) => void;
 }
 
@@ -45,6 +49,12 @@ interface BatchPutGroup {
   enqueuedAtMs: number;
   policyEnqueuedAtMs: number;
   waiters: BatchPutWaiter[];
+}
+
+/** One dispatchable slice of the queue: the groups it claimed and their framed bytes. */
+interface BatchCarve {
+  groups: BatchPutGroup[];
+  bytes: number;
 }
 
 export class BlobBatchUploader {
@@ -208,7 +218,7 @@ export class BlobBatchUploader {
     this.armFillV2Timer();
   }
 
-  private launch(batch: { groups: BatchPutGroup[]; bytes: number }, reason: UploadDispatchReason): void {
+  private launch(batch: BatchCarve, reason: UploadDispatchReason): void {
     if (batch.groups.length === 0) return;
     if (this.closed) {
       for (const group of batch.groups) this.rejectGroup(group, this.closeError!);
@@ -228,7 +238,7 @@ export class BlobBatchUploader {
     });
   }
 
-  private carve(): { groups: BatchPutGroup[]; bytes: number } {
+  private carve(): BatchCarve {
     const taken: BatchPutGroup[] = [];
     let bytes = 0;
     let i = 0;
@@ -319,7 +329,7 @@ export class BlobBatchUploader {
         // With 24 slots, up to `slots` oversized requests may already be in flight;
         // each independently falls back to singles. The latch prevents NEW oversized carves.
         const sent = body.groups.length;
-        const parsedMax = parseBatchPutErrorMax(await res.json().catch(() => null));
+        const parsedMax = parseBatchPutErrorMax(await readBatchResponseJson(res));
         const target = parsedMax !== undefined && parsedMax < sent
           ? Math.max(BATCH_RECORDS_FLOOR, parsedMax)
           : BATCH_RECORDS_FLOOR;
@@ -331,7 +341,7 @@ export class BlobBatchUploader {
         await this.fallbackAll(pending);
         return;
       }
-      const parsed = parseBatchPutResponse(await res.json().catch(() => null));
+      const parsed = parseBatchPutResponse(await readBatchResponseJson(res));
       if (!parsed) {
         await this.fallbackAll(pending);
         return;
@@ -452,8 +462,8 @@ export class BlobBatchUploader {
     this.bySha.delete(group.sha);
   }
 
-  private rejectGroup(group: BatchPutGroup, e: unknown): void {
-    for (const waiter of group.waiters) waiter.reject(e);
+  private rejectGroup(group: BatchPutGroup, error: Error): void {
+    for (const waiter of group.waiters) waiter.reject(error);
     this.bySha.delete(group.sha);
   }
 
