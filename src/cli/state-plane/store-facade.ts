@@ -42,7 +42,7 @@ export {
   type TransitionRow,
 } from "./store/transition-stages.js";
 export { buildCasRetryView } from "./store/cas-retry-view.js";
-export { applyCasPacket, ensureTelemetryBindingId, type CasExpectation, type CasPacket } from "./store/write-packet.js";
+export { applyCasPacket, ensureStoreTelemetryBindingId, type CasExpectation, type CasPacket } from "./store/write-packet.js";
 export { applyLocalScan, invalidateLocalPlane, type LocalScanResult } from "./store/local-plane.js";
 export { StageLock } from "./store/stage-artifacts.js";
 export { STAGE_GIT_ROLES, type StageCounts, type StageLogicalDigest } from "./digest/stage-semantic-v1.js";

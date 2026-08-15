@@ -56,7 +56,7 @@ const STATE_ORDER_OWNERS = new Map([
   ])],
   ["src/cli/state-plane/adapters/legacy-json-store.ts", new Set([
     "applyLegacyJsonSavePacket",
-    "ensureTelemetryBindingId",
+    "ensureJsonTelemetryId",
     "installGenesisResetStateUnderHeldLock",
     "loadRawLegacyJsonState",
     "loadLegacyJsonState",
@@ -64,6 +64,7 @@ const STATE_ORDER_OWNERS = new Map([
   ])],
   ["src/cli/state-plane/adapters/whole-state-compat.ts", new Set([
     "applyStateSavePacket",
+    "ensureTelemetryBindingId",
     "loadRawState",
     "loadState",
     "saveThroughStore",
@@ -97,6 +98,7 @@ const STATE_ORDER_CALLEES = new Set([
   "assertStatePublishable",
   "assertStateReadable",
   "ensureStateReserve",
+  "ensureStoreTelemetryBindingId",
   "fs.lstat",
   "fs.open",
   "fs.rename",

@@ -67,7 +67,6 @@ const ALLOWED: ReadonlyMap<string, { sites: number; reason: string }> = new Map(
   ["WorkspaceChoice", { sites: 2, reason: "unrelated domains: init-plan's new/join command union vs. the picker's list-row label/value" }],
   ["boundedStream", { sites: 2, reason: "unrelated: sealed-stages batches rows under a byte budget, reset-io reads a file under a byte cap" }],
   ["doctorCmd", { sites: 2, reason: "REAL DUPLICATE, pending rename — hydrate-cmd.ts exports an unrelated hydrate routine under the doctor command's name. Rename it; this entry goes with it" }],
-  ["ensureTelemetryBindingId", { sites: 2, reason: "the legacy-JSON and SQLite planes each implement this write for their own store during U3; they converge when the legacy adapter retires" }],
   ["fsyncDirectory", { sites: 2, reason: "the state-plane store is synchronous by construction (descriptor-bound proofs), so it cannot use engine/fsutil's promise-returning one" }],
   ["errCode", { sites: 2, reason: "unrelated: engine/fsutil returns `string | undefined` for absent-code handling, daemon/logger returns a always-present `\"unknown\"` fallback for log lines" }],
   ["genesisPaths", { sites: 2, reason: "unrelated domains: state-plane genesis artifacts keyed by workspace root vs. e2ee enrollment artifacts keyed by account id" }],

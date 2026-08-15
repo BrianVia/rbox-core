@@ -223,8 +223,8 @@ function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef
   }
 }
 
-function isBusy(error: unknown): boolean {
-  const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+function isBusy(error: Error): boolean {
+  const code = String(Reflect.get(error, "code") ?? "");
   return code.startsWith("SQLITE_BUSY") || /database is locked/i.test(String(error));
 }
 
@@ -240,7 +240,7 @@ function runTransaction(
   } catch (error) {
     // Another writer owns the authority right now. This is the design's `busy`:
     // nothing was attempted, so the caller may recompute and retry.
-    if (isBusy(error)) return { status: "busy", detail: String(error) };
+    if (error instanceof Error && isBusy(error)) return { status: "busy", detail: String(error) };
     throw error;
   }
   let rejection: CasRejectionReason | undefined;
@@ -299,7 +299,14 @@ function buildRejection(
 
 /** A separate singleton transaction that deliberately preserves `stateRevision`:
  * minting a local telemetry binding is not a state mutation callers may CAS on. */
-export function ensureTelemetryBindingId(store: StateStoreHandle, expectedStream: string): string {
+export function ensureStoreTelemetryBindingId(
+  store: StateStoreHandle,
+  expectedStream: string,
+  ownerToken: OwnedLockCasToken,
+  randomBytes: (size: number) => Buffer = crypto.randomBytes,
+): string {
+  if (store.readonly) throw new Error("state store is open read-only");
+  if (!ownerToken.isOwner()) throw new Error("sync state telemetry lock ownership was lost");
   const db = stateStoreDatabase(store);
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -307,11 +314,14 @@ export function ensureTelemetryBindingId(store: StateStoreHandle, expectedStream
       db, `SELECT l.lineage_id,l.stream,l.telemetry_binding_id FROM store_meta m
       JOIN state_lineage l ON l.lineage_id=m.active_lineage_id WHERE m.singleton=1`);
     if (!row) throw new Error("state store singleton disappeared");
-    if (row.stream !== expectedStream) throw new Error(`telemetry binding requested for stream ${expectedStream}, store holds ${row.stream}`);
-    const binding = row.telemetry_binding_id ?? crypto.randomBytes(8).toString("hex");
+    if (row.stream !== expectedStream) {
+      throw new Error(`sync state belongs to stream ${row.stream}, not ${expectedStream}; refusing to overwrite it`);
+    }
+    const binding = row.telemetry_binding_id ?? randomBytes(8).toString("hex");
     if (row.telemetry_binding_id === null) {
       runStatement(db, "UPDATE state_lineage SET telemetry_binding_id=? WHERE lineage_id=?", binding, row.lineage_id);
     }
+    if (!ownerToken.isOwner()) throw new Error("sync state telemetry lock ownership was lost");
     db.exec("COMMIT");
     return binding;
   } catch (error) {

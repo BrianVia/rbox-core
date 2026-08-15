@@ -32,7 +32,7 @@ import {
   type SyncState,
 } from "../../sync-state-model.js";
 import {
-  StateAuthorityCorruptError, StateStoreOpenError, StreamMismatchError,
+  StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";
 import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import type { CasRejectionReason, CasResult } from "../ports.js";
@@ -41,6 +41,7 @@ import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal } from "../reset-lineage.js";
 import {
   applyLegacyJsonSavePacket,
+  ensureJsonTelemetryId,
   loadLegacyJsonState,
   loadRawLegacyJsonState,
   stateLockBusyDetail,
@@ -170,6 +171,48 @@ export async function ensureCapableStateLineage(root: string, state: SyncState):
   throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
 }
 
+/** Mint or reuse the telemetry identity through the authority selected from the
+ * state marker. SQLite uses the same state lock and owner capability as its CAS
+ * writer; JSON keeps its existing physical implementation byte-for-byte. */
+export async function ensureTelemetryBindingId(
+  root: string,
+  expectedStream: string,
+  randomBytes?: (size: number) => Buffer,
+): Promise<{ state: SyncState; bindingId: string }> {
+  if ((await selectAuthority(root)).kind === "legacy-json-store") {
+    return ensureJsonTelemetryId(root, expectedStream, randomBytes);
+  }
+
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") {
+    throw new Error(`sync state telemetry lock unavailable (${stateLockBusyDetail(acquired)})`);
+  }
+  try {
+    if (!acquired.lock.isOwnerSync()) throw new Error("sync state telemetry lock ownership was lost");
+    const coordinator = await import("../authority-bootstrap.js");
+    coordinator.assertAuthorityWritable(root);
+    const selection = await coordinator.selectStateAuthority(root);
+    if (selection.kind === "legacy-json-store") {
+      throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
+    }
+    const authority = sqliteAuthority(root, selection);
+    const { store, facade } = await openAuthorityStore(authority, false);
+    try {
+      const bindingId = facade.ensureStoreTelemetryBindingId(
+        store,
+        expectedStream,
+        casOwnerTokenFromLock(acquired.lock),
+        randomBytes,
+      );
+      return { state: facade.loadRawStateFromStore(store), bindingId };
+    } finally {
+      store.close();
+    }
+  } finally {
+    await acquired.lock.release();
+  }
+}
+
 /** Apply one generation-CAS packet under `<state>.lock`. Rejection is
  * whole-packet on both backends. */
 export async function applyStateSavePacket(
@@ -198,13 +241,23 @@ async function saveThroughStore(
     lock = options.heldLock;
   } else {
     const acquired = await acquireLock(stateLockPath(root), options.lock);
-    if (acquired.status === "unsupported") return { status: "unsupported", error: acquired.error };
+    if (acquired.status === "unsupported") {
+      return {
+        status: "unsupported",
+        error: new StateWriteRefusedError(
+          "state-lock-unavailable",
+          statePath(root),
+          String(acquired.error),
+        ),
+      };
+    }
     if (acquired.status === "error") return { status: "busy", detail: String(acquired.error) };
     if (acquired.status === "held") return { status: "busy", detail: stateLockBusyDetail(acquired) };
     lock = acquired.lock;
     releaseLock = true;
   }
   try {
+    if (!lock.isOwnerSync()) return { status: "busy", detail: "state lock ownership was lost" };
     // The state-plane write fence, once per save, under the held state lock.
     // A-2 holds no opinion about migration or genesis: the coordinator owns the
     // predicate and is the only module allowed to import both domains (§7.9).

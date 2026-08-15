@@ -17,6 +17,14 @@ the FINALE of this loop, not a standalone PR. Slices, in order:
   → the existing SQLite impl (store/write-packet.ts:302); the degraded-mutex
   forceLegacy writes (pull.ts:477, push.ts:566) get a SQLite-side owner;
   reset/rebind (reset-state.ts:288) reads through the store, not raw JSON.
+- **SP-2.5 Rig + e2e SQLite dimension** (founder-ordered 2026-08-15,
+  prerequisite for SP-3): the docker rig and e2e suites gain a
+  SQLite-authority dimension — every FAST scenario runs against a
+  genesis-created workspace, plus a fresh-install e2e (track → genesis →
+  first sync → pair a second device → converge) and an upgrade-path e2e
+  (existing JSON workspace keeps working on the same build). The default
+  flip does NOT ship until this dimension is green; SP-1's fixtures
+  (state-view across both authorities) are the substrate.
 - **SP-3 Default flip + fleet cutover** (fixes A#4): genesis becomes the
   default for absent state; the automatic upgrade-window migration is
   removed in the same PR; 1.x/candidate co-use prohibition stated; founder
@@ -85,6 +93,15 @@ design 163 actually wanted — SQLite as THE state plane — is stalled
 behind this bridge nobody crosses.
 
 ## Decision (founder, pinned)
+
+- (2026-08-15, SP-2 scope) "All legacy stuff can be removed with a healthy
+  v2/SQLite setup" — standing approval that legacy-only MODES and fallbacks
+  (forceLegacy degraded writes, legacy-only sidecars/branches) are
+  ELIMINATED once the SQLite equivalent is proven healthy, not ported
+  one-for-one. Each slice still proves parity before its removal ships;
+  the approval removes the preserve-behind-an-interface obligation for
+  legacy-only mechanisms whose SQLite replacement passes the slice's
+  differential matrix.
 
 - No in-place 1.x→2.0 state upgrade is supported. A 2.0 client finding
   legacy JSON state refuses with start-fresh instructions ("removing and

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -362,19 +362,28 @@ describe("design 93 §6 transactional unit", () => {
         partial: { r: partial },
       },
     }, {
-      forceLegacy: workspaceSyncMutexDegraded(syncMutex),
       apply: async () => {
         lockedApplyCalled = true;
-        throw new Error("must not acquire the transactional state lock");
+        return { status: "unsupported", error: new Error("state lock unsupported") };
       },
     });
-    expect(lockedApplyCalled).toBe(false);
+    expect(lockedApplyCalled).toBe(true);
     expect(saved.stateNonce).toBeUndefined();
     expect(saved.stateRevision).toBeUndefined();
     expect(saved.repoRecords).toBeUndefined();
     expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
     expect(saved.gitDeferrals?.r?.apply).toEqual(applyDeferral);
     expect(saved.gitPartial?.r).toEqual(partial);
+    const legacyGolden = {
+      stream,
+      lastSyncedSequence: 2,
+      lastSyncedManifest: manifest("two", { r: section("next") }),
+      gitDeferrals: { r: { apply: applyDeferral } },
+      gitPartial: { r: partial },
+    };
+    expect(saved).toEqual(legacyGolden);
+    expect(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8"))
+      .toBe(JSON.stringify(legacyGolden, null, 2));
     const restarted = await loadState(root, stream);
     expect(repoRecordsForState(restarted).r).toMatchObject({
       deferrals: { apply: applyDeferral },
@@ -389,6 +398,113 @@ describe("design 93 §6 transactional unit", () => {
     expect(preserved.repoRecords).toBeUndefined();
     expect(preserved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
     await releaseWorkspaceSyncMutex(syncMutex);
+  });
+
+  test("pre-removal JSON projection characterizes all four former caller effects", async () => {
+    const unsupportedApply = async () => ({
+      status: "unsupported" as const,
+      error: Object.assign(new Error("hard links unsupported"), { code: "EOPNOTSUPP" }),
+    });
+    const cases: Array<{
+      name: string;
+      initial: SyncState;
+      source: StateSource;
+      assertResult: (saved: SyncState) => void;
+    }> = [
+      {
+        name: "pull global plus repository",
+        initial: baseState({ r: { repoGen: 4, sourceSeq: 1, base: section("old") } }),
+        source: {
+          expectedStream: stream,
+          sourceGlobalSeq: 2,
+          globalManifest: manifest("pull", { r: section("pull") }),
+          observedRepos: ["r"],
+          values: { bases: { r: section("pull") } },
+        },
+        assertResult: (saved) => {
+          expect(saved.lastSyncedSequence).toBe(2);
+          expect(saved.lastSyncedManifest).toEqual(manifest("pull", { r: section("pull") }));
+        },
+      },
+      {
+        name: "push observation",
+        initial: baseState({ r: { repoGen: 7, sourceSeq: 1, base: section("old") } }),
+        source: {
+          expectedStream: stream,
+          sourceGlobalSeq: 3,
+          observedRepos: ["r"],
+          values: { partial: { r: { incomingKey: "observation", checkoutPending: true, appliedRefs: {}, heldRefs: {}, configApplied: false } } },
+        },
+        assertResult: (saved) => {
+          expect(saved.lastSyncedSequence).toBe(0);
+          expect(saved.gitPartial?.r?.incomingKey).toBe("observation");
+        },
+      },
+      {
+        name: "push carry-on-no-op",
+        initial: baseState({ r: { repoGen: 8, sourceSeq: 1, base: section("old") } }),
+        source: {
+          expectedStream: stream,
+          sourceGlobalSeq: 4,
+          observedRepos: ["r"],
+          values: { pending: { r: section("carried") } },
+        },
+        assertResult: (saved) => {
+          expect(saved.lastSyncedSequence).toBe(0);
+          expect(saved.gitPendingRemote?.r).toEqual(section("carried"));
+        },
+      },
+      {
+        name: "push acknowledgement",
+        initial: baseState({ r: { repoGen: 9, sourceSeq: 1, base: section("old"), cfgSynced: "old" } }),
+        source: {
+          expectedStream: stream,
+          sourceGlobalSeq: 5,
+          globalManifest: manifest("ack", { r: section("ack") }),
+          observedRepos: ["r"],
+          values: { bases: { r: section("ack") }, advertised: { r: section("ack") } },
+          authoredCfgHashByRepo: { r: "authored" },
+        },
+        assertResult: (saved) => {
+          expect(saved.lastSyncedSequence).toBe(5);
+          expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("ack"));
+        },
+      },
+    ];
+
+    for (const row of cases) {
+      const caseRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-state93-characterization-"));
+      try {
+        const saved = await saveStateSource(caseRoot, row.initial, row.source, { apply: unsupportedApply });
+        row.assertResult(saved);
+        expect(saved.stateNonce, row.name).toBeUndefined();
+        expect(saved.stateRevision, row.name).toBeUndefined();
+        expect(saved.repoRecords, row.name).toBeUndefined();
+        expect(repoRecordsForState(await loadState(caseRoot, stream)).r?.repoGen, row.name).toBe(0);
+      } finally {
+        await fs.rm(caseRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("published journal keeps its pre-removal no-option unsupported refusal and bytes", async () => {
+    const initial = baseState({ r: { repoGen: 2, sourceSeq: 1, base: section("old") } });
+    await saveStateUnsafeLegacyOrTest(root, initial);
+    const file = path.join(root, ".rbox", "state.json");
+    const before = await fs.readFile(file);
+    const unsupported = Object.assign(new Error("hard links unsupported"), { code: "EOPNOTSUPP" });
+    const link = spyOn(fs, "link").mockRejectedValue(unsupported);
+    try {
+      await expect(savePublishedRepoIntent(root, initial, "r", {
+        relPath: "r",
+        expectedRepoGen: 2,
+        previousRecord: { sourceSeq: 1, base: section("old") },
+        record: { sourceSeq: 2, base: section("next") },
+      })).rejects.toThrow("sync state transactional save unsupported");
+      expect(await fs.readFile(file)).toEqual(before);
+    } finally {
+      link.mockRestore();
+    }
   });
 
   test("legacy sidecar maps are bounded and ignored once repoRecords is authoritative", () => {

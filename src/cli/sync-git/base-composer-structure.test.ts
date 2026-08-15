@@ -145,7 +145,7 @@ test("design 130 whole-state persistence is a closed allowlist", async () => {
   expect(counts(sites)).toEqual({
     "src/cli/scan-probe.ts": 1,
     "src/cli/state-plane/adapters/legacy-json-store.ts": 4,
-    "src/cli/sync-state.ts": 4,
+    "src/cli/sync-state.ts": 2,
   });
 });
 
@@ -161,7 +161,7 @@ test("design 130 raw whole-state APIs cannot be aliased into new production site
   const unsafe = await sweep(/\bsaveStateUnsafeLegacyOrTest\b/g, outsideFacade);
   expect(counts(unsafe)).toEqual({
     "src/cli/state-plane/adapters/legacy-json-store.ts": 1,
-    "src/cli/sync-state.ts": 5,
+    "src/cli/sync-state.ts": 3,
   });
   const guarded = await sweep(/\bsaveState\b/g, outsideFacade);
   expect(counts(guarded)).toEqual({

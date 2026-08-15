@@ -565,7 +565,6 @@ async function runPushAttempt(
               repoProofs: write.repoProofs,
             }, {
               allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-              forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
             }));
             try {
               deps.onGitDeferralsSaved?.(state);
@@ -605,7 +604,6 @@ async function runPushAttempt(
         repoProofs,
       }, {
         allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-        forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
       }));
     },
     logPublicationLine: ({ plan }) => {
@@ -927,7 +925,6 @@ async function runPushAttempt(
             authoredCfgHashByRepo: write.authoredCfgHashByRepo,
           }, {
             allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-            forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
           }));
       },
     };

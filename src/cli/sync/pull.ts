@@ -476,7 +476,6 @@ export async function applyPulledManifest(
     repoProofs: gitOutcome.repoProofs,
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-    forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
   })), {
     mutationBoundary: deps.mutationBoundary,
     observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
