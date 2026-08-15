@@ -80,13 +80,20 @@ const halt = (condition: ScopeSealFailure): BindingScope =>
 const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((value, index) => value === b[index]);
 
+/** What a binding record claims about scope. "unreadable" is the PRESENT-but-broken
+ *  reading, never absence — collapsing the two is the demotion this seal prevents. */
+type DeclaredScope =
+  | { kind: "absent" }
+  | { kind: "unreadable" }
+  | { kind: "declared"; prefixes: readonly string[] };
+
 /** Normalize what a binding record claims. An unparseable scope field is treated
  *  as PRESENT-but-broken, never as absent. */
-function declaredScope(cfg: WorkspaceConfig): { present: boolean; prefixes?: string[] } {
-  if (cfg.scope === undefined) return { present: false };
-  if (!Array.isArray(cfg.scope) || cfg.scope.length === 0) return { present: true };
+function declaredScope(cfg: WorkspaceConfig): DeclaredScope {
+  if (cfg.scope === undefined) return { kind: "absent" };
+  if (!Array.isArray(cfg.scope) || cfg.scope.length === 0) return { kind: "unreadable" };
   const validated = validateScopePrefixes(cfg.scope);
-  return validated.ok ? { present: true, prefixes: validated.prefixes } : { present: true };
+  return validated.ok ? { kind: "declared", prefixes: validated.prefixes } : { kind: "unreadable" };
 }
 
 /**
@@ -111,8 +118,8 @@ export async function resolveBindingScope(root: string): Promise<BindingScope> {
   }
 
   const declared = declaredScope(record);
-  if (declared.present && declared.prefixes === undefined) return halt("binding-record-unreadable");
-  if (declared.prefixes) {
+  if (declared.kind === "unreadable") return halt("binding-record-unreadable");
+  if (declared.kind === "declared") {
     if (witnessScope && !sameSet(witnessScope, declared.prefixes)) return halt("scope-witness-disagreement");
     return { kind: "scoped", prefixes: declared.prefixes, generation: record.scopeGeneration ?? 0 };
   }

@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../../json.js";
 import { toHex } from "../../../engine/e2ee/index.js";
 import { DEFAULT_BATCH_RECORD_BYTES } from "./config.js";
 
@@ -20,14 +21,6 @@ export interface BatchFrame {
 export type BatchPutResponseRecord =
   | { sha256: string; ok: true; sizeBytes: number; receipt: string }
   | { sha256: string; ok: false; error: "sha_mismatch" | "too_large" | "r2_error" };
-
-interface BatchPutResponseCandidate {
-  sha256?: unknown;
-  ok?: unknown;
-  sizeBytes?: unknown;
-  receipt?: unknown;
-  error?: unknown;
-}
 
 export async function* parseBatchFrames(body: ReadableStream<Uint8Array>, onChunk?: () => void): AsyncGenerator<BatchFrame> {
   const reader = body.getReader();
@@ -107,22 +100,31 @@ export function framedBytes(payloadBytes: number): number {
   return BATCH_FRAME_HEADER_BYTES + payloadBytes;
 }
 
-/** Decode the batch-PUT response body. The parameter is `unknown` because that
- *  is exactly what the producer hands over — undici types `Response.json()` as
- *  `Promise<unknown>` — and this function IS the parser at that boundary, the
- *  earliest point where the bytes become `BatchPutResponseRecord[]`. */
-export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] | null {
-  if (!body || typeof body !== "object" || !Array.isArray((body as { results?: unknown }).results)) return null;
+/** Read a batch-endpoint JSON body at its I/O boundary. `Response.json()` is typed
+ *  `Promise<unknown>`, so the bytes are decoded here instead, where `JSON.parse`
+ *  yields a `JsonValue` by construction. An unreadable or malformed body is `null`,
+ *  exactly as the former `res.json().catch(() => null)` rendered it. */
+export async function readBatchResponseJson(res: Response): Promise<JsonValue | null> {
+  try {
+    const parsed: JsonValue = JSON.parse(await res.text());
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Decode the batch-PUT response body into the records the uploader acts on. */
+export function parseBatchPutResponse(body: JsonValue | null): BatchPutResponseRecord[] | null {
+  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.results)) return null;
   const out: BatchPutResponseRecord[] = [];
-  for (const raw of (body as { results: unknown[] }).results) {
-    if (!raw || typeof raw !== "object") return null;
-    const r = raw as BatchPutResponseCandidate;
-    if (typeof r.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(r.sha256)) return null;
-    if (r.ok === true) {
-      if (typeof r.sizeBytes !== "number" || typeof r.receipt !== "string") return null;
-      out.push({ sha256: r.sha256, ok: true, sizeBytes: r.sizeBytes, receipt: r.receipt });
-    } else if (r.ok === false && (r.error === "sha_mismatch" || r.error === "too_large" || r.error === "r2_error")) {
-      out.push({ sha256: r.sha256, ok: false, error: r.error });
+  for (const raw of body.results) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    if (typeof raw.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.sha256)) return null;
+    if (raw.ok === true) {
+      if (typeof raw.sizeBytes !== "number" || typeof raw.receipt !== "string") return null;
+      out.push({ sha256: raw.sha256, ok: true, sizeBytes: raw.sizeBytes, receipt: raw.receipt });
+    } else if (raw.ok === false && (raw.error === "sha_mismatch" || raw.error === "too_large" || raw.error === "r2_error")) {
+      out.push({ sha256: raw.sha256, ok: false, error: raw.error });
     } else {
       return null;
     }
@@ -130,16 +132,14 @@ export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] |
   return out;
 }
 
-/** The server's advertised record cap from an over-cap 400 body. Same
- *  `Response.json(): Promise<unknown>` boundary as {@link parseBatchPutResponse}. */
-export function parseBatchPutErrorMax(body: unknown): number | undefined {
-  if (!body || typeof body !== "object") return undefined;
-  const error = body as { error?: unknown; max?: unknown };
-  return error.error === "too_many_records"
-      && typeof error.max === "number"
-      && Number.isSafeInteger(error.max)
-      && error.max > 0
-    ? error.max
+/** The server's advertised record cap from an over-cap 400 body. */
+export function parseBatchPutErrorMax(body: JsonValue | null): number | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  return body.error === "too_many_records"
+      && typeof body.max === "number"
+      && Number.isSafeInteger(body.max)
+      && body.max > 0
+    ? body.max
     : undefined;
 }
 
