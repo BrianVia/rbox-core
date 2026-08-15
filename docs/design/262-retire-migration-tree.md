@@ -86,6 +86,15 @@ behind this bridge nobody crosses.
 
 ## Decision (founder, pinned)
 
+- (2026-08-15, SP-2 scope) "All legacy stuff can be removed with a healthy
+  v2/SQLite setup" — standing approval that legacy-only MODES and fallbacks
+  (forceLegacy degraded writes, legacy-only sidecars/branches) are
+  ELIMINATED once the SQLite equivalent is proven healthy, not ported
+  one-for-one. Each slice still proves parity before its removal ships;
+  the approval removes the preserve-behind-an-interface obligation for
+  legacy-only mechanisms whose SQLite replacement passes the slice's
+  differential matrix.
+
 - No in-place 1.x→2.0 state upgrade is supported. A 2.0 client finding
   legacy JSON state refuses with start-fresh instructions ("removing and
   starting fresh seems cleaner" — 2026-08-15). No rename-aside
