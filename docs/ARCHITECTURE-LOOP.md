@@ -117,19 +117,19 @@ retired.
 
 | metric | baseline (2026-08-14) | current | target |
 |---|---:|---:|---:|
-| anti-slop warnings, repo-wide | 3,421 | **2,523** | 0 |
-| — no-runtime-typeof | — | 851 | 0 |
+| anti-slop warnings, repo-wide | 3,421 | **2,390** | 0 |
+| — no-runtime-typeof | — | 852 | 0 |
 | — no-conditional-empty-object-spread | — | 555 | 0 |
 | — no-shape-in-symbol-names | — | 424 | 0 |
-| — no-unknown-parameters | — | 304 | 0 |
-| — no-chained-type-assertions | — | 213 | 0 |
-| — no-known-value-widening | — | 148 | 0 |
-| — no-unsafe-dictionary-type / no-object-parameters | — | 28 | 0 |
+| — no-unknown-parameters | — | 257 | 0 |
+| — no-chained-type-assertions | — | 155 | 0 |
+| — no-known-value-widening | — | 124 | 0 |
+| — no-unsafe-dictionary-type / no-object-parameters | — | 23 | 0 |
 | CODEMAP.md size (lines) | 460 | 460 | **deleted** |
 | size-gate allowlist entries | 69 | 65 | 0 |
-| local branches | ~300 | 57 | ~10 |
-| worktrees | 61 | 34 | active-only |
-| loop tasks complete | 0/12 | **11/12** (#31-38, #40-41) | 12/12 |
+| local branches | ~300 | 55 | ~10 |
+| worktrees | 61 | 33 | active-only |
+| loop tasks complete | 0/12 | **11/12** (#31-41 done; #42 awaits sign-off) | 12/12 |
 
 Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| grep -oE 'anti-slop\([a-z-]+\)' \| sort \| uniq -c`; allowlist `grep -cE '^  \["' src/cli/state-plane/file-size.test.ts` (÷2).
 
@@ -181,3 +181,21 @@ Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| 
   standing-branch-proof contract test, prompt-ink leftover, and the two
   structural campaigns (no-runtime-typeof parse-at-boundary; shape-names
   rename decision).
+- 2026-08-14 (late): **CAPSTONE #39 MERGED (#724, design 261)** — the
+  3-round adversarial loop KILLED the original big-module mechanism (two
+  independent reviews proved every proposed extraction breaks a pinned
+  contract: capture lives inside preparePublishCandidate, settle precedes
+  conditional ack, ports close over attempt-mutable state, report crosses
+  the scheduler boundary). What shipped is the honest capstone: the
+  Publication domain term in CONTEXT.md; publication.contract.test.ts
+  (the loop's whole contract in one file via a FakeRemote test-helper
+  extraction, literal-move audited); push.ts's false "pending split"
+  marker replaced by an audited-cohesion verdict (gate prose now knows
+  audited-cohesive entries; pins unchanged 940/49,750); daemon seal
+  observation dedup w/ deliberate deep-clone (aliasing pinned). Net −113
+  lines. Wave 4+5 type lanes also merged (#721-723, #725-727; remote,
+  engine, daemon/cli, sync-git, state-plane/cmd, api-4): burn-down
+  2,523 → **2,390** (−1,031 from baseline, 30%). New flake sighting
+  recorded (daemon-activity pr8, rerun-proven). REMAINING: #42 only —
+  awaiting founder support-window sign-off. e2ee-client.ts flagged as a
+  decomposition candidate (838 lines, warnings clustered).

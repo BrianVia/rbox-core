@@ -5,6 +5,28 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_NIGHT CAP (2026-08-14→15, arch-loop session, PRs #703-#727 = 25 merged):
+**ARCHITECTURE LOOP 11/12 DONE** (docs/ARCHITECTURE-LOOP.md is the ledger).
+Big cuts: #40 RefPlaneTransaction (follow.ts 1,210→247, PR #710), #41
+engine/git GONE (24 modules folded into sync-git, lockfile+git-spawn
+promoted, pin tightened, PR #717), capstone #39 Publication (PR #724,
+design 261 — the 3-round review loop killed the big-module rewrite and
+shipped the honest version: domain term + one consolidated retry-contract
+file + audited-cohesion verdict replacing the false "pending split"
+marker + daemon seal dedup; net −113 lines). **Type-slop campaign: 14
+opus lanes merged (#711-716, #718-723, #725-727)** — every fix traced to
+the producer's true type, zero fakes/suppressions; burn-down **3,421 →
+2,390 (−30%)**; four type rules now 559 total (from ~1,673). Remaining
+mass: runtime-typeof 852 (parse-at-boundary campaign), spread 555,
+shape-names 424 (needs rename decision). Flake: daemon-activity "pr8
+remint" sighted + rerun-proven (registry entry added). Fleet: all three
+hosts restarted onto 41061f47b mid-session; ANOTHER fleet update due for
+the #39/#41-late merges (main at #727+). AWAITING FOUNDER: #42
+migration-tree retirement support-window sign-off (~6,415 lines, ~90
+warnings, ~35 CODEMAP entries); e2ee-client.ts flagged as next
+decomposition candidate. apps/api/test/** still in no tsconfig program
+(ticket-worthy)._
+
 _EVENING CAP (2026-08-14, fleet on **1940cfc**, session PRs #684-#701 = 18):
 **#700 MERGED** — apply.ts decomposed at the held-decision seam (1,559→1,249
 nonblank, ratchet re-pinned DOWN below the original; held-decision.ts +
