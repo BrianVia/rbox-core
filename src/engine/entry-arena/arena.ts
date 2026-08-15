@@ -20,7 +20,7 @@
  * `mtimeMs`.
  */
 import type { FileEntry } from "../types.js";
-import { EntryShapeError } from "./errors.js";
+import { EntryStructureError } from "./errors.js";
 import type { SlotId } from "./tokens.js";
 
 export interface ArenaSlot {
@@ -56,7 +56,7 @@ export interface EntryArenaOptions {
 
 /** Nesting bound for extension members. Manifest extras are decoded JSON, which
  *  is acyclic and shallow in practice; the bound turns a pathological or cyclic
- *  input into a loud `EntryShapeError` instead of a stack overflow. */
+ *  input into a loud `EntryStructureError` instead of a stack overflow. */
 export const MAX_EXTENSION_DEPTH = 32;
 
 type EntrySnapshotValue = null | boolean | number | string | undefined | readonly EntrySnapshotValue[] | EntrySnapshotObject;
@@ -75,11 +75,11 @@ function defineOwn(target: EntrySnapshotObject, key: string, value: EntrySnapsho
 /** Reads each source value EXACTLY once and returns a frozen, null-prototype
  *  deep copy. Every later step reads this result, never the caller's object. */
 function snapshotValue(value: EntrySnapshotSource, path: string, depth: number): EntrySnapshotValue {
-  if (depth > MAX_EXTENSION_DEPTH) throw new EntryShapeError(path, `nested deeper than ${MAX_EXTENSION_DEPTH}`);
+  if (depth > MAX_EXTENSION_DEPTH) throw new EntryStructureError(path, `nested deeper than ${MAX_EXTENSION_DEPTH}`);
   if (value === null) return null;
   if (typeof value !== "object") {
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
-    throw new EntryShapeError(path, `${typeof value} is not representable in a manifest`);
+    throw new EntryStructureError(path, `${typeof value} is not representable in a manifest`);
   }
   if (Array.isArray(value)) {
     return Object.freeze(value.map((item, index) => snapshotValue(item, `${path}[${index}]`, depth + 1)));

@@ -74,3 +74,28 @@ Format: field — file:line — suggested name — blast radius.
   hashed into resolution receipts, so renaming the key changes every binding
   identity hash — any in-flight resolution recorded by an older CLI stops
   matching. Requires the 2.0 receipt-format break, not a standalone rename.
+
+## `"p-repair-shape-mismatch"` (base composer hold code)
+
+- **Anchor:** `src/cli/sync-git/base-composer.ts:191` (union member), emitted at
+  `:434`, `:443`, `:458`; mirrored in the durable hold-code union at
+  `src/cli/sync-state-model.ts:234`.
+- **Suggested name:** `p-repair-witness-mismatch` — the hold fires when the
+  P-repair witness disagrees with the locked proof, not when a "shape" is off.
+- **Blast radius:** the value is a hold code carried in composer output and
+  persisted with the sync state record, so it is design-176 grammar-frozen
+  wire, not a code symbol. Renaming it changes emitted diagnostics and stored
+  hold rows that older CLIs and existing records still spell the old way; it
+  needs the 2.0 grammar break. The surrounding predicates
+  (`branchWitnessWellFormed`, `safeWitnessWellFormed`) were renamed in place.
+
+## `EntryStructureError.name === "EntryShapeError"` (arena error identity)
+
+- **Anchor:** `src/engine/entry-arena/errors.ts:44`.
+- **Suggested name:** `"EntryStructureError"`, matching the class after the
+  code-symbol rename.
+- **Blast radius:** the string is the runtime `error.name` surfaced in
+  diagnostics and crash output, so it is emitted text rather than a symbol. No
+  in-repo consumer matches on it today, but any captured log or support
+  transcript spells it the old way; flip it with the next diagnostics-grammar
+  change. The class and every import were renamed to `EntryStructureError`.

@@ -63,24 +63,24 @@ test("§130 invalid wire creates no partial attestation and scoped sections crea
 });
 
 test("§130 capable→old→capable skew walk never revalidates positive BASE around A/Z", () => {
-  const absenceShapes: Array<{ label: string; liveRefs: Record<string, string>; logicalBaseRefs: Record<string, string>; origins: Parameters<typeof buildTombstoneAttestations>[0]["origins"] }> = [
+  const absenceScenarios: Array<{ label: string; liveRefs: Record<string, string>; logicalBaseRefs: Record<string, string>; origins: Parameters<typeof buildTombstoneAttestations>[0]["origins"] }> = [
     { label: "old leaves R absent", liveRefs: {}, logicalBaseRefs: {}, origins: {} },
     { label: "old reapplies advertised T and rewrites BASE", liveRefs: { [ref]: T }, logicalBaseRefs: {}, origins: { [ref]: { v: 1, oid: T, lineageHash: L, kind: "publisher-ack", sourceSeq: 8, incomingKey: "old" } } },
     { label: "user recreates T while old state says positive", liveRefs: { [ref]: T }, logicalBaseRefs: {}, origins: { [ref]: { v: 1, oid: T, lineageHash: L, kind: "manual", episode: "8".repeat(32) } } },
   ];
-  for (const shape of absenceShapes) {
+  for (const scenario of absenceScenarios) {
     const map = buildTombstoneAttestations({
       section: section(), incomingKey: key, lineageHash: L,
-      liveRefs: shape.liveRefs, logicalBaseRefs: shape.logicalBaseRefs,
-      origins: shape.origins,
+      liveRefs: scenario.liveRefs, logicalBaseRefs: scenario.logicalBaseRefs,
+      origins: scenario.origins,
       artifacts: { [ref]: { ...clear, absence: "valid-owning" } },
       pendingEvidence: { [ref]: { incomingKey: key, d2Revalidated: true } },
     });
     expect(checkTombstoneAttestation(map, {
       incomingKey: key, ref, oid: T,
-      liveOid: shape.liveRefs[ref] ?? null,
-      logicalBaseOid: shape.logicalBaseRefs[ref] ?? null,
-    }).status, shape.label).toBe("hard-veto");
+      liveOid: scenario.liveRefs[ref] ?? null,
+      logicalBaseOid: scenario.logicalBaseRefs[ref] ?? null,
+    }).status, scenario.label).toBe("hard-veto");
   }
 
   // Old-field truncation only destroys authority: no chain means no attestation,

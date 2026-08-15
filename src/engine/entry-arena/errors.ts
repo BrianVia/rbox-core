@@ -45,9 +45,6 @@ export class EntryStructureError extends Error {
   }
 }
 
-// Compatibility name retained for existing imports and runtime diagnostics.
-export { EntryStructureError as "EntryShapeError" };
-
 /** A terminal operation was started from inside a resource-release callback.
  *  Same-owner is a direct cycle and cross-owner pairs are a mutual one, so NO
  *  owner may be driven terminal from a release callback. Detected across
