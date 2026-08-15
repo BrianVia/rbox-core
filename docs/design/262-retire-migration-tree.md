@@ -17,6 +17,14 @@ the FINALE of this loop, not a standalone PR. Slices, in order:
   → the existing SQLite impl (store/write-packet.ts:302); the degraded-mutex
   forceLegacy writes (pull.ts:477, push.ts:566) get a SQLite-side owner;
   reset/rebind (reset-state.ts:288) reads through the store, not raw JSON.
+- **SP-2.5 Rig + e2e SQLite dimension** (founder-ordered 2026-08-15,
+  prerequisite for SP-3): the docker rig and e2e suites gain a
+  SQLite-authority dimension — every FAST scenario runs against a
+  genesis-created workspace, plus a fresh-install e2e (track → genesis →
+  first sync → pair a second device → converge) and an upgrade-path e2e
+  (existing JSON workspace keeps working on the same build). The default
+  flip does NOT ship until this dimension is green; SP-1's fixtures
+  (state-view across both authorities) are the substrate.
 - **SP-3 Default flip + fleet cutover** (fixes A#4): genesis becomes the
   default for absent state; the automatic upgrade-window migration is
   removed in the same PR; 1.x/candidate co-use prohibition stated; founder
