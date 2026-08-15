@@ -6,6 +6,7 @@ import { HashCache, scanManifest, type Manifest } from "../../engine/index.js";
 import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "../e2ee-fake-server.js";
 import { RboxDaemon } from "../daemon.js";
 import { push } from "../sync.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 
 const NOW = 1_900_000_000_000;
@@ -62,12 +63,15 @@ test("daemon wires manifest attribution and publication through its log sink", a
   const remote = remoteFor(server, secrets, ACCOUNT_ID, WORKSPACE_ID, NOW + 5_000, { warningSink: sink });
   const cfg = await cfgFor(root, secrets, remote, WORKSPACE_ID);
   await prepareDaemonFolderAdmission(root, cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   daemon = new RboxDaemon(
     root,
     cfg,
     { remote, warningSink: sink, onGitLog: sink },
     { log: sink, keyDeliveryFlight: null },
-  ) as unknown as DaemonInternals;
+  ) as DaemonInternals;
   await fs.writeFile(path.join(root, "attribution.txt"), "manifest attribution\n");
   daemon.cache = await HashCache.load(root);
   daemon.local.head = await scanManifest(root);
@@ -110,7 +114,7 @@ test("209/6 first daemon commit after a full boot scan emits one op for one real
     cfg,
     { remote, warningSink: sink, onGitLog: sink },
     { log: sink, keyDeliveryFlight: null },
-  ) as unknown as DaemonInternals;
+  ) as DaemonInternals;
   daemon.cache = await HashCache.load(root);
   daemon.local.head = await scanManifest(root);
   await daemon.loadSyncBase();

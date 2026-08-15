@@ -384,14 +384,16 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       bundleCipherSize: bundle.cipherSize,
       head,
       refs,
-      indexSha: index?.sha,
-      indexEncSha: index?.encSha,
-      indexCipherSize: index?.cipherSize,
       indexTree,
-      opState: Object.keys(opState).length ? opState : undefined,
       refScope: ctx.kind === "dir" ? "all" : "scoped",
       generatedAt: new Date().toISOString(),
     };
+    if (index) {
+      section.indexSha = index.sha;
+      section.indexEncSha = index.encSha;
+      section.indexCipherSize = index.cipherSize;
+    }
+    if (Object.keys(opState).length > 0) section.opState = opState;
     // Engine self-check (scrutiny M4): a capture race (branch deleted between the HEAD and
     // refs reads by a concurrent git/sibling worktree, or an exotic symbolic-ref outside
     // refs/heads) can assemble a section apply-side validation refuses. Defer this repo

@@ -61,12 +61,14 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // that is already current.
   { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
 
-  // The whole-state compatibility adapter (design 222 §1.2 A-2): one selection
-  // from the document's bytes, and every backend-specific read or write behind
-  // it. The refusals are file-level, so nothing here opens a database first.
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectSqliteAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
+  // Design 263: the coordinator owns file-level selection and genesis admission;
+  // the compatibility Adapter reaches both through one lazy selection seam and
+  // opens only the backend named by the returned durable observation.
+  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "selectStateAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
+  { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "admitGenesisAuthority", kind: "read", sites: 1, guards: ["readGenesisIntent", "selectStateAuthority", "withGenesisAdmissionLocks"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority", "selectStateAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
   // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
   // legacy document, so the repositories it covers are the same set in either
   // format. It used to classify and refuse instead, which made every lock bundle
@@ -89,8 +91,8 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyLegacyJsonSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
   // The SQLite save boundary: the lock, then the ONE write fence, then the
   // selection re-read under that lock, and only then a database open.
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectSqliteAuthority"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectSqliteAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 
@@ -113,7 +115,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/genesis.ts", symbol: "inspect", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/genesis.ts", symbol: "eligibility", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/genesis.ts", symbol: "resume", kind: "read", sites: 2, guards: ["classifyStateFormat", "holdsMarkerFor"] },
-  { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["classifyStateFormat", "fsp.rename"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["assertHealthyOwnedSyncMutex", "isOwner", "classifyStateFormat", "fsp.rename"] },
 
   // Design 163's authority flip (M-6): the one rename in the product that
   // replaces a live legacy document with `Q`. Its barrier is deliberately not
@@ -132,7 +134,7 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
-  ["src/cli/state-plane/locks.ts::withStatePlaneLocks", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the document is read by the guarded inspectInventory" }],
+  ["src/cli/state-plane/locks.ts::runLockAttempt", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the injected guarded inventory reader owns any document read" }],
   ["src/cli/state-plane/migration/authority-flip.ts::completeFlip", { sites: 2, reason: "names `.rbox` only as the parent to fsync after the flip's rename; the document itself is replaced by flipAuthority, which is inventoried above" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],

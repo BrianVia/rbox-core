@@ -39,6 +39,7 @@ import {
   verifyManifestOnDisk,
 } from "../lib/manifest-check.js";
 import type { Device } from "../lib/device.js";
+import { ageDeviceApplyDeferral, readDeviceSyncState } from "../lib/state-view.js";
 import { createRecorder, errMsg } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { Recorder } from "./harness.js";
@@ -135,7 +136,7 @@ interface RigSyncState {
 }
 
 async function readSyncState(dev: Device): Promise<RigSyncState> {
-  return JSON.parse(await dev.readFile(`${GUEST.workDir}/.rbox/state.json`)) as RigSyncState;
+  return readDeviceSyncState(dev, GUEST.workDir);
 }
 
 function assertRepoSettled(rec: Recorder, label: string, state: RigSyncState): void {
@@ -154,8 +155,8 @@ function assertRepoSettled(rec: Recorder, label: string, state: RigSyncState): v
 }
 
 async function assertTrackedFollow(rec: Recorder, label: string, a: Device, b: Device, repoA: string, repoB: string): Promise<void> {
-  const opShape = (dev: Device, repo: string) => dev.exec(["sh", "-c", `for n in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do p="$(git -C '${repo}' rev-parse --git-path "$n")"; test ! -e "$p" || printf '%s\\n' "$n"; done`]);
-  const configShape = (dev: Device, repo: string) => gitExec(dev, repo, ["config", "--local", "--get-regexp", "^(branch\\.|remote\\.)"]);
+  const opStateView = (dev: Device, repo: string) => dev.exec(["sh", "-c", `for n in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do p="$(git -C '${repo}' rev-parse --git-path "$n")"; test ! -e "$p" || printf '%s\\n' "$n"; done`]);
+  const configStoreView = (dev: Device, repo: string) => gitExec(dev, repo, ["config", "--local", "--get-regexp", "^(branch\\.|remote\\.)"]);
   const [aState, bState, aIndex, bIndex, aBytes, bBytes, aOp, bOp, aConfig, bConfig] = await Promise.all([
     readRepoState(a, repoA),
     readRepoState(b, repoB),
@@ -163,10 +164,10 @@ async function assertTrackedFollow(rec: Recorder, label: string, a: Device, b: D
     gitExec(b, repoB, ["write-tree"]),
     a.readFile(`${repoA}/a.txt`),
     b.readFile(`${repoB}/a.txt`),
-    opShape(a, repoA),
-    opShape(b, repoB),
-    configShape(a, repoA),
-    configShape(b, repoB),
+    opStateView(a, repoA),
+    opStateView(b, repoB),
+    configStoreView(a, repoA),
+    configStoreView(b, repoB),
   ]);
   rec.assert(`[${label}] B fsck --strict clean`, bState.fsckCode === 0, `exit ${bState.fsckCode}`);
   rec.assert(`[${label}] HEAD form exact`, aState.headSymbolic === bState.headSymbolic, `A=${aState.headSymbolic || "(detached)"} B=${bState.headSymbolic || "(detached)"}`);
@@ -504,26 +505,12 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
             // Design 200 aged visibility: cross the transient quiet window and retain
             // design 176's frozen human `git deferred` grammar as a live rig consumer.
             await ctx.b.daemonStop(GUEST.workDir);
-            const statePath = `${GUEST.workDir}/.rbox/state.json`;
-            const rawState = await ctx.b.readFile(statePath);
             const applyDeferral = state.repoRecords?.[TOP]?.deferrals?.apply;
             if (typeof applyDeferral?.deferredSince !== "string" || typeof applyDeferral.reasonSince !== "string") {
               throw new Error(`missing ${TOP} apply-lane timestamps before aged visibility: ${JSON.stringify(applyDeferral)}`);
             }
             const agedAt = new Date(Date.now() - 11 * 60_000).toISOString();
-            const replaceTimestampOnce = (source: string, field: "deferredSince" | "reasonSince", current: string): string => {
-              const token = `${JSON.stringify(field)}: ${JSON.stringify(current)}`;
-              if (source.split(token).length !== 2) {
-                throw new Error(`expected exactly one ${field} token for ${TOP} apply deferral`);
-              }
-              return source.replace(token, `${JSON.stringify(field)}: ${JSON.stringify(agedAt)}`);
-            };
-            const agedState = replaceTimestampOnce(
-              replaceTimestampOnce(rawState, "deferredSince", applyDeferral.deferredSince),
-              "reasonSince",
-              applyDeferral.reasonSince,
-            );
-            await ctx.b.writeFile(statePath, agedState);
+            await ageDeviceApplyDeferral(ctx.b, GUEST.workDir, TOP, agedAt);
             await ctx.b.daemonStart(GUEST.workDir);
 
             const agedHuman = await ctx.b.rbox(["status", "--git"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
@@ -563,10 +550,11 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
       // ── Manifest convergence (plain files) — the git channel is asserted above; this
       //    covers the PLAIN-file half (`.git` is fingerprint-pruned, never plain-synced). ──
       await rec.step("synced-set convergence A vs B (manifest ∩ disk)", async () => {
-        const statePath = `${GUEST.workDir}/.rbox/state.json`;
-        const [stateA, stateB, fpB] = await Promise.all([ctx.a.readFile(statePath), ctx.b.readFile(statePath), fingerprintTree(ctx.b, GUEST.workDir)]);
-        const manA = canonicalManifest(parseManifestState(stateA));
-        const manB = canonicalManifest(parseManifestState(stateB));
+        const [stateA, stateB, fpB] = await Promise.all([
+          readSyncState(ctx.a), readSyncState(ctx.b), fingerprintTree(ctx.b, GUEST.workDir),
+        ]);
+        const manA = canonicalManifest(parseManifestState(JSON.stringify(stateA)));
+        const manB = canonicalManifest(parseManifestState(JSON.stringify(stateB)));
 
         const diff = compareManifests(manA, manB);
         rec.assert("synced set converged (A manifest == B manifest)", diff.identical, diff.identical ? `${manB.length} entries synced` : manifestDiffDetail(diff));

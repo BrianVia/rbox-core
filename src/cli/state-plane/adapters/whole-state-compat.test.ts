@@ -7,7 +7,7 @@
  * this adapter refuses is byte-identical afterwards, SQLite sidecars included,
  * because a read-only open is not a zero-write operation (163 v13).
  */
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -15,14 +15,20 @@ import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
 import { acquireLock } from "../../../engine/lockfile.js";
 import { withProtocolLockClass } from "../../../cli/sync-git/protocol-locks.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../../sync-mutex.js";
 import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
-import { authorityMarkerBytes } from "../authority-marker.js";
+import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
+import { authorityMarkerBytes, readAuthorityMarkerId } from "../authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError } from "../errors.js";
+import { readGenesisIntent } from "../genesis-intent.js";
+import { rboxResidue } from "../migration/fault-rig.js";
 import { genesisPaths, sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { sqliteResetFacade } from "../reset/index.js";
-import { createStateStore, ownedStateStoreWriterForReset } from "../store/open.js";
 import {
-  applyStateSavePacket, LEGACY_REJECTION_REASON, loadRawState, loadState,
+  createStateStore, openStateStore, ownedStateStoreWriterForReset, stateStoreDatabase,
+} from "../store/open.js";
+import {
+  applyStateSavePacket, ensureCapableStateLineage, LEGACY_REJECTION_REASON, loadRawState, loadState,
 } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_222::root";
@@ -40,6 +46,22 @@ async function workspace(prefix: string): Promise<string> {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), `rbox-2c-${prefix}-`));
   roots.push(root);
   await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  return root;
+}
+
+async function configuredWorkspace(prefix: string): Promise<string> {
+  const root = await workspace(prefix);
+  const config: WorkspaceConfig = {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: "ws_222",
+    projectId: "root",
+    deviceId: "dev",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+  };
+  expect(syncStreamId(config)).toBe(STREAM);
+  await saveConfig(root, config);
   return root;
 }
 
@@ -61,6 +83,21 @@ async function legacy(prefix: string): Promise<string> {
     lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] }, repoRecords: {},
   } satisfies SyncState));
   return root;
+}
+
+async function plantResumeIntent(root: string, authorityId: string): Promise<void> {
+  const active = sqliteResetPaths.active(root);
+  const stat = await fsp.stat(active);
+  const store = openStateStore(active, { readonly: true });
+  const lineageId = store.header.active_lineage_id;
+  store.close();
+  await fsp.writeFile(genesisPaths.intent(root), JSON.stringify({
+    version: 1,
+    authorityId,
+    lineageId,
+    evidence: { root: await fsp.realpath(root), stream: STREAM, incarnation: "absent" },
+    staging: { dev: stat.dev, ino: stat.ino },
+  }));
 }
 
 const file = (name: string, seed: number): FileEntry => ({
@@ -108,10 +145,186 @@ test("legacy JSON keeps every read and write on the JSON backend", async () => {
   expect(Object.keys(snapshot(root)).filter((name) => name.startsWith("state.db"))).toEqual([]);
 });
 
+test("settled JSON preserves the released-handle load behavior and leaves no admission residue", async () => {
+  const root = await legacy("released-json");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  await releaseWorkspaceSyncMutex(mutex);
+  const beforeState = await fsp.readFile(statePath(root));
+  const beforeDirectory = snapshot(root);
+
+  expect((await loadState(root, STREAM, () => undefined, mutex)).stateNonce).toBe(NONCE);
+  expect(await fsp.readFile(statePath(root))).toEqual(beforeState);
+  expect(snapshot(root)).toEqual(beforeDirectory);
+  expect(readGenesisIntent(root)).toBeUndefined();
+});
+
+test("a held-mutex settled JSON load performs exactly one bounded intent read", async () => {
+  const root = await legacy("one-intent-read");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  const originalOpen = fs.openSync;
+  let intentReads = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === path.resolve(genesisPaths.intent(root))) intentReads += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    expect((await loadState(root, STREAM, () => undefined, mutex)).stateNonce).toBe(NONCE);
+    expect(intentReads).toBe(1);
+  } finally {
+    observed.mockRestore();
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+});
+
+test("settled JSON preserves wrong-root, ownership-lost, and degraded adapter behavior", async () => {
+  const wrongRootState = await legacy("wrong-root-json");
+  const other = await workspace("wrong-root-handle");
+  const wrongRoot = await acquireWorkspaceSyncMutex(other, "cli");
+  const wrongRootResidue = rboxResidue(wrongRootState);
+  try {
+    expect((await loadState(wrongRootState, STREAM, () => undefined, wrongRoot)).stateNonce).toBe(NONCE);
+    expect(rboxResidue(wrongRootState)).toEqual(wrongRootResidue);
+  } finally {
+    await releaseWorkspaceSyncMutex(wrongRoot);
+  }
+
+  const ownershipLostState = await legacy("ownership-lost-json");
+  const ownershipLost = await acquireWorkspaceSyncMutex(ownershipLostState, "cli");
+  if (!ownershipLost.lock) throw new Error("test requires a real mutex");
+  await fsp.rm(ownershipLost.lock.path);
+  const ownershipLostResidue = rboxResidue(ownershipLostState);
+  try {
+    expect((await loadState(ownershipLostState, STREAM, () => undefined, ownershipLost)).stateNonce).toBe(NONCE);
+    expect(rboxResidue(ownershipLostState)).toEqual(ownershipLostResidue);
+  } finally {
+    await releaseWorkspaceSyncMutex(ownershipLost).catch(() => undefined);
+  }
+
+  const degradedState = await legacy("degraded-json");
+  const degraded = {
+    root: degradedState,
+    incarnation: "degraded",
+    released: false,
+    degraded: { reason: "test" },
+  } as const;
+  const degradedResidue = rboxResidue(degradedState);
+  expect((await loadState(degradedState, STREAM, () => undefined, degraded)).stateNonce).toBe(NONCE);
+  expect(rboxResidue(degradedState)).toEqual(degradedResidue);
+});
+
 test("an absent state document is still the JSON backend's first run", async () => {
   const root = await workspace("absent");
   expect((await loadState(root, STREAM)).lastSyncedSequence).toBe(0);
   expect(await loadRawState(root)).toBeUndefined();
+});
+
+test("a healthy held-mutex load admits absent state and re-selects the genesis store", async () => {
+  const root = await configuredWorkspace("admit-absent");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    const state = await loadState(root, STREAM, () => undefined, mutex);
+    expect(state.stream).toBe(STREAM);
+    expect(state.lastSyncedSequence).toBe(0);
+    expect(state.stateNonce).toBeUndefined();
+    const capable = await ensureCapableStateLineage(root, state);
+    expect(capable.stateNonce).toMatch(/^[0-9a-f]{32}$/);
+    expect((await loadState(root, STREAM, () => undefined, mutex)).stateNonce).toBe(capable.stateNonce);
+
+    const authorityId = await readAuthorityMarkerId(statePath(root));
+    expect(authorityId).toMatch(/^[0-9a-f]{32}$/);
+    expect(readGenesisIntent(root)).toBeUndefined();
+    expect(await mutex.lock?.isOwner()).toBeTrue();
+    expect(mutex.released).toBeFalse();
+
+    const store = openStateStore(sqliteResetPaths.active(root), { readonly: true });
+    try {
+      expect(store.header.authority_id).toBe(authorityId!);
+      const completion = stateStoreDatabase(store).query(
+        "SELECT origin_kind,migration_id,entry_count,repo_count FROM migration_completion WHERE singleton=1",
+      ).get() as { origin_kind: string; migration_id: string; entry_count: number; repo_count: number };
+      expect(completion).toEqual({
+        origin_kind: "genesis",
+        migration_id: `genesis:${store.header.active_lineage_id}`,
+        entry_count: 0,
+        repo_count: 0,
+      });
+    } finally {
+      store.close();
+    }
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+});
+
+for (const markerPublished of [true, false]) {
+  test(`held-mutex load resumes ${markerPublished ? "Q + intent" : "absent + active DB + intent"} with the same authority`, async () => {
+    const root = await configuredWorkspace(markerPublished ? "resume-q" : "resume-active");
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+    try {
+      await loadState(root, STREAM, () => undefined, mutex);
+      const authorityId = await readAuthorityMarkerId(statePath(root));
+      expect(authorityId).toMatch(/^[0-9a-f]{32}$/);
+      await plantResumeIntent(root, authorityId!);
+      if (!markerPublished) await fsp.rm(statePath(root));
+
+      const beforeResume = await import("../authority-bootstrap.js");
+      expect(() => beforeResume.assertAuthorityWritable(root)).toThrow(StateWriteRefusedError);
+      const recovered = await loadState(root, STREAM, () => undefined, mutex);
+      expect(await readAuthorityMarkerId(statePath(root))).toBe(authorityId!);
+      expect(readGenesisIntent(root)).toBeUndefined();
+      expect(() => beforeResume.assertAuthorityWritable(root)).not.toThrow();
+      expect((await applyStateSavePacket(root, packet({
+        expectedNonce: recovered.stateNonce ?? "legacy",
+        sourceGlobalSeq: 1,
+      }))).status).toBe("accepted");
+    } finally {
+      await releaseWorkspaceSyncMutex(mutex);
+    }
+  });
+}
+
+test("JSON plus an intent is recovered before dispatch without changing the JSON bytes", async () => {
+  const root = await configuredWorkspace("resume-json");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    await loadState(root, STREAM, () => undefined, mutex);
+    const authorityId = await readAuthorityMarkerId(statePath(root));
+    await plantResumeIntent(root, authorityId!);
+    const json = JSON.stringify({
+      stream: STREAM,
+      stateNonce: NONCE,
+      stateRevision: 0,
+      lastSyncedSequence: 0,
+      lastSyncedManifest: { generatedAt: "", files: [] },
+      repoRecords: {},
+    } satisfies SyncState);
+    await fsp.writeFile(statePath(root), json);
+
+    expect((await loadState(root, STREAM, () => undefined, mutex)).stateNonce).toBe(NONCE);
+    expect(await fsp.readFile(statePath(root), "utf8")).toBe(json);
+    expect(readGenesisIntent(root)).toBeUndefined();
+    expect(fs.existsSync(sqliteResetPaths.active(root))).toBeFalse();
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+});
+
+test("a foreign authority file cannot hide a surviving genesis intent", async () => {
+  const root = await configuredWorkspace("resume-foreign");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    await loadState(root, STREAM, () => undefined, mutex);
+    const authorityId = await readAuthorityMarkerId(statePath(root));
+    await plantResumeIntent(root, authorityId!);
+    await fsp.writeFile(statePath(root), "foreign authority holder\n");
+
+    await expect(loadState(root, STREAM, () => undefined, mutex))
+      .rejects.toBeInstanceOf(StateAuthorityCorruptError);
+    expect(readGenesisIntent(root)?.authorityId).toBe(authorityId!);
+    expect(fs.existsSync(sqliteResetPaths.active(root))).toBeTrue();
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
 });
 
 // --- selection on Q ---------------------------------------------------------
@@ -122,6 +335,31 @@ test("Q selects the store for whole reads", async () => {
   expect(state.stream).toBe(STREAM);
   expect(state.stateNonce).toBe(NONCE);
   expect((await loadRawState(root))!.stateRevision).toBe(0);
+});
+
+test("a held-mutex settled Q load reads intent once and opens the authority exactly once", async () => {
+  const root = await flipped("one-q-open");
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  const originalOpen = fs.openSync;
+  let intentReads = 0;
+  let authorityOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    const resolved = path.resolve(String(file));
+    if (resolved === path.resolve(genesisPaths.intent(root))) intentReads += 1;
+    if (resolved === path.resolve(sqliteResetPaths.active(root))) authorityOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    expect((await loadState(root, STREAM, () => undefined, mutex)).stateNonce).toBe(NONCE);
+    expect(intentReads).toBe(1);
+    expect(authorityOpens).toBe(1);
+  } finally {
+    observed.mockRestore();
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    expect(fs.existsSync(`${sqliteResetPaths.active(root)}${suffix}`)).toBeFalse();
+  }
 });
 
 test("a different stream refuses on the SQLite backend too", async () => {

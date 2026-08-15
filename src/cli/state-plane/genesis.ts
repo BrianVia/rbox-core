@@ -10,6 +10,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
+import { assertHealthyOwnedSyncMutex } from "../sync-mutex.js";
 import { loadConfigIfPresent, syncStreamId } from "../workspace-config.js";
 import { AUTHORITY_MARKER_BYTES, authorityMarkerBytes, classifyStateFormat } from "./authority-marker.js";
 import { StateAuthorityCorruptError } from "./errors.js";
@@ -80,7 +81,7 @@ export async function establish(
   const intent: GenesisIntent = { version: 1, ...ids, evidence, staging };
   await publishIntent(root, intent);
   buildStagedStore(root, intent);
-  return placeAndPublish(root, intent, faults);
+  return placeAndPublish(root, intent, locks, faults);
 }
 
 /** Step 1. Nothing is mutated on any branch. */
@@ -125,7 +126,7 @@ async function resume(
   if (inodeOf(active)) {                                                          // case 2, else case 6
     if (!isFinishedGenesis(active, intent, live)) throw corrupt(root, "an unrecorded database holds the active path");
     await sealAtRest(active);
-    return finishWithQ(root, intent, faults);
+    return finishWithQ(root, intent, locks, faults);
   }
   const staged = genesisPaths.staged(root, intent.authorityId);
   const found = inodeOf(staged);
@@ -135,7 +136,7 @@ async function resume(
     await truncateRecordedInode(staged, intent.staging);
     buildStagedStore(root, intent);
   }
-  return placeAndPublish(root, intent, faults);                                    // case 3, clean
+  return placeAndPublish(root, intent, locks, faults);                             // case 3, clean
 }
 
 /** Step 2. A crash here leaves a zero-byte file no record names; nothing sweeps it. */
@@ -173,15 +174,19 @@ function buildStagedStore(root: string, intent: GenesisIntent): void {
 }
 
 /** Steps 5 through 7. */
-async function placeAndPublish(root: string, intent: GenesisIntent, faults: GenesisFaults): Promise<GenesisOutcome> {
+async function placeAndPublish(
+  root: string, intent: GenesisIntent, locks: HeldStatePlaneLocks, faults: GenesisFaults,
+): Promise<GenesisOutcome> {
   const staged = genesisPaths.staged(root, intent.authorityId);
   await sealAtRest(staged);
   await fsp.rename(staged, sqliteResetPaths.active(root));
   await fsyncDirectory(sqliteResetPaths.stateRoot(root));
-  return finishWithQ(root, intent, faults);
+  return finishWithQ(root, intent, locks, faults);
 }
 
-async function finishWithQ(root: string, intent: GenesisIntent, faults: GenesisFaults): Promise<GenesisOutcome> {
+async function finishWithQ(
+  root: string, intent: GenesisIntent, locks: HeldStatePlaneLocks, faults: GenesisFaults,
+): Promise<GenesisOutcome> {
   const sibling = genesisPaths.qSibling(root, intent.authorityId);
   await writeAuthorityMarker(sibling, intent.authorityId);                        // step 6
   await faults.afterQPrepared?.();
@@ -189,6 +194,8 @@ async function finishWithQ(root: string, intent: GenesisIntent, faults: GenesisF
   if (!live || evidenceKey(live) !== evidenceKey(intent.evidence)) {
     throw corrupt(root, "this workspace's evidence changed while genesis was running");
   }
+  await assertHealthyOwnedSyncMutex(locks.mutex, root);
+  if (!await locks.stateLock.isOwner()) throw new Error("genesis publication refused: state lock ownership was lost");
   // The literal final operation before the rename, with nothing between them.
   // Each format gets `resume`'s answer, not one collapsed refusal: only `"json"`
   // is a legacy workspace. A marker or a foreign artifact appearing here would
@@ -388,4 +395,3 @@ function inodeOf(file: string): ClaimedInode | undefined {
 function sameInode(found: ClaimedInode | undefined, expected: ClaimedInode): boolean {
   return found?.dev === expected.dev && found.ino === expected.ino;
 }
-

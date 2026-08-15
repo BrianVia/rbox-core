@@ -36,7 +36,7 @@ import os from "node:os";
 import path from "node:path";
 import { checkStateMigration } from "../doctor-state-plane.js";
 import { saveConfig, type WorkspaceConfig } from "../workspace-config.js";
-import { assertAuthorityWritable } from "./authority-bootstrap.js";
+import { assertAuthorityWritable, selectStateAuthority } from "./authority-bootstrap.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { establish, readGenesisIntent, type GenesisIds } from "./genesis.js";
@@ -45,14 +45,17 @@ import { inodeOf as inodeKey, replaceUnderNewInode } from "./migration/inode-fix
 import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { openStateStore, stateStoreDatabase } from "./store/open.js";
 
-// The branded lock witness, constructed rather than acquired. This is §7.9's
-// enumerated test exception to the cast gate, and the repo convention at ten
-// other sites. It is sound HERE for one specific reason, not by habit:
-// `establish` takes the bundle as proof-of-exclusivity and never reads a member
-// of it, so a real bundle and this one are indistinguishable to the code under
-// test. The migration child takes the trouble to acquire a real bundle because
-// it drives a whole command that DOES pass locks onward.
-const LOCKS = {} as Parameters<typeof establish>[2];
+// Protocol-only tests use an owned in-memory witness. Real-entry and lock tests
+// separately prove acquisition; these rows need publication checks to pass so
+// they can isolate the crash protocol.
+function publicationLocks(root: string): Parameters<typeof establish>[2] {
+  const lock = { isOwner: async () => true };
+  return {
+    mutex: { root, incarnation: "genesis-crash-test", released: false, lock },
+    stateLock: lock,
+    underRepositoryFence: true,
+  } as Parameters<typeof establish>[2];
+}
 const SIDECARS = ["-wal", "-shm", "-journal"];
 const hex32 = (): string => randomBytes(16).toString("hex");
 const freshIds = (): GenesisIds => ({ authorityId: hex32(), lineageId: hex32() });
@@ -79,24 +82,45 @@ fs.writeFileSync(CHILD, `
 import fs from "node:fs";
 import { establish } from ${JSON.stringify(path.join(import.meta.dir, "genesis.ts"))};
 const [root, authorityId, lineageId, specJson] = process.argv.slice(2);
+const lock = { isOwner: async () => true };
+const locks = { mutex: { root, incarnation: "crash-child", released: false, lock }, stateLock: lock, underRepositoryFence: true };
 const spec = JSON.parse(specJson);
 const table = fs.promises;
-const call = table[spec.syscall];
 let matched = 0;
 let fired = false;
-table[spec.syscall] = function patched(...args) {
-  const subject = args.filter((a) => typeof a === "string").join("\\u0000");
-  if (spec.match !== undefined && !new RegExp(spec.match).test(subject)) return call.apply(this, args);
-  matched += 1;
-  if (matched !== (spec.nth ?? 1)) return call.apply(this, args);
-  fired = true;
-  if (spec.when === "before") process.kill(process.pid, "SIGKILL");
-  return Promise.resolve(call.apply(this, args)).then((value) => {
-    process.kill(process.pid, "SIGKILL");
-    return value;
-  });
-};
-try { await establish(root, () => ({ authorityId, lineageId }), {}); } catch (error) { console.error(String(error)); }
+if (spec.syscall === "dirsync") {
+  const call = table.open;
+  table.open = async function patchedOpen(...args) {
+    const handle = await call.apply(this, args);
+    const subject = args.filter((a) => typeof a === "string").join("\\u0000");
+    if (spec.match !== undefined && !new RegExp(spec.match).test(subject)) return handle;
+    matched += 1;
+    if (matched !== (spec.nth ?? 1)) return handle;
+    const sync = handle.sync.bind(handle);
+    handle.sync = async () => {
+      fired = true;
+      if (spec.when === "before") process.kill(process.pid, "SIGKILL");
+      await sync();
+      process.kill(process.pid, "SIGKILL");
+    };
+    return handle;
+  };
+} else {
+  const call = table[spec.syscall];
+  table[spec.syscall] = function patched(...args) {
+    const subject = args.filter((a) => typeof a === "string").join("\\u0000");
+    if (spec.match !== undefined && !new RegExp(spec.match).test(subject)) return call.apply(this, args);
+    matched += 1;
+    if (matched !== (spec.nth ?? 1)) return call.apply(this, args);
+    fired = true;
+    if (spec.when === "before") process.kill(process.pid, "SIGKILL");
+    return Promise.resolve(call.apply(this, args)).then((value) => {
+      process.kill(process.pid, "SIGKILL");
+      return value;
+    });
+  };
+}
+try { await establish(root, () => ({ authorityId, lineageId }), locks); } catch (error) { console.error(String(error)); }
 if (!fired) { console.error("fault point never matched: " + specJson); process.exit(65); }
 process.exit(0);
 `);
@@ -123,11 +147,14 @@ const BEFORE_STEP_7: KillPoint = { syscall: "realpath", nth: 2, when: "before" }
 /** The in-process half of the same primitive, for errno injection on the
  * promise surface. `hit` inspects the raw arguments rather than a joined string
  * because two different calls open the same pathname with different flags. */
-function patchPromise(name: "open", hit: (args: unknown[]) => boolean, nth: number, act: () => never): () => void {
+type OpenArgs = Parameters<typeof fs.promises.open>;
+type OpenResult = ReturnType<typeof fs.promises.open>;
+
+function patchPromise(name: "open", hit: (args: OpenArgs) => boolean, nth: number, act: () => never): () => void {
   const table = fs.promises;
-  const call = table[name] as (...args: unknown[]) => unknown;
+  const call = table[name] as (...args: OpenArgs) => OpenResult;
   let matched = 0;
-  const patched = function (this: unknown, ...args: unknown[]): unknown {
+  const patched = function (this: typeof table, ...args: OpenArgs): OpenResult {
     if (!hit(args)) return call.apply(this, args);
     matched += 1;
     if (matched !== nth) return call.apply(this, args);
@@ -150,7 +177,7 @@ const errno = (c: string): never => { throw Object.assign(new Error(`${c}: injec
  * `workspace.json` is genesis's INPUT and embeds the workspace's own path, so
  * it is compared by presence.
  */
-function residueShape(root: string): Record<string, string> {
+function expectedResidue(root: string): Record<string, string> {
   const residue = rboxResidue(root);
   const active = sqliteResetPaths.active(root);
   const key = path.relative(path.join(root, ".rbox"), active);
@@ -178,14 +205,14 @@ function storeTuple(file: string): string {
  * must land on. */
 async function uninterrupted(ids: GenesisIds): Promise<Record<string, string>> {
   const root = await workspace();
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "established", authorityId: ids.authorityId });
-  return residueShape(root);
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "established", authorityId: ids.authorityId });
+  return expectedResidue(root);
 }
 
 test("G1: a full genesis publishes Q, retires the intent, and leaves no migration artifact", async () => {
   const root = await workspace();
   const ids = freshIds();
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "established", authorityId: ids.authorityId });
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "established", authorityId: ids.authorityId });
 
   const paths = rboxResiduePaths(root);
   expect(paths).toEqual(["state.json", "state/state.db", "workspace.json"]);
@@ -215,10 +242,10 @@ test("G2 case 2: killed after the active rename, the resume lands on the uninter
   expect(fs.existsSync(sqliteResetPaths.active(root))).toBe(true);
   expect(readGenesisIntent(root)?.authorityId).toBe(ids.authorityId);
 
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "established", authorityId: ids.authorityId });
-  expect(residueShape(root)).toEqual(await uninterrupted(ids));
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "established", authorityId: ids.authorityId });
+  expect(expectedResidue(root)).toEqual(await uninterrupted(ids));
   // The comparison has teeth: a different authority id is a different tree.
-  expect(residueShape(root)).not.toEqual(await uninterrupted(freshIds()));
+  expect(expectedResidue(root)).not.toEqual(await uninterrupted(freshIds()));
 }, 30_000);
 
 test("G2 case 3-clean: killed before the staged seal, the resume lands on the uninterrupted tree", async () => {
@@ -230,8 +257,8 @@ test("G2 case 3-clean: killed before the staged seal, the resume lands on the un
   expect(fs.existsSync(sqliteResetPaths.active(root))).toBe(false);
   expect(fs.statSync(staged).size).toBeGreaterThan(0);
 
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "established", authorityId: ids.authorityId });
-  expect(residueShape(root)).toEqual(await uninterrupted(ids));
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "established", authorityId: ids.authorityId });
+  expect(expectedResidue(root)).toEqual(await uninterrupted(ids));
 }, 30_000);
 
 test("G2 case 3-unopenable: the recorded inode survives the repair, and unlinking it halts", async () => {
@@ -243,11 +270,11 @@ test("G2 case 3-unopenable: the recorded inode survives the repair, and unlinkin
   expect(fs.statSync(staged).size).toBe(0); // the intent is durable, the database is not
   const recorded = inodeKey(staged);
 
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "established", authorityId: ids.authorityId });
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "established", authorityId: ids.authorityId });
   // C3: `ftruncate` in place, never unlink — the active path holds the RECORDED
   // inode, so a second kill reads case 3 again and never case 6.
   expect(inodeKey(sqliteResetPaths.active(root))).toBe(recorded);
-  expect(residueShape(root)).toEqual(await uninterrupted(ids));
+  expect(expectedResidue(root)).toEqual(await uninterrupted(ids));
 
   // Negative control: r3's remedy. Unlink the recorded inode, let the rebuild
   // recreate the staged path, and the identical workspace that just succeeded
@@ -258,7 +285,7 @@ test("G2 case 3-unopenable: the recorded inode survives the repair, and unlinkin
   const controlStaged = genesisPaths.staged(control, controlIds.authorityId);
   const controlRecorded = inodeKey(controlStaged);
   expect(replaceUnderNewInode(controlStaged, "", { mode: 0o600 })).not.toBe(controlRecorded);
-  await expect(establish(control, () => controlIds, LOCKS)).rejects.toThrow(StateAuthorityCorruptError);
+  await expect(establish(control, () => controlIds, publicationLocks(control))).rejects.toThrow(StateAuthorityCorruptError);
 }, 40_000);
 
 test("G2 case 4: nothing durable followed the intent — rebuild under a fresh authority id", async () => {
@@ -277,16 +304,16 @@ test("G2 case 4: nothing durable followed the intent — rebuild under a fresh a
   fs.unlinkSync(genesisPaths.staged(root, dead.authorityId));
 
   const reborn = freshIds();
-  expect(await establish(root, () => reborn, LOCKS)).toEqual({ kind: "established", authorityId: reborn.authorityId });
+  expect(await establish(root, () => reborn, publicationLocks(root))).toEqual({ kind: "established", authorityId: reborn.authorityId });
   expect(fs.readFileSync(statePath(root))).toEqual(authorityMarkerBytes(reborn.authorityId));
-  expect(residueShape(root)).toEqual(await uninterrupted(reborn));
+  expect(expectedResidue(root)).toEqual(await uninterrupted(reborn));
 }, 30_000);
 
 test("G3: an L published between step 6's fsync and step 7's rename refuses and renames nothing", async () => {
   const root = await workspace();
   const ids = freshIds();
   const legacy = '{"lastSyncedSequence":7}';
-  const outcome = await establish(root, () => ids, LOCKS, {
+  const outcome = await establish(root, () => ids, publicationLocks(root), {
     afterQPrepared: async () => { await fsp.writeFile(statePath(root), legacy); },
   });
 
@@ -303,10 +330,10 @@ test("G3: an L published between step 6's fsync and step 7's rename refuses and 
   const control = await workspace();
   const controlIds = freshIds();
   const restore = patchPromise(
-    "open", (args) => args[0] === statePath(control) && typeof args[1] === "number", 2, () => errno("ENOENT"),
+    "open", (args) => args[0] === statePath(control) && args[1] === Number(args[1]), 2, () => errno("ENOENT"),
   );
   try {
-    expect(await establish(control, () => controlIds, LOCKS, {
+    expect(await establish(control, () => controlIds, publicationLocks(control), {
       afterQPrepared: async () => { await fsp.writeFile(statePath(control), legacy); },
     })).toEqual({ kind: "established", authorityId: controlIds.authorityId });
   } finally {
@@ -330,10 +357,10 @@ test("G4: killed after the authority rename, the write fence refuses until recov
   expect(refusal).toBeInstanceOf(StateWriteRefusedError);
   expect((refusal as StateWriteRefusedError).reason).toBe("authority-recovery-pending");
 
-  expect(await establish(root, () => ids, LOCKS)).toEqual({ kind: "already-established" });
+  expect(await establish(root, () => ids, publicationLocks(root))).toEqual({ kind: "already-established" });
   expect(readGenesisIntent(root)).toBeUndefined();
   expect(() => assertAuthorityWritable(root)).not.toThrow(); // writes then flow
-  expect(residueShape(root)).toEqual(await uninterrupted(ids));
+  expect(expectedResidue(root)).toEqual(await uninterrupted(ids));
 
   // Negative control: the fence's condition is the surviving intent and nothing
   // else. Remove it from an identically crashed workspace and the write lands
@@ -345,10 +372,84 @@ test("G4: killed after the authority rename, the write fence refuses until recov
   expect(() => assertAuthorityWritable(control)).not.toThrow();
 }, 40_000);
 
+const pathPattern = (file: string): string => `${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\u0000|$)`;
+
+async function convergePostQ(root: string, ids: GenesisIds): Promise<void> {
+  if (readGenesisIntent(root)) {
+    expect(await establish(root, () => freshIds(), publicationLocks(root)))
+      .toEqual({ kind: "already-established" });
+  } else {
+    expect(await selectStateAuthority(root)).toEqual({
+      kind: "sqlite-store", format: "authority-marker", authorityId: ids.authorityId,
+    });
+  }
+  expect(fs.readFileSync(statePath(root))).toEqual(authorityMarkerBytes(ids.authorityId));
+  expect(readGenesisIntent(root)).toBeUndefined();
+  expect(rboxResiduePaths(root)).toEqual(["state.json", "state/state.db", "workspace.json"]);
+  expect(() => assertAuthorityWritable(root)).not.toThrow();
+}
+
+test("G4 restart cells converge across every post-Q cleanup durability boundary", async () => {
+  // Repeated `.rbox` fsync after proving Q + DB, before owned cleanup.
+  {
+    const root = await workspace();
+    const ids = freshIds();
+    crash(root, ids, AFTER_Q_RENAME);
+    crash(root, ids, { syscall: "dirsync", match: pathPattern(path.join(root, ".rbox")), when: "after" });
+    await convergePostQ(root, ids);
+  }
+
+  // An owned sibling can reappear when its unlink was not parent-fsynced, or
+  // stay absent. Exercise both durability outcomes, then the durable unlink.
+  for (const reappears of [true, false]) {
+    const root = await workspace();
+    const ids = freshIds();
+    crash(root, ids, AFTER_Q_RENAME);
+    const sibling = genesisPaths.qSibling(root, ids.authorityId);
+    const bytes = fs.readFileSync(statePath(root));
+    fs.writeFileSync(sibling, bytes);
+    crash(root, ids, { syscall: "rm", match: pathPattern(sibling), when: "after" });
+    if (reappears) fs.writeFileSync(sibling, bytes);
+    await convergePostQ(root, ids);
+  }
+  {
+    const root = await workspace();
+    const ids = freshIds();
+    crash(root, ids, AFTER_Q_RENAME);
+    fs.copyFileSync(statePath(root), genesisPaths.qSibling(root, ids.authorityId));
+    crash(root, ids, {
+      syscall: "dirsync", match: pathPattern(path.join(root, ".rbox")), nth: 2, when: "after",
+    });
+    await convergePostQ(root, ids);
+  }
+
+  // The intent unlink has the same two pre-fsync durability outcomes. Once its
+  // state-directory fsync completes, settled Q is the entire restart answer.
+  for (const reappears of [true, false]) {
+    const root = await workspace();
+    const ids = freshIds();
+    crash(root, ids, AFTER_Q_RENAME);
+    const intent = genesisPaths.intent(root);
+    const bytes = fs.readFileSync(intent);
+    crash(root, ids, { syscall: "rm", match: pathPattern(intent), when: "after" });
+    if (reappears) fs.writeFileSync(intent, bytes);
+    await convergePostQ(root, ids);
+  }
+  {
+    const root = await workspace();
+    const ids = freshIds();
+    crash(root, ids, AFTER_Q_RENAME);
+    crash(root, ids, {
+      syscall: "dirsync", match: pathPattern(sqliteResetPaths.stateRoot(root)), nth: 2, when: "after",
+    });
+    await convergePostQ(root, ids);
+  }
+}, 40_000);
+
 test("G5: a complete genesis database copied from another workspace never publishes Q", async () => {
   const donor = await workspace();
   const donorIds = freshIds();
-  await establish(donor, () => donorIds, LOCKS);
+  await establish(donor, () => donorIds, publicationLocks(donor));
 
   const root = await workspace();
   fs.copyFileSync(sqliteResetPaths.active(donor), sqliteResetPaths.active(root));
@@ -356,7 +457,7 @@ test("G5: a complete genesis database copied from another workspace never publis
 
   // G5 asserts a REFUSAL (222 §7.1) — the machine's answer to the copy, not
   // silence; F5/F6 are the rows that assert silence.
-  expect(await establish(root, () => freshIds(), LOCKS)).toEqual({ kind: "refused", reason: "artifact-present" });
+  expect(await establish(root, () => freshIds(), publicationLocks(root))).toEqual({ kind: "refused", reason: "artifact-present" });
   expect(rboxResidue(root)).toEqual(before); // zero writes
   expect(fs.existsSync(statePath(root))).toBe(false); // no Q published
 
@@ -381,7 +482,7 @@ test("G6: foreign-id strands and a foreign-evidence intent are never adopted and
   expect(readGenesisIntent(root)).toBeUndefined(); // nothing names it
 
   const live = freshIds();
-  expect(await establish(root, () => live, LOCKS)).toEqual({ kind: "established", authorityId: live.authorityId });
+  expect(await establish(root, () => live, publicationLocks(root))).toEqual({ kind: "established", authorityId: live.authorityId });
   expect(fs.existsSync(strand)).toBe(true); // U3 grants no deletion authority
   expect(fs.statSync(strand).size).toBe(0);
   // FINDING against §7.1's G6 row ("reported by doctor as an inert artifact"):
@@ -403,7 +504,7 @@ test("G6: foreign-id strands and a foreign-evidence intent are never adopted and
   const foreignSibling = genesisPaths.qSibling(carried, donorIds.authorityId);
   fs.copyFileSync(donorSibling, foreignSibling);
   const carriedIds = freshIds();
-  expect(await establish(carried, () => carriedIds, LOCKS))
+  expect(await establish(carried, () => carriedIds, publicationLocks(carried)))
     .toEqual({ kind: "established", authorityId: carriedIds.authorityId });
   expect(fs.readFileSync(foreignSibling)).toEqual(authorityMarkerBytes(donorIds.authorityId));
   expect(fs.readFileSync(statePath(carried))).toEqual(authorityMarkerBytes(carriedIds.authorityId));
@@ -414,7 +515,7 @@ test("G6: foreign-id strands and a foreign-evidence intent are never adopted and
   fs.copyFileSync(genesisPaths.intent(donor), genesisPaths.intent(copied));
   fs.copyFileSync(sqliteResetPaths.active(donor), sqliteResetPaths.active(copied));
   const untouched = rboxResidue(copied);
-  await expect(establish(copied, () => freshIds(), LOCKS)).rejects.toThrow(StateAuthorityCorruptError);
+  await expect(establish(copied, () => freshIds(), publicationLocks(copied))).rejects.toThrow(StateAuthorityCorruptError);
   expect(rboxResidue(copied)).toEqual(untouched); // zero writes, nothing deleted
   expect(fs.existsSync(statePath(copied))).toBe(false);
   expect(checkStateMigration(copied)).toMatchObject({ ok: false, status: "state-genesis/unfinished" });
@@ -425,12 +526,12 @@ test("ENOSPC at the intent write leaves an unowned zero-byte staged file and not
   const ids = freshIds();
   const restore = patchPromise(
     "open",
-    (args) => typeof args[0] === "string" && args[0].endsWith("genesis-v1.json") && args[1] === "w",
+    (args) => args[0] === String(args[0]) && args[0].endsWith("genesis-v1.json") && args[1] === "w",
     1,
     () => errno("ENOSPC"),
   );
   try {
-    await expect(establish(root, () => ids, LOCKS)).rejects.toThrow(/ENOSPC/);
+    await expect(establish(root, () => ids, publicationLocks(root))).rejects.toThrow(/ENOSPC/);
   } finally {
     restore();
   }
@@ -458,6 +559,6 @@ test("every crash between the staged claim and the intent leaks one zero-byte st
 
   // And a healthy genesis still completes over them, adopting none of them.
   const live = freshIds();
-  expect(await establish(root, () => live, LOCKS)).toEqual({ kind: "established", authorityId: live.authorityId });
+  expect(await establish(root, () => live, publicationLocks(root))).toEqual({ kind: "established", authorityId: live.authorityId });
   expect(rboxResiduePaths(root).filter((p) => p.includes("state.db.genesis."))).toHaveLength(crashes);
 }, 40_000);

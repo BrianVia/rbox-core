@@ -136,7 +136,13 @@ let daemons: DaemonInternals[];
 beforeEach(async () => {
   daemons = [];
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-activity-")));
-  await prepareDaemonFolderAdmission(root, testConfig());
+  const cfg = testConfig();
+  await prepareDaemonFolderAdmission(root, cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   await Promise.all(daemons.map((daemon) => daemon.stop().catch(() => {})));

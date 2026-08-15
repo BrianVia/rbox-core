@@ -3,9 +3,9 @@
  * §3.2 — 163's `MIGRATION-EXCLUSIVITY-v11` "parked car" rule).
  *
  * The repository fence is callback-scoped, so the bundle is a witness of what is
- * held rather than a set of handles. `withStatePlaneLocks` is its only mint
- * site: the brand below has no exported name, so no other module can construct
- * one without an explicit cast.
+ * held rather than a set of handles. The full and borrowed acquisitions below
+ * are its only mint sites: the brand has no exported name, so no other module
+ * can construct one without an explicit cast.
  */
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -18,6 +18,7 @@ import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-jo
 import { repoRecordsForState } from "../sync-state-model.js";
 import {
   acquireWorkspaceSyncMutex,
+  assertHealthyOwnedSyncMutex,
   releaseWorkspaceSyncMutex,
   workspaceSyncMutexDegraded,
   type SyncMutexOptions,
@@ -206,6 +207,28 @@ async function inspectInventory(root: string): Promise<Inventory> {
   };
 }
 
+/** Genesis never touches state-named repositories. Its fence only needs the
+ * durable stream and repositories named by a standing reset transaction. */
+async function inspectResetInventory(root: string): Promise<Inventory> {
+  const config = await loadConfigIfPresent(root).catch(() => undefined);
+  const stream = config ? syncStreamId(config) : undefined;
+  const journal = await readResetJournal(root);
+  const requests = new Map<string, RepositoryRequest>();
+  for (const entry of journal?.old.z ?? []) {
+    const relPath = `reset:${entry.repositoryIdentity.commonDirReal}`;
+    requests.set(relPath, {
+      relPath, commonDir: entry.repositoryIdentity.commonDirReal,
+      reflogRefs: [entry.activeRef, entry.recoveryRef].sort(), origins: true,
+      identityHash: repositoryIdentityHash(entry.repositoryIdentity),
+    });
+  }
+  return {
+    requests: [...requests.values()].sort((a, b) => a.relPath < b.relPath ? -1 : 1),
+    stream,
+    standingResetJournal: journal !== undefined,
+  };
+}
+
 /**
  * The inventory read's own refusal, carried out of the fence by an exception
  * because the two `inspectInventory` call sites sit at different depths. Minted
@@ -236,6 +259,48 @@ async function completeStandingReset(root: string, inventory: Inventory, stateLo
   if (!inventory.standingResetJournal) return;
   if (!inventory.stream) throw new Error("state-plane locks refused: reset recovery needs the durable config stream");
   await recoverResetJournalUnderHeldFence(root, inventory.stream, {}, stateLock);
+}
+
+type LockAttempt<T> = { readonly restart: true } | { readonly restart: false; readonly value: T };
+
+/** One common acquisition attempt. Callers own mutex acquisition/lifetime and
+ * choose the inventory appropriate to the operation; neither choice leaks as
+ * a public mode. */
+async function runLockAttempt<T>(
+  root: string,
+  mutex: WorkspaceSyncMutex,
+  read: (root: string) => Promise<Inventory>,
+  fn: (locks: HeldStatePlaneLocks) => Promise<T>,
+  options: StatePlaneLockOptions,
+  validateMutex?: () => Promise<void>,
+): Promise<LockAttempt<T>> {
+  await validateMutex?.();
+  await options.onStage?.("mutex");
+  const inventory = await read(root);
+  await options.onStage?.("inventory");
+  return withRepositoryRecoveryFence(inventory.requests, path.resolve(statePath(root)), async () => {
+    await options.onStage?.("fence");
+    const acquired = await acquireLock(stateLockPath(root));
+    if (acquired.status !== "acquired") {
+      throw new Error(`state-plane locks refused: the sync state lock is unavailable (${acquired.status})`);
+    }
+    const stateLock = acquired.lock;
+    try {
+      await options.onStage?.("state-lock");
+      if (inventoryFingerprint(await read(root)) !== inventoryFingerprint(inventory)) return { restart: true };
+      await options.onStage?.("fenced-recheck");
+      await completeStandingReset(root, inventory, stateLock);
+      await options.onStage?.("reset-recovery");
+      if (!await stateLock.isOwner()) throw new Error("state-plane locks refused: state lock ownership was lost");
+      await options.onStage?.("body");
+      const locks = {
+        mutex, stateLock, underRepositoryFence: true, [heldStatePlaneLocks]: true,
+      } satisfies HeldStatePlaneLocks;
+      return { restart: false, value: await fn(locks) };
+    } finally {
+      await stateLock.release();
+    }
+  });
 }
 
 /**
@@ -275,34 +340,7 @@ export async function withStatePlaneLocks<T>(
           refusal: { code: "degraded-fence", detail: mutex.degraded?.reason ?? "identity-unavailable" },
         };
       }
-      await options.onStage?.("mutex");
-      const inventory = await readInventory(root);
-      await options.onStage?.("inventory");
-      const restart = await withRepositoryRecoveryFence(inventory.requests, path.resolve(statePath(root)), async () => {
-        await options.onStage?.("fence");
-        const acquired = await acquireLock(stateLockPath(root));
-        if (acquired.status !== "acquired") {
-          throw new Error(`state-plane locks refused: the sync state lock is unavailable (${acquired.status})`);
-        }
-        const stateLock = acquired.lock;
-        try {
-          await options.onStage?.("state-lock");
-          if (inventoryFingerprint(await readInventory(root)) !== inventoryFingerprint(inventory)) {
-            return { restart: true as const };
-          }
-          await options.onStage?.("fenced-recheck");
-          await completeStandingReset(root, inventory, stateLock);
-          await options.onStage?.("reset-recovery");
-          if (!await stateLock.isOwner()) throw new Error("state-plane locks refused: state lock ownership was lost");
-          await options.onStage?.("body");
-          const locks = {
-            mutex, stateLock, underRepositoryFence: true, [heldStatePlaneLocks]: true,
-          } satisfies HeldStatePlaneLocks;
-          return { restart: false as const, value: await fn(locks) };
-        } finally {
-          await stateLock.release();
-        }
-      });
+      const restart = await runLockAttempt(root, mutex, readInventory, fn, options);
       if (!restart.restart) return { held: true, value: restart.value };
     } catch (error) {
       if (error instanceof InventoryRefused) return { held: false, refusal: error.refusal };
@@ -310,6 +348,27 @@ export async function withStatePlaneLocks<T>(
     } finally {
       await releaseWorkspaceSyncMutex(mutex);
     }
+    if (attempt >= attempts) {
+      throw new Error(`state-plane locks refused: the workspace kept changing under the fence (${attempts} attempts)`);
+    }
+  }
+}
+
+/** Run genesis while borrowing the caller's live workspace mutex. The caller
+ * remains its sole owner and is responsible for releasing it. */
+export async function withGenesisAdmissionLocks<T>(
+  root: string,
+  heldMutex: WorkspaceSyncMutex,
+  fn: (locks: HeldStatePlaneLocks) => Promise<T>,
+  options: StatePlaneLockOptions = {},
+): Promise<T> {
+  const attempts = options.attempts ?? 3;
+  for (let attempt = 1; ; attempt++) {
+    const result = await runLockAttempt(
+      root, heldMutex, inspectResetInventory, fn, options,
+      () => assertHealthyOwnedSyncMutex(heldMutex, root),
+    );
+    if (!result.restart) return result.value;
     if (attempt >= attempts) {
       throw new Error(`state-plane locks refused: the workspace kept changing under the fence (${attempts} attempts)`);
     }

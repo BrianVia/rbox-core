@@ -46,6 +46,10 @@ const STATE_ORDER_OWNERS = new Map([
   ["src/cli/reset-quarantine.ts", new Set(["restoreResetQuarantineUnderFence"])],
   ["src/cli/reset-state.ts", new Set(["prepareResetArtifactsUnderFence", "resetSyncState"])],
   ["src/cli/state-plane/authority-marker.ts", new Set(["classifyStateFormat", "isSymbolicLinkAtPath"])],
+  ["src/cli/state-plane/authority-bootstrap.ts", new Set([
+    "admitGenesisAuthority",
+    "selectStateAuthority",
+  ])],
   ["src/cli/state-plane/adapters/legacy-json-publication.ts", new Set([
     "afterStatePublication",
     "publishWholeState",
@@ -63,8 +67,9 @@ const STATE_ORDER_OWNERS = new Map([
     "loadRawState",
     "loadState",
     "saveThroughStore",
-    "selectSqliteAuthority",
+    "selectAuthority",
   ])],
+  ["src/cli/state-plane/genesis.ts", new Set(["finishWithQ"])],
   // Design 163's authority flip. It reaches `.rbox/state.json` through a local
   // binding rather than a `statePath(...)` argument, so without this entry its
   // ordering — the sibling fence, the exact-sibling image, the revalidations,
@@ -77,11 +82,17 @@ const STATE_ORDER_OWNERS = new Map([
 ]);
 const STATE_ORDER_CALLEES = new Set([
   "acquireLock",
+  "admitGenesisAuthority",
+  "assertHealthyOwnedSyncMutex",
   "assertAuthorityWritable",
   "markResetLineageProvenance",
   "openAuthorityStore",
   "recoverStandingResetJournal",
-  "selectSqliteAuthority",
+  "readAuthorityMarkerId",
+  "readGenesisIntent",
+  "selectAuthority",
+  "selectStateAuthority",
+  "withGenesisAdmissionLocks",
   "afterStatePublication",
   "assertStatePublishable",
   "assertStateReadable",
