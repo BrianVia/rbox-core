@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { acquireLock } from "../engine/lockfile.js";
 import { withRepositoryRecoveryFence } from "../cli/sync-git/protocol-locks.js";
+import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
+import { StateWriteRefusedError } from "./state-plane/errors.js";
+import { sqliteResetPaths } from "./state-plane/paths.js";
+import { createStateStore } from "./state-plane/store/open.js";
 import {
   applyStateSavePacket,
   installGenesisResetStateUnderHeldLock,
@@ -74,6 +78,43 @@ test("ordinary state CAS preserves the canonical state.json bytes", async () => 
     stateRevision: 1,
     repoRecords: {},
   }, null, 2));
+});
+
+test("selected Q boundary returns the literal typed unsupported refusal without changing bytes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-state-store-q-unsupported-"));
+  try {
+    await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+    createStateStore(sqliteResetPaths.active(root), {
+      authorityId: "a".repeat(32),
+      lineageId: "b".repeat(32),
+      stream: "stream",
+      createdBy: "test",
+      stateNonce: "c".repeat(32),
+      stateRevision: 0,
+    }).close();
+    await fs.writeFile(statePath(root), authorityMarkerBytes("a".repeat(32)));
+    const beforeMarker = await fs.readFile(statePath(root));
+    const beforeStore = await fs.readFile(sqliteResetPaths.active(root));
+    const result = await applyStateSavePacket(root, {
+      expectedStream: "stream",
+      expectedNonce: "c".repeat(32),
+      sourceGlobalSeq: 1,
+      repos: [],
+    }, {
+      lock: {
+        identity: {
+          current: async () => { throw new Error("identity unavailable"); },
+          probe: async () => ({ status: "unknown" }),
+        },
+      },
+    });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") expect(result.error).toBeInstanceOf(StateWriteRefusedError);
+    expect(await fs.readFile(statePath(root))).toEqual(beforeMarker);
+    expect(await fs.readFile(sqliteResetPaths.active(root))).toEqual(beforeStore);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("held-lock reset genesis preserves state and incarnation marker bytes", async () => {

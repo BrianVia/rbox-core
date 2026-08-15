@@ -87,12 +87,14 @@ describe("manifest metadata packet semantics", () => {
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
   });
 
-  test("metadata rides the global despite pending projection; legacy drops it", async () => {
+  test("metadata rides the global despite pending projection; actual unsupported JSON fallback drops it", async () => {
     const clean = composeStateSavePacket(state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [], manifestSchema: 2, gitRepos: { r: section("c") } }, manifestMeta: meta, observedRepos: ["r"], values: { bases: { r: section("c") } } });
     expect(clean.global?.manifestMeta).toEqual(meta);
     const pending = composeStateSavePacket(state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [], manifestSchema: 2, gitRepos: { r: section("c") } }, manifestMeta: meta, observedRepos: ["r"], values: { bases: { r: section("c") }, pending: { r: section("e") } } });
     expect(pending.global?.manifestMeta).toEqual(meta);
-    const legacy = await saveStateSource(root, state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [] }, manifestMeta: meta, observedRepos: [], values: {} }, { forceLegacy: true });
+    const legacy = await saveStateSource(root, state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [] }, manifestMeta: meta, observedRepos: [], values: {} }, {
+      apply: async () => ({ status: "unsupported", error: new Error("lock unsupported") }),
+    });
     expect(legacy.manifestMeta).toBeUndefined();
   });
 

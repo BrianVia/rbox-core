@@ -12,13 +12,13 @@ export { statePath, stateLockPath } from "./state-plane/paths.js";
 export {
   applyStateSavePacket,
   ensureCapableStateLineage,
+  ensureTelemetryBindingId,
   loadRawState,
   loadState,
 } from "./state-plane/adapters/whole-state-compat.js";
 export {
   StreamMismatchError,
   assertResetIncarnationMarkerNormalized,
-  ensureTelemetryBindingId,
   installGenesisResetStateUnderHeldLock,
   saveState,
   saveStateUnsafeLegacyOrTest,

@@ -9,7 +9,7 @@
  * only this comparison proves the write seam preserves the JSON authority's
  * semantics.
  */
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +24,9 @@ import type {
 } from "../../sync-state-model.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
 import { applySavePacketToStore } from "../adapters/sqlite-state-save.js";
+import { authorityMarkerBytes } from "../authority-marker.js";
+import { StateWriteRefusedError } from "../errors.js";
+import { sqliteResetPaths } from "../paths.js";
 import type { ManifestHeader } from "../ports.js";
 import { createStateStore, openStateStore } from "./open.js";
 import { casOwnerTokenForTest } from "./owner-token-testkit.js";
@@ -294,4 +297,44 @@ test("adapter owns sealed-stage cleanup before CAS ownership and on unsupported 
   expect(result.status).toBe("unsupported");
   expect(fs.readdirSync(sqlRoot).filter((name) => name.startsWith("stage-"))).toEqual([]);
   readonly.close();
+});
+
+test("selected adapter refuses an unsupported Q lock with zero opens and byte-identical authority", async () => {
+  const sqlRoot = root("rbox-cas-sql-selected-unsupported-");
+  fs.mkdirSync(sqliteResetPaths.stateRoot(sqlRoot), { recursive: true });
+  createStateStore(sqliteResetPaths.active(sqlRoot), {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: STREAM,
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+  }).close();
+  fs.writeFileSync(statePath(sqlRoot), authorityMarkerBytes("a".repeat(32)));
+  const before = Object.fromEntries(fs.readdirSync(sqliteResetPaths.stateRoot(sqlRoot)).sort().map((name) => [
+    name,
+    fs.readFileSync(path.join(sqliteResetPaths.stateRoot(sqlRoot), name)).toString("base64"),
+  ]));
+  const active = path.resolve(sqliteResetPaths.active(sqlRoot));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const open = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    const result = await applyStateSavePacket(sqlRoot, jsonPacket(SEED, NONCE), {
+      lock: {
+        identity: {
+          current: async () => { throw new Error("identity unavailable"); },
+          probe: async () => ({ status: "unknown" }),
+        },
+      },
+    });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") expect(result.error).toBeInstanceOf(StateWriteRefusedError);
+    expect(storeOpens).toBe(0);
+    expect(Object.fromEntries(fs.readdirSync(sqliteResetPaths.stateRoot(sqlRoot)).sort().map((name) => [
+      name,
+      fs.readFileSync(path.join(sqliteResetPaths.stateRoot(sqlRoot), name)).toString("base64"),
+    ]))).toEqual(before);
+  } finally {
+    open.mockRestore();
+  }
 });

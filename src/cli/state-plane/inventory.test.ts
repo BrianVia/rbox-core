@@ -23,9 +23,9 @@ const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sw
 // 16,683 bytes when introduced; leave room for new guarded entry points. Raised
 // to 28 KiB by U3 wave 4A, which enrolled `flipAuthority` — the one rename that
 // elects SQLite — as an order-tracked owner, adding roughly 1 KiB of records.
-// This is a transport bound on the sweep's stdout, not a policy on how many
-// entry points may exist.
-const AST_SWEEP_MAX_BYTES = 28 * 1024;
+// SP-2 adds the selected telemetry entry's ordered calls. This is a transport
+// bound on the sweep's stdout, not a policy on how many entry points may exist.
+const AST_SWEEP_MAX_BYTES = 29 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -93,8 +93,9 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // selection re-read under that lock, and only then a database open.
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureJsonTelemetryId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 
   // Reset entry points — the same obligations, plus the ones that republish the
   // state document by renaming a prepared candidate over it.
@@ -245,7 +246,7 @@ describe("state barrier pinning inventory", () => {
   });
 
   test("inline CAS publication proves its callback and post-publication order", () => {
-    for (const symbol of ["applyLegacyJsonSavePacket", "ensureTelemetryBindingId"]) {
+    for (const symbol of ["applyLegacyJsonSavePacket", "ensureJsonTelemetryId"]) {
       const publish = requiredCall("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, "writeFileAtomic");
       const options = publish.arguments?.[2] ?? "";
       expect(options).toContain("beforeRename");

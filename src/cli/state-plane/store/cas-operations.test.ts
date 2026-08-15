@@ -21,7 +21,7 @@ import { applyLocalScan, invalidateLocalPlane } from "./local-plane.js";
 import { createStateStore, openStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
 import { beginRepoTransitionStage, type SealedRepoTransitionRef } from "./transition-stages.js";
-import { applyCasPacket, ensureTelemetryBindingId, type CasExpectation, type CasPacket } from "./write-packet.js";
+import { applyCasPacket, ensureStoreTelemetryBindingId, type CasExpectation, type CasPacket } from "./write-packet.js";
 import type { OwnedLockCasToken } from "./owner-token.js";
 import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
@@ -702,12 +702,35 @@ test("telemetry binding is a singleton transaction that preserves stateRevision"
   const { stages, handle } = workspace("rbox-cas-telemetry-");
   expect(applyCasPacket(handle, stages, packet(stages, handle, {})).status).toBe("accepted");
   const before = openReadSnapshot(handle).token;
-  const binding = ensureTelemetryBindingId(handle, STREAM);
-  expect(binding).toMatch(/^[0-9a-f]{16}$/);
-  expect(ensureTelemetryBindingId(handle, STREAM)).toBe(binding);
+  const binding = ensureStoreTelemetryBindingId(
+    handle,
+    STREAM,
+    OWNER,
+    () => Buffer.from("0011223344556677", "hex"),
+  );
+  expect(binding).toBe("0011223344556677");
+  expect(ensureStoreTelemetryBindingId(
+    handle,
+    STREAM,
+    OWNER,
+    () => Buffer.from("ffffffffffffffff", "hex"),
+  )).toBe(binding);
   const after = openReadSnapshot(handle).token;
-  expect(after.stateRevision).toBe(before.stateRevision);
-  expect(after.telemetryBindingId).toBe(binding);
-  expect(() => ensureTelemetryBindingId(handle, "other")).toThrow();
+  expect(after).toEqual({ ...before, telemetryBindingId: binding });
+  expect(() => ensureStoreTelemetryBindingId(handle, "other", OWNER)).toThrow();
+  handle.close();
+});
+
+test("telemetry rolls back when lock ownership is lost before commit", () => {
+  const { handle } = workspace("rbox-cas-telemetry-owner-lost-");
+  let checks = 0;
+  const owner = casOwnerTokenForTest(() => checks++ === 0);
+  expect(() => ensureStoreTelemetryBindingId(
+    handle,
+    STREAM,
+    owner,
+    () => Buffer.from("0011223344556677", "hex"),
+  )).toThrow("sync state telemetry lock ownership was lost");
+  expect(openReadSnapshot(handle).token.telemetryBindingId).toBeUndefined();
   handle.close();
 });

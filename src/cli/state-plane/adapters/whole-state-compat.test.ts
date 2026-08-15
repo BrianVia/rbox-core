@@ -17,6 +17,7 @@ import { acquireLock } from "../../../engine/lockfile.js";
 import { withProtocolLockClass } from "../../../cli/sync-git/protocol-locks.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../../sync-mutex.js";
 import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
+import { saveStateSource } from "../../sync-state.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
 import { authorityMarkerBytes, readAuthorityMarkerId } from "../authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError } from "../errors.js";
@@ -24,11 +25,13 @@ import { readGenesisIntent } from "../genesis-intent.js";
 import { rboxResidue } from "../migration/fault-rig.js";
 import { genesisPaths, sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { sqliteResetFacade } from "../reset/index.js";
+import * as storeFacade from "../store-facade.js";
 import {
   createStateStore, openStateStore, ownedStateStoreWriterForReset, stateStoreDatabase,
 } from "../store/open.js";
 import {
-  applyStateSavePacket, ensureCapableStateLineage, LEGACY_REJECTION_REASON, loadRawState, loadState,
+  applyStateSavePacket, ensureCapableStateLineage, ensureTelemetryBindingId,
+  LEGACY_REJECTION_REASON, loadRawState, loadState,
 } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_222::root";
@@ -380,6 +383,172 @@ test("a save on Q lands in the store and never republishes JSON", async () => {
   expect(await loadRawState(root)).toStrictEqual(result.state);
 });
 
+test("telemetry on Q mints once through the selected store without advancing state", async () => {
+  const root = await flipped("telemetry");
+  const before = await loadRawState(root);
+  const first = await ensureTelemetryBindingId(
+    root,
+    STREAM,
+    () => Buffer.from("0011223344556677", "hex"),
+  );
+  const second = await ensureTelemetryBindingId(
+    root,
+    STREAM,
+    () => Buffer.from("ffffffffffffffff", "hex"),
+  );
+  expect(first.bindingId).toBe("0011223344556677");
+  expect(second.bindingId).toBe(first.bindingId);
+  expect(first.state).toEqual({ ...before, telemetryBindingId: first.bindingId });
+  expect(second.state).toEqual(first.state);
+  expect(second.state.stateRevision).toBe(before?.stateRevision);
+  expect(fs.readFileSync(statePath(root))).toEqual(authorityMarkerBytes(AUTHORITY));
+  expect(ownedStateStoreWriterForReset(sqliteResetPaths.active(root))).toBeUndefined();
+});
+
+test("telemetry binding remains durable when post-commit materialization throws", async () => {
+  const root = await flipped("telemetry-post-commit");
+  const materialize = spyOn(storeFacade, "loadRawStateFromStore")
+    .mockImplementationOnce(() => { throw new Error("after telemetry commit"); });
+  try {
+    await expect(ensureTelemetryBindingId(
+      root,
+      STREAM,
+      () => Buffer.from("0011223344556677", "hex"),
+    )).rejects.toThrow("after telemetry commit");
+  } finally {
+    materialize.mockRestore();
+  }
+  expect((await loadRawState(root))?.telemetryBindingId).toBe("0011223344556677");
+  expect(ownedStateStoreWriterForReset(sqliteResetPaths.active(root))).toBeUndefined();
+});
+
+test("telemetry on Q rejects stream mismatch without changing the store", async () => {
+  const root = await flipped("telemetry-stream");
+  const before = snapshot(root);
+  await expect(ensureTelemetryBindingId(
+    root,
+    "https://api.test::other::root",
+    () => Buffer.from("0011223344556677", "hex"),
+  )).rejects.toThrow(`sync state belongs to stream ${STREAM}, not https://api.test::other::root`);
+  expect(snapshot(root)).toEqual(before);
+});
+
+test("telemetry on Q refuses a held lock before opening the store", async () => {
+  const root = await flipped("telemetry-held");
+  const held = await acquireLock(stateLockPath(root));
+  expect(held.status).toBe("acquired");
+  if (held.status !== "acquired") return;
+  const before = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    await expect(ensureTelemetryBindingId(root, STREAM)).rejects.toThrow("sync state telemetry lock unavailable");
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(before);
+  } finally {
+    observed.mockRestore();
+    await held.lock.release();
+  }
+});
+
+test("an unsupported Q save refuses before opening or mutating the store", async () => {
+  const root = await flipped("unsupported-save");
+  const before = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    const result = await applyStateSavePacket(root, packet(), {
+      lock: {
+        identity: {
+          current: async () => { throw new Error("identity unavailable"); },
+          probe: async () => ({ status: "unknown" }),
+        },
+      },
+    });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") {
+      expect(result.error).toBeInstanceOf(StateWriteRefusedError);
+      expect((result.error as StateWriteRefusedError).reason).toBe("state-lock-unavailable");
+    }
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(before);
+  } finally {
+    observed.mockRestore();
+  }
+});
+
+test("exact-Q saveStateSource refusal precedes the legacy JSON fallback writer", async () => {
+  const root = await flipped("unsupported-save-source");
+  const initial = (await loadRawState(root))!;
+  const before = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observedOpen = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  const unsupported = Object.assign(new Error("hard links unsupported"), { code: "EOPNOTSUPP" });
+  const observedLink = spyOn(fsp, "link").mockRejectedValue(unsupported);
+  try {
+    const refusal = await saveStateSource(root, initial, {
+      expectedStream: STREAM,
+      sourceGlobalSeq: 5,
+      globalManifest: packet().global!.manifest,
+      observedRepos: [],
+      values: {},
+    }).catch((error: Error) => error);
+    expect(refusal).toBeInstanceOf(StateWriteRefusedError);
+    expect((refusal as StateWriteRefusedError).reason).toBe("state-lock-unavailable");
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(before);
+    expect(fs.readFileSync(statePath(root))).toEqual(authorityMarkerBytes(AUTHORITY));
+    expect(Object.keys(snapshot(root)).some((name) => name.includes(".tmp-"))).toBeFalse();
+  } finally {
+    observedLink.mockRestore();
+    observedOpen.mockRestore();
+  }
+});
+
+test("a Q state-lock error refuses before opening or mutating the store", async () => {
+  const root = await flipped("error-save");
+  const before = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    const failure = Object.assign(new Error("lock I/O failed"), { code: "EIO" });
+    const result = await applyStateSavePacket(root, packet(), {
+      lock: {
+        identity: {
+          current: async () => ({ hostId: "aa", bootId: "bb", pid: 1, startTime: "1" }),
+          probe: async () => ({ status: "alive", startTime: "1" }),
+        },
+        hooks: { link: async () => { throw failure; } },
+      },
+    });
+    expect(result).toEqual({ status: "busy", detail: String(failure) });
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(before);
+  } finally {
+    observed.mockRestore();
+  }
+});
+
 test("a standing SQLite reset is recovered by the read, not reported as corruption", async () => {
   const root = await flipped("reset");
   await sqliteResetFacade.begin(root, "next", [], {
@@ -393,6 +562,58 @@ test("a standing SQLite reset is recovered by the read, not reported as corrupti
   expect(outcome, String(outcome)).toBeInstanceOf(StreamMismatchError); // the reset rebound the stream
   expect(fs.existsSync(sqliteResetPaths.journal(root))).toBe(false);
   expect((await loadState(root, "next")).stream).toBe("next");
+});
+
+test("D19: unsupported Q save refuses without mutation while reset recovery completes", async () => {
+  const root = await flipped("unsupported-reset-race");
+  await sqliteResetFacade.begin(root, "next", [], {
+    version: 2, authorizedNextStream: "next", consentKind: "setup-rebind", mintedAtRevision: 0,
+  });
+
+  let recoveryReady!: () => void;
+  const atReady = new Promise<void>((resolve) => { recoveryReady = resolve; });
+  let continueRecovery!: () => void;
+  const mayContinue = new Promise<void>((resolve) => { continueRecovery = resolve; });
+  const recovery = sqliteResetFacade.recover(root, STREAM, {
+    crashAt: async (point) => {
+      if (point !== "after-ready") return;
+      recoveryReady();
+      await mayContinue;
+    },
+  });
+  await atReady;
+
+  const beforeSave = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    const save = await applyStateSavePacket(root, packet(), {
+      lock: {
+        identity: {
+          current: async () => { throw new Error("identity unavailable"); },
+          probe: async () => ({ status: "unknown" }),
+        },
+      },
+    });
+    expect(save.status).toBe("unsupported");
+    if (save.status === "unsupported") expect(save.error).toBeInstanceOf(StateWriteRefusedError);
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(beforeSave);
+  } finally {
+    observed.mockRestore();
+  }
+  continueRecovery();
+  expect(await recovery).toBe("complete");
+
+  const installed = await loadState(root, "next");
+  expect(installed.lastSyncedSequence).toBe(0);
+  expect(installed.lastSyncedManifest.files).toEqual([]);
+  expect(fs.existsSync(sqliteResetPaths.journal(root))).toBeFalse();
 });
 
 // --- CasResult translation --------------------------------------------------
@@ -472,18 +693,18 @@ test("an unretired genesis intent refuses the save before anything opens the dat
   expect(after).toEqual(before);
 });
 
-test("the fence is called exactly once per save, and never through a static import", async () => {
+test("each selected write fences exactly once and never through a static import", async () => {
   const source = fs.readFileSync(COMPAT, "utf8");
-  expect(source.split("assertAuthorityWritable(").length - 1).toBe(1);
+  expect(source.split("assertAuthorityWritable(").length - 1).toBe(2);
   expect(source).toContain('await import("../authority-bootstrap.js")');
   // Both read paths take a read-only handle; only the save path takes the
   // writer. 163 v13 is specifically about what a READ is allowed to do.
   expect(source.match(/openAuthorityStore\(authority, true\)/g) ?? []).toHaveLength(2);
-  expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(1);
+  expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(2);
   expect(source).toContain("facade.openStateStore(authority.file, { readonly })");
-  // Four closes: the two read paths, the save, and the authority-id refusal
-  // that closes the handle it had to open to compare ids.
-  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(4);
+  // Five closes: the two read paths, save, telemetry, and the authority-id
+  // refusal that closes the handle it had to open to compare ids.
+  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(5);
   // A static import of either the coordinator or the store would drag
   // `bun:sqlite` into the CLI's eager graph, which `schema/inventory.test.ts`
   // forbids — and would stop the adapter being inert before the flip.
@@ -529,6 +750,32 @@ test("a held lock is reused when it is the state lock, and refused when it is no
     expect(result.status).toBe("accepted");
   } finally {
     await held.lock.release();
+  }
+});
+
+test("a lost held Q lock refuses before opening or mutating the store", async () => {
+  const root = await flipped("held-lock-lost");
+  const held = await acquireLock(stateLockPath(root));
+  expect(held.status).toBe("acquired");
+  if (held.status !== "acquired") return;
+  const before = snapshot(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const observed = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    await fsp.rm(held.lock.path);
+    const result = await withProtocolLockClass("state", path.resolve(statePath(root)), () =>
+      applyStateSavePacket(root, packet(), { heldLock: held.lock }));
+    expect(result).toEqual({ status: "busy", detail: "state lock ownership was lost" });
+    expect(storeOpens).toBe(0);
+    expect(snapshot(root)).toEqual(before);
+  } finally {
+    observed.mockRestore();
+    await held.lock.release().catch(() => undefined);
   }
 });
 

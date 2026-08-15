@@ -36,8 +36,8 @@ import {
   type SyncState,
 } from "../../sync-state-model.js";
 
-function isENOENT(e: unknown): boolean {
-  return (e as NodeJS.ErrnoException)?.code === "ENOENT";
+function isENOENT(error: Error): boolean {
+  return Reflect.get(error, "code") === "ENOENT";
 }
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
@@ -194,7 +194,7 @@ export async function applyLegacyJsonSavePacket(root: string, packet: StateSaveP
     // fallback baseline after an accepted save.
     await fsyncDirectory(path.dirname(statePath(root)));
     const markerExisted = await fs.lstat(stateIncarnationPath(root)).then(() => true, (error) => {
-      if (isENOENT(error)) return false;
+      if (error instanceof Error && isENOENT(error)) return false;
       throw error;
     });
     await fs.rm(stateIncarnationPath(root), { force: true });
@@ -231,7 +231,7 @@ export async function loadLegacyJsonState(
   await recoverStandingResetJournal(root, stream, heldMutex);
   const fresh = freshState(stream);
   const activePresent = await fs.lstat(statePath(root)).then(() => true, (error) => {
-    if (isENOENT(error)) return false;
+    if (error instanceof Error && isENOENT(error)) return false;
     throw error;
   });
   const loaded = await loadRawLegacyJsonState(root);
@@ -323,7 +323,7 @@ export async function saveStateUnsafeLegacyOrTest(root: string, state: SyncState
 }
 
 /** Initialize the telemetry binding identity under the same lock as transactional state writes. */
-export async function ensureTelemetryBindingId(
+export async function ensureJsonTelemetryId(
   root: string,
   stream: string,
   randomBytes: (size: number) => Buffer = crypto.randomBytes,

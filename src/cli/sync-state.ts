@@ -30,6 +30,7 @@ import {
   type SyncState,
 } from "./config.js";
 import { ResetCorruptionError } from "./reset-io.js";
+import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
 /** Planner-facing lane results. Persistence converts these to ordered
@@ -349,19 +350,18 @@ export async function saveStateSource(
   root: string,
   initialSnapshot: SyncState,
   source: StateSource,
-  options: { apply?: typeof applyStateSavePacket; allowLegacyStreamReplacement?: boolean; forceLegacy?: boolean } = {},
+  options: { apply?: typeof applyStateSavePacket; allowLegacyStreamReplacement?: boolean } = {},
 ): Promise<SyncState> {
-  if (options.forceLegacy) {
-    const next = legacyState(initialSnapshot, source);
-    await saveStateUnsafeLegacyOrTest(root, next);
-    return next;
-  }
   const apply = options.apply ?? applyStateSavePacket;
   let snapshot = initialSnapshot;
   for (let attempt = 0; attempt < 3; attempt++) {
     const result = await apply(root, composeStateSavePacket(snapshot, source));
     if (result.status === "accepted") return result.state;
     if (result.status === "unsupported") {
+      // Exact-Q lock refusal is a typed state-plane barrier. It must escape
+      // before the JSON-only projection or writer is even reached. Legacy JSON
+      // keeps its raw unsupported result and therefore its established fallback.
+      rethrowIfStateBarrier(result.error);
       const next = legacyState(snapshot, source);
       await saveStateUnsafeLegacyOrTest(root, next);
       return next;
@@ -421,7 +421,6 @@ export async function savePublishedRepoIntent(
   snapshot: SyncState,
   relPath: string,
   intended: { record: RepoRecordInput; expectedRepoGen: number; relPath: string; previousRecord?: RepoRecordInput; baseProof?: RepoBaseProof },
-  options: { forceLegacy?: boolean } = {},
 ): Promise<PublishedRepoIntentResult> {
   if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
   const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
@@ -543,16 +542,6 @@ export async function savePublishedRepoIntent(
       return { state: currentSnapshot, disposition: superseded ? "superseded" : "already-semantic" };
     }
 
-    if (options.forceLegacy) {
-      const records = repoRecordsForState(currentSnapshot);
-      records[relPath] = { ...sanitizeRepoRecordInput(merged), repoGen: current.repoGen + 1 };
-      for (const [carriedRelPath, record] of Object.entries(records)) {
-        records[carriedRelPath] = { ...sanitizeRepoRecordInput(record), repoGen: record.repoGen };
-      }
-      const next = stateFromRepoRecords(currentSnapshot, records);
-      await saveStateUnsafeLegacyOrTest(root, next);
-      return { state: next, disposition: superseded ? "superseded" : "landed" };
-    }
     const result = await applyStateSavePacket(root, {
       expectedStream: currentSnapshot.stream,
       expectedNonce: expectedStateNonce(currentSnapshot),
@@ -588,7 +577,8 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     ...Object.keys(values.resolutionReceipt ?? {}),
     ...Object.keys(values.packedRefsIdentity ?? {}),
   ]);
-  const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  const same = <Left, Right>(a: Left, b: Right): boolean =>
+    JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   return [...keys].filter((relPath) => {
     const record = records[relPath];
     const receiptTransition = values.resolutionReceipt?.[relPath];

@@ -18,7 +18,7 @@
  * byte-identical across the read. Sidecar reaping is timing-sensitive, so each
  * case runs `ROUNDS` times rather than once.
  */
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -31,6 +31,7 @@ import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-
 import { materializeManifestFromStore } from "../adapters/read-only.js";
 import { applyStateSavePacket, loadRawState, loadState } from "../adapters/whole-state-compat.js";
 import { establishStateAuthority } from "../authority-bootstrap.js";
+import { StateWriteRefusedError } from "../errors.js";
 import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
 import { runMigration } from "../migration/authority.js";
 import { sqliteResetPaths } from "../paths.js";
@@ -136,6 +137,42 @@ test("applyStateSavePacket leaves the committed store at rest", async () => {
     expect(fs.existsSync(`${sqliteResetPaths.active(root)}-wal`)).toBe(false);
     expect(fs.existsSync(`${sqliteResetPaths.active(root)}-shm`)).toBe(false);
     expect((await inspectResetJournal(root, stream(root))).status).toBe("none");
+  }
+});
+
+test("unsupported Q save opens no store and leaves the complete workspace at rest", async () => {
+  const root = await migratedWorkspace();
+  const before = treeDigest(root);
+  const active = path.resolve(sqliteResetPaths.active(root));
+  const originalOpen = fs.openSync;
+  let storeOpens = 0;
+  const open = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+    if (path.resolve(String(file)) === active) storeOpens += 1;
+    return originalOpen(file, ...args);
+  }) as typeof fs.openSync);
+  try {
+    const result = await applyStateSavePacket(root, {
+      expectedStream: stream(root),
+      expectedNonce: NONCE,
+      sourceGlobalSeq: 5,
+      global: { manifest: { generatedAt: "2026-08-15T00:00:00.000Z", files: [] } },
+      repos: [],
+    }, {
+      lock: {
+        identity: {
+          current: async () => { throw new Error("identity unavailable"); },
+          probe: async () => ({ status: "unknown" }),
+        },
+      },
+    });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") expect(result.error).toBeInstanceOf(StateWriteRefusedError);
+    expect(storeOpens).toBe(0);
+    expect(treeDigest(root)).toEqual(before);
+    expect((await inspectResetJournal(root, stream(root))).status).toBe("none");
+  } finally {
+    open.mockRestore();
+    await fsp.rm(root, { recursive: true, force: true });
   }
 });
 
