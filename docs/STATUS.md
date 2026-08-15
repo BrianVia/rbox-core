@@ -5,6 +5,33 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_LATE-NIGHT CAP 2 (2026-08-15, same session, PRs #703-#732 = 30 merged):
+**Slop 3,421 → 2,216 (−35%)**; waves 5-6 + first two shape-names lanes
+merged (#725-#732; shape campaign is CODE-SYMBOL-ONLY by founder ruling —
+wire candidates parked in docs/wire-rename-candidates.md, 5 entries).
+**#42 IN FLIGHT with founder sign-off ("just delete it" / "start fresh")**
+— but field checks falsified the premise: the JSON→SQLite migration NEVER
+ran on any fleet host AND fresh joins still create legacy JSON (SQLite
+plane fully dormant; only rbox migrate / upgrade-window reach it). Design
+262 (worktree arch-42) therefore ships two PRs: PR-A = genesis-default
+flip (fresh joins → SQLite) then fleet cutover; PR-B = delete migration
+tree (44 files/13.7k lines) + legacy-json-store + refusal gate. Round-1
+reviews in arch-42/CODEX-262-{A,B}.md, both CHANGES-REQUIRED — fold next.
+**LIVE INCIDENT (desktop): start-fresh rebuild left ~/Development wedged**
+— state was rebuilt via rename-aside (.rbox.pre-sqlite-backup kept) +
+track --workspace + daemon; files safe and synced content intact, but the
+re-baseline push conflict-loops ("too many conflicts") EVEN WITH Mac+FM
+daemons paused (so not a race), and 103 git repos sit in keep-mine
+deferrals (daemon captured 99 but they carry pending, never settle).
+Mac+FM restarted read-write on 540e224 and healthy; desktop daemon left
+retrying. NEXT SESSION: state-surgery triage on the desktop publication
+refusal (grep daemon log for the per-attempt refusal; suspect carried-
+pending admission), then bulk keep-mine (list at scratchpad
+deferred-repos.txt, resolve refuses while daemon syncing — stop first),
+then fold 262 reviews. Telemetry recipe for device versions is in the
+262 evidence section (D1 devices table; 5 external 1.x hosts, one on
+1.6.6)._
+
 _NIGHT CAP (2026-08-14→15, arch-loop session, PRs #703-#727 = 25 merged):
 **ARCHITECTURE LOOP 11/12 DONE** (docs/ARCHITECTURE-LOOP.md is the ledger).
 Big cuts: #40 RefPlaneTransaction (follow.ts 1,210→247, PR #710), #41
