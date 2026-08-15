@@ -30,6 +30,19 @@ the FINALE of this loop, not a standalone PR. Slices, in order:
   guards), dispositions for the 12 external migration-importing tests,
   executable retirement gate, user-visible ledger incl. doctor flags.
 
+**Standing mandate (founder, 2026-08-15): every slice applies
+`simplify-codebase-primitives` to the SQLite modules it touches** — the v1
+SQLite plane (U1-U3) predates this session's type doctrine and the
+simplification bar. Concretely, per slice: (a) reduce concepts, not files —
+collapse ports/plans/receipts that merely relay one in-process call (skill
+rule 4); (b) true types throughout — the four anti-slop type rules land at
+ZERO in every touched store/codec module, JSON boundaries flow JsonValue,
+durable records are JSON-comparable aliases (the merged #711-#732 doctrine);
+(c) each slice's review verifies a concept-count delta, not just
+correctness — a slice that only relocates complexity is rejected per skill
+rule 5. The state plane should come out of this loop SMALLER and better
+typed than v1, not just reachable.
+
 Each slice is its own dev-cycle with its own review round. Original v1
 text below retained as the SP-4 specification baseline.
 Depends on: 163 (state-plane SQLite law), 222 (U3 implementation), 215/216/
