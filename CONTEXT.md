@@ -12,6 +12,20 @@ wins and the disagreement is noted. Paths are repo-relative.
 
 ## The push/pull spine
 
+**Publication** — the domain process taking one publish request through capture
+→ candidate → encrypt/upload → commit to a classified outcome, with publisher
+acknowledgement as the CONDITIONAL final leg: ordinary acceptance proceeds to
+`acknowledgePublishedGitTransitions` (`push.ts:927`); a resolution transition
+settles and returns WITHOUT publisher ack (`push.ts:863`) — that terminal branch
+is part of the contract, not an exception to it. Its owner is `pushManifest` →
+`pushManifestInner` (`sync/push.ts`): the bounded in-process retry loop
+(`RecoveryAction`, `push.ts:173`; the `for(;;)` at :354; `PushAttemptState` :425)
+IS the module; its legs are the four deep owners (`publish-candidate` →
+`manifest-commit-executor` → `publisher-ack-transition`, spans via `PushSpans`).
+In-process bounded retry lives inside; the daemon's long-horizon retry (recovery
+probe, git-busy ladder) lives outside by design (`push.ts:296-300`). One
+publication = one `pushManifest` call.
+
 **manifest** — a point-in-time snapshot of a workspace tree's syncable state:
 `{generatedAt, files, manifestSchema?, gitRepos?}`, encrypted client-side into a
 blob addressed by `encManifestSha`. Owner: `src/engine/types.ts`,
@@ -86,7 +100,8 @@ four at once.
 **deferral** — a durable per-repo, per-lane refusal: one `GitDeferral` per
 `(repo, lane)` with one classified `reason`, episode timestamps and `lastSeen`
 (`src/cli/sync-state-model.ts`). Set by `sync-git/apply.ts` and
-`git-capture-observation.ts`; cleared by publisher-ACK retirement and
+`git-capture-observation.ts`; cleared by publisher-ACK retirement (the
+conditional final leg of **Publication**) and
 `deferral-hygiene.ts`. **The lane is the dimension being refused, not a property
 of the deferral**: exactly three — `apply`, `capture`, `config` — held
 concurrently. 18 causes in `GIT_DEFERRAL_REASONS`; a *second*, deliberately
@@ -151,7 +166,7 @@ accounting off the PUT hot path — not a durable server row);
 `StandingBranchProofReceipt`; `PhaseReceipt`.
 
 **attempt** — one bounded execution with an identity. Two senses: the
-publish attempt (`sealPublishRequest(attemptId, …)`,
+publish attempt within **Publication** (`sealPublishRequest(attemptId, …)`,
 `src/cli/daemon/daemon-publish-transition.ts`) and the durable `GitHeldAttempt`
 that feeds held-skip.
 
@@ -164,8 +179,9 @@ precondition succeeds"* — on `stream`, `nonce`, `repo-generation`,
 **the identity-binding rule** — *an outcome bound to another attempt performs no
 transition.* Canonically: *"an outcome whose `attemptId` is not the one this
 transition sealed performs NO effect at all"* (`daemon-publish-transition.ts`).
-It is an **invariant with ~6 enforcement sites, not a shared helper**: publish
-transitions key on `attemptId`, `publish-candidate.ts` on `planId`,
+It is an **invariant with ~6 enforcement sites, not a shared helper**: on the
+push side, `publish-candidate.ts` binds `planId` and
+`daemon-publish-transition.ts` binds `attemptId`; elsewhere,
 `remote-repository-deletion.ts` on deletion identity, `follow-repo-transition.ts`
 and `standing-branch-proof.ts` on repository+`incomingKey`, state-plane packets
 on the CAS triple, and `src/engine/e2ee/keys.ts` refuses to unwrap a wrap bound

@@ -1,3 +1,10 @@
+/**
+ * Publication owns one pushManifest call from capture through classified outcome.
+ * Its bounded in-process retry loop stays inside this module; daemon long-horizon
+ * recovery-probe and git-busy retries stay outside. Publisher acknowledgement is
+ * conditional: ordinary acceptance acknowledges, while resolution transitions
+ * settle and return without it.
+ */
 import {
   canonicalManifestHashStreaming,
   diffManifests,

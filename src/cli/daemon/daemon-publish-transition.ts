@@ -3,7 +3,7 @@ import type { DaemonActivity } from "../activity.js";
 import { saveMetrics, type SyncMetrics } from "../metrics.js";
 import { CommitRejectedError } from "../remote.js";
 import { deferManifest } from "../sync-recovery.js";
-import type { PushManifestOptions, PushResult } from "../sync/push.js";
+import { localFileObservationForScan, type PushManifestOptions, type PushResult } from "../sync/push.js";
 import type { GitCaptureSample } from "../telemetry/contract.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { PushProvenance } from "./daemon.js";
@@ -76,9 +76,7 @@ export function sealPublishRequest(attemptId: string, inputs: PublishAttemptInpu
       ? deferManifest(inputs.manifest, inputs.appliedBase, inputs.gcFencedPaths)
       : inputs.manifest,
     blockedFingerprint: inputs.blockedFingerprint,
-    localFileObservation: inputs.observationComplete
-      ? { authority: "authoritative" }
-      : { authority: "preserve", caseCollisions: inputs.caseCollisions },
+    localFileObservation: localFileObservationForScan(inputs.observationComplete, inputs.caseCollisions),
   };
 }
 
