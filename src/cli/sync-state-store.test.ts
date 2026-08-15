@@ -214,3 +214,13 @@ test("an accepted state CAS publishes state.json's parent before retiring the in
     }
   });
 });
+
+test("selected replacement is private to sync-state and never widens the store facade", async () => {
+  const cli = path.dirname(new URL(import.meta.url).pathname);
+  const syncState = await fs.readFile(path.join(cli, "sync-state.ts"), "utf8");
+  const storeFacade = await fs.readFile(path.join(cli, "sync-state-store.ts"), "utf8");
+  const configFacade = await fs.readFile(path.join(cli, "config.ts"), "utf8");
+  expect(syncState.match(/\breplaceResetLineageStream\b/g)).toHaveLength(2);
+  expect(storeFacade).not.toContain("replaceResetLineageStream");
+  expect(configFacade).not.toContain("replaceResetLineageStream");
+});

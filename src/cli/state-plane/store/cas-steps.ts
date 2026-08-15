@@ -44,20 +44,17 @@ export interface FrozenCasInputs {
   globalHeader?: ManifestHeader;
   globalManifestMeta?: GlobalManifestMeta;
   globalBinding?: SourceStageBinding;
+  /** Existing stream admitted for the one reset-provenance replacement case. */
+  replacementOldStream?: string;
   ownerToken: CasOwnerToken;
 }
 
-/** Structural deep copy through the canonical codec: the result shares no object
- * identity with the caller's packet, so later mutation cannot reach it.
- *
- * The assertion is a documented leftover of the same boundary `digest/codecs.ts`
- * records: the canonical round trip IS the validator, and TypeScript cannot state
- * that a `JsonValue` is structurally the caller's `T`. Constraining `T` to
- * `JsonValue` would reject every interface-typed caller (`CasExpectation`,
- * `ManifestHeader`, `GlobalManifestMeta`), because an interface carries no index
- * signature — so the copy is typed from the input it was made of. */
-export const freezeValue = <T>(value: T): T =>
-  value === undefined ? value : parseCanonicalJson(canonicalJson(value)) as unknown as T;
+/** Canonical validated copy of the one nested packet value the caller owns. */
+export function freezeGlobalManifestMeta(value: GlobalManifestMeta): GlobalManifestMeta {
+  const copied = validManifestMeta(parseCanonicalJson(canonicalJson(value)));
+  if (!copied) throw new Error("not a valid GlobalManifestMeta");
+  return copied;
+}
 
 export class Rejected extends Error {
   constructor(readonly reason: CasRejectionReason) {
@@ -84,12 +81,13 @@ export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified:
   if (!row) throw new Error("state store singleton disappeared");
   const expected = frozen.expected;
   if (row.lineage_id !== expected.lineageId) reject("lineage");
-  if (row.stream !== expected.stream) reject("stream");
+  if (row.stream !== (frozen.replacementOldStream ?? expected.stream)) reject("stream");
   if ((row.state_nonce ?? "legacy") !== expected.nonce) reject("nonce");
   if ((row.state_revision ?? 0) !== expected.stateRevision) reject("state-revision");
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
   if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
+  if (frozen.replacementOldStream !== undefined && row.last_synced_sequence !== 0) reject("global-sequence");
   const drift = selectRow<{ rel_path: string }>(db, `SELECT t.rel_path FROM ${CAS_TRANSITION_TEMP} t
     WHERE t.expected_repo_gen <> COALESCE(
       (SELECT r.repo_gen FROM repo_records r WHERE r.lineage_id=? AND r.rel_path=t.rel_path), 0)

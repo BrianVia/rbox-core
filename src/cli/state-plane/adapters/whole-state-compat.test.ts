@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
 import { acquireLock } from "../../../engine/lockfile.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
 import { withProtocolLockClass } from "../../../cli/sync-git/protocol-locks.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../../sync-mutex.js";
 import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
@@ -24,6 +25,8 @@ import { StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError
 import { readGenesisIntent } from "../genesis-intent.js";
 import { rboxResidue } from "../migration/fault-rig.js";
 import { genesisPaths, sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
+import { stableDbHash } from "../reset/artifacts.js";
+import { markResetLineageProvenance } from "../reset-lineage.js";
 import { sqliteResetFacade } from "../reset/index.js";
 import * as storeFacade from "../store-facade.js";
 import {
@@ -31,7 +34,7 @@ import {
 } from "../store/open.js";
 import {
   applyStateSavePacket, ensureCapableStateLineage, ensureTelemetryBindingId,
-  LEGACY_REJECTION_REASON, loadRawState, loadState,
+  LEGACY_REJECTION_REASON, loadRawState, loadState, replaceResetLineageStream,
 } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_222::root";
@@ -50,6 +53,12 @@ async function workspace(prefix: string): Promise<string> {
   roots.push(root);
   await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
   return root;
+}
+
+async function withStateLock<T>(root: string, fn: (lock: OwnedLock) => Promise<T>): Promise<T> {
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  try { return await fn(acquired.lock); } finally { await acquired.lock.release(); }
 }
 
 async function configuredWorkspace(prefix: string): Promise<string> {
@@ -131,6 +140,28 @@ function snapshot(root: string): StateDirectoryBytes {
     out[name] = fs.statSync(entry).isDirectory() ? "<dir>" : fs.readFileSync(entry).toString("base64");
   }
   return out;
+}
+
+async function replacementFixture(label: string) {
+  const root = await workspace(`replacement-${label}`);
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId: AUTHORITY, lineageId: LINEAGE, stream: "old-stream",
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+    telemetryBindingId: "e".repeat(16),
+  }).close();
+  await fsp.writeFile(statePath(root), authorityMarkerBytes(AUTHORITY));
+  const hash = (await stableDbHash(sqliteResetPaths.active(root))).sha256;
+  const archive = sqliteResetPaths.archive(root, "d".repeat(32), hash);
+  await fsp.mkdir(path.dirname(archive), { recursive: true });
+  await fsp.copyFile(sqliteResetPaths.active(root), archive);
+  const authorized = await markResetLineageProvenance(root, {
+    stream: STREAM, stateNonce: NONCE, stateRevision: 0,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+    repoRecords: {},
+  });
+  const rejected = (await loadRawState(root))!;
+  return { root, archive, authorized, rejected };
 }
 
 // --- inert over legacy JSON -------------------------------------------------
@@ -551,9 +582,11 @@ test("a Q state-lock error refuses before opening or mutating the store", async 
 
 test("a standing SQLite reset is recovered by the read, not reported as corruption", async () => {
   const root = await flipped("reset");
-  await sqliteResetFacade.begin(root, "next", [], {
+  await withStateLock(root, (lock) => sqliteResetFacade.begin(root, "next", {
+    stream: STREAM, stateNonce: NONCE,
+  }, [], {
     version: 2, authorizedNextStream: "next", consentKind: "setup-rebind", mintedAtRevision: 0,
-  });
+  }, lock));
   expect(fs.existsSync(sqliteResetPaths.journal(root))).toBe(true);
   // Gating this recovery on the LEGACY journal decoder threw
   // `ResetCorruptionError` here: a `Q` workspace's journal is `sqlite/v1`, the
@@ -566,21 +599,23 @@ test("a standing SQLite reset is recovered by the read, not reported as corrupti
 
 test("D19: unsupported Q save refuses without mutation while reset recovery completes", async () => {
   const root = await flipped("unsupported-reset-race");
-  await sqliteResetFacade.begin(root, "next", [], {
+  await withStateLock(root, (lock) => sqliteResetFacade.begin(root, "next", {
+    stream: STREAM, stateNonce: NONCE,
+  }, [], {
     version: 2, authorizedNextStream: "next", consentKind: "setup-rebind", mintedAtRevision: 0,
-  });
+  }, lock));
 
   let recoveryReady!: () => void;
   const atReady = new Promise<void>((resolve) => { recoveryReady = resolve; });
   let continueRecovery!: () => void;
   const mayContinue = new Promise<void>((resolve) => { continueRecovery = resolve; });
-  const recovery = sqliteResetFacade.recover(root, STREAM, {
-    crashAt: async (point) => {
-      if (point !== "after-ready") return;
-      recoveryReady();
-      await mayContinue;
-    },
-  });
+  const recovery = withStateLock(root, (lock) => sqliteResetFacade.recover(root, STREAM, lock, {
+      crashAt: async (point) => {
+        if (point !== "after-ready") return;
+        recoveryReady();
+        await mayContinue;
+      },
+    }));
   await atReady;
 
   const beforeSave = snapshot(root);
@@ -695,16 +730,16 @@ test("an unretired genesis intent refuses the save before anything opens the dat
 
 test("each selected write fences exactly once and never through a static import", async () => {
   const source = fs.readFileSync(COMPAT, "utf8");
-  expect(source.split("assertAuthorityWritable(").length - 1).toBe(2);
+  expect(source.split("assertAuthorityWritable(").length - 1).toBe(3);
   expect(source).toContain('await import("../authority-bootstrap.js")');
   // Both read paths take a read-only handle; only the save path takes the
   // writer. 163 v13 is specifically about what a READ is allowed to do.
   expect(source.match(/openAuthorityStore\(authority, true\)/g) ?? []).toHaveLength(2);
-  expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(2);
+  expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(3);
   expect(source).toContain("facade.openStateStore(authority.file, { readonly })");
   // Five closes: the two read paths, save, telemetry, and the authority-id
   // refusal that closes the handle it had to open to compare ids.
-  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(5);
+  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(6);
   // A static import of either the coordinator or the store would drag
   // `bun:sqlite` into the CLI's eager graph, which `schema/inventory.test.ts`
   // forbids — and would stop the adapter being inert before the flip.
@@ -819,6 +854,69 @@ test("a marker with no database at all refuses and repairs nothing", async () =>
   await fsp.writeFile(statePath(root), authorityMarkerBytes(AUTHORITY));
   await expect(loadState(root, STREAM)).rejects.toBeInstanceOf(StateAuthorityCorruptError);
   expect(snapshot(root)).toEqual({});
+});
+
+test("L1 exact Q atomically replaces the reset stream and applies the packet", async () => {
+  const { root, authorized, rejected } = await replacementFixture("accepted");
+  const save = packet();
+  const accepted = { ...authorized, lastSyncedSequence: 5, lastSyncedManifest: save.global!.manifest };
+  const applied = await replaceResetLineageStream(root, authorized, rejected, save, accepted, authorized);
+  expect(applied).toMatchObject({ stream: STREAM, lastSyncedSequence: 5, telemetryBindingId: "e".repeat(16) });
+  expect(applied.lastSyncedManifest.files.map((entry) => entry.path)).toEqual(["one.txt"]);
+  expect(applied).toStrictEqual(await loadRawState(root));
+  expect(fs.readFileSync(statePath(root))).toEqual(authorityMarkerBytes(AUTHORITY));
+});
+
+test("L2 Q replacement refuses when exact archive provenance disappears", async () => {
+  const { root, archive, authorized, rejected } = await replacementFixture("archive-missing");
+  await fsp.rm(archive);
+  const before = snapshot(root);
+  await expect(replaceResetLineageStream(root, authorized, rejected, packet(), authorized, authorized))
+    .rejects.toThrow("exact SQLite reset archive");
+  expect(snapshot(root)).toEqual(before);
+});
+
+test("L2 Q replacement refuses a hash-addressed archive with non-exact bytes", async () => {
+  const { root, archive, authorized, rejected } = await replacementFixture("archive-corrupt");
+  await fsp.writeFile(archive, "not the named database\n");
+  const before = snapshot(root);
+  await expect(replaceResetLineageStream(root, authorized, rejected, packet(), authorized, authorized))
+    .rejects.toThrow("exact SQLite reset archive");
+  expect(snapshot(root)).toEqual(before);
+});
+
+test("L3 Q replacement refuses an unmarked snapshot", async () => {
+  const { root, authorized, rejected } = await replacementFixture("unmarked");
+  const unmarked = { ...authorized };
+  const before = snapshot(root);
+  await expect(replaceResetLineageStream(root, unmarked, rejected, packet(), unmarked, unmarked))
+    .rejects.toThrow("lacks reset provenance");
+  expect(snapshot(root)).toEqual(before);
+});
+
+test("L4 Q replacement refuses live tuple drift with zero transaction", async () => {
+  const { root, authorized, rejected } = await replacementFixture("tuple-drift");
+  const store = openStateStore(sqliteResetPaths.active(root));
+  stateStoreDatabase(store).run("UPDATE state_lineage SET state_revision=1");
+  store.close();
+  const before = snapshot(root);
+  await expect(replaceResetLineageStream(root, authorized, rejected, packet(), authorized, authorized))
+    .rejects.toThrow("lineage changed");
+  expect(snapshot(root)).toEqual(before);
+});
+
+test("L5 Q replacement refuses a held canonical lock before store mutation", async () => {
+  const { root, authorized, rejected } = await replacementFixture("held-lock");
+  const held = await acquireLock(stateLockPath(root));
+  if (held.status !== "acquired") throw new Error(`test state lock unavailable: ${held.status}`);
+  const before = snapshot(root);
+  try {
+    await expect(replaceResetLineageStream(root, authorized, rejected, packet(), authorized, authorized))
+      .rejects.toMatchObject({ reason: "state-lock-unavailable" });
+    expect(snapshot(root)).toEqual(before);
+  } finally {
+    await held.lock.release();
+  }
 });
 
 // --- the call-site inventory ------------------------------------------------

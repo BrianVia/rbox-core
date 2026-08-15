@@ -23,9 +23,10 @@ const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sw
 // 16,683 bytes when introduced; leave room for new guarded entry points. Raised
 // to 28 KiB by U3 wave 4A, which enrolled `flipAuthority` — the one rename that
 // elects SQLite — as an order-tracked owner, adding roughly 1 KiB of records.
-// SP-2 adds the selected telemetry entry's ordered calls. This is a transport
-// bound on the sweep's stdout, not a policy on how many entry points may exist.
-const AST_SWEEP_MAX_BYTES = 29 * 1024;
+// SP-2 adds the selected telemetry entry's ordered calls; SP-2B adds the
+// format-neutral reset inventory and selected replacement owners. This is a
+// transport bound on the sweep's stdout, not an entry-point policy.
+const AST_SWEEP_MAX_BYTES = 32 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -83,6 +84,10 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // marker rather than refuse it, so its guard is the classifier that decides
   // the format, not the barrier that throws on it.
   { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
+  // FLAKE-009: the reset fence fingerprints the document on every ordinary load,
+  // unlocked, so a writer's atomic republish can land inside it. The guard is the
+  // retry that re-runs the whole identity tuple rather than reporting corruption.
+  { file: "src/cli/reset-journal-inspection.ts", symbol: "artifactIdentity", kind: "read", sites: 1, guards: ["retryOnIdentityRace", "assertUnmovedSince"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
@@ -93,6 +98,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // selection re-read under that lock, and only then a database open.
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "selectStateAuthority", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "selectStateAuthority", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureJsonTelemetryId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
@@ -100,12 +106,16 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reset entry points — the same obligations, plus the ones that republish the
   // state document by renaming a prepared candidate over it.
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "installGenesisResetStateUnderHeldLock", kind: "reset", sites: 4, guards: ["publishWholeState", "afterStatePublication"] },
-  { file: "src/cli/reset-journal.ts", symbol: "observePhysical", kind: "reset", sites: 0, guards: ["assertStateReadable"] },
-  { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournalUnderHeldFence", kind: "reset", sites: 8, guards: ["assertStateReadable", "isOwner", "recordLastWriterWitness"] },
+  { file: "src/cli/reset-journal-inspection.ts", symbol: "observeLegacyResetPhysical", kind: "reset", sites: 0, guards: ["assertStateReadable"] },
+  { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournalUnderHeldFence", kind: "reset", sites: 11, guards: ["assertStateReadable", "assertResetOwner", "recordLastWriterWitness"] },
   { file: "src/cli/reset-journal.ts", symbol: "inspectResetJournal", kind: "reset", sites: 1, guards: ["classifyStateFormat"] },
-  { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournal", kind: "reset", sites: 5, guards: ["classifyStateFormat", "recoverResetJournalUnderHeldFence"] },
-  { file: "src/cli/reset-state.ts", symbol: "prepareResetArtifactsUnderFence", kind: "reset", sites: 3, guards: ["assertStateReadable"] },
-  { file: "src/cli/reset-state.ts", symbol: "resetSyncState", kind: "reset", sites: 5, guards: ["loadRawState", "assertStateReadable"] },
+  { file: "src/cli/reset-journal.ts", symbol: "inspectStanding", kind: "reset", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/reset-journal.ts", symbol: "inspectResetFenceInventory", kind: "reset", sites: 1, guards: ["inspectStanding", "createResetFenceObservation"] },
+  { file: "src/cli/reset-journal.ts", symbol: "settleStandingResetUnderHeldFence", kind: "reset", sites: 1, guards: ["assertResetOwner", "inspectResetFenceInventory", "assertResetProtocolFence"] },
+  { file: "src/cli/reset-journal.ts", symbol: "settleStandingReset", kind: "reset", sites: 2, guards: ["assertHealthyOwnedSyncMutex", "inspectResetFenceInventory", "withRepositoryRecoveryFence", "acquireLock"] },
+  { file: "src/cli/reset-journal.ts", symbol: "beginSelectedReset", kind: "reset", sites: 5, guards: ["assertResetProtocolFence", "assertResetOwner", "classifyStateFormat"] },
+  { file: "src/cli/reset-state.ts", symbol: "prepareResetArtifactsUnderFence", kind: "reset", sites: 0, guards: ["loadRawState"] },
+  { file: "src/cli/reset-state.ts", symbol: "resetSyncState", kind: "reset", sites: 2, guards: ["loadRawState"] },
   { file: "src/cli/reset-quarantine.ts", symbol: "restoreResetQuarantineUnderFence", kind: "reset", sites: 1, guards: ["assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "withResetJournalDoctorFence", kind: "reset", sites: 5, guards: ["classifyStateFormat", "assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "quarantineStandingJournal", kind: "reset", sites: 4, guards: ["withResetJournalDoctorFence"] },
@@ -133,7 +143,8 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
 const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/state-plane/errors.ts::<module>", { sites: 1, reason: "StreamMismatchError renders the stable legacy authority path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
-  ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
+  ["src/cli/reset-journal.ts::beginResetJournal", { sites: 1, reason: "names the active path for classified physical comparison; the exact live document is read by its selected guarded caller under the same lock" }],
+  ["src/cli/reset-journal-inspection.ts::assertResetProtocolFence", { sites: 2, reason: "names the state path only as the protocol lock identity and never reads or writes the document" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
   ["src/cli/state-plane/locks.ts::runLockAttempt", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the injected guarded inventory reader owns any document read" }],
   ["src/cli/state-plane/migration/authority-flip.ts::completeFlip", { sites: 2, reason: "names `.rbox` only as the parent to fsync after the flip's rename; the document itself is replaced by flipAuthority, which is inventoried above" }],
@@ -267,12 +278,14 @@ describe("state barrier pinning inventory", () => {
     const owner = "recoverResetJournalUnderHeldFence";
     const calls = callsIn(file, owner);
     const renameIndex = calls.findIndex((site) => calleeMatches(site, "fs.rename"));
-    const ownerIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "isOwner"));
+    const ownerIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "assertResetOwner"));
     const readableIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "assertStateReadable"));
+    const observationIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "fsSync.readFileSync"));
     const stateParentSyncIndex = calls.findIndex((site, index) => index > renameIndex && calleeMatches(site, "fsyncDirectory"));
-    expect(ownerIndex).toBeGreaterThan(-1);
-    expect(readableIndex).toBeGreaterThan(ownerIndex);
-    expect(renameIndex).toBeGreaterThan(readableIndex);
+    expect(readableIndex).toBeGreaterThan(-1);
+    expect(ownerIndex).toBeGreaterThan(readableIndex);
+    expect(observationIndex).toBeGreaterThan(ownerIndex);
+    expect(renameIndex).toBeGreaterThan(observationIndex);
     expect(stateParentSyncIndex).toBeGreaterThan(renameIndex);
     expect(calls[stateParentSyncIndex]?.arguments?.[0]).toBe("activeParent");
     expectOrderedCalls(file, owner, ["fs.rename", "fsyncDirectory", "recordLastWriterWitness"]);

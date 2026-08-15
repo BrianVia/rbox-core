@@ -31,6 +31,7 @@ import {
 } from "./config.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
+import { replaceResetLineageStream } from "./state-plane/adapters/whole-state-compat.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
 /** Planner-facing lane results. Persistence converts these to ordered
@@ -290,7 +291,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
-  const records = repoRecordsForState(snapshot);
+  const records = { ...repoRecordsForState(snapshot) };
   const observedRepos = [...new Set(source.observedRepos)].sort();
   const repos = observedRepos.map((relPath) => {
     const current = records[relPath] ?? { repoGen: 0, sourceSeq: 0 };
@@ -309,7 +310,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
   };
 }
 
-function legacyState(snapshot: SyncState, source: StateSource): SyncState {
+function projectStateSource(snapshot: SyncState, source: StateSource): SyncState {
   const packet = composeStateSavePacket(snapshot, source);
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
@@ -317,6 +318,24 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
     records[relPath] = { ...sanitizeRepoRecordInput(record), repoGen: record.repoGen };
   }
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
+  const projected = stateFromRepoRecords({
+    ...snapshot,
+    manifestMeta: packet.global ? packet.global.manifestMeta : snapshot.manifestMeta,
+    lastSyncedSequence: packet.global ? source.sourceGlobalSeq : snapshot.lastSyncedSequence,
+    lastSyncedManifest: manifest,
+  }, records);
+  if (projected.manifestMeta === undefined) delete projected.manifestMeta;
+  if (projected.lastSyncedManifest.gitRepos === undefined) delete projected.lastSyncedManifest.gitRepos;
+  if (projected.gitReposRemoved === undefined) delete projected.gitReposRemoved;
+  if (projected.gitNeedsResolution === undefined) delete projected.gitNeedsResolution;
+  if (projected.gitPendingRemote === undefined) delete projected.gitPendingRemote;
+  if (projected.gitDeferrals === undefined) delete projected.gitDeferrals;
+  if (projected.gitPartial === undefined) delete projected.gitPartial;
+  return projected;
+}
+
+function legacyState(projected: SyncState): SyncState {
+  const records = repoRecordsForState(projected);
   const legacyMap = <T>(pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined => {
     const result: Record<string, T> = {};
     for (const [relPath, record] of Object.entries(records).sort(([a], [b]) => a.localeCompare(b))) {
@@ -329,12 +348,8 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
     return Object.keys(result).length === 0 ? undefined : result;
   };
   return {
-    ...stateFromRepoRecords({
-      ...snapshot,
-      manifestMeta: undefined,
-      lastSyncedSequence: packet.global ? source.sourceGlobalSeq : snapshot.lastSyncedSequence,
-      lastSyncedManifest: manifest,
-    }, records),
+    ...projected,
+    manifestMeta: undefined,
     // link()-unsupported fallback intentionally has no lane fence/state.
     stateNonce: undefined,
     stateRevision: undefined,
@@ -355,22 +370,24 @@ export async function saveStateSource(
   const apply = options.apply ?? applyStateSavePacket;
   let snapshot = initialSnapshot;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await apply(root, composeStateSavePacket(snapshot, source));
+    const packet = composeStateSavePacket(snapshot, source);
+    const result = await apply(root, packet);
     if (result.status === "accepted") return result.state;
     if (result.status === "unsupported") {
       // Exact-Q lock refusal is a typed state-plane barrier. It must escape
       // before the JSON-only projection or writer is even reached. Legacy JSON
       // keeps its raw unsupported result and therefore its established fallback.
       rethrowIfStateBarrier(result.error);
-      const next = legacyState(snapshot, source);
+      const next = legacyState(projectStateSource(snapshot, source));
       await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
     if (result.status === "rejected" && result.reason === "stream" && options.allowLegacyStreamReplacement) {
-      const next = legacyState(snapshot, source);
-      await saveStateUnsafeLegacyOrTest(root, next);
-      return next;
+      const acceptedProjection = projectStateSource(snapshot, source);
+      return replaceResetLineageStream(
+        root, snapshot, result.state, packet, acceptedProjection, legacyState(acceptedProjection),
+      );
     }
     if (result.reason === "stream" || result.reason === "nonce" || result.reason === "owner-lost") {
       throw new Error(`sync state changed during operation (${result.reason})`);

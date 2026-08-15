@@ -48,3 +48,33 @@ test("live recovery, doctor, and quarantine preserve one exact J0 decoder result
   });
   expect(await fs.readdir(sqliteResetPaths.stateRoot(root))).toEqual(before);
 });
+
+async function productionSource(relative: string): Promise<string> {
+  return fs.readFile(path.resolve(import.meta.dir, relative), "utf8");
+}
+
+test("selected begin and settle are the sole production facade reset executors", async () => {
+  const source = await productionSource("../../reset-journal.ts");
+  expect(source.match(/sqliteResetFacade\.begin\s*\(/g)).toHaveLength(1);
+  expect(source.match(/sqliteResetFacade\.recover\s*\(/g)).toHaveLength(1);
+});
+
+test("reset orchestration has two format-neutral gates and no legacy journal decision", async () => {
+  const source = await productionSource("../../reset-state.ts");
+  expect(source).toContain("inspectResetFenceInventory");
+  expect(source).toContain("settleStandingResetUnderHeldFence");
+  expect(source).not.toMatch(/readResetJournal|inspectResetJournal/);
+});
+
+test("both lock inventories use the format-neutral reset fence", async () => {
+  const source = await productionSource("../locks.ts");
+  expect(source.match(/inspectResetFenceInventory\s*\(/g)).toHaveLength(2);
+  expect(source).not.toContain("readResetJournal");
+});
+
+test("lineage recovery delegates inventory and settlement without a journal lstat", async () => {
+  const source = await productionSource("../reset-lineage.ts");
+  expect(source).toContain("inspectResetFenceInventory");
+  expect(source).toContain("settleStandingReset");
+  expect(source).not.toMatch(/lstat\([^)]*reset/);
+});

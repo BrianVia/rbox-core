@@ -34,7 +34,7 @@ test("production transport deduplicates wrapped probes and counts only commit-en
   const commit: SignedCommit = { body: "{}", commitHash: "a".repeat(64), sig: "sig" };
   const commitPayloads: number[] = [];
   let manifests = 0;
-  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url, init) => {
+  ctx.fetch = async (url, init) => {
     const bytes = Buffer.byteLength(String(typeof init === "function" ? init().body : init.body));
     if (url.endsWith("/blobs/check")) return new Response(JSON.stringify({ missing: [] }), { status: 200 });
     if (url.endsWith("/receipts/redeem")) {

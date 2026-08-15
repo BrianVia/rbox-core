@@ -67,8 +67,17 @@ const STATE_ORDER_OWNERS = new Map([
     "ensureTelemetryBindingId",
     "loadRawState",
     "loadState",
+    "replaceResetLineageStream",
     "saveThroughStore",
     "selectAuthority",
+  ])],
+  ["src/cli/reset-journal-inspection.ts", new Set(["artifactIdentity", "observeLegacyResetPhysical"])],
+  ["src/cli/reset-journal.ts", new Set([
+    "beginSelectedReset",
+    "inspectResetFenceInventory",
+    "recoverResetJournalUnderHeldFence",
+    "settleStandingReset",
+    "settleStandingResetUnderHeldFence",
   ])],
   ["src/cli/state-plane/genesis.ts", new Set(["finishWithQ"])],
   // Design 163's authority flip. It reaches `.rbox/state.json` through a local
@@ -107,6 +116,13 @@ const STATE_ORDER_CALLEES = new Set([
   "handle.stat",
   "isOwner",
   "isSymbolicLink",
+  "inventoryResetNamespace",
+  "inspectResetFenceInventory",
+  "inspectStanding",
+  // The ordinary-load fence's race obligations: the retry wrapper and the
+  // post-hash re-stat that makes one identity tuple describe one settled file.
+  "retryOnIdentityRace",
+  "assertUnmovedSince",
   // The authority flip's own obligations (design 163 M6).
   "requireSibling",
   "observeQSibling",
@@ -119,6 +135,10 @@ const STATE_ORDER_CALLEES = new Set([
   "publishWholeState",
   "recordLastWriterWitness",
   "recoverResetJournalUnderHeldFence",
+  "assertResetOwner",
+  "assertResetProtocolFence",
+  "replaceStreamAndApplySavePacketToStore",
+  "stableDbHash",
   "writeFileAtomic",
 ]);
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -175,11 +195,9 @@ function statePlaneCall(node, source, file) {
   if (tracksOrder && callee === "fs.open" && arguments_[1] !== undefined) projected[1] = arguments_[1];
   if (tracksOrder && calleeLeaf === "writeFileAtomic" && arguments_[2] !== undefined) projected[2] = arguments_[2];
   if (tracksOrder && calleeLeaf === "fsyncDirectory" && arguments_[0] !== undefined) projected[0] = arguments_[0];
-  return {
-    category: "call",
-    callee,
-    ...(projected.some(Boolean) ? { arguments: projected } : {}),
-  };
+  const call = { category: "call", callee };
+  if (projected.some(Boolean)) call.arguments = projected;
+  return call;
 }
 
 try {
@@ -196,31 +214,32 @@ try {
     if (!source) continue;
     const relativeFile = path.relative(root, file);
     const visit = (node) => {
-      let shape;
+      let found;
       if (isCallExpression(node)) {
-        shape = mode === "base-composer-structure"
+        found = mode === "base-composer-structure"
           ? baseComposerCall(node, source)
           : statePlaneCall(node, source, relativeFile);
       } else if (mode === "base-composer-structure" && isPropertyAssignment(node)) {
-        shape = { category: "property-assignment", name: node.name.getText(source).replace(/["']/g, "") };
+        found = { category: "property-assignment", name: node.name.getText(source).replace(/["']/g, "") };
       } else if (mode === "base-composer-structure" && isBinaryExpression(node)
         && isAssignmentOperator(node.operatorToken.kind)
         && isPropertyAccessExpression(node.left)) {
-        shape = { category: "property-write", name: node.left.name.text };
+        found = { category: "property-write", name: node.left.name.text };
       } else if (mode === "base-composer-structure"
         && isDeleteExpression(node) && isPropertyAccessExpression(node.expression)) {
-        shape = { category: "property-delete", name: node.expression.name.text };
+        found = { category: "property-delete", name: node.expression.name.text };
       }
-      if (shape && shape.category !== "call"
+      if (found && found.category !== "call"
         && (relativeFile.startsWith("src/cli/") === false
-          || !["base", "branchBaseOrigins"].includes(shape?.name))) shape = undefined;
-      if (shape) {
-        records.push({
-          ...shape,
+          || !["base", "branchBaseOrigins"].includes(found?.name))) found = undefined;
+      if (found) {
+        const record = {
+          ...found,
           file: relativeFile,
           line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1,
-          ...(mode === "state-plane-inventory" ? { owner: ownerOf(node) } : {}),
-        });
+        };
+        if (mode === "state-plane-inventory") record.owner = ownerOf(node);
+        records.push(record);
       }
       node.forEachChild(visit);
     };

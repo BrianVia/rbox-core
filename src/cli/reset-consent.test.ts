@@ -2,16 +2,22 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { acquireLock, type OwnedLock } from "../engine/lockfile.js";
 import { loadState, resetSyncState, StreamMismatchError } from "./config.js";
 import {
   ResetConsentError,
   consumeResetConsent,
   createWorkspaceWithConsent,
   inspectResetConsent,
+  inspectResetConsentIntent,
   mintSetupCreateConsent,
   mintSetupExistingConsent,
   type ResetConsentWitness,
 } from "./reset-consent.js";
+import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
+import { sqliteResetPaths, stateLockPath, statePath } from "./state-plane/paths.js";
+import { sqliteResetFacade } from "./state-plane/reset/index.js";
+import { createStateStore } from "./state-plane/store/open.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -100,6 +106,49 @@ async function durableSnapshot(dir: string): Promise<Record<string, string>> {
   const all = await snapshot(dir);
   return Object.fromEntries(Object.entries(all).filter(([file]) =>
     !file.endsWith(".lock") && !file.includes("rbox-locks/") && !file.endsWith("locking-health.json")));
+}
+
+async function withStateLock<T>(root: string, fn: (lock: OwnedLock) => Promise<T>): Promise<T> {
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  try { return await fn(acquired.lock); } finally { await acquired.lock.release(); }
+}
+
+type ExactQStandingRow = "P" | "R" | "I" | "Z" | "W1";
+
+async function exactQStandingRoot(row: ExactQStandingRow): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-consent-q-${row.toLowerCase()}-`));
+  roots.push(root);
+  if (row === "W1") {
+    const child = Bun.spawn({
+      cmd: [process.execPath, import.meta.dir + "/state-plane/reset/crash-rig-child.ts", "w1-prepare", root, "prepare"],
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect([9, 137]).toContain(await child.exited);
+    return root;
+  }
+  const authorityId = "a".repeat(32);
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId, lineageId: "b".repeat(32), stream: "old",
+    createdBy: "reset-consent-test", stateNonce: "1".repeat(32), stateRevision: 1,
+  }).close();
+  await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+  await withStateLock(root, (lock) => sqliteResetFacade.begin(
+    root, "next", { stream: "old", stateNonce: "1".repeat(32) }, [], {
+      version: 2, authorizedNextStream: "next", consentKind: "setup-rebind", mintedAtRevision: 1,
+    }, lock, {
+      now: () => new Date("2026-08-15T12:00:00.000Z"),
+      randomBytes: (size) => Buffer.alloc(size, size === 16 ? 2 : 3),
+    },
+  ));
+  const boundary = row === "R" ? "after-ready" : row === "I" ? "after-installed" : row === "Z" ? "after-z-retired" : undefined;
+  if (boundary) {
+    await expect(withStateLock(root, (lock) => sqliteResetFacade.recover(root, "old", lock, {
+      crashAt(point) { if (point === boundary) throw new Error(point); },
+    }))).rejects.toThrow(boundary);
+  }
+  return root;
 }
 
 async function git(repo: string, ...args: string[]): Promise<string> {
@@ -230,4 +279,129 @@ test("nonce advance after witness validation is a zero-reset-write barrier inclu
   expect(await durableSnapshot(root)).toEqual(afterAdvance!);
   expect(await git(repo, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refsAfterAdvance);
   expect(() => inspectResetConsent(consent)).not.toThrow();
+});
+
+for (const mismatch of ["root", "old-stream", "old-nonce", "next-stream"] as const) {
+  test(`A1 ${mismatch} tuple mismatch refuses without consuming the witness`, () => {
+    const root = "/tmp/consent-tuple-root";
+    const witness = mintSetupExistingConsent({
+      ...common(root), remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+    });
+    const expected = {
+      root,
+      observedOldStream: common(root).observedOldStream,
+      observedOldNonce: common(root).observedOldNonce,
+      nextStream: "https://new.test::ws_new::root",
+    };
+    if (mismatch === "root") expected.root = "/tmp/other-root";
+    if (mismatch === "old-stream") expected.observedOldStream = "other-old";
+    if (mismatch === "old-nonce") expected.observedOldNonce = "f".repeat(32);
+    if (mismatch === "next-stream") expected.nextStream = "https://new.test::other::root";
+    expect(() => consumeResetConsent(witness, expected)).toThrow(ResetConsentError);
+    expect(inspectResetConsent(witness).nextStream).toBe("https://new.test::ws_new::root");
+  });
+}
+
+async function consentStateRoot(label: string): Promise<{ root: string; witness: ResetConsentWitness }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-consent-${label}-`));
+  roots.push(root);
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify({
+    stream: common(root).observedOldStream,
+    stateNonce: common(root).observedOldNonce,
+    stateRevision: 7,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+    repoRecords: {},
+  }));
+  return {
+    root,
+    witness: mintSetupExistingConsent({
+      ...common(root), remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+    }),
+  };
+}
+
+test("A0 empty next stream refuses before consuming a valid witness", async () => {
+  const { root, witness } = await consentStateRoot("empty-next");
+  await expect(resetSyncState(root, "", undefined, witness)).rejects.toThrow("next stream is empty");
+  expect(() => inspectResetConsent(witness)).not.toThrow();
+});
+
+test("A2 bound state without a witness refuses with byte-exact zero mutation", async () => {
+  const { root } = await consentStateRoot("missing-witness");
+  const before = await durableSnapshot(root);
+  await expect(resetSyncState(root, "https://new.test::ws_new::root")).rejects.toMatchObject({ name: "RebindConsentRequiredError" });
+  expect(await durableSnapshot(root)).toEqual(before);
+});
+
+test("A2 witness on a no-state root refuses unconsumed with zero mutation", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-consent-no-state-"));
+  roots.push(root);
+  const witness = mintSetupExistingConsent({
+    ...common(root), remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+  });
+  await expect(resetSyncState(root, "https://new.test::ws_new::root", undefined, witness))
+    .rejects.toMatchObject({ name: "RebindConsentRequiredError" });
+  expect(await fs.readdir(root)).toEqual([]);
+  expect(() => inspectResetConsent(witness)).not.toThrow();
+});
+
+test("A1 revision mismatch refuses before consumption and mutation", async () => {
+  const { root } = await consentStateRoot("revision-mismatch");
+  const witness = mintSetupExistingConsent({
+    ...common(root), mintedAtRevision: 6,
+    remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+  });
+  const before = await durableSnapshot(root);
+  await expect(resetSyncState(root, "https://new.test::ws_new::root", undefined, witness))
+    .rejects.toMatchObject({ name: "RebindConsentRequiredError" });
+  expect(await durableSnapshot(root)).toEqual(before);
+  expect(() => inspectResetConsent(witness)).not.toThrow();
+});
+
+test("A1 non-narrowed create witness is unusable and unconsumed", () => {
+  const witness = mintSetupCreateConsent({
+    ...common("/tmp/not-narrowed"), remoteUrl: "https://new.test", projectId: "root",
+  });
+  expect(() => inspectResetConsent(witness)).toThrow(/not been narrowed/);
+  expect(() => inspectResetConsentIntent(witness)).not.toThrow();
+});
+
+for (const row of ["P", "R", "I", "Z", "W1"] as const) {
+  test(`A2 exact-Q standing ${row} missing consent has byte-exact zero effect`, async () => {
+    const root = await exactQStandingRoot(row);
+    const before = await snapshot(root);
+    await expect(resetSyncState(root, "next")).rejects.toMatchObject({ name: "RebindConsentRequiredError" });
+    expect(await snapshot(root)).toEqual(before);
+  });
+
+  test(`A1 exact-Q standing ${row} invalid consent has byte-exact zero effect`, async () => {
+    const root = await exactQStandingRoot(row);
+    const before = await snapshot(root);
+    await expect(resetSyncState(root, "next", undefined, Object.freeze({}) as ResetConsentWitness))
+      .rejects.toMatchObject({ name: "ResetConsentError", reason: "invalid" });
+    expect(await snapshot(root)).toEqual(before);
+  });
+
+  test(`A1 exact-Q standing ${row} lineage tuple mismatch has byte-exact zero effect`, async () => {
+    const root = await exactQStandingRoot(row);
+    const witness = mintSetupExistingConsent({
+      root, observedOldStream: "wrong-old-stream", observedOldNonce: "f".repeat(32),
+      mintedAtRevision: 99,
+      remoteUrl: "https://new.test", workspaceId: "ws_new", projectId: "root",
+    });
+    const before = await snapshot(root);
+    await expect(resetSyncState(root, "https://new.test::ws_new::root", undefined, witness))
+      .rejects.toMatchObject({ name: "RebindConsentRequiredError" });
+    expect(await snapshot(root)).toEqual(before);
+    expect(() => inspectResetConsent(witness)).not.toThrow();
+  });
+}
+
+test("D0 successful selected reset consumes the witness exactly once", async () => {
+  const { root, witness } = await consentStateRoot("consumed-success");
+  await resetSyncState(root, "https://new.test::ws_new::root", undefined, witness);
+  expect((await loadState(root, "https://new.test::ws_new::root")).stream).toBe("https://new.test::ws_new::root");
+  expect(() => inspectResetConsent(witness)).toThrow(/already consumed/);
 });

@@ -23,7 +23,7 @@ import type {
   GlobalManifestMeta, RepoRecordInput, StateSavePacket, SyncState,
 } from "../../sync-state-model.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
-import { applySavePacketToStore } from "../adapters/sqlite-state-save.js";
+import { applySavePacketToStore, replaceStreamAndApplySavePacketToStore } from "../adapters/sqlite-state-save.js";
 import { authorityMarkerBytes } from "../authority-marker.js";
 import { StateWriteRefusedError } from "../errors.js";
 import { sqliteResetPaths } from "../paths.js";
@@ -218,6 +218,21 @@ test("write-then-read round trips are strictly differential with the JSON author
   expect(final.repoRecords!["repo-held"]!.base).toBeUndefined();
   expect(final.repoRecords!["repo-held"]!.pending).toBeDefined();
   expect(final.repoRecords!["repo-clean"]!.repoGen).toBe(2);
+  handle.close();
+});
+
+test("reset-lineage replacement stays differential through the sole packet translator", async () => {
+  const jsonRoot = root("rbox-replacement-json-");
+  const sqlRoot = root("rbox-replacement-sql-");
+  seedJsonAuthority(jsonRoot);
+  const handle = createStateStore(path.join(sqlRoot, "state.db"), {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: "old-stream",
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+  });
+  const packet = jsonPacket(SEED, NONCE);
+  expect((await applyStateSavePacket(jsonRoot, packet, { lock: lockOptions })).status).toBe("accepted");
+  expect((await replaceStreamAndApplySavePacketToStore(handle, packet, "old-stream", OWNER)).status).toBe("accepted");
+  expect(loadRawStateFromStore(handle)).toStrictEqual(await loadRawState(jsonRoot));
   handle.close();
 });
 

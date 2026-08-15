@@ -16,9 +16,12 @@ import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
 import { semverGt } from "../../semver.js";
 import { RBOX_VERSION } from "../../version.js";
 import { RBOX_DIR } from "../../workspace-config.js";
+import { StateWriteRefusedError } from "../errors.js";
+import { stateLockPath } from "../paths.js";
 
 /** The ratified downgrade floor: the first release whose writers maintain this
  * witness. A workspace whose most recent writer predates it is not migratable. */
@@ -120,8 +123,12 @@ export async function recordLastWriterWitness(
   statePath: string,
   publishedBytes: string | Uint8Array,
   nowMs: () => number = Date.now,
+  heldLock?: OwnedLock,
 ): Promise<LastWriterWitness | undefined> {
   try {
+    if (heldLock && path.resolve(heldLock.path) !== path.resolve(stateLockPath(root))) {
+      throw new StateWriteRefusedError("state-lock-unavailable", statePath, "held lock has the wrong canonical path");
+    }
     const body = typeof publishedBytes === "string" ? Buffer.from(publishedBytes, "utf8") : Buffer.from(publishedBytes);
     const sample = await sampleStateFile(statePath);
     if (!sample) return undefined;
@@ -143,8 +150,17 @@ export async function recordLastWriterWitness(
       stateIno: Number(stat.ino),
     };
     const file = lastWriterWitnessPath(root);
+    if (heldLock && !heldLock.isOwnerSync()) {
+      throw new StateWriteRefusedError("state-lock-lease-lost", file);
+    }
     await fs.mkdir(path.dirname(file), { recursive: true });
-    await writeFileAtomic(file, `${JSON.stringify(witness, null, 2)}\n`);
+    await writeFileAtomic(file, `${JSON.stringify(witness, null, 2)}\n`, {
+      beforeRenameSync: heldLock
+        ? () => {
+            if (!heldLock.isOwnerSync()) throw new StateWriteRefusedError("state-lock-lease-lost", file);
+          }
+        : undefined,
+    });
     await fsyncDirectory(path.dirname(file));
     return witness;
   } catch {

@@ -12,6 +12,7 @@ import {
   resetDbArtifacts,
   resetInventoryHasNonS0,
 } from "./reset-namespace-inventory.js";
+import { loadState, resetSyncState } from "./config.js";
 
 const NONCE = "1".repeat(32);
 const HASH = "2".repeat(64);
@@ -319,5 +320,16 @@ describe("bounded namespace and frozen temp grammar", () => {
     await fs.mkdir(lineages, { recursive: true });
     await fs.writeFile(path.join(lineages, `${HASH}.db-wal`), "");
     expect(await hasResetLineageProvenance(root)).toBe(false);
+  });
+
+  test("E7b inventory is not JSON genesis eligibility and its residue survives", async () => {
+    const root = await workspace();
+    const residue = path.join(await stateDir(root), "reset-candidates", ".rbox-tmp-1-1-inert.db");
+    await fs.mkdir(path.dirname(residue), { recursive: true });
+    await fs.writeFile(residue, "inert reset residue\n");
+    expect((await inventoryResetNamespace(root)).inertTemps).toEqual([residue]);
+    await resetSyncState(root, "next-stream");
+    expect((await loadState(root, "next-stream")).stream).toBe("next-stream");
+    expect(await fs.readFile(residue, "utf8")).toBe("inert reset residue\n");
   });
 });

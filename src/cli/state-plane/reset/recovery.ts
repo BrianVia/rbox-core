@@ -1,8 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock } from "../../../engine/lockfile.js";
-import { withRepositoryRecoveryFence } from "../../../cli/sync-git/protocol-locks.js";
+import type { OwnedLock } from "../../../engine/lockfile.js";
 import {
   classifyResetPhysicalSignature,
   type MarkerDisposition,
@@ -55,7 +54,8 @@ import {
   type DbArtifactResetExecutorCapability,
 } from "./owner.js";
 import {
-  PRODUCTION_RECOVERY_FS,
+  createSqliteResetRecoveryFs,
+  type SqliteResetFsTraceEvent,
   type SqliteResetRecoveryFs,
 } from "./trace-fs.js";
 export {
@@ -68,10 +68,8 @@ export interface SqliteResetHooks {
   now?: () => Date;
   randomBytes?: (size: number) => Buffer;
   crashAt?: (point: string) => void | Promise<void>;
-  /** Injectable durability seam used by the power-cut rig. Every operation
-   * delegates to the real filesystem; recorders observe the production
-   * writer's actual ordering rather than restating the protocol in a test. */
-  recoveryFs?: SqliteResetRecoveryFs;
+  /** Ordered observation of the real lock-carrying filesystem primitives. */
+  observeFs?: (event: SqliteResetFsTraceEvent) => void;
 }
 
 export type SqliteResetInspection =
@@ -251,9 +249,15 @@ async function writeJournal(
   await recoveryFs.fsyncCreatedDirectoryAncestors(parent, created);
 }
 
-async function setPhase(root: string, journal: SQLiteResetJournalV2, phase: SQLiteResetJournalV2["phase"], hooks: SqliteResetHooks): Promise<SQLiteResetJournalV2> {
+async function setPhase(
+  root: string,
+  journal: SQLiteResetJournalV2,
+  phase: SQLiteResetJournalV2["phase"],
+  hooks: SqliteResetHooks,
+  recoveryFs: SqliteResetRecoveryFs,
+): Promise<SQLiteResetJournalV2> {
   const next = { ...journal, phase };
-  await writeJournal(root, next, hooks.recoveryFs ?? PRODUCTION_RECOVERY_FS);
+  await writeJournal(root, next, recoveryFs);
   await hooks.crashAt?.(`after-${phase}`);
   return next;
 }
@@ -262,9 +266,10 @@ async function recoverHeld(
   capability: DbArtifactResetExecutorCapability,
   root: string,
   stream: string,
+  heldStateLock: OwnedLock,
   hooks: SqliteResetHooks,
 ): Promise<"complete"> {
-  const recoveryFs = hooks.recoveryFs ?? PRODUCTION_RECOVERY_FS;
+  const recoveryFs = createSqliteResetRecoveryFs(root, heldStateLock, hooks.observeFs);
   let inspected = await inspectSqliteReset(capability, root, stream);
   if (inspected.status !== "recoverable") {
     throw new Error(`SQLite reset is not recoverable: ${inspected.status}`);
@@ -283,8 +288,8 @@ async function recoverHeld(
     }
     inspected = await inspectSqliteReset(capability, root, stream) as Extract<SqliteResetInspection, { status: "recoverable" }>;
     if (inspected.status !== "recoverable") throw new Error("SQLite reset moved before refs");
-    await createResetRecoveryRefs(journal.old.z, inspected.row.observation.recoveryRefs.count, hooks.crashAt);
-    journal = await setPhase(root, journal, "ready", hooks);
+    await createResetRecoveryRefs(root, journal.old.z, inspected.row.observation.recoveryRefs.count, heldStateLock, hooks.crashAt);
+    journal = await setPhase(root, journal, "ready", hooks, recoveryFs);
     inspected = await inspectSqliteReset(capability, root, stream) as Extract<SqliteResetInspection, { status: "recoverable" }>;
   }
   if (journal.phase === "ready") {
@@ -299,7 +304,7 @@ async function recoverHeld(
     await hooks.crashAt?.("after-source-unlink");
     await recoveryFs.fsyncDirectory(path.dirname(inspected.paths.candidate));
     await hooks.crashAt?.("after-source-parent-fsync");
-    journal = await setPhase(root, journal, "installed", hooks);
+    journal = await setPhase(root, journal, "installed", hooks, recoveryFs);
     inspected = await inspectSqliteReset(capability, root, stream) as Extract<SqliteResetInspection, { status: "recoverable" }>;
   }
   if (journal.phase === "installed") {
@@ -317,8 +322,8 @@ async function recoverHeld(
     }
     inspected = await inspectSqliteReset(capability, root, stream) as Extract<SqliteResetInspection, { status: "recoverable" }>;
     if (inspected.status !== "recoverable") throw new Error("SQLite reset moved during retirement");
-    await retireResetActiveGroups(journal.old.z, inspected.row.observation.activeRefGroups.count, hooks.crashAt);
-    journal = await setPhase(root, journal, "z-retired", hooks);
+    await retireResetActiveGroups(root, journal.old.z, inspected.row.observation.activeRefGroups.count, heldStateLock, hooks.crashAt);
+    journal = await setPhase(root, journal, "z-retired", hooks, recoveryFs);
   }
   const terminal = await inspectSqliteReset(capability, root, stream);
   if (terminal.status !== "recoverable" || !terminal.row.ids.includes("Z0")) throw new Error("SQLite reset terminal row missing");
@@ -333,6 +338,7 @@ export async function recoverSqliteReset(
   capability: DbArtifactResetExecutorCapability,
   root: string,
   callerStream: string,
+  heldStateLock: OwnedLock,
   hooks: SqliteResetHooks = {},
 ): Promise<"none" | "complete"> {
   assertDbArtifactResetExecutorCapability(capability);
@@ -344,45 +350,29 @@ export async function recoverSqliteReset(
     throw new Error("SQLite reset orphan-artifact state changed during halt classification");
   }
   if (preflight.status === "w1") {
-    const lock = await acquireLock(`${sqliteResetPaths.active(root)}.lock`);
-    if (lock.status !== "acquired") throw new Error("SQLite W1 state lock unavailable");
-    try {
-      await recoverOrdinaryWalCrash(root, undefined, hooks);
-      const terminal = await inspectSqliteReset(capability, root, callerStream);
-      if (terminal.status !== "steady") throw new Error("SQLite W1 takeover did not reach S0 steady state");
-      return "complete";
-    } finally {
-      await lock.lock.release();
-    }
+    await recoverOrdinaryWalCrash(root, heldStateLock, undefined, hooks);
+    const terminal = await inspectSqliteReset(capability, root, callerStream);
+    if (terminal.status !== "steady") throw new Error("SQLite W1 takeover did not reach S0 steady state");
+    return "complete";
   }
   if (preflight.status !== "recoverable") throw new Error(`SQLite reset halted: ${preflight.reason}`);
-  const requests = preflight.journal.old.z.map((entry) => ({
-    commonDir: entry.repositoryIdentity.commonDirReal,
-    reflogRefs: [entry.activeRef, entry.recoveryRef],
-  }));
-  return withRepositoryRecoveryFence(requests, path.resolve(sqliteResetPaths.active(root)), async () => {
-    const lock = await acquireLock(`${sqliteResetPaths.active(root)}.lock`);
-    if (lock.status !== "acquired") throw new Error("SQLite reset state lock unavailable");
-    try {
-      const held = await inspectSqliteReset(capability, root, callerStream);
-      if (held.status !== "recoverable"
-        || held.journalIdentityHash !== preflight.journalIdentityHash
-        || held.inventoryIdentity !== preflight.inventoryIdentity) {
-        throw new Error("SQLite reset changed between preflight and held-fence pass");
-      }
-      return await recoverHeld(capability, root, callerStream, hooks);
-    } finally {
-      await lock.lock.release();
-    }
-  });
+  const held = await inspectSqliteReset(capability, root, callerStream);
+  if (held.status !== "recoverable"
+    || held.journalIdentityHash !== preflight.journalIdentityHash
+    || held.inventoryIdentity !== preflight.inventoryIdentity) {
+    throw new Error("SQLite reset changed between preflight and held-fence pass");
+  }
+  return recoverHeld(capability, root, callerStream, heldStateLock, hooks);
 }
 
 export async function beginSqliteReset(
   capability: DbArtifactResetExecutorCapability,
   root: string,
   nextStream: string,
+  expectedOld: { stream: string; stateNonce: string },
   z: ResetZEntry[],
   authorization: ResetJournalAuthorization,
+  heldStateLock: OwnedLock,
   hooks: SqliteResetHooks = {},
 ): Promise<SQLiteResetJournalV2> {
   assertDbArtifactResetExecutorCapability(capability);
@@ -407,14 +397,17 @@ export async function beginSqliteReset(
   if (!/^[0-9a-f]{32}$/.test(id) || !/^[0-9a-f]{32}$/.test(nonce)) {
     throw new Error("SQLite reset random source returned invalid bytes");
   }
-  const old = await quiesceActiveDbForReset(root);
+  const old = await quiesceActiveDbForReset(root, heldStateLock);
+  if (old.stream !== expectedOld.stream || old.stateNonce !== expectedOld.stateNonce) {
+    throw new Error("SQLite reset old lineage changed before begin");
+  }
   const authorityId = await readSqliteAuthorityId(root);
   const seed = await prepareEmptyResetDbSeed(root, {
     stream: nextStream,
     stateNonce: nonce,
     stateRevision: old.stateRevision + 1,
     ...(old.telemetryBindingId === undefined ? {} : { telemetryBindingId: old.telemetryBindingId }),
-  }, authorityId);
+  }, authorityId, heldStateLock);
   const activeHash = (await stableDbHash(sqliteResetPaths.active(root))).sha256;
   const archive = sqliteResetPaths.archive(root, old.stateNonce, activeHash);
   const archiveHash = await optionalStableHash(archive);
@@ -461,7 +454,7 @@ export async function beginSqliteReset(
   const exactRecovery = await exactResetRecoveryRefs(journal.old.z);
   for (let index = 0; index < exactRecovery.length; index++) {
     await hooks.crashAt?.(`before-recovery-ref-normalize-${index + 1}`);
-    await deleteExactResetRecoveryRef(exactRecovery[index]!);
+    await deleteExactResetRecoveryRef(root, exactRecovery[index]!, heldStateLock);
   }
   const normalizedRefs = await observeResetRefs(journal.old.z);
   if (normalizedRefs.recovery.kind !== "prefix" || normalizedRefs.recovery.count !== 0
@@ -470,7 +463,7 @@ export async function beginSqliteReset(
   }
   const marker = await markerDisposition(sqliteResetPaths.marker(root), journal);
   if (marker !== "old" && marker !== "absent") throw new Error("SQLite reset incarnation marker is not a P0 precondition");
-  await writeJournal(root, journal, hooks.recoveryFs ?? PRODUCTION_RECOVERY_FS);
+  await writeJournal(root, journal, createSqliteResetRecoveryFs(root, heldStateLock, hooks.observeFs));
   await hooks.crashAt?.("after-prepared");
   return journal;
 }

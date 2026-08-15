@@ -43,6 +43,12 @@ export async function saveScopeFindings(root: string, findings: ScopeFindings): 
 const entryDiffers = (local: FileEntry | undefined, remote: FileEntry): boolean =>
   local === undefined || local.sha256 !== remote.sha256 || local.type !== remote.type;
 
+/** The amended plan plus the rule-file paths whose local bytes lost to remote truth. */
+export interface RuleFileAuthorityOutcome {
+  actions: Action[];
+  diverged: string[];
+}
+
 /**
  * Overlay remote authority for metadata rule files onto a planned action list.
  * Returns the amended actions plus the paths whose local bytes lost. Any planned
@@ -55,7 +61,7 @@ export function applyRuleFileAuthority(
   base: Manifest,
   local: Manifest,
   remote: Manifest,
-): { actions: Action[]; diverged: string[] } {
+): RuleFileAuthorityOutcome {
   const localByPath = new Map(local.files.map((entry) => [entry.path, entry]));
   const baseByPath = new Map(base.files.map((entry) => [entry.path, entry]));
   const diverged: string[] = [];

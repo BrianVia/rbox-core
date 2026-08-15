@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -16,12 +17,14 @@ import {
 } from "./base-artifacts.js";
 import { gitRaw, setGitSpawnObserver } from "../../engine/git-spawn.js";
 import type { RepoIdentityV1 } from "./repo-lineage.js";
-import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
+import { lastWriterWitnessPath, recordLastWriterWitness, type LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
 import {
-  beginResetJournal,
+  beginResetJournal as beginResetJournalUnderLock,
   inspectResetJournal,
+  inspectResetFenceInventory,
   readResetJournal,
   recoverResetJournal,
+  recoverResetJournalUnderHeldFence,
   resetArchivePath,
   resetCandidatePath,
   resetIncarnationPath,
@@ -29,11 +32,22 @@ import {
   validateResetJournalV2,
   type ResetZEntry,
 } from "../reset-journal.js";
-import { loadState, resetSyncState, saveConfig, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
+import { applyStateSavePacket, loadState, resetSyncState, saveConfig, saveStateUnsafeLegacyOrTest, type StateSavePacket, type SyncState } from "../config.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { mintSetupExistingConsent } from "../reset-consent.js";
 import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
 import { readResetQuarantineBundle, resetQuarantineRoot } from "../reset-quarantine.js";
+import { acquireLock } from "../../engine/lockfile.js";
+import { stateLockPath } from "../state-plane/paths.js";
+import type { ResetJournalAuthorization, ResetJournalHooks } from "../reset-journal.js";
+import { writeFileAtomic } from "../../engine/fsutil.js";
+import { boundedCopy } from "../reset-io.js";
+import { publishWholeState } from "../state-plane/adapters/legacy-json-publication.js";
+import { authorityMarkerBytes } from "../state-plane/authority-marker.js";
+import { StateAuthorityCorruptError, StateWriteRefusedError } from "../state-plane/errors.js";
+import { sqliteResetPaths } from "../state-plane/paths.js";
+import { createResetRecoveryRefs } from "../reset-z-runtime.js";
+import type { OwnedLock } from "../../engine/lockfile.js";
 
 const exec = promisify(execFile);
 let root = "";
@@ -60,6 +74,49 @@ const resetConsent = () => mintSetupExistingConsent({
 async function writeOld(): Promise<void> {
   await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
   await fs.writeFile(stateFile(), oldBytes());
+}
+
+async function commitAcceptedSave(packet: StateSavePacket): Promise<Buffer> {
+  const result = await applyStateSavePacket(root, packet);
+  expect(result.status).toBe("accepted");
+  return fs.readFile(stateFile());
+}
+
+function commitAcceptedSaveSync(packet: StateSavePacket): Buffer {
+  const moduleUrl = new URL("../state-plane/adapters/whole-state-compat.ts", import.meta.url).href;
+  const child = Bun.spawnSync({
+    cmd: [process.execPath, "-e", `const {applyStateSavePacket}=await import(${JSON.stringify(moduleUrl)});const result=await applyStateSavePacket(process.env.RBOX_TEST_ROOT,JSON.parse(process.env.RBOX_TEST_PACKET));if(result.status!=="accepted")throw new Error("save was "+result.status);`],
+    env: { ...process.env, RBOX_TEST_ROOT: root, RBOX_TEST_PACKET: JSON.stringify(packet) },
+    stdout: "pipe", stderr: "pipe",
+  });
+  expect(child.exitCode, child.stderr.toString()).toBe(0);
+  return fsSync.readFileSync(stateFile());
+}
+
+const competingPacket = (expectedStream: string, expectedNonce: string, sourceGlobalSeq: number): StateSavePacket => ({
+  expectedStream, expectedNonce, sourceGlobalSeq,
+  global: { manifest: { generatedAt: "competing-accepted-save", files: [] } },
+  repos: [],
+});
+
+async function beginResetJournal(
+  targetRoot: string,
+  nextStream: string,
+  bytes: Uint8Array,
+  state: SyncState,
+  z: ResetZEntry[],
+  authorization: ResetJournalAuthorization,
+  hooks: ResetJournalHooks = {},
+) {
+  const acquired = await acquireLock(stateLockPath(targetRoot));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  try {
+    return await beginResetJournalUnderLock(
+      targetRoot, nextStream, bytes, state, z, authorization, acquired.lock, hooks,
+    );
+  } finally {
+    await acquired.lock.release();
+  }
 }
 
 async function begin(z: ResetZEntry[] = [], crashAt?: (point: string) => void): Promise<void> {
@@ -155,6 +212,19 @@ async function legacyProtocolTree(z: ResetZEntry[] = []): Promise<Record<string,
   return Object.fromEntries(Object.entries(snapshot).sort(([left], [right]) => left.localeCompare(right)));
 }
 
+async function byteLevelProtocolFixture(): Promise<Record<string, string | { bytes: number; sha256: string; bodyBase64?: string }>> {
+  const tree = await legacyProtocolTree();
+  return Object.fromEntries(Object.entries(tree).map(([file, value]) => {
+    if (file.endsWith("/") || value.startsWith("symlink:") || value === "<absent>") return [file, value];
+    const bytes = Buffer.from(value, "base64");
+    const fixture = {
+      bytes: bytes.byteLength,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    };
+    return [file, bytes.byteLength <= 1_024 ? { ...fixture, bodyBase64: value } : fixture];
+  }));
+}
+
 async function freshLegacyFixture(label: string): Promise<void> {
   await fs.rm(root, { recursive: true, force: true });
   root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-reset-differential-${label}-`));
@@ -166,6 +236,22 @@ beforeEach(async () => {
   await writeOld();
 });
 afterEach(async () => { await fs.rm(root, { recursive: true, force: true }); });
+
+const X_TIMINGS = ["stale-entry", "syscall-adjacent"] as const;
+
+function stealStateLock(lock: OwnedLock): void {
+  fsSync.writeFileSync(lock.path, "foreign lease\n");
+}
+
+async function acquireStateLock(): Promise<OwnedLock> {
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`test state lock unavailable: ${acquired.status}`);
+  return acquired.lock;
+}
+
+function assertTestOwner(lock: OwnedLock, target: string): void {
+  if (!lock.isOwnerSync()) throw new StateWriteRefusedError("state-lock-lease-lost", target);
+}
 
 describe("design 130 reset-v1 strict schema", () => {
   test("prepared journal is exact, bounded, path-derived, and preserves telemetry", async () => {
@@ -649,6 +735,227 @@ describe("design 138 physical write-boundary recovery", () => {
     expect(await recoverResetJournal(root, "old-stream")).toBe("complete");
   });
 });
+
+async function stagePublicStandingReset(point: string): Promise<void> {
+  if (point === "after-prepared") {
+    await expect(begin([], (seen) => { if (seen === point) throw new Error(point); })).rejects.toThrow(point);
+    return;
+  }
+  await begin();
+  await expect(recoverResetJournal(root, "old-stream", { crashAt(seen) {
+    if (seen === point) throw new Error(point);
+  } })).rejects.toThrow(point);
+}
+
+for (const point of ["after-prepared", "after-candidate-create", "after-archive-create", "after-ready", "after-installed"]) {
+  test(`P public fence inventory authenticates standing JSON at ${point}`, async () => {
+    await stagePublicStandingReset(point);
+    const before = await fs.readFile(stateFile());
+    const inventory = await inspectResetFenceInventory(root, "old-stream");
+    expect(inventory.settlement).toBe("required");
+    expect(inventory.observation).toBeDefined();
+    expect(await fs.readFile(stateFile())).toEqual(before);
+  });
+
+  test(`P public load settlement resumes standing JSON at ${point}`, async () => {
+    await stagePublicStandingReset(point);
+    expect((await loadState(root, "new-stream", () => undefined)).stream).toBe("new-stream");
+    expect((await inspectResetFenceInventory(root, "new-stream")).settlement).toBe("none");
+  });
+}
+
+for (const residue of ["none", "unselected-db", "orphan-candidate", "orphan-archive", "inert-temp"] as const) {
+  test(`P E7b JSON no-state eligibility remains neutral with ${residue}`, async () => {
+    await fs.rm(root, { recursive: true, force: true });
+    root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-reset-e7b-${residue}-`));
+    let residuePath: string | undefined;
+    if (residue !== "none") {
+      residuePath = residue === "unselected-db"
+        ? path.join(root, ".rbox", "state", "state.db")
+        : residue === "orphan-candidate"
+          ? path.join(root, ".rbox", "state", "reset-candidates", `${"3".repeat(32)}.db`)
+          : residue === "orphan-archive"
+            ? path.join(root, ".rbox", "state", "lineages", "4".repeat(32), `${"5".repeat(64)}.db`)
+            : path.join(root, ".rbox", "state", "reset-candidates", ".rbox-tmp-1-1-inert.db");
+      await fs.mkdir(path.dirname(residuePath), { recursive: true });
+      await fs.writeFile(residuePath, `residue:${residue}\n`);
+    }
+    const before = await byteLevelProtocolFixture();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const randomBytes = spyOn(crypto, "randomBytes").mockImplementation((size) => Buffer.alloc(size, 0x66));
+    const log = spyOn(console, "log").mockImplementation((...values) => { stdout.push(values.join(" ")); });
+    const error = spyOn(console, "error").mockImplementation((...values) => { stderr.push(values.join(" ")); });
+    try {
+      await resetSyncState(root, "new-stream");
+    } finally {
+      randomBytes.mockRestore();
+      log.mockRestore();
+      error.mockRestore();
+    }
+    expect((await loadState(root, "new-stream")).stream).toBe("new-stream");
+    if (residuePath) expect(await fs.readFile(residuePath, "utf8")).toBe(`residue:${residue}\n`);
+    expect({ before, after: await byteLevelProtocolFixture(), stdout, stderr })
+      .toMatchSnapshot(`E0 E7b pre-port byte differential ${residue}`);
+  });
+}
+
+test("reset consent refuses a corrupt selected store with zero effects", async () => {
+  const authorityId = "a".repeat(32);
+  await fs.writeFile(stateFile(), authorityMarkerBytes(authorityId));
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  await fs.writeFile(sqliteResetPaths.active(root), "not a SQLite database\n");
+  const before = await legacyProtocolTree();
+
+  await expect(resetSyncState(root, resetDestination, undefined, resetConsent()))
+    .rejects.toBeInstanceOf(StateAuthorityCorruptError);
+
+  expect(await legacyProtocolTree()).toEqual(before);
+});
+
+for (const timing of X_TIMINGS) {
+  test(`X1 JSON journal/phase/marker atomic rename refuses owner loss at ${timing}`, async () => {
+    const lock = await acquireStateLock();
+    const target = resetJournalPath(root);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, "old-row\n");
+    if (timing === "stale-entry") stealStateLock(lock);
+    await expect(writeFileAtomic(target, "new-row\n", {
+      onStep(point) { if (timing === "syscall-adjacent" && point === "before-rename") stealStateLock(lock); },
+      beforeRenameSync() { assertTestOwner(lock, target); },
+    })).rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    expect(await fs.readFile(target, "utf8")).toBe("old-row\n");
+  });
+
+  test(`X2 JSON candidate/archive bounded copy refuses owner loss at ${timing}`, async () => {
+    const lock = await acquireStateLock();
+    const source = stateFile();
+    const target = path.join(root, ".rbox", "state", "lineages", "copy.json");
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, "old-copy\n");
+    if (timing === "stale-entry") stealStateLock(lock);
+    await expect(boundedCopy(source, target, undefined, {
+      onStep(point) { if (timing === "syscall-adjacent" && point === "before-rename") stealStateLock(lock); },
+      beforeRenameSync() { assertTestOwner(lock, target); },
+    })).rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    expect(await fs.readFile(target, "utf8")).toBe("old-copy\n");
+  });
+
+  test(`X3 JSON candidate-to-active rename preserves a competing accepted save at ${timing}`, async () => {
+    await begin();
+    await expect(recoverResetJournal(root, "old-stream", { crashAt(point) {
+      if (point === "after-ready") throw new Error(point);
+    } })).rejects.toThrow("after-ready");
+    const lock = await acquireStateLock();
+    let competing: Buffer;
+    if (timing === "stale-entry") {
+      await lock.release();
+      competing = await commitAcceptedSave(competingPacket("old-stream", "1".repeat(32), 10));
+    } else {
+      const original = lock.isOwnerSync.bind(lock);
+      let checks = 0;
+      lock.isOwnerSync = () => {
+        checks++;
+        if (checks === 2) {
+          fsSync.rmSync(lock.path, { force: true });
+          competing = commitAcceptedSaveSync(competingPacket("old-stream", "1".repeat(32), 10));
+        }
+        return original();
+      };
+    }
+    await expect(recoverResetJournalUnderHeldFence(root, "old-stream", {}, lock))
+      .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    expect(await fs.readFile(stateFile())).toEqual(competing!);
+  });
+
+  test(`X4 JSON recovery-ref spawn preserves the preceding prefix at ${timing}`, async () => {
+    const entry = await zFixture(path.join(root, `x4-${timing}`), `x4-${timing}`, "7");
+    const lock = await acquireStateLock();
+    if (timing === "stale-entry") stealStateLock(lock);
+    if (timing === "syscall-adjacent") {
+      setGitSpawnObserver((_repo, args) => {
+        if (args[0] === "update-ref" && args[1] === entry.recoveryRef) stealStateLock(lock);
+      });
+    }
+    try {
+      await expect(createResetRecoveryRefs(root, [entry], 0, lock))
+        .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    } finally {
+      setGitSpawnObserver(undefined);
+    }
+    await expect(gitRaw(entry.repositoryIdentity.commonDirReal, ["rev-parse", "--verify", entry.recoveryRef]))
+      .rejects.toBeDefined();
+  });
+
+  test(`X5 JSON terminal journal unlink retains Z0 at ${timing}`, async () => {
+    await begin();
+    await expect(recoverResetJournal(root, "old-stream", { crashAt(point) {
+      if (point === "after-z-retired") throw new Error(point);
+    } })).rejects.toThrow("after-z-retired");
+    const lock = await acquireStateLock();
+    if (timing === "stale-entry") stealStateLock(lock);
+    else {
+      const original = lock.isOwnerSync.bind(lock);
+      let checks = 0;
+      lock.isOwnerSync = () => {
+        checks++;
+        if (checks === 2) stealStateLock(lock);
+        return original();
+      };
+    }
+    await expect(recoverResetJournalUnderHeldFence(root, "old-stream", {}, lock))
+      .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    expect((await readResetJournal(root))?.phase).toBe("z-retired");
+  });
+
+  test(`X6 E0 publishWholeState preserves competing state at ${timing}`, async () => {
+    await fs.rm(stateFile());
+    const lock = await acquireStateLock();
+    let competing: Buffer;
+    if (timing === "stale-entry") {
+      await lock.release();
+      competing = await commitAcceptedSave(competingPacket("competing-genesis", "legacy", 1));
+    } else {
+      const original = lock.isOwner.bind(lock);
+      lock.isOwner = async () => {
+        const owned = await original();
+        await lock.release();
+        competing = await commitAcceptedSave(competingPacket("competing-genesis", "legacy", 1));
+        return owned;
+      };
+    }
+    await expect(publishWholeState(stateFile(), '{"stream":"stale-genesis"}\n', lock))
+      .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+    expect(await fs.readFile(stateFile())).toEqual(competing!);
+  });
+
+  test(`X7 last-writer witness preserves competing witness at ${timing}`, async () => {
+    const sampled = await commitAcceptedSave(competingPacket("old-stream", "1".repeat(32), 10));
+    const lock = await acquireStateLock();
+    let competing: Buffer;
+    let witnessBefore: Buffer;
+    if (timing === "stale-entry") {
+      await lock.release();
+      competing = await commitAcceptedSave(competingPacket("old-stream", "1".repeat(32), 11));
+      witnessBefore = await fs.readFile(lastWriterWitnessPath(root));
+    } else {
+      const original = lock.isOwnerSync.bind(lock);
+      let checks = 0;
+      lock.isOwnerSync = () => {
+        checks++;
+        if (checks === 2) {
+          fsSync.rmSync(lock.path, { force: true });
+          competing = commitAcceptedSaveSync(competingPacket("old-stream", "1".repeat(32), 11));
+          witnessBefore = fsSync.readFileSync(lastWriterWitnessPath(root));
+        }
+        return original();
+      };
+    }
+    expect(await recordLastWriterWitness(root, stateFile(), sampled, () => 200, lock)).toBeUndefined();
+    expect(await fs.readFile(stateFile())).toEqual(competing!);
+    expect(await fs.readFile(lastWriterWitnessPath(root))).toEqual(witnessBefore!);
+  });
+}
 
 const constrainedMemory = process.env.RBOX_RUN_CONSTRAINED_RESET_MEMORY === "1" ? test : test.skip;
 

@@ -117,8 +117,8 @@ export interface BoundedStreamOptions {
   onChunk?: (chunk: Uint8Array, bytesRead: number) => void | Promise<void>;
 }
 
-function absent(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === "ENOENT";
+function absent(error: NodeJS.ErrnoException): boolean {
+  return error.code === "ENOENT";
 }
 
 function identity(stat: Awaited<ReturnType<typeof fs.lstat>>): BoundedIdentity {
@@ -149,7 +149,7 @@ export async function boundedStream(
   try {
     beforeStat = await fs.lstat(file);
   } catch (error) {
-    if (absent(error)) return undefined;
+    if (absent(error as NodeJS.ErrnoException)) return undefined;
     throw error;
   }
   if (!beforeStat.isFile() || beforeStat.isSymbolicLink()) throw unsafe(file, "unsafe non-regular reset file");
@@ -183,7 +183,7 @@ export async function boundedStream(
     try {
       afterPathStat = await fs.lstat(file);
     } catch (error) {
-      if (absent(error)) throw unsafe(file, "reset file disappeared while reading", "identity-race");
+      if (absent(error as NodeJS.ErrnoException)) throw unsafe(file, "reset file disappeared while reading", "identity-race");
       throw error;
     }
     const afterPath = identity(afterPathStat);
@@ -200,19 +200,29 @@ export async function boundedStream(
   }
 }
 
-export async function boundedRead(file: string, cap: number, options: BoundedStreamOptions = {}): Promise<Buffer | undefined> {
-  const retries = options.identityRetries ?? 2;
+/** An atomically republished file is a settled writer, not corruption: the next
+ * attempt reads the successor whole. Exhausting the budget still surfaces the
+ * race. Scope is deliberately narrow — `boundedRead` and the ordinary-load reset
+ * fence only. Standing-reset inspection keeps reading without this retry: on the
+ * destructive plane, an artifact republished mid-inspection must fail closed. */
+export async function retryOnIdentityRace<T>(attempt: () => Promise<T>, retries = 2): Promise<T> {
   if (!Number.isSafeInteger(retries) || retries < 0 || retries > 8) throw new RangeError("bounded read retry count is invalid");
-  for (let attempt = 0;; attempt++) {
-    const chunks: Buffer[] = [];
+  for (let tries = 0;; tries++) {
     try {
-      const result = await boundedStream(file, cap, (chunk) => { chunks.push(Buffer.from(chunk)); }, options);
-      return result ? Buffer.concat(chunks, result.bytesRead) : undefined;
+      return await attempt();
     } catch (error) {
       const changed = error instanceof ResetCorruptionError && error.kind === "identity-race";
-      if (!changed || attempt >= retries) throw error;
+      if (!changed || tries >= retries) throw error;
     }
   }
+}
+
+export async function boundedRead(file: string, cap: number, options: BoundedStreamOptions = {}): Promise<Buffer | undefined> {
+  return retryOnIdentityRace(async () => {
+    const chunks: Buffer[] = [];
+    const result = await boundedStream(file, cap, (chunk) => { chunks.push(Buffer.from(chunk)); }, options);
+    return result ? Buffer.concat(chunks, result.bytesRead) : undefined;
+  }, options.identityRetries ?? 2);
 }
 
 export async function boundedHash(file: string, cap = RESET_STREAM_BYTE_LIMIT): Promise<string | undefined> {
@@ -254,6 +264,9 @@ export interface BoundedCopyOptions {
       | "parent-synced"
       | "created-ancestors-synced",
   ) => void | Promise<void>;
+  /** Synchronous final assertion after all awaited preparation and immediately
+   * before the destination rename. */
+  beforeRenameSync?: () => void;
 }
 
 /** Stream-copy a stable source to an atomically published destination. */
@@ -267,6 +280,7 @@ export async function boundedCopy(
   const created = await ensureDirectoryChain(parent, "bounded-copy destination");
   const tmp = path.join(parent, `${RBOX_TMP_PREFIX}${process.pid}-${crypto.randomBytes(8).toString("hex")}-${path.basename(destination)}`);
   let output: fs.FileHandle | undefined;
+  let preserveTemp = false;
   try {
     output = await fs.open(tmp, "wx", 0o600);
     await options.onStep?.("temp-opened");
@@ -281,6 +295,12 @@ export async function boundedCopy(
     output = undefined;
     await options.onStep?.("temp-closed");
     await options.onStep?.("before-rename");
+    try {
+      options.beforeRenameSync?.();
+    } catch (error) {
+      preserveTemp = true;
+      throw error;
+    }
     await fs.rename(tmp, destination);
     await options.onStep?.("after-rename");
     await fsyncDirectory(parent);
@@ -293,7 +313,7 @@ export async function boundedCopy(
       await output.close().catch(() => {});
       await options.onStep?.("temp-closed");
     }
-    await fs.rm(tmp, { force: true }).catch(() => {});
+    if (!preserveTemp) await fs.rm(tmp, { force: true }).catch(() => {});
   }
 }
 
@@ -345,7 +365,7 @@ export async function boundedJsonRead<T>(
   try {
     preflight = await fs.lstat(file);
   } catch (error) {
-    if (absent(error)) return undefined;
+    if (absent(error as NodeJS.ErrnoException)) return undefined;
     throw error;
   }
   if (!preflight.isFile() || preflight.isSymbolicLink()) throw unsafe(file, "unsafe non-regular reset file");
