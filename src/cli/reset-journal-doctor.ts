@@ -202,7 +202,7 @@ async function quarantineStandingJournal(root: string): Promise<void> {
 }
 
 /** Rescue dispatcher. It intentionally runs before collectDoctorContext and
- * therefore before workspaceShape/loadState. */
+ * therefore before measureWorkspaceSize/loadState. */
 export async function resetJournalDoctorCmd(root: string, opts: ResetJournalDoctorOptions = {}): Promise<void> {
   if (opts.quarantine && opts.restore) throw new Error("choose either --quarantine or --restore");
   if (opts.restore) return restoreBundle(root, opts.restore);

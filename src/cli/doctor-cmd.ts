@@ -71,7 +71,7 @@ export interface DoctorCheck {
 export type DoctorChecks = Record<CheckName, DoctorCheck>
   & { chain?: DoctorCheck; reserve?: DoctorCheck; migration?: DoctorCheck };
 
-export interface WorkspaceShape {
+export interface WorkspaceSize {
   fileCount: number;
   totalBytes: number;
 }
@@ -89,7 +89,7 @@ export interface DiagnosticsBundle {
   daemonLogTail: DaemonLogSection;
   metrics: MetricsSection;
   activity: ActivitySection;
-  workspaceShape: WorkspaceShape;
+  workspaceShape: WorkspaceSize;
   leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
   repoResidue: DiagnosticsRepoResidueSection;
 }
@@ -161,7 +161,7 @@ export interface DoctorContext {
   creds?: Credentials;
   credentialResult?: CredentialLoadResult;
   checks: DoctorChecks;
-  workspaceShape: WorkspaceShape;
+  workspaceSize: WorkspaceSize;
   observation: LocalWorkspaceObservation;
   localOnly: {
     leftoverWorktrees: LocalOnlyLeftoverWorktreeSection;
@@ -474,15 +474,15 @@ async function checkGitCapability(root: string): Promise<DoctorCheck> {
   }
 }
 
-async function workspaceShape(root: string, cfg: WorkspaceConfig): Promise<WorkspaceShape> {
+async function measureWorkspaceSize(root: string, cfg: WorkspaceConfig): Promise<WorkspaceSize> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
     respectGitignore: cfg.respectGitignore === true,
     knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
   });
-  const shape: WorkspaceShape = { fileCount: 0, totalBytes: 0 };
-  await addWorkspaceShape(root, "", matcher, shape);
-  return shape;
+  const size: WorkspaceSize = { fileCount: 0, totalBytes: 0 };
+  await addDirectorySize(root, "", matcher, size);
+  return size;
 }
 
 export async function collectLeftoverWorktrees(
@@ -642,7 +642,7 @@ export async function collectRepoResidue(
   };
 }
 
-async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMatcher, shape: WorkspaceShape): Promise<void> {
+async function addDirectorySize(root: string, relDir: string, matcher: IgnoreMatcher, size: WorkspaceSize): Promise<void> {
   const absDir = relDir ? path.join(root, relDir) : root;
   let entries: Array<import("node:fs").Dirent>;
   try {
@@ -655,16 +655,16 @@ async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMa
     if (ent.isDirectory() ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel)) continue;
     const abs = path.join(root, rel);
     if (ent.isDirectory()) {
-      await addWorkspaceShape(root, rel, matcher, shape);
+      await addDirectorySize(root, rel, matcher, size);
       continue;
     }
     if (!ent.isFile() && !ent.isSymbolicLink()) continue;
     try {
       const st = await fsp.lstat(abs);
-      shape.fileCount++;
-      shape.totalBytes += st.size;
+      size.fileCount++;
+      size.totalBytes += st.size;
     } catch {
-      /* best effort: shape is diagnostic, not correctness state */
+      /* best effort: the size total is diagnostic, not correctness state */
     }
   }
 }
@@ -727,12 +727,12 @@ export async function collectDoctorContext(
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const input: DoctorCheckRunInput = { root, cfg, daemon: observation.daemon, creds, loaded };
-  const [checkEntries, shape, leftoverWorktrees, repoResidue] = await Promise.all([
+  const [checkEntries, workspaceSize, leftoverWorktrees, repoResidue] = await Promise.all([
     // Each descriptor carries its own key: a keyed record, not index-aligned.
     Promise.all(DOCTOR_CHECKS.map(async (descriptor) => [descriptor.id, await descriptor.run(input)] as const)),
     // An unreadable or foreign-stream state.json is what `checkState` REPORTS;
-    // letting its shape read abort collection made doctor unusable where needed.
-    workspaceShape(root, cfg).catch(() => ({ fileCount: 0, totalBytes: 0 })),
+    // letting its size read abort collection made doctor unusable where needed.
+    measureWorkspaceSize(root, cfg).catch(() => ({ fileCount: 0, totalBytes: 0 })),
     collectLeftoverWorktrees(root, cfg).catch(() => ({
       localOnly: { count: 0, entries: [] },
       diagnostics: { count: 0, entries: [] },
@@ -760,7 +760,7 @@ export async function collectDoctorContext(
     creds,
     credentialResult: loaded,
     observation,
-    workspaceShape: shape,
+    workspaceSize,
     checks,
     localOnly: {
       leftoverWorktrees: leftoverWorktrees.localOnly,
@@ -837,7 +837,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     daemonLogTail: sidecars.daemonLogTail,
     metrics: sidecars.metrics,
     activity: sidecars.activity,
-    workspaceShape: ctx.workspaceShape,
+    workspaceShape: ctx.workspaceSize,
     leftoverWorktrees: ctx.diagnostics.leftoverWorktrees,
     repoResidue: ctx.diagnostics.repoResidue ?? {
       count: 0,
