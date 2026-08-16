@@ -2,6 +2,7 @@ import {
   MAX_GIT_REPOS,
   readManifestChain,
   validateGitRepos,
+  type FileEntry,
   type GitSection,
   type Manifest,
 } from "../engine/index.js";
@@ -350,11 +351,32 @@ export type FileOnlyManifest = Omit<Manifest, "gitRepos"> & { gitRepos?: never }
  * Both backends re-check it against live state under the canonical state lock. */
 export interface ElisionExpectation { nonce: string; stateRevision: number }
 
+/** The predecessor a delta is relative to. The exact shape an ElisionReceipt
+ * already ships: an accepted CAS of any kind bumps `stateRevision`, so revision
+ * equality proves no writer interleaved since the composer's load. */
+export interface DeltaBinding { nonce: string; stateRevision: number }
+
+/** One file-level change against the predecessor manifest. */
+export type DeltaOp =
+  | { kind: "upsert"; entry: FileEntry }
+  | { kind: "delete"; path: string };
+
+/** A composed global as ops against a bound predecessor. Ops are in strictly
+ * ascending path order and no path appears twice across both kinds. */
+export interface GlobalDelta {
+  binding: DeltaBinding;
+  ops: readonly DeltaOp[];
+}
+
 export interface StateSavePacket {
   expectedStream: string;
   expectedNonce: string;
   sourceGlobalSeq: number;
   global?: { manifest: FileOnlyManifest; manifestMeta?: GlobalManifestMeta };
+  /** Design 269: the same global expressed relatively. A backend may stage it
+   * instead of `global`'s whole manifest; `global` stays authoritative for every
+   * consumer that does not understand deltas. */
+  globalDelta?: GlobalDelta;
   repos: RepoTransition[];
   /** Present only when composition omitted a section it proved unchanged. */
   elisionExpectation?: ElisionExpectation;

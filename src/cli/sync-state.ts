@@ -30,8 +30,11 @@ import {
   type SyncState,
 } from "./config.js";
 import {
-  fullyElidedPacket, globalWouldNotChange, receiptBoundTo, recordWouldNotChange, type ElisionReceipt,
+  fullyElidedPacket, globalElisionAudit, receiptBoundTo, recordWouldNotChange, type ElisionReceipt,
 } from "./sync-state-elision.js";
+import {
+  composeGlobalDelta, deltaBindingFor, noteCompleteSaveAccepted, observeGlobalContentDrift,
+} from "./sync-state-delta.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
 import { replaceResetLineageStream } from "./state-plane/adapters/whole-state-compat.js";
@@ -106,6 +109,13 @@ export interface StateSource {
   /** Design 267: a pull's proof that sections of this save would move nothing.
    * Absent — every non-pull source — composes the full packet as always. */
   elisionReceipt?: ElisionReceipt;
+  /** Design 269: this source's base is the unprojected remote manifest, so the
+   * idle-cycle audit covers this lane and a relative global is admissible.
+   * A scoped projection, a repair, or a migration never sets it. */
+  baseIsUnscopedRemote?: boolean;
+  /** Design 269 §2.4: known base drift. Composes a COMPLETE save, which is the
+   * sole repair authority. Process-local and never durable. */
+  forceCompleteSave?: true;
 }
 
 export interface ConfigApplyCompletion {
@@ -297,8 +307,13 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
   // transitions ride that same proof rather than each carrying their own, so a
   // content-carrying save never attaches an expectation and never spends part
   // of its retry budget on a race it had no reason to care about (§3.3).
-  const proven = receipt !== undefined
-    && globalWouldNotChange(snapshot, source.sourceGlobalSeq, receipt) ? receipt : undefined;
+  const audit = receipt === undefined
+    ? "not-audited"
+    : globalElisionAudit(snapshot, source.sourceGlobalSeq, receipt);
+  // The audit is the only detector of durable base drift (269 §2.4): once it
+  // fires, saves carry whole manifests until one is accepted.
+  if (audit === "content-drift") observeGlobalContentDrift();
+  const proven = audit === "unchanged" ? receipt : undefined;
   const repos = observedRepos.flatMap((relPath) => {
     const stored = records[relPath];
     const current = stored ?? { repoGen: 0, sourceSeq: 0 };
@@ -321,6 +336,13 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
   // Repo transitions above likewise retain records with a newer sourceSeq.
   if (source.globalManifest !== undefined && proven === undefined && source.sourceGlobalSeq >= snapshot.lastSyncedSequence) {
     packet.global = { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta };
+    // ONE walk, over the two file-only projections, producing the ops that the
+    // whole manifest above is the independent statement of (269 §2.1).
+    const binding = deltaBindingFor(snapshot, source);
+    const delta = binding === undefined
+      ? undefined
+      : composeGlobalDelta(fileOnlyManifest(snapshot.lastSyncedManifest).files, packet.global.manifest.files, binding);
+    if (delta !== undefined) packet.globalDelta = delta;
   }
   if (proven !== undefined) {
     packet.elisionExpectation = { nonce: proven.nonce, stateRevision: proven.stateRevision };
@@ -390,7 +412,12 @@ export async function saveStateSource(
   for (let attempt = 0; attempt < 3; attempt++) {
     const packet = composeStateSavePacket(snapshot, source);
     const result = await apply(root, packet, fullyElidedPacket(packet) ? { acceptedProjection: snapshot } : {});
-    if (result.status === "accepted") return result.state;
+    if (result.status === "accepted") {
+      // A whole-manifest global that landed rewrote the base outright, which is
+      // the heal §2.4 waits for.
+      if (packet.global !== undefined && packet.globalDelta === undefined) noteCompleteSaveAccepted();
+      return result.state;
+    }
     if (result.status === "unsupported") {
       // Exact-Q lock refusal is a typed state-plane barrier. It must escape
       // before the JSON-only projection or writer is even reached. Legacy JSON

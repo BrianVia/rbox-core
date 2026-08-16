@@ -127,8 +127,7 @@ function assertDeltaBinding(delta: CasDeltaGlobal): void {
   if (!sealed || !claimed) {
     throw new StageChangedError(delta.stage.stageId, "a delta global must carry a predecessor binding");
   }
-  if (typeof claimed.nonce !== "string" || claimed.nonce.length === 0
-    || !Number.isSafeInteger(claimed.stateRevision) || claimed.stateRevision < 0) {
+  if (!claimed.nonce || !Number.isSafeInteger(claimed.stateRevision) || claimed.stateRevision < 0) {
     throw new StageChangedError(delta.stage.stageId, "a delta binding must name a nonce and a nonnegative revision");
   }
   if (canonicalDeltaBinding(sealed) !== canonicalDeltaBinding(claimed)) {

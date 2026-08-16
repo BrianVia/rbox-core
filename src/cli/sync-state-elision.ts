@@ -90,13 +90,29 @@ export function globalWouldNotChange(
   sourceGlobalSeq: number,
   receipt: ElisionReceipt,
 ): boolean {
-  if (!receipt.noActions || !receipt.storedBaseIsRemote) return false;
-  if (sourceGlobalSeq !== snapshot.lastSyncedSequence) return false;
+  return globalElisionAudit(snapshot, sourceGlobalSeq, receipt) === "unchanged";
+}
+
+/**
+ * What the audit actually observed. `content-drift` is the ONE outcome that says
+ * something about the durable base rather than about this cycle's shape: every
+ * other input agreed, and only the persisted content's hash disagreed — design
+ * 269 §2.4's drift detector.
+ */
+export type GlobalElisionAudit = "unchanged" | "content-drift" | "not-audited";
+
+export function globalElisionAudit(
+  snapshot: SyncState,
+  sourceGlobalSeq: number,
+  receipt: ElisionReceipt,
+): GlobalElisionAudit {
+  if (!receipt.noActions || !receipt.storedBaseIsRemote) return "not-audited";
+  if (sourceGlobalSeq !== snapshot.lastSyncedSequence) return "not-audited";
   const incoming = validManifestMeta(receipt.manifestMeta);
   const persisted = validManifestMeta(snapshot.manifestMeta);
-  if (!incoming || !persisted || !isDeepStrictEqual(incoming, persisted)) return false;
+  if (!incoming || !persisted || !isDeepStrictEqual(incoming, persisted)) return "not-audited";
   return canonicalManifestHashStreaming(manifestFromMeta(snapshot.lastSyncedManifest, persisted))
-    === incoming.manifestHash;
+    === incoming.manifestHash ? "unchanged" : "content-drift";
 }
 
 /** §3.3. `applyTransitions` is a pure upsert with no absence semantics, so a
