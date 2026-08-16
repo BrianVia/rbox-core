@@ -211,6 +211,10 @@ try {
     if (!file.startsWith(`${srcRoot}${path.sep}`)
       || !file.endsWith(".ts")
       || file.endsWith(".test.ts")
+      // Test code is out of scope for every gate built on this sweep, and a
+      // fixture builder is test code wherever it lives — the same category the
+      // module-size and duplicate-declaration gates already spell out.
+      || file.endsWith(".test-helper.ts")
       || file.endsWith(".bench-helper.ts")) continue;
     const source = project.program.getSourceFile(file);
     if (!source) continue;

@@ -190,7 +190,8 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     "src/cli/sync-git/pins.ts": 1,
     "src/cli/sync-git/quarantine.ts": 3,
     "src/cli/sync-git/rollback.ts": 4,
-    "src/cli/sync-git/v1724-journal-fixture.test-helper.ts": 1,
+    // No .test-helper.ts rows: the sweep excludes test code, which is what a
+    // fixture builder is. v1724-journal-fixture's single site left with it.
   });
 });
 
