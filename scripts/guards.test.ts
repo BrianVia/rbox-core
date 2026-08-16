@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { INQUIRER_IMPORT_ERROR, TUI_IMPORT_ERROR } from "./guards";
+import { findShardWeightViolations, INQUIRER_IMPORT_ERROR, TUI_IMPORT_ERROR } from "./guards";
+import { FILE_WEIGHTS } from "./ci-shard-weights";
 
 const fixtureRoots: string[] = [];
 const dedicatedGitSyncTests = [
@@ -31,6 +32,9 @@ async function makeFixture(options: { duplicateSplitName?: boolean; missingDedic
   await put(root, "src/cli/sync-git/git-sync.test.ts", [...configured, ...ordinary].map((name) => `test(${JSON.stringify(name)}, () => {});`).join("\n"));
   await put(root, "src/cli/e2ee-sync.test.ts", 'test("e2ee transport", () => {});\n');
   await put(root, "src/cli/sync-git/git-nested.test.ts", 'test("nested one", () => {});\n');
+  // The shard-weight guard checks every weighted file still exists, so a
+  // synthetic tree must carry stand-ins for the whole registry.
+  for (const file of FILE_WEIGHTS.keys()) await put(root, file, 'test("weighted", () => {});\n');
   await put(root, "src/cli/prompt.ts", "export const prompt = true;\n");
   await put(root, "src/cli/prompt-ink.tsx", 'import React from "react";\nimport { render } from "ink";\nvoid React; void render;\n');
   if (options.strayImport) {
@@ -153,5 +157,19 @@ describe("repository guards", () => {
     const result = await runSharderFixture(await makeFixture(), "guard", 4);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("anti-affinity group git-sync-process exceeds 4 shards");
+  });
+});
+
+describe("shard weight guard", () => {
+  test("the committed registry is measured and every weighted file still exists", async () => {
+    expect(await findShardWeightViolations(process.cwd())).toEqual([]);
+  });
+
+  test("a checkout missing the weighted files reports each one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "rbox-shard-weights-"));
+    fixtureRoots.push(root);
+    const violations = await findShardWeightViolations(root);
+    expect(violations.length).toBeGreaterThan(40);
+    expect(violations.every((violation) => violation.startsWith("weighted test file no longer exists: "))).toBeTrue();
   });
 });
