@@ -1,5 +1,24 @@
 # rbox status — living state snapshot
 
+## 2026-08-16 — SP-3 CLOSE-OUT: fleet soak CLEAN on da28ddc
+
+- Darwin trilogy fixed + field-validated (#745 PERSIST_WAL, #746 sealed
+  DELETE-mode, #747 containment keeps private names — Apple's system SQLite
+  cannot read unlinked databases, probe matrix in PR). Soak: desktop + Mac
+  "syncing normally", Mac sealed-stage errors ZERO post-fix (was ~6/min),
+  FM pull-only with zero publishes ever. Mac git deferrals down to the ~6
+  known parked ones. CI has NO darwin runtime lane — three field bugs say
+  build one (queued).
+- Status false-halt flap: read-only W1 classifier races a live writer and
+  intermittently reports "sync halted" while the daemon is healthy — folded
+  into task #50 (W1 takeover-not-halt + halt retry).
+- FM read-write flip awaits explicit founder yes (266 §9.4).
+- SP-4 eligibility: all §9.4 criteria met except soak duration is founder's
+  call; backups + cutover records retained.
+- New host reality: desktop runs a LIVE fleet daemon — local crash-rig/io-halt
+  suites now fail on this host from co-residence/tmpfs pressure; CI or rig
+  containers are the arbiter for those suites (papercut class).
+
 ## 2026-08-15/16 — SQLITE FLEET CUTOVER COMPLETE (SP-3 shipped + live)
 
 - SP-3 merged (#743, design 266 ALIGNED v4 + fold R4): genesis default at every
