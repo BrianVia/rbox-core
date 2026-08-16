@@ -230,6 +230,31 @@ expectation only: multi-second reduction with read-back + fullfsync
 COMMIT as the residual floor. Zero-op delta case (git-only commits — the
 Mac field shape) drops the entire 2.3s stage pipeline.
 
+### 5.1 Measured, before/after (implementation close-out)
+
+`scripts/bench/state-plane.ts`, N=119k, desktop, **real ext4**
+(`TMPDIR=/home/via/.cache/rbox-bench-269`; the default `/tmp` is tmpfs on this
+host and reports a machine nobody runs on). Before = `main` @ `4f544f462`;
+after = this branch, two runs, spread under 1%.
+
+| case | before | after | note |
+|---|---:|---:|---|
+| `save_cold` | 3397 ms | 2936-2948 ms | complete path, R1+R3 only |
+| `save_steady_one_changed` | 2771 ms | 2294 ms | complete path, R1+R3 only |
+| `save_delta_one_changed` | — | 45-46 ms | the new shape |
+| `save_minimal_noop` | 29 ms | 14 ms | 267's minimal packet |
+| `load_full` | 385 ms | 385 ms | the kept read-back (§7) |
+
+The one-changed content save is 2771 → **45 ms** of save-proper, below the
+§5 estimate of 180-370 (the estimate priced a diff this bench does not pay:
+the composer's walk happens upstream in `composeStateSavePacket`). The riders
+alone take the surviving complete path down 13-17%, which is what genesis,
+repair, and every heal now cost. The read-back is untouched and is now ~89% of
+the observed delta-save phase wall — §7's top residual, restated with numbers.
+
+Not measured here: the composer walk (upstream of the store), the Mac, and
+both field lanes. The darwin probe and the field close-out remain open.
+
 ## 6. Validation
 
 - `saveStateSource`-level differential (THE authority for the seam):

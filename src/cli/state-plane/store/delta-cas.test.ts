@@ -121,17 +121,17 @@ function deltaPacket(
   const token = openReadSnapshot(handle).token;
   const sealedBinding = options.binding ?? liveBinding(handle);
   const stage = sealDelta(stages, sealedBinding, ops, options.resultFiles ?? resultFiles);
-  const packet: CasPacket = {
+  const globalDelta: CasPacket["globalDelta"] = {
+    stage, fileHeader: stage.header, binding: options.claimedBinding ?? sealedBinding,
+  };
+  if (options.manifestMeta) globalDelta.manifestMeta = options.manifestMeta;
+  return {
     expected: expectation(token),
     sourceGlobalSeq: options.sourceGlobalSeq ?? 5,
-    globalDelta: {
-      stage, fileHeader: stage.header, binding: options.claimedBinding ?? sealedBinding,
-      ...(options.manifestMeta ? { manifestMeta: options.manifestMeta } : {}),
-    },
+    globalDelta,
     repoTransitions: sealTransitions(stages, token, stage),
     ownerToken: OWNER,
   };
-  return packet;
 }
 
 function completeSave(workspaceUnderTest: Workspace, files: readonly FileEntry[], sourceGlobalSeq = 5): CasResult {

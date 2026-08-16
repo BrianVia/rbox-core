@@ -35,7 +35,12 @@ afterEach(() => {
 
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function workspace(prefix: string): { stages: string; handle: StateStoreHandle } {
+interface Workspace {
+  stages: string;
+  handle: StateStoreHandle;
+}
+
+function workspace(prefix: string): Workspace {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   roots.push(root);
   const handle = createStateStore(path.join(root, "state.db"), {

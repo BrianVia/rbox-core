@@ -437,7 +437,7 @@ test("repo-transition-v1 moves for every binding, evidence, row, and snapshot di
 
 /* ------------------------------------------------------------ delta grammar */
 
-interface DeltaShape {
+interface DeltaConstruction {
   stageId: string;
   plane: "base" | "local";
   header: ManifestHeader;
@@ -446,7 +446,7 @@ interface DeltaShape {
   counts?: DeltaCounts;
 }
 
-const DELTA_BASE: DeltaShape = {
+const DELTA_BASE: DeltaConstruction = {
   stageId: STAGE_ID,
   plane: "base",
   header: HEADER,
@@ -458,11 +458,11 @@ const DELTA_BASE: DeltaShape = {
   ],
 };
 
-function deltaDigest(shape: DeltaShape): string {
-  const builder = new StageDeltaDigestBuilder(shape.stageId, shape.plane, shape.header, shape.binding);
+function deltaDigest(construction: DeltaConstruction): string {
+  const builder = new StageDeltaDigestBuilder(construction.stageId, construction.plane, construction.header, construction.binding);
   let upserts = 0;
   let deletes = 0;
-  for (const op of shape.ops) {
+  for (const op of construction.ops) {
     if (op.kind === "upsert") {
       builder.upsert(op.entry.path, encodeFileEntry(op.entry).canonical);
       upserts++;
@@ -471,7 +471,7 @@ function deltaDigest(shape: DeltaShape): string {
       deletes++;
     }
   }
-  return builder.seal(shape.counts ?? { upserts, deletes, resultFiles: 4 });
+  return builder.seal(construction.counts ?? { upserts, deletes, resultFiles: 4 });
 }
 
 test("stage-delta-v1 base construction is pinned", () => {
@@ -481,7 +481,7 @@ test("stage-delta-v1 base construction is pinned", () => {
 test("stage-delta-v1 moves for every dimension it frames", () => {
   const base = deltaDigest(DELTA_BASE);
   const [first, second, third] = DELTA_BASE.ops as [DeltaOp, DeltaOp, DeltaOp];
-  const variants = new Map<string, DeltaShape>([
+  const variants = new Map<string, DeltaConstruction>([
     ["stage id", { ...DELTA_BASE, stageId: "2".repeat(32) }],
     ["plane", { ...DELTA_BASE, plane: "local" }],
     ["header generatedAt", { ...DELTA_BASE, header: { ...HEADER, generatedAt: "2026-07-28T10:00:01.000Z" } }],
@@ -495,7 +495,7 @@ test("stage-delta-v1 moves for every dimension it frames", () => {
     ["upsert value", { ...DELTA_BASE, ops: [{ kind: "upsert", entry: { ...ENTRIES[0]!, size: 99 } }, second, third] }],
     ["resultFiles", { ...DELTA_BASE, counts: { upserts: 2, deletes: 1, resultFiles: 5 } }],
   ]);
-  assertAllDistinct(base, new Map([...variants].map(([name, shape]) => [name, deltaDigest(shape)])));
+  assertAllDistinct(base, new Map([...variants].map(([name, construction]) => [name, deltaDigest(construction)])));
 });
 
 test("stage-delta-v1 refuses counts that disagree with what it framed", () => {
