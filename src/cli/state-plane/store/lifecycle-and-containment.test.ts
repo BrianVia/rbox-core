@@ -40,7 +40,7 @@ afterEach(() => {
 
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function workspace(prefix: string): { root: string; stages: string; handle: StateStoreHandle } {
+function workspace(prefix: string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   roots.push(root);
   const handle = createStateStore(path.join(root, "state.db"), {
@@ -99,12 +99,15 @@ test("stage builders run in WAL and seal only with zero sidecars", () => {
   const sealed = sealedStagePath(stages, stage.stageId, stage.logicalDigest);
   // S0 is a checked precondition of publication, not an assumption.
   for (const suffix of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(`${sealed}${suffix}`)).toBe(false);
-  // The artifact really is a WAL database; DELETE journaling would make S0 a
-  // structural side effect rather than the normative checkpoint-then-check.
+  // The sealed artifact is DELETE-mode: a WAL-mode seal needs a -shm created
+  // at every later read-only open, which Apple's system SQLite refuses
+  // (SQLITE_CANTOPEN — 291 field deferrals, 2026-08-16 Mac cutover). The
+  // checkpoint-then-check discipline is unchanged: S0 is still asserted at
+  // seal before the mode flip, as a normative check, not a side effect.
   const scratch = path.join(root, "scratch.db");
   fs.copyFileSync(sealed, scratch);
   const probe = new Database(scratch, { create: false, readonly: true });
-  expect(String((probe.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toLowerCase()).toBe("wal");
+  expect(String((probe.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toLowerCase()).toBe("delete");
   probe.close();
 });
 
@@ -151,8 +154,10 @@ function pagedStage(stages: string, marker: string, rows: number): SealedStageRe
     builder.putEntries(Array.from({ length: Math.min(128, rows - offset) }, (_, index) => ({
       path: `${marker}/${String(offset + index).padStart(5, "0")}.txt`,
       sha256: hex(64, 1), size: 1, mode: 0o644, mtimeMs: 1, type: "file",
+      // The extra padding field bloats each stored row past one page; the
+      // builder round-trips unknown fields, which is exactly what this relies on.
       padding: marker.repeat(512),
-    } as unknown as FileEntry)));
+    })) as readonly FileEntry[]);
   }
   return builder.finishGeneration({ files: rows, gitSections: 0 });
 }
