@@ -597,6 +597,11 @@ per-connection wrapper cost the test's own comment names; hypothesis is
 retained-connection nondeterminism under shard-process cumulative
 pressure, NOT authority-size growth (the branch reduces this path's
 allocation: R3 removes per-row randomBytes). The two new 269 suites
-measure 0.41s/0.08s — not the pressure source. Watch: if it recurs,
-isolate the guard into its own shard-dedicated file rather than raising
-the budget.
+measure 0.41s/0.08s — not the pressure source. RECURRED same day (2nd sighting,
+next full-gate run; again green on rerun + isolation). Isolation into its
+own file is NOT mechanical — the guard shares the file's fixture
+machinery, and its own in-code comment concedes the 16MiB threshold
+cannot catch the regression it is named for. Follow-up owed: redesign the
+guard (per-connection-cost-aware baseline or a dedicated-process runner),
+not a threshold bump. Until then: registered flake, green-on-rerun
+proceeds.

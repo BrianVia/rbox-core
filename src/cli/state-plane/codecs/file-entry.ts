@@ -2,7 +2,7 @@ import type { FileEntry } from "../../../engine/index.js";
 import { isSafeRelPath } from "../../../engine/index.js";
 import { createHash, randomBytes } from "node:crypto";
 import { FileEntryOversizeError } from "../errors.js";
-import { jsonCounter, jsonObject, jsonText } from "../../../json.js";
+import { jsonObject, jsonText } from "../../../json.js";
 import { canonicalJson, extrasOf, parseCanonicalJson, retainedEstimate, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
 
 export const FILE_ENTRY_KEYS = [
@@ -47,7 +47,8 @@ function hex(value: string | undefined, field: string, optional = false): Buffer
 }
 
 function nonnegativeInteger(value: number | undefined, field: string): asserts value is number {
-  if (jsonCounter(value) === undefined) throw new TypeError(`${field} must be a nonnegative integer`);
+  // Number.isInteger never coerces, so it is the whole boundary test.
+  if (!Number.isInteger(value) || (value as number) < 0) throw new TypeError(`${field} must be a nonnegative integer`);
 }
 
 /** Canonical stage/plane bytes as the entry they encode. The container test is
