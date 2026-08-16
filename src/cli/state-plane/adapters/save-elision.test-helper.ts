@@ -106,10 +106,15 @@ export async function seededSqlite(
     repos: [{ relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: SEQ } }],
   });
   if (first.status !== "accepted") throw new Error(`seed save was refused (${first.status})`);
-  const meta = {
-    ...metaFields,
-    manifestHash: canonicalManifestHashStreaming(manifestFromMeta(first.state.lastSyncedManifest, metaFields)),
-  };
+  // A caller that already knows the hash it wants persisted (a drift fixture,
+  // whose meta must describe the TRUTH rather than the bytes being seeded)
+  // supplies it; otherwise the meta is made to describe what actually landed.
+  const meta = metaFields.manifestHash === META_FIELDS.manifestHash
+    ? {
+        ...metaFields,
+        manifestHash: canonicalManifestHashStreaming(manifestFromMeta(first.state.lastSyncedManifest, metaFields)),
+      }
+    : metaFields;
   const second = await applyStateSavePacket(root, {
     expectedStream: STREAM, expectedNonce: NONCE, sourceGlobalSeq: SEQ,
     global: { manifest, manifestMeta: meta }, repos: [],

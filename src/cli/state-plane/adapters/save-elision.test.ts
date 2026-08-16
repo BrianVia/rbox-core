@@ -19,8 +19,12 @@ afterEach(cleanupElisionFixtures);
 
 // --- M1: the minimal packet -------------------------------------------------
 
-test("red-first: without a receipt the no-op save still builds the whole global stage", async () => {
-  const seed = await seededSqlite("red-first");
+/** NOT a red-first pin — it characterizes the receipt-less path, which behaves
+ * this way before and after M1. What discriminates the mechanism is the pair
+ * below it (the same workspace WITH a receipt) and the mutation evidence
+ * recorded for the content self-check. */
+test("characterization: without a receipt the no-op save still builds the whole global stage", async () => {
+  const seed = await seededSqlite("no-receipt");
   const packets: StateSavePacket[] = [];
   const before = baseGeneration(seed.root);
   const { elisionReceipt: _none, ...noProvenance } = pullSource(seed);
@@ -154,21 +158,27 @@ test("a changed repo record is never elided, and the unchanged ones still are", 
 });
 
 test("encSha-ONLY durable drift under zero actions refuses elision and heals", async () => {
-  // The r1 counterexample, isolated: plaintext sha256, size, mode and mtime all
-  // match the meta's manifest — ONLY the ciphertext address differs. A predicate
-  // that stopped binding `encSha` would elide here and leave the drift durable,
-  // which no other fixture in this suite would notice.
-  const truth = MANIFEST.files.map((entry) => ({ ...entry, encSha: hex(64, 200 + entry.size) }));
-  const drifted = truth.map((entry, index) => index === 1 ? { ...entry, encSha: hex(64, 999) } : entry);
-  const seed = await seededSqlite("enc-drift", { ...MANIFEST, files: drifted });
+  // The r1 counterexample, isolated so ONLY the content self-check can refuse.
+  //
+  // Isolating it takes care. Seeding a drifted manifest and hashing it into the
+  // meta makes the STORED meta disagree with the incoming one, and §3.2.2's
+  // deep-equal refuses first — the hash is then never the discriminator, and a
+  // build with the self-check deleted passes. So the true meta is installed over
+  // the drifted manifest: incoming meta and stored meta are identical, every
+  // other file field matches, and the only disagreement left in the world is
+  // one entry's ciphertext address versus the hash the meta commits to.
+  const truth = MANIFEST.files.map((file) => ({ ...file, encSha: hex(64, 200 + file.size) }));
+  const drifted = truth.map((file, index) => index === 1 ? { ...file, encSha: hex(64, 999) } : file);
   const trueMeta = {
     ...META_FIELDS,
     manifestHash: canonicalManifestHashStreaming(manifestFromMeta({ ...MANIFEST, files: truth }, META_FIELDS)),
   };
+  const seed = await seededSqlite("enc-drift", { ...MANIFEST, files: drifted }, trueMeta);
   const durableBefore = (await loadRawState(seed.root))!;
+  expect(seed.meta).toEqual(trueMeta);
   expect(durableBefore.lastSyncedManifest.files[1]!.encSha).toBe(hex(64, 999));
-  expect(durableBefore.lastSyncedManifest.files.map((entry) => entry.sha256))
-    .toEqual(truth.map((entry) => entry.sha256));
+  expect(durableBefore.lastSyncedManifest.files.map((file) => ({ ...file, encSha: undefined })))
+    .toEqual(truth.map((file) => ({ ...file, encSha: undefined })));
 
   const packets: StateSavePacket[] = [];
   const source: StateSource = {
