@@ -76,8 +76,11 @@ function assertPragmas(values: StorePragmas, readonly: boolean, file: string): v
     busyTimeout: readonly ? 250 : 5000,
     tempStore: 1,
     queryOnly: 0,
-    ...(process.platform === "darwin" ? { fullfsync: 1, checkpointFullfsync: 1 } : {}),
   };
+  if (process.platform === "darwin") {
+    expected.fullfsync = 1;
+    expected.checkpointFullfsync = 1;
+  }
   if (!readonly) expected.journalSizeLimit = 67108864;
   for (const [key, wanted] of Object.entries(expected)) {
     if (values[key as keyof StorePragmas] !== wanted) {
@@ -378,8 +381,12 @@ export function openStateStore(file: string, options: { readonly?: boolean } = {
 export interface ImmutableStoreLineage {
   authorityId: string;
   stream: string;
-  stateNonce: string;
-  stateRevision: number;
+  /** Absent until the lineage's first save mints one. Genesis is the default for
+   * absent state (design 266), so a tracked-but-never-synced workspace has a
+   * settled authority whose nonce and revision are legitimately unset — that is
+   * pre-first-save state, not a structural fault. */
+  stateNonce?: string;
+  stateRevision?: number;
 }
 
 /** Read the main-file lineage without allowing SQLite to create or touch WAL/SHM. */
@@ -392,8 +399,11 @@ export function readImmutableStoreLineage(file: string): ImmutableStoreLineage {
     const header = validateOpen(db, file);
     const row = selectRow<{ stream: string; stateNonce: string | null; stateRevision: number | null }>(db,
       "SELECT stream,state_nonce AS stateNonce,state_revision AS stateRevision FROM state_lineage WHERE lineage_id=(SELECT active_lineage_id FROM store_meta WHERE singleton=1)");
-    if (!row?.stateNonce || row.stateRevision === null) throw new StateStoreOpenError("structural-invariant", file, "active lineage is incomplete");
-    return { authorityId: header.authority_id, stream: row.stream, stateNonce: row.stateNonce, stateRevision: row.stateRevision };
+    if (!row) throw new StateStoreOpenError("structural-invariant", file, "the store names no active lineage");
+    const lineage: ImmutableStoreLineage = { authorityId: header.authority_id, stream: row.stream };
+    if (row.stateNonce !== null) lineage.stateNonce = row.stateNonce;
+    if (row.stateRevision !== null) lineage.stateRevision = row.stateRevision;
+    return lineage;
   } finally { db.close(); }
 }
 

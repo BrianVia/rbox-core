@@ -43,6 +43,7 @@ test("LocalRuntime owns one lease and exposes only reachable foreground policies
   ]);
   expect(result.failedTrace).toEqual([
     "lease:acquired",
+    "genesis:admitted",
     "remote:built",
     "authority:pinned",
     "admission:pinned",
@@ -52,6 +53,7 @@ test("LocalRuntime owns one lease and exposes only reachable foreground policies
   ]);
   expect(result.refusalTrace).toEqual([
     "lease:acquired",
+    "genesis:admitted",
     "remote:built",
     "authority:pinned",
     "admission:pinned",
@@ -62,6 +64,17 @@ test("LocalRuntime owns one lease and exposes only reachable foreground policies
   expect(result.admissionCalls).toBe(12);
 });
 
+interface ExpectedRun {
+  label: string;
+  report: string;
+  execute: string;
+  allowPull?: boolean;
+  allowPush?: boolean;
+  hint?: string;
+  cfg: ReturnType<typeof expectedCfg>;
+  trace: string[];
+}
+
 function run(
   label: string,
   report: string,
@@ -69,17 +82,15 @@ function run(
   allowPull?: boolean,
   allowPush?: boolean,
   hint?: string,
-) {
-  return {
+): ExpectedRun {
+  const expected: ExpectedRun = {
     label,
     report,
     execute,
-    ...(allowPull === undefined ? {} : { allowPull }),
-    ...(allowPush === undefined ? {} : { allowPush }),
-    ...(hint === undefined ? {} : { hint }),
     cfg: expectedCfg(),
     trace: [
       "lease:acquired",
+      "genesis:admitted",
       "remote:built",
       "authority:pinned",
       "admission:pinned",
@@ -89,6 +100,10 @@ function run(
       "lease:released",
     ],
   };
+  if (allowPull !== undefined) expected.allowPull = allowPull;
+  if (allowPush !== undefined) expected.allowPush = allowPush;
+  if (hint !== undefined) expected.hint = hint;
+  return expected;
 }
 
 function expectedCfg() {

@@ -14,11 +14,11 @@ import { push } from "./sync/push.js";
 import { sync } from "./sync/sync.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import type { WorkspaceConfig } from "./workspace-config.js";
-import { loadConfigIfPresent } from "./workspace-config.js";
-import { admitGenesisAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
-import { loadCredentials } from "./credentials.js";
-import { RboxApi } from "./remote.js";
-import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
+import {
+  admitGenesisAuthority,
+  requireSelected,
+  type GenesisAdmissionRefusal,
+} from "./state-plane/authority-bootstrap.js";
 
 type MassDeleteConsent = "guarded" | "allow";
 type SyncMassDeleteConsent = "guard-both" | "allow-push" | "allow-both";
@@ -113,25 +113,7 @@ export class LocalRuntime {
     return withWorkspaceSyncMutex(this.root, async (syncMutex) => {
       const genesisAdmission = await admitGenesisAuthority(this.root, syncMutex);
       if (genesisAdmission.kind === "refused") {
-        try {
-          const [cfg, loaded] = await Promise.all([
-            loadConfigIfPresent(this.root),
-            loadCredentials(),
-          ]);
-          if (cfg && loaded.state === "valid") {
-            await reportGenesisLockUnsupported(
-              genesisAdmission.refusal,
-              new RboxApi(
-                loaded.credentials.remoteUrl,
-                loaded.credentials.token,
-                cfg.remoteWorkspaceId,
-                cfg.projectId,
-              ),
-            );
-          }
-        } catch {
-          // Telemetry is optional and never replaces the admission refusal.
-        }
+        await reportRefusalOccurrence(this.root, genesisAdmission.refusal);
       }
       requireSelected(genesisAdmission);
       const { cfg: remoteCfg, deps: remoteDeps } = await buildAuthedRemote(
@@ -144,15 +126,11 @@ export class LocalRuntime {
       if (admission.kind !== "admitted") throw runtimeRefusal(admission);
       const cfg = applyFolderPolicy(remoteCfg, admission.policy);
       const report = beginReport(reportKind);
-      const deps: SyncDeps = {
-        ...remoteDeps,
-        syncMutex,
-        report,
-        ...(observer.onProgress ? { onProgress: observer.onProgress } : {}),
-        ...(observer.onGitLog ? { onGitLog: observer.onGitLog } : {}),
-        ...(observer.onGitProgress ? { onGitProgress: observer.onGitProgress } : {}),
-        ...(observer.massDeleteHint ? { massDeleteHint: observer.massDeleteHint } : {}),
-      };
+      const deps: SyncDeps = { ...remoteDeps, syncMutex, report };
+      if (observer.onProgress) deps.onProgress = observer.onProgress;
+      if (observer.onGitLog) deps.onGitLog = observer.onGitLog;
+      if (observer.onGitProgress) deps.onGitProgress = observer.onGitProgress;
+      if (observer.massDeleteHint) deps.massDeleteHint = observer.massDeleteHint;
       const finish = async <T extends ForegroundOperationOutcome>(outcome: T): Promise<T> => {
         await complete?.(outcome, cfg);
         return outcome;
@@ -180,5 +158,29 @@ export class LocalRuntime {
       const result = await sync(this.root, cfg, deps);
       return finish({ kind: "sync", mode: "pull-push", report, ...result });
     });
+  }
+}
+
+/** Occurrence telemetry for a genesis refusal. A refusal is exceptional, so the
+ * credential, config, and control-plane HTTP transport it needs load only on
+ * that branch: the settled-state admission every ordinary run takes must not
+ * drag the remote client into the foreground module graph. */
+async function reportRefusalOccurrence(root: string, refusal: GenesisAdmissionRefusal): Promise<void> {
+  try {
+    const [{ loadConfigIfPresent }, { loadCredentials }, { RboxApi }, { reportGenesisLockUnsupported }] =
+      await Promise.all([
+        import("./workspace-config.js"),
+        import("./credentials.js"),
+        import("./remote.js"),
+        import("./telemetry/queue.js"),
+      ]);
+    const [cfg, loaded] = await Promise.all([loadConfigIfPresent(root), loadCredentials()]);
+    if (!cfg || loaded.state !== "valid") return;
+    await reportGenesisLockUnsupported(
+      refusal,
+      new RboxApi(loaded.credentials.remoteUrl, loaded.credentials.token, cfg.remoteWorkspaceId, cfg.projectId),
+    );
+  } catch {
+    // Telemetry is optional and never replaces the admission refusal.
   }
 }
