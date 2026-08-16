@@ -379,7 +379,7 @@ struct MenuContentView: View {
         workspace.omittedDeferralCount > 0 ? "+\(workspace.omittedDeferralCount) more" : nil
     }
 
-    static func deferralAgeBucket(_ seconds: Int) -> String {
+    nonisolated static func deferralAgeBucket(_ seconds: Int) -> String {
         let age = max(0, seconds)
         if age < 3_600 { return "\(age / 60)m" }
         if age < 86_400 { return "1h" }
