@@ -6,6 +6,31 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0-beta.3] - 2026-08-16
+
+### Performance
+- Zero-change sync cycles no longer rewrite the whole state: a provably
+  no-op save composes a minimal packet (desktop zero-change pull
+  13.3s -> 3.6s; state-save 9.8s -> 0.8s). Kill switch RBOX_SAVE_NOOP_ELIDE.
+- Content-carrying saves are delta-staged: only changed entries are
+  written and verified (one-changed save ~2.8s -> ~60ms; Mac 1-blob
+  receive 20.4s -> 9.0s). Complete saves remain the genesis/repair
+  fallback. Kill switch RBOX_SAVE_DELTA.
+- Git state-CAS lock acquisition amortized (append-structured journal,
+  batched directory fsyncs, single-use release handle): large-pull
+  acquire 50.3s -> 16.4s at 2,292 locks, with per-span lock counts now
+  reported.
+- Held git repos with composer artifact holds join the held-skip fast
+  path (~3.5s -> ~53ms per repo per cycle). Kill switch
+  RBOX_GIT_HELD_SKIP_COMPOSER.
+
+### Fixed
+- Sync status spans now attribute lock counts (locks<N> blocked<M>) so
+  O(N) durability work is distinguishable from real contention.
+- Held-skip could survive a manual git resolution's artifact changes; the
+  artifact plane is now digested into skip eligibility.
+
+
 ### Changed
 - macOS filesystem scans now use the native bulk directory walk by default
   when supported; no environment opt-in is required. Runtime capability,
