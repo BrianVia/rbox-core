@@ -238,26 +238,38 @@ Mac field shape) drops the entire 2.3s stage pipeline.
 
 `scripts/bench/state-plane.ts`, N=119k, desktop, **real ext4**
 (`TMPDIR=/home/via/.cache/rbox-bench-269`; the default `/tmp` is tmpfs on this
-host and reports a machine nobody runs on). Before = `main` @ `4f544f462`;
-after = this branch, two runs, spread under 1%.
+host and would report a machine nobody runs on). Before = the MERGE-BASE this
+branch sits on, `ccfc58319`, run from a detached worktree of that exact commit;
+after = this branch. Two runs each, reported as ranges.
 
 | case | before | after | note |
 |---|---:|---:|---|
-| `save_cold` | 3397 ms | 2936-2948 ms | complete path, R1+R3 only |
-| `save_steady_one_changed` | 2771 ms | 2294 ms | complete path, R1+R3 only |
-| `save_delta_one_changed` | — | 45-46 ms | the new shape |
-| `save_minimal_noop` | 29 ms | 14 ms | 267's minimal packet |
-| `load_full` | 385 ms | 385 ms | the kept read-back (§7) |
+| `save_cold` | 3432-3489 ms | 3219-3336 ms | complete path, R1+R3 only |
+| `save_steady_one_changed` | 2821-2908 ms | 2318-2481 ms | complete path, R1+R3 only |
+| `compose_delta_walk` | — | 21-22 ms | the composer walk, upstream of the store |
+| `save_delta_one_changed` | — | 37-39 ms | the new shape |
+| `save_minimal_noop` | 27-28 ms | 20 ms | see the footnote — not row-comparable |
+| `load_full` | 394-426 ms | 422-431 ms | the kept read-back (§7); unchanged |
 
-The one-changed content save is 2771 → **45 ms** of save-proper, below the
-§5 estimate of 180-370 (the estimate priced a diff this bench does not pay:
-the composer's walk happens upstream in `composeStateSavePacket`). The riders
-alone take the surviving complete path down 13-17%, which is what genesis,
-repair, and every heal now cost. The read-back is untouched and is now ~89% of
-the observed delta-save phase wall — §7's top residual, restated with numbers.
+**The honest one-changed number is the walk PLUS the save: ~58-61 ms**, against
+2821-2908 ms for the same save today. The walk is measured on inputs that share
+no entry identity with their predecessor (a scan's output never does); an
+earlier draft of this bench reused the same objects, which let deep-equality
+short-circuit and reported a walk nobody runs. Even so the total lands well
+under §5's 180-370 ms estimate, because the estimate priced a diff at
+150-300 ms and the real walk over 119k entries is ~21.
 
-Not measured here: the composer walk (upstream of the store), the Mac, and
-both field lanes. The darwin probe and the field close-out remain open.
+The riders alone take the surviving complete path down ~6% cold and ~15-18%
+steady — that is what genesis, repair, and every heal now cost. The read-back is
+untouched and is now roughly seven times the entire delta save: §7's top
+residual, restated with numbers.
+
+`save_minimal_noop` is NOT a row-for-row comparison: since 269 its predecessor
+in the bench is the delta save rather than the complete one, so the two columns
+describe different preceding states.
+
+Not measured here: the Mac, and both field lanes. The darwin probe and the
+field close-out remain open.
 
 ## 6. Validation
 
