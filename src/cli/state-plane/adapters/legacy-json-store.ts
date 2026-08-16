@@ -24,9 +24,8 @@ import {
 import { RBOX_DIR } from "../../workspace-config.js";
 import { statePath, stateLockPath, stateIncarnationPath } from "../paths.js";
 import {
-  expectedStateNonce,
-  normalizeStateCounter,
-  repoRecordsForState,
+  elisionExpectationDrifted, expectedStateNonce,
+  normalizeStateCounter, repoRecordsForState,
   stateFromRepoRecords,
   stripObsoleteResolutionIntents,
   type RepoRecord,
@@ -109,6 +108,9 @@ export async function applyLegacyJsonSavePacket(root: string, packet: StateSaveP
     }
     const current = loaded.stream === undefined ? { ...loaded, stream: packet.expectedStream } : loaded;
     if (!packetNonceMatches(packet.expectedNonce, current.stateNonce)) return { status: "rejected", reason: "nonce", state: current };
+    // Nonce survives an ordinary intervening JSON save, so only the revision
+    // predicate closes design 267 §3.2b's race on this arm.
+    if (elisionExpectationDrifted(packet, current)) return { status: "rejected", reason: "elision-drift", state: current };
     if (packet.global && packet.sourceGlobalSeq < current.lastSyncedSequence) {
       return { status: "rejected", reason: "global-sequence", state: current };
     }

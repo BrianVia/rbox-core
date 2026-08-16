@@ -6,6 +6,7 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import type { JsonValue } from "../json.js";
+import type { ElisionExpectation } from "./sync-state-elision.js";
 import type { AcquireLockOptions, OwnedLock } from "../engine/lockfile.js";
 import type { ConfigStatToken } from "./sync-git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
@@ -354,16 +355,31 @@ export interface StateSavePacket {
   sourceGlobalSeq: number;
   global?: { manifest: FileOnlyManifest; manifestMeta?: GlobalManifestMeta };
   repos: RepoTransition[];
+  /** Present only when composition omitted a section it proved unchanged. */
+  elisionExpectation?: ElisionExpectation;
+}
+
+/** An accepted save of ANY kind advances stateRevision, so revision equality is
+ * the one scalar proving nothing interleaved since the composer's load. */
+export function elisionExpectationDrifted(packet: StateSavePacket, live: SyncState): boolean {
+  const expected = packet.elisionExpectation;
+  if (expected === undefined) return false;
+  return expectedStateNonce(live) !== expected.nonce
+    || normalizeStateCounter(live.stateRevision) !== expected.stateRevision;
 }
 
 export type StateSaveResult =
   | { status: "accepted"; state: SyncState }
-  | { status: "rejected"; reason: "stream" | "nonce" | "repo-generation" | "global-sequence" | "owner-lost"; state: SyncState }
+  | { status: "rejected"; reason: "stream" | "nonce" | "repo-generation" | "global-sequence" | "owner-lost" | "elision-drift"; state: SyncState }
   | { status: "busy"; detail: string }
   | { status: "unsupported"; error: unknown };
 
 export interface StateSaveOptions {
   lock?: AcquireLockOptions;
+  /** Design 267 §4: a complete caller-composed accepted state for a save whose
+   * every section was elided. The adapter overlays the CAS token fields onto it
+   * instead of re-reading the whole store. Every other save shape reads back. */
+  acceptedProjection?: SyncState;
   /** Complete-reset fence already owns both the protocol state class and the
    * physical state lock. The writer must assert and reuse it, never re-enter. */
   heldLock?: OwnedLock;

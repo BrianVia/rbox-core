@@ -11,6 +11,7 @@ import {
 import {
   validManifestMeta, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
+import type { ElisionExpectation } from "../../sync-state-elision.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
@@ -46,6 +47,8 @@ export interface FrozenCasInputs {
   globalBinding?: SourceStageBinding;
   /** Existing stream admitted for the one reset-provenance replacement case. */
   replacementOldStream?: string;
+  /** The snapshot this packet's elisions were proven against (design 267 §3.2b). */
+  elisionExpectation?: ElisionExpectation;
   ownerToken: CasOwnerToken;
 }
 
@@ -84,6 +87,12 @@ export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified:
   if (row.stream !== (frozen.replacementOldStream ?? expected.stream)) reject("stream");
   if ((row.state_nonce ?? "legacy") !== expected.nonce) reject("nonce");
   if ((row.state_revision ?? 0) !== expected.stateRevision) reject("state-revision");
+  // Sampled BEFORE the state lock, unlike every predicate above: an elided
+  // global disables the sequence predicate and an elided repo leaves no
+  // repo_gen to check, so revision equality is what proves nothing interleaved.
+  const elision = frozen.elisionExpectation;
+  if (elision && ((row.state_nonce ?? "legacy") !== elision.nonce
+    || (row.state_revision ?? 0) !== elision.stateRevision)) reject("elision-drift");
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
   if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");

@@ -669,6 +669,9 @@ test("the rejection vocabulary is exactly the translation the JSON CAS speaks", 
     "repo-generation": "repo-generation",
     "global-sequence": "global-sequence",
     "owner-lost": "owner-lost",
+    // Design 267: retryable, and deliberately NOT folded into the terminal
+    // `nonce` verdict the raw `state-revision` row translates to.
+    "elision-drift": "elision-drift",
   });
 });
 

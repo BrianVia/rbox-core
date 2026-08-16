@@ -17,7 +17,7 @@ import {
   type RepoTransitionStageBuilder,
   type SealedRepoTransitionRef,
 } from "../store/transition-stages.js";
-import { applyCasPacket } from "../store/write-packet.js";
+import { applyCasPacket, type CasPacket } from "../store/write-packet.js";
 import { stateStoreDatabase, type StateStoreHandle } from "../store/open.js";
 import { selectRow } from "../store/statements.js";
 
@@ -65,10 +65,12 @@ export function readReplacementLineage(store: StateStoreHandle): ReplacementLine
   return { ...row, stateNonce: row.stateNonce, stateRevision: row.stateRevision };
 }
 
-/** Add store-generated identity to the caller's already-composed projection. */
+/** Add store-generated identity to the caller's already-composed projection: the
+ * six lineage-token fields a read-back would have carried, and nothing else. */
 export function projectAcceptedSavePacket(projection: SyncState, token: LineageSnapshot): SyncState {
   const result: SyncState = {
     ...projection,
+    ...token.lineageExtras,
     stream: token.stream,
     lastSyncedSequence: token.lastSyncedSequence,
   };
@@ -155,7 +157,7 @@ async function translateSavePacket(
     }
     transitions = transitionBuilder.finishRepoTransitionStage();
 
-    const result = applyCasPacket(store, directory, {
+    const casPacket: CasPacket = {
       expected: {
         lineageId: token.lineageId,
         stream: packet.expectedStream,
@@ -179,7 +181,9 @@ async function translateSavePacket(
       repoTransitions: transitions,
       replacementOldStream,
       ownerToken,
-    });
+    };
+    if (packet.elisionExpectation !== undefined) casPacket.elisionExpectation = packet.elisionExpectation;
+    const result = applyCasPacket(store, directory, casPacket);
     applied = result.status === "accepted" || result.status === "rejected";
     return result;
   } catch (error) {
