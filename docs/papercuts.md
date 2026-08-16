@@ -611,3 +611,16 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
   per fix iteration, full suite ONCE as the final gate. (Note: a diff touching a
   root like `src/json.ts` selects ~85% of the suite anyway — worth knowing before
   assuming "affected" is always cheap.)
+
+## 2026-08-16 — fleet git-pull conflict-copy waves
+Concurrent `git pull` on synced checkouts (desktop+Mac, then FM) turned the
+267/268 merges into conflict-copy litter waves (38+7 files) and phantom
+"local changes" that abort pulls — bit 3x in one day. Recipe: pull
+desktop FIRST, let the publish settle, then Mac, then FM; a wedged replica
+repairs with `git fetch && git reset --hard origin/main` (content is
+already synced; only HEAD lags). Litter sweeps: `find -name '*.conflict.*'`.
+
+## 2026-08-16 — full-suite gates ran serial all day
+Agents and orchestrator used `bun test src/cli src/engine` (~550s) for
+final gates when `bun run test:parallel` (6 shards, 145s) exists. Bake
+test:parallel into agent briefs for the one full-suite gate.
