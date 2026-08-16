@@ -47,9 +47,15 @@ identity).
 ## Process
 Preflight test-runnability; bun run test:affected per iteration; ONE
 bun run test:parallel final gate; typecheck (clear tsbuildinfo after
-scripted edits); lint:affected zero new warnings (3 documented
-sync-state-model names excepted; PLUS the 4 no-runtime-typeof warnings at
-held-skip.ts:201/209/244/247 — the legacy-attempt compatibility path
+scripted edits); lint:affected zero new warnings (5 documented
+shape-name warnings excepted — 3 in sync-state-model.ts plus their 2
+`satisfies Record<keyof ...>` mirrors in state-plane/codecs/coverage.ts:79
+and :111. Those two keys are FORCED by the durable field names, so they
+cannot be renamed without the state migration and client-skew story that
+docs/wire-rename-candidates.md already specifies; that ledger names both
+coverage.ts anchors explicitly in the `cfgShape` and
+`ConfigStoreIdentity.shape` blast radii. PLUS the 4 no-runtime-typeof
+warnings at held-skip.ts:201/209/268/271 — the legacy-attempt compatibility path
 (`worktreeRegistryDigest`/`classifierInputKey` presence on attempts
 written before designs 200/176), kept deliberately and pinned by
 held-skip.test.ts:302/308. Restructuring them into a boundary parse is a

@@ -20,9 +20,14 @@ the attempt record. Not in the spec; forced by the gate.
 486/25713 with the queued decomposition and pin-restore acceptance written into
 the allowlist reason string.
 
-**Phase 2 disposition:** 269's decomposition deletes both the ALLOWED and RATCHET
-entries for this file, so the `file-size.test.ts` hunk is to be DROPPED entirely
-on the post-269 rebase. This deviation is expected to disappear, not to persist.
+**RESOLVED on the post-269 rebase (269 = 4f282a41d).** Confirmed: `main` carries
+NO `sync-state-model.ts` entry in either the ALLOWED or the RATCHET table — 269's
+decomposition deleted both — so the rebase conflicted exactly there and the hunk
+was dropped whole. `git diff origin/main -- src/cli/state-plane/file-size.test.ts`
+is now empty: this PR no longer touches the size gate at all. The file itself is
+346 nonblank lines / 18,320 bytes WITH the `artifactPlaneDigest` field, well under
+the 400-line / 25 KiB hard limit, so it is no longer allowlisted either. **D2 is
+dead — no bridge re-pin ships.**
 
 ## D3 — `GitHeldAttempt` gained a field, and so did the codec coverage ledger
 
@@ -69,6 +74,21 @@ the same state. The journal pair is asserted as a no-op via
 have required a chained type assertion the anti-slop lint rejects. The test
 proves the field participates in the disposition, which is the property §2.4
 depends on. It does not exercise receipt payload contents.
+
+## D8 — three conditional-empty-object spreads restructured post-rebase
+
+Not required by the design; required by the touched-file lint rule.
+`follow-repo-transition.ts:145` and `follow.test.ts:128,156` used
+`...(cond ? {x} : {})`. Each is now a named object with a conditional assignment,
+and the safe-ref entry type gained a name (`SafeRefLockedProof`, an indexed access
+on the existing `RepoBaseLockedProof["safeRefs"]` — no new declaration in
+base-composer.ts, no semantic change).
+
+The 5 remaining shape-name warnings are NOT restructurable here: the two in
+`coverage.ts` are `satisfies Record<keyof ...>` keys whose names are forced by the
+durable fields, and all five anchors are already recorded in
+`docs/wire-rename-candidates.md` under the founder's 2026-08-15 code-symbol-only
+ruling.
 
 ## D7 — MINOR-2's early-out changes git-spawn counts on refusal paths
 

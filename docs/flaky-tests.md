@@ -598,10 +598,25 @@ retained-connection nondeterminism under shard-process cumulative
 pressure, NOT authority-size growth (the branch reduces this path's
 allocation: R3 removes per-row randomBytes). The two new 269 suites
 measure 0.41s/0.08s — not the pressure source. RECURRED same day (2nd sighting,
-next full-gate run; again green on rerun + isolation). Isolation into its
+next full-gate run; again green on rerun + isolation). **ESCALATED 2026-08-16: no longer
+rerun-green on the Linux desktop — treat "green-on-rerun proceeds" as
+SUSPENDED until the guard is redesigned.** On the 270 branch's
+post-269-rebase gate it failed on TWO consecutive full `test:parallel`
+runs (24.0MB then 29.2MB vs the 16MB budget, shard 1/6, sole failure both
+times), which is not the rerun-green behavior this entry was registered
+on. Negative control run the same hour: a clean detached worktree at
+`4f282a41d` (origin/main, ZERO 270 commits) fails the IDENTICAL test, same
+shard, sole failure, at **29.9MB** — the worst of the three. So the red is
+a main-baseline condition on this host, not a property of any feature
+branch, and a branch cannot clear it by rerunning. The suite is still
+green 23/23 in isolation, so the guard measures host/shard pressure rather
+than the code path it names. Its own comment already concedes the 16MiB
+threshold cannot catch the regression it is named for. Until the redesign
+lands (per-connection-cost-aware baseline or a dedicated-process runner),
+a branch whose ONLY `test:parallel` failure is this guard, with a
+same-commit-of-main control reproducing it, should be reported as
+"baseline-red, branch-neutral" — never as a green gate. Isolation into its
 own file is NOT mechanical — the guard shares the file's fixture
-machinery, and its own in-code comment concedes the 16MiB threshold
-cannot catch the regression it is named for. Follow-up owed: redesign the
-guard (per-connection-cost-aware baseline or a dedicated-process runner),
-not a threshold bump. Until then: registered flake, green-on-rerun
-proceeds.
+machinery. Follow-up owed, now blocking every branch's final gate on this
+host: redesign the guard (per-connection-cost-aware baseline or a
+dedicated-process runner), not a threshold bump.

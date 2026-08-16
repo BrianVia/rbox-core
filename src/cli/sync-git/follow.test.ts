@@ -17,7 +17,7 @@ import { keepPinRef, readKeepPinOrigins } from "./keep-pins.js";
 import { hasInProgressOpState, readOpStateSnapshot } from "./refs.js";
 import { repoCtx } from "./git-state.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { applyPulledManifest } from "../sync.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
@@ -120,13 +120,14 @@ async function commit(content: string, message: string): Promise<string> {
 const manifest = (section: GitSection): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: { repo: section } });
 const stateWith = (section?: GitSection): SyncState => {
   if (section && section === materializedSection && materializedState) return structuredClone(materializedState);
-  return {
+  const state: SyncState = {
     stream: "test-stream",
     stateNonce: "a".repeat(32),
     lastSyncedSequence: section ? 1 : 0,
     lastSyncedManifest: section ? manifest(section) : { generatedAt: "", files: [] },
-    ...(section ? { repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section } } } : {}),
   };
+  if (section) state.repoRecords = { repo: { repoGen: 1, sourceSeq: 1, base: section } };
+  return state;
 };
 
 const matchingOracle: AppliedManifestOracle = {
@@ -145,16 +146,13 @@ async function materialize(section: GitSection): Promise<void> {
   const empty = stateWith();
   const outcome = await applyGitSections(workspace, cfg, empty, manifest(section), store, buildIgnoreMatcher(workspace), () => {});
   expect(outcome.gitRepos?.repo).toEqual(section);
+  const record: RepoRecord = { repoGen: 1, sourceSeq: 1, base: section };
+  if (outcome.branchBaseOrigins?.repo) record.branchBaseOrigins = outcome.branchBaseOrigins.repo;
   const initial: SyncState = {
     ...empty,
     lastSyncedSequence: 1,
     lastSyncedManifest: manifest(section),
-    repoRecords: { repo: {
-      repoGen: 1,
-      sourceSeq: 1,
-      base: section,
-      ...(outcome.branchBaseOrigins?.repo ? { branchBaseOrigins: outcome.branchBaseOrigins.repo } : {}),
-    } },
+    repoRecords: { repo: record },
   };
   await saveStateUnsafeLegacyOrTest(workspace, initial);
   materializedSection = section;
