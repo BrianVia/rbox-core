@@ -15,25 +15,21 @@ import {
   snapshotApplyStats,
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
-import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, syncStreamId, trashConfig, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
 import { type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
 } from "../sync-recovery.js";
-import {
-  applyGitSections,
-  formatGitApplyMetrics,
-  settleCommittedBranchArtifacts,
-  withRevalidatedGitPartialApplies,
-} from "../sync-git.js";
+import { applyGitSections, formatGitApplyMetrics } from "../sync-git.js";
 import { carryRepoBaseProof, recordOriginLineage } from "../sync-git/base-composer.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
 import { applyScopedRuleAuthority, prepareScopedPull } from "../scope/pull-scope.js";
 import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
+import { inputRecord } from "../sync-state.js";
+import { savePulledState } from "./pull-state-save.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
-import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatCasSteps, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
+import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
 
 export async function scanManifestForPushResult(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<{ manifest: Manifest; observationComplete: boolean }> {
@@ -115,7 +111,7 @@ export async function pullWithMetadata(
   surfaceResolutionReceiptReconciliation(reconciled, deps);
   return {
     actions: reconciled.status === "none"
-      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state }, trustedView)
+      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state, elisionEligible: true }, trustedView)
       : reconciled.actions,
     initialRemoteSequence: sequence,
   };
@@ -219,7 +215,9 @@ export async function applyPulledManifest(
   cfg: WorkspaceConfig,
   deps: SyncDeps,
   api: SyncRemote,
-  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState },
+  /** `elisionEligible` is design 267's provenance gate: the standalone pull line
+   *  sets it, and chain repair and receipt reconciliation structurally do not. */
+  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState; elisionEligible?: boolean },
   /** Design 202, daemon-internal: passed ONLY by `pullWithMetadata`'s main line.
    *  Every other caller (resolution-receipt reconciliation, chain repair, CLI
    *  one-shots) omits it and therefore scans. */
@@ -443,47 +441,12 @@ export async function applyPulledManifest(
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
   report.appendDetails("git-apply", { oracle: oracleMetrics }, formatPullOracleMetrics(oracleMetrics));
-  const casStepMs: Record<string, number> = {};
-  let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
-    expectedStream: syncStreamId(cfg),
-    sourceGlobalSeq: sequence,
-    globalManifest: scoped.storedBase,
-    ...(scoped.storedBaseIsRemote && manifestMeta ? { manifestMeta } : {}),
-    observedRepos: scoped.probeKeys(observedRepoKeys(state, remote.gitRepos, {
-      bases: gitOutcome.gitRepos,
-      branchBaseOrigins: gitOutcome.branchBaseOrigins,
-      pending: gitOutcome.gitPendingRemote,
-      removed: gitOutcome.gitReposRemoved,
-      resolutions: gitOutcome.gitNeedsResolution,
-      configLane: gitOutcome.configLane,
-      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals),
-      partial: gitOutcome.partial,
-      attempt: gitOutcome.attempt,
-      idxProj: gitOutcome.idxProj,
-    })),
-    values: {
-      bases: gitOutcome.gitRepos,
-      branchBaseOrigins: gitOutcome.branchBaseOrigins,
-      pending: gitOutcome.gitPendingRemote,
-      removed: gitOutcome.gitReposRemoved,
-      resolutions: gitOutcome.gitNeedsResolution,
-      configLane: gitOutcome.configLane,
-      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals),
-      partial: gitOutcome.partial,
-      attempt: gitOutcome.attempt,
-      idxProj: gitOutcome.idxProj,
-    },
-    repoProofs: gitOutcome.repoProofs,
-  }, {
-    allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-  })), {
-    mutationBoundary: deps.mutationBoundary,
-    observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
+  const savedState = await savePulledState({
+    root, cfg, deps, report, state, scoped, gitOutcome, sequence, manifestMeta,
+    remoteGitRepos: remote.gitRepos,
+    noActions: all.length === 0,
+    elisionEligible: input.elisionEligible === true,
   });
-  report.appendDetails("state-save", { cas: casStepMs }, formatCasSteps(casStepMs));
-  const settleT0 = Date.now();
-  savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
-  report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);
   try {
     deps.onGitDeferralsSaved?.(savedState);
   } catch {
