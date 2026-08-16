@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_ci: ${{ steps.scope.outputs.run_ci }}
+      run_rboxbar: ${{ steps.scope.outputs.run_rboxbar }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -60,6 +61,36 @@ jobs:
           fi
           echo "run_ci=$RUN_CI" >> "$GITHUB_OUTPUT"
           echo "full CI required: $RUN_CI"
+          # RboxBar has no other CI lane; a Swift compile break rode main to a
+          # release tag (v2.0.0-beta.3). Path-filtered so ordinary PRs pay 0s.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            RANGE="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")..$PR_HEAD_SHA"
+          else
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          RUN_RBOXBAR=false
+          if git diff --no-renames --name-only "$RANGE" 2>/dev/null | grep -q '^macos/RboxBar/'; then
+            RUN_RBOXBAR=true
+          fi
+          echo "run_rboxbar=$RUN_RBOXBAR" >> "$GITHUB_OUTPUT"
+          echo "RboxBar lane: $RUN_RBOXBAR"
+
+  rboxbar-build:
+    name: "RboxBar · swift build + test (release toolchain)"
+    needs: changes
+    if: needs.changes.outputs.run_rboxbar == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Same image + default Xcode as release.yml's rboxbar job: the floor is
+      # whatever Swift that toolchain ships, and this lane exists to catch
+      # code that only newer local toolchains accept.
+      - name: Build and test RboxBar
+        working-directory: macos/RboxBar
+        run: |
+          swift --version
+          swift build -c release
+          swift test
 
   sqlite-contract-floor:
     name: "SQLite contract · Bun 1.3.14 floor"
