@@ -343,7 +343,7 @@ final class AppModel: ObservableObject {
 
     private func startPolling() {
         timer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.refresh()
             }
         }
@@ -362,7 +362,7 @@ final class AppModel: ObservableObject {
     private func startUpdateChecks() {
         checkForUpdates()
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.checkForUpdates()
             }
         }
