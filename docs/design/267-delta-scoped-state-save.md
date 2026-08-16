@@ -398,8 +398,17 @@ Remaining O(N) per no-op cycle after M1+M2, named per §5.9: state load
   the end-to-end number. Bench gains the minimal-packet case; field re-run
   covers desktop zero-change pull + push AND Mac 1-blob (both lanes,
   before/after, per the perf close-out rule); numbers appended here.
-- Lint: all touched files anti-slop clean; oxlint anti-slop-types rules
-  pass on new code.
+- Lint: all touched files anti-slop clean, with one recorded exception — the
+  three `no-shape-in-symbol-names` hits in `sync-state-model.ts` (:135, :283,
+  :321) are durable persisted field names already queued in
+  `docs/wire-rename-candidates.md`; a code-symbol rename cannot retire them.
+  oxlint anti-slop-types rules pass on new code; no suppressions.
+- Mutation evidence for §3.2.3 (the one predicate condition no shipped fixture
+  discriminated on its own): with the content self-check replaced by `true`,
+  the isolated `encSha` fixture and the warmed-fold regression both fail, and
+  both pass with it restored. Recorded because git history places this design's
+  implementation before its tests — the mutation is the honest substitute for a
+  red-first commit, not a claim of one.
 
 ## 8. Not built (standing, inherited from 235 §4)
 

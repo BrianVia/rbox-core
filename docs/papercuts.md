@@ -611,4 +611,3 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
   per fix iteration, full suite ONCE as the final gate. (Note: a diff touching a
   root like `src/json.ts` selects ~85% of the suite anyway — worth knowing before
   assuming "affected" is always cheap.)
-
