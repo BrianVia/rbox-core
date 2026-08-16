@@ -28,7 +28,7 @@ import {
   assertResetParseAdmission, RESET_MATERIALIZED_BYTE_LIMIT, ResetMemoryAdmissionError,
 } from "../../reset-io.js";
 import type { SyncState } from "../../sync-state-model.js";
-import { LegacyStateShapeError, normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";
+import { LegacyStateStructureError, normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";
 import { legacyStateSemanticDigest } from "../digest/state-semantic-v1.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
 import { migrationPaths } from "../paths.js";
@@ -283,7 +283,7 @@ export async function importOwnedStaging(
   try {
     plan = normalizeLegacyStateV1(state, importLineageId(control));
   } catch (error) {
-    if (!(error instanceof LegacyStateShapeError) && !(error instanceof TypeError)) throw error;
+    if (!(error instanceof LegacyStateStructureError) && !(error instanceof TypeError)) throw error;
     return halt("verification", false, error.message);
   }
   const completedAtIso = new Date().toISOString();

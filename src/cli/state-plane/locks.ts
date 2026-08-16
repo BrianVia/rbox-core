@@ -19,7 +19,9 @@ import {
   settleStandingResetUnderHeldFence,
   type ResetFenceObservation,
 } from "../reset-journal.js";
-import { repoRecordsForState } from "../sync-state-model.js";
+import {
+  repoRecordsForState,
+} from "../sync-state-records.js";
 import {
   acquireWorkspaceSyncMutex,
   assertHealthyOwnedSyncMutex,

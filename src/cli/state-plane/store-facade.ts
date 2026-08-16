@@ -31,7 +31,8 @@ export {
   replaceStreamAndApplySavePacketToStore,
 } from "./adapters/sqlite-state-save.js";
 export { publishStateBackup, type StateBackupOptions, type StateBackupResult } from "./backup/publish.js";
-export { beginGeneration, collectUnreferencedEntryValues, type GenerationBuilder } from "./store/generations.js";
+export { beginGeneration, type GenerationBuilder } from "./store/generations.js";
+export { collectUnreferencedEntryValues } from "./store/plane-promotion.js";
 export {
   openSealedStage,
   verifySourceStageBinding,

@@ -33,7 +33,12 @@ import type { DoctorCheck } from "../doctor-cmd.js";
 import { checkState, checkStateMigration } from "../doctor-state-plane.js";
 import { migrateCmd } from "../state-plane-cmd.js";
 import { statusCmd } from "../status-cmd.js";
-import { repoRecordsForState, stateFromRepoRecords, type RepoRecord, type SyncState } from "../sync-state-model.js";
+import {
+  type RepoRecord, type SyncState,
+} from "../sync-state-model.js";
+import {
+  repoRecordsForState, stateFromRepoRecords,
+} from "../sync-state-records.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import { AUTHORITY_MARKER_MAGIC } from "./authority-marker.js";
@@ -112,7 +117,7 @@ async function captureConsole<T>(body: () => Promise<T>): Promise<{ value: T; ou
   const stdout = process.stdout.write.bind(process.stdout);
   const log = console.log;
   process.stdout.write = ((chunk: string | Uint8Array) => {
-    out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    out.push(chunk instanceof Uint8Array ? Buffer.from(chunk).toString("utf8") : chunk);
     return true;
   }) as typeof process.stdout.write;
   console.log = (...args: unknown[]) => { out.push(args.map(String).join(" ")); };
@@ -341,7 +346,12 @@ test("the differential FAILS when one post-migration value is perturbed", async 
   // untracked early return would let this control quietly become a no-op the day
   // capture starts throwing, which is the same "passes for the wrong reason"
   // defect the wave exists to close.
-  const perturbed = await observe(root, "json").catch((error: unknown) => error);
+  let perturbed: unknown;
+  try {
+    perturbed = await observe(root, "json");
+  } catch (error) {
+    perturbed = error;
+  }
   const branch = perturbed instanceof Error ? "capture-refused" : "differential-rejected";
   if (branch === "differential-rejected") {
     expect(() => assertDifferential(before, perturbed as Observation)).toThrow();

@@ -22,7 +22,12 @@ import os from "node:os";
 import path from "node:path";
 import { checkState, checkStateMigration } from "../doctor-state-plane.js";
 import { migrateCmd } from "../state-plane-cmd.js";
-import { repoRecordsForState, stateFromRepoRecords, type SyncState } from "../sync-state-model.js";
+import {
+  type SyncState,
+} from "../sync-state-model.js";
+import {
+  repoRecordsForState, stateFromRepoRecords,
+} from "../sync-state-records.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import {
@@ -74,8 +79,14 @@ async function migratedWorkspace(prefix: string): Promise<string> {
   return root;
 }
 
-const rejects = async (body: () => Promise<unknown>): Promise<unknown> =>
-  body().then(() => undefined, (error: unknown) => error);
+const rejects = async (body: () => Promise<unknown>): Promise<unknown> => {
+  try {
+    await body();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // ROW 1 — released OLD binary, candidate (post-`Q`) workspace. Fail closed.

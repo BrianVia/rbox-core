@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { canonicalJson } from "../digest/codecs.js";
-import { genesisSourceShapeFlags, sourceShapeFlagsCjson } from "../digest/source-shape.js";
+import { genesisSourcePresenceFlags, sourcePresenceFlagsCjson } from "../digest/source-shape.js";
 import { SCHEMA_V1_DDL } from "./v1.js";
 import { runStatement } from "../store/statements.js";
 
@@ -74,7 +74,7 @@ export function installGenesisLineage(db: Database, genesis: GenesisLineage): vo
       `genesis:${genesis.lineageId}`,
       genesis.createdBy,
       genesis.authorityId,
-      sourceShapeFlagsCjson(genesisSourceShapeFlags({
+      sourcePresenceFlagsCjson(genesisSourcePresenceFlags({
         stateNonce: genesis.stateNonce !== undefined,
         stateRevision: genesis.stateRevision !== undefined,
       })),

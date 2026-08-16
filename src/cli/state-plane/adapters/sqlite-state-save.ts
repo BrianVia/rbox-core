@@ -3,6 +3,7 @@ import path from "node:path";
 import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
 import type { CasResult, LineageSnapshot, ManifestHeader } from "../ports.js";
 import { beginGeneration, type GenerationBuilder } from "../store/generations.js";
+import { beginDeltaStage, type DeltaStageBuilder, type SealedDeltaStageRef } from "../store/delta-stages.js";
 import type { OwnedLockCasToken } from "../store/owner-token.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
 import { MAX_FILE_BATCH, type SealedStageRef } from "../store/sealed-stages.js";
@@ -119,13 +120,34 @@ async function translateSavePacket(
   const expectedToken: LineageSnapshot = { ...tokenWithoutNonce, stream: packet.expectedStream };
   if (packet.expectedNonce !== "legacy") expectedToken.nonce = packet.expectedNonce;
   let globalBuilder: GenerationBuilder | undefined;
+  let deltaBuilder: DeltaStageBuilder | undefined;
   let transitionBuilder: RepoTransitionStageBuilder | undefined;
   let global: SealedStageRef | undefined;
+  let globalDelta: SealedDeltaStageRef | undefined;
   let transitions: SealedRepoTransitionRef | undefined;
   let applied = false;
   let failure: unknown;
   try {
-    if (packet.global) {
+    // A relative global stages ONLY its ops; `packet.global` stays the composer's
+    // whole-manifest truth and supplies the header and the result count.
+    if (packet.global && packet.globalDelta) {
+      const header = manifestHeader(packet);
+      deltaBuilder = beginDeltaStage(directory, "base", header, packet.globalDelta.binding);
+      let upserts = 0;
+      let deletes = 0;
+      for (const op of packet.globalDelta.ops) {
+        if (op.kind === "upsert") {
+          deltaBuilder.putUpsert(op.entry);
+          upserts++;
+        } else {
+          deltaBuilder.putDelete(op.path);
+          deletes++;
+        }
+      }
+      globalDelta = deltaBuilder.finishDeltaStage({
+        upserts, deletes, resultFiles: packet.global.manifest.files.length,
+      });
+    } else if (packet.global) {
       const header = manifestHeader(packet);
       globalBuilder = beginGeneration(directory, "base", header);
       for (let offset = 0; offset < packet.global.manifest.files.length; offset += MAX_FILE_BATCH) {
@@ -137,18 +159,19 @@ async function translateSavePacket(
       });
     }
 
-    const bindings = global
+    const staged = global ?? globalDelta;
+    const bindings = staged
       ? [{
-          stageId: global.stageId,
-          logicalDigest: global.logicalDigest,
-          physicalSha256: global.physicalSha256,
+          stageId: staged.stageId,
+          logicalDigest: staged.logicalDigest,
+          physicalSha256: staged.physicalSha256,
         }]
       : [];
     transitionBuilder = beginRepoTransitionStage(
       directory,
       expectedToken,
       bindings,
-      global ? { globalBinding: bindings[0]! } : {},
+      staged ? { globalBinding: bindings[0]! } : {},
     );
     for (const transition of packet.repos) {
       transitionBuilder.putTransition({
@@ -172,10 +195,15 @@ async function translateSavePacket(
       replacementOldStream,
       ownerToken,
     };
+    const manifestMeta = packet.global?.manifestMeta;
     if (global) {
       casPacket.global = { stage: global, fileHeader: global.header };
-      const manifestMeta = packet.global?.manifestMeta;
       if (manifestMeta !== undefined) casPacket.global.manifestMeta = manifestMeta;
+    } else if (globalDelta) {
+      casPacket.globalDelta = {
+        stage: globalDelta, fileHeader: globalDelta.header, binding: globalDelta.binding,
+      };
+      if (manifestMeta !== undefined) casPacket.globalDelta.manifestMeta = manifestMeta;
     }
     if (packet.elisionExpectation !== undefined) casPacket.elisionExpectation = packet.elisionExpectation;
     const result = applyCasPacket(store, directory, casPacket);
@@ -186,9 +214,10 @@ async function translateSavePacket(
     throw error;
   } finally {
     globalBuilder?.discardGeneration();
+    deltaBuilder?.discardDeltaStage();
     transitionBuilder?.discard();
     if (!applied) {
-      const cleanupFailure = deleteStages(directory, [transitions, global]);
+      const cleanupFailure = deleteStages(directory, [transitions, global, globalDelta]);
       if (failure === undefined && cleanupFailure !== undefined) throw cleanupFailure;
     }
   }

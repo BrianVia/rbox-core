@@ -90,6 +90,7 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
     values,
     repoProofs: gitOutcome.repoProofs,
     elisionReceipt: receipt,
+    baseIsUnscopedRemote: scoped.storedBaseIsRemote,
   };
   // The meta is persisted only alongside an unprojected remote base; a scoped
   // projection must never carry another base's meta forward.

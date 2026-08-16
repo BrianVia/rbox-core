@@ -4,11 +4,12 @@ import {
   statePath,
 } from "../sync-state-store.js";
 import {
-  expectedStateNonce,
-  repoRecordsForState,
-  type RepoRecord,
-  type StateSaveOptions,
+  type RepoRecord, type StateSaveOptions, type SyncState,
 } from "../sync-state-model.js";
+import { jsonCounter } from "../../json.js";
+import {
+  expectedStateNonce, repoRecordsForState,
+} from "../sync-state-records.js";
 import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
 import { parsePRepairReceipt, type PRepairReceipt } from "./p-repair.js";
 import type { PRepairStatePort, PRepairStateSnapshot } from "./p-repair-transaction.js";
@@ -32,7 +33,7 @@ export interface PRepairStatePortInput {
 
 export type PRepairReceiptStatePortInput = Omit<PRepairStatePortInput, "p"> & { receipt: PRepairReceipt };
 
-const counter = (value: unknown): number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+const counter = (value: SyncState["stateRevision"]): number => jsonCounter(value) ?? 0;
 
 function defaultPRepairPartial(episode: string): NonNullable<RepoRecord["partial"]> {
   return {
@@ -82,12 +83,9 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
     if (mode === "compact") delete pRepaired[witness.ref]; else pRepaired[witness.ref] = receipt;
     const appliedRefs = { ...existingPartial.appliedRefs };
     if (mode === "restore") delete appliedRefs[witness.ref];
-    const partial = {
-      ...existingPartial,
-      appliedRefs,
-      ...(Object.keys(pRepaired).length ? { pRepaired } : {}),
-    };
-    if (!Object.keys(pRepaired).length) delete partial.pRepaired;
+    const partial = { ...existingPartial, appliedRefs };
+    if (Object.keys(pRepaired).length) partial.pRepaired = pRepaired;
+    else delete partial.pRepaired;
     const { repoGen: _repoGen, ...withoutGeneration } = record;
     const proof = carryRepoBaseProof(witness.lineageHash);
     const result = await applyStateSavePacket(input.root, {

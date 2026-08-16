@@ -587,3 +587,21 @@ removed; the redacted result is retained at
 - Third distinct sighting in the trusted-pull family (see the two SUSPECTED
   entries above). Per the standing bar this family NOW EARNS the
   shard-ordering reproduction treatment (FLAKE-008 style) — queued.
+
+## cas-operations heap-scaling guard (registered 2026-08-16)
+`cas-operations.test.ts` "promotion of a large stage does not scale heap
+with authority size": failed once on the 269 branch's `test:parallel`
+(authorityScaledGrowth ~26.5MB vs 16MB budget), passed 3/3 in isolation
+and green on full rerun — rerun-proven flake. The ~26MB matches the
+per-connection wrapper cost the test's own comment names; hypothesis is
+retained-connection nondeterminism under shard-process cumulative
+pressure, NOT authority-size growth (the branch reduces this path's
+allocation: R3 removes per-row randomBytes). The two new 269 suites
+measure 0.41s/0.08s — not the pressure source. RECURRED same day (2nd sighting,
+next full-gate run; again green on rerun + isolation). Isolation into its
+own file is NOT mechanical — the guard shares the file's fixture
+machinery, and its own in-code comment concedes the 16MiB threshold
+cannot catch the regression it is named for. Follow-up owed: redesign the
+guard (per-connection-cost-aware baseline or a dedicated-process runner),
+not a threshold bump. Until then: registered flake, green-on-rerun
+proceeds.

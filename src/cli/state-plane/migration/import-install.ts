@@ -15,7 +15,7 @@ import type { Database } from "bun:sqlite";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeRepoRecord, REPO_RECORD_COLUMN_BY_FIELD } from "../codecs/repo-record.js";
 import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
-import { sourceShapeFlagsCjson } from "../digest/source-shape.js";
+import { sourcePresenceFlagsCjson } from "../digest/source-shape.js";
 import type { NormalizedLegacyState } from "../digest/legacy-state-plan.js";
 import {
   STATE_STORE_APPLICATION_ID, STATE_STORE_DDL_FINGERPRINT, STATE_STORE_SCHEMA_VERSION,
@@ -168,7 +168,7 @@ export function installLegacyState(
     ) VALUES (1,'migration',?,?,?,?,?,?,?,?,?,?,?,?)`, (insert) => insert(
       provenance.migrationId, provenance.importerVersion, provenance.authorityId,
       provenance.sourceJsonSha256, provenance.sourceSemanticDigest, provenance.sourceBytes,
-      sourceShapeFlagsCjson(plan.shapeFlags), plan.repoRecordsPresent ? 1 : 0,
+      sourcePresenceFlagsCjson(plan.presenceFlags), plan.repoRecordsPresent ? 1 : 0,
       plan.entries.length, plan.repos.length, canonicalJson(perTableCounts),
       provenance.completedAtIso,
     ));

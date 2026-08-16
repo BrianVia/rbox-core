@@ -5,6 +5,7 @@ import { performance } from "node:perf_hooks";
 import type { FileEntry, Manifest } from "../../src/engine/index.js";
 import type { StateSavePacket } from "../../src/cli/sync-state-model.js";
 import { applySavePacketToStore } from "../../src/cli/state-plane/adapters/sqlite-state-save.js";
+import { composeGlobalDelta, type GlobalDelta } from "../../src/cli/sync-state-delta.js";
 import { loadRawStateFromStore } from "../../src/cli/state-plane/adapters/read-only.js";
 import { createStateStore } from "../../src/cli/state-plane/store/open.js";
 import { casOwnerTokenFromLock } from "../../src/cli/state-plane/store/owner-token.js";
@@ -20,7 +21,11 @@ const STREAM = "bench://state-plane";
 const NONCE = "c".repeat(32);
 // The bench owns its scratch store outright, so a trivially-held lock is honest.
 const OWNER = casOwnerTokenFromLock({ isOwnerSync: () => true } as OwnedLock);
+// The stage pipeline is fsync-bound, so the numbers are only meaningful on a
+// real disk-backed filesystem. Point TMPDIR at one (this run prints which) —
+// a tmpfs /tmp reports a machine nobody actually runs on.
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-state-plane-bench-"));
+console.log(`root: ${root}`);
 
 function file(index: number, changed = false): FileEntry {
   const ordinal = String(index).padStart(8, "0");
@@ -84,13 +89,33 @@ try {
     if (result.status !== "accepted") throw new Error(`steady save returned ${result.status}`);
     steadyRevision = result.token.stateRevision ?? 0;
   });
+  // Design 269: the same one-changed save, staged relatively. Both sides of the
+  // walk are freshly built, so no entry is reference-identical to its
+  // predecessor — a scan's output never is, and shared identity would let the
+  // deep-equality short-circuit report a walk nobody actually runs.
+  const deltaPredecessor = steadyFiles.map((entry) => ({ ...entry }));
+  const deltaFiles = deltaPredecessor.map((entry) => ({ ...entry }));
+  const deltaAt = Math.floor(count / 3);
+  deltaFiles[deltaAt] = file(deltaAt, true);
+  let composed!: GlobalDelta;
+  await timed("compose_delta_walk", () => {
+    const delta = composeGlobalDelta(deltaPredecessor, deltaFiles, { nonce: NONCE, stateRevision: steadyRevision });
+    if (!delta || delta.ops.length !== 1) throw new Error(`delta composed ${delta?.ops.length ?? "no"} ops`);
+    composed = delta;
+  });
+  await timed("save_delta_one_changed", async () => {
+    const result = await applySavePacketToStore(store, { ...packet(deltaFiles, 3), globalDelta: composed }, OWNER);
+    if (result.status !== "accepted") throw new Error(`delta save returned ${result.status}`);
+    steadyRevision = result.token.stateRevision ?? 0;
+  });
   // Design 267's minimal packet, bound to the revision the previous save
-  // actually landed on. This times the SAVE only; whether a real pull elides is
+  // actually landed on — since 269 that predecessor is the delta save above,
+  // not the complete one, so its number is not comparable row-for-row. This times the SAVE only; whether a real pull elides is
   // decided in composeStateSavePacket and is not visible here — the field trace
   // is the authority for the end-to-end number.
   await timed("save_minimal_noop", async () => {
     const result = await applySavePacketToStore(store, {
-      expectedStream: STREAM, expectedNonce: NONCE, sourceGlobalSeq: 3, repos: [],
+      expectedStream: STREAM, expectedNonce: NONCE, sourceGlobalSeq: 4, repos: [],
       elisionExpectation: { nonce: NONCE, stateRevision: steadyRevision },
     }, OWNER);
     if (result.status !== "accepted") throw new Error(`minimal save returned ${result.status}`);

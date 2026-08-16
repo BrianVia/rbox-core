@@ -314,12 +314,16 @@ export function deleteSealedArtifact(directory: string, ref: SealedArtifactRef, 
  * Stage builders run in WAL exactly as the design specifies. `S0` is then a checked
  * precondition of sealing (see {@link sealAndPublish}) rather than a property
  * inferred from a journal mode.
+ *
+ * A builder's durability point is the seal `fsync(fd)`, never an intermediate
+ * COMMIT: an unsealed artifact is discarded by every recovery path, so
+ * `synchronous=OFF` costs nothing a crash could observe.
  */
 export function configureStageBuilder(db: Database): void {
   db.exec(`
     PRAGMA page_size=4096;
     PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=FULL;
+    PRAGMA synchronous=OFF;
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
     PRAGMA temp_store=FILE;

@@ -5,11 +5,11 @@ import path from "node:path";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { loadRawState, loadState, statePath, StreamMismatchError } from "../../sync-state-store.js";
 import {
-  stateFromRepoRecords,
-  type RepoRecord,
-  type SyncState,
-  type TypedBlocker,
+  type RepoRecord, type SyncState, type TypedBlocker,
 } from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords,
+} from "../../sync-state-records.js";
 import { loadRawStateFromStore, materializeManifestFromStore } from "../adapters/read-only.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
@@ -116,6 +116,9 @@ function completePRepairReceipt() {
   } as const;
 }
 
+/** One unknown extension per index, cycling: none, null, object, array. */
+const EXTENSIONS = [{}, { extensionNull: null }, { extensionObject: {} }, { extensionArray: [] }] as const;
+
 function realisticState(): SyncState {
   const files: FileEntry[] = Array.from({ length: 513 }, (_, index) => ({
     path: `files/${String(index).padStart(3, "0")}.txt`,
@@ -124,9 +127,7 @@ function realisticState(): SyncState {
     mode: index % 2 ? 0o755 : 0o644,
     mtimeMs: index + 0.25,
     type: "file",
-    ...(index % 4 === 1 ? { extensionNull: null } : {}),
-    ...(index % 4 === 2 ? { extensionObject: {} } : {}),
-    ...(index % 4 === 3 ? { extensionArray: [] } : {}),
+    ...EXTENSIONS[index % 4],
   } as FileEntry));
   const records: Record<string, RepoRecord> = {};
   for (let index = 0; index < 17; index++) {
@@ -134,9 +135,7 @@ function realisticState(): SyncState {
       repoGen: index + 1,
       sourceSeq: 41,
       base: section(index),
-      ...(index % 4 === 1 ? { extensionNull: null } : {}),
-      ...(index % 4 === 2 ? { extensionObject: {} } : {}),
-      ...(index % 4 === 3 ? { extensionArray: [] } : {}),
+      ...EXTENSIONS[index % 4],
     } as RepoRecord;
   }
   const originSection = section(50);

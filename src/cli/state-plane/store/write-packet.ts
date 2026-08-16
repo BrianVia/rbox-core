@@ -7,22 +7,31 @@
 import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { ElisionExpectation, GlobalManifestMeta } from "../../sync-state-model.js";
+import type { DeltaBinding } from "../../sync-state-delta.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { StageChangedError } from "../errors.js";
 import type { CasRejectionReason, CasResult, ManifestHeader } from "../ports.js";
 import type { OwnedLockCasToken } from "./owner-token.js";
 import { buildCasRetryView } from "./cas-retry-view.js";
+import { admitCasPacket } from "./cas-admission.js";
 import {
   Rejected, applyGlobal, applyTransitions, checkPredicates, copyTransitionRowsIntoTemp,
   createTransitionTemp, dropTransitionTemp, freezeGlobalManifestMeta, rebuildManifestProjection, reject,
-  type FrozenCasInputs,
+  type FrozenCasInputs, type FrozenDeltaInputs,
 } from "./cas-steps.js";
-import { copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp } from "./generations.js";
+import {
+  CAS_DELTA_DELETES, CAS_DELTA_UPSERTS, copyFileValuesIntoTemp, copyStageFilesIntoTemp,
+  createDeltaTemps, createStageFileTemp, dropDeltaTemps, dropStageFileTemp,
+} from "./plane-promotion.js";
+import {
+  canonicalBinding as canonicalDeltaBinding, openSealedDeltaStageForConsume,
+  type ConsumedDeltaReader, type SealedDeltaStageRef,
+} from "./delta-stages.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
-import { runStatement, selectRow } from "./statements.js";
+import { runStatement, selectRow, withStatement } from "./statements.js";
 import { currentSnapshot } from "./read-snapshot.js";
-import { openSealedStage, verifySourceStageBinding, type SealedStageRef } from "./sealed-stages.js";
+import { openSealedStageForConsume, verifySourceStageBinding, type SealedStageRef } from "./sealed-stages.js";
 import { StageLock, deleteSealedArtifact, type SealedArtifactRef } from "./stage-artifacts.js";
 import { openSealedRepoTransitionStage, type SealedRepoTransitionRef } from "./transition-stages.js";
 
@@ -36,10 +45,29 @@ export interface CasExpectation {
   localRevision: number;
 }
 
+/** A relative global (design 269): the sealed delta, the header it commits, and
+ * the caller's OWN copy of the predecessor binding — the second carrier, which
+ * must equal the one sealed into the artifact. */
+export interface CasDeltaGlobal {
+  stage: SealedDeltaStageRef;
+  fileHeader: ManifestHeader;
+  manifestMeta?: GlobalManifestMeta;
+  binding: DeltaBinding;
+}
+
+/** A whole-manifest global: the sealed complete stage and the header it commits. */
+export interface CasCompleteGlobal {
+  stage: SealedStageRef;
+  fileHeader: ManifestHeader;
+  manifestMeta?: GlobalManifestMeta;
+}
+
 export interface CasPacket {
   expected: CasExpectation;
   sourceGlobalSeq: number;
-  global?: { stage: SealedStageRef; fileHeader: ManifestHeader; manifestMeta?: GlobalManifestMeta };
+  global?: CasCompleteGlobal;
+  /** Mutually exclusive with `global`: the same global, expressed relatively. */
+  globalDelta?: CasDeltaGlobal;
   repoTransitions: SealedRepoTransitionRef;
   /** Reset-provenance stream observed before the packet's target stream. */
   replacementOldStream?: string;
@@ -59,55 +87,6 @@ export interface CasInternalHooks {
   afterRetryView?: () => void;
 }
 
-/**
- * A global packet must be paired with the transition stage built from it, and the
- * design explicitly allows further stages that are named only as Git evidence — so
- * the global binding must be PRESENT, not alone.
- */
-function assertPairing(packet: CasPacket): void {
-  const bindings = packet.repoTransitions.sourceStageBindings;
-  if (!packet.global) {
-    if (bindings.length !== 0 || packet.repoTransitions.globalBinding !== undefined) {
-      throw new StageChangedError(packet.repoTransitions.stageId, "a repo-only packet must declare an empty source-stage list");
-    }
-    return;
-  }
-  if (!bindings.some((binding) => sameStageBinding(binding, packet.global!.stage))) {
-    throw new StageChangedError(packet.repoTransitions.stageId, "the global stage is not one of the transition stage's source bindings");
-  }
-  // The transition stage must have been SEALED knowing which binding is global;
-  // otherwise its rows were admitted without the global-present-per-row rule.
-  const sealedGlobal = packet.repoTransitions.globalBinding;
-  if (!sealedGlobal || !sameStageBinding(sealedGlobal, packet.global.stage)) {
-    throw new StageChangedError(packet.repoTransitions.stageId, "the transition stage was not sealed against this global stage");
-  }
-  if (packet.global.stage.plane !== "base") {
-    throw new StageChangedError(packet.global.stage.stageId, "a CAS global stage must be a BASE stage");
-  }
-  if (packet.global.stage.counts.gitSections !== 0) {
-    throw new StageChangedError(packet.global.stage.stageId, "the global ref names a file-only stage; stage Git must be consumed into transitions");
-  }
-  // The header that commits is the sealed one. A caller-supplied header is only
-  // ever a claim, so it is compared and refused rather than trusted.
-  if (canonicalJson(packet.global.fileHeader) !== canonicalJson(packet.global.stage.header)) {
-    throw new StageChangedError(packet.global.stage.stageId, "the packet's file header is not the header this stage was sealed with");
-  }
-}
-
-function assertTransitionSnapshot(packet: CasPacket): void {
-  const token = packet.repoTransitions.snapshotToken;
-  const expected = packet.expected;
-  const matches = token.lineageId === expected.lineageId
-    && token.stream === expected.stream
-    && (token.nonce ?? "legacy") === expected.nonce
-    && (token.stateRevision ?? 0) === expected.stateRevision
-    && token.baseGeneration === expected.baseGeneration
-    && token.localRevision === expected.localRevision;
-  if (!matches) {
-    throw new StageChangedError(packet.repoTransitions.stageId, "the transition stage is bound to a different snapshot than the packet expects");
-  }
-}
-
 export function applyCasPacket(
   store: StateStoreHandle,
   stageDirectory: string,
@@ -116,9 +95,9 @@ export function applyCasPacket(
 ): CasResult {
   if (store.readonly) return { status: "unsupported", error: new Error("state store is open read-only") };
   const db = stateStoreDatabase(store);
-  assertPairing(packet);
-  assertTransitionSnapshot(packet);
+  admitCasPacket(packet);
   createStageFileTemp(db);
+  createDeltaTemps(db);
   createTransitionTemp(db);
   // Keyed by exact identity: a packet may legitimately name the same artifact more
   // than once, and cleanup must still delete it exactly once.
@@ -136,7 +115,8 @@ export function applyCasPacket(
       // The skip compares the WHOLE identity. Pairing and the sealed-ref comparison
       // already refuse a binding that merely reuses the global stage's id, so this
       // is defence in depth: no single comparison in the chain decides on id alone.
-      if (packet.global && sameStageBinding(binding, packet.global.stage)) {
+      const globalStage = (packet.global ?? packet.globalDelta)?.stage;
+      if (globalStage && sameStageBinding(binding, globalStage)) {
         verified.add(canonicalBinding(binding));
         continue;
       }
@@ -148,20 +128,26 @@ export function applyCasPacket(
       consumed.set(canonicalBinding(binding), binding);
     }
     let sealedHeader: ManifestHeader | undefined;
+    let frozenDelta: FrozenDeltaInputs | undefined;
     if (packet.global) {
       sealedHeader = consumeGlobalStage(db, stageDirectory, packet.global.stage);
       consumed.set(canonicalBinding(packet.global.stage), packet.global.stage);
+    } else if (packet.globalDelta) {
+      const delta = consumeDeltaStage(db, stageDirectory, packet.globalDelta);
+      sealedHeader = delta.sealedHeader;
+      frozenDelta = delta.frozen;
+      consumed.set(canonicalBinding(packet.globalDelta.stage), packet.globalDelta.stage);
     }
     // Everything the transaction reads is copied here, out of the verified
     // artifact and the packet scalars, once and for all.
+    const global: CasCompleteGlobal | CasDeltaGlobal | undefined = packet.global ?? packet.globalDelta;
+    const manifestMeta = global?.manifestMeta;
     const frozen: FrozenCasInputs = {
       expected: { ...packet.expected },
       sourceGlobalSeq: packet.sourceGlobalSeq,
-      hasGlobal: packet.global !== undefined,
+      hasGlobal: global !== undefined,
       globalHeader: sealedHeader,
-      globalManifestMeta: packet.global?.manifestMeta === undefined
-        ? undefined
-        : freezeGlobalManifestMeta(packet.global.manifestMeta),
+      globalManifestMeta: manifestMeta === undefined ? undefined : freezeGlobalManifestMeta(manifestMeta),
       globalBinding: packet.repoTransitions.globalBinding === undefined
         ? undefined
         : { ...packet.repoTransitions.globalBinding },
@@ -171,6 +157,7 @@ export function applyCasPacket(
     if (packet.elisionExpectation !== undefined) {
       frozen.elisionExpectation = { ...packet.elisionExpectation };
     }
+    if (frozenDelta !== undefined) frozen.delta = frozenDelta;
     const result = runTransaction(db, stageDirectory, frozen, verified, hooks);
     // The design's id-scoped cleanup after adoption or refusal. `busy` adopted and
     // refused nothing, so its inputs stay available to the caller's retry.
@@ -180,6 +167,7 @@ export function applyCasPacket(
     return result;
   } finally {
     dropStageFileTemp(db);
+    dropDeltaTemps(db);
     dropTransitionTemp(db);
   }
 }
@@ -218,7 +206,7 @@ function consumeTransitionStage(db: Database, directory: string, ref: SealedRepo
 function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef): ManifestHeader {
   const lock = StageLock.acquire(directory, ref.stageId);
   try {
-    const reader = openSealedStage(directory, ref, lock);
+    const reader = openSealedStageForConsume(directory, ref, lock);
     let copied: number;
     try {
       copied = copyStageFilesIntoTemp(db, reader);
@@ -230,6 +218,53 @@ function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef
   } finally {
     lock.release();
   }
+}
+
+interface ConsumedDelta {
+  sealedHeader: ManifestHeader;
+  frozen: FrozenDeltaInputs;
+}
+
+/**
+ * Copy a verified delta's ops into the two connection-owned TEMP tables. The
+ * sealed binding is compared to the caller's carrier here, where the artifact's
+ * own value has just been proven, and the whole copy is SAVEPOINT-contained and
+ * precedes `BEGIN IMMEDIATE`.
+ */
+function consumeDeltaStage(db: Database, directory: string, delta: CasDeltaGlobal): ConsumedDelta {
+  const lock = StageLock.acquire(directory, delta.stage.stageId);
+  try {
+    const reader = openSealedDeltaStageForConsume(directory, delta.stage, lock);
+    try {
+      if (canonicalDeltaBinding(reader.sealedBinding) !== canonicalDeltaBinding(delta.binding)) {
+        throw new StageChangedError(delta.stage.stageId, "the sealed delta binding is not the binding the packet carries");
+      }
+      copyDeltaOpsIntoTemp(db, reader);
+      return {
+        sealedHeader: reader.sealedHeader,
+        frozen: {
+          stageId: delta.stage.stageId,
+          binding: { ...reader.sealedBinding },
+          resultFiles: reader.resultFiles,
+        },
+      };
+    } finally {
+      reader.close();
+    }
+  } finally {
+    lock.release();
+  }
+}
+
+/** One pass, one savepoint: an op is written to its kind's table as it arrives,
+ * so a mid-stream or end-of-stream refusal rolls back both tables together. */
+function copyDeltaOpsIntoTemp(db: Database, reader: ConsumedDeltaReader): void {
+  withStatement(db, `INSERT INTO ${CAS_DELTA_DELETES}(path) VALUES (?)`, (insertDelete) => {
+    copyFileValuesIntoTemp(db, CAS_DELTA_UPSERTS, (visitUpsert) => reader.streamOps((op) => {
+      if (op.kind === "delete") insertDelete.run(op.path);
+      else visitUpsert(op.entry);
+    }));
+  });
 }
 
 function isBusy(error: Error): boolean {

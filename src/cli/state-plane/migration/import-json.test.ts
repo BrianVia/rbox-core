@@ -4,10 +4,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { stateFromRepoRecords, type RepoRecord, type SyncState } from "../../sync-state-model.js";
+import {
+  type RepoRecord, type SyncState,
+} from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords,
+} from "../../sync-state-records.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
 import { compareUtf16 } from "../digest/codecs.js";
-import { LegacyStateShapeError, normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";
+import { LegacyStateStructureError, normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";
 import { legacyStateSemanticDigest, stateSemanticDigest } from "../digest/state-semantic-v1.js";
 import { MigrationPhaseHaltError } from "../errors.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
@@ -25,7 +30,17 @@ import { claimStagingMain, importOwnedStaging, preserveSource } from "./import-j
 import { proveStaging } from "./prove-staging.js";
 import { publishBackup } from "./legacy-backup.js";
 
-const locks = {} as unknown as HeldStatePlaneLocks;
+const locks = {} as HeldStatePlaneLocks;
+
+/** Capture a refusal as a value; a call that does not refuse yields `undefined`. */
+const rejection = async (body: () => Promise<unknown>): Promise<unknown> => {
+  try {
+    await body();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+};
 const MIGRATION = "9f".repeat(8);
 const AUTHORITY = "ab".repeat(16);
 const ADMISSION = { sourceBytes: 1, requiredBytes: 52, budgetBytes: 1024 } as const;
@@ -87,6 +102,10 @@ const ASTRAL = "\u{1F600}";
  * walk always reads back sorted, so a pre-sorted fixture would let a dropped
  * `.sort()` pass unnoticed — it did, until this fixture was shuffled.
  */
+/** A <=1.7.18 record, still carrying the retired resolution intent the import strips. */
+const preDesign177 = (record: RepoRecord): RepoRecord & { resolutionIntent: string } =>
+  ({ ...record, resolutionIntent: "obsolete" });
+
 function fixtureState(): SyncState {
   const files: FileEntry[] = [
     { path: `z/${BMP}.txt`, sha256: hex(64, 7), size: 1, mode: 0o644, mtimeMs: 5, type: "file" },
@@ -96,12 +115,12 @@ function fixtureState(): SyncState {
     { path: "a/plain.txt", sha256: hex(64, 1), size: 3, mode: 0o644, mtimeMs: 1.5, type: "file" },
     { path: "b/link", sha256: hex(64, 2), size: 0, mode: 0o777, type: "symlink", mtimeMs: 2, symlinkTarget: "../a/plain.txt" },
   ] as FileEntry[];
-  const records: Record<string, RepoRecord> = {
+  const records = {
     [`repo-${BMP}`]: { repoGen: 3, sourceSeq: 41, base: section(4) } as RepoRecord,
-    "repo-b": { repoGen: 0, sourceSeq: 0, pending: section(2), removedKey: "gone", resolutionIntent: "obsolete" } as unknown as RepoRecord,
+    "repo-b": preDesign177({ repoGen: 0, sourceSeq: 0, pending: section(2), removedKey: "gone" }),
     [`repo-${ASTRAL}`]: { repoGen: 5, sourceSeq: 41, base: section(6) } as RepoRecord,
     "repo-a": { repoGen: 2, sourceSeq: 41, base: section(1), extensionObject: {} } as RepoRecord,
-  };
+  } satisfies Record<string, RepoRecord>;
   return stateFromRepoRecords({
     extensionArray: [],
     stream: "workspace/project",
@@ -375,15 +394,24 @@ test("the source-shape presence bits distinguish an absent key from an empty one
   const withoutKey = normalizeLegacyStateV1({
     stream: "s", lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } as never,
   } as SyncState, lineage);
-  expect(withKey.shapeFlags.lastSyncedManifest.gitRepos).toBe(true);
-  expect(withoutKey.shapeFlags.lastSyncedManifest.gitRepos).toBe(false);
+  expect(withKey.presenceFlags.lastSyncedManifest.gitRepos).toBe(true);
+  expect(withoutKey.presenceFlags.lastSyncedManifest.gitRepos).toBe(false);
   expect(legacyStateSemanticDigest(withKey)).not.toBe(legacyStateSemanticDigest(withoutKey));
 });
 
 // ---------------------------------------------------------------------------
 // Hostile sources.
 
-const refuses = (state: unknown, detail: RegExp): void => {
+/** Legacy JSON that reached disk before this schema existed: every field is suspect. */
+interface UntrustedLegacyState {
+  stream?: unknown;
+  lastSyncedSequence?: unknown;
+  lastSyncedManifest?: unknown;
+  stateNonce?: unknown;
+  telemetryBindingId?: unknown;
+}
+
+const refuses = (state: UntrustedLegacyState, detail: RegExp): void => {
   expect(() => normalizeLegacyStateV1(state as SyncState, "e".repeat(32))).toThrow(detail);
 };
 
@@ -407,7 +435,7 @@ test("the normalizer refuses shapes the schema cannot hold", () => {
   refuses({ ...base, lastSyncedManifest: { generatedAt: "", files: [], manifestSchema: 1.5 } }, /manifestSchema is not a schema version/);
   const duplicate = { path: "a", sha256: hex(64, 1), size: 0, mode: 0o644, mtimeMs: 0, type: "file" };
   refuses({ ...base, lastSyncedManifest: { generatedAt: "", files: [duplicate, { ...duplicate }] } }, /repeats a path/);
-  expect(() => normalizeLegacyStateV1(base as SyncState, "not-a-lineage")).toThrow(LegacyStateShapeError);
+  expect(() => normalizeLegacyStateV1(base as SyncState, "not-a-lineage")).toThrow(LegacyStateStructureError);
 });
 
 /**
@@ -448,8 +476,7 @@ test.each([
   const published = control(root, source, {
     phase: "M2", admission: ADMISSION, ...m2, stagingMain: { state: "present", ...claim.identity },
   });
-  const failure = await importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).wrote).toBe(false);
@@ -481,8 +508,7 @@ test.each([
   const published = control(root, doctor(real), {
     phase: "M2", admission: ADMISSION, ...m2, stagingMain: { state: "present", ...claim.identity },
   });
-  const failure = await importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).message).toMatch(detail);
@@ -508,8 +534,7 @@ test("an unparseable or changed source halts the import with zero staging writes
   const published = control(root, source, {
     phase: "M2", admission: ADMISSION, ...m2, stagingMain: { state: "present", ...claim.identity },
   });
-  const failure = await importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => importOwnedStaging(root, { identity: claim.identity, receipt: receiptFor(published) }, locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   // The adopter cleans up after itself: the claimed inode and its sidecars go.
@@ -521,8 +546,7 @@ test("a source that changed since the control recorded it never reaches a mutato
   const root = workspace("source-changed");
   const source = writeLegacy(root, fixtureState());
   fs.writeFileSync(statePath(root), "{}", { mode: 0o600 });
-  const failure = await preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).wrote).toBe(false);
@@ -536,8 +560,7 @@ test("the source hash alone decides identity, independent of size and mtime", as
   const root = workspace("source-hash");
   const source = writeLegacy(root, fixtureState());
   const lying = { ...source, sha256: "f".repeat(64) };
-  const failure = await preserveSource(root, receiptFor(control(root, lying, { phase: "M1", admission: ADMISSION })), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => preserveSource(root, receiptFor(control(root, lying, { phase: "M1", admission: ADMISSION })), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).wrote).toBe(false);
@@ -617,8 +640,7 @@ test("a preamble whose digest is the wrong length is not a backup", async () => 
   fs.mkdirSync(path.dirname(migrationPaths.fixedBackup(root)), { recursive: true });
   // 63 hex characters: the right shape, the wrong width.
   fs.writeFileSync(migrationPaths.fixedBackup(root), `RBOX-LEGACY-STATE-BACKUP-v1 ${"a".repeat(63)}\n{}`, { mode: 0o600 });
-  const failure = await preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("reserved-path");
   expect((failure as MigrationPhaseHaltError).message).toMatch(/does not carry the legacy backup preamble/);
@@ -629,8 +651,7 @@ test("a backup path holding something that is not a backup halts with zero write
   const source = writeLegacy(root, fixtureState());
   fs.mkdirSync(path.dirname(migrationPaths.fixedBackup(root)), { recursive: true });
   fs.writeFileSync(migrationPaths.fixedBackup(root), '{"stream":"restorable"}', { mode: 0o600 });
-  const failure = await preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => preserveSource(root, receiptFor(control(root, source, { phase: "M1", admission: ADMISSION })), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("reserved-path");
 });
@@ -694,8 +715,7 @@ test("anything else at the staging path is a reserved-path halt with zero writes
   const { root, source, m2 } = await stagedAt("claim-foreign");
   const file = migrationPaths.staging(root, MIGRATION);
   fs.writeFileSync(`${file}-wal`, "orphan", { mode: 0o600 });
-  const failure = await claimStagingMain(root, receiptFor(control(root, source, { phase: "M2", admission: ADMISSION, ...m2 })), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => claimStagingMain(root, receiptFor(control(root, source, { phase: "M2", admission: ADMISSION, ...m2 })), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("reserved-path");
   expect((failure as MigrationPhaseHaltError).wrote).toBe(false);
@@ -712,8 +732,7 @@ test("a completed import belonging to another migration halts rather than being 
     migrationId: "other-migration",
     stagingPath: imported.stagingPath,
   };
-  const failure = await claimStagingMain(imported.root, receiptFor(foreign), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => claimStagingMain(imported.root, receiptFor(foreign), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("reserved-path");
 });
@@ -876,8 +895,7 @@ test("M4 halts on verification when the imported rows no longer reproduce the di
   const store = openStateStoreForWalTakeover(imported.stagingPath);
   stateStoreDatabase(store).query("UPDATE state_lineage SET last_synced_sequence=last_synced_sequence+1").run();
   store.close();
-  const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).halt.underlyingCode).toBe("semantic-digest");
@@ -890,8 +908,7 @@ test("M4 halts when the committed completion row is not the one M3 published", a
   const store = openStateStoreForWalTakeover(imported.stagingPath);
   stateStoreDatabase(store).query("UPDATE migration_completion SET entry_count=entry_count+1 WHERE singleton=1").run();
   store.close();
-  const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   // Five M4 checks share the `verification` code and the durable record drops
@@ -909,8 +926,7 @@ test("M4 refuses a staging database whose authority is not the one the control n
     ...imported,
     completion: { ...imported.completion, authorityId: "f".repeat(32) },
   });
-  const failure = await proveStaging(imported.root, receiptFor(foreign), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(foreign), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).message).toMatch(/different authority/);
@@ -921,8 +937,7 @@ test("a staging database that will not open as a valid store is a halt, not a ra
   const store = openStateStoreForWalTakeover(imported.stagingPath);
   stateStoreDatabase(store).query("UPDATE store_meta SET authority_id=? WHERE singleton=1").run("f".repeat(32));
   store.close();
-  const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).message).toMatch(/did not open as a valid store/);
@@ -943,8 +958,7 @@ test("M4 refuses a dangling plane entry that integrity_check calls healthy", asy
     .map((row) => Object.values(row)[0])).toEqual(["ok"]);
   expect(db.query("PRAGMA foreign_key_check").all().length).toBeGreaterThan(0);
   store.close();
-  const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
   expect((failure as MigrationPhaseHaltError).message).toMatch(/foreign key violations/);
@@ -960,8 +974,7 @@ test("M4 halts rather than publishing when the checkpoint cannot reach rest", as
   readerDb.exec("BEGIN");
   readerDb.query("SELECT count(*) AS n FROM entry_values").get();
   try {
-    const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-      .then(() => undefined, (error: unknown) => error);
+    const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
     expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
     expect((failure as MigrationPhaseHaltError).halt.code).toBe("durability-indeterminate");
     // A halt AFTER the database was opened and recovered reports that honestly.
@@ -988,8 +1001,7 @@ test("M4 refuses a staging path that is no longer the recorded inode", async () 
     `${(swapped as ClaimedInode).dev}:${(swapped as ClaimedInode).ino}`,
     "the fixture must actually produce a different inode",
   ).not.toBe(`${imported.identity.dev}:${imported.identity.ino}`);
-  const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
-    .then(() => undefined, (error: unknown) => error);
+  const failure = await rejection(() => proveStaging(imported.root, receiptFor(m3Control(imported)), locks));
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("reserved-path");
 });

@@ -19,14 +19,16 @@ type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["r
  * caller's packet; the rest describe a store that moved under the held state
  * lock, which the JSON vocabulary calls a nonce or global-sequence mismatch.
  * `elision-drift` is deliberately NOT folded into `nonce`: it is retryable, and
- * `nonce` is the terminal incarnation-change verdict.
+ * `nonce` is the terminal incarnation-change verdict. `delta-binding` joins that
+ * same retryable family for the same reason — a delta's predecessor moved, which
+ * the composer answers by recomposing, never by giving up.
  * Exported so the unreachable rows are pinned rather than merely compiled.
  */
 export const LEGACY_REJECTION_REASON = {
   lineage: "nonce", stream: "stream", nonce: "nonce",
   "state-revision": "nonce", "base-generation": "global-sequence", "local-revision": "nonce",
   "repo-generation": "repo-generation", "global-sequence": "global-sequence", "owner-lost": "owner-lost",
-  "elision-drift": "elision-drift",
+  "elision-drift": "elision-drift", "delta-binding": "elision-drift",
 } satisfies Record<CasRejectionReason, LegacyRejectionReason>;
 
 /**

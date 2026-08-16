@@ -68,7 +68,9 @@ export type CasRejectionReason =
   | "lineage" | "stream" | "nonce" | "state-revision" | "base-generation"
   | "local-revision" | "repo-generation" | "global-sequence" | "owner-lost"
   /** A packet whose composition elided sections was bound to an older snapshot. */
-  | "elision-drift";
+  | "elision-drift"
+  /** A relative global was composed against a predecessor that has since moved. */
+  | "delta-binding";
 
 export interface CasRetryRepo {
   relPath: string;

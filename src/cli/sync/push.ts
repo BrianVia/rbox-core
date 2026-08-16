@@ -921,6 +921,9 @@ async function runPushAttempt(
             sourceGlobalSeq: write.acceptedSequence,
             globalManifest: write.globalManifest,
             manifestMeta: write.manifestMeta,
+            // Push is structurally unscoped: `assertMayPublish` is its first
+            // statement, so its base is always the unprojected remote manifest.
+            baseIsUnscopedRemote: true,
             observedRepos: write.observedRepos,
             values: write.values,
             repoProofs: write.repoProofs,

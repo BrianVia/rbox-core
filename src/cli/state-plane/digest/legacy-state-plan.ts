@@ -9,14 +9,17 @@
  */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import {
-  normalizeStateCounter, repoRecordsForState,
   validManifestMeta, type RepoRecord, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  normalizeStateCounter, repoRecordsForState,
+} from "../../sync-state-records.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
+import { jsonObject, jsonText } from "../../../json.js";
 import { canonicalJson, compareUtf16, extrasOf, parseCanonicalJson, type JsonValue } from "./codecs.js";
-import { legacySourceShapeFlags, type SourceShapeFlags } from "./source-shape.js";
+import { legacySourcePresenceFlags, type SourcePresenceFlags } from "./source-shape.js";
 
 
 /** The generation every v1 import lands on. BASE starts at zero and the import
@@ -47,15 +50,15 @@ const HEX16 = /^[0-9a-f]{16}$/;
 /** The legacy document is not a shape this schema can hold. Typed and
  * fail-closed, so M-5 publishes a `verification` halt instead of letting a
  * `CHECK` constraint surface as an opaque SQLite error mid-transaction. */
-export class LegacyStateShapeError extends Error {
+export class LegacyStateStructureError extends Error {
   constructor(readonly detail: string) {
     super(`legacy state cannot be imported: ${detail}`);
-    this.name = "LegacyStateShapeError";
+    this.name = "LegacyStateStructureError";
   }
 }
 
 const refuse = (detail: string): never => {
-  throw new LegacyStateShapeError(detail);
+  throw new LegacyStateStructureError(detail);
 };
 
 /** `path_order` is a big-endian UTF-16 blob, so its memcmp order is JS string
@@ -122,25 +125,26 @@ export interface NormalizedLegacyState {
   readonly gitSections: readonly LegacyGitSectionRow[];
   readonly repos: readonly LegacyRepoRow[];
   readonly legacyMaps: readonly LegacyMapRow[];
-  readonly shapeFlags: SourceShapeFlags;
+  readonly presenceFlags: SourcePresenceFlags;
   readonly repoRecordsPresent: boolean;
 }
 
-function optionalHex(value: unknown, pattern: RegExp, field: string): string | null {
+/** The legacy document is typed optimistically by its loader; every member that
+ * reaches a guard here is really just decoded JSON. */
+const decoded = <T>(value: T): JsonValue | undefined => value as JsonValue | undefined;
+
+function optionalHex(value: string | undefined, pattern: RegExp, field: string): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "string" || !pattern.test(value)) {
-    refuse(`${field} is not the lowercase hex identity the schema admits`);
-  }
-  return value as string;
+  if (!jsonText(decoded(value))) refuse(`${field} is not the lowercase hex identity the schema admits`);
+  if (!pattern.test(value)) refuse(`${field} is not the lowercase hex identity the schema admits`);
+  return value;
 }
 
 function orderedGitSections(
   role: LegacyGitSectionRow["role"], sections: Readonly<Record<string, GitSection>> | undefined,
 ): LegacyGitSectionRow[] {
   if (sections === undefined) return [];
-  if (typeof sections !== "object" || sections === null || Array.isArray(sections)) {
-    refuse(`${role} git sections is not an object`);
-  }
+  if (!jsonObject(decoded(sections))) refuse(`${role} git sections is not an object`);
   return Object.entries(sections)
     .map(([relPath, section]) => {
       // The store's one admission point: a section this refuses is one the wire
@@ -151,12 +155,17 @@ function orderedGitSections(
     .sort((a, b) => compareUtf16(a.relPath, b.relPath));
 }
 
+/** `extras` is ABSENT when the source carried none — an explicit undefined
+ * would reach the digest as a member the source never had. */
+const metaExtrasRow = (metaExtras: string | null): Pick<LegacyManifestMetaRow, "extras"> =>
+  (metaExtras === null ? {} : { extras: parseCanonicalJson(metaExtras) });
+
 function legacyMapRows(state: SyncState): LegacyMapRow[] {
   const rows: LegacyMapRow[] = [];
   for (const field of LEGACY_MAP_FIELDS) {
     const map = state[field];
     if (map === undefined) continue;
-    if (typeof map !== "object" || map === null || Array.isArray(map)) refuse(`${field} is not an object`);
+    if (!jsonObject(decoded(map))) refuse(`${field} is not an object`);
     for (const [relPath, value] of Object.entries(map)) {
       rows.push({ field, relPath, value: parseCanonicalJson(canonicalJson(value)) });
     }
@@ -181,15 +190,13 @@ function legacyMapRows(state: SyncState): LegacyMapRow[] {
  */
 export function normalizeLegacyStateV1(state: SyncState, lineageId: string): NormalizedLegacyState {
   if (!HEX32.test(lineageId)) refuse("the migration lineage id is not lowercase hex32");
-  if (typeof state.stream !== "string" || state.stream.length === 0) refuse("stream is not nonempty text");
+  if (!jsonText(decoded(state.stream)) || state.stream.length === 0) refuse("stream is not nonempty text");
   const manifest = state.lastSyncedManifest;
-  if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
-    refuse("lastSyncedManifest is not an object");
-  }
+  if (!jsonObject(decoded(manifest))) refuse("lastSyncedManifest is not an object");
   for (const reserved of RESERVED_MANIFEST_KEYS) {
     if (reserved in manifest) refuse(`lastSyncedManifest.${reserved} collides with a plane_heads column`);
   }
-  if (typeof manifest.generatedAt !== "string") refuse("lastSyncedManifest.generatedAt is not text");
+  if (!jsonText(decoded(manifest.generatedAt))) refuse("lastSyncedManifest.generatedAt is not text");
   if (!Array.isArray(manifest.files)) refuse("lastSyncedManifest.files is not a list");
   if (manifest.manifestSchema !== undefined
     && (!Number.isSafeInteger(manifest.manifestSchema) || (manifest.manifestSchema as number) < 1)) {
@@ -256,7 +263,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
       keyEpoch: meta.keyEpoch,
       chainBytes: meta.chainBytes,
       snapshotBytes: meta.snapshotBytes,
-      ...(metaExtras === null ? {} : { extras: parseCanonicalJson(metaExtras) }),
+      ...metaExtrasRow(metaExtras),
     },
     chain: meta === undefined ? [] : meta.chain,
     gitSections: [
@@ -265,7 +272,7 @@ export function normalizeLegacyStateV1(state: SyncState, lineageId: string): Nor
     ],
     repos,
     legacyMaps: legacyMapRows(state),
-    shapeFlags: legacySourceShapeFlags(state),
+    presenceFlags: legacySourcePresenceFlags(state),
     repoRecordsPresent: state.repoRecords !== undefined,
   };
 }

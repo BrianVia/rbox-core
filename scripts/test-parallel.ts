@@ -29,7 +29,15 @@ const results = await Promise.all(procs.map(async (p, i) => {
   const started = performance.now();
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   const seconds = (performance.now() - started) / 1000;
-  return { i, code, seconds, tail: (out + err).split("\n").filter((l) => /(pass|fail|skip)/.test(l)).slice(-4) };
+  const lines = (out + err).split("\n");
+  // A green shard reports its counts; a red one has to report WHAT failed. The
+  // count filter hides a file that threw before any test ran — an import that
+  // no longer resolves prints `# Unhandled error between tests` and no `(fail)`
+  // line at all — so a failing shard keeps its raw tail instead.
+  const tail = code === 0
+    ? lines.filter((l) => /(pass|fail|skip)/.test(l)).slice(-4)
+    : lines.filter((l) => l.trim() !== "").slice(-40);
+  return { i, code, seconds, tail };
 }));
 const wall = ((performance.now() - t0) / 1000).toFixed(0);
 let failed = false;

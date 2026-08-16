@@ -1,11 +1,10 @@
 import type { Manifest } from "../../../engine/index.js";
 import {
-  stateFromRepoRecords,
-  stripObsoleteResolutionIntents,
-  type GlobalManifestMeta,
-  type RepoRecord,
-  type SyncState,
+  type GlobalManifestMeta, type RepoRecord, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords, stripObsoleteResolutionIntents,
+} from "../../sync-state-records.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { SnapshotChangedError } from "../errors.js";
 import type {
@@ -39,16 +38,17 @@ function materializeManifest(snapshot: ReadSnapshot, plane: Plane): Manifest {
   }
   const header = plane === "base" ? snapshot.token.baseHeader : snapshot.token.localHeader;
   const gitRepos = plane === "base" ? collectGit(snapshot, "manifest-projection") : {};
-  return {
+  const manifest = {
     ...Object.fromEntries(Object.entries(header).filter(([key]) =>
       !["complete", "sourceSequence", "trustEpoch"].includes(key))),
     generatedAt: header.generatedAt,
     files,
-    ...(header.manifestSchema === undefined ? {} : { manifestSchema: header.manifestSchema }),
-    ...(plane === "base" && (snapshot.token.manifestGitReposPresent || Object.keys(gitRepos).length)
-      ? { gitRepos }
-      : {}),
   } as Manifest;
+  if (header.manifestSchema !== undefined) manifest.manifestSchema = header.manifestSchema;
+  if (plane === "base" && (snapshot.token.manifestGitReposPresent || Object.keys(gitRepos).length)) {
+    manifest.gitRepos = gitRepos;
+  }
+  return manifest;
 }
 
 function manifestMeta(snapshot: ReadSnapshot): GlobalManifestMeta | undefined {
@@ -88,17 +88,19 @@ export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
     after = page.after;
   }
   const meta = manifestMeta(guard);
+  // Members are appended in the legacy document's own order; the optional ones
+  // stay absent rather than present-and-undefined.
   const base: SyncState = {
     ...token.lineageExtras,
     stream: token.stream,
     lastSyncedSequence: token.lastSyncedSequence,
     lastSyncedManifest: materializeManifest(guard, "base"),
-    ...(meta ? { manifestMeta: meta } : {}),
-    ...(token.nonce === undefined ? {} : { stateNonce: token.nonce }),
-    ...(token.stateRevision === undefined ? {} : { stateRevision: token.stateRevision }),
-    ...(token.telemetryBindingId === undefined ? {} : { telemetryBindingId: token.telemetryBindingId }),
-    repoRecords: records,
   };
+  if (meta) base.manifestMeta = meta;
+  if (token.nonce !== undefined) base.stateNonce = token.nonce;
+  if (token.stateRevision !== undefined) base.stateRevision = token.stateRevision;
+  if (token.telemetryBindingId !== undefined) base.telemetryBindingId = token.telemetryBindingId;
+  base.repoRecords = records;
   const normalized = stripObsoleteResolutionIntents(stateFromRepoRecords(base, records));
   const cleanManifest = withoutUndefinedMembers<Manifest>(normalized.lastSyncedManifest);
   const cleanState = withoutUndefinedMembers<SyncState>({ ...normalized, lastSyncedManifest: cleanManifest });

@@ -2,7 +2,8 @@ import type { FileEntry } from "../../../engine/index.js";
 import { isSafeRelPath } from "../../../engine/index.js";
 import { createHash, randomBytes } from "node:crypto";
 import { FileEntryOversizeError } from "../errors.js";
-import { canonicalJson, extrasOf, retainedEstimate, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
+import { jsonObject, jsonText } from "../../../json.js";
+import { canonicalJson, extrasOf, parseCanonicalJson, retainedEstimate, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
 
 export const FILE_ENTRY_KEYS = [
   "path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget",
@@ -41,23 +42,38 @@ function assertPath(path: string): void {
 
 function hex(value: string | undefined, field: string, optional = false): Buffer | null {
   if (value === undefined && optional) return null;
-  if (typeof value !== "string" || !HEX64.test(value)) throw new TypeError(`${field} must be lowercase hex64`);
+  if (!jsonText(value) || !HEX64.test(value)) throw new TypeError(`${field} must be lowercase hex64`);
   return Buffer.from(value, "hex");
 }
 
 function nonnegativeInteger(value: number | undefined, field: string): asserts value is number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative integer`);
+  // Number.isInteger never coerces, so it is the whole boundary test.
+  if (!Number.isInteger(value) || (value as number) < 0) throw new TypeError(`${field} must be a nonnegative integer`);
 }
 
+/** Canonical stage/plane bytes as the entry they encode. The container test is
+ * the only rule here; `admitFileEntry` downstream is the validator. */
+export function fileEntryFromCanonical(text: string): FileEntry {
+  const value = parseCanonicalJson(text);
+  if (!jsonObject(value)) throw new TypeError("file entry is not a JSON object");
+  return Object.assign(Object.create(null), value) as FileEntry;
+}
+
+/** Every column an interned value is identified by, minus the id itself. The
+ * consume path resolves or mints ids in SQL, so it never pays the CSPRNG. */
+export type ConsumedFileEntry = Omit<EncodedFileEntry, "entryId">;
+
 export function encodeFileEntry(input: FileEntry): EncodedFileEntry {
+  // entry_id is an independent, domain-separated identity. A collision in the
+  // non-unique exact_fingerprint lookup must still reach exact row comparison.
+  return { entryId: randomBytes(16).toString("hex"), ...encodeFileEntryForConsume(input) };
+}
+
+export function encodeFileEntryForConsume(input: FileEntry): ConsumedFileEntry {
   const value = input;
   const admitted = admitFileEntry(value);
   const fingerprint = createHash("sha256").update(admitted.canonical).digest("hex");
-  // entry_id is an independent, domain-separated identity. A collision in the
-  // non-unique exact_fingerprint lookup must still reach exact row comparison.
-  const entryId = randomBytes(16).toString("hex");
   return {
-    entryId,
     exactFingerprint: fingerprint,
     path: value.path,
     pathOrder: utf16beOrderKey(value.path),
@@ -103,9 +119,9 @@ function admitFileEntry(value: FileEntry): AdmittedFileEntry {
   assertPath(value.path);
   nonnegativeInteger(value.size, "size");
   if (!Number.isInteger(value.mode) || value.mode < 0 || value.mode > 0o7777) throw new TypeError("mode out of range");
-  if (typeof value.mtimeMs !== "number" || !Number.isFinite(value.mtimeMs)) throw new TypeError("mtimeMs must be finite");
+  if (!Number.isFinite(value.mtimeMs)) throw new TypeError("mtimeMs must be finite");
   if (value.type !== "file" && value.type !== "symlink") throw new TypeError("type must be file or symlink");
-  if (value.symlinkTarget !== undefined && (typeof value.symlinkTarget !== "string" || value.symlinkTarget.length === 0)) {
+  if (value.symlinkTarget !== undefined && !(jsonText(value.symlinkTarget) && value.symlinkTarget.length > 0)) {
     throw new TypeError("symlinkTarget must be nonempty text");
   }
   if (value.type === "symlink" && value.symlinkTarget === undefined) throw new TypeError("symlink requires symlinkTarget");
@@ -155,8 +171,14 @@ export interface FileEntryRow {
   extras_cjson: string | null; canonical_bytes: number; retained_estimate: number;
 }
 
+/** A FileEntry under construction: optional members are installed after the
+ * required ones, so an absent column stays an ABSENT key. */
+type DecodedFileEntry = { -readonly [K in keyof FileEntry]: FileEntry[K] };
+
 export function decodeFileEntry(row: FileEntryRow): FileEntry {
-  const entry = {
+  // A NULL column means the member is ABSENT, never present-and-undefined: the
+  // canonical encoder refuses undefined and the digest covers key presence.
+  const entry: DecodedFileEntry = {
     ...spreadExtras(row.extras_cjson),
     path: row.path,
     sha256: Buffer.from(row.sha256).toString("hex"),
@@ -164,12 +186,12 @@ export function decodeFileEntry(row: FileEntryRow): FileEntry {
     mode: row.mode,
     mtimeMs: row.mtime_ms,
     type: row.kind,
-    ...(row.symlink_target === null ? {} : { symlinkTarget: row.symlink_target }),
-    ...(row.enc_sha === null ? {} : { encSha: Buffer.from(row.enc_sha).toString("hex") }),
-    ...(row.comp === null ? {} : { comp: row.comp }),
-    ...(row.payload_sha === null ? {} : { payloadSha: Buffer.from(row.payload_sha).toString("hex") }),
-    ...(row.cipher_size === null ? {} : { cipherSize: row.cipher_size }),
-  } satisfies FileEntry;
+  };
+  if (row.symlink_target !== null) entry.symlinkTarget = row.symlink_target;
+  if (row.enc_sha !== null) entry.encSha = Buffer.from(row.enc_sha).toString("hex");
+  if (row.comp !== null) entry.comp = row.comp;
+  if (row.payload_sha !== null) entry.payloadSha = Buffer.from(row.payload_sha).toString("hex");
+  if (row.cipher_size !== null) entry.cipherSize = row.cipher_size;
   const commonFile = row.kind === "file" && row.symlink_target === null && row.enc_sha === null
     && row.comp === null && row.payload_sha === null && row.cipher_size === null && row.extras_cjson === null;
   let canonicalBytes: number;
@@ -179,7 +201,7 @@ export function decodeFileEntry(row: FileEntryRow): FileEntry {
     if (row.sha256.byteLength !== 32) throw new TypeError("sha256 must be lowercase hex64");
     nonnegativeInteger(row.size, "size");
     if (!Number.isInteger(row.mode) || row.mode < 0 || row.mode > 0o7777) throw new TypeError("mode out of range");
-    if (typeof row.mtime_ms !== "number" || !Number.isFinite(row.mtime_ms)) throw new TypeError("mtimeMs must be finite");
+    if (!Number.isFinite(row.mtime_ms)) throw new TypeError("mtimeMs must be finite");
     canonicalBytes = Buffer.byteLength(JSON.stringify({
       mode: row.mode, mtimeMs: row.mtime_ms, path: row.path,
       sha256: entry.sha256, size: row.size, type: "file",

@@ -73,7 +73,7 @@ import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
 import type { GitDeferral, RepoRecord } from "../../../src/cli/sync-state-model.js";
-import { repoRecordsForState } from "../../../src/cli/sync-state-model.js";
+import { repoRecordsForState } from "../../../src/cli/sync-state-records.js";
 
 const REPO = "repo-752";
 const repoDir = `${GUEST.workDir}/${REPO}`;

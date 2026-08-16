@@ -11,12 +11,15 @@ export {
 } from "./workspace-config.js";
 
 export {
-  DEFERRAL_LANES,
   MAX_LEGACY_GIT_SIDECAR_REPOS,
   expectedStateNonce,
-  manifestFromMeta,
   repoRecordsForState,
   stateFromRepoRecords,
+} from "./sync-state-records.js";
+
+export {
+  DEFERRAL_LANES,
+  manifestFromMeta,
   validManifestMeta,
   type ConfigStoreIdentity,
   type FileOnlyManifest,

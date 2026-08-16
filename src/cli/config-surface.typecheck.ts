@@ -1,6 +1,7 @@
 import * as barrel from "./config.js";
 import * as resetState from "./reset-state.js";
 import * as model from "./sync-state-model.js";
+import * as records from "./sync-state-records.js";
 import * as store from "./sync-state-store.js";
 import * as workspace from "./workspace-config.js";
 import type {
@@ -55,12 +56,13 @@ type OwnerValues =
     | "trashConfig">
   & Pick<typeof model,
     | "DEFERRAL_LANES"
+    | "manifestFromMeta"
+    | "validManifestMeta">
+  & Pick<typeof records,
     | "MAX_LEGACY_GIT_SIDECAR_REPOS"
     | "expectedStateNonce"
-    | "manifestFromMeta"
     | "repoRecordsForState"
-    | "stateFromRepoRecords"
-    | "validManifestMeta">
+    | "stateFromRepoRecords">
   & Pick<typeof store,
     | "StreamMismatchError"
     | "applyStateSavePacket"
