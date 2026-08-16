@@ -32,9 +32,10 @@ import * as storeFacade from "../store-facade.js";
 import {
   createStateStore, openStateStore, ownedStateStoreWriterForReset, stateStoreDatabase,
 } from "../store/open.js";
+import { LEGACY_REJECTION_REASON } from "./cas-translation.js";
 import {
   applyStateSavePacket, ensureCapableStateLineage, ensureTelemetryBindingId,
-  LEGACY_REJECTION_REASON, loadRawState, loadState, replaceResetLineageStream,
+  loadRawState, loadState, replaceResetLineageStream,
 } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_222::root";

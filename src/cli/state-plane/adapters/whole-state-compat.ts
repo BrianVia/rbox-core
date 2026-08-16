@@ -40,8 +40,6 @@ import {
   stateLockBusyDetail,
 } from "./legacy-json-store.js";
 
-export { LEGACY_REJECTION_REASON };
-
 /** `.rbox/state.json` carries `Q`, and this is the database it names. */
 interface SqliteAuthority { authorityId: string; file: string }
 
@@ -286,7 +284,7 @@ async function saveThroughStore(
     try {
       return translateCasResult(
         await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)),
-        store, facade, options.acceptedProjection,
+        store, facade, packet, options.acceptedProjection,
       );
     } finally {
       store.close();

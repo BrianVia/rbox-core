@@ -68,9 +68,12 @@ export function readReplacementLineage(store: StateStoreHandle): ReplacementLine
 /** Add store-generated identity to the caller's already-composed projection: the
  * six lineage-token fields a read-back would have carried, and nothing else. */
 export function projectAcceptedSavePacket(projection: SyncState, token: LineageSnapshot): SyncState {
+  // Extras FIRST, exactly as the read-back layers them (read-only.ts): an
+  // unrecognized lineage column may not shadow lastSyncedManifest, manifestMeta,
+  // or repoRecords, which the projection is authoritative for.
   const result: SyncState = {
-    ...projection,
     ...token.lineageExtras,
+    ...projection,
     stream: token.stream,
     lastSyncedSequence: token.lastSyncedSequence,
   };

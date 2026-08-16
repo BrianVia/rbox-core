@@ -3,7 +3,8 @@
  * translation: the rejection vocabulary the JSON CAS has always spoken, and the
  * choice between reading the accepted state back and projecting it.
  */
-import type { StateSaveResult, SyncState } from "../../sync-state-model.js";
+import { fullyElidedPacket } from "../../sync-state-elision.js";
+import type { StateSavePacket, StateSaveResult, SyncState } from "../../sync-state-model.js";
 import type { CasRejectionReason, CasResult } from "../ports.js";
 import type { StateStoreHandle } from "../store/open.js";
 
@@ -28,20 +29,26 @@ export const LEGACY_REJECTION_REASON = {
   "elision-drift": "elision-drift",
 } satisfies Record<CasRejectionReason, LegacyRejectionReason>;
 
+/**
+ * Design 267 §4. The projection is a caller's CLAIM about what the store now
+ * holds, so the adapter re-derives its precondition from the packet it just
+ * applied rather than trusting that the caller only offers one when it may: a
+ * packet that carried any section wrote something the projection cannot know.
+ */
 export function translateCasResult(
   result: CasResult,
   store: StateStoreHandle,
   facade: StoreFacade,
-  /** Design 267 §4: supplied only for a save whose every section was elided. */
+  packet: StateSavePacket,
   acceptedProjection?: SyncState,
 ): StateSaveResult {
   switch (result.status) {
     case "accepted":
       return {
         status: "accepted",
-        state: acceptedProjection === undefined
-          ? facade.loadRawStateFromStore(store)
-          : facade.projectAcceptedSavePacket(acceptedProjection, result.token),
+        state: acceptedProjection !== undefined && fullyElidedPacket(packet)
+          ? facade.projectAcceptedSavePacket(acceptedProjection, result.token)
+          : facade.loadRawStateFromStore(store),
       };
     case "rejected":
       try {
