@@ -16,15 +16,17 @@ import {
 import { gitIncomingKey } from "./shared.js";
 import {
   blockersAfterComposer,
-  createHeldAttempt,
-  gitHeldSkipEnabled,
   gitOwnershipHeldSkipEnabled,
   gitOwnershipNoEscalateEnabled,
+  heldBlockersAllowSkip,
+} from "./held-blockers.js";
+import {
+  createHeldAttempt,
+  gitHeldSkipEnabled,
   heldAttemptFloorElapsed,
   heldAttemptMatches,
   heldAttemptMismatchField,
   heldClassifierInputKey,
-  heldBlockersAllowSkip,
   observeHeldInputs,
   readWorktreeRegistryDigest,
   earlyHeldAttemptDecision,
