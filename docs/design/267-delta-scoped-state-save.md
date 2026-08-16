@@ -77,9 +77,15 @@ nonce-less JSON state (`whole-state-compat.ts:165`) — no receipt, full
 save. No normalized-sentinel comparison semantics are introduced.
 
 No receipt → full packet, unconditionally. Degraded pulls, push-conflict
-recovery adoption (`daemon/daemon.ts:1859`), chain repair, resolution
-settlement, and every direct packet caller never construct one, so their
-ineligibility is structural — not a negative control we hope holds. The
+recovery, chain repair, resolution settlement, and every direct packet caller
+never construct one, so their ineligibility is structural — not a negative
+control we hope holds. r1-IMPL correction: "recovery" is NOT only the daemon's
+adoption path. Push's 409/pull-first and `pullAndLoadAccepted` arms
+(`sync/push.ts`) call the ordinary `pull()`, which would otherwise inherit the
+standalone lane's eligibility. The lane is therefore an explicit argument —
+`PullProvenance` = `standalone` | `recovery`, defaulting to `standalone` at the
+public entry and to `recovery` wherever `applyPulledManifest` is reached
+directly — so a new nested-pull caller is receipt-less until someone names it. The
 receipt is the 235 §5.2 first-class evidence interface: `StateSource` gains
 one optional field; no other signature changes.
 
@@ -174,10 +180,18 @@ retryable reason `"elision-drift"` (r3-CRITICAL: the raw
 `"state-revision"` reason is translated to terminal `"nonce"` at
 `whole-state-compat.ts:392`, which `saveStateSource` treats as an
 incarnation change and throws, `sync-state.ts:392-395` — receipt drift
-must not ride that mapping). **Receipts are single-attempt:** on
-`"elision-drift"` the caller discards the receipt and retries through the
-standing full-save recomposition against the adapter's under-lock reload
-(`whole-state-compat.ts:398`). No rebinding, no proof re-establishment —
+must not ride that mapping). **Receipts are single-attempt, structurally.** r1-IMPL correction: making the
+rejection handler discard the receipt covers only `"elision-drift"`, so an
+ordinary `repo-generation`/`global-sequence` rejection would recompose against
+the fresh reload while re-attaching the stale proof — a deterministic
+`elision-drift` on the next attempt, turning a pull that survives two
+interleaves today into a three-attempt throw. The coupling belongs in
+composition instead: `composeStateSavePacket` uses a receipt ONLY when
+`receipt.nonce === expectedStateNonce(snapshot)` and
+`receipt.stateRevision === snapshot.stateRevision`. Every retry recomposes
+against the adapter's under-lock reload (`whole-state-compat.ts:398`), so a
+reload that moved the revision — for ANY rejection reason — leaves the receipt
+unbound and therefore spent. No rebinding, no proof re-establishment —
 the deterministic-rejection loop codex constructed (an interleaved no-op
 save advances revision without changing any elision predicate, so an
 unbound retry re-sends the stale receipt forever) is impossible by
@@ -199,7 +213,15 @@ and every transition is an unconditional upsert with `repo_gen+1`
 (`cas-steps.ts:205-210`). Without this half, M1 never fires on desktop/FM.
 
 Elide a repo transition when its composed `newRecord` deep-equals the
-current record in the loaded state. Safe against 235 §5.4: delete-absent
+current record in the loaded state AND the global was itself proven unchanged
+this cycle. r1-IMPL ruling: repo elision is gated on `elideGlobal`. Ungated, it
+fires on ordinary content-carrying pulls, where it buys ~nothing (the measured
+8.4s is entirely global-stage work) while attaching an `elisionExpectation` —
+and therefore a cross-process drift rejection — to every such save; the
+daemon's load→lock window is minutes long on a large workspace, and a CLI
+writer landing inside it would spend a retry attempt for no gain. Gating keeps
+100% of the measured no-op win and gives `elisionExpectation` exactly one
+meaning: the global was proven unchanged. Safe against 235 §5.4: delete-absent
 applies to the file plane only (`generations.ts:344-355`); `applyTransitions`
 is pure upsert with no absence semantics. The r2 trade ("elided repo loses
 its `repo_gen` guard") is superseded by §3.2b: the receipt's
@@ -263,6 +285,11 @@ state as the projection; the adapter overlays ONLY the CAS token fields
 `telemetryBindingId`, `lineageExtras` — the `LineageSnapshot`/token
 surface, `ports.ts:23-38`; note `projectAcceptedSavePacket` today overlays
 only five of the six — `lineageExtras` must be added, r2 disposition).
+The precondition is re-derived by the ADAPTER, not trusted from the caller
+(r1-IMPL): `translateCasResult` honours `acceptedProjection` only for a packet
+that carries an `elisionExpectation`, no global, and no repo transitions. A
+packet that wrote anything is read back regardless of what the caller offered,
+so a future caller cannot make a stale projection durable by mistake.
 This projection reuse is sound ONLY because of §3.2b: an accepted elided
 CAS proves via the revision predicate that durable content equals the
 loaded state plus exactly the token-field changes. Gate: strict-equality
@@ -345,6 +372,21 @@ Remaining O(N) per no-op cycle after M1+M2, named per §5.9: state load
   `telemetryBindingId`.
 - Strict-equality projection test for the elided shape (returnedState vs
   durable reload), per `whole-state-compat.test.ts:867` precedent.
+- Provenance fixtures run through the REAL `pull()` lanes (r1-IMPL): a
+  standalone pull of an unchanged head elides (no BASE generation is built), the
+  same head pulled on the `recovery` lane composes a full packet, and a remote
+  change on an IGNORED path composes a full packet — the last pins `noActions`
+  against the unfiltered `all`, which nothing else observes.
+- `encSha`-ONLY drift fixture: every other field of the durable entry matches
+  the meta's manifest. A predicate that stopped binding `encSha` passes a
+  fixture that also moves `sha256`/`size`/`mtimeMs`, so the drift is isolated.
+- `manifestFromMeta` operand fixture: meta-wire git present, local projection
+  empty, the two hashes asserted DIFFERENT, and elision still fires.
+- Projection-guard fixture: a content-carrying packet offering an
+  `acceptedProjection` is read back from the store, not projected.
+- Reset-migration pin: the nonce-less legacy migration's empty packet
+  (`reset-state.ts:434-445`) still mints the nonce, advances the revision once,
+  and leaves every other member byte-identical.
 - Retained-generation fixture (§3.4.1, founder condition): two consecutive
   accepted elided saves leave `active_base_generation` unchanged and a full load
   still returns state deep-equal to the pre-elision durable state; the next

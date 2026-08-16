@@ -78,17 +78,20 @@ try {
     const result = await applySavePacketToStore(store, packet(coldFiles, 1), OWNER);
     if (result.status !== "accepted") throw new Error(`cold save returned ${result.status}`);
   });
+  let steadyRevision = 0;
   await timed("save_steady_one_changed", async () => {
     const result = await applySavePacketToStore(store, packet(steadyFiles, 2), OWNER);
     if (result.status !== "accepted") throw new Error(`steady save returned ${result.status}`);
+    steadyRevision = result.token.stateRevision ?? 0;
   });
-  // Design 267's minimal packet. This times the SAVE only; whether a real pull
-  // elides is decided in composeStateSavePacket and is not visible here — the
-  // field trace is the authority for the end-to-end number.
+  // Design 267's minimal packet, bound to the revision the previous save
+  // actually landed on. This times the SAVE only; whether a real pull elides is
+  // decided in composeStateSavePacket and is not visible here — the field trace
+  // is the authority for the end-to-end number.
   await timed("save_minimal_noop", async () => {
     const result = await applySavePacketToStore(store, {
       expectedStream: STREAM, expectedNonce: NONCE, sourceGlobalSeq: 3, repos: [],
-      elisionExpectation: { nonce: NONCE, stateRevision: 2 },
+      elisionExpectation: { nonce: NONCE, stateRevision: steadyRevision },
     }, OWNER);
     if (result.status !== "accepted") throw new Error(`minimal save returned ${result.status}`);
   });
