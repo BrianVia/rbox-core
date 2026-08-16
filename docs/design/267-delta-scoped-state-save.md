@@ -415,3 +415,20 @@ Remaining O(N) per no-op cycle after M1+M2, named per §5.9: state load
 No server changed-path endpoint; no second on-disk manifest representation;
 no scheduler changes; no new digest grammar; no mechanism for any stage the
 numbers say is cheap.
+
+## 8. Field close-out (2026-08-16, desktop, live daemon, build 431167a)
+
+Perf-differential close-out, both lanes, same host/workspace (120,485
+files, 263 MB store), captured from the production daemon log:
+
+| Zero-change cycle | before (da28ddc, 16:26-16:30Z) | after (431167a, 16:41-16:43Z) |
+|---|---|---|
+| pull wall | 13.3s | **3.6s** |
+| pull state-save | 9.8s | **0.8s** |
+| push wall | 6.9-7.5s | 6.5-7.0s (no regression; push save was already 0.0) |
+
+The residual 0.8s save is the preserved minimal-CAS path (lock, fence,
+revision, projection overlay). Remaining pull cost is dominated by
+state-load (~1.7s) — the §5 deferred M4 evidence item. Mac 1-blob leg
+runs post-merge via the normal fleet rebuild (worktree branches do not
+sync to the Mac by design).
