@@ -319,6 +319,34 @@ Workspace-level: ~10.5s of per-cycle git-apply removed on the Mac
 (3 × ~3.5s), leaving `rbox-core`'s follow as the dominant remaining
 cost. Field close-out re-measures both lanes per the perf rule.
 
+### 4.1 Field close-out watch items (implementation round)
+
+Three consequences are expected, bounded, and NOT defects — but the Mac
+close-out should name each explicitly rather than discover it as a
+surprise:
+
+1. **Shared-ref-store invalidation on worktree-heavy hosts.** The
+   artifact plane lives in the shared common dir, so every linked
+   worktree of one repository reads the SAME digest. A P/K write for any
+   one of them invalidates the stored attempt of ALL of them. On hosts
+   with many linked worktrees per repo this dents the skip hit-rate in a
+   way the single-worktree field data does not show. It is correct — the
+   composer reads that same shared plane — but it is the first thing to
+   check if measured hit-rate lands below §4's prediction.
+2. **One re-follow per held repo on the first pull after upgrade.**
+   Attempts stored before this change carry no digest, so every held
+   repo takes the full path exactly once while the digest is minted
+   (~5 × 3.5s on the Mac, one time). A second consecutive pull showing
+   the same cost is the real signal; the first one is expected.
+3. **Reflog-only moves stay invisible to the early gate** until the
+   hourly floor. That is #641's deliberate subset — the early gate never
+   observed reflogs, only the late matcher's `reflogs` digest does — but
+   270 now points that gate at a hold class whose `missing-safe-ref-proof`
+   arm is stash/reflog-adjacent. The bound is one hour, and §7 D2's
+   coverage argument (stash reflog is an attempt input via
+   `finalReflogPaths`, tags/stash are fingerprint-covered) is what keeps
+   it sound; re-read that argument if a stash-shaped repo misbehaves.
+
 ## 5. Validation
 
 - Red-first: composer-held fixpoint repo re-follows on identical inputs

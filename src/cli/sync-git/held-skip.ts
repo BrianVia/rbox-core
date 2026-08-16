@@ -224,9 +224,31 @@ export function heldAttemptFloorElapsed(attempt: GitHeldAttempt, nowMs = Date.no
  * protocol state. Two independent fingerprints bracket the decision so an
  * incomplete, changing, or racy repository always falls through to the full
  * path and its authoritative late check. */
+/** Every gate the early check can refuse on, plus the two the caller supplies
+ * when it never runs. Naming them keeps the RBOX_TRACE_HELD vocabulary closed. */
+export type EarlyHeldAttemptReason =
+  | "none"
+  | "no-attempt"
+  | "disabled"
+  | "fingerprint-version"
+  | "worktree-registry"
+  | "attempt-time"
+  | "safety-floor"
+  | "legacy-classifier-key"
+  | "classifier-key"
+  | "partial-disposition"
+  | "artifact-plane"
+  | "artifact-plane-unavailable"
+  | "artifact-plane-race"
+  | "dependencies-incomplete"
+  | "fingerprint-race"
+  | "local-fingerprint"
+  | "racy-clean"
+  | "observation-error";
+
 export interface EarlyHeldAttemptDecision {
   matches: boolean;
-  reason: string;
+  reason: EarlyHeldAttemptReason;
 }
 
 export async function earlyHeldAttemptDecision(input: {
@@ -237,6 +259,8 @@ export async function earlyHeldAttemptDecision(input: {
   /** The durable partial as it stood before this pull's frame. */
   partial?: GitPartialApply;
   nowMs?: number;
+  /** Test seam for an artifact-plane mutation between the bracket reads. */
+  afterFirstArtifactPlaneRead?: () => void | Promise<void>;
 }): Promise<EarlyHeldAttemptDecision> {
   const nowMs = input.nowMs ?? Date.now();
   const writtenAt = Date.parse(input.attempt.at);
@@ -257,18 +281,30 @@ export async function earlyHeldAttemptDecision(input: {
     const before = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
     );
-    if (gitHeldSkipComposerEnabled()) {
-      const repoDir = before.diskCtx?.repoDir;
+    const stored = input.attempt.artifactPlaneDigest;
+    const composer = gitHeldSkipComposerEnabled();
+    // An attempt with no stored digest can never match one; refuse it without
+    // spending a git spawn, and likewise when the fingerprint already refuses.
+    if (composer && stored === undefined) return { matches: false, reason: "artifact-plane" };
+    let repoDir: string | undefined;
+    let digestBefore: string | undefined;
+    if (composer && before.dependenciesComplete) {
+      repoDir = before.diskCtx?.repoDir;
       if (!repoDir) return { matches: false, reason: "artifact-plane-unavailable" };
-      if (await readArtifactPlaneDigest(repoDir) !== input.attempt.artifactPlaneDigest) {
-        return { matches: false, reason: "artifact-plane" };
-      }
+      digestBefore = await readArtifactPlaneDigest(repoDir);
+      if (digestBefore !== stored) return { matches: false, reason: "artifact-plane" };
+      await input.afterFirstArtifactPlaneRead?.();
     }
     const after = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
     );
     if (!before.dependenciesComplete || !after.dependenciesComplete) return { matches: false, reason: "dependencies-incomplete" };
     if (before.hash !== after.hash) return { matches: false, reason: "fingerprint-race" };
+    // Bracket the plane the way the fingerprints bracket the repo: a resolve or
+    // reset landing inside this window must fall through, not skip one cycle stale.
+    if (repoDir !== undefined && await readArtifactPlaneDigest(repoDir) !== digestBefore) {
+      return { matches: false, reason: "artifact-plane-race" };
+    }
     if (after.hash !== input.attempt.localFingerprint) return { matches: false, reason: "local-fingerprint" };
     if (Math.max(before.maxTsMs, after.maxTsMs) >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) {
       return { matches: false, reason: "racy-clean" };

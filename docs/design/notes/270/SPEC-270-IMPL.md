@@ -7,8 +7,14 @@ Authority: docs/design/270-held-followed-skip.md (r4 ALIGNED, f815a5b04)
 1. §2.1+§7: allowlist disjunct — provenance==="composer" && (code===
    "missing-branch-proof" || code==="missing-safe-ref-proof"), gated by
    NEW flag RBOX_GIT_HELD_SKIP_COMPOSER (default ON, defaults-ledger
-   registered). All 20 existing heldBlockersAllowSkip pins stay green
-   UNMODIFIED (the doc lists why per pin).
+   registered). All existing heldBlockersAllowSkip pins stay green
+   UNMODIFIED (the doc lists why per pin). CORRECTION (implementation):
+   there are **21** such pins, not 20 — 19 in held-skip.test.ts
+   (:81-88, 106, 117, 155, 166, 180, 199, 225, 236, 257, 268, 284) and 2
+   in follow.test.ts (:2264, 2302). All 21 verified green unmodified; the
+   only diff in held-skip.test.ts is its import statement, which the
+   held-blockers.ts extraction forced. The 6d41d990 and 577e233b commit
+   messages still say "20" — recorded here, not rewritten.
 2. §2.3+§7: artifact-plane digest (for-each-ref over the four rbox
    base/recovery namespaces, refname+oid hashed) into BOTH
    earlyHeldAttemptDecision and observeHeldInputs — SAME flag gates it
@@ -42,7 +48,13 @@ identity).
 Preflight test-runnability; bun run test:affected per iteration; ONE
 bun run test:parallel final gate; typecheck (clear tsbuildinfo after
 scripted edits); lint:affected zero new warnings (3 documented
-sync-state-model names excepted); no suppressions; named exported types;
+sync-state-model names excepted; PLUS the 4 no-runtime-typeof warnings at
+held-skip.ts:201/209/244/247 — the legacy-attempt compatibility path
+(`worktreeRegistryDigest`/`classifierInputKey` presence on attempts
+written before designs 200/176), kept deliberately and pinned by
+held-skip.test.ts:302/308. Restructuring them into a boundary parse is a
+real change to the durable-attempt read path with its own compatibility
+story — a separate PR, not this one); no suppressions; named exported types;
 comments ≤1 line; ≤500 lines/file (decompose, never shave); artifacts in
 docs/design/notes/270/ NEVER repo root. Logical commits on
 held-followed-skip; do NOT push.

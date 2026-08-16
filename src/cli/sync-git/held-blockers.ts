@@ -38,9 +38,12 @@ export function sameHeldOutcome(a: readonly TypedBlocker[], b: readonly TypedBlo
  * "The follow minted no proof for this ref" — causally the same shape as a
  * ref-plane hold: the ref did not advance, and re-running the follow reproduces
  * the same nothing. Every other RepoBaseHoldCode either contradicts an existing
- * proof or structurally refuses the request, which is an independent veto and
- * stays ineligible; a refless composer mint (the vacuous pending disposition,
- * and `checkout-incomplete`) never matches either.
+ * proof or structurally refuses the request, which is an independent veto.
+ *
+ * The exclusion is by CODE, never by the presence of `ref`. The vacuous pending
+ * mint carries no code and `checkout-incomplete` carries a code outside the
+ * pair, so both are refused on that basis alone — reflessness is incidental to
+ * how they are minted today and is NOT a safety property to rely on.
  */
 export function composerHoldAllowsSkip(blocker: TypedBlocker): boolean {
   return blocker.provenance === "composer"

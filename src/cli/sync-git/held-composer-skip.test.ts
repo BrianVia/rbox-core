@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { git } from "../../engine/git-spawn.js";
+import { git, setGitSpawnObserver } from "../../engine/git-spawn.js";
 import type { GitDeferral, GitHeldAttempt, GitPartialApply, TypedBlocker } from "../config.js";
 import { createHeldDecisionPlane, heldTraceEnabled } from "./held-decision.js";
 import { zeroGitChainTimings } from "./chain-timings.js";
@@ -325,14 +325,15 @@ test("exactly the two no-proof-was-minted codes are eligible; a later code defau
   expect(heldBlockersAllowSkip([composerHold, safeRef])).toBe(true);
 });
 
-test("a refless or foreign-provenance artifact blocker is never eligible", () => {
+test("the vacuous mint and foreign provenances are ineligible — by code, not by reflessness", () => {
   const vacuous: TypedBlocker = {
     provenance: "composer", reason: "artifact",
     detail: "BASE composer retained an unexplained pending disposition",
   };
   expect(composerHoldAllowsSkip(vacuous)).toBe(false);
   expect(heldBlockersAllowSkip([vacuous])).toBe(false);
-  // A refless mint that somehow carried an eligible code is still not a ref hold.
+  // Pinning the real rule: `ref` is not consulted, so a refless mint carrying an
+  // eligible code IS admitted. Reflessness must never be read as a guard.
   expect(heldBlockersAllowSkip([{ ...vacuous, code: "missing-branch-proof" }])).toBe(true);
   for (const provenance of ["protocol", "checkout", "boundary"] as const) {
     const foreign = { provenance, reason: "artifact", detail: "foreign artifact veto" } as TypedBlocker;
@@ -364,4 +365,56 @@ test("the trace names an applied-but-held repo's standing blocker instead of pri
     if (savedTrace === undefined) delete process.env.RBOX_TRACE_HELD;
     else process.env.RBOX_TRACE_HELD = savedTrace;
   }
+});
+
+test("an artifact write inside the fingerprint bracket refuses the skip, not one cycle late", async () => {
+  const { root, tip } = await repoWithCommit();
+  const attempt = createHeldAttempt(await observe(root, tip), [composerHold]);
+  const raced = await earlyHeldAttemptDecision({
+    root, relPath: ".", incoming: sectionFor(tip), attempt,
+    nowMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
+    afterFirstArtifactPlaneRead: async () => {
+      await git(root, ["update-ref", `refs/rbox-local/base-absent/v2/${"a".repeat(64)}/${"b".repeat(64)}`, tip]);
+    },
+  });
+  expect(raced).toEqual({ matches: false, reason: "artifact-plane-race" });
+});
+
+test("an attempt with no stored digest refuses without spending a for-each-ref", async () => {
+  const { root, tip } = await repoWithCommit();
+  const { artifactPlaneDigest: _digest, ...withoutDigest } = await observe(root, tip);
+  const legacy = createHeldAttempt(withoutDigest, [composerHold]);
+  const planeReads: string[][] = [];
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "for-each-ref" && args.some((arg) => arg.startsWith("refs/rbox-"))) planeReads.push([...args]);
+  });
+  try {
+    const decision = await earlyHeldAttemptDecision({
+      root, relPath: ".", incoming: sectionFor(tip), attempt: legacy,
+      nowMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
+    });
+    expect(decision).toEqual({ matches: false, reason: "artifact-plane" });
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(planeReads).toEqual([]);
+});
+
+test("a matching attempt spends exactly two artifact-plane reads — the bracket", async () => {
+  const { root, tip } = await repoWithCommit();
+  const attempt = createHeldAttempt(await observe(root, tip), [composerHold]);
+  let planeReads = 0;
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "for-each-ref" && args.some((arg) => arg.startsWith("refs/rbox-"))) planeReads++;
+  });
+  try {
+    const decision = await earlyHeldAttemptDecision({
+      root, relPath: ".", incoming: sectionFor(tip), attempt,
+      nowMs: Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
+    });
+    expect(decision).toEqual({ matches: true, reason: "none" });
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(planeReads).toBe(2);
 });
