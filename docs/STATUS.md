@@ -1,5 +1,41 @@
 # rbox status — living state snapshot
 
+## 2026-08-16 (night) — PERF ARC COMPLETE: 6 PRs, v2.0.0-beta.3 to next
+
+- **Shipped + field-verified on the fleet (cbca36c):** #750 delta-scoped
+  no-op saves (zero-change pull 13.3s→3.6s); #751 CAS-lock amortization
+  (FM acquire 50.3s→16.4s @ N=2,292, `locks<N>` attribution live); #756
+  delta-staged content saves (one-changed 2.8s→~60ms bench; Mac 1-blob
+  receive 20.4s→9.0s, content save 5.9s→1.2s); #758 held-skip composer
+  eligibility (trio 3.5s→53ms/repo — 65×; Mac git-apply 7.4-8s→4.4s).
+  Also #753 (rig key for 3 parked defects) + #754 (#699 shard weights
+  restored+guarded, replay 65-150s→97-101s; #677 rig commit column).
+- **Release v2.0.0-beta.3** tagged to the `next` channel (this section's
+  four kill switches: RBOX_SAVE_NOOP_ELIDE, RBOX_SAVE_DELTA,
+  RBOX_GIT_HELD_SKIP_COMPOSER + 268's journal v2; all default ON,
+  defaults-ledger registered).
+- Issues: CLOSED #748 #749 #699 #677; #752-A fixed (B = p-settlement
+  asymmetry + resolve-UX slice, rig-keyed, still open); FILED #755
+  (9 pre-existing darwin state-plane failures — the darwin CI lane's
+  work list), #757 (cas-operations heap guard red on clean main,
+  host-dependent, mis-calibrated; green-on-rerun SUSPENDED for it).
+- **Remaining long poles (evidence-ranked):** desktop zero-change PUSH
+  6.7-6.8s (#661: state-load 1.7s + gaps — sender is now the ≤10s
+  frontier); Mac residual git-apply 3.6s = #752-B wedge; content-save
+  floor = read-back + darwin fullfsync (ledgered follow-up); state-load
+  cross-cycle cache (267 §5).
+- Founder queue: #659 (P1 correctness, next cycle), #664 evidence pass,
+  #660 shard leaks, 2.0 tag-gate trio (#688 guard unbuilt / #667 / #702).
+- New standing rules (memory): efficient-frontier routing for big work;
+  codex quota-benched → opus lanes; design artifacts in
+  docs/design/notes/<n>/ never repo root; staggered fleet git-pulls
+  (reset-repair recipe); TMPDIR needs mkdir -p; test:parallel for full
+  gates; continuous antislop (named types, ≤1-line comments, net fewer
+  concepts/slice).
+- Mac daemon left with RBOX_TRACE_HELD=1 armed (cheap; disarm at next
+  routine restart).
+
+
 ## 2026-08-16 (final) — #749 ALSO KILLED: CAS-lock amortization SHIPPED (#751, design 268)
 
 - **PR #751 merged** (design 268): append-structured journal v2 (O(N²)→O(N)
