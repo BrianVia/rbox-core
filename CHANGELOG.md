@@ -6,7 +6,15 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
-## [2.0.0-beta.3] - 2026-08-16
+## [2.0.0-beta.4] - 2026-08-16
+
+### Fixed
+- RboxBar builds again on the release toolchain (Swift 5.10 concurrency
+  compatibility); a path-filtered PR-time RboxBar build lane now guards it.
+
+_(v2.0.0-beta.3 was tagged but never published: its release run failed in
+the RboxBar build, fail-closed, before any channel mutation.)_
+
 
 ### Performance
 - Zero-change sync cycles no longer rewrite the whole state: a provably
