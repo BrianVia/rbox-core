@@ -1,5 +1,44 @@
 # rbox status — living state snapshot
 
+## 2026-08-16 (later) — #748 KILLED: delta-scoped state save SHIPPED (#750, design 267)
+
+- **PR #750 merged** (design 267, 235-Phase-B): provably-no-op pulls compose
+  a minimal save packet — lock/fence/revision/housekeeping preserved, O(N)
+  staging skipped. Proof = canonical manifest hash over `manifestFromMeta`
+  + whole-meta identity + `{nonce, stateRevision}` CAS predicate
+  (single-attempt receipts, structural binding). Kill switch
+  `RBOX_SAVE_NOOP_ELIDE` (ON). 4-round design review + 2-round impl review
+  (codex+opus), all findings folded; review trail in
+  `docs/design/notes/267/`.
+- **Field-verified BOTH hosts**: desktop zero-change pull 13.3s → **3.6s**
+  (state-save 9.8s → **0.8s**), push unchanged ~6.8s. Mac zero-change
+  state-save **1.6s** (darwin fullfsync floor). Founder-accepted trade
+  (§3.4.1): elided cycles keep prior BASE generation — reader audit +
+  fixture prove no freshness consumers. Desktop+Mac daemons on `2be999a`.
+- **Mac's next long pole is NOT the save**: git-apply re-proving 7.4s +
+  settle 2.5s per cycle (parked-deferral churn) — pre-existing bucket,
+  separate from #748/#749.
+- **#749 re-diagnosed** (evidence on issue): the "50s mutex stall" is NOT a
+  lock wait — it is the git state-CAS lock publication loop's own
+  durability ceremony (O(N²) journal rewrites + ~4 fsyncs/lock ×
+  1-2k locks). Measured: FM NVMe (970 EVO Plus/LVM/ext4) 2.92ms/fsync,
+  desktop NVMe 1.06ms — the ceremony hurts every real fs at first-pull
+  lock counts. **Design 268 ALIGNED r4** (append-journal v2 + batched dir
+  fsyncs; per-lock provenance proven to be the threat-model floor across
+  3 refuted schemes — trail in the cas-lock-amortize worktree); codex
+  implementing. Expected ~50.3s → ~9s; below-floor levers (K-batched
+  appends, per-repo lock granularity, consumed-name provenance) are
+  founder-ledger items in the doc.
+- New standing rules (memory): continuous antislop+architecture per cycle
+  (maintainability IS the goal); agents use `bun run test:affected` per
+  iteration, full suite once (papercut logged).
+- CI cost triage (parked by founder): ~1,078 runs/4wk × ~20 jobs; option A
+  (merge sub-minute jobs, dedupe main re-run via tree-hash, fix #699
+  weights) sketched; post-merge main run is release-gate-required (design
+  150) — do NOT cut it.
+- Sweep note: 15 `.conflict.ts` sync-litter files removed from the
+  rbox-core checkout (device dev_aaaa337, 04:16-06:34Z timestamps).
+
 ## 2026-08-16 — SP-3 CLOSE-OUT: fleet soak CLEAN on da28ddc
 
 - Post-cutover propagation bench (5 rounds, 602-byte change, desktop→Mac,
