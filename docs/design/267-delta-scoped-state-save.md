@@ -432,3 +432,10 @@ revision, projection overlay). Remaining pull cost is dominated by
 state-load (~1.7s) — the §5 deferred M4 evidence item. Mac 1-blob leg
 runs post-merge via the normal fleet rebuild (worktree branches do not
 sync to the Mac by design).
+
+Mac 1-blob leg (post-merge, 2be999a, 17:02Z): receive wall 20.4s —
+unchanged vs the 18.3-18.7s baseline, AS DESIGNED (content pulls are not
+elidable). Decomposition: git-apply 8.0s (parked-deferral re-prove churn,
+separate class) + full state-save 5.9s + latest 1.4s. Verdict per §5: the
+small-delta save is still over budget → M4 (delta-stage) is now
+evidence-earned and queues as its own design.
