@@ -1,5 +1,12 @@
 #!/usr/bin/env bun
 import { basename } from "node:path";
+import {
+  DEDICATED_TESTS,
+  DEFAULT_WEIGHT,
+  FILE_WEIGHTS,
+  SPLIT_FILES,
+  WHOLE_FILE_ANTI_AFFINITY,
+} from "./ci-shard-weights.js";
 
 type Shard = {
   units: TestUnit[];
@@ -16,57 +23,6 @@ type TestUnit = {
   antiAffinityGroup?: string;
 };
 
-type DedicatedTest = {
-  name: string;
-  weight: number;
-  antiAffinityGroup: string;
-};
-
-const HEAVY_WEIGHTS: Record<string, number> = {
-  // These hints keep the runtime partition balanced without hardcoding complete
-  // shard file lists. Every test is still discovered from src/**/*.test.ts.
-  "src/cli/daemon/daemon-activity.test.ts": 24,
-  "src/cli/sync/sync.test.ts": 13,
-  "src/cli/e2ee-sync.test.ts": 3,
-  "src/cli/shell-init.test.ts": 3,
-  "src/cli/daemon/daemon-binding.test.ts": 7,
-  "src/cli/daemon-spawn.test.ts": 7,
-  "src/cli/daemon/daemon-safety.test.ts": 5,
-  "src/cli/daemon-logs.test.ts": 5,
-  "src/cli/daemon/daemon-watch-degrade.test.ts": 5,
-  "src/engine/e2ee/e2ee-e2e.test.ts": 4,
-  // Compiles the pool-exit fixture into a ~100MB standalone binary and runs it.
-  "src/engine/crypto-pool-exit-compiled.test.ts": 3,
-};
-
-const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?: number[] }> = {
-  // Measured locally: git-sync is ~84s and git-nested is ~20s as single files,
-  // so a file-only partition cannot hit the <=30s target. Split by test names
-  // discovered from the source at runtime; the guard verifies every discovered
-  // test name in these files is covered exactly once.
-  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 73, partWeights: [8.8, 8.8, 6, 5.3, 5.4, 4.5, 4.7, 3.9, 8, 3.9, 4.3, 3.3] },
-  "src/cli/sync-git/git-nested.test.ts": { parts: 4, weight: 19, partWeights: [6, 3.7, 4, 5.2] },
-};
-
-const DEDICATED_TESTS: Record<string, DedicatedTest[]> = {
-  // These subprocess-heavy end-to-end workflows have repeatedly exhausted
-  // their caps together on contended runners. Standalone units let the
-  // partitioner spread them without depending on source-order bucket positions.
-  "src/cli/sync-git/git-sync.test.ts": [
-    { name: "design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN", weight: 0.9, antiAffinityGroup: "git-sync-process" },
-    { name: "git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir", weight: 0.3, antiAffinityGroup: "git-sync-process" },
-    { name: "D2 apply deferral keeps chronic age across newer truth and resets reason age", weight: 0.7, antiAffinityGroup: "git-sync-process" },
-    { name: "pending + 422: failed retries preserve P and all sidecars byte-for-byte", weight: 0.6, antiAffinityGroup: "git-sync-process" },
-    { name: "clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch", weight: 0.6, antiAffinityGroup: "git-sync-process" },
-  ],
-};
-
-const WHOLE_FILE_ANTI_AFFINITY: Record<string, string> = {
-  // This file's transport family is subprocess/crypto heavy as a whole. Keep
-  // it unsplit so nested describe names retain Bun's normal matching semantics.
-  "src/cli/e2ee-sync.test.ts": "git-sync-process",
-};
-const DEFAULT_WEIGHT = 0.5;
 
 function usage(): never {
   console.error(`usage: bun scripts/${basename(import.meta.path)} <list|command|run|guard|plan> --shard-count N [--shard-index I]`);
@@ -113,7 +69,7 @@ function stableHash(s: string): number {
 }
 
 function weightOf(file: string): number {
-  return HEAVY_WEIGHTS[file] ?? DEFAULT_WEIGHT;
+  return FILE_WEIGHTS.get(file) ?? DEFAULT_WEIGHT;
 }
 
 function regexEscape(s: string): string {
@@ -141,19 +97,19 @@ async function testNames(file: string): Promise<string[]> {
 async function buildUnits(files: string[]): Promise<TestUnit[]> {
   const units: TestUnit[] = [];
   for (const file of files) {
-    const split = SPLIT_FILES[file];
+    const split = SPLIT_FILES.get(file);
     if (!split) {
       units.push({
         label: file,
         files: [file],
         weight: weightOf(file),
-        antiAffinityGroup: WHOLE_FILE_ANTI_AFFINITY[file],
+        antiAffinityGroup: WHOLE_FILE_ANTI_AFFINITY.get(file),
       });
       continue;
     }
 
     const names = await testNames(file);
-    const dedicated = DEDICATED_TESTS[file] ?? [];
+    const dedicated = DEDICATED_TESTS.get(file) ?? [];
     const dedicatedByName = new Map(dedicated.map((entry) => [entry.name, entry]));
     for (const entry of dedicated) {
       const count = names.filter((name) => name === entry.name).length;
@@ -231,7 +187,7 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
     for (const unit of shard.units) {
       for (const file of unit.files) {
         const count = seen.get(file) ?? 0;
-        if (count > 0 && !SPLIT_FILES[file]) duplicates.push(file);
+        if (count > 0 && !SPLIT_FILES.has(file)) duplicates.push(file);
         seen.set(file, count + 1);
       }
       if (unit.pattern && unit.files.length === 1) {
@@ -247,7 +203,7 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
   const extra = [...seen.keys()].filter((file) => !expected.has(file));
   const empty = shards.flatMap((shard, index) => (shard.units.length === 0 ? [index] : []));
   const splitErrors: string[] = [];
-  for (const file of Object.keys(SPLIT_FILES)) {
+  for (const file of SPLIT_FILES.keys()) {
     const expectedNames = await testNames(file);
     const covered = splitCoverage.get(file) ?? [];
     const counts = new Map<string, number>();
@@ -260,7 +216,7 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
   }
 
   const dedicatedErrors: string[] = [];
-  for (const [file, configured] of Object.entries(DEDICATED_TESTS)) {
+  for (const [file, configured] of DEDICATED_TESTS) {
     for (const entry of configured) {
       const emitted = shards.flatMap((shard) => shard.units).filter((unit) => unit.files[0] === file && unit.names?.includes(entry.name));
       if (emitted.length !== 1 || emitted[0]?.antiAffinityGroup !== entry.antiAffinityGroup) {
@@ -268,7 +224,7 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
       }
     }
   }
-  for (const [file, antiAffinityGroup] of Object.entries(WHOLE_FILE_ANTI_AFFINITY)) {
+  for (const [file, antiAffinityGroup] of WHOLE_FILE_ANTI_AFFINITY) {
     const emitted = shards.flatMap((shard) => shard.units).filter((unit) => unit.label === file && unit.files.length === 1 && unit.files[0] === file);
     if (emitted.length !== 1 || emitted[0]?.antiAffinityGroup !== antiAffinityGroup) {
       dedicatedErrors.push(`${file}: emitted ${emitted.length} times with expected anti-affinity`);
@@ -318,9 +274,9 @@ if (command === "guard") {
 if (command === "plan") {
   for (let i = 0; i < shards.length; i++) {
     const shard = shards[i]!;
-    console.log(`shard ${i}/${shardCount}: ${shard.units.length} units, weight ${shard.weight}`);
+    console.log(`shard ${i}/${shardCount}: ${shard.units.length} units, weight ${shard.weight.toFixed(1)}`);
     for (const unit of shard.units) {
-      const split = unit.pattern ? ` (${unit.files[0]}, split, w=${unit.weight})` : HEAVY_WEIGHTS[unit.label] ? ` (w=${HEAVY_WEIGHTS[unit.label]})` : "";
+      const split = unit.pattern ? ` (${unit.files[0]}, split, w=${unit.weight})` : FILE_WEIGHTS.has(unit.label) ? ` (w=${FILE_WEIGHTS.get(unit.label)})` : "";
       console.log(`  ${unit.label}${split}`);
     }
   }

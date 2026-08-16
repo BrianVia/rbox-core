@@ -6,9 +6,11 @@ import {
   assertDistinctBinaryVersions,
   assertDualBinaryAllowed,
   isMismatchedBinarySelection,
+  makeRigBinaryIdentity,
   prepareRigBinarySelection,
   resolveRigBinaryPaths,
   rigGuestMounts,
+  rigSourceCommit,
   sourceRigBinaryArtifact,
   stageRigBinaryOverride,
   type RigBinaryArtifact,
@@ -147,4 +149,28 @@ describe("rig --binary", () => {
       if (stagedDirectory) fs.rmSync(stagedDirectory, { recursive: true, force: true });
     }
   });
+});
+
+test("source artifacts carry the checkout commit and dirty flag", () => {
+  const calls: string[][] = [];
+  const git = (args: readonly string[]) => {
+    calls.push([...args]);
+    return args[0] === "rev-parse" ? `${"c".repeat(40)}\n` : " M src/cli.ts\n";
+  };
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-rig-commit-test-"));
+  try {
+    for (const relative of ["src", "patches", "scripts/rig"]) fs.mkdirSync(path.join(root, relative), { recursive: true });
+    for (const relative of ["package.json", "bun.lock", "scripts/rig/Dockerfile"]) fs.writeFileSync(path.join(root, relative), relative);
+    const artifact = sourceRigBinaryArtifact(root, git);
+    expect(artifact.source).toEqual({ commit: "c".repeat(40), dirty: true });
+    expect(calls).toEqual([["rev-parse", "HEAD"], ["status", "--porcelain"]]);
+    expect(makeRigBinaryIdentity("A", artifact, "rbox 1.0.0", 0).source).toEqual(artifact.source);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a non-git checkout reports no commit instead of throwing", () => {
+  expect(rigSourceCommit("/nonexistent", () => { throw new Error("not a repository"); })).toBeUndefined();
+  expect(rigSourceCommit("/nonexistent", () => "not-a-sha\n")).toBeUndefined();
 });

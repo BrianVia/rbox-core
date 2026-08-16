@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { Mount } from "./container.js";
@@ -16,11 +17,18 @@ export interface RigBinaryPaths {
   b?: string;
 }
 
+/** Git identity of the checkout a source-mode artifact was hashed from. */
+export interface RigSourceCommit {
+  commit: string;
+  dirty: boolean;
+}
+
 export interface RigBinaryArtifact {
   mode: "source" | "compiled";
   sha256: string;
   hostPath?: string;
   stagedDirectory?: string;
+  source?: RigSourceCommit;
 }
 
 export interface RigBinarySelection {
@@ -35,6 +43,7 @@ export interface RigBinaryIdentity {
   versionExitCode: number;
   hostPath?: string;
   sha256?: string;
+  source?: RigSourceCommit;
 }
 
 /** Validate one host artifact before any guest/container is created. */
@@ -104,14 +113,16 @@ export function makeRigBinaryIdentity(
   version: string,
   versionExitCode: number,
 ): RigBinaryIdentity {
-  return {
+  const identity: RigBinaryIdentity = {
     device,
     mode: binary.mode,
-    ...(binary.hostPath ? { hostPath: binary.hostPath } : {}),
     sha256: binary.sha256,
     version,
     versionExitCode,
   };
+  if (binary.hostPath) identity.hostPath = binary.hostPath;
+  if (binary.source) identity.source = binary.source;
+  return identity;
 }
 
 export function assertDistinctBinaryVersions(
@@ -171,13 +182,32 @@ function hashSourceEntry(hash: ReturnType<typeof createHash>, root: string, rela
   }
 }
 
+export type GitRunner = (args: readonly string[], repoRoot: string) => string;
+
+const runGit: GitRunner = (args, repoRoot) =>
+  execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+
+/** Commit + dirty state of the checkout, or undefined when it is not a git tree. */
+export function rigSourceCommit(repoRoot: string, git: GitRunner = runGit): RigSourceCommit | undefined {
+  try {
+    const commit = git(["rev-parse", "HEAD"], repoRoot).trim();
+    if (!/^[0-9a-f]{40}$/.test(commit)) return undefined;
+    return { commit, dirty: git(["status", "--porcelain"], repoRoot).trim().length > 0 };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Exact identity of the source-mode executable plus its baked dependency inputs. */
-export function sourceRigBinaryArtifact(repoRoot: string): RigBinaryArtifact {
+export function sourceRigBinaryArtifact(repoRoot: string, git: GitRunner = runGit): RigBinaryArtifact {
   const hash = createHash("sha256");
   for (const relative of ["src", "package.json", "bun.lock", "patches", "scripts/rig/Dockerfile"]) {
     hashSourceEntry(hash, repoRoot, relative);
   }
-  return { mode: "source", sha256: hash.digest("hex") };
+  const artifact: RigBinaryArtifact = { mode: "source", sha256: hash.digest("hex") };
+  const source = rigSourceCommit(repoRoot, git);
+  if (source) artifact.source = source;
+  return artifact;
 }
 
 /** Read/stage each unique compiled path once, preserving the exact staged digest. */

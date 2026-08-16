@@ -69,3 +69,16 @@ test("renderReportMd renders an all-skipped capture without throwing", () => {
   expect(md).toContain("wrangler tail exited early");
   expect(md).toContain("marker: rootless-unvalidated");
 });
+
+test("the Binaries table names each source row's commit and dirty state", () => {
+  const md = renderReportMd({
+    ...report,
+    binaries: [
+      { device: "A", mode: "source", version: "rbox 1.11.0", versionExitCode: 0, sha256: "a".repeat(64), source: { commit: "d".repeat(40), dirty: true } },
+      { device: "B", mode: "compiled", version: "rbox 2.0.0", versionExitCode: 0, hostPath: "/artifacts/rbox-2.0.0", sha256: "b".repeat(64) },
+    ],
+  }, fullCapture);
+  expect(md).toContain("| commit |");
+  expect(md).toContain(`| ${"d".repeat(12)} (dirty) | checkout source |`);
+  expect(md).toContain("| — | /artifacts/rbox-2.0.0 |");
+});

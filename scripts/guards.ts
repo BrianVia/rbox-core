@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
+import { DEDICATED_TESTS, FILE_WEIGHTS, SPLIT_FILES, WEIGHTS_MEASURED, WHOLE_FILE_ANTI_AFFINITY } from "./ci-shard-weights.js";
 
 export const INQUIRER_IMPORT_ERROR =
   "::error::@inquirer is retired; all interactive widgets must use the shared Ink prompt runtime";
@@ -11,6 +12,41 @@ export const BARE_FETCH_ERROR =
 const ALLOWED_TUI_IMPORT = "src/cli/prompt-ink.tsx";
 /** The one module allowed to call the global `fetch`: it IS the deadline wrapper. */
 const ALLOWED_BARE_FETCH = "src/cli/remote/resilient.ts";
+
+export const SHARD_WEIGHTS_ERROR =
+  "::error::scripts/ci-shard-weights.ts no longer carries measured timings — re-measure and commit the table (issue #699: PR #314 silently restored coarse defaults and shards ran 32-242s for three weeks)";
+
+/**
+ * Minimum measured entries. Held HERE, not beside the table, so reverting
+ * scripts/ci-shard-weights.ts alone trips this guard instead of passing silently.
+ */
+const MIN_MEASURED_FILE_WEIGHTS = 40;
+
+export async function findShardWeightViolations(root: string): Promise<string[]> {
+  const violations: string[] = [];
+  const measured = FILE_WEIGHTS.size;
+  if (measured < MIN_MEASURED_FILE_WEIGHTS) {
+    violations.push(`FILE_WEIGHTS has ${measured} entries, below the measured floor of ${MIN_MEASURED_FILE_WEIGHTS}`);
+  }
+  const tabled = [...FILE_WEIGHTS.keys(), ...SPLIT_FILES.keys(), ...DEDICATED_TESTS.keys(), ...WHOLE_FILE_ANTI_AFFINITY.keys()];
+  for (const file of [...new Set(tabled)].sort()) {
+    if (!(await Bun.file(join(root, file)).exists())) violations.push(`weighted test file no longer exists: ${file}`);
+  }
+  for (const [file, split] of SPLIT_FILES) {
+    if (split.partWeights && split.partWeights.length !== split.parts) {
+      violations.push(`${file}: ${split.partWeights.length} partWeights for ${split.parts} parts`);
+    }
+  }
+  return violations;
+}
+
+async function guardShardWeights(root: string): Promise<boolean> {
+  console.log(`shard-weight guard: ${FILE_WEIGHTS.size} measured files (${WEIGHTS_MEASURED})`);
+  const violations = await findShardWeightViolations(root);
+  for (const violation of violations) console.log(violation);
+  if (violations.length) console.error(SHARD_WEIGHTS_ERROR);
+  return violations.length === 0;
+}
 
 async function guardSrcTestShardCoverage(root: string): Promise<boolean> {
   const processHandle = Bun.spawn(
@@ -110,9 +146,10 @@ async function guardTuiImports(root: string): Promise<boolean> {
 
 export async function runGuards(root = process.cwd()): Promise<boolean> {
   if (!(await guardSrcTestShardCoverage(root))) return false;
+  const shardWeights = await guardShardWeights(root);
   const tui = await guardTuiImports(root);
   const bareFetch = await guardBareFetch(root);
-  return tui && bareFetch;
+  return shardWeights && tui && bareFetch;
 }
 
 if (import.meta.main && !(await runGuards())) process.exit(1);
