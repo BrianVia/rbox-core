@@ -12,6 +12,7 @@ import { gitConfigSync } from "./git-config-sync.js";
 import { gitShapes } from "./git-shapes.js";
 import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
+import { gitRebuildSettlement } from "./git-rebuild-settlement.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
 import { gitHeldLivelock } from "./git-held-livelock.js";
 import { gitStaleOpstate } from "./git-stale-opstate.js";
@@ -33,6 +34,7 @@ export const SCENARIOS = {
   "git-shapes": gitShapes,
   "git-ff": gitFf,
   "git-join-ahead": gitJoinAhead,
+  "git-rebuild-settlement": gitRebuildSettlement,
   "git-commit-propagation": gitCommitPropagation,
   "git-held-livelock": gitHeldLivelock,
   "git-stale-opstate": gitStaleOpstate,
@@ -73,6 +75,11 @@ export const SCENARIOS = {
  * delete lifecycle). Registering it in FAST_SUITE — or in `.github/workflows/e2e.yml`'s
  * `all` — would wire a known failure into the gate. Run it on demand:
  * `bun run rig run worktree-squash-lifecycle`.
+ * git-rebuild-settlement is EXCLUDED and likewise kept out of every CI workflow, for
+ * the OPPOSITE reason: it is a BUG-PINNED reproduction of GH #752 defect B, so it
+ * goes GREEN on today's defective product and RED once p-settlement is fixed.
+ * Wiring a scenario that passes on a live defect into a gate would be worse than
+ * useless. Run it on demand: `bun run rig run git-rebuild-settlement`.
  */
 export const FAST_SUITE = [
   "sqlite-fresh-install",

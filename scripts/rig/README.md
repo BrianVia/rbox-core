@@ -210,6 +210,38 @@ Note the surface asymmetry it exposes: `rbox push` has no `onGitLog` wiring
 lane's per-repo forensics exist only in the daemon log. That is why the scenario ends with
 a live-daemon soak and asserts on both devices' daemon logs.
 
+### `git-rebuild-settlement` (explicit-only — **BUG-PINNED: green while #752-B is live**)
+
+The two-device-rebuild reproduction three parked items asked for (GH #752 defect B,
+#647, design 236 §3.2c). Unlike `worktree-squash-lifecycle`, its assertions describe
+the CURRENT defective behavior — it PASSES today and goes RED when p-settlement is
+fixed, which is the flip it exists to force. Every pinned assertion is prefixed
+`[BUG #752-B]`. Kept out of `FAST_SUITE` and out of every CI workflow: a scenario
+that goes green on a live defect must never gate a PR.
+
+```bash
+bun run rig run git-rebuild-settlement
+```
+
+1. A seeds a git repo; both devices converge (B serializes a BASE).
+2. A publishes a NEW branch, B pulls — the negative control: an ordinary follow
+   writes a present artifact (P) and retires it in-flight, leaving zero standing P.
+3. **The rebuild** (the 2026-08-15 desktop/Mac shape): B renames `.rbox` aside and
+   re-tracks the SAME non-empty directory with `rbox track --workspace <id>`. No
+   state, no BASE, every git repository still on disk.
+4. A publishes a second NEW branch. B's next pull must follow a ref with no prior
+   BASE value into a record with no BASE at all: P is written, settlement holds,
+   and the repo can never earn the BASE it needs to settle that P.
+5. Asserts the loop: `git-sync deferred <repo>: P settlement BASE disappeared` on
+   consecutive pulls with a frozen `deferredSince`, a standing P every cycle, and
+   `rbox git resolve <repo> take-theirs` refusing identically on repeat.
+
+Recorded deviations from the field notes: take-theirs surfaces the REAL reason here
+(the `artifact` refusal), not the `could not complete safely` catch-all the Mac saw;
+and #647's boundary self-invalidation is NOT reachable from this fixture, because a
+standing P makes resolve's artifact preflight refuse before the locked boundary is
+ever reached. #647 needs its own fixture (dirty worktree, no standing P).
+
 ### CI — `.github/workflows/e2e.yml`
 
 Manual (`workflow_dispatch`, input `scenario`, default `all`) + nightly
