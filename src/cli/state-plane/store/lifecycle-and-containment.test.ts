@@ -120,17 +120,17 @@ test("swapping the shared pathname cannot change what a contained consumer reads
 
   const proof = StageLock.acquire(stages, original.stageId);
   try {
-    // The consumer's connection is bound to an ANONYMOUS inode: the private copy
-    // and its WAL sidecars are unlinked once the priming read has materialized the
-    // WAL index, so after this point no pathname at all reaches the bytes SQLite
-    // reads — not the shared name, and not the private one either.
+    // The consumer's connection reads its own PRIVATE copy: the 0700 directory
+    // is namable only by the held lock's owner, and the bytes were hash-proven
+    // during the copy. The name stays until close — Apple's system SQLite
+    // cannot read an unlinked database (field 2026-08-16), so unlink-based
+    // anonymity is not available as a containment primitive.
     const accessor = openSealedArtifact(stages, original, proof);
     try {
       const attached = accessor.db.query("PRAGMA database_list").get() as { file: string };
       expect(attached.file.startsWith(privateDirectoryPath(stages, original.stageId))).toBe(true);
       expect(attached.file).not.toBe(originalPath);
-      expect(fs.existsSync(attached.file)).toBe(false);
-      expect(fs.readdirSync(privateDirectoryPath(stages, original.stageId))).toEqual([]);
+      expect(fs.existsSync(attached.file)).toBe(true);
     } finally {
       accessor.close();
     }
@@ -338,19 +338,18 @@ test("containment initialization never leaks a SQLite handle", () => {
   const stage = seal(stages, [entry("one.txt", 1)]);
   const openDescriptors = (): number => fs.readdirSync("/proc/self/fd").length;
   const before = openDescriptors();
-  const originalRm = fs.rmSync;
-  // Fail the unlink that follows the priming read: the handle is already open, so
-  // this is exactly the window in which it could be stranded on an inode nothing
-  // can reach.
-  const rm = spyOn(fs, "rmSync").mockImplementation((target, options) => {
-    if (String(target).endsWith("/artifact")) throw new Error("simulated unlink failure");
-    originalRm(target, options);
+  // Fail the priming read: the handle is already open, so this is exactly the
+  // window in which it could be stranded while the private directory is torn
+  // down. (The unlink step this test used to fail no longer exists — names
+  // persist for the accessor's lifetime.)
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(() => {
+    throw new Error("simulated priming failure");
   });
   const lock = StageLock.acquire(stages, stage.stageId);
   try {
-    expect(() => openSealedArtifact(stages, stage, lock)).toThrow("simulated unlink failure");
+    expect(() => openSealedArtifact(stages, stage, lock)).toThrow("simulated priming failure");
   } finally {
-    rm.mockRestore();
+    exec.mockRestore();
     lock.release();
   }
   // A leaked handle would keep both the database and its WAL sidecars open.
