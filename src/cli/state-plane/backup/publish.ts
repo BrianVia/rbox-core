@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { constants, Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -25,7 +25,12 @@ function fsyncDirectory(directory: string): void {
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
-function backupFileHash(file: string): { sha256: BackupFileHash; bytes: number } {
+interface BackupFileProof {
+  readonly sha256: BackupFileHash;
+  readonly bytes: number;
+}
+
+function backupFileHash(file: string): BackupFileProof {
   const hash = createHash("sha256");
   let bytes = 0;
   const fd = fs.openSync(file, "r");
@@ -78,6 +83,9 @@ function publishStateBackupWithPublication(
     }
     const verifier = new Database(staging, { create: false, readonly: true });
     try {
+      // Apple's system SQLite defaults PERSIST_WAL on: without this even a
+      // readonly open would leave sidecars beside the staged backup on close.
+      verifier.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
       validateOpen(verifier, staging);
       if ((options.integrity ?? "full") === "full") {
         const result = selectRows<{ integrity_check: string }>(verifier, "PRAGMA integrity_check");

@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { constants, Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -102,6 +102,7 @@ function configureWriter(db: Database): void {
     PRAGMA query_only=OFF;
   `);
   if (process.platform === "darwin") db.exec("PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON");
+  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
 }
 
 /**
@@ -121,6 +122,7 @@ function configureReader(db: Database): void {
     PRAGMA busy_timeout=250;
     PRAGMA temp_store=FILE;
   `);
+  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
 }
 
 export class StateStoreHandle {

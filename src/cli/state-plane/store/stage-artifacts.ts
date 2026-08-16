@@ -17,7 +17,7 @@
  * model. The same boundary covers the residual window between the identity check
  * and the unlink in {@link deleteSealedArtifact}.
  */
-import { Database } from "bun:sqlite";
+import { constants, Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { StageChangedError, StageLockError } from "../errors.js";
@@ -130,12 +130,17 @@ export class PrivateStageDirectory {
  * the proven inode — or a parent fsync that fails after the link — is removed:
  * a destination must never survive a failed seal.
  */
+export interface SealedPublication {
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
 export function sealAndPublish(
   db: Database,
   privateFile: string,
   destination: string,
   stageId: string,
-): { sha256: string; bytes: number } {
+): SealedPublication {
   selectRow(db, "PRAGMA wal_checkpoint(TRUNCATE)");
   db.close();
   assertNoSidecars(privateFile, stageId);
@@ -312,6 +317,9 @@ export function configureStageBuilder(db: Database): void {
     PRAGMA busy_timeout=5000;
     PRAGMA temp_store=FILE;
   `);
+  // Apple's system SQLite defaults PERSIST_WAL on; staged artifacts must
+  // reach S0 (no -wal/-shm) to seal. Zero is the default everywhere else.
+  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
   const mode = String(selectRow<{ journal_mode: string }>(db, "PRAGMA journal_mode")!.journal_mode).toLowerCase();
   if (mode !== "wal") throw new Error(`stage builder journal_mode is ${mode}`);
 }
