@@ -37,6 +37,7 @@ import {
 } from "./sync-state-delta.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
+import { stateWasStreamMismatch } from "./state-plane/reset-lineage.js";
 import { replaceResetLineageStream } from "./state-plane/adapters/whole-state-compat.js";
 
 /** The record's config-lane members, in persisted order. Durable field names,
@@ -113,9 +114,6 @@ export interface StateSource {
    * idle-cycle audit covers this lane and a relative global is admissible.
    * A scoped projection, a repair, or a migration never sets it. */
   baseIsUnscopedRemote?: boolean;
-  /** Design 269 §2.4: known base drift. Composes a COMPLETE save, which is the
-   * sole repair authority. Process-local and never durable. */
-  forceCompleteSave?: true;
 }
 
 export interface ConfigApplyCompletion {
@@ -312,7 +310,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
     : globalElisionAudit(snapshot, source.sourceGlobalSeq, receipt);
   // The audit is the only detector of durable base drift (269 §2.4): once it
   // fires, saves carry whole manifests until one is accepted.
-  if (audit === "content-drift") observeGlobalContentDrift();
+  if (audit === "content-drift") observeGlobalContentDrift(snapshot.stream);
   const proven = audit === "unchanged" ? receipt : undefined;
   const repos = observedRepos.flatMap((relPath) => {
     const stored = records[relPath];
@@ -338,7 +336,12 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
     packet.global = { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta };
     // ONE walk, over the two file-only projections, producing the ops that the
     // whole manifest above is the independent statement of (269 §2.1).
-    const binding = deltaBindingFor(snapshot, source);
+    const binding = deltaBindingFor(snapshot, {
+      baseIsUnscopedRemote: source.baseIsUnscopedRemote,
+      // A snapshot carrying reset provenance may still have its stream replaced
+      // by this very save, which is not the predecessor a delta binds to.
+      replacesStream: stateWasStreamMismatch(snapshot),
+    });
     const delta = binding === undefined
       ? undefined
       : composeGlobalDelta(fileOnlyManifest(snapshot.lastSyncedManifest).files, packet.global.manifest.files, binding);
@@ -415,7 +418,7 @@ export async function saveStateSource(
     if (result.status === "accepted") {
       // A whole-manifest global that landed rewrote the base outright, which is
       // the heal §2.4 waits for.
-      if (packet.global !== undefined && packet.globalDelta === undefined) noteCompleteSaveAccepted();
+      if (packet.global !== undefined && packet.globalDelta === undefined) noteCompleteSaveAccepted(snapshot.stream);
       return result.state;
     }
     if (result.status === "unsupported") {

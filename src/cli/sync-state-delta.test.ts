@@ -5,7 +5,7 @@ import type { FileEntry, Manifest } from "../engine/index.js";
 import type { DeltaOp, SyncState } from "./sync-state-model.js";
 import {
   applyDeltaOps, composeGlobalDelta, deltaBindingFor, noteCompleteSaveAccepted,
-  observeGlobalContentDrift, resetForceCompleteSaveForTests, saveDeltaEnabled,
+  observeGlobalContentDrift, resetObservedDriftForTests, saveDeltaEnabled,
 } from "./sync-state-delta.js";
 import { composeStateSavePacket, type StateSource } from "./sync-state.js";
 
@@ -14,7 +14,7 @@ const NONCE = "a".repeat(32);
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
 afterEach(() => {
-  resetForceCompleteSaveForTests();
+  resetObservedDriftForTests();
   delete process.env.RBOX_SAVE_DELTA;
 });
 
@@ -99,7 +99,7 @@ test("eligibility requires the switch, an audit-covered base, a bound snapshot, 
 
   expect(deltaBindingFor(state, {})).toBeUndefined();
   expect(deltaBindingFor(state, { baseIsUnscopedRemote: false })).toBeUndefined();
-  expect(deltaBindingFor(state, { ...eligible, forceCompleteSave: true })).toBeUndefined();
+  expect(deltaBindingFor(state, { ...eligible, replacesStream: true })).toBeUndefined();
   expect(deltaBindingFor(snapshot([], { stateNonce: undefined }), eligible)).toBeUndefined();
   expect(deltaBindingFor(snapshot([], { stateNonce: "legacy" }), eligible)).toBeUndefined();
   expect(deltaBindingFor(snapshot([], { stateRevision: undefined }), eligible)).toBeUndefined();
@@ -109,12 +109,19 @@ test("eligibility requires the switch, an audit-covered base, a bound snapshot, 
   expect(deltaBindingFor(state, eligible)).toBeUndefined();
 });
 
-test("observed content drift forces complete saves until one is accepted", () => {
+test("observed content drift forces complete saves for THAT stream until one is accepted", () => {
   const state = snapshot([entry("a.txt", 1)]);
+  const other = snapshot([entry("a.txt", 1)], { stream: `${STREAM}::other` });
   const eligible = { baseIsUnscopedRemote: true };
-  observeGlobalContentDrift();
+
+  observeGlobalContentDrift(state.stream);
   expect(deltaBindingFor(state, eligible)).toBeUndefined();
-  noteCompleteSaveAccepted();
+  // A second workspace in the same process has its own base and its own audit.
+  expect(deltaBindingFor(other, eligible)).toBeDefined();
+
+  noteCompleteSaveAccepted(other.stream);
+  expect(deltaBindingFor(state, eligible)).toBeUndefined();
+  noteCompleteSaveAccepted(state.stream);
   expect(deltaBindingFor(state, eligible)).toBeDefined();
 });
 
@@ -139,7 +146,10 @@ test("an ineligible source composes the same packet it always did, with no ops",
   expect(scoped.global?.manifest.files).toEqual(after);
   expect(scoped.globalDelta).toBeUndefined();
 
-  const healing = composeStateSavePacket(snapshot(before), source(after, { forceCompleteSave: true }));
+  const drifted = snapshot(before);
+  observeGlobalContentDrift(drifted.stream);
+  const healing = composeStateSavePacket(drifted, source(after));
+  expect(healing.global?.manifest.files).toEqual(after);
   expect(healing.globalDelta).toBeUndefined();
 });
 

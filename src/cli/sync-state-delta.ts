@@ -31,26 +31,33 @@ export interface GlobalDelta {
  * Mac field close-out. */
 export const saveDeltaEnabled = (): boolean => process.env.RBOX_SAVE_DELTA !== "0";
 
-/** Process-local heal flag (§2.4). The idle-cycle audit is the only detector of
- * base drift, so a save composed while drift is standing must be a COMPLETE
- * save — the sole repair authority. Lost on restart and re-derived by the next
- * audit, exactly like the observation that set it. */
-let forceCompleteSave = false;
+/** Streams whose durable base the idle audit found drifted (§2.4). Keyed by
+ * stream: one process may hold several, and one workspace's drift is no reason
+ * to make another rewrite its whole manifest. Lost on restart, re-derived by
+ * the next audit — exactly like the observation that filled it. */
+const driftedStreams = new Set<string>();
 
-export const observeGlobalContentDrift = (): void => { forceCompleteSave = true; };
-
-export const forceCompleteSaveStanding = (): boolean => forceCompleteSave;
+export const observeGlobalContentDrift = (stream: string): void => { driftedStreams.add(stream); };
 
 /** An accepted complete save IS the heal, whatever composed it. */
-export const noteCompleteSaveAccepted = (): void => { forceCompleteSave = false; };
+export const noteCompleteSaveAccepted = (stream: string): void => { driftedStreams.delete(stream); };
 
-/** Test seam: a process-local flag would otherwise leak across cases. */
-export const resetForceCompleteSaveForTests = (): void => { forceCompleteSave = false; };
+/** Test seam: process-local drift would otherwise leak across cases. */
+export const resetObservedDriftForTests = (): void => { driftedStreams.clear(); };
 
 /** The only part of a loaded state a binding is derived from. */
 export interface BindableSnapshot {
+  stream: string;
   stateNonce?: string;
   stateRevision?: number;
+}
+
+/** What a source must establish for its base to be delta-eligible. */
+export interface DeltaEligibility {
+  baseIsUnscopedRemote?: boolean;
+  /** A reset-provenance replacement rewrites the lineage's stream in the same
+   * CAS, so its predecessor is not the base this delta would bind to. */
+  replacesStream?: boolean;
 }
 
 /**
@@ -60,11 +67,12 @@ export interface BindableSnapshot {
  */
 export function deltaBindingFor(
   snapshot: BindableSnapshot,
-  source: { baseIsUnscopedRemote?: boolean; forceCompleteSave?: true },
+  source: DeltaEligibility,
 ): DeltaBinding | undefined {
   if (!saveDeltaEnabled()) return undefined;
   if (source.baseIsUnscopedRemote !== true) return undefined;
-  if (source.forceCompleteSave === true || forceCompleteSaveStanding()) return undefined;
+  if (source.replacesStream === true) return undefined;
+  if (driftedStreams.has(snapshot.stream)) return undefined;
   const nonce = snapshot.stateNonce;
   if (nonce === undefined || !/^[0-9a-f]{32}$/.test(nonce)) return undefined;
   if (snapshot.stateRevision === undefined) return undefined;
