@@ -9,7 +9,7 @@ import {
   composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue,
 } from "../../sync-git/base-composer.js";
 import {
-  validManifestMeta, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
+  validManifestMeta, type ElisionExpectation, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
@@ -25,7 +25,7 @@ import {
 import type { SourceStageBinding } from "../digest/repo-transition-v1.js";
 import type { CasOwnerToken } from "../ports.js";
 import type { CasExpectation } from "./write-packet.js";
-import type { JsonValue } from "../../../json.js";
+import { jsonText, type JsonValue } from "../../../json.js";
 
 
 /**
@@ -46,6 +46,8 @@ export interface FrozenCasInputs {
   globalBinding?: SourceStageBinding;
   /** Existing stream admitted for the one reset-provenance replacement case. */
   replacementOldStream?: string;
+  /** The snapshot this packet's elisions were proven against (design 267 §3.2b). */
+  elisionExpectation?: ElisionExpectation;
   ownerToken: CasOwnerToken;
 }
 
@@ -84,6 +86,12 @@ export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified:
   if (row.stream !== (frozen.replacementOldStream ?? expected.stream)) reject("stream");
   if ((row.state_nonce ?? "legacy") !== expected.nonce) reject("nonce");
   if ((row.state_revision ?? 0) !== expected.stateRevision) reject("state-revision");
+  // Sampled BEFORE the state lock, unlike every predicate above: an elided
+  // global disables the sequence predicate and an elided repo leaves no
+  // repo_gen to check, so revision equality is what proves nothing interleaved.
+  const elision = frozen.elisionExpectation;
+  if (elision && ((row.state_nonce ?? "legacy") !== elision.nonce
+    || (row.state_revision ?? 0) !== elision.stateRevision)) reject("elision-drift");
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
   if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
@@ -219,17 +227,15 @@ export function applyTransitions(db: Database, lineageId: string): void {
  * The parsed object itself is returned, so members this rule cannot see ride
  * along into the recomposed record exactly as they were stored.
  */
-const isText = (value: JsonValue | undefined): value is string => typeof value === "string";
-
 function assertBranchBaseOrigins(value: JsonValue): asserts value is JsonValue & Record<string, BranchBaseOrigin> {
   if (!isJsonObject(value)) throw new TypeError("branchBaseOrigins is not a JSON object");
   for (const [ref, origin] of Object.entries(value)) {
-    if (!isJsonObject(origin) || origin.v !== 1 || !isText(origin.oid) || !isText(origin.lineageHash)) {
+    if (!isJsonObject(origin) || origin.v !== 1 || !jsonText(origin.oid) || !jsonText(origin.lineageHash)) {
       throw new TypeError(`branchBaseOrigins.${ref} is not a v1 branch origin`);
     }
     const named = origin.kind === "publisher-ack"
-      ? Number.isSafeInteger(origin.sourceSeq) && isText(origin.incomingKey)
-      : (origin.kind === "pull-p" || origin.kind === "manual") && isText(origin.episode);
+      ? Number.isSafeInteger(origin.sourceSeq) && jsonText(origin.incomingKey)
+      : (origin.kind === "pull-p" || origin.kind === "manual") && jsonText(origin.episode);
     if (!named) throw new TypeError(`branchBaseOrigins.${ref} has no known origin kind`);
   }
 }
@@ -255,17 +261,14 @@ function recomposeBase(
   // taxonomy every other authority read observes. The base column routes through
   // the shared Git-section codec so canonical-but-inadmissible bytes are caught
   // here rather than escaping validation.
-  const previous: RepoBaseValue = {
-    ...(before?.base_cjson == null
-      ? {}
-      : { base: decodeAuthorityRow("gitSection", relPath, () => decodeGitSection(relPath, before.base_cjson!)) }),
-    ...(before?.branch_base_origins_cjson == null
-      ? {}
-      : {
-        branchBaseOrigins: decodeAuthorityRow("repoRecord", relPath,
-          () => decodeBranchBaseOrigins(before.branch_base_origins_cjson!)),
-      }),
-  };
+  const previous: RepoBaseValue = {};
+  if (before?.base_cjson != null) {
+    previous.base = decodeAuthorityRow("gitSection", relPath, () => decodeGitSection(relPath, before.base_cjson!));
+  }
+  if (before?.branch_base_origins_cjson != null) {
+    previous.branchBaseOrigins = decodeAuthorityRow("repoRecord", relPath,
+      () => decodeBranchBaseOrigins(before.branch_base_origins_cjson!));
+  }
   if (baseProofCjson === null) {
     // Without a proof this transition may not move BASE authority in ANY
     // direction. Branch origins are BASE provenance in their own right, so a

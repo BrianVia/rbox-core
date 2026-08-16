@@ -235,7 +235,12 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
     const syncSource = await fs.readFile(path.join(sourceRoot, "cli", "sync", "sync.ts"), "utf8");
     expect(pushSource).not.toContain("acquireWorkspaceSyncMutex");
     expect(syncSource).not.toContain("acquireWorkspaceSyncMutex");
-    expect(pushSource).toContain("await pull(root, cfg, deps)");
+    // `deps` carries the held handle; design 267 adds the lane name after it, so
+    // pin the forwarding rather than one exact argument list.
+    expect(pushSource).toMatch(/await pull\(root, cfg, deps[,)]/);
+    // Both nested-recovery pulls name themselves recovery, which is what keeps
+    // them structurally ineligible to mint an elision receipt (267 §3.0).
+    expect(pushSource.match(/await pull\(root, cfg, deps, undefined, "recovery"\)/g)).toHaveLength(2);
     expect(syncSource).toContain("await pullWithMetadata(root, cfg, deps)");
     expect(syncSource).toContain("await push(root, cfg, deps)");
   });

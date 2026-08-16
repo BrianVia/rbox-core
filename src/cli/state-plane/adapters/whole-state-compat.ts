@@ -26,8 +26,8 @@ import {
 } from "../errors.js";
 import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
-import type { CasRejectionReason, CasResult } from "../ports.js";
 import type { StateStoreHandle } from "../store/open.js";
+import { LEGACY_REJECTION_REASON, translateCasResult, type StoreFacade } from "./cas-translation.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
@@ -42,7 +42,6 @@ import {
 
 /** `.rbox/state.json` carries `Q`, and this is the database it names. */
 interface SqliteAuthority { authorityId: string; file: string }
-type StoreFacade = typeof import("../store-facade.js");
 
 const sqliteAuthority = (
   root: string,
@@ -283,7 +282,10 @@ async function saveThroughStore(
     const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
-      return translateCasResult(await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)), store, facade);
+      return translateCasResult(
+        await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)),
+        store, facade, packet, options.acceptedProjection,
+      );
     } finally {
       store.close();
     }
@@ -376,45 +378,5 @@ export async function replaceResetLineageStream(
     }
   } finally {
     await acquired.lock.release();
-  }
-}
-
-type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["reason"];
-
-/**
- * Exhaustive by construction: a new `CasRejectionReason` fails to compile here
- * rather than reaching a caller unhandled, and `StateSaveResult` is not widened
- * to carry the store's finer vocabulary. Only five rows are reachable from a
- * caller's packet; the rest describe a store that moved under the held state
- * lock, which the JSON vocabulary calls a nonce or global-sequence mismatch.
- * Exported so the unreachable rows are pinned rather than merely compiled.
- */
-export const LEGACY_REJECTION_REASON = {
-  lineage: "nonce", stream: "stream", nonce: "nonce",
-  "state-revision": "nonce", "base-generation": "global-sequence", "local-revision": "nonce",
-  "repo-generation": "repo-generation", "global-sequence": "global-sequence", "owner-lost": "owner-lost",
-} satisfies Record<CasRejectionReason, LegacyRejectionReason>;
-
-function translateCasResult(result: CasResult, store: StateStoreHandle, facade: StoreFacade): StateSaveResult {
-  switch (result.status) {
-    case "accepted":
-      return { status: "accepted", state: facade.loadRawStateFromStore(store) };
-    case "rejected":
-      try {
-        // The state a caller recomputes against is the authority the rejection
-        // was decided against: a rejected CAS wrote nothing, and this read runs
-        // on the same connection under the same still-held state lock.
-        return {
-          status: "rejected",
-          reason: LEGACY_REJECTION_REASON[result.reason],
-          state: facade.loadRawStateFromStore(store),
-        };
-      } finally {
-        result.retry.close();
-      }
-    case "busy":
-      return result;
-    case "unsupported":
-      return result;
   }
 }

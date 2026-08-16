@@ -15,6 +15,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { runAstSweep } from "../sync-git/ast-sweep-runner.js";
 
@@ -167,6 +168,25 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
 ]);
 
+/**
+ * Fixture builders that plant a state document for a test to act on. They are
+ * neither guarded production entry points nor EXEMPT (they really do write the
+ * bytes), so they are listed EXPLICITLY, per function, by name — never excused
+ * by a filename category. Two rules keep the list from becoming an escape
+ * hatch: an entry must live in a `.test-helper.ts`, and the test below proves
+ * no production module can reach one.
+ */
+const TEST_FIXTURES: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
+  ["src/cli/state-plane/adapters/save-elision.test-helper.ts::seededSqlite", {
+    sites: 1,
+    reason: "design 267 fixture: writes the authority marker that elects the SQLite store for an elision workspace",
+  }],
+  ["src/cli/state-plane/adapters/save-elision.test-helper.ts::seededLegacy", {
+    sites: 1,
+    reason: "design 267 fixture: writes the legacy JSON state document the parity fixtures load",
+  }],
+]);
+
 let cached: AstSite[] | undefined;
 function astSites(): AstSite[] {
   if (cached) return cached;
@@ -239,6 +259,7 @@ describe("state barrier pinning inventory", () => {
       if (entry.sites > 0) expected.set(key(entry.file, entry.symbol), entry.sites);
     }
     for (const [id, { sites }] of EXEMPT) expected.set(id, sites);
+    for (const [id, { sites }] of TEST_FIXTURES) expected.set(id, sites);
     expect(
       Object.fromEntries([...accessTable()].sort()),
       "a function reached .rbox/state.json a different number of times than the barrier inventory records; "
@@ -372,5 +393,26 @@ describe("state barrier pinning inventory", () => {
 
   test("every exemption states a reason", () => {
     for (const [id, { reason }] of EXEMPT) expect(reason.length, id).toBeGreaterThan(20);
+    for (const [id, { reason }] of TEST_FIXTURES) expect(reason.length, id).toBeGreaterThan(20);
+  });
+
+  test("no production module can reach a listed test fixture", () => {
+    // What makes an explicit fixture row safe: the file cannot be pulled into
+    // the shipped graph. `tsconfig.json` compiles all of `src` and the release
+    // bundler follows imports, so a `.test-helper.ts` is ordinary code — only
+    // this check stops one from carrying state-plane behavior into production.
+    for (const id of TEST_FIXTURES.keys()) {
+      expect(id.split("::")[0], `${id} is listed as a fixture but is not a .test-helper.ts`)
+        .toMatch(/\.test-helper\.ts$/);
+    }
+    const src = path.join(REPO, "src");
+    const offenders: string[] = [];
+    for (const entry of fsSync.readdirSync(src, { recursive: true, encoding: "utf8" })) {
+      if (!entry.endsWith(".ts") || entry.endsWith(".test.ts") || entry.endsWith(".test-helper.ts")) continue;
+      const text = fsSync.readFileSync(path.join(src, entry), "utf8");
+      if (/["'][^"']*\.test-helper\.(?:js|ts)["']/.test(text)) offenders.push(`src/${entry}`);
+    }
+    expect(offenders, "a production module imports a test helper — the fixture rows above are no longer safe")
+      .toEqual([]);
   });
 });

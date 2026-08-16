@@ -6,7 +6,7 @@
  * the ones the sealed artifacts authenticate — never a caller's parallel claim. */
 import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
-import type { GlobalManifestMeta } from "../../sync-state-model.js";
+import type { ElisionExpectation, GlobalManifestMeta } from "../../sync-state-model.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { StageChangedError } from "../errors.js";
@@ -43,6 +43,9 @@ export interface CasPacket {
   repoTransitions: SealedRepoTransitionRef;
   /** Reset-provenance stream observed before the packet's target stream. */
   replacementOldStream?: string;
+  /** Design 267 §3.2b: the pre-lock snapshot this packet's elisions were proven
+   * against. Absent on every packet that elided nothing. */
+  elisionExpectation?: ElisionExpectation;
   /** Only a branded token minted from a held `OwnedLock` (or the test-only seam)
    * can authorize a commit; a bare `{ isOwner }` is rejected at this boundary. */
   ownerToken: OwnedLockCasToken;
@@ -165,6 +168,9 @@ export function applyCasPacket(
       replacementOldStream: packet.replacementOldStream,
       ownerToken: packet.ownerToken,
     };
+    if (packet.elisionExpectation !== undefined) {
+      frozen.elisionExpectation = { ...packet.elisionExpectation };
+    }
     const result = runTransaction(db, stageDirectory, frozen, verified, hooks);
     // The design's id-scoped cleanup after adoption or refusal. `busy` adopted and
     // refused nothing, so its inputs stay available to the caller's retry.

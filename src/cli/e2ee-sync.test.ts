@@ -1184,6 +1184,71 @@ test("R2 same-head real pull reuses persisted evidence with zero blob fetches", 
   });
 });
 
+/**
+ * Design 267 §3.2.3, the r1 counterexample in its literal form: a WARMED
+ * evidence fold. `latest()` returns the LRU's manifest for a matching
+ * address/epoch/chain WITHOUT re-hashing the carried base, and zero reconcile
+ * actions ignore `encSha` by design — so every input the elision receipt
+ * carries says "nothing changed" while the durable store disagrees. Only the
+ * content self-check, which hashes the state actually loaded this operation,
+ * can refuse. If it ever stops doing so, the drift survives this pull silently.
+ */
+test("267: a warmed evidence fold cannot hide durable encSha drift", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-267-warm", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, puller);
+    const head = deltaSizedManifest("267-warm-head");
+    await writer.commit(0, secrets.deviceId, head);
+
+    // Pull one: materializes the tree, persists base + meta, and warms THIS
+    // remote's evidence LRU for exactly this address/epoch/chain.
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    const seeded = await loadState(root, syncStreamId(cfg));
+    expect(seeded.lastSyncedManifest.files.length).toBe(head.files.length);
+    expect(validManifestMeta(seeded.manifestMeta)).toBeDefined();
+
+    // Durable drift, one field, one entry: the ciphertext address. Everything
+    // the receipt inspects — sequence, meta, the unfiltered action list — is
+    // untouched, and `diffManifests` does not look at `encSha` at all.
+    const driftAt = 7;
+    const truth = seeded.lastSyncedManifest.files[driftAt]!;
+    expect(truth.encSha).toBeUndefined();
+    await saveStateUnsafeLegacyOrTest(root, {
+      ...seeded,
+      lastSyncedManifest: {
+        ...seeded.lastSyncedManifest,
+        files: seeded.lastSyncedManifest.files.map((entry, index) =>
+          index === driftAt ? { ...entry, encSha: hex(0xd12f7) } : entry),
+      },
+    });
+    expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest.files[driftAt]!.encSha)
+      .toBe(hex(0xd12f7));
+
+    // Pull two, against the warm cache.
+    server.store.getCalls = [];
+    const report = PhaseReport.pull();
+    const actions = await withFastPullFlag("1", () => pull(root, cfg, { remote: puller, report }));
+
+    // The warm path really ran: no blob was re-read, and the fold was served
+    // from evidence rather than a cold walk that would have re-hashed anyway.
+    expect(server.store.getCalls).toEqual([]);
+    expect((report.toJSON().phases.latest!.details as { fold?: string }).fold).toBe("evidence");
+    // Reconcile saw nothing to do — the drift is invisible to it.
+    expect(actions).toEqual([]);
+
+    // …and the save still healed it, which only a full packet can do: an elided
+    // save writes no global section, so the drift would have survived.
+    const healed = await loadState(root, syncStreamId(cfg));
+    expect(healed.lastSyncedManifest.files[driftAt]!.encSha).toBeUndefined();
+    expect(healed.lastSyncedManifest).toEqual(seeded.lastSyncedManifest);
+    expect(healed.manifestMeta).toEqual(seeded.manifestMeta);
+  });
+});
+
 test("R3 same-head evidence lazily self-heals corruption and then reuses the verified fold", async () => {
   await withManifestEncodingFlags("1", "1", async () => {
     const server = new FakeServer();
@@ -1313,7 +1378,10 @@ type FileEntryMember = readonly FileEntry[] | FileEntry | FileEntry[keyof FileEn
 
 function hasKeyDeep(value: FileEntryMember, keys: ReadonlySet<string>): boolean {
   if (Array.isArray(value)) return value.some((v) => hasKeyDeep(v, keys));
-  if (value === null || typeof value !== "object") return false;
+  // `instanceof Object`, not a `typeof` tag: a primitive member (a sha string, a
+  // size) has no keys to walk, and Object.entries would iterate a string's
+  // characters if one ever reached the loop below.
+  if (value === null || !(value instanceof Object)) return false;
   for (const [key, child] of Object.entries(value)) {
     if (keys.has(key)) return true;
     if (hasKeyDeep(child, keys)) return true;

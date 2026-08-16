@@ -4,6 +4,7 @@ import { fillVersion } from "./remote/blob-batch/config.js";
 import { preflightDeltaEnabled } from "./sync-recovery.js";
 import { mdeWritePolicy } from "./e2ee-remote.js";
 import { fuseEnabled } from "./publish-pipeline/shared.js";
+import { noopElisionEnabled } from "./sync-state-elision.js";
 import { configuredWorkers, resetConfiguredWorkersCacheForTests } from "../engine/crypto-pool/config.js";
 
 /**
@@ -19,6 +20,7 @@ const FLAGS = [
   "RBOX_PREFLIGHT_DELTA", "RBOX_MDE_DELTA", "RBOX_MDE_SNAPSHOT", "RBOX_MDE_FAST_PULL",
   "RBOX_BLOB_PACK", "RBOX_PACK_STREAMS", "RBOX_BATCH_FILL", "RBOX_CRYPTO_FUSE",
   "RBOX_CRYPTO_WORKERS", "RBOX_GIT_PLAN_LAZY", "RBOX_GIT_APPLY_LAZY",
+  "RBOX_SAVE_NOOP_ELIDE",
 ] as const;
 const saved = new Map<string, string | undefined>();
 
@@ -38,6 +40,9 @@ describe("defaults ledger — the shipped default of every perf/behavior flag", 
     expect(mdeWritePolicy()).toEqual({ delta: true, snapshot: true });
     expect(fillVersion()).toBe("v2");
   });
+  test("the no-op state-save elision is ON by default", () => {
+    expect(noopElisionEnabled()).toBe(true);
+  });
   test("blob packing is ON at 16 streams by default", () => {
     const pack = packUploadConfig();
     expect(pack.enabled).toBe(true);
@@ -56,9 +61,11 @@ describe("defaults ledger — the shipped default of every perf/behavior flag", 
     process.env.RBOX_MDE_DELTA = "0";
     process.env.RBOX_BLOB_PACK = "0";
     process.env.RBOX_CRYPTO_FUSE = "0";
+    process.env.RBOX_SAVE_NOOP_ELIDE = "0";
     expect(preflightDeltaEnabled()).toBe(false);
     expect(mdeWritePolicy().delta).toBe(false);
     expect(packUploadConfig().enabled).toBe(false);
     expect(fuseEnabled()).toBe(false);
+    expect(noopElisionEnabled()).toBe(false);
   });
 });

@@ -66,7 +66,9 @@ export interface CasOwnerToken {
 
 export type CasRejectionReason =
   | "lineage" | "stream" | "nonce" | "state-revision" | "base-generation"
-  | "local-revision" | "repo-generation" | "global-sequence" | "owner-lost";
+  | "local-revision" | "repo-generation" | "global-sequence" | "owner-lost"
+  /** A packet whose composition elided sections was bound to an older snapshot. */
+  | "elision-drift";
 
 export interface CasRetryRepo {
   relPath: string;

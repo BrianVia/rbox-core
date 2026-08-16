@@ -408,7 +408,9 @@ async function pushManifestInner(
       state.filesFirstAborted = true;
       if (outcome.action.kind === "pull-first") {
         await backoff(attempt);
-        await pull(root, cfg, deps);
+        // Design 267 §3.0: a recovery pull nested in this retry loop never mints
+        // an elision receipt — it observes a slice, not a whole cycle.
+        await pull(root, cfg, deps, undefined, "recovery");
       } else {
         await refreshWriteContext(cfg, deps);
       }
@@ -831,7 +833,7 @@ async function runPushAttempt(
           : { status: reconciled.status, sequence: reconciled.sequence, manifest: reconciled.manifest };
       },
       pullAndLoadAccepted: async () => {
-        await pull(root, cfg, deps);
+        await pull(root, cfg, deps, undefined, "recovery");
         const postPull = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
         return { sequence: postPull.lastSyncedSequence, manifest: postPull.lastSyncedManifest };
       },

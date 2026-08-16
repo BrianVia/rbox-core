@@ -38,7 +38,7 @@ Format: field — file:line — suggested name — blast radius.
   row can still be verified.
 ## `cfgShape` (repo record config lane)
 
-- **Anchor:** `src/cli/sync-state-model.ts:323` (`RepoRecordInput.cfgShape`),
+- **Anchor:** `src/cli/sync-state-model.ts:321` (`RepoRecordInput.cfgShape`),
   column mapping `cfg_shape_cjson` at
   `src/cli/state-plane/codecs/repo-record.ts:21`.
 - **Suggested name:** `cfgStore` (column `cfg_store_cjson`) — it identifies the
@@ -48,13 +48,13 @@ Format: field — file:line — suggested name — blast radius.
   (`repo-record.ts:33,47,83-87`), digest grammar goldens
   (`src/cli/state-plane/digest/grammar-goldens.test.ts:216`), codec coverage
   (`src/cli/state-plane/codecs/coverage.ts:79`), `ConfigLaneState` projection
-  (`src/cli/sync-state.ts:34,49,430`), every sync-git config-lane reader and
+  (`src/cli/sync-state.ts:41,43,53`), every sync-git config-lane reader and
   writer, and the e2e/pull/contract test assertions. Needs a state migration
   and a client-skew story (records written by older CLIs carry the old key).
 
 ## `ConfigStoreIdentity.shape` (repo kind inside the store identity)
 
-- **Anchor:** `src/cli/sync-state-model.ts:137`, written at
+- **Anchor:** `src/cli/sync-state-model.ts:135`, written at
   `src/cli/sync-git/config-lane.ts:101`.
 - **Suggested name:** `repoKind` — the value is the `RepoCtx.kind`
   (`"dir"` / `"pointer"`), which the rest of the codebase already calls
@@ -66,7 +66,7 @@ Format: field — file:line — suggested name — blast radius.
 
 ## `GitResolutionBinding["config"].shape`
 
-- **Anchor:** `src/cli/sync-state-model.ts:285`, populated at
+- **Anchor:** `src/cli/sync-state-model.ts:283`, populated at
   `src/cli/sync-git/resolution-intent.ts:62-67`.
 - **Suggested name:** `storeIdentity` — it is the canonicalized
   `ConfigStoreIdentity`, matching the code-symbol name now used everywhere else.
@@ -79,7 +79,7 @@ Format: field — file:line — suggested name — blast radius.
 
 - **Anchor:** `src/cli/sync-git/base-composer.ts:191` (union member), emitted at
   `:434`, `:443`, `:458`; mirrored in the durable hold-code union at
-  `src/cli/sync-state-model.ts:234`.
+  `src/cli/sync-state-model.ts:232`.
 - **Suggested name:** `p-repair-witness-mismatch` — the hold fires when the
   P-repair witness disagrees with the locked proof, not when a "shape" is off.
 - **Blast radius:** the value is a hold code carried in composer output and

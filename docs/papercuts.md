@@ -604,3 +604,10 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
   regressions; CI (green main) caught them. Rule: a pre-existing claim needs a
   differential against origin/main (worktree or `git stash` PLUS checkout of
   the merge base), never against "my changes stashed".
+
+- Agents default to the full `bun test src/cli src/engine` (~9 min) when
+  `bun run test:affected` already exists and selects by import graph. Cost this
+  cycle: several full runs where a scoped one would have done. Rule: affected
+  per fix iteration, full suite ONCE as the final gate. (Note: a diff touching a
+  root like `src/json.ts` selects ~85% of the suite anyway — worth knowing before
+  assuming "affected" is always cheap.)
