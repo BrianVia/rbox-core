@@ -93,13 +93,14 @@ export async function gitDivergenceStatus(
     for (const lane of DEFERRAL_LANES) {
       const deferral = record.deferrals?.[lane];
       if (!deferral) continue;
-      deferrals.push({
+      const projected: GitDivergenceStatus["deferrals"][number] = {
         relPath,
         lane: deferral.lane,
         reason: deferral.reason,
         deferredSince: deferral.deferredSince,
-        ...(deferral.bytesChanged === undefined ? {} : { bytesChanged: deferral.bytesChanged }),
-      });
+      };
+      if (deferral.bytesChanged !== undefined) projected.bytesChanged = deferral.bytesChanged;
+      deferrals.push(projected);
     }
   }
   deferrals.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0) || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0));

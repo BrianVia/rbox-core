@@ -75,7 +75,7 @@ const section = (seed: number, extras: Partial<ExtendedGitSection> = {}): Extend
 
 type Role = "meta-wire" | "manifest-projection";
 
-interface StageShape {
+interface StageConstruction {
   stageId: string;
   plane: "base" | "local";
   header: ManifestHeader;
@@ -85,7 +85,7 @@ interface StageShape {
   counts?: StageCounts;
 }
 
-const STAGE_BASE: StageShape = {
+const STAGE_BASE: StageConstruction = {
   stageId: STAGE_ID,
   plane: "base",
   header: HEADER,
@@ -94,21 +94,19 @@ const STAGE_BASE: StageShape = {
   sections: [{ role: "meta-wire", relPath: "repo-a", section: section(30, { extensionNull: null }) }],
 };
 
-function stageDigest(shape: StageShape): string {
-  const builder = new StageDigestBuilder(shape.stageId, shape.plane, shape.header);
-  for (const entry of shape.entries) builder.file(encodeFileEntry(entry).canonical);
-  for (const role of shape.roles) builder.declareRole(role);
-  for (const row of shape.sections) builder.gitSection(row.role, row.relPath, canonicalJson(row.section));
-  return builder.seal(shape.counts ?? { files: shape.entries.length, gitSections: shape.sections.length });
+function stageDigest(construction: StageConstruction): string {
+  const builder = new StageDigestBuilder(construction.stageId, construction.plane, construction.header);
+  for (const entry of construction.entries) builder.file(encodeFileEntry(entry).canonical);
+  for (const role of construction.roles) builder.declareRole(role);
+  for (const row of construction.sections) builder.gitSection(row.role, row.relPath, canonicalJson(row.section));
+  return builder.seal(construction.counts ?? { files: construction.entries.length, gitSections: construction.sections.length });
 }
 
-const withEntry = (index: number, patch: Partial<ExtendedFileEntry> | { remove: OptionalFileEntryKey }): StageShape => ({
+const withEntry = (index: number, patch: Partial<ExtendedFileEntry> | { remove: OptionalFileEntryKey }): StageConstruction => ({
   ...STAGE_BASE,
   entries: STAGE_BASE.entries.map((entry, at) => {
     if (at !== index) return entry;
-    if ("remove" in patch && typeof patch.remove === "string") {
-      return omit(entry, patch.remove);
-    }
+    if ("remove" in patch) return omit(entry, patch.remove);
     return { ...entry, ...patch } as FileEntry;
   }),
 });
@@ -119,7 +117,7 @@ test("stage-semantic-v1 base construction is pinned", () => {
 
 test("stage-semantic-v1 moves for every single dimension it frames", () => {
   const base = stageDigest(STAGE_BASE);
-  const variants = new Map<string, StageShape>([
+  const variants = new Map<string, StageConstruction>([
     ["stage id", { ...STAGE_BASE, stageId: "2".repeat(32) }],
     ["plane", { ...STAGE_BASE, plane: "local" }],
     ["header generatedAt", { ...STAGE_BASE, header: { ...HEADER, generatedAt: "2026-07-28T10:00:01.000Z" } }],
@@ -166,7 +164,7 @@ test("stage-semantic-v1 moves for every single dimension it frames", () => {
       sections: [...STAGE_BASE.sections, { role: "meta-wire" as Role, relPath: "repo-b", section: section(31) }],
     }],
   ]);
-  assertAllDistinct(base, new Map([...variants].map(([name, shape]) => [name, stageDigest(shape)])));
+  assertAllDistinct(base, new Map([...variants].map(([name, construction]) => [name, stageDigest(construction)])));
 });
 
 /* ------------------------------------------------------- transition grammar */
@@ -223,7 +221,7 @@ const FULL_RECORD: RepoRecordInput = {
   idxProj: "projection",
 };
 
-interface TransitionRowShape {
+interface TransitionRowFixture {
   relPath: string;
   expectedRepoGen: number;
   record: RepoRecordInput;
@@ -231,14 +229,14 @@ interface TransitionRowShape {
   evidence: SourceStageBinding[];
 }
 
-interface TransitionShape {
+interface TransitionConstruction {
   token: LineageSnapshot;
   bindings: SourceStageBinding[];
   globalBinding?: SourceStageBinding;
-  rows: TransitionRowShape[];
+  rows: TransitionRowFixture[];
 }
 
-const TRANSITION_BASE: TransitionShape = {
+const TRANSITION_BASE: TransitionConstruction = {
   token: TOKEN,
   bindings: [GLOBAL, GIT_PROOF],
   globalBinding: GLOBAL,
@@ -251,9 +249,9 @@ const TRANSITION_BASE: TransitionShape = {
   ],
 };
 
-function transitionDigest(shape: TransitionShape): string {
-  const builder = new RepoTransitionDigestBuilder(shape.token, shape.bindings, shape.globalBinding);
-  for (const row of shape.rows) {
+function transitionDigest(construction: TransitionConstruction): string {
+  const builder = new RepoTransitionDigestBuilder(construction.token, construction.bindings, construction.globalBinding);
+  for (const row of construction.rows) {
     builder.row({
       relPath: row.relPath,
       expectedRepoGen: row.expectedRepoGen,
@@ -265,7 +263,7 @@ function transitionDigest(shape: TransitionShape): string {
   return builder.seal();
 }
 
-const withRecord = (patch: (record: Mutable<RepoRecordInput>) => void): TransitionShape => {
+const withRecord = (patch: (record: Mutable<RepoRecordInput>) => void): TransitionConstruction => {
   const record = { ...FULL_RECORD };
   patch(record);
   return {
@@ -388,8 +386,8 @@ test("repo-transition-v1 frames its explicit row-count token", () => {
 
 test("repo-transition-v1 moves for every binding, evidence, row, and snapshot dimension", () => {
   const base = transitionDigest(TRANSITION_BASE);
-  const [first, second] = TRANSITION_BASE.rows as [TransitionRowShape, TransitionRowShape];
-  const variants = new Map<string, TransitionShape>([
+  const [first, second] = TRANSITION_BASE.rows as [TransitionRowFixture, TransitionRowFixture];
+  const variants = new Map<string, TransitionConstruction>([
     ["row relPath", { ...TRANSITION_BASE, rows: [{ ...first, relPath: "repo-z" }, second] }],
     ["row expected generation", { ...TRANSITION_BASE, rows: [{ ...first, expectedRepoGen: 9 }, second] }],
     ["row proof absent", { ...TRANSITION_BASE, rows: [omit(first, "proof"), second] }],
@@ -433,7 +431,7 @@ test("repo-transition-v1 moves for every binding, evidence, row, and snapshot di
       } as LineageSnapshot,
     }],
   ]);
-  assertAllDistinct(base, new Map([...variants].map(([name, shape]) => [name, transitionDigest(shape)])));
+  assertAllDistinct(base, new Map([...variants].map(([name, construction]) => [name, transitionDigest(construction)])));
 });
 
 /* ------------------------------------------------------------ delta grammar */

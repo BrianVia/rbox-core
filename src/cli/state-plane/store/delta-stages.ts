@@ -9,7 +9,7 @@ import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { FileEntry } from "../../../engine/index.js";
 import type { DeltaBinding } from "../../sync-state-delta.js";
-import { encodeFileEntryForConsume, type ConsumedFileEntry } from "../codecs/file-entry.js";
+import { encodeFileEntryForConsume, fileEntryFromCanonical, type ConsumedFileEntry } from "../codecs/file-entry.js";
 import { jsonCounter, jsonText } from "../../../json.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import {
@@ -161,7 +161,7 @@ class SqliteDeltaStageBuilder implements DeltaStageBuilder {
           digest.delete(row.path);
           return;
         }
-        const encoded = encodeFileEntryForConsume(parseCanonicalJson(row.entry_cjson!) as unknown as FileEntry);
+        const encoded = encodeFileEntryForConsume(fileEntryFromCanonical(row.entry_cjson!));
         if (encoded.canonical !== row.entry_cjson || encoded.path !== row.path) {
           throw new StageChangedError(this.stageId, `delta row ${row.path} is not canonical`);
         }
@@ -304,7 +304,7 @@ function streamDeltaOps(
       if (row.kind !== "upsert" || row.entry_cjson === null) {
         throw new StageChangedError(ref.stageId, `sealed delta op ${row.path} has no known kind`);
       }
-      const entry = encodeFileEntryForConsume(JSON.parse(row.entry_cjson) as FileEntry);
+      const entry = encodeFileEntryForConsume(fileEntryFromCanonical(row.entry_cjson));
       if (entry.path !== row.path || entry.canonical !== row.entry_cjson) {
         throw new StageChangedError(ref.stageId, `sealed delta row ${row.path} is not canonical`);
       }

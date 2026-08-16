@@ -79,8 +79,14 @@ async function migratedWorkspace(prefix: string): Promise<string> {
   return root;
 }
 
-const rejects = async (body: () => Promise<unknown>): Promise<unknown> =>
-  body().then(() => undefined, (error: unknown) => error);
+const rejects = async (body: () => Promise<unknown>): Promise<unknown> => {
+  try {
+    await body();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // ROW 1 — released OLD binary, candidate (post-`Q`) workspace. Fail closed.

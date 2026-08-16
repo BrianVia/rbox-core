@@ -9,6 +9,7 @@ import { withRepositoryRecoveryFence } from "./sync-git/protocol-locks.js";
 import { runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair } from "./sync-git/p-repair-transaction.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { acquireLock, captureCommonDirIdentity, type OwnedLock } from "../engine/lockfile.js";
+import { errCode } from "../engine/fsutil.js";
 import { gitRaw } from "../engine/git-spawn.js";
 import {
   acquireWorkspaceSyncMutex,
@@ -49,10 +50,6 @@ import {
   stateLockPath,
   statePath,
 } from "./sync-state-store.js";
-
-function isENOENT(e: unknown): boolean {
-  return (e as NodeJS.ErrnoException)?.code === "ENOENT";
-}
 
 interface ResetRepositoryDescriptor {
   relPath: string;
@@ -124,7 +121,7 @@ async function prepareResetArtifactsUnderFence<T>(
     // journal before settling any P or compacting any A in any repository.
     for (const { relPath } of repos) {
       const checkoutPath = path.join(checkoutJournalDir(root, relPath), "journal.json");
-      const checkoutStat = await fs.lstat(checkoutPath).catch((error) => isENOENT(error) ? undefined : Promise.reject(error));
+      const checkoutStat = await fs.lstat(checkoutPath).catch((error) => errCode(error) === "ENOENT" ? undefined : Promise.reject(error));
       if (checkoutStat) {
         if (!checkoutStat.isFile() || checkoutStat.isSymbolicLink() || checkoutStat.size > 512 * 1024) {
           throw new Error(`reset refused: unsafe or oversized checkout journal for ${relPath}`);
@@ -269,7 +266,7 @@ async function prepareResetArtifactsUnderFence<T>(
       }
     }
     const journalRoot = path.join(root, RBOX_DIR, "state", "git-journal");
-    const remaining = await fs.readdir(journalRoot).catch((error) => isENOENT(error) ? [] : Promise.reject(error));
+    const remaining = await fs.readdir(journalRoot).catch((error) => errCode(error) === "ENOENT" ? [] : Promise.reject(error));
     if (remaining.length > 0) throw new Error(`reset refused: unbound or unreadable checkout journal entries remain at ${journalRoot}`);
     // Complete-fence preflight contract: recheck cheap Q lineage after P work.
     const finalLineage = await selectedStateForResetConsent(root);
@@ -480,7 +477,7 @@ export async function resetSyncState(
       try {
         await fs.rm(p, { recursive: true });
       } catch (error) {
-        if (!isENOENT(error)) throw error;
+        if (errCode(error) !== "ENOENT") throw error;
       }
     }
   } finally {

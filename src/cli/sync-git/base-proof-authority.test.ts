@@ -43,10 +43,11 @@ const state = (): SyncState => ({
   repoRecords: { r: { repoGen: 3, sourceSeq: 1, base: section(T), branchBaseOrigins: { "refs/heads/main": origin } } },
 });
 
-const source = (values: StateSource["values"], repoProofs?: StateSource["repoProofs"]): StateSource => ({
-  expectedStream: "s", sourceGlobalSeq: 2, observedRepos: ["r"], values,
-  ...(repoProofs ? { repoProofs } : {}),
-});
+const source = (values: StateSource["values"], repoProofs?: StateSource["repoProofs"]): StateSource => {
+  const built: StateSource = { expectedStream: "s", sourceGlobalSeq: 2, observedRepos: ["r"], values };
+  if (repoProofs) built.repoProofs = repoProofs;
+  return built;
+};
 
 test("a proofless candidate BASE move is held by carry authority, never laundered as a migration", () => {
   // The packet composer works from a snapshot that may already be stale, so it

@@ -97,11 +97,13 @@ function localBaseSequenceMismatched(activity: DaemonActivity | undefined, state
   return local !== undefined && local.stream === state.stream && local.baseSequence !== state.lastSyncedSequence;
 }
 
-function createGitRepoFeed(): {
+interface GitRepoFeed {
   push: (repo: DiscoveredGitRepo) => void;
   close: () => void;
   iterable: AsyncIterable<DiscoveredGitRepo>;
-} {
+}
+
+function createGitRepoFeed(): GitRepoFeed {
   const feed = new PassThrough({ objectMode: true });
   let closed = false;
   return {
@@ -171,21 +173,22 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const watcherTrust = observedDaemon.trustedAmbient?.watcherTrust;
   const daemon: StatusDaemonProjection = {
     running,
-    ...(observedDaemon.pid === undefined ? {} : { pid: observedDaemon.pid }),
     stale: observedDaemon.stale,
     version: daemonVersion,
     mode: daemonMode,
-    ...(watcherTrust === undefined ? {} : { watcherTrust }),
     versionSkew: daemonVersion !== undefined && daemonVersion !== RBOX_VERSION,
   };
+  if (observedDaemon.pid !== undefined) daemon.pid = observedDaemon.pid;
+  if (watcherTrust !== undefined) daemon.watcherTrust = watcherTrust;
+  const workspace: StatusProjectionCommon["workspace"] = {
+    id: cfg.remoteWorkspaceId,
+    root,
+    deviceId: cfg.deviceId,
+    syncGit: cfg.syncGit === true,
+  };
+  if (cfg.name !== undefined) workspace.name = cfg.name;
   const common: StatusProjectionCommon = {
-    workspace: {
-      id: cfg.remoteWorkspaceId,
-      ...(cfg.name === undefined ? {} : { name: cfg.name }),
-      root,
-      deviceId: cfg.deviceId,
-      syncGit: cfg.syncGit === true,
-    },
+    workspace,
     daemon,
     credentials: loadedCredentials,
     bookkeeping: { promoteDaemonModeIntent: running },
@@ -325,13 +328,16 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       trackedFiles: populate.operation.filesDone,
       gitChanged: 0,
       gitDeferrals: localGitDeferrals(state).filter(({ repo }) =>
-        statusScope === undefined || statusScope.classifyRepo(repo) === "in").map(({ repo, ...d }) => ({
-        relPath: repo,
-        lane: d.lane,
-        reason: d.reason,
-        deferredSince: d.deferredSince,
-        ...(d.bytesChanged === undefined ? {} : { bytesChanged: d.bytesChanged }),
-      })),
+        statusScope === undefined || statusScope.classifyRepo(repo) === "in").map(({ repo, ...d }) => {
+        const projected: StatusLocalCounts["gitDeferrals"][number] = {
+          relPath: repo,
+          lane: d.lane,
+          reason: d.reason,
+          deferredSince: d.deferredSince,
+        };
+        if (d.bytesChanged !== undefined) projected.bytesChanged = d.bytesChanged;
+        return projected;
+      }),
       conflictSnapshots,
       source: "computed",
     };
@@ -399,11 +405,11 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     humanLocalRepoProjections: projectGitDeferralRepos(humanGitDeferralEntries(localGitEntries, now), now),
     deferredRepos: projectedRepos.length,
     bytesChangedDeferrals: projectedRepos.filter((repo) => repo.bytesChanged).length,
-    ...(projectedRepos.some((repo) => repo.displayReason === "unsupported")
-      ? { capability: await port.readCheckoutTransactionCapability(root) }
-      : {}),
-    ...(live ? { live } : {}),
   };
+  if (projectedRepos.some((repo) => repo.displayReason === "unsupported")) {
+    git.capability = await port.readCheckoutTransactionCapability(root);
+  }
+  if (live) git.live = live;
 
   const detail: StatusDetailProjection & { probes: StatusModeProbes } = {
     kind: "detail",
@@ -419,7 +425,6 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     remote,
     remoteLine: attributed.remoteLine,
     counts,
-    ...(strandedIgnored === undefined ? {} : { strandedIgnored }),
     localChanges,
     health: projectHealth({
       activity,
@@ -447,5 +452,6 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
         ? { mode: "verbose", accountSummary: (await accountSummaryP)!, metrics: await probes.readMetrics(root), update: await probes.readUpdateState() }
         : { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials), update: await probes.readUpdateState() },
   };
+  if (strandedIgnored !== undefined) detail.strandedIgnored = strandedIgnored;
   return detail as WorkspaceStatusProjection<M>;
 }

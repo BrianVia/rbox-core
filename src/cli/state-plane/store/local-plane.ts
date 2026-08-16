@@ -6,6 +6,7 @@
  * through the lineage snapshot token. As on the global side, the header that
  * commits is the one the stage was sealed with. */
 import type { Database } from "bun:sqlite";
+import { jsonText } from "../../../json.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
@@ -40,7 +41,7 @@ export function applyLocalScan(
   if (store.readonly) throw new Error("state store is open read-only");
   if (stage.plane !== "local") throw new StageChangedError(stage.stageId, "a LOCAL scan requires a LOCAL stage");
   if (stage.counts.gitSections !== 0) throw new StageChangedError(stage.stageId, "a LOCAL stage carries no Git sections");
-  if (typeof stage.header.trustEpoch !== "string" || stage.header.trustEpoch.length === 0) {
+  if (!jsonText(stage.header.trustEpoch) || stage.header.trustEpoch.length === 0) {
     throw new StageChangedError(stage.stageId, "a completed LOCAL scan must be sealed with its trust epoch");
   }
   const db = stateStoreDatabase(store);

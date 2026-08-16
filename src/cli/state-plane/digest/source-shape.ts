@@ -12,9 +12,10 @@
  * neither may drag the semantic-digest grammar (or `bun:sqlite`) behind it.
  */
 import type { SyncState } from "../../sync-state-model.js";
+import { jsonObject } from "../../../json.js";
 import { canonicalJson, type JsonValue } from "./codecs.js";
 
-export interface SourceShapeFlags {
+export interface SourcePresenceFlags {
   readonly stream: boolean;
   readonly stateNonce: boolean;
   readonly stateRevision: boolean;
@@ -24,7 +25,7 @@ export interface SourceShapeFlags {
   };
 }
 
-export interface SourceShapePresence {
+export interface SourcePresenceInputs {
   readonly stream: boolean;
   readonly stateNonce: boolean;
   readonly stateRevision: boolean;
@@ -32,9 +33,9 @@ export interface SourceShapePresence {
   readonly gitRepos: boolean;
 }
 
-/** The one builder. The nesting mirrors `SyncState`, because that is the shape
+/** The one builder. The nesting mirrors `SyncState`, because that is what
  * `read-snapshot.ts` navigates when it asks whether the source had a git layer. */
-export function sourceShapeFlags(present: SourceShapePresence): SourceShapeFlags {
+export function sourcePresenceFlags(present: SourcePresenceInputs): SourcePresenceFlags {
   return {
     stream: present.stream,
     stateNonce: present.stateNonce,
@@ -49,20 +50,19 @@ export function sourceShapeFlags(present: SourceShapePresence): SourceShapeFlags
 /** The read path intentionally projects only this compatibility bit. Older
  * rows may omit every other flag; future rows may add flags this reader does
  * not understand. The owning question therefore returns a boolean rather than
- * pretending the persisted value is a complete current SourceShapeFlags. */
+ * pretending the persisted value is a complete current SourcePresenceFlags. */
 export function manifestGitReposWasPresent(value: JsonValue): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  if (!jsonObject(value)) return false;
   const manifest = value.lastSyncedManifest;
-  return typeof manifest === "object" && manifest !== null && !Array.isArray(manifest)
-    && manifest.gitRepos === true;
+  return jsonObject(manifest) && manifest.gitRepos === true;
 }
 
 /** Genesis has a stream and nothing else; its two optional lineage members are
  * the caller's, so they are asked rather than assumed. */
-export function genesisSourceShapeFlags(
-  present: Pick<SourceShapePresence, "stateNonce" | "stateRevision">,
-): SourceShapeFlags {
-  return sourceShapeFlags({
+export function genesisSourcePresenceFlags(
+  present: Pick<SourcePresenceInputs, "stateNonce" | "stateRevision">,
+): SourcePresenceFlags {
+  return sourcePresenceFlags({
     stream: true,
     stateNonce: present.stateNonce,
     stateRevision: present.stateRevision,
@@ -75,8 +75,8 @@ export function genesisSourceShapeFlags(
  * records that the KEY was present, not that it held anything: an empty object
  * and an absent key are different sources and the read path reconstructs them
  * differently. */
-export function legacySourceShapeFlags(state: SyncState): SourceShapeFlags {
-  return sourceShapeFlags({
+export function legacySourcePresenceFlags(state: SyncState): SourcePresenceFlags {
+  return sourcePresenceFlags({
     stream: state.stream !== undefined,
     stateNonce: state.stateNonce !== undefined,
     stateRevision: state.stateRevision !== undefined,
@@ -85,4 +85,4 @@ export function legacySourceShapeFlags(state: SyncState): SourceShapeFlags {
   });
 }
 
-export const sourceShapeFlagsCjson = (flags: SourceShapeFlags): string => canonicalJson(flags);
+export const sourcePresenceFlagsCjson = (flags: SourcePresenceFlags): string => canonicalJson(flags);

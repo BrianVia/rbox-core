@@ -15,11 +15,12 @@ import type { Database } from "bun:sqlite";
 import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";
 import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import type { StateSemanticDigest } from "../ports.js";
+import type { JsonObject } from "../../../json.js";
 import { canonicalJson, domainHash, parseCanonicalJson } from "./codecs.js";
 import type { NormalizedLegacyState } from "./legacy-state-plan.js";
 import type { LegacyLineageRow, LegacyPlaneHeadRow } from "./legacy-state-plan.js";
 
-function tokens(hash: ReturnType<typeof domainHash>, tag: string, value: unknown): void {
+function tokens<T>(hash: ReturnType<typeof domainHash>, tag: string, value: T | undefined): void {
   hash.token(tag);
   hash.token(value === undefined ? "0" : "1");
   if (value !== undefined) hash.token(canonicalJson(value));
@@ -71,14 +72,39 @@ export function stateSemanticDigest(db: Database): StateSemanticDigest {
   }
 }
 
+interface ManifestMetaRow {
+  base_generation: number; enc_manifest_sha: Uint8Array; manifest_hash: Uint8Array;
+  account_epoch: number; key_epoch: number; chain_bytes: number; snapshot_bytes: number;
+  extras_cjson: string | null;
+}
+
+/** `extras` is ABSENT when the row carried none: the digest frames key
+ * presence, so an explicit undefined would be a different value. */
+function hashedManifestMeta(meta: ManifestMetaRow): JsonObject {
+  const hashed: JsonObject = {
+    baseGeneration: meta.base_generation,
+    encManifestSha: Buffer.from(meta.enc_manifest_sha).toString("hex"),
+    manifestHash: Buffer.from(meta.manifest_hash).toString("hex"),
+    accountEpoch: meta.account_epoch,
+    keyEpoch: meta.key_epoch,
+    chainBytes: meta.chain_bytes,
+    snapshotBytes: meta.snapshot_bytes,
+  };
+  if (meta.extras_cjson !== null) hashed.extras = parseCanonicalJson(meta.extras_cjson);
+  return hashed;
+}
+
 function projectSemanticDigest(db: Database, statements: DigestStatements): StateSemanticDigest {
   const hash = domainHash("state-semantic-v1");
+  // The column keeps its durable name; only the read alias is a code symbol
+  // (docs/wire-rename-candidates.md). The DIGEST TOKEN below is framed into the
+  // hash and can never be renamed without a new grammar.
   const completion = statements.one<{
-    source_shape_flags_cjson: string; source_repo_records_present: number;
-  }>(db, `SELECT source_shape_flags_cjson,source_repo_records_present
+    presence_flags_cjson: string; source_repo_records_present: number;
+  }>(db, `SELECT source_shape_flags_cjson AS presence_flags_cjson,source_repo_records_present
     FROM migration_completion WHERE singleton=1`);
   if (!completion) throw new Error("state semantic digest requires migration_completion singleton");
-  tokens(hash, "source-shape-flags", parseCanonicalJson(completion.source_shape_flags_cjson));
+  tokens(hash, "source-shape-flags", parseCanonicalJson(completion.presence_flags_cjson));
   tokens(hash, "source-repo-records-present", completion.source_repo_records_present === 1);
   const lineage = statements.one<LegacyLineageRow>(db, `SELECT l.* FROM state_lineage l JOIN store_meta m
     ON m.active_lineage_id=l.lineage_id WHERE m.singleton=1`)!;
@@ -92,21 +118,9 @@ function projectSemanticDigest(db: Database, statements: DigestStatements): Stat
       WHERE p.lineage_id=? AND p.plane=? ORDER BY p.path_order`, [lineageId, plane],
     (row) => tokens(hash, `${plane}-file`, decodeFileEntry(row)));
   }
-  const meta = statements.one<{
-    base_generation: number; enc_manifest_sha: Uint8Array; manifest_hash: Uint8Array;
-    account_epoch: number; key_epoch: number; chain_bytes: number; snapshot_bytes: number;
-    extras_cjson: string | null;
-  }>(db, "SELECT * FROM global_manifest_meta WHERE lineage_id=?", lineageId);
-  tokens(hash, "manifest-meta", meta ? {
-    baseGeneration: meta.base_generation,
-    encManifestSha: Buffer.from(meta.enc_manifest_sha).toString("hex"),
-    manifestHash: Buffer.from(meta.manifest_hash).toString("hex"),
-    accountEpoch: meta.account_epoch,
-    keyEpoch: meta.key_epoch,
-    chainBytes: meta.chain_bytes,
-    snapshotBytes: meta.snapshot_bytes,
-    ...(meta.extras_cjson === null ? {} : { extras: parseCanonicalJson(meta.extras_cjson) }),
-  } : undefined);
+  const meta = statements.one<ManifestMetaRow>(db,
+    "SELECT * FROM global_manifest_meta WHERE lineage_id=?", lineageId);
+  tokens(hash, "manifest-meta", meta === null ? undefined : hashedManifestMeta(meta));
   statements.each<{ ordinal: number; enc_sha: Uint8Array }>(
     db, "SELECT ordinal,enc_sha FROM manifest_chain WHERE lineage_id=? ORDER BY ordinal", [lineageId],
     (row) => tokens(hash, "manifest-chain", { ordinal: row.ordinal, encSha: Buffer.from(row.enc_sha).toString("hex") }));
@@ -131,7 +145,7 @@ function projectSemanticDigest(db: Database, statements: DigestStatements): Stat
 /** The same grammar, walked over the row plan instead of the tables. */
 export function legacyStateSemanticDigest(plan: NormalizedLegacyState): StateSemanticDigest {
   const hash = domainHash("state-semantic-v1");
-  tokens(hash, "source-shape-flags", plan.shapeFlags);
+  tokens(hash, "source-shape-flags", plan.presenceFlags);
   tokens(hash, "source-repo-records-present", plan.repoRecordsPresent);
   tokens(hash, "lineage", plan.lineage);
   tokens(hash, "base-head", plan.baseHead);

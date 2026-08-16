@@ -22,7 +22,7 @@ import {
 import { projectGitDeferralRepos } from "./status-view.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { RBOX_DIR } from "./workspace-config.js";
-import type { JsonValue } from "../json.js";
+import { jsonText, type JsonValue } from "../json.js";
 
 /** One field read out of the parsed sidecar: a JSON value, or absent. The file
  *  is daemon-written but user-editable, so every slot is validated on read. */
@@ -131,27 +131,28 @@ const shellLinePath = (root: string) => path.join(root, RBOX_DIR, "state", "shel
 export async function loadActivity(root: string): Promise<DaemonActivity | undefined> {
   try {
     const raw = JSON.parse(await fs.readFile(activityPath(root), "utf8")) as Partial<DaemonActivity>;
-    if (typeof raw?.at !== "string") return undefined;
-    const num = (v: JsonField): v is number => typeof v === "number" && Number.isFinite(v);
+    if (!jsonText(raw?.at)) return undefined;
+    const num = (v: JsonField): v is number => Number.isFinite(v);
+    const flag = (v: JsonField): v is boolean => v === true || v === false;
     const uint = (v: JsonField): v is number => Number.isInteger(v) && (v as number) >= 0;
     const positiveInt = (v: JsonField): v is number => Number.isInteger(v) && (v as number) > 0;
-    const timestamp = (v: JsonField): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
+    const timestamp = (v: JsonField): v is string => jsonText(v) && Number.isFinite(Date.parse(v));
     const a: DaemonActivity = { at: raw.at };
     const local = raw.local;
     if (
       local &&
-      typeof local.at === "string" &&
-      typeof local.stream === "string" &&
+      jsonText(local.at) &&
+      jsonText(local.stream) &&
       uint(local.baseSequence) &&
       uint(local.trackedFiles) &&
       uint(local.added) &&
       uint(local.changed) &&
       uint(local.deleted) &&
-      typeof local.settled === "boolean" &&
+      flag(local.settled) &&
       (local.strandedIgnored === undefined || uint(local.strandedIgnored)) &&
       local.sourceVersion === 1
     ) {
-      a.local = {
+      const decoded: NonNullable<DaemonActivity["local"]> = {
         at: local.at,
         stream: local.stream,
         baseSequence: local.baseSequence,
@@ -160,47 +161,49 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         changed: local.changed,
         deleted: local.deleted,
         settled: local.settled,
-        ...(local.strandedIgnored === undefined ? {} : { strandedIgnored: local.strandedIgnored }),
         sourceVersion: 1,
       };
+      if (local.strandedIgnored !== undefined) decoded.strandedIgnored = local.strandedIgnored;
+      a.local = decoded;
     }
     const ws = raw.ws;
     if (
       ws &&
-      typeof ws.connected === "boolean" &&
-      typeof ws.at === "string" &&
-      typeof ws.caughtUp === "boolean" &&
-      typeof ws.bootId === "string" &&
+      flag(ws.connected) &&
+      jsonText(ws.at) &&
+      flag(ws.caughtUp) &&
+      jsonText(ws.bootId) &&
       ws.bootId.length > 0 &&
       positiveInt(ws.pid) &&
       (ws.lastBroadcastSequence === undefined || uint(ws.lastBroadcastSequence))
     ) {
-      a.ws = {
+      const decoded: NonNullable<DaemonActivity["ws"]> = {
         connected: ws.connected,
         at: ws.at,
         caughtUp: ws.caughtUp,
         bootId: ws.bootId,
         pid: ws.pid,
-        ...(ws.lastBroadcastSequence !== undefined ? { lastBroadcastSequence: ws.lastBroadcastSequence } : {}),
       };
+      if (ws.lastBroadcastSequence !== undefined) decoded.lastBroadcastSequence = ws.lastBroadcastSequence;
+      a.ws = decoded;
     }
     const push = raw.lastPush;
-    if (push && typeof push.at === "string" && num(push.files) && num(push.sequence)) {
+    if (push && jsonText(push.at) && num(push.files) && num(push.sequence)) {
       a.lastPush = { at: push.at, files: push.files, sequence: push.sequence };
     }
     const pull = raw.lastPull;
-    if (pull && typeof pull.at === "string" && num(pull.writes) && num(pull.deletes) && num(pull.conflicts)) {
+    if (pull && jsonText(pull.at) && num(pull.writes) && num(pull.deletes) && num(pull.conflicts)) {
       a.lastPull = { at: pull.at, writes: pull.writes, deletes: pull.deletes, conflicts: pull.conflicts };
     }
     const act = raw.active;
-    if (act && typeof act.at === "string" && isTransferPhase(act.phase) && num(act.done) && num(act.total)) {
+    if (act && jsonText(act.at) && isTransferPhase(act.phase) && num(act.done) && num(act.total)) {
       a.active = {
         at: act.at,
         phase: act.phase,
         done: act.done,
         total: act.total,
-        ...(typeof act.detail === "string" ? { detail: act.detail } : {}),
       };
+      if (jsonText(act.detail)) a.active.detail = act.detail;
       if (
         uint(act.bytesDone) &&
         (act.bytesTotal === undefined || (positiveInt(act.bytesTotal) && act.bytesDone <= act.bytesTotal))
@@ -208,46 +211,42 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         a.active.bytesDone = act.bytesDone;
         if (act.bytesTotal !== undefined) a.active.bytesTotal = act.bytesTotal;
       }
-      if (typeof act.bytesPerSecond === "number" && Number.isFinite(act.bytesPerSecond) && act.bytesPerSecond > 0) {
+      if (num(act.bytesPerSecond) && act.bytesPerSecond > 0) {
         a.active.bytesPerSecond = act.bytesPerSecond;
       }
       if (uint(act.etaSeconds)) a.active.etaSeconds = act.etaSeconds;
     }
     const parseHalt = (halt: DaemonRecoveryHalt | undefined, requiredOp?: DaemonRecoveryHalt["op"]): DaemonRecoveryHalt | undefined => {
-      if (!halt || !timestamp(halt.at) || typeof halt.reason !== "string" || !positiveInt(halt.count)
+      if (!halt || !timestamp(halt.at) || !jsonText(halt.reason) || !positiveInt(halt.count)
         || !(halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")
         || (requiredOp !== undefined && halt.op !== requiredOp)) return undefined;
-      const terminal = halt.terminal;
-      return {
+      const decoded: DaemonRecoveryHalt = {
         at: halt.at,
         reason: halt.reason,
         count: halt.count,
         op: halt.op,
-        ...(timestamp(halt.firstFailureAt) ? { firstFailureAt: halt.firstFailureAt } : {}),
-        ...(timestamp(halt.lastFailureAt) ? { lastFailureAt: halt.lastFailureAt } : {}),
-        ...(positiveInt(halt.consecutiveFailures) ? { consecutiveFailures: halt.consecutiveFailures } : {}),
-        ...(timestamp(halt.nextProbeAt) ? { nextProbeAt: halt.nextProbeAt } : {}),
-        ...(timestamp(halt.lastProbeAt) ? { lastProbeAt: halt.lastProbeAt } : {}),
-        ...(halt.recoveryState === "armed" || halt.recoveryState === "running" || halt.recoveryState === "suspended"
-          ? { recoveryState: halt.recoveryState }
-          : {}),
-        ...(halt.typedReason?.kind === "mass-delete" && (halt.typedReason.op === "pull" || halt.typedReason.op === "push")
-          ? { typedReason: { kind: "mass-delete" as const, op: halt.typedReason.op } }
-          : halt.typedReason?.kind === "push-conflict"
-            ? { typedReason: { kind: "push-conflict" as const } }
-          : halt.typedReason?.kind === "chain-repair"
-            ? { typedReason: { kind: "chain-repair" as const } }
-          : halt.typedReason?.kind === "too-many-refs"
-            ? { typedReason: { kind: "too-many-refs" as const } }
-            : halt.typedReason?.kind === "body-too-large"
-              ? { typedReason: { kind: "body-too-large" as const } }
-              : halt.typedReason?.kind === "folder-admission"
-                ? { typedReason: { kind: "folder-admission" as const } }
-              : {}),
-        ...(terminal && typeof terminal.fingerprint === "string" && terminal.fingerprint.length > 0
-          ? { terminal: { fingerprint: terminal.fingerprint } }
-          : {}),
       };
+      if (timestamp(halt.firstFailureAt)) decoded.firstFailureAt = halt.firstFailureAt;
+      if (timestamp(halt.lastFailureAt)) decoded.lastFailureAt = halt.lastFailureAt;
+      if (positiveInt(halt.consecutiveFailures)) decoded.consecutiveFailures = halt.consecutiveFailures;
+      if (timestamp(halt.nextProbeAt)) decoded.nextProbeAt = halt.nextProbeAt;
+      if (timestamp(halt.lastProbeAt)) decoded.lastProbeAt = halt.lastProbeAt;
+      if (halt.recoveryState === "armed" || halt.recoveryState === "running" || halt.recoveryState === "suspended") {
+        decoded.recoveryState = halt.recoveryState;
+      }
+      const typedReason = halt.typedReason;
+      if (typedReason?.kind === "mass-delete" && (typedReason.op === "pull" || typedReason.op === "push")) {
+        decoded.typedReason = { kind: "mass-delete", op: typedReason.op };
+      } else if (typedReason?.kind === "push-conflict") decoded.typedReason = { kind: "push-conflict" };
+      else if (typedReason?.kind === "chain-repair") decoded.typedReason = { kind: "chain-repair" };
+      else if (typedReason?.kind === "too-many-refs") decoded.typedReason = { kind: "too-many-refs" };
+      else if (typedReason?.kind === "body-too-large") decoded.typedReason = { kind: "body-too-large" };
+      else if (typedReason?.kind === "folder-admission") decoded.typedReason = { kind: "folder-admission" };
+      const terminal = halt.terminal;
+      if (terminal && jsonText(terminal.fingerprint) && terminal.fingerprint.length > 0) {
+        decoded.terminal = { fingerprint: terminal.fingerprint };
+      }
+      return decoded;
     };
     const halt = parseHalt(raw.halt);
     if (halt) a.halt = halt;
@@ -256,19 +255,17 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const out = raw.outOfStorage;
     if (
       out &&
-      typeof out.at === "string" &&
+      jsonText(out.at) &&
       (out.kind === "storage" || out.kind === "workspaces") &&
       (out.used === undefined || num(out.used)) &&
       (out.cap === undefined || num(out.cap)) &&
       (out.reason === undefined || out.reason === "no_plan")
     ) {
-      a.outOfStorage = {
-        at: out.at,
-        kind: out.kind,
-        ...(out.used !== undefined ? { used: out.used } : {}),
-        ...(out.cap !== undefined ? { cap: out.cap } : {}),
-        ...(out.reason === "no_plan" ? { reason: out.reason } : {}),
-      };
+      const decoded: NonNullable<DaemonActivity["outOfStorage"]> = { at: out.at, kind: out.kind };
+      if (out.used !== undefined) decoded.used = out.used;
+      if (out.cap !== undefined) decoded.cap = out.cap;
+      if (out.reason === "no_plan") decoded.reason = out.reason;
+      a.outOfStorage = decoded;
     }
     return a;
   } catch {

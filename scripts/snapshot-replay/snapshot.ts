@@ -33,6 +33,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {type SyncState} from "../../src/cli/sync-state-model.js";
 import { repoRecordsForState } from "../../src/cli/sync-state-records.js";
+import { jsonText } from "../../src/json.js";
 import { RBOX_DIR, type WorkspaceConfig } from "../../src/cli/workspace-config.js";
 import type { LastWriterWitness } from "../../src/cli/state-plane/migration/last-writer-witness.js";
 import { sandboxLayout, SNAPSHOT_EXCLUDES, type SnapshotReport } from "./layout.js";
@@ -89,7 +90,12 @@ function copyRbox(sourceRbox: string, destRbox: string): void {
  * tear. The double copy is what rules out a snapshot that straddles two
  * revisions ACROSS files, which is the failure a live daemon actually produces.
  */
-function stableCopy(sourceRbox: string, stageRbox: string, keepRbox: string): { attempts: number; entries: Entry[] } {
+interface StableCopy {
+  attempts: number;
+  entries: Entry[];
+}
+
+function stableCopy(sourceRbox: string, stageRbox: string, keepRbox: string): StableCopy {
   let previous: string | undefined;
   for (let attempt = 1; attempt <= MAX_COPY_ATTEMPTS; attempt++) {
     copyRbox(sourceRbox, attempt % 2 === 1 ? stageRbox : keepRbox);
@@ -143,7 +149,7 @@ function repointConfig(ws: string, fixups: string[]): void {
   const file = path.join(ws, RBOX_DIR, "workspace.json");
   if (!fs.existsSync(file)) return;
   const config = JSON.parse(fs.readFileSync(file, "utf8")) as WorkspaceConfig;
-  if (typeof config.rootPath !== "string" || config.rootPath === ws) return;
+  if (!jsonText(config.rootPath) || config.rootPath === ws) return;
   const before = config.rootPath;
   fs.writeFileSync(file, `${JSON.stringify({ ...config, rootPath: ws }, null, 2)}\n`);
   fixups.push(`workspace.json rootPath repointed from ${before} to the sandbox`);
@@ -152,7 +158,12 @@ function repointConfig(ws: string, fixups: string[]): void {
 /** One empty `.git` directory per repo the legacy state names, so
  * `inspectInventory` can resolve an identity for each and the fence has
  * something inside the sandbox to lock. */
-function stubRepos(source: string, ws: string, state: SyncState): { stubs: number; pointers: string[] } {
+interface RepoStubs {
+  stubs: number;
+  pointers: string[];
+}
+
+function stubRepos(source: string, ws: string, state: SyncState): RepoStubs {
   const pointers: string[] = [];
   let stubs = 0;
   for (const relPath of Object.keys(repoRecordsForState(state)).sort()) {

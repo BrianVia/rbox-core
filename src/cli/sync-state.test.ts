@@ -52,11 +52,20 @@ const section = (id: string): GitSection => ({
   refScope: "all",
   generatedAt: "",
 });
-const manifest = (name: string, gitRepos?: Record<string, GitSection>): Manifest => ({
-  generatedAt: name,
-  files: [],
-  ...(gitRepos ? { manifestSchema: 2, gitRepos } : {}),
-});
+const manifest = (name: string, gitRepos?: Record<string, GitSection>): Manifest => {
+  const built: Manifest = { generatedAt: name, files: [] };
+  if (gitRepos) {
+    built.manifestSchema = 2;
+    built.gitRepos = gitRepos;
+  }
+  return built;
+};
+
+/** A record written by <=1.7.18, which still carried a resolution intent. */
+type PreDesign177RepoRecord = RepoRecord & {
+  resolutionIntent: { v: number; verb: string; snapshot: string };
+};
+
 const baseState = (records: Record<string, RepoRecord> = {}): SyncState => ({
   stream,
   stateNonce: nonce,
@@ -148,15 +157,13 @@ describe("design 93 §6 transactional unit", () => {
   }
 
   test("design 177 strips a <=1.7.18 intent and an unrelated repository save drops it from disk", async () => {
-    const raw = baseState({
-      old: {
-        repoGen: 1,
-        sourceSeq: 0,
-        pending: section("pending"),
-        resolutionIntent: { v: 1, verb: "keep-mine", snapshot: "obsolete" },
-      } as unknown as RepoRecord,
-      other: { repoGen: 0, sourceSeq: 0 },
-    });
+    const stripped: PreDesign177RepoRecord = {
+      repoGen: 1,
+      sourceSeq: 0,
+      pending: section("pending"),
+      resolutionIntent: { v: 1, verb: "keep-mine", snapshot: "obsolete" },
+    };
+    const raw = baseState({ old: stripped, other: { repoGen: 0, sourceSeq: 0 } });
     await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
     await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(raw));
 

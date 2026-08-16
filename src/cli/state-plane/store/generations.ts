@@ -8,7 +8,7 @@
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { encodeFileEntry, encodeFileEntryForStage } from "../codecs/file-entry.js";
+import { encodeFileEntry, encodeFileEntryForStage, fileEntryFromCanonical } from "../codecs/file-entry.js";
 import { encodeGitSection } from "../codecs/git-section.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { StageDigestBuilder, type StageCounts } from "../digest/stage-semantic-v1.js";
@@ -214,7 +214,7 @@ class SqliteGenerationBuilder implements GenerationBuilder {
         [this.stageId], (row) => {
           // Re-encode rather than trust the stored bytes: the digest must cover a
           // value this store would itself admit, in this store's canonical spelling.
-          const encoded = encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry);
+          const encoded = encodeFileEntry(fileEntryFromCanonical(row.entry_cjson));
           if (encoded.canonical !== row.entry_cjson || encoded.path !== row.path) {
             throw new StageChangedError(this.stageId, `stage row ${row.path} is not canonical`);
           }

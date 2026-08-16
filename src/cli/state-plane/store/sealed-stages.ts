@@ -6,7 +6,7 @@
  * column. The verified sealed header is part of the ref, which is what makes it
  * the header that later commits to authority. */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import type { JsonObject, JsonValue } from "../../../json.js";
+import { jsonObject, jsonText, type JsonObject, type JsonValue } from "../../../json.js";
 import {
   decodeFileEntry, encodeFileEntry, encodeFileEntryForConsume,
   type ConsumedFileEntry, type EncodedFileEntry,
@@ -121,9 +121,7 @@ function deriveStageRef(
 }
 
 /** The one container test every persisted-bytes decode in this seam shares. */
-function jsonObject(value: JsonValue): JsonObject | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
-}
+const sealedObject = (value: JsonValue): JsonObject | undefined => (jsonObject(value) ? value : undefined);
 
 /**
  * The persisted spelling of a sealed stage's own metadata. `stage-semantic-v1`
@@ -133,9 +131,9 @@ function jsonObject(value: JsonValue): JsonObject | undefined {
  * members these rules cannot see ride along exactly as they were sealed.
  */
 function isManifestHeader(value: JsonValue): value is JsonObject & ManifestHeader {
-  const object = jsonObject(value);
+  const object = sealedObject(value);
   return object !== undefined
-    && typeof object.generatedAt === "string" && typeof object.complete === "boolean";
+    && jsonText(object.generatedAt) && (object.complete === true || object.complete === false);
 }
 
 function decodeSealedHeader(stageId: string, text: string): ManifestHeader {
@@ -147,9 +145,10 @@ function decodeSealedHeader(stageId: string, text: string): ManifestHeader {
 }
 
 function isStageCounts(value: JsonValue): value is JsonObject & StageCounts {
-  const object = jsonObject(value);
+  const object = sealedObject(value);
+  // Non-finite numbers cannot be persisted: canonical JSON refuses them.
   return object !== undefined
-    && typeof object.files === "number" && typeof object.gitSections === "number";
+    && Number.isFinite(object.files) && Number.isFinite(object.gitSections);
 }
 
 function decodeSealedCounts(stageId: string, text: string): StageCounts {
@@ -163,7 +162,7 @@ function decodeSealedCounts(stageId: string, text: string): StageCounts {
 /** A stage entry's persisted canonical bytes. `encodeFileEntry`'s admission is
  * the validator; only the JSON object container is re-established here. */
 function isFileEntry(value: JsonValue): value is JsonObject & FileEntry {
-  return jsonObject(value) !== undefined;
+  return sealedObject(value) !== undefined;
 }
 
 function decodeStageEntryBytes(text: string): FileEntry {
@@ -289,11 +288,10 @@ export function boundedStream<Row, Out>(
     last = key(row);
     return true;
   });
-  return {
-    rows,
-    done: !stoppedOnBytes && yielded < batchSize,
-    ...(last === undefined ? {} : { after: last }),
-  };
+  const page: CursorPage<Out> = { rows, done: !stoppedOnBytes && yielded < batchSize };
+  // `after` is ABSENT rather than undefined: callers test key presence.
+  if (last !== undefined) page.after = last;
+  return page;
 }
 
 function assertWindow(kind: "file" | "git", batchSize: number, maximum: number): void {

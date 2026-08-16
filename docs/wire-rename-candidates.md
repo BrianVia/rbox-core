@@ -99,3 +99,34 @@ Format: field — file:line — suggested name — blast radius.
   in-repo consumer matches on it today, but any captured log or support
   transcript spells it the old way; flip it with the next diagnostics-grammar
   change. The class and every import were renamed to `EntryStructureError`.
+
+## `source_shape_flags_cjson` (migration completion presence bits)
+
+- **Anchor:** the `migration_completion.source_shape_flags_cjson` durable column
+  (`src/cli/state-plane/schema/`), written by
+  `sourcePresenceFlagsCjson(...)` and read by `manifestGitReposWasPresent`.
+- **Suggested name:** `source_presence_flags_cjson` — the value is a set of
+  "did the source document carry this member" bits, not a schema shape.
+- **Blast radius:** the durable column on every migrated store, plus the
+  `state-semantic-v1` digest token `"source-shape-flags"`, which is FRAMED INTO
+  THE HASH — renaming the token changes every legacy-import digest and would
+  break the migration's JSON-vs-SQL differential. Needs a grammar version, not
+  a rename.
+- **Status:** design 269 renamed the TypeScript symbols around it
+  (`SourcePresenceFlags`, `sourcePresenceFlags`, `plan.presenceFlags`) per the
+  2026-08-15 code-symbol ruling. The column and the digest token stay.
+
+## `mismatches.baseShape` (P-repair trigger contract)
+
+- **Anchor:** `src/cli/sync-git/p-repair.ts:160` and
+  `src/cli/sync-git/standing-branch-proof.ts:78`; call sites in
+  `src/cli/reset-state.ts`, `src/cli/git/resolve-command.ts`, and three suites.
+- **Suggested name:** `baseRefs` or `baseMismatch` — the bit says the standing
+  proof's base refs disagree, not that a "shape" is off.
+- **Blast radius:** in-memory only, BUT it feeds `pRepairReason`, which maps it
+  to the durable receipt reason `"base-shape-mismatch"` persisted inside
+  `GitPartialApply.pRepaired`. The member can be renamed on its own; the reason
+  string cannot without a receipt-compat story, and renaming only half would
+  leave the two spellings disagreeing.
+- **Status:** deliberately NOT renamed by design 269's lint sweep — a
+  cross-module contract owned by the git plane, out of that fold's scope.

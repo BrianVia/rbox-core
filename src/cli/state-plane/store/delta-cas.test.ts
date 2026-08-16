@@ -90,6 +90,9 @@ function sealDelta(
   return builder.finishDeltaStage({ upserts, deletes, resultFiles });
 }
 
+/** A complete stage dressed as a delta ref: its logical digest is the wrong grammar. */
+type ForgedDeltaStageRef = Omit<SealedDeltaStageRef, "logicalDigest"> & Pick<SealedStageRef, "logicalDigest">;
+
 function sealComplete(stages: string, files: readonly FileEntry[]): SealedStageRef {
   const builder = beginGeneration(stages, "base", HEADER);
   builder.putEntries([...files]);
@@ -399,13 +402,15 @@ test("a complete stage offered as a delta is refused in this seam's own taxonomy
   const complete = sealComplete(under.stages, BASE);
   const token = openReadSnapshot(under.handle).token;
   // A `stage-semantic-v1` artifact has no delta_meta table at all.
-  const offered = { ...complete, binding: liveBinding(under.handle), counts: { upserts: 0, deletes: 0, resultFiles: 3 } };
+  const offered: ForgedDeltaStageRef = {
+    ...complete, binding: liveBinding(under.handle), counts: { upserts: 0, deletes: 0, resultFiles: 3 },
+  };
 
   expect(() => applyCasPacket(under.handle, under.stages, {
     expected: expectation(token),
     sourceGlobalSeq: 6,
     globalDelta: {
-      stage: offered as unknown as SealedDeltaStageRef,
+      stage: offered as SealedDeltaStageRef,
       fileHeader: complete.header,
       binding: offered.binding,
     },
