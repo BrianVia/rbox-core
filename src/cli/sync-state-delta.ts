@@ -9,9 +9,8 @@
 import type { FileEntry } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
 
-/** The predecessor a delta is relative to. The exact shape an ElisionReceipt
- * already ships: an accepted CAS of any kind bumps `stateRevision`, so revision
- * equality proves no writer interleaved since the composer's load. */
+/** An accepted CAS of any kind bumps `stateRevision`, so revision equality
+ * proves no writer interleaved since the composer's load. */
 export interface DeltaBinding { nonce: string; stateRevision: number }
 
 /** One file-level change against the predecessor manifest. */
@@ -19,8 +18,7 @@ export type DeltaOp =
   | { kind: "upsert"; entry: FileEntry }
   | { kind: "delete"; path: string };
 
-/** A composed global as ops against a bound predecessor. Ops are in strictly
- * ascending path order and no path appears twice across both kinds. */
+/** Ops are strictly ascending by path; no path appears twice across kinds. */
 export interface GlobalDelta {
   binding: DeltaBinding;
   ops: readonly DeltaOp[];
@@ -31,10 +29,8 @@ export interface GlobalDelta {
  * Mac field close-out. */
 export const saveDeltaEnabled = (): boolean => process.env.RBOX_SAVE_DELTA !== "0";
 
-/** Streams whose durable base the idle audit found drifted (§2.4). Keyed by
- * stream: one process may hold several, and one workspace's drift is no reason
- * to make another rewrite its whole manifest. Lost on restart, re-derived by
- * the next audit — exactly like the observation that filled it. */
+/** Keyed by stream: one process may hold several workspaces, and drift in one
+ * is no reason to make another rewrite its manifest (§2.4). */
 const driftedStreams = new Set<string>();
 
 export const observeGlobalContentDrift = (stream: string): void => { driftedStreams.add(stream); };
@@ -60,11 +56,8 @@ export interface DeltaEligibility {
   replacesStream?: boolean;
 }
 
-/**
- * The predecessor a delta may bind to, or `undefined` when this save must carry
- * a whole manifest. Genesis, first save, reset, repair, migration, scoped bases,
- * a standing drift heal, and the kill switch all land here.
- */
+/** Undefined means this save must carry a whole manifest: genesis, first save,
+ * reset, repair, migration, scoped bases, a standing heal, the kill switch. */
 export function deltaBindingFor(
   snapshot: BindableSnapshot,
   source: DeltaEligibility,
@@ -86,11 +79,8 @@ const strictlyAscending = (files: readonly FileEntry[]): boolean => {
   return true;
 };
 
-/**
- * The one merge walk. Returns `undefined` when either side is not strictly
- * ascending by path — the delta grammar's ordering rule is a property of the
- * inputs, never something this composer repairs silently.
- */
+/** Undefined when either side is not strictly ascending: the grammar's ordering
+ * rule is a property of the inputs, never repaired silently here. */
 export function composeGlobalDelta(
   previous: readonly FileEntry[],
   next: readonly FileEntry[],
@@ -120,11 +110,8 @@ export function composeGlobalDelta(
   return { binding, ops };
 }
 
-/**
- * The reference semantic of `stage-delta-v1`'s ops, in the same shape the store
- * applies them: only named paths move, and a delete of an absent path is a
- * refusal rather than a silent no-op.
- */
+/** The store's semantic, in one place: only named paths move, and a delete of
+ * an absent path is a refusal rather than a silent no-op. */
 export function applyDeltaOps(previous: readonly FileEntry[], ops: readonly DeltaOp[]): FileEntry[] {
   const result: FileEntry[] = [];
   let index = 0;

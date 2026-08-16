@@ -10,13 +10,15 @@ import crypto from "node:crypto";
 import type { FileEntry } from "../../../engine/index.js";
 import type { DeltaBinding } from "../../sync-state-delta.js";
 import { encodeFileEntryForConsume, type ConsumedFileEntry } from "../codecs/file-entry.js";
-import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
+import { jsonCounter, jsonText } from "../../../json.js";
+import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import {
   StageDeltaDigestBuilder, type DeltaCounts, type StageDeltaLogicalDigest,
 } from "../digest/stage-delta-v1.js";
 import { StageChangedError } from "../errors.js";
 import type { ManifestHeader, Plane } from "../ports.js";
 import { PAGE_BYTES } from "./sealed-stages.js";
+import { isJsonObject } from "./transition-stages.js";
 import {
   PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, openSealedArtifact,
   sealAndPublish, sealedStagePath,
@@ -126,7 +128,8 @@ class SqliteDeltaStageBuilder implements DeltaStageBuilder {
   finishDeltaStage(expectedCounts: DeltaCounts): SealedDeltaStageRef {
     this.#assertOpen();
     try {
-      const logicalDigest = this.#digest.seal(expectedCounts);
+      const digest = process.env.RBOX_STATE_VERIFY_STAGE === "1" ? this.#verifiedDigest() : this.#digest;
+      const logicalDigest = digest.seal(expectedCounts);
       runStatement(this.db, "UPDATE delta_meta SET state='sealed',digest=?,counts_cjson=? WHERE stage_id=?",
         logicalDigest, canonicalJson(expectedCounts), this.stageId);
       this.db.exec("COMMIT");
@@ -148,14 +151,32 @@ class SqliteDeltaStageBuilder implements DeltaStageBuilder {
     }
   }
 
+  /** Re-derive from the persisted rows, in the order a consumer reads them. */
+  #verifiedDigest(): StageDeltaDigestBuilder {
+    const digest = new StageDeltaDigestBuilder(this.stageId, this.plane, this.header, this.binding);
+    streamRows<{ path: string; kind: string; entry_cjson: string | null }>(
+      this.db, "SELECT path,kind,entry_cjson FROM delta_ops WHERE stage_id=? ORDER BY path_order",
+      [this.stageId], (row) => {
+        if (row.kind === "delete") {
+          digest.delete(row.path);
+          return;
+        }
+        const encoded = encodeFileEntryForConsume(parseCanonicalJson(row.entry_cjson!) as unknown as FileEntry);
+        if (encoded.canonical !== row.entry_cjson || encoded.path !== row.path) {
+          throw new StageChangedError(this.stageId, `delta row ${row.path} is not canonical`);
+        }
+        digest.upsert(encoded.path, encoded.canonical);
+      });
+    return digest;
+  }
+
   discardDeltaStage(): void {
     if (!this.#open) return;
     this.#open = false;
     abandonBuilder(this.db, this.lock, this.privateDirectory);
   }
 
-  /** One ordered op sequence: strictly ascending across BOTH kinds, so a
-   * duplicated or reordered path is refused before any row exists. */
+  /** Strictly ascending across BOTH kinds, refused before any row exists. */
   #admitPath(path: string, rowBytes: number): void {
     this.#assertOpen();
     if (this.#lastPath !== undefined && this.#lastPath >= path) {
@@ -195,11 +216,8 @@ interface DeltaMetaRow {
   header_cjson: string; binding_cjson: string; digest: string; counts_cjson: string;
 }
 
-/**
- * Verify and open one sealed delta under its own id-scoped lock. Metadata is
- * proven before any op is yielded; the ops themselves are proven by the fused
- * digest at end-of-stream, before the consumer's copy can reach authority.
- */
+/** Metadata is proven before any op is yielded; the ops themselves at
+ * end-of-stream, before the consumer's copy can reach authority. */
 export function openSealedDeltaStageForConsume(
   directory: string,
   ref: SealedDeltaStageRef,
@@ -207,9 +225,10 @@ export function openSealedDeltaStageForConsume(
 ): ConsumedDeltaReader {
   const accessor = openSealedArtifact(directory, ref, lock);
   try {
-    const meta = selectRow<DeltaMetaRow>(accessor.db,
-      "SELECT stage_id,plane,state,header_cjson,binding_cjson,digest,counts_cjson FROM delta_meta");
-    if (!meta || meta.stage_id !== ref.stageId || meta.state !== "sealed") {
+    // An artifact of another kind has no delta_meta at all; that is a refusal
+    // in this seam's own taxonomy, never a raw SQLite error escaping it.
+    const meta = deltaMetaOf(accessor.db, ref.stageId);
+    if (meta.stage_id !== ref.stageId || meta.state !== "sealed") {
       throw new StageChangedError(ref.stageId, "sealed delta identity does not match its ref");
     }
     // Canonical bytes are a value's ONE spelling, so comparing them to the ref's
@@ -220,9 +239,13 @@ export function openSealedDeltaStageForConsume(
       || meta.counts_cjson !== canonicalJson(ref.counts)) {
       throw new StageChangedError(ref.stageId, "sealed delta metadata does not match its ref");
     }
+    // The binding the consumer compares against is PARSED FROM THE ARTIFACT, so
+    // the two-carrier check has the sealed bytes as its source rather than the
+    // ref it just compared them to (§2.6, r4-F4).
+    const sealedBinding = decodeSealedBinding(ref.stageId, meta.binding_cjson);
     return {
       sealedHeader: ref.header,
-      sealedBinding: ref.binding,
+      sealedBinding,
       resultFiles: ref.counts.resultFiles,
       streamOps(visit: (op: ConsumedDeltaOp) => void): number {
         return streamDeltaOps(accessor.db, ref, visit);
@@ -235,6 +258,27 @@ export function openSealedDeltaStageForConsume(
     try { accessor.close(); } catch { /* the original refusal is the report */ }
     throw error;
   }
+}
+
+function deltaMetaOf(db: Database, stageId: string): DeltaMetaRow {
+  let row: DeltaMetaRow | null;
+  try {
+    row = selectRow<DeltaMetaRow>(db,
+      "SELECT stage_id,plane,state,header_cjson,binding_cjson,digest,counts_cjson FROM delta_meta");
+  } catch (cause) {
+    throw new StageChangedError(stageId, `sealed artifact carries no delta: ${String(cause)}`);
+  }
+  if (!row) throw new StageChangedError(stageId, "sealed delta has no delta_meta row");
+  return row;
+}
+
+/** The sealed predecessor, re-established from the artifact's own bytes. */
+function decodeSealedBinding(stageId: string, text: string): DeltaBinding {
+  const value = parseCanonicalJson(text);
+  if (!isJsonObject(value) || !jsonText(value.nonce) || jsonCounter(value.stateRevision) === undefined) {
+    throw new StageChangedError(stageId, "sealed delta binding is not a predecessor binding");
+  }
+  return { nonce: value.nonce, stateRevision: value.stateRevision as number };
 }
 
 function streamDeltaOps(

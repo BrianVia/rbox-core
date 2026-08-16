@@ -55,10 +55,17 @@ export interface CasDeltaGlobal {
   binding: DeltaBinding;
 }
 
+/** A whole-manifest global: the sealed complete stage and the header it commits. */
+export interface CasCompleteGlobal {
+  stage: SealedStageRef;
+  fileHeader: ManifestHeader;
+  manifestMeta?: GlobalManifestMeta;
+}
+
 export interface CasPacket {
   expected: CasExpectation;
   sourceGlobalSeq: number;
-  global?: { stage: SealedStageRef; fileHeader: ManifestHeader; manifestMeta?: GlobalManifestMeta };
+  global?: CasCompleteGlobal;
   /** Mutually exclusive with `global`: the same global, expressed relatively. */
   globalDelta?: CasDeltaGlobal;
   repoTransitions: SealedRepoTransitionRef;
@@ -133,14 +140,14 @@ export function applyCasPacket(
     }
     // Everything the transaction reads is copied here, out of the verified
     // artifact and the packet scalars, once and for all.
+    const global: CasCompleteGlobal | CasDeltaGlobal | undefined = packet.global ?? packet.globalDelta;
+    const manifestMeta = global?.manifestMeta;
     const frozen: FrozenCasInputs = {
       expected: { ...packet.expected },
       sourceGlobalSeq: packet.sourceGlobalSeq,
-      hasGlobal: packet.global !== undefined || packet.globalDelta !== undefined,
+      hasGlobal: global !== undefined,
       globalHeader: sealedHeader,
-      globalManifestMeta: (packet.global ?? packet.globalDelta)?.manifestMeta === undefined
-        ? undefined
-        : freezeGlobalManifestMeta((packet.global ?? packet.globalDelta)!.manifestMeta!),
+      globalManifestMeta: manifestMeta === undefined ? undefined : freezeGlobalManifestMeta(manifestMeta),
       globalBinding: packet.repoTransitions.globalBinding === undefined
         ? undefined
         : { ...packet.repoTransitions.globalBinding },

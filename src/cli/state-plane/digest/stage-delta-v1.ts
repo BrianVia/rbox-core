@@ -5,8 +5,8 @@ import { canonicalJson, domainHash } from "./codecs.js";
 declare const deltaDigestBrand: unique symbol;
 export type StageDeltaLogicalDigest = string & { readonly [deltaDigestBrand]: "stage-delta-v1" };
 
-/** Every count a sealed delta commits to: how many ops it carries, by kind, and
- * how many files the plane must hold once they are applied. */
+/** What a sealed delta commits to: its op counts, and the file count the plane
+ * must hold once they are applied. */
 export interface DeltaCounts {
   upserts: number;
   deletes: number;

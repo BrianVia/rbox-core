@@ -1,5 +1,4 @@
 import {
-  MAX_GIT_REPOS,
   readManifestChain,
   validateGitRepos,
   type GitSection,
@@ -373,4 +372,3 @@ export interface StateSaveOptions {
   heldLock?: OwnedLock;
 }
 
-export const MAX_LEGACY_GIT_SIDECAR_REPOS = MAX_GIT_REPOS;

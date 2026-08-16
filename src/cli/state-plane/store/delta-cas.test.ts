@@ -1,15 +1,18 @@
 /** Design 269 §2.5/§2.6: the relative-global save shape, its structural refusals,
  * and the negative controls that keep it isolated from the complete path. */
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
-import type { DeltaBinding, DeltaOp, GlobalManifestMeta } from "../../sync-state-model.js";
+import type { GlobalManifestMeta } from "../../sync-state-model.js";
+import type { DeltaBinding, DeltaOp } from "../../sync-state-delta.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
 import { StageChangedError } from "../errors.js";
 import type { CasResult, LineageSnapshot, ManifestHeader } from "../ports.js";
-import { beginDeltaStage, type SealedDeltaStageRef } from "./delta-stages.js";
+import { beginDeltaStage, canonicalBinding, type SealedDeltaStageRef } from "./delta-stages.js";
 import { beginGeneration } from "./generations.js";
 import { createStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
@@ -388,4 +391,57 @@ test("a delta and a forced-complete save of the same result produce identical pl
     .toEqual(loadRawStateFromStore(viaComplete.handle).lastSyncedManifest);
   viaDelta.handle.close();
   viaComplete.handle.close();
+});
+
+test("a complete stage offered as a delta is refused in this seam's own taxonomy", () => {
+  const under = workspace("rbox-delta-wrong-kind-");
+  expect(completeSave(under, BASE, 5).status).toBe("accepted");
+  const complete = sealComplete(under.stages, BASE);
+  const token = openReadSnapshot(under.handle).token;
+  // A `stage-semantic-v1` artifact has no delta_meta table at all.
+  const offered = { ...complete, binding: liveBinding(under.handle), counts: { upserts: 0, deletes: 0, resultFiles: 3 } };
+
+  expect(() => applyCasPacket(under.handle, under.stages, {
+    expected: expectation(token),
+    sourceGlobalSeq: 6,
+    globalDelta: {
+      stage: offered as unknown as SealedDeltaStageRef,
+      fileHeader: complete.header,
+      binding: offered.binding,
+    },
+    repoTransitions: sealTransitions(under.stages, token, complete),
+    ownerToken: OWNER,
+  })).toThrow(StageChangedError);
+  under.handle.close();
+});
+
+test("the sealed binding bytes are the authority, not the ref that names them", () => {
+  const under = workspace("rbox-delta-sealed-binding-");
+  expect(completeSave(under, BASE, 5).status).toBe("accepted");
+  const sealed = liveBinding(under.handle);
+  const packet = deltaPacket(under, [{ kind: "upsert", entry: entry("d.txt", 4) }], 4, { sourceGlobalSeq: 6 });
+  const artifact = sealedStagePath(under.stages, packet.globalDelta!.stage.stageId, packet.globalDelta!.stage.logicalDigest);
+  const forged = { nonce: sealed.nonce, stateRevision: sealed.stateRevision + 1 };
+  const database = new Database(artifact, { readwrite: true });
+  database.exec("PRAGMA journal_mode=DELETE");
+  database.run("UPDATE delta_meta SET binding_cjson=?", canonicalBinding(forged));
+  database.close();
+  const physicalSha256 = createHash("sha256").update(fs.readFileSync(artifact)).digest("hex");
+
+  // Ref still claims the original binding: the artifact's bytes disagree.
+  expect(() => applyCasPacket(under.handle, under.stages, {
+    ...packet,
+    globalDelta: { ...packet.globalDelta!, stage: { ...packet.globalDelta!.stage, physicalSha256 } },
+  })).toThrow(StageChangedError);
+  // Ref updated to the forged binding: the digest covers it, so it still fails.
+  expect(() => applyCasPacket(under.handle, under.stages, {
+    ...packet,
+    globalDelta: {
+      ...packet.globalDelta!,
+      stage: { ...packet.globalDelta!.stage, physicalSha256, binding: forged },
+      binding: forged,
+    },
+  })).toThrow(StageChangedError);
+  expect(planeRows(under.handle).map((row) => row.path)).toEqual(["a.txt", "b.txt", "c.txt"]);
+  under.handle.close();
 });

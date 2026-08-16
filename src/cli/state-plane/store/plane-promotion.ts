@@ -155,14 +155,9 @@ export interface DeltaApplication {
   resultFiles: number;
 }
 
-/**
- * Apply a verified delta's ops to one plane. Only the named paths move: there is
- * no set-difference and no delete-absent statement anywhere on this path, so a
- * delete of a path the plane does not hold is a refusal rather than a silent
- * no-op that would convert base mismatch into success. The upsert carries
- * promotion's `changed_generation` guard, so a recomposed delta re-upserting an
- * already-landed value leaves that row's generation exactly as promotion would.
- */
+/** Only named paths move: no set-difference and no delete-absent statement is
+ * reachable here, so a delete the plane cannot satisfy is a refusal, and the
+ * upsert carries promotion's `changed_generation` guard unchanged. */
 export function applyDeltaOpsIntoPlane(
   db: Database,
   lineageId: string,

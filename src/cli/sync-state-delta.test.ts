@@ -2,7 +2,8 @@
  * op-equivalence that makes the ops and the whole manifest one derivation. */
 import { afterEach, expect, test } from "bun:test";
 import type { FileEntry, Manifest } from "../engine/index.js";
-import type { DeltaOp, SyncState } from "./sync-state-model.js";
+import type { SyncState } from "./sync-state-model.js";
+import type { DeltaOp } from "./sync-state-delta.js";
 import {
   applyDeltaOps, composeGlobalDelta, deltaBindingFor, noteCompleteSaveAccepted,
   observeGlobalContentDrift, resetObservedDriftForTests, saveDeltaEnabled,

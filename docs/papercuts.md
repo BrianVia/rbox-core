@@ -624,3 +624,14 @@ already synced; only HEAD lags). Litter sweeps: `find -name '*.conflict.*'`.
 Agents and orchestrator used `bun test src/cli src/engine` (~550s) for
 final gates when `bun run test:parallel` (6 shards, 145s) exists. Bake
 test:parallel into agent briefs for the one full-suite gate.
+
+## 2026-08-16 — test:parallel hid WHICH test failed
+`scripts/test-parallel.ts` reported a red shard by printing the last 4 lines
+matching `/(pass|fail|skip)/`. A test file that throws before any test runs —
+269's case was a `.test.ts` importing a symbol that had moved modules, which
+typecheck does not cover — prints `# Unhandled error between tests` and NO
+`(fail)` line, so the harness printed ` 1 fail` with no name and no file.
+Cost: ~25 minutes and three full 145s gate runs to identify a one-line import
+fix, including a wrong "cross-shard contention flake" hypothesis (each shard
+passed alone). Fixed here: a failing shard now keeps its raw last-40 lines;
+green shards keep the terse counts.

@@ -56,9 +56,8 @@ function assertPairing(packet: CasPacket): void {
   if (packet.globalDelta) assertDeltaBinding(packet.globalDelta);
 }
 
-/** A delta with no caller-minted binding is structurally inadmissible, and a
- * caller's binding that disagrees with the sealed one is never believed: the
- * value exists in two carriers precisely so neither can be trusted alone. */
+/** Two carriers exist precisely so neither is trusted alone: a missing or
+ * disagreeing binding is inadmissible, never a retryable race. */
 function assertDeltaBinding(delta: CasDeltaGlobal): void {
   const sealed = delta.stage.binding;
   const claimed = delta.binding;

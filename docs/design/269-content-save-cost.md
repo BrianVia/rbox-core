@@ -109,14 +109,18 @@ Heal mechanism, made implementable (r3-M2): when the idle-cycle audit
 fails on a receipt-carrying cycle, that SAME call already composes the
 full packet — the heal is immediate. The only case needing a carrier is
 a content-carrying save under known drift: a process-local daemon flag
-set on audit mismatch, passed as `StateSource.forceCompleteSave?: true`,
-cleared when a complete save is accepted; lost on restart, re-derived by
-the next audit. Zero durable state (ledgered in §8).
+set on audit mismatch and cleared when a complete save is accepted; lost on
+restart, re-derived by the next audit. Zero durable state (ledgered in §8).
+KEYED BY STREAM (implementation): one process may hold several workspaces, and
+one drifted base is no reason to make another rewrite its manifest. The
+implementation carries NO `StateSource` flag — a field with no production
+producer is a requirement with no owner — so the audit is the sole carrier.
 
 | Decision | Statement |
 |---|---|
 | Relative saves | Content saves stop being self-healing rewrites. Audit = the idle-cycle content hash; detection ≈ one idle cycle on daemon hosts, heal immediate-to-next-save. ACCEPT this loss of per-save self-healing, or gate 269 on a stronger audit. |
 | Coverage gap | Receipt-less hosts (CLI-only push users, degraded mutex) and scoped workspaces NEVER run the audit: drift there is undetected while a drifted base feeds the 267 §4 chain (wrong deltas to the server). Bound: 4 external users, all daemon-based today. (Scoped workspaces stay complete-save — pre-existing C4 residual, NO new 269 exposure, booked in §7.) Accept, or require a delta-path audit first. |
+| Retry budget | A content save now spends a recompose attempt on any interleave that moves `stateRevision`, where a complete save previously won outright (equal-sequence saves are admitted by `cas-steps.ts:97`). The budget is 3 and the recompose is cheap, but a hot repo-write lane raises the rejection rate on the content lane. Watch it in the fleet soak; a delta that exhausts the budget throws today. |
 | New digest grammar | `stage-delta-v1` retires 235 §4 / 267 §8's standing "no new digest grammar" — explicit ratification requested. |
 
 ### 2.5 Stage grammar `stage-delta-v1`
@@ -274,8 +278,13 @@ both field lanes. The darwin probe and the field close-out remain open.
   → next zero-action cycle fails the 267 predicate → next save composes
   COMPLETE and heals, byte-compared (the §2.4 trade, pinned end-to-end).
 - Crash: post-seal kill → fresh process verifies the sealed delta
-  (physical hash); kill between accept and stage delete → recovery
-  retires; genesis/reset/scoped pins (complete path).
+  (physical hash, S0, no sidecars). Stage deletion is INLINE after the
+  CAS returns (`write-packet.ts`'s consumed-set loop), and there is no
+  sweeper: a kill in the window between COMMIT and that delete leaks the
+  artifact until an operator removes it. That is the standing behavior of
+  `stage-semantic-v1` too — NO new 269 exposure — and the orphan sweep is
+  booked in §7 rather than built here. Genesis/reset/scoped pins stay on
+  the complete path.
 - Riders: R1 post-seal-crash artifact-verify; R2′ digest-mismatch
   refusal still fires (rows tampered post-seal … caught by physical
   hash; stale digest column caught by fused verify); R3 interned-id
@@ -292,14 +301,34 @@ content-equality authority; own design. State-load cache (267 §5).
 Scoped-workspace drift audit (C4 residual: scoped stays complete-save
 until an audit exists).
 
+Two ledger rows this implementation opened:
+
+- **Sealed-stage cursor reader** (`openSealedStage` / `SealedStageReader`,
+  exported from `store-facade`). R2′ moved both production consumers (the CAS
+  global consume and the LOCAL scan) to the fused single-pass reader, leaving
+  the cursor reader with no production caller. NOT deleted: the two shapes are
+  not mergeable — fused verification needs the WHOLE ordered stream, which a
+  paged random-access cursor by construction never completes, so folding them
+  would weaken the invariant R2′ rests on. It stays as the verify-at-open
+  reader four suites pin refusals through. Owner: this design. Deletion
+  condition: a release in which no consumer (facade export, adapter, or rig)
+  reads a stage by cursor, plus the refusal coverage re-homed onto the fused
+  reader.
+- **Sealed-artifact orphan sweep.** Stage deletion is inline after the CAS
+  returns; a kill in that window leaks a sealed artifact. Pre-existing for
+  every stage kind and unchanged by 269, but 269 makes stages more frequent.
+  Owner: 268's recovery territory. Deletion condition: a sweeper that can
+  prove an artifact belongs to no live interval (the id-scoped lock is the
+  existing primitive), or a measured decision that the leak is acceptable.
+
 ## 8. Concept ledger (honest, r2-B M4)
 
 Added: GlobalDelta/DeltaBinding/DeltaOp types (named, exported), the
 `stage-delta-v1` grammar + its fused verification,
 `cas_delta_upserts`/`cas_delta_deletes` + `applyDeltaOpsIntoPlane` +
 the table-parameterized intern statements, the eligibility predicate
-(`StateSource.baseIsUnscopedRemote`) + kill switch, the heal flag
-(`StateSource.forceCompleteSave`, process-local), the COUNT
+(`StateSource.baseIsUnscopedRemote` + `DeltaEligibility`) + kill switch, the
+process-local drifted-stream set (no `StateSource` flag), the COUNT
 post-condition, the consume-encoder variant (R3 — must still produce
 `exact_fingerprint` and every `EXACT_MATCH` column except the id,
 `generations.ts:263-267`), the new rejection reason + its
@@ -307,6 +336,13 @@ post-condition, the consume-encoder variant (R3 — must still produce
 NOT-NULL relaxation on `CAS_FILE_TEMP` (`generations.ts:272` — shipped
 TEMP DDL, no migration). NO new SyncState member, NO durable additions
 of any kind.
+Added by the implementation, beyond the design's own list: a SECOND sealed-stage
+reader interface (R2′'s fused `ConsumedStageReader` alongside the cursor
+`SealedStageReader` — the split is the §7 ledger row), and four modules the
+size gate forced out of files 269 grew (`plane-promotion.ts`, `cas-admission.ts`,
+`sync-state-records.ts`, `sync-published-intent.ts`) — each a seam that already
+existed, and one of them (`sync-state-model.ts`) left the size allowlist
+entirely.
 Deleted/avoided: the second consume scan (R2′, both kinds), per-row
 CSPRNG mint (R3), O(N/4MB) durable stage commits (R1), r2's chain +2
 columns + schema-v2 slice + rollout tooling, r1's A2 branch and A5
