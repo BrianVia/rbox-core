@@ -220,3 +220,15 @@ pull. Below-floor levers, ledger-recorded, founder decisions:
 
 Independent of design 267; M0 prints into the same report line 267
 brushes (`pull.ts:483`) — 267 merges first, this rebases.
+
+## 7. Bench close-out (real filesystem, 2026-08-16)
+
+The tmpfs caveat is real: the suite's /tmp fixtures make fsyncs free and
+show only ~13% — meaningless. On desktop ext4 (1.06ms/fsync probe), 140
+locks, median of 5: acquire 742→400ms, release 187→38ms, total 929→438ms
+(2.1×; per-lock ~6.6ms → ~3.1ms = the ~2-fsync provenance floor).
+Scaled to FM (2.92ms/fsync, ~1,500 locks): ~50.3s → ~9s expected, with
+the O(N²) journal drag (absent at N=140, dominant at N≈1500)
+additionally removed. Field FM re-pull remains the authoritative gate.
+Bench harness note: any future run MUST place fixtures on a real fs —
+/tmp is tmpfs on the dev hosts.
