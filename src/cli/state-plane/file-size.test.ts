@@ -164,7 +164,7 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/sync-git/deferral-hygiene.ts", { nonblank: 507, bytes: 24777 }],
   ["src/cli/sync-git/plan.ts", { nonblank: 1213, bytes: 59144 }],
   ["src/cli/sync-recovery.ts", { nonblank: 542, bytes: 27521 }],
-  ["src/cli/sync-state.ts", { nonblank: 590, bytes: 31196 }],
+  ["src/cli/sync-state.ts", { nonblank: 497, bytes: 26374 }],
   ["src/cli/sync/pull.ts", { nonblank: 465, bytes: 25252 }],
   ["src/cli/sync/push.ts", { nonblank: 940, bytes: 49750 }],
   ["src/cli/upgrade-cmd.ts", { nonblank: 499, bytes: 23827 }],

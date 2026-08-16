@@ -93,8 +93,8 @@ unscoped — `assertMayPublish` is its first statement, `push.ts:298`).
 The name states base identity; its operational meaning is "this lane is
 audit-covered". Delta-eligible iff: kill switch on AND
 `baseIsUnscopedRemote` AND snapshot carries a minted nonce + defined
-`stateRevision` AND the packet has a global AND `forceCompleteSave`
-(§2.4) is unset. Everything else — genesis, first save, reset, repair,
+`stateRevision` AND the packet has a global AND no standing
+content-drift for this stream (§2.4). Everything else — genesis, first save, reset, repair,
 migration, scoped, JSON-authority (structurally: the delta only alters
 the SQLite adapter's staging; `packet.global` stays whole-manifest so
 the JSON arm is unaffected regardless — the composer need not know the

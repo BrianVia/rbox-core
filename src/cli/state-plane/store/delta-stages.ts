@@ -304,7 +304,7 @@ function streamDeltaOps(
       if (row.kind !== "upsert" || row.entry_cjson === null) {
         throw new StageChangedError(ref.stageId, `sealed delta op ${row.path} has no known kind`);
       }
-      const entry = encodeFileEntryForConsume(fileEntryFromCanonical(row.entry_cjson));
+      const entry = encodeFileEntryForConsume(JSON.parse(row.entry_cjson) as FileEntry);
       if (entry.path !== row.path || entry.canonical !== row.entry_cjson) {
         throw new StageChangedError(ref.stageId, `sealed delta row ${row.path} is not canonical`);
       }

@@ -38,7 +38,7 @@ Format: field — file:line — suggested name — blast radius.
   row can still be verified.
 ## `cfgShape` (repo record config lane)
 
-- **Anchor:** `src/cli/sync-state-model.ts:321` (`RepoRecordInput.cfgShape`),
+- **Anchor:** `src/cli/sync-state-model.ts:312` (`RepoRecordInput.cfgShape`),
   column mapping `cfg_shape_cjson` at
   `src/cli/state-plane/codecs/repo-record.ts:21`.
 - **Suggested name:** `cfgStore` (column `cfg_store_cjson`) — it identifies the
@@ -54,7 +54,7 @@ Format: field — file:line — suggested name — blast radius.
 
 ## `ConfigStoreIdentity.shape` (repo kind inside the store identity)
 
-- **Anchor:** `src/cli/sync-state-model.ts:135`, written at
+- **Anchor:** `src/cli/sync-state-model.ts:126`, written at
   `src/cli/sync-git/config-lane.ts:101`.
 - **Suggested name:** `repoKind` — the value is the `RepoCtx.kind`
   (`"dir"` / `"pointer"`), which the rest of the codebase already calls
@@ -66,7 +66,7 @@ Format: field — file:line — suggested name — blast radius.
 
 ## `GitResolutionBinding["config"].shape`
 
-- **Anchor:** `src/cli/sync-state-model.ts:283`, populated at
+- **Anchor:** `src/cli/sync-state-model.ts:274`, populated at
   `src/cli/sync-git/resolution-intent.ts:62-67`.
 - **Suggested name:** `storeIdentity` — it is the canonicalized
   `ConfigStoreIdentity`, matching the code-symbol name now used everywhere else.
@@ -79,7 +79,7 @@ Format: field — file:line — suggested name — blast radius.
 
 - **Anchor:** `src/cli/sync-git/base-composer.ts:191` (union member), emitted at
   `:434`, `:443`, `:458`; mirrored in the durable hold-code union at
-  `src/cli/sync-state-model.ts:232`.
+  `src/cli/sync-state-model.ts:223`.
 - **Suggested name:** `p-repair-witness-mismatch` — the hold fires when the
   P-repair witness disagrees with the locked proof, not when a "shape" is off.
 - **Blast radius:** the value is a hold code carried in composer output and
