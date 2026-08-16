@@ -370,6 +370,20 @@ tests, exports, and CODEMAP row remain physically present, marked retired and
 unreachable from production; SP-4 owns closure-complete deletion. No SP-3 step,
 size gate, or inventory may smuggle that deletion.
 
+**Fold R4 amendment (orchestrator ruling).** As written, this section
+contradicted §3.3/§7.1: the module's body calls `establishStateAuthority` and
+`describeAuthorityOutcome`, the exact shared dispatch symbols §3.3 deletes.
+Retaining the body verbatim would keep a second migration entry site and the
+deleted symbols alive — the stronger structural criterion this slice exists to
+enforce. Resolution: the module's NAME, export surface, test file, and CODEMAP
+row remain physically present until SP-4; its BODY is retired in SP-3 to a
+no-op preserving the never-throw contract, as a direct consequence of §3.3
+symbol deletion. The automatic upgrade-window migration is approved-retired
+legacy behavior (design 262 pinned founder decision), not a smuggled deletion.
+The CODEMAP row states this truthfully. §7.2's "121 / 6,600 must remain
+present" is amended to "the module file and its test file must remain present;
+their retired size is not pinned."
+
 Candidate-side removal cannot change the inode of an already-running old
 `rbox upgrade` process. Therefore the first transition from any hook-bearing
 binary is ordered as:
@@ -602,7 +616,7 @@ daemon and the re-track path.
 
 At `44f0e917`, the corrected formerly blank anchors are `reset-state.ts` 461 /
 25,974 and `legacy-json-store.ts` 398 / 20,232. The retired
-`upgrade-state-window.ts` is 121 / 6,600 and must remain present;
+`upgrade-state-window.ts` and its test file must remain present (retired body, size unpinned — fold R4, see §3.4);
 `upgrade-cmd.ts` is 499 / 23,827 and must shrink. Other populated v1 baselines
 were verified exact in round 1. Re-measure the implementation base; line count
 is a warning, not a file-splitting target, and no suite count is claimed without
