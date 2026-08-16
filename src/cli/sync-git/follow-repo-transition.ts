@@ -9,7 +9,7 @@ import {
   type RepoBaseValue,
 } from "./base-composer.js";
 import { firstReason, type FollowProgress } from "./follow.js";
-import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, ownershipBlockersArePerRefOnly } from "./held-skip.js";
+import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, ownershipBlockersArePerRefOnly } from "./held-blockers.js";
 
 /**
  * The exact repository and wire section a follow transition is bound to. The
@@ -17,6 +17,9 @@ import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, ownershipBlockers
  * this composer mints is stamped with it: an authority can only ever describe
  * the section its execution was planned from.
  */
+/** One settled safe-ref entry of a locked BASE proof. */
+export type SafeRefLockedProof = RepoBaseLockedProof["safeRefs"][string];
+
 export interface FollowTransitionIdentity {
   readonly relPath: string;
   readonly incomingKey: string;
@@ -139,11 +142,13 @@ export function followBaseProof(
 ): RepoBaseProof {
   assertBound(identity, proof);
   const branches: RepoBaseLockedProof["branches"] = { ...(progress.branchLockedProofs ?? {}) };
-  const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => [ref, {
-    liveOid: witness.afterOid,
-    witness,
-    ...(ref === "refs/stash" && witness.afterOid !== null ? { stashReflogReady: true } : {}),
-  }]));
+  const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(
+    Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => {
+      const entry: SafeRefLockedProof = { liveOid: witness.afterOid, witness };
+      if (ref === "refs/stash" && witness.afterOid !== null) entry.stashReflogReady = true;
+      return [ref, entry];
+    }),
+  );
   return {
     authority: {
       kind: "pull-ref-transaction",

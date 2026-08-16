@@ -36,7 +36,8 @@ import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, readWorktreeRegistryDigest } from "./held-skip.js";
+import { blockersAfterComposer, gitOwnershipNoEscalateEnabled } from "./held-blockers.js";
+import { readWorktreeRegistryDigest } from "./held-skip.js";
 import { createHeldDecisionPlane, heldTraceEnabled, type HeldRepoDecision } from "./held-decision.js";
 import { startGitApplyRun, type GitApplyMetrics, type GitApplyRepoResult, type GitApplyRunKind } from "./apply-metrics.js";
 import {
@@ -1221,7 +1222,11 @@ opts: {
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async (commonDirLock) => {
         startedAt = Date.now();
-        if (await held.earlySkip({ pending: pending[rel] !== undefined, attempt: records[rel]?.attempt })) {
+        if (await held.earlySkip({
+          pending: pending[rel] !== undefined,
+          attempt: records[rel]?.attempt,
+          partial: records[rel]?.partial,
+        })) {
           result = "skipped";
           return;
         }

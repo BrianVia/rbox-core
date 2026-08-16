@@ -39,3 +39,13 @@ test("attempt omission preserves and explicit null clears through the generation
   expect(cleared.repos[0]!.newRecord.attempt).toBeUndefined();
   expect(cleared.repos[0]!.newRecord.pending).toBeUndefined();
 });
+
+test("design 270: the artifact-plane digest survives the generation-CAS packet", () => {
+  const withDigest = { ...attempt, artifactPlaneDigest: "d".repeat(64) };
+  const snapshot = state({ repoGen: 4, sourceSeq: 1, base: section, pending: section, attempt: withDigest });
+  const preserved = composeStateSavePacket(snapshot, {
+    expectedStream: "stream", sourceGlobalSeq: 2, observedRepos: ["repo"],
+    values: { bases: { repo: section }, pending: { repo: section } },
+  });
+  expect(preserved.repos[0]!.newRecord.attempt).toEqual(withDigest);
+});

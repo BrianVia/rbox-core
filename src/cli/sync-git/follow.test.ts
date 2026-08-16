@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, hashBytes, oracleFromState, probeReceiverEquivalence, scanManifest, setReceiverEquivalenceProbeForTests, type AppliedManifestOracle, type GitSection, type Manifest } from "../../engine/index.js";
-import { BASE_ABSENT_PREFIX, SETTLED_ABSENCE_PREFIX } from "./base-artifacts.js";
+import { BASE_ABSENT_PREFIX, BASE_PRESENT_PREFIX, SETTLED_ABSENCE_PREFIX } from "./base-artifacts.js";
+import { checkoutJournalPresent } from "./journal.js";
 import { captureGitState } from "./capture.js";
 import { indexIdentityV2 } from "./index-identity.js";
 import { ownershipProofContext } from "./reachability.js";
@@ -16,7 +17,7 @@ import { keepPinRef, readKeepPinOrigins } from "./keep-pins.js";
 import { hasInProgressOpState, readOpStateSnapshot } from "./refs.js";
 import { repoCtx } from "./git-state.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { applyPulledManifest } from "../sync.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
@@ -25,7 +26,7 @@ import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from
 import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { opStateDetailToken } from "./follow-classify.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
-import { heldBlockersAllowSkip } from "./held-skip.js";
+import { heldBlockersAllowSkip } from "./held-blockers.js";
 import { planGitSections } from "./plan.js";
 import { GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { fingerprintHitProbe, type GitDivergenceCache } from "./divergence-cache.js";
@@ -119,13 +120,14 @@ async function commit(content: string, message: string): Promise<string> {
 const manifest = (section: GitSection): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: { repo: section } });
 const stateWith = (section?: GitSection): SyncState => {
   if (section && section === materializedSection && materializedState) return structuredClone(materializedState);
-  return {
+  const state: SyncState = {
     stream: "test-stream",
     stateNonce: "a".repeat(32),
     lastSyncedSequence: section ? 1 : 0,
     lastSyncedManifest: section ? manifest(section) : { generatedAt: "", files: [] },
-    ...(section ? { repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section } } } : {}),
   };
+  if (section) state.repoRecords = { repo: { repoGen: 1, sourceSeq: 1, base: section } };
+  return state;
 };
 
 const matchingOracle: AppliedManifestOracle = {
@@ -144,16 +146,13 @@ async function materialize(section: GitSection): Promise<void> {
   const empty = stateWith();
   const outcome = await applyGitSections(workspace, cfg, empty, manifest(section), store, buildIgnoreMatcher(workspace), () => {});
   expect(outcome.gitRepos?.repo).toEqual(section);
+  const record: RepoRecord = { repoGen: 1, sourceSeq: 1, base: section };
+  if (outcome.branchBaseOrigins?.repo) record.branchBaseOrigins = outcome.branchBaseOrigins.repo;
   const initial: SyncState = {
     ...empty,
     lastSyncedSequence: 1,
     lastSyncedManifest: manifest(section),
-    repoRecords: { repo: {
-      repoGen: 1,
-      sourceSeq: 1,
-      base: section,
-      ...(outcome.branchBaseOrigins?.repo ? { branchBaseOrigins: outcome.branchBaseOrigins.repo } : {}),
-    } },
+    repoRecords: { repo: record },
   };
   await saveStateUnsafeLegacyOrTest(workspace, initial);
   materializedSection = section;
@@ -3081,3 +3080,76 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
   expect(Math.abs(leafSum + chain.residualMs - timing.wallMs)).toBeLessThan(2);
   expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
 }, 30_000);
+
+// Design 270: the artifact-plane digest and the early partial identity are new
+// inputs to a shipped fast path. These pin that the path still behaves — and
+// that a repair the fingerprint cannot see now invalidates it.
+
+async function heldFixpointState(): Promise<{ saved: SyncState; incoming: GitSection }> {
+  const { state, incoming } = await baseAndIncoming();
+  await git(receiver, "update-ref", "refs/heads/side-at-base", await git(receiver, "rev-parse", "refs/heads/main"));
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  expect(heldBlockersAllowSkip(first.outcome.attempt?.repo?.blockers ?? [])).toBe(true);
+  return { saved: await landOutcome(state, first.outcome, 2), incoming };
+}
+
+function comparableRecord(state: SyncState) {
+  const record = repoRecordsForState(state).repo!;
+  const attempt = record.attempt ? (({ at: _at, ...rest }) => rest)(record.attempt) : undefined;
+  // `at`/`lastSeen` are wall clocks the two lanes stamp independently; every
+  // other durable field must be identical.
+  const deferrals = record.deferrals?.apply
+    ? { ...record.deferrals, apply: { ...record.deferrals.apply, lastSeen: "normalized" } }
+    : record.deferrals;
+  return {
+    base: record.base, branchBaseOrigins: record.branchBaseOrigins, pending: record.pending,
+    partial: record.partial, deferrals, idxProj: record.idxProj, attempt,
+  };
+}
+
+test("design 270: skipping and re-following leave the same durable record, and publish no journal", async () => {
+  const { saved, incoming } = await heldFixpointState();
+
+  process.env.RBOX_GIT_HELD_SKIP = "0";
+  const followed = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true, heldNow: heldNowAfterRacyWindow,
+  }).finally(() => { delete process.env.RBOX_GIT_HELD_SKIP; });
+  expect(followed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  const followedState = await landOutcome(saved, followed.outcome, 3);
+
+  let cycles = saved;
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const skipped = await applyIncoming(cycles, incoming, matchingOracle, {
+      collectMetrics: true, heldNow: heldNowAfterRacyWindow,
+    });
+    expect(skipped.outcome.gitApplyMetrics?.results.skipped, `cycle ${cycle}`).toBe(1);
+    // A skip performs no follow, so it publishes no checkout journal at all.
+    expect(skipped.outcome.publishedJournals, `cycle ${cycle}`).toBeUndefined();
+    expect(await checkoutJournalPresent(workspace, "repo"), `cycle ${cycle}`).toBe(false);
+    cycles = await landOutcome(cycles, skipped.outcome, 3 + cycle);
+  }
+  expect(comparableRecord(cycles)).toEqual(comparableRecord(followedState));
+});
+
+test("design 270: an rbox artifact ref written between cycles forces the next pull down the full path", async () => {
+  const { saved, incoming } = await heldFixpointState();
+  const skipped = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true, heldNow: heldNowAfterRacyWindow,
+  });
+  expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+
+  const artifactRef = BASE_PRESENT_PREFIX + "/" + "a".repeat(64) + "/" + "b".repeat(64);
+  await git(receiver, "update-ref", artifactRef, await git(receiver, "rev-parse", "refs/heads/main"));
+  const invalidated = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true, heldNow: heldNowAfterRacyWindow,
+  });
+  expect(invalidated.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+
+  // Restoring the exact prior artifact plane restores the skip, so the digest —
+  // not some incidental side effect of the write — is what invalidated it.
+  await git(receiver, "update-ref", "-d", artifactRef);
+  const restored = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true, heldNow: heldNowAfterRacyWindow,
+  });
+  expect(restored.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+});

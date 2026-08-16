@@ -157,6 +157,7 @@ export const GIT_HELD_ATTEMPT_FIELD_COVERAGE = {
   stateNonce: true,
   baseOriginsHash: true,
   partialDisposition: true,
+  artifactPlaneDigest: true,
   at: true,
 } as const satisfies Record<keyof GitHeldAttempt, true>;
 
