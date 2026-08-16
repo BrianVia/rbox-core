@@ -112,11 +112,9 @@ async function translateSavePacket(
   // JSON-compat semantic 2C translates. A fabricated token only reaches a kept
   // artifact on the accepted path, where the claims provably matched.
   const { nonce: _nonce, ...tokenWithoutNonce } = token;
-  const expectedToken = {
-    ...tokenWithoutNonce,
-    stream: packet.expectedStream,
-    ...(packet.expectedNonce === "legacy" ? {} : { nonce: packet.expectedNonce }),
-  };
+  // The legacy sentinel is the ABSENT nonce; it must not become a stored one.
+  const expectedToken: LineageSnapshot = { ...tokenWithoutNonce, stream: packet.expectedStream };
+  if (packet.expectedNonce !== "legacy") expectedToken.nonce = packet.expectedNonce;
   let globalBuilder: GenerationBuilder | undefined;
   let transitionBuilder: RepoTransitionStageBuilder | undefined;
   let global: SealedStageRef | undefined;
@@ -167,21 +165,15 @@ async function translateSavePacket(
         localRevision: token.localRevision,
       },
       sourceGlobalSeq: packet.sourceGlobalSeq,
-      ...(global
-        ? {
-            global: {
-              stage: global,
-              fileHeader: global.header,
-              ...(packet.global?.manifestMeta === undefined
-                ? {}
-                : { manifestMeta: packet.global.manifestMeta }),
-            },
-          }
-        : {}),
       repoTransitions: transitions,
       replacementOldStream,
       ownerToken,
     };
+    if (global) {
+      casPacket.global = { stage: global, fileHeader: global.header };
+      const manifestMeta = packet.global?.manifestMeta;
+      if (manifestMeta !== undefined) casPacket.global.manifestMeta = manifestMeta;
+    }
     if (packet.elisionExpectation !== undefined) casPacket.elisionExpectation = packet.elisionExpectation;
     const result = applyCasPacket(store, directory, casPacket);
     applied = result.status === "accepted" || result.status === "rejected";

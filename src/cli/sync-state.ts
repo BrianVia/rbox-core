@@ -1,7 +1,7 @@
 import type { GitSection, Manifest } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../cli/sync-git/config-txn.js";
-import { sanitizeGitSectionForPersistence } from "../cli/sync-git/config-sync.js";
+import { sanitizeRepoRecord } from "./repo-record-sanitation.js";
 import {
   composeRepoBase,
   type BranchBaseOrigin,
@@ -36,7 +36,11 @@ import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
 import { replaceResetLineageStream } from "./state-plane/adapters/whole-state-compat.js";
 
-export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+/** The record's config-lane members, in persisted order. Durable field names,
+ * not code symbols (docs/wire-rename-candidates.md). */
+const CONFIG_LANE_FIELDS = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
+
+export type ConfigLaneState = Pick<RepoRecordInput, (typeof CONFIG_LANE_FIELDS)[number]>;
 /** Planner-facing lane results. Persistence converts these to ordered
  * transitions with orderedDeferralUpdates() before a generation-CAS save. */
 export type GitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferral | null>>;
@@ -47,12 +51,11 @@ type GitDeferralTransition =
 export type OrderedGitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferralTransition>>;
 
 export function configLaneState(record: ConfigLaneState): ConfigLaneState {
-  return {
-    ...(record.cfgSynced === undefined ? {} : { cfgSynced: record.cfgSynced }),
-    ...(record.cfgApplied === undefined ? {} : { cfgApplied: record.cfgApplied }),
-    ...(record.cfgToken === undefined ? {} : { cfgToken: record.cfgToken }),
-    ...(record.cfgShape === undefined ? {} : { cfgShape: record.cfgShape }),
-  };
+  const lane: ConfigLaneState = {};
+  for (const field of CONFIG_LANE_FIELDS) {
+    if (record[field] !== undefined) Object.assign(lane, { [field]: record[field] });
+  }
+  return lane;
 }
 
 export interface RepoStateValues {
@@ -116,12 +119,11 @@ export interface ConfigApplyCompletion {
 export function completeConfigApply(record: RepoRecordInput, completion: ConfigApplyCompletion): RepoRecordInput {
   const ownsPre = completion.pre === record.cfgSynced || completion.pre === completion.basePre;
   const cfgSynced = ownsPre || completion.post === completion.incoming ? completion.post : record.cfgSynced;
-  return {
-    ...record,
-    ...(cfgSynced === undefined ? {} : { cfgSynced }),
-    cfgApplied: completion.incoming,
-    cfgToken: completion.postToken,
-  };
+  const completed: RepoRecordInput = { ...record };
+  if (cfgSynced !== undefined) completed.cfgSynced = cfgSynced;
+  completed.cfgApplied = completion.incoming;
+  completed.cfgToken = completion.postToken;
+  return completed;
 }
 
 export function stampConfigAck(record: RepoRecordInput, authoredHash: string | undefined): RepoRecordInput {
@@ -137,17 +139,6 @@ export const inputRecord = (record: RepoRecord): RepoRecordInput => {
   const { repoGen: _repoGen, ...input } = record;
   return input;
 };
-
-function sanitizeRepoRecordInput(record: RepoRecordInput): RepoRecordInput {
-  const base = record.base === undefined ? undefined : sanitizeGitSectionForPersistence(record.base);
-  const pending = record.pending === undefined ? undefined : sanitizeGitSectionForPersistence(record.pending);
-  if (base === record.base && pending === record.pending) return record;
-  return {
-    ...record,
-    ...(base === undefined ? {} : { base }),
-    ...(pending === undefined ? {} : { pending }),
-  };
-}
 
 const isStrictlyNewer = (candidate: string, bound: string): boolean => {
   const candidateMs = Date.parse(candidate);
@@ -213,17 +204,19 @@ function mergeDeferrals(
   return Object.keys(merged).length === 0 ? undefined : merged;
 }
 
-/** Sidecar tri-state: key absent → retain current; explicit null → delete; value → replace. */
+/** One local-only sidecar lane's transition: an omitted incoming value retains
+ * the current one, an explicit null clears it, and a value replaces it. */
+const selectSidecarLane = <Lane>(incoming: Lane | null | undefined, current: Lane | undefined): Lane | undefined =>
+  incoming === undefined ? current : incoming ?? undefined;
+
+/** Sidecar tri-state, keyed by property presence rather than by value. */
 function selectPackedRefsIdentity(
   values: RepoStateValues["packedRefsIdentity"],
   relPath: string,
   current: RepoRecord["packedRefsIdentity"],
-): { packedRefsIdentity?: NonNullable<RepoRecord["packedRefsIdentity"]> } {
-  if (!Object.prototype.hasOwnProperty.call(values ?? {}, relPath)) {
-    return current === undefined ? {} : { packedRefsIdentity: current };
-  }
-  const next = values![relPath];
-  return next === null ? {} : { packedRefsIdentity: next };
+): NonNullable<RepoRecord["packedRefsIdentity"]> | undefined {
+  if (!Object.prototype.hasOwnProperty.call(values ?? {}, relPath)) return current;
+  return values![relPath] ?? undefined;
 }
 
 /** The transition one source contributes for one repository: its record and the
@@ -245,7 +238,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     else retained.deferrals = mergedDeferrals;
     // A retention moves nothing, so it carries the record's own lineage rather
     // than the discarded source's proof.
-    return { newRecord: sanitizeRepoRecordInput(retained), baseProof: provisionalRepoBaseProof(relPath, undefined, previousValue) };
+    return { newRecord: sanitizeRepoRecord(retained), baseProof: provisionalRepoBaseProof(relPath, undefined, previousValue) };
   }
   const lane = source.values.configLane?.[relPath] ?? current;
   const hasAdvertisedValue = Object.prototype.hasOwnProperty.call(source.values.advertised ?? {}, relPath);
@@ -261,39 +254,37 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     proof.authority,
     proof.lockedProof,
   );
-  const next = stampConfigAck({
-    sourceSeq: source.sourceGlobalSeq,
-    ...(composed.base === undefined ? {} : { base: composed.base }),
-    ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
-    ...selectPackedRefsIdentity(source.values.packedRefsIdentity, relPath, current.packedRefsIdentity),
-    ...(hasAdvertisedValue
-      ? (advertisedValue === null ? {} : { advertised: advertisedValue })
-      : (current.advertised === undefined ? {} : { advertised: current.advertised })),
-    ...(source.values.repoAbsent === undefined
-      ? (current.repoAbsent === true ? { repoAbsent: true as const } : {})
-      : (source.values.repoAbsent[relPath] === true ? { repoAbsent: true as const } : {})),
-    ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
-    ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
-    ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
-    ...configLaneState(lane),
-    ...(mergedDeferrals === undefined ? {} : { deferrals: mergedDeferrals }),
-    ...(source.values.partial?.[relPath] === undefined
-      ? (current.partial === undefined ? {} : { partial: current.partial })
-      : source.values.partial[relPath] === null ? {} : { partial: source.values.partial[relPath] }),
-    ...(source.values.attempt?.[relPath] === undefined
-      ? (current.attempt === undefined ? {} : { attempt: current.attempt })
-      : source.values.attempt[relPath] === null ? {} : { attempt: source.values.attempt[relPath] }),
-    ...(source.values.resolutionReceipt?.[relPath] === undefined
-      ? (current.resolutionReceipt === undefined ? {} : { resolutionReceipt: current.resolutionReceipt })
-      : source.values.resolutionReceipt[relPath] === null ? {} : { resolutionReceipt: source.values.resolutionReceipt[relPath] }),
-    ...(source.values.idxProj?.[relPath] === undefined
-      ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
-      : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
-  }, source.authoredCfgHashByRepo?.[relPath]);
+  // Installed in persisted order; an omitted member is ABSENT, never undefined.
+  const composedRecord: RepoRecordInput = { sourceSeq: source.sourceGlobalSeq };
+  if (composed.base !== undefined) composedRecord.base = composed.base;
+  if (composed.branchBaseOrigins !== undefined) composedRecord.branchBaseOrigins = composed.branchBaseOrigins;
+  const packedRefsIdentity = selectPackedRefsIdentity(source.values.packedRefsIdentity, relPath, current.packedRefsIdentity);
+  if (packedRefsIdentity !== undefined) composedRecord.packedRefsIdentity = packedRefsIdentity;
+  const advertised = hasAdvertisedValue ? advertisedValue ?? undefined : current.advertised;
+  if (advertised !== undefined) composedRecord.advertised = advertised;
+  const repoAbsent = source.values.repoAbsent === undefined ? current.repoAbsent : source.values.repoAbsent[relPath];
+  if (repoAbsent === true) composedRecord.repoAbsent = true;
+  const pending = source.values.pending?.[relPath];
+  if (pending !== undefined) composedRecord.pending = pending;
+  const removedKey = source.values.removed?.[relPath];
+  if (removedKey !== undefined) composedRecord.removedKey = removedKey;
+  const resolutionKey = source.values.resolutions?.[relPath];
+  if (resolutionKey !== undefined) composedRecord.resolutionKey = resolutionKey;
+  Object.assign(composedRecord, configLaneState(lane));
+  if (mergedDeferrals !== undefined) composedRecord.deferrals = mergedDeferrals;
+  const partial = selectSidecarLane(source.values.partial?.[relPath], current.partial);
+  if (partial !== undefined) composedRecord.partial = partial;
+  const attempt = selectSidecarLane(source.values.attempt?.[relPath], current.attempt);
+  if (attempt !== undefined) composedRecord.attempt = attempt;
+  const resolutionReceipt = selectSidecarLane(source.values.resolutionReceipt?.[relPath], current.resolutionReceipt);
+  if (resolutionReceipt !== undefined) composedRecord.resolutionReceipt = resolutionReceipt;
+  const idxProj = selectSidecarLane(source.values.idxProj?.[relPath], current.idxProj);
+  if (idxProj !== undefined) composedRecord.idxProj = idxProj;
+  const next = stampConfigAck(composedRecord, source.authoredCfgHashByRepo?.[relPath]);
   if (composed.disposition === "pending" && source.values.bases?.[relPath] && next.pending === undefined) {
     next.pending = source.values.bases[relPath];
   }
-  return { newRecord: sanitizeRepoRecordInput(next), baseProof: proof };
+  return { newRecord: sanitizeRepoRecord(next), baseProof: proof };
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
@@ -319,13 +310,13 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
     expectedStream: source.expectedStream,
     expectedNonce: expectedStateNonce(snapshot),
     sourceGlobalSeq: source.sourceGlobalSeq,
-    // On recompute after a newer global landed, omit this stale global candidate.
-    // Repo transitions above likewise retain records with a newer sourceSeq.
-    ...(source.globalManifest === undefined || elideGlobal || source.sourceGlobalSeq < snapshot.lastSyncedSequence
-      ? {}
-      : { global: { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta } }),
     repos,
   };
+  // On recompute after a newer global landed, omit this stale global candidate.
+  // Repo transitions above likewise retain records with a newer sourceSeq.
+  if (source.globalManifest !== undefined && !elideGlobal && source.sourceGlobalSeq >= snapshot.lastSyncedSequence) {
+    packet.global = { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta };
+  }
   if (elided && receipt !== undefined) {
     packet.elisionExpectation = { nonce: receipt.nonce, stateRevision: receipt.stateRevision };
   }
@@ -341,9 +332,7 @@ function projectStateSource(snapshot: SyncState, source: StateSource): SyncState
   const packet = composeStateSavePacket(snapshot, source);
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
-  for (const [relPath, record] of Object.entries(records)) {
-    records[relPath] = { ...sanitizeRepoRecordInput(record), repoGen: record.repoGen };
-  }
+  for (const [relPath, record] of Object.entries(records)) records[relPath] = sanitizeRepoRecord(record);
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
   const projected = stateFromRepoRecords({
     ...snapshot,
@@ -479,7 +468,7 @@ export async function savePublishedRepoIntent(
   const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
     Object.fromEntries(fields.map((field) => [field, record?.[field]]));
   const applyFields = ["base", "branchBaseOrigins", "packedRefsIdentity", "pending", "repoAbsent", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
-  const configFields = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
+  const configFields = CONFIG_LANE_FIELDS;
   const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
     for (const field of fields) {
       if (desired[field] === undefined) delete target[field];

@@ -5,7 +5,7 @@ import {
   type GitSection,
   type Manifest,
 } from "../engine/index.js";
-import type { JsonValue } from "../json.js";
+import { jsonCounter, jsonObject, jsonText, type JsonValue } from "../json.js";
 import type { AcquireLockOptions, OwnedLock } from "../engine/lockfile.js";
 import type { ConfigStatToken } from "./sync-git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
@@ -106,13 +106,13 @@ export function validManifestMeta(v: GlobalManifestMeta | JsonValue | undefined)
 /** Re-establishes every member of a persisted meta. The value itself is returned
  * unchanged when it holds, so members this rule cannot see ride along. */
 function admissibleManifestMeta(v: GlobalManifestMeta | JsonValue | undefined): v is GlobalManifestMeta {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const meta = v as GlobalManifestMetaCandidate;
-  const hex = (value: JsonValue | undefined): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
-  const counter = (value: JsonValue | undefined): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (!jsonObject(meta)) return false;
+  const hex = (value: JsonValue | undefined): value is string => jsonText(value) && /^[0-9a-f]{64}$/.test(value);
+  const counter = (value: JsonValue | undefined): boolean => jsonCounter(value) !== undefined;
   if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return false;
   if (!counter(meta.accountEpoch) || !counter(meta.keyEpoch) || !counter(meta.chainBytes)) return false;
-  if (!Number.isSafeInteger(meta.snapshotBytes) || (meta.snapshotBytes as number) <= 0) return false;
+  if ((jsonCounter(meta.snapshotBytes) ?? 0) <= 0) return false;
   // The chain shape rule (cap, hex, dedup, self-exclusion) is the SAME invariant
   // the wire parser enforces — one definition, or persisted metas could drift
   // from what the commit codec/server accept. Explicit Array check first: the
@@ -125,12 +125,10 @@ function admissibleManifestMeta(v: GlobalManifestMeta | JsonValue | undefined): 
 
 /** Reconstruct the exact described manifest independently of local repo apply progress. */
 export function manifestFromMeta(lastSyncedManifest: Manifest, meta: GlobalManifestMeta): Manifest {
-  return {
-    generatedAt: lastSyncedManifest.generatedAt,
-    files: lastSyncedManifest.files,
-    ...(lastSyncedManifest.manifestSchema === undefined ? {} : { manifestSchema: lastSyncedManifest.manifestSchema }),
-    ...(Object.keys(meta.gitRepos).length === 0 ? {} : { gitRepos: meta.gitRepos }),
-  };
+  const manifest: Manifest = { generatedAt: lastSyncedManifest.generatedAt, files: lastSyncedManifest.files };
+  if (lastSyncedManifest.manifestSchema !== undefined) manifest.manifestSchema = lastSyncedManifest.manifestSchema;
+  if (Object.keys(meta.gitRepos).length !== 0) manifest.gitRepos = meta.gitRepos;
+  return manifest;
 }
 
 export interface ConfigStoreIdentity {
@@ -412,7 +410,7 @@ export function stripObsoleteResolutionIntents(state: SyncState): SyncState {
 /** `value` is either a typed counter this process already holds, or the same
  * field as decoded from a durable JSON record — never anything else. */
 export function normalizeStateCounter(value: JsonValue | undefined): number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return jsonCounter(value) ?? 0;
 }
 
 /** Every git repo key this state knows of: the last-synced manifest, whatever the
@@ -456,16 +454,21 @@ export function repoRecordsForState(state: SyncState): RepoRecordsByPath {
       records[relPath] = { ...normalizedSaved, repoGen: normalizeStateCounter(saved.repoGen), sourceSeq: normalizeStateCounter(saved.sourceSeq) };
       continue;
     }
-    records[relPath] = {
+    // Folded in member order; an absent legacy map contributes an ABSENT member.
+    const folded: RepoRecord = {
       repoGen: 0,
       sourceSeq: normalizeStateCounter(state.lastSyncedSequence),
       ...adoptLegacyManifestRepoBase(state.lastSyncedManifest.gitRepos?.[relPath]),
-      ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
-      ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
-      ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),
-      ...(legacyDeferrals[relPath] === undefined ? {} : { deferrals: legacyDeferrals[relPath] }),
-      ...(legacyPartial[relPath] === undefined ? {} : { partial: legacyPartial[relPath] }),
     };
+    const pending = state.gitPendingRemote?.[relPath];
+    if (pending !== undefined) folded.pending = pending;
+    const removedKey = state.gitReposRemoved?.[relPath];
+    if (removedKey !== undefined) folded.removedKey = removedKey;
+    const resolutionKey = state.gitNeedsResolution?.[relPath];
+    if (resolutionKey !== undefined) folded.resolutionKey = resolutionKey;
+    if (legacyDeferrals[relPath] !== undefined) folded.deferrals = legacyDeferrals[relPath];
+    if (legacyPartial[relPath] !== undefined) folded.partial = legacyPartial[relPath];
+    records[relPath] = folded;
   }
   return records;
 }

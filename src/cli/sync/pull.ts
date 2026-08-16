@@ -16,7 +16,7 @@ import {
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
 import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, syncStreamId, trashConfig, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
-import { type LatestTimings, type SyncRemote } from "../remote.js";
+import { type LatestOptions, type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
 } from "../sync-recovery.js";
@@ -95,13 +95,12 @@ export async function pullWithMetadata(
     ? { manifest: manifestFromMeta(state.lastSyncedManifest, validatedMeta), meta: validatedMeta }
     : undefined;
   let latestTimings: LatestTimings | undefined;
+  const latestOptions: LatestOptions = {};
+  if (report.enabled) latestOptions.onLatestTimings = (t: LatestTimings) => (latestTimings = t);
+  if (fastFoldBase) latestOptions.fastFoldBase = fastFoldBase;
+  if (fastPullEnabled) latestOptions.recordEvidence = true;
   const { sequence, manifest: remote, manifestMeta } = await report.phase("latest", () =>
-    api.latest(report.enabled || fastPullEnabled ? {
-      ...(report.enabled ? { onLatestTimings: (t: LatestTimings) => (latestTimings = t) } : {}),
-      ...(fastFoldBase ? { fastFoldBase } : {}),
-      ...(fastPullEnabled ? { recordEvidence: true } : {}),
-    } : undefined)
-  );
+    api.latest(report.enabled || fastPullEnabled ? latestOptions : undefined));
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
   const reconciled = await reconcileResolutionReceipt(root, cfg, deps, api, {
@@ -199,7 +198,7 @@ export async function reconcileResolutionReceipt(
   const actions = await applyPulledManifest(root, cfg, deps, api, {
     sequence: head.sequence,
     manifest: head.manifest,
-    ...(head.manifestMeta ? { manifestMeta: head.manifestMeta } : {}),
+    manifestMeta: head.manifestMeta,
     state,
   });
   const afterApply = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
@@ -433,7 +432,7 @@ export async function applyPulledManifest(
       warningSink: deps.warningSink,
       mutationBoundary: deps.mutationBoundary,
       sourceGlobalSeq: sequence,
-      ...(projection ? { scope: projection } : {}),
+      scope: projection,
     })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });

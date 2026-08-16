@@ -232,6 +232,12 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan-accumulator.ts": 1,
     "src/cli/sync-git/plan.ts": 3,
+    // Persistence sanitation only: the one owner that rewrites a record's stored
+    // BASE/pending into their sanitized form. It composes no authority and moves
+    // no lineage — it replaces the section it was handed with its canonical
+    // bytes, the write sync-state.ts and legacy-json-store.ts each open-coded
+    // before it was extracted.
+    "src/cli/repo-record-sanitation.ts": 1,
     // Three sites left with the legacy-manifest adoption they belonged to.
     "src/cli/sync-state-model.ts": 8,
     // T1.1 moved the JSON CAS here; the proof-selection hoist is count-neutral.

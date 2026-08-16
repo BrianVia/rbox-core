@@ -2,11 +2,12 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection, Manifest } from "../../../engine/index.js";
-import type { JsonValue } from "../../../json.js";
+import { jsonObject, jsonText, type JsonValue } from "../../../json.js";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
 import { sanitizeGitSectionForPersistence } from "../../../cli/sync-git/config-sync.js";
+import { sanitizeRepoRecord } from "../../repo-record-sanitation.js";
 import { composeRepoBase } from "../../sync-git/base-composer.js";
 import { requireRepoBaseProof } from "../../sync-git/base-proof-selection.js";
 import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
@@ -29,6 +30,7 @@ import {
   stateFromRepoRecords,
   stripObsoleteResolutionIntents,
   type RepoRecord,
+  type RepoRecordInput,
   type StateSaveOptions,
   type StateSavePacket,
   type StateSaveResult,
@@ -54,7 +56,7 @@ export async function loadRawLegacyJsonState(root: string): Promise<SyncState | 
     stream?: JsonValue; stateNonce?: JsonValue; stateRevision?: JsonValue;
   }>(stateIncarnationPath(root), 512 * 1024);
   if (!marker) return undefined;
-  if (typeof marker.stream === "string" && typeof marker.stateNonce === "string") {
+  if (jsonText(marker.stream) && jsonText(marker.stateNonce)) {
     return {
       ...freshState(marker.stream),
       stateNonce: marker.stateNonce,
@@ -136,12 +138,8 @@ export async function applyLegacyJsonSavePacket(root: string, packet: StateSaveP
         proof.authority,
         proof.lockedProof,
       );
-      const newRecord = {
-        ...transition.newRecord,
-        ...(transition.newRecord.pending === undefined
-          ? {}
-          : { pending: sanitizeGitSectionForPersistence(transition.newRecord.pending) }),
-      };
+      const newRecord: RepoRecordInput = { ...transition.newRecord };
+      if (newRecord.pending !== undefined) newRecord.pending = sanitizeGitSectionForPersistence(newRecord.pending);
       if (composed.base === undefined) delete newRecord.base; else newRecord.base = composed.base;
       if (composed.branchBaseOrigins === undefined) delete newRecord.branchBaseOrigins;
       else newRecord.branchBaseOrigins = composed.branchBaseOrigins;
@@ -164,16 +162,7 @@ export async function applyLegacyJsonSavePacket(root: string, packet: StateSaveP
     // P/BASE too—not only records named by this packet. This makes sanitation a
     // persistence invariant across collision, exception, recovery, and CAS-retry
     // paths instead of an apply-path tendency.
-    for (const [relPath, record] of Object.entries(records)) {
-      const base = record.base === undefined ? undefined : sanitizeGitSectionForPersistence(record.base);
-      const pending = record.pending === undefined ? undefined : sanitizeGitSectionForPersistence(record.pending);
-      if (base === record.base && pending === record.pending) continue;
-      records[relPath] = {
-        ...record,
-        ...(base === undefined ? {} : { base }),
-        ...(pending === undefined ? {} : { pending }),
-      };
-    }
+    for (const [relPath, record] of Object.entries(records)) records[relPath] = sanitizeRepoRecord(record);
     const next = stateFromRepoRecords({
       ...base,
       stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),
@@ -262,31 +251,20 @@ async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<vo
     ? undefined
     : Object.fromEntries(Object.entries(sections)
       .map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
-  const sanitized = state.repoRecords === undefined
-    ? {
-        ...state,
-        lastSyncedManifest: {
-          ...state.lastSyncedManifest,
-          ...(state.lastSyncedManifest.gitRepos === undefined ? {} : { gitRepos: sanitizeSectionMap(state.lastSyncedManifest.gitRepos) }),
-        },
-        ...(state.gitPendingRemote === undefined ? {} : { gitPendingRemote: sanitizeSectionMap(state.gitPendingRemote) }),
-      }
-    : (() => {
-        // Route authoritative records through the universal sanitizer/composer,
-        // while preserving this explicitly unsafe API's caller-supplied legacy
-        // projections (tests and degraded compatibility intentionally exercise
-        // mismatched snapshots).
-        const projected = stateFromRepoRecords(state, repoRecordsForState(state));
-        return {
-          ...state,
-          repoRecords: projected.repoRecords,
-          lastSyncedManifest: {
-            ...state.lastSyncedManifest,
-            ...(state.lastSyncedManifest.gitRepos === undefined ? {} : { gitRepos: sanitizeSectionMap(state.lastSyncedManifest.gitRepos) }),
-          },
-          ...(state.gitPendingRemote === undefined ? {} : { gitPendingRemote: sanitizeSectionMap(state.gitPendingRemote) }),
-        };
-      })();
+  const sanitized: SyncState = { ...state };
+  // Authoritative records route through the universal sanitizer/composer, while
+  // this explicitly unsafe API's caller-supplied legacy projections are preserved
+  // (tests and degraded compatibility intentionally exercise mismatched snapshots).
+  if (state.repoRecords !== undefined) {
+    sanitized.repoRecords = stateFromRepoRecords(state, repoRecordsForState(state)).repoRecords;
+  }
+  if (state.lastSyncedManifest.gitRepos !== undefined) {
+    sanitized.lastSyncedManifest = {
+      ...state.lastSyncedManifest,
+      gitRepos: sanitizeSectionMap(state.lastSyncedManifest.gitRepos),
+    };
+  }
+  if (state.gitPendingRemote !== undefined) sanitized.gitPendingRemote = sanitizeSectionMap(state.gitPendingRemote);
   const body = JSON.stringify(sanitized, null, 2);
   // The whole-state writer historically published with no lock at all, which is
   // what let a legacy save land on top of a newer format. It now takes the same
@@ -340,7 +318,7 @@ export async function ensureJsonTelemetryId(
       throw new Error(`sync state belongs to stream ${raw.stream}, not ${stream}; refusing to overwrite it`);
     }
     const current = stateFromRepoRecords(raw, repoRecordsForState(raw));
-    if (typeof current.telemetryBindingId === "string" && BINDING_ID_RE.test(current.telemetryBindingId)) {
+    if (current.telemetryBindingId !== undefined && BINDING_ID_RE.test(current.telemetryBindingId)) {
       return { state: current, bindingId: current.telemetryBindingId };
     }
     const bindingId = randomBytes(8).toString("hex");
@@ -364,19 +342,14 @@ export async function ensureJsonTelemetryId(
 
 export async function assertResetIncarnationMarkerNormalized(root: string, state: SyncState): Promise<void> {
   if (!state.stream || !state.stateNonce) return; // legacy migration removes it
-  const marker = await boundedJsonRead<unknown>(stateIncarnationPath(root), 512 * 1024);
+  const marker = await boundedJsonRead<JsonValue>(stateIncarnationPath(root), 512 * 1024);
   if (!marker) return;
-  if (typeof marker !== "object" || Array.isArray(marker)) {
-    throw new Error("reset refused: stale or foreign state incarnation marker");
-  }
-  const keys = Object.keys(marker).sort().join("\0");
-  const stream: unknown = Reflect.get(marker, "stream");
-  const stateNonce: unknown = Reflect.get(marker, "stateNonce");
-  const stateRevision: unknown = Reflect.get(marker, "stateRevision");
-  if (keys !== ["stateNonce", "stateRevision", "stream"].sort().join("\0")
-    || stream !== state.stream || stateNonce !== state.stateNonce
-    || stateRevision !== state.stateRevision) {
-    throw new Error("reset refused: stale or foreign state incarnation marker");
+  const foreign = (): Error => new Error("reset refused: stale or foreign state incarnation marker");
+  if (!jsonObject(marker)) throw foreign();
+  if (Object.keys(marker).sort().join("\0") !== ["stateNonce", "stateRevision", "stream"].sort().join("\0")
+    || marker.stream !== state.stream || marker.stateNonce !== state.stateNonce
+    || marker.stateRevision !== state.stateRevision) {
+    throw foreign();
   }
 }
 
