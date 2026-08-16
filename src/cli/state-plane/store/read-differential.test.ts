@@ -5,11 +5,11 @@ import path from "node:path";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { loadRawState, loadState, statePath, StreamMismatchError } from "../../sync-state-store.js";
 import {
-  stateFromRepoRecords,
-  type RepoRecord,
-  type SyncState,
-  type TypedBlocker,
+  type RepoRecord, type SyncState, type TypedBlocker,
 } from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords,
+} from "../../sync-state-records.js";
 import { loadRawStateFromStore, materializeManifestFromStore } from "../adapters/read-only.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";

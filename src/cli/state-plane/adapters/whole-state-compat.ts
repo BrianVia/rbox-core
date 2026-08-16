@@ -15,12 +15,11 @@ import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
 import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
 import {
-  repoRecordsForState,
-  type StateSaveOptions,
-  type StateSavePacket,
-  type StateSaveResult,
-  type SyncState,
+  type StateSaveOptions, type StateSavePacket, type StateSaveResult, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  repoRecordsForState,
+} from "../../sync-state-records.js";
 import {
   StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";

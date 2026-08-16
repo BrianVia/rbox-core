@@ -1,4 +1,4 @@
-import type { DeltaBinding } from "../../sync-state-model.js";
+import type { DeltaBinding } from "../../sync-state-delta.js";
 import type { ManifestHeader, Plane } from "../ports.js";
 import { canonicalJson, domainHash } from "./codecs.js";
 

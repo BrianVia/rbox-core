@@ -238,11 +238,15 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // bytes, the write sync-state.ts and legacy-json-store.ts each open-coded
     // before it was extracted.
     "src/cli/repo-record-sanitation.ts": 1,
-    // Three sites left with the legacy-manifest adoption they belonged to.
-    "src/cli/sync-state-model.ts": 8,
+    // The record projection kept the legacy-manifest adoption it belonged to
+    // when design 269 split it out of the model file; count-neutral.
+    "src/cli/sync-state-records.ts": 8,
     // T1.1 moved the JSON CAS here; the proof-selection hoist is count-neutral.
     "src/cli/state-plane/adapters/legacy-json-store.ts": 8,
-    "src/cli/sync-state.ts": 14,
+    // 14 in sync-state.ts before design 269 split the published-intent
+    // completion into its own owner; the 22 sites are unchanged.
+    "src/cli/sync-published-intent.ts": 8,
+    "src/cli/sync-state.ts": 6,
     // 2 in sync/pull.ts before design 267 moved the pull's state-save into its
     // own owner: the two sites were one `bases:` literal written twice, once for
     // observedRepos and once for values. The save composes it once now.

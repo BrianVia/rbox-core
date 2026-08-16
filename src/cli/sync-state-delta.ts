@@ -8,7 +8,24 @@
  */
 import type { FileEntry } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
-import type { DeltaBinding, DeltaOp, GlobalDelta, SyncState } from "./sync-state-model.js";
+
+/** The predecessor a delta is relative to. The exact shape an ElisionReceipt
+ * already ships: an accepted CAS of any kind bumps `stateRevision`, so revision
+ * equality proves no writer interleaved since the composer's load. */
+export interface DeltaBinding { nonce: string; stateRevision: number }
+
+/** One file-level change against the predecessor manifest. */
+export type DeltaOp =
+  | { kind: "upsert"; entry: FileEntry }
+  | { kind: "delete"; path: string };
+
+/** A composed global as ops against a bound predecessor. Ops are in strictly
+ * ascending path order and no path appears twice across both kinds. */
+export interface GlobalDelta {
+  binding: DeltaBinding;
+  ops: readonly DeltaOp[];
+}
+
 
 /** Kill switch, default ON; deletion condition is one clean fleet soak plus the
  * Mac field close-out. */
@@ -30,13 +47,19 @@ export const noteCompleteSaveAccepted = (): void => { forceCompleteSave = false;
 /** Test seam: a process-local flag would otherwise leak across cases. */
 export const resetForceCompleteSaveForTests = (): void => { forceCompleteSave = false; };
 
+/** The only part of a loaded state a binding is derived from. */
+export interface BindableSnapshot {
+  stateNonce?: string;
+  stateRevision?: number;
+}
+
 /**
  * The predecessor a delta may bind to, or `undefined` when this save must carry
  * a whole manifest. Genesis, first save, reset, repair, migration, scoped bases,
  * a standing drift heal, and the kill switch all land here.
  */
 export function deltaBindingFor(
-  snapshot: SyncState,
+  snapshot: BindableSnapshot,
   source: { baseIsUnscopedRemote?: boolean; forceCompleteSave?: true },
 ): DeltaBinding | undefined {
   if (!saveDeltaEnabled()) return undefined;

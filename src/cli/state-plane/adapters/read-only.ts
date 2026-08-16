@@ -1,11 +1,10 @@
 import type { Manifest } from "../../../engine/index.js";
 import {
-  stateFromRepoRecords,
-  stripObsoleteResolutionIntents,
-  type GlobalManifestMeta,
-  type RepoRecord,
-  type SyncState,
+  type GlobalManifestMeta, type RepoRecord, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords, stripObsoleteResolutionIntents,
+} from "../../sync-state-records.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { SnapshotChangedError } from "../errors.js";
 import type {

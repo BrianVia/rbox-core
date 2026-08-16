@@ -33,7 +33,12 @@ import type { DoctorCheck } from "../doctor-cmd.js";
 import { checkState, checkStateMigration } from "../doctor-state-plane.js";
 import { migrateCmd } from "../state-plane-cmd.js";
 import { statusCmd } from "../status-cmd.js";
-import { repoRecordsForState, stateFromRepoRecords, type RepoRecord, type SyncState } from "../sync-state-model.js";
+import {
+  type RepoRecord, type SyncState,
+} from "../sync-state-model.js";
+import {
+  repoRecordsForState, stateFromRepoRecords,
+} from "../sync-state-records.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import { AUTHORITY_MARKER_MAGIC } from "./authority-marker.js";

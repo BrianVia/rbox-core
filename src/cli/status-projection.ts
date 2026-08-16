@@ -2,7 +2,9 @@ import { PassThrough } from "node:stream";
 import { diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
-import { knownRepoKeys } from "./sync-state-model.js";
+import {
+  knownRepoKeys,
+} from "./sync-state-records.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";

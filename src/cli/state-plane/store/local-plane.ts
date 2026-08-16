@@ -12,7 +12,7 @@ import type { LineageSnapshot, ManifestHeader } from "../ports.js";
 import {
   copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp, internStagedEntryValues,
   promoteFilesIntoPlane,
-} from "./generations.js";
+} from "./plane-promotion.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { runStatement, selectRow } from "./statements.js";
 import { currentSnapshot } from "./read-snapshot.js";

@@ -8,7 +8,7 @@
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { FileEntry } from "../../../engine/index.js";
-import type { DeltaBinding } from "../../sync-state-model.js";
+import type { DeltaBinding } from "../../sync-state-delta.js";
 import { encodeFileEntryForConsume, type ConsumedFileEntry } from "../codecs/file-entry.js";
 import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import {

@@ -23,11 +23,11 @@ import {
   daemonBindingMatches,
   observedRepoKeys,
   orderedDeferralUpdates,
-  savePublishedRepoIntent,
   saveStateSource,
   stampConfigAck,
   type StateSource,
 } from "./sync-state.js";
+import { savePublishedRepoIntent } from "./sync-published-intent.js";
 import { carryRepoBaseProof } from "./sync-git/base-composer.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
 import { mintSetupExistingConsent } from "./reset-consent.js";

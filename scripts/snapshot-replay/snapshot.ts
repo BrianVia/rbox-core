@@ -31,7 +31,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { repoRecordsForState, type SyncState } from "../../src/cli/sync-state-model.js";
+import {type SyncState} from "../../src/cli/sync-state-model.js";
+import { repoRecordsForState } from "../../src/cli/sync-state-records.js";
 import { RBOX_DIR, type WorkspaceConfig } from "../../src/cli/workspace-config.js";
 import type { LastWriterWitness } from "../../src/cli/state-plane/migration/last-writer-witness.js";
 import { sandboxLayout, SNAPSHOT_EXCLUDES, type SnapshotReport } from "./layout.js";

@@ -10,14 +10,11 @@
 import { isDeepStrictEqual } from "node:util";
 import { canonicalManifestHashStreaming } from "../engine/index.js";
 import {
-  expectedStateNonce,
-  manifestFromMeta,
-  validManifestMeta,
-  type GlobalManifestMeta,
-  type RepoRecordInput,
-  type StateSavePacket,
-  type SyncState,
+  manifestFromMeta, validManifestMeta, type GlobalManifestMeta, type RepoRecordInput, type StateSavePacket, type SyncState,
 } from "./sync-state-model.js";
+import {
+  expectedStateNonce,
+} from "./sync-state-records.js";
 
 /** Pull-owned evidence, gathered before the state lock is taken. */
 export interface ElisionReceipt {

@@ -4,7 +4,9 @@ import { discoverGitRepos, poolMap, type GitSection, type IgnoreMatcher } from "
 import { repoCtxFromDisk, type GitRepoKind } from "./git-state.js";
 import { type GitConfigRunner } from "./config-txn.js";
 import { DEFERRAL_LANES, repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
-import { knownRepoKeys } from "../sync-state-model.js";
+import {
+  knownRepoKeys,
+} from "../sync-state-records.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";
 import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";

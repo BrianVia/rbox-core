@@ -9,15 +9,16 @@ import {
   composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue,
 } from "../../sync-git/base-composer.js";
 import {
-  validManifestMeta, type DeltaBinding, type ElisionExpectation, type GlobalManifestMeta,
+  validManifestMeta, type ElisionExpectation, type GlobalManifestMeta,
   type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
+import type { DeltaBinding } from "../../sync-state-delta.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { ProoflessBaseError, StageChangedError, decodeAuthorityRow } from "../errors.js";
 import type { CasRejectionReason, ManifestHeader } from "../ports.js";
-import { applyDeltaOpsIntoPlane, internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
+import { applyDeltaOpsIntoPlane, internStagedEntryValues, promoteFilesIntoPlane } from "./plane-promotion.js";
 import { runStatement, selectRow, streamRows, withStatement } from "./statements.js";
 import {
   canonicalEvidenceOf, decodeTransitionBaseProof, decodeTransitionEvidence, decodeTransitionRecord,

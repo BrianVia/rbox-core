@@ -9,9 +9,11 @@
  */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import {
-  normalizeStateCounter, repoRecordsForState,
   validManifestMeta, type RepoRecord, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  normalizeStateCounter, repoRecordsForState,
+} from "../../sync-state-records.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";

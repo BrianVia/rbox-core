@@ -11,12 +11,11 @@ import {
   statePath,
 } from "../sync-state-store.js";
 import {
-  expectedStateNonce,
-  repoRecordsForState,
-  type RepoRecordInput,
-  type StateSaveOptions,
-  type SyncState,
+  type RepoRecordInput, type StateSaveOptions, type SyncState,
 } from "../sync-state-model.js";
+import {
+  expectedStateNonce, repoRecordsForState,
+} from "../sync-state-records.js";
 import { presentWitnessFromPreparedRef, type RepoBaseProof } from "./base-composer.js";
 import { MutationGateClosedError, type MutationBoundary, type MutationLease } from "../../engine/mutation-gate.js";
 

@@ -4,7 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { stateFromRepoRecords, type RepoRecord, type SyncState } from "../../sync-state-model.js";
+import {
+  type RepoRecord, type SyncState,
+} from "../../sync-state-model.js";
+import {
+  stateFromRepoRecords,
+} from "../../sync-state-records.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
 import { compareUtf16 } from "../digest/codecs.js";
 import { LegacyStateShapeError, normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";

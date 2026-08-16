@@ -4,11 +4,11 @@ import {
   statePath,
 } from "../sync-state-store.js";
 import {
-  expectedStateNonce,
-  repoRecordsForState,
-  type RepoRecord,
-  type StateSaveOptions,
+  type RepoRecord, type StateSaveOptions,
 } from "../sync-state-model.js";
+import {
+  expectedStateNonce, repoRecordsForState,
+} from "../sync-state-records.js";
 import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
 import { parsePRepairReceipt, type PRepairReceipt } from "./p-repair.js";
 import type { PRepairStatePort, PRepairStateSnapshot } from "./p-repair-transaction.js";

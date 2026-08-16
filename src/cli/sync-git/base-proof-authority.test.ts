@@ -20,7 +20,8 @@ import path from "node:path";
 import type { GitSection } from "../../engine/index.js";
 import { ProoflessBaseError } from "../state-plane/errors.js";
 import { applyStateSavePacket, type SyncState } from "../config.js";
-import { composeStateSavePacket, savePublishedRepoIntent, type StateSource } from "../sync-state.js";
+import { composeStateSavePacket, type StateSource } from "../sync-state.js";
+import { savePublishedRepoIntent } from "../sync-published-intent.js";
 import { carryRepoBaseProof, composeRepoBase, observedLandingRepoBaseProof, type BranchBaseOrigin, type RepoBaseProof } from "./base-composer.js";
 import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
 
@@ -239,7 +240,7 @@ test("the mints' importers are a closed list", async () => {
   }
   expect(importers.sort(), "migration BASE authority escaped its territory").toEqual([
     // The legacy JSON manifest adoption the blanket authority exists for.
-    "cli/sync-state-model.ts",
+    "cli/sync-state-records.ts",
     // Composer unit test: the one place migration composition semantics are asserted.
     "cli/sync-git/base-composer.test.ts",
     // This file, proving carry composes byte-identically to the old default.

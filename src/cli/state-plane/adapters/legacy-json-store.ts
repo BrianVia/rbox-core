@@ -25,17 +25,11 @@ import {
 import { RBOX_DIR } from "../../workspace-config.js";
 import { statePath, stateLockPath, stateIncarnationPath } from "../paths.js";
 import {
-  elisionExpectationDrifted, expectedStateNonce,
-  normalizeStateCounter, repoRecordsForState,
-  stateFromRepoRecords,
-  stripObsoleteResolutionIntents,
-  type RepoRecord,
-  type RepoRecordInput,
-  type StateSaveOptions,
-  type StateSavePacket,
-  type StateSaveResult,
-  type SyncState,
+  type RepoRecord, type RepoRecordInput, type StateSaveOptions, type StateSavePacket, type StateSaveResult, type SyncState,
 } from "../../sync-state-model.js";
+import {
+  elisionExpectationDrifted, expectedStateNonce, normalizeStateCounter, repoRecordsForState, stateFromRepoRecords, stripObsoleteResolutionIntents,
+} from "../../sync-state-records.js";
 
 function isENOENT(error: Error): boolean {
   return Reflect.get(error, "code") === "ENOENT";

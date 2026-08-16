@@ -13,7 +13,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
-import { repoRecordsForState, type RepoRecord, type SyncState } from "./sync-state-model.js";
+import {
+  type RepoRecord, type SyncState,
+} from "./sync-state-model.js";
+import {
+  repoRecordsForState,
+} from "./sync-state-records.js";
 import { projectGitDeferralRepos } from "./status-view.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { RBOX_DIR } from "./workspace-config.js";

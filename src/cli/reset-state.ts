@@ -35,8 +35,11 @@ import {
 } from "./reset-consent.js";
 import { RBOX_DIR, loadConfig, syncStreamId } from "./workspace-config.js";
 import {
-  normalizeStateCounter, repoRecordsForState, type SyncState,
+  type SyncState,
 } from "./sync-state-model.js";
+import {
+  normalizeStateCounter, repoRecordsForState,
+} from "./sync-state-records.js";
 import {
   applyStateSavePacket,
   assertResetIncarnationMarkerNormalized,
