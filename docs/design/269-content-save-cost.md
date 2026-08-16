@@ -360,3 +360,14 @@ CSPRNG mint (R3), O(N/4MB) durable stage commits (R1), r2's chain +2
 columns + schema-v2 slice + rollout tooling, r1's A2 branch and A5
 channel. Net: one new save shape with structural isolation, priced
 against the 85% bucket it deletes.
+
+## 9. Darwin probe close-out (2026-08-16, Mac, branch a76aa768)
+
+Full state-plane suite on Apple system SQLite: every 269 delta-lifecycle
+fixture GREEN (seal S0, containment, consume, refusals). Bench (real fs,
+~/.cache): save_delta_one_changed **36.6ms** + compose walk **18.1ms** vs
+save_steady_one_changed 1,604ms — the Mac's 5.9s field save projects to
+~55ms + read-back. 9 failures observed are byte-identical on main
+(differential run) — pre-existing darwin debt, filed as GH #755 with the
+darwin-CI-lane case. Probe traps recorded: non-interactive SSH PATH lacks
+node; TMPDIR redirection requires mkdir -p (bit 3x today).
