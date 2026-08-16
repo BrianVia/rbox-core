@@ -6,11 +6,17 @@
  * skipped fixture (must never throw). Keeping it pure means the report can be
  * re-rendered from artifacts without a container.
  */
+import type { RigSourceCommit } from "./binary.js";
 import type { ScenarioReport } from "../scenarios/types.js";
 import { isSkipped, type CaptureSummary, type ServerMetricsSummary, type StatSummary, type TailSummary } from "./capture.js";
 
 function n1(x: number): string {
   return (Math.round(x * 10) / 10).toLocaleString("en-US");
+}
+
+function commitCell(source: RigSourceCommit | undefined): string {
+  if (!source) return "—";
+  return `${source.commit.slice(0, 12)}${source.dirty ? " (dirty)" : " (clean)"}`;
 }
 
 function statLine(label: string, s: StatSummary | { skipped: string }): string {
@@ -46,9 +52,9 @@ export function renderReportMd(report: ScenarioReport, capture: CaptureSummary):
   out.push(`- finished: ${report.finishedAt}`);
   out.push(`- duration: ${n1(report.durationMs)} ms`, "");
   if (report.binaries) {
-    out.push("## Binaries", "", "| device | mode | version | sha256 | host path |", "| --- | --- | --- | --- | --- |");
+    out.push("## Binaries", "", "| device | mode | version | sha256 | commit | host path |", "| --- | --- | --- | --- | --- | --- |");
     for (const binary of report.binaries) {
-      out.push(`| ${binary.device} | ${binary.mode} | ${binary.version} | ${binary.sha256 ?? "—"} | ${binary.hostPath ?? "checkout source"} |`);
+      out.push(`| ${binary.device} | ${binary.mode} | ${binary.version} | ${binary.sha256 ?? "—"} | ${commitCell(binary.source)} | ${binary.hostPath ?? "checkout source"} |`);
     }
     out.push("");
   }
