@@ -30,7 +30,7 @@ import {
   type SyncState,
 } from "./config.js";
 import {
-  globalWouldNotChange, recordWouldNotChange, type ElisionReceipt,
+  fullyElidedPacket, globalWouldNotChange, receiptBoundTo, recordWouldNotChange, type ElisionReceipt,
 } from "./sync-state-elision.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
@@ -290,18 +290,23 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
   const records = { ...repoRecordsForState(snapshot) };
   const observedRepos = [...new Set(source.observedRepos)].sort();
-  const receipt = source.elisionReceipt;
-  const elideGlobal = receipt !== undefined && globalWouldNotChange(snapshot, source.sourceGlobalSeq, receipt);
-  let elided = elideGlobal;
+  // The receipt is evidence only against the snapshot it was minted from, so a
+  // recomposition after ANY rejection silently spends it (§3.2b).
+  const receipt = receiptBoundTo(snapshot, source.elisionReceipt);
+  // An elision has ONE meaning: the global was proven unchanged. Repo
+  // transitions ride that same proof rather than each carrying their own, so a
+  // content-carrying save never attaches an expectation and never spends part
+  // of its retry budget on a race it had no reason to care about (§3.3).
+  const proven = receipt !== undefined
+    && globalWouldNotChange(snapshot, source.sourceGlobalSeq, receipt) ? receipt : undefined;
   const repos = observedRepos.flatMap((relPath) => {
     const stored = records[relPath];
     const current = stored ?? { repoGen: 0, sourceSeq: 0 };
     const transition = sourceRecord(source, relPath, current);
     // A path with no stored record is never elided: absence is a distinct
     // durable outcome from a record that happens to compose to the same values.
-    if (receipt !== undefined && stored !== undefined
+    if (proven !== undefined && stored !== undefined
       && recordWouldNotChange(inputRecord(stored), transition.newRecord)) {
-      elided = true;
       return [];
     }
     return [{ relPath, expectedRepoGen: current.repoGen, ...transition }];
@@ -314,19 +319,14 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
   };
   // On recompute after a newer global landed, omit this stale global candidate.
   // Repo transitions above likewise retain records with a newer sourceSeq.
-  if (source.globalManifest !== undefined && !elideGlobal && source.sourceGlobalSeq >= snapshot.lastSyncedSequence) {
+  if (source.globalManifest !== undefined && proven === undefined && source.sourceGlobalSeq >= snapshot.lastSyncedSequence) {
     packet.global = { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta };
   }
-  if (elided && receipt !== undefined) {
-    packet.elisionExpectation = { nonce: receipt.nonce, stateRevision: receipt.stateRevision };
+  if (proven !== undefined) {
+    packet.elisionExpectation = { nonce: proven.nonce, stateRevision: proven.stateRevision };
   }
   return packet;
 }
-
-/** Nothing but lineage identity remains, so the caller's loaded state plus the
- * accepted CAS token IS the durable state (design 267 §4). */
-const fullyElided = (packet: StateSavePacket): boolean =>
-  packet.elisionExpectation !== undefined && packet.global === undefined && packet.repos.length === 0;
 
 function projectStateSource(snapshot: SyncState, source: StateSource): SyncState {
   const packet = composeStateSavePacket(snapshot, source);
@@ -387,29 +387,22 @@ export async function saveStateSource(
 ): Promise<SyncState> {
   const apply = options.apply ?? applyStateSavePacket;
   let snapshot = initialSnapshot;
-  let active = source;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const packet = composeStateSavePacket(snapshot, active);
-    const result = await apply(root, packet, fullyElided(packet) ? { acceptedProjection: snapshot } : {});
+    const packet = composeStateSavePacket(snapshot, source);
+    const result = await apply(root, packet, fullyElidedPacket(packet) ? { acceptedProjection: snapshot } : {});
     if (result.status === "accepted") return result.state;
     if (result.status === "unsupported") {
       // Exact-Q lock refusal is a typed state-plane barrier. It must escape
       // before the JSON-only projection or writer is even reached. Legacy JSON
       // keeps its raw unsupported result and therefore its established fallback.
       rethrowIfStateBarrier(result.error);
-      const next = legacyState(projectStateSource(snapshot, active));
+      const next = legacyState(projectStateSource(snapshot, source));
       await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
-    if (result.status === "rejected" && result.reason === "elision-drift") {
-      const { elisionReceipt: _spent, ...withoutReceipt } = active;
-      active = withoutReceipt;
-      snapshot = result.state;
-      continue;
-    }
     if (result.status === "rejected" && result.reason === "stream" && options.allowLegacyStreamReplacement) {
-      const acceptedProjection = projectStateSource(snapshot, active);
+      const acceptedProjection = projectStateSource(snapshot, source);
       return replaceResetLineageStream(
         root, snapshot, result.state, packet, acceptedProjection, legacyState(acceptedProjection),
       );
