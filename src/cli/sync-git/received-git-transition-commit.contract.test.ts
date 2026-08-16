@@ -11,8 +11,11 @@ import { gitRaw } from "../../engine/git-spawn.js";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { loadRawState, saveStateUnsafeLegacyOrTest, type GitPartialApply, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";
-import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
+import type { BranchTransitionWitness, LockedBranchProof, RepoBaseProof } from "./base-composer.js";
+import type { RepoRecord } from "../sync-state-model.js";
 import { gitIncomingKey } from "./shared.js";
+import { parseStateCasJournal } from "./state-cas-journal.js";
+import { recoverStateCasLocks, stateCasJournalDir } from "./state-cas-locks.js";
 import {
   partialRefsStillMatch,
   revalidateGitPartialApplies,
@@ -77,7 +80,11 @@ function stateWithPartial(value: GitPartialApply | undefined): SyncState {
     stateRevision: 1,
     lastSyncedSequence: 1,
     lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: {} },
-    repoRecords: { [REL]: { repoGen: 1, sourceSeq: 1, ...(value ? { partial: value } : {}) } },
+    repoRecords: (() => {
+      const record: RepoRecord = { repoGen: 1, sourceSeq: 1 };
+      if (value) record.partial = value;
+      return { [REL]: record };
+    })(),
   };
 }
 
@@ -213,6 +220,7 @@ test("a gate closed before the commit boundary refuses the save and releases eve
   })).rejects.toBeInstanceOf(MutationGateClosedError);
   expect(saved).toBe(false);
   expect(await fs.readdir(path.join(repo, ".git", "refs", "heads"))).toEqual(["topic"]);
+  expect(await fs.readdir(stateCasJournalDir(root)).catch(() => [])).toEqual([]);
 });
 
 test("a commit boundary that refuses the transition stops the save even with no lock to hold", async () => {
@@ -243,6 +251,39 @@ test("a gate closed after the journal is prepared refuses before any lock is pub
   })).rejects.toBeInstanceOf(MutationGateClosedError);
   expect(saved).toBe(false);
   expect(await fs.readdir(path.join(repo, ".git", "refs", "heads"))).toEqual(["topic"]);
+  expect(await fs.readdir(stateCasJournalDir(root)).catch(() => [])).toEqual([]);
+});
+
+test("production wrapper retains authority after batch finalization cleanup until recovery re-fsyncs its parent", async () => {
+  const oid = await git("rev-parse", REF);
+  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  let saved = false;
+  await expect(withRevalidatedGitPartialApplies(root, state, {}, async () => { saved = true; }, {
+    stateCasLockHooks: { afterCreate: () => { throw new Error("injected batch-finalization failure"); } },
+  })).rejects.toThrow("injected batch-finalization failure");
+  expect(saved).toBe(false);
+  const lockParent = path.join(repo, ".git", "refs", "heads");
+  expect(await fs.lstat(path.join(lockParent, "topic.lock")).then(() => true, () => false)).toBe(false);
+  const journalDir = stateCasJournalDir(root);
+  const journals = await fs.readdir(journalDir);
+  expect(journals).toHaveLength(1);
+  const journalPath = path.join(journalDir, journals[0]!);
+  const journal = parseStateCasJournal(await fs.readFile(journalPath, "utf8"), journalPath);
+  expect(journal).toBeDefined();
+  const synced: string[] = [];
+  const recovery = await recoverStateCasLocks(root, {
+    identity: {
+      current: async () => journal!.owner,
+      probe: async () => ({ status: "dead" as const }),
+    },
+    syncDirectory: async (directory) => {
+      expect(await fs.lstat(journalPath).then(() => true, () => false)).toBe(true);
+      synced.push(directory);
+    },
+  });
+  expect(recovery).toMatchObject({ recovered: 0, indeterminate: 0 });
+  expect(synced).toEqual([lockParent]);
+  expect(await fs.lstat(journalPath).then(() => true, () => false)).toBe(false);
 });
 
 // ── branch-proof terminal revalidation ──────────────────────────────────────
@@ -274,13 +315,16 @@ function proofFor(binding: { lineageHash: string; repositoryIdentityHash: string
       effectiveRefScope: "all",
       checkoutComplete: true,
       branches: {
-        [REF]: {
-          liveOid: witness.kind === "present" ? witness.nextOid : null,
-          witness,
-          ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
-          artifactsClear: true, ownershipStable: true, reflogStable: true,
-          currentRef: true, siblingOwned: false,
-        },
+        [REF]: (() => {
+          const branch: LockedBranchProof = {
+            liveOid: witness.kind === "present" ? witness.nextOid : null,
+            witness,
+            artifactsClear: true, ownershipStable: true, reflogStable: true,
+            currentRef: true, siblingOwned: false,
+          };
+          if (witness.kind === "present") branch.reflogEpisode = witness.episode;
+          return branch;
+        })(),
       },
       safeRefs: {},
     },

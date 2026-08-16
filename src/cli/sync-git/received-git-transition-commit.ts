@@ -12,7 +12,7 @@ import { clearFollowJournal } from "./follow.js";
 import { rebindHeldAttemptsAfterSettlement } from "./held-skip.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { chainLock, gitApplyMutationKey, gitIncomingKey, nextDeferral, repoDirOf } from "./shared.js";
-import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
+import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, type AcquiredStateCasLocks, type StateCasLockRequest } from "./state-cas-locks.js";
 
 /**
  * The received Git transition's commit half: everything between a completed
@@ -190,18 +190,17 @@ function carryUnreadableRefDatabase(
     ? undefined
     : existingTransition?.apply ?? prior?.deferrals?.apply;
   const now = new Date().toISOString();
+  const transition = existingTransition && existingTransition !== null ? { ...existingTransition } : {};
+  transition.apply = nextDeferral(
+    "apply",
+    existing,
+    "ref-read-unreadable",
+    now,
+    candidate ? gitIncomingKey(candidate) : undefined,
+  );
   outcome.deferrals = {
     ...(outcome.deferrals ?? {}),
-    [rel]: {
-      ...(existingTransition && existingTransition !== null ? existingTransition : {}),
-      apply: nextDeferral(
-        "apply",
-        existing,
-        "ref-read-unreadable",
-        now,
-        candidate ? gitIncomingKey(candidate) : undefined,
-      ),
-    },
+    [rel]: transition,
   };
 }
 
@@ -255,12 +254,14 @@ export async function withRevalidatedGitPartialApplies<T>(
     afterFirstStateCasLockAcquired?: () => void | Promise<void>;
     /** Real-process crash seams; tests only. */
     afterStateCasJournalPrepared?: () => void | Promise<void>;
-    afterStateCasLockPersisted?: (count: number, lockPath: string) => void | Promise<void>;
+    afterStateCasLockAppended?: (count: number, lockPath: string) => void | Promise<void>;
+    afterStateCasBatchDurable?: () => void | Promise<void>;
     afterStateCasLocksAcquired?: () => void | Promise<void>;
     afterStateCasCommitted?: () => void | Promise<void>;
     stateCasLockHooks?: LockfileHooks;
     /** Observation only: wall ms per CAS step, for the pull phase report. */
     observeStep?: (step: "plan" | "prepare" | "acquire" | "revalidate-partials" | "revalidate-proofs" | "settle", ms: number) => void;
+    observeLockCounts?: (locks: number, blocked: number) => void;
   } = {},
 ): Promise<T> {
   const timed = async <R>(step: Parameters<NonNullable<typeof options.observeStep>>[0], fn: () => Promise<R>): Promise<R> => {
@@ -274,23 +275,25 @@ export async function withRevalidatedGitPartialApplies<T>(
   };
   const records = repoRecordsForState(state);
   const { requested, mutationRepos } = await timed("plan", () => planStateCasLocks(root, state, outcome));
-  const lease = options.mutationBoundary?.enter({
-    phase: "state-cas",
-    ...(mutationRepos.length > 0 ? { repository: mutationRepos.join(",") } : {}),
-  });
+  const leaseRequest = mutationRepos.length > 0
+    ? { phase: "state-cas" as const, repository: mutationRepos.join(",") }
+    : { phase: "state-cas" as const };
+  const lease = options.mutationBoundary?.enter(leaseRequest);
   let prepared: Awaited<ReturnType<typeof prepareStateCasLocks>>;
-  let held: HeldStateCasLock[] = [];
+  let acquired: AcquiredStateCasLocks | undefined;
   try {
     prepared = await timed("prepare", () => prepareStateCasLocks(
       root,
       { stream: state.stream, stateNonce: expectedStateNonce(state) },
       [...requested.entries()].map(([lockPath, request]) => ({ lockPath, commonDir: request.commonDir, proofs: request.proofs })),
     ));
-    await options.afterStateCasJournalPrepared?.();
-    if (lease?.abortRequested) throw new MutationGateClosedError();
     if (prepared) {
       const preparedLocks = prepared;
-      const acquired = await timed("acquire", () => acquirePreparedStateCasLocks(preparedLocks, {
+      acquired = await timed("acquire", () => acquirePreparedStateCasLocks(preparedLocks, {
+        beforeAcquire: async () => {
+          await options.afterStateCasJournalPrepared?.();
+          if (lease?.abortRequested) throw new MutationGateClosedError();
+        },
         beforeLockPublish: () => {
           if (lease?.abortRequested) throw new MutationGateClosedError();
         },
@@ -298,14 +301,18 @@ export async function withRevalidatedGitPartialApplies<T>(
           if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
           await options.afterFirstStateCasLockAcquired?.();
         },
-        afterAcquisitionPersisted: options.afterStateCasLockPersisted,
+        afterLockAppended: options.afterStateCasLockAppended,
+        afterBatchDurable: options.afterStateCasBatchDurable,
         hooks: options.stateCasLockHooks,
       }));
-      held = acquired.held;
+      try { options.observeLockCounts?.(acquired.acquired, acquired.blocked.size); } catch { /* observation must not fail the CAS */ }
       await options.afterStateCasLocksAcquired?.();
       for (const lockPath of acquired.blocked) {
         for (const rel of requested.get(lockPath)?.rels ?? []) dropPartial(rel, outcome);
       }
+    } else {
+      await options.afterStateCasJournalPrepared?.();
+      if (lease?.abortRequested) throw new MutationGateClosedError();
     }
     await timed("revalidate-partials", () => revalidateGitPartialApplies(root, state, outcome));
     await timed("revalidate-proofs", () => revalidateCommittedBranchProofs(root, records, outcome));
@@ -318,7 +325,7 @@ export async function withRevalidatedGitPartialApplies<T>(
     });
     return saved;
   } finally {
-    await releaseStateCasLocks(prepared, held).catch(() => false);
+    await acquired?.release().catch(() => false);
     lease?.finish();
   }
 }

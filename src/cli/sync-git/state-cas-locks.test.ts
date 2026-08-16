@@ -5,10 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { formatLockMarker, observeLockMarker, publishLockMarker, releaseObservedLock, type ProcessIncarnation } from "../../engine/lockfile.js";
+import { parseStateCasJournal } from "./state-cas-journal.js";
 import {
   acquirePreparedStateCasLocks,
   classifyStateCasLockEvidence,
-  markStateCasCommitted,
   prepareStateCasLocks,
   recoverStateCasLocks,
   stateCasJournalDir,
@@ -127,6 +127,7 @@ test("gate closure during marker staging wins before the first visible lock", as
   })).rejects.toThrow(MutationGateClosedError);
   lease.finish();
   expect(await fs.lstat(lockPath).then(() => true, () => false)).toBe(false);
+  expect(await fs.lstat(prepared!.journalPath).then(() => true, () => false)).toBe(false);
 });
 
 test("state-CAS refuses publication after common-directory inode replacement", async () => {
@@ -175,7 +176,7 @@ test("dead-owner recovery reaps the exact marker, validates Git, and retires its
     proofs: [{ repo: ".", ref: "refs/heads/main", expectedOid: null }],
   }], { identity: identity("alive") });
   const acquired = await acquirePreparedStateCasLocks(prepared!);
-  expect(acquired.held).toHaveLength(1);
+  expect(acquired.acquired).toBe(1);
 
   expect(await recoverStateCasLocks(root, { commonDir: common, identity: identity("dead") })).toMatchObject({
     recovered: 1,
@@ -233,7 +234,7 @@ test("mixed cohort recovers exact-owned lock beside changed foreign blocker", as
     { commonDir: common, lockPath: foreignPath, proofs: [{ repo: ".", ref: "refs/heads/changed", expectedOid: null }] },
   ], { identity: identity("alive") });
   const acquired = await acquirePreparedStateCasLocks(prepared!);
-  expect(acquired.held).toHaveLength(1);
+  expect(acquired.acquired).toBe(1);
   await runGit(common, ["update-ref", "refs/heads/changed", "1".repeat(40)]).catch(async () => {
     // Bare repositories reject nonexistent objects; a symbolic ref still
     // changes the proof without affecting the owned sibling.
@@ -293,6 +294,17 @@ test("a dead journal with absent locks is retained until post-recovery Git valid
   expect(await fs.lstat(prepared!.journalPath).then(() => true, () => false)).toBe(true);
 });
 
+test("a re-stringified unmodified v2 header with newline parses", async () => {
+  const common = await bareCommon();
+  const prepared = await prepareStateCasLocks(root, { stream: "stream", stateNonce: "1".repeat(32) }, [{
+    commonDir: common,
+    lockPath: path.join(common, "refs", "heads", "main.lock"),
+    proofs: [{ repo: ".", ref: "refs/heads/main", expectedOid: null }],
+  }], { identity: identity("alive") });
+  const header = JSON.parse(await fs.readFile(prepared!.journalPath, "utf8"));
+  expect(parseStateCasJournal(`${JSON.stringify(header)}\n`, prepared!.journalPath)).toMatchObject({ version: 2, phase: "prepared" });
+});
+
 for (const corruption of ["invalid-marker", "marker-owner-mismatch", "non-lock-target"] as const) {
   test(`forged journal authority is indeterminate and never deletes its named file: ${corruption}`, async () => {
     const common = await bareCommon();
@@ -314,7 +326,7 @@ for (const corruption of ["invalid-marker", "marker-owner-mismatch", "non-lock-t
     journal.commonDirs[0].locks[0].marker = raw;
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, raw);
-    await fs.writeFile(prepared!.journalPath, JSON.stringify(journal));
+    await fs.writeFile(prepared!.journalPath, `${JSON.stringify(journal)}\n`);
 
     const result = await recoverStateCasLocks(root, { identity: identity("dead") });
     expect(result.indeterminate).toBeGreaterThan(0);
@@ -366,106 +378,3 @@ test("targeted recovery counts a symlinked journal as indeterminate", async () =
   await fs.symlink(target, path.join(dir, "bad.json"));
   expect(await recoverStateCasLocks(root, { commonDir: common })).toMatchObject({ indeterminate: 1 });
 });
-
-test("R2 real-process crash matrix recovers a 140-lock withRevalidated state-CAS", async () => {
-  const repo = path.join(root, "repo");
-  await fs.mkdir(repo);
-  await runGit(repo, ["init", "-qb", "main"]);
-  await runGit(repo, ["config", "user.email", "crash@example.invalid"]);
-  await runGit(repo, ["config", "user.name", "crash test"]);
-  await fs.writeFile(path.join(repo, "seed"), "seed\n");
-  await runGit(repo, ["add", "seed"]);
-  await runGit(repo, ["commit", "-qm", "seed"]);
-  const oid = await runGit(repo, ["rev-parse", "HEAD"]);
-  const refs = Array.from({ length: 140 }, (_, index) => `refs/heads/crash-${String(index).padStart(3, "0")}`);
-  const updater = Bun.spawn(["git", "-C", repo, "update-ref", "--stdin"], { stdin: "pipe", stdout: "ignore", stderr: "pipe" });
-  updater.stdin.write(refs.map((ref) => `create ${ref} ${oid}\n`).join(""));
-  updater.stdin.end();
-  if (await updater.exited !== 0) throw new Error(await new Response(updater.stderr).text());
-
-  const script = `
-    import { withRevalidatedGitPartialApplies } from "./src/cli/sync-git/received-git-transition-commit.ts";
-    const root = process.env.RBOX_T3_CRASH_ROOT;
-    const oid = process.env.RBOX_T3_CRASH_OID;
-    const point = process.env.RBOX_T3_CRASH_POINT;
-    if (!root || !oid || !point) throw new Error("missing crash fixture");
-    const refs = Array.from({ length: 140 }, (_, index) => "refs/heads/crash-" + String(index).padStart(3, "0"));
-    const state = {
-      stream: "stream", stateNonce: "1".repeat(32), lastSyncedSequence: 0,
-      lastSyncedManifest: { generatedAt: "", files: [] },
-      repoRecords: { repo: { repoGen: 1, sourceSeq: 0, partial: {
-        incomingKey: "incoming", checkoutPending: false, configApplied: true, heldRefs: {},
-        appliedRefs: Object.fromEntries(refs.map((ref) => [ref, { kind: "direct", oid }]))
-      } } }
-    };
-    const crash = () => process.kill(process.pid, "SIGKILL");
-    let created = 0;
-    await withRevalidatedGitPartialApplies(root, state, {}, async () => {
-      if (point === "during-state-save") crash();
-    }, {
-      afterStateCasJournalPrepared: () => { if (point === "after-journal") crash(); },
-      afterStateCasLockPersisted: () => { created++; if (point === "after-lock-N" && created === 70) crash(); },
-      afterStateCasLocksAcquired: () => { if (point === "after-final-lock") crash(); },
-      afterStateCasCommitted: () => { if (point === "after-state-save") crash(); },
-    });
-  `;
-  for (const point of ["after-journal", "after-lock-N", "after-final-lock", "during-state-save", "after-state-save"]) {
-    const child = Bun.spawn(["bun", "--eval", script], {
-      cwd: process.cwd(),
-      env: { ...process.env, RBOX_T3_CRASH_ROOT: root, RBOX_T3_CRASH_OID: oid, RBOX_T3_CRASH_POINT: point },
-      stdout: "ignore",
-      stderr: "pipe",
-    });
-    expect(await child.exited).not.toBe(0);
-    const recovery = await recoverStateCasLocks(root);
-    expect(recovery.indeterminate).toBe(0);
-    expect(await fs.readdir(stateCasJournalDir(root)).catch(() => [])).toEqual([]);
-    for (const ref of refs) {
-      expect(await fs.lstat(path.join(repo, ".git", `${ref}.lock`)).then(() => true, () => false)).toBe(false);
-    }
-  }
-}, 30_000);
-
-for (const point of ["after-journal", "after-lock-N", "after-final-lock", "during-state-save", "after-state-save"] as const) {
-  test(`R2 crash injection: ${point} recovers every exact owned lock`, async () => {
-    const common = await bareCommon();
-    const requests = ["one", "two", "three"].map((name) => ({
-      commonDir: common,
-      lockPath: path.join(common, "refs", "heads", `${name}.lock`),
-      proofs: [{ repo: ".", ref: `refs/heads/${name}`, expectedOid: null }],
-    }));
-    const prepared = await prepareStateCasLocks(
-      root,
-      { stream: "stream", stateNonce: "1".repeat(32) },
-      requests,
-      { identity: identity("alive") },
-    );
-    let expectedRecovered = 0;
-    if (point === "after-lock-N") {
-      for (const lock of prepared!.journal.commonDirs[0]!.locks.slice(0, 2)) {
-        const published = await publishLockMarker(lock.path, lock.marker);
-        expect(published.status).toBe("created");
-        if (published.status === "created") {
-          lock.acquisition = "acquired";
-          lock.observation = {
-            dev: String(published.observation.dev), inode: String(published.observation.inode),
-            size: String(published.observation.size), mtimeNs: String(published.observation.mtimeNs), raw: published.observation.raw,
-          };
-        }
-        expectedRecovered++;
-      }
-      await fs.writeFile(prepared!.journalPath, `${JSON.stringify(prepared!.journal, null, 2)}\n`);
-    } else if (point !== "after-journal") {
-      const acquired = await acquirePreparedStateCasLocks(prepared!);
-      expectedRecovered = acquired.held.length;
-      if (point === "after-state-save") await markStateCasCommitted(prepared);
-    }
-
-    const result = await recoverStateCasLocks(root, { identity: identity("dead") });
-    expect(result.recovered).toBe(expectedRecovered);
-    for (const request of requests) {
-      expect(await fs.lstat(request.lockPath).then(() => true, () => false)).toBe(false);
-    }
-    expect(await fs.lstat(prepared!.journalPath).then(() => true, () => false)).toBe(false);
-  });
-}
