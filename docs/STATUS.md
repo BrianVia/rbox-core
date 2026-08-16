@@ -1,5 +1,34 @@
 # rbox status — living state snapshot
 
+## 2026-08-16 (final) — #749 ALSO KILLED: CAS-lock amortization SHIPPED (#751, design 268)
+
+- **PR #751 merged** (design 268): append-structured journal v2 (O(N²)→O(N)
+  bytes, 1 fsync/lock), per-directory batched fsyncs, single-use release
+  handle (one owner per physical effect — double-release unrepresentable).
+  4-round design + 2-lane impl review + fold + final serial confirm; the
+  wave caught 3 CRITICAL-class defects pre-merge (double-release authority
+  deletion, journal-cap wedge at FM scale, un-canonicalized identities).
+  Trail in docs/design/notes/268/. #749 CLOSED.
+- **Field-verified within minutes**: FM's post-deploy catch-up pull was the
+  pathological shape at N=2,292 locks — acquire 50.3s → **16.4s**
+  (~33ms → **7.2ms/lock**, at the measured 2-fsync provenance floor;
+  FM NVMe 2.92ms/fsync, desktop 1.06ms). New span attribution
+  `locks<N> blocked<M>` makes O(N)-work vs real contention self-diagnosing.
+- **Rig FAST 9/9 PASS** on merged 13bbcb8 (incl. git-entanglement — the
+  lock machinery's own scenario — and json-upgrade-path with 267's elision
+  live on both backends). Fleet uniform on 13bbcb8, all 3 hosts.
+- Founder-ledger rows (below-floor levers, decisions pending): K-batched
+  provenance appends; per-repo lock granularity (the deep N-reduction);
+  consumed-name provenance (needs native binding + threat-model ruling).
+- **Next long poles (evidence-ranked)**: M4 delta-stage save (Mac content
+  pull still 5.9s full save — earned by measurement); Mac git-apply
+  re-prove churn 7.4-8s/cycle (parked-deferral class); state-load 1.7-2s
+  cross-cycle cache; codex quota LOW — new work routes to opus until reset.
+- Papercuts: fleet git-pulls must be staggered + desktop-first (synced
+  checkouts turn concurrent pulls into conflict-copy waves — bit 3x today;
+  FM repair = fetch + reset --hard origin/main); full-suite gates should
+  use `bun run test:parallel` (145s) not serial `bun test` (550s).
+
 ## 2026-08-16 (later) — #748 KILLED: delta-scoped state save SHIPPED (#750, design 267)
 
 - **PR #750 merged** (design 267, 235-Phase-B): provably-no-op pulls compose
