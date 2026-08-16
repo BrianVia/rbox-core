@@ -49,15 +49,21 @@ function nonnegativeInteger(value: number | undefined, field: string): asserts v
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative integer`);
 }
 
+/** Every column an interned value is identified by, minus the id itself. The
+ * consume path resolves or mints ids in SQL, so it never pays the CSPRNG. */
+export type ConsumedFileEntry = Omit<EncodedFileEntry, "entryId">;
+
 export function encodeFileEntry(input: FileEntry): EncodedFileEntry {
+  // entry_id is an independent, domain-separated identity. A collision in the
+  // non-unique exact_fingerprint lookup must still reach exact row comparison.
+  return { entryId: randomBytes(16).toString("hex"), ...encodeFileEntryForConsume(input) };
+}
+
+export function encodeFileEntryForConsume(input: FileEntry): ConsumedFileEntry {
   const value = input;
   const admitted = admitFileEntry(value);
   const fingerprint = createHash("sha256").update(admitted.canonical).digest("hex");
-  // entry_id is an independent, domain-separated identity. A collision in the
-  // non-unique exact_fingerprint lookup must still reach exact row comparison.
-  const entryId = randomBytes(16).toString("hex");
   return {
-    entryId,
     exactFingerprint: fingerprint,
     path: value.path,
     pathOrder: utf16beOrderKey(value.path),

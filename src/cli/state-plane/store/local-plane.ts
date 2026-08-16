@@ -16,7 +16,7 @@ import {
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { runStatement, selectRow } from "./statements.js";
 import { currentSnapshot } from "./read-snapshot.js";
-import { openSealedStage, type SealedStageRef } from "./sealed-stages.js";
+import { openSealedStageForConsume, type SealedStageRef } from "./sealed-stages.js";
 import { StageLock, deleteSealedArtifact } from "./stage-artifacts.js";
 
 export interface LocalScanResult {
@@ -48,7 +48,7 @@ export function applyLocalScan(
   try {
     const lock = StageLock.acquire(stageDirectory, stage.stageId);
     try {
-      const reader = openSealedStage(stageDirectory, stage, lock);
+      const reader = openSealedStageForConsume(stageDirectory, stage, lock);
       try {
         const copied = copyStageFilesIntoTemp(db, reader);
         if (copied !== stage.counts.files) {

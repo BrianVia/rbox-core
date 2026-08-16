@@ -7,7 +7,10 @@
  * the header that later commits to authority. */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import type { JsonObject, JsonValue } from "../../../json.js";
-import { decodeFileEntry, encodeFileEntry, type EncodedFileEntry } from "../codecs/file-entry.js";
+import {
+  decodeFileEntry, encodeFileEntry, encodeFileEntryForConsume,
+  type ConsumedFileEntry, type EncodedFileEntry,
+} from "../codecs/file-entry.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { StageDigestBuilder, type StageCounts, type StageLogicalDigest } from "../digest/stage-semantic-v1.js";
@@ -40,8 +43,14 @@ export interface SealedStageReader {
   files(afterPath: string | undefined, batchSize: number): CursorPage<FileEntry>;
   gitRepoCursor(role: GitSectionRole, afterRelPath: string | undefined, batchSize: number): CursorPage<{ relPath: string; section: GitSection }>;
   gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined;
-  /** Row-at-a-time canonical stream. The only interface the CAS copy uses. */
-  streamFiles(visit: (encoded: EncodedFileEntry) => void): number;
+  close(): void;
+}
+
+/** Consumption's one interface: a single canonical pass that both yields the rows
+ * and proves the artifact, verified at end-of-stream. */
+export interface ConsumedStageReader {
+  readonly sealedHeader: ManifestHeader;
+  streamFiles(visit: (encoded: ConsumedFileEntry) => void): number;
   close(): void;
 }
 
@@ -62,12 +71,15 @@ export function openSealedStage(directory: string, ref: SealedStageRef, lock: St
   return new SqliteSealedStage(accessor, ref, derived.header);
 }
 
-function deriveStageRef(
-  accessor: SealedArtifactAccessor,
-  stageId: string,
-  physicalSha256: string,
-  bytes: number,
-): SealedStageRef {
+/** A sealed stage's own metadata, read without scanning a single row. */
+interface SealedStageMeta {
+  plane: Plane;
+  header: ManifestHeader;
+  counts: StageCounts;
+  digest: string;
+}
+
+function readSealedStageMeta(accessor: SealedArtifactAccessor, stageId: string): SealedStageMeta {
   const meta = selectRow<{
     stage_id: string; plane: Plane; state: string; header_cjson: string; digest: string; counts_cjson: string;
   }>(accessor.db, "SELECT stage_id,plane,state,header_cjson,digest,counts_cjson FROM stage_meta");
@@ -75,8 +87,23 @@ function deriveStageRef(
   if (meta.stage_id !== stageId || meta.state !== "sealed") {
     throw new StageChangedError(stageId, "sealed stage identity does not match its ref");
   }
-  const header = decodeSealedHeader(stageId, meta.header_cjson);
-  const digest = new StageDigestBuilder(meta.stage_id, meta.plane, header);
+  return {
+    plane: meta.plane,
+    header: decodeSealedHeader(stageId, meta.header_cjson),
+    counts: decodeSealedCounts(stageId, meta.counts_cjson),
+    digest: meta.digest,
+  };
+}
+
+function deriveStageRef(
+  accessor: SealedArtifactAccessor,
+  stageId: string,
+  physicalSha256: string,
+  bytes: number,
+): SealedStageRef {
+  const meta = readSealedStageMeta(accessor, stageId);
+  const header = meta.header;
+  const digest = new StageDigestBuilder(stageId, meta.plane, header);
   streamRows<{ entry_cjson: string }>(
     accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
     [stageId], (row) => digest.file(row.entry_cjson));
@@ -88,7 +115,7 @@ function deriveStageRef(
       WHERE stage_id=? ORDER BY role,path_order`,
     [stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
   const counts = digest.counts;
-  const logicalDigest = digest.seal(decodeSealedCounts(stageId, meta.counts_cjson));
+  const logicalDigest = digest.seal(meta.counts);
   if (meta.digest !== logicalDigest) throw new StageChangedError(stageId, "sealed stage digest column is stale");
   return { stageId, plane: meta.plane, header, logicalDigest, physicalSha256, bytes, counts };
 }
@@ -143,6 +170,66 @@ function decodeStageEntryBytes(text: string): FileEntry {
   const value = parseCanonicalJson(text);
   if (!isFileEntry(value)) throw new TypeError("stage entry is not a JSON object");
   return value;
+}
+
+/**
+ * Open a sealed stage for CONSUMPTION: metadata is proven before any row is
+ * yielded, and the logical digest is accumulated during the one row pass the
+ * consumer already makes, then verified at end-of-stream. Consume-then-verify is
+ * safe because the consumer's copy is SAVEPOINT-contained and precedes `BEGIN
+ * IMMEDIATE`, so no authority row exists before the proof completes.
+ */
+export function openSealedStageForConsume(
+  directory: string,
+  ref: SealedStageRef,
+  lock: StageLock,
+): ConsumedStageReader {
+  const accessor = openSealedArtifact(directory, ref, lock);
+  let meta: SealedStageMeta;
+  try {
+    meta = readSealedStageMeta(accessor, ref.stageId);
+    if (meta.plane !== ref.plane || meta.digest !== ref.logicalDigest
+      || canonicalJson(meta.header) !== canonicalJson(ref.header)
+      || canonicalJson(meta.counts) !== canonicalJson(ref.counts)) {
+      throw new StageChangedError(ref.stageId, "sealed stage identity does not match its ref");
+    }
+  } catch (error) {
+    try { accessor.close(); } catch { /* the original refusal is the report */ }
+    throw error;
+  }
+  return {
+    sealedHeader: meta.header,
+    streamFiles(visit: (encoded: ConsumedFileEntry) => void): number {
+      const digest = new StageDigestBuilder(ref.stageId, ref.plane, meta.header);
+      const copied = streamRows<{ path: string; entry_cjson: string }>(
+        accessor.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
+        [ref.stageId], (row) => {
+          const encoded = encodeFileEntryForConsume(JSON.parse(row.entry_cjson) as FileEntry);
+          if (encoded.path !== row.path || encoded.canonical !== row.entry_cjson) {
+            throw new StageChangedError(ref.stageId, `stage row ${row.path} is not canonical`);
+          }
+          digest.file(encoded.canonical);
+          visit(encoded);
+        });
+      streamRows<{ role: GitSectionRole }>(
+        accessor.db, "SELECT role FROM stage_git_roles WHERE stage_id=? ORDER BY role",
+        [ref.stageId], (row) => digest.declareRole(row.role));
+      streamRows<{ role: GitSectionRole; rel_path: string; section_cjson: string }>(
+        accessor.db, `SELECT role,rel_path,section_cjson FROM stage_git_sections
+          WHERE stage_id=? ORDER BY role,path_order`,
+        [ref.stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
+      if (canonicalJson(digest.counts) !== canonicalJson(ref.counts)) {
+        throw new StageChangedError(ref.stageId, "sealed stage counts do not match its ref");
+      }
+      if (digest.seal(ref.counts) !== ref.logicalDigest) {
+        throw new StageChangedError(ref.stageId, "sealed stage logical digest does not match its ref");
+      }
+      return copied;
+    },
+    close(): void {
+      accessor.close();
+    },
+  };
 }
 
 /**
@@ -274,18 +361,6 @@ class SqliteSealedStage implements SealedStageReader {
     } catch (cause) {
       throw new StageChangedError(this.ref.stageId, `git section ${relPath} is not a canonical admissible section: ${String(cause)}`);
     }
-  }
-
-  streamFiles(visit: (encoded: EncodedFileEntry) => void): number {
-    return streamRows<{ path: string; entry_cjson: string }>(
-      this.accessor.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
-      [this.ref.stageId], (row) => {
-        const encoded = encodeFileEntry(JSON.parse(row.entry_cjson) as FileEntry);
-        if (encoded.path !== row.path || encoded.canonical !== row.entry_cjson) {
-          throw new StageChangedError(this.ref.stageId, `stage row ${row.path} is not canonical`);
-        }
-        visit(encoded);
-      });
   }
 
   close(): void {

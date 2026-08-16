@@ -673,6 +673,9 @@ test("the rejection vocabulary is exactly the translation the JSON CAS speaks", 
     // Design 267: retryable, and deliberately NOT folded into the terminal
     // `nonce` verdict the raw `state-revision` row translates to.
     "elision-drift": "elision-drift",
+    // Design 269: a moved delta predecessor is retryable for the same reason, so
+    // it joins the elision-drift family rather than the terminal `nonce` one.
+    "delta-binding": "elision-drift",
   });
 });
 

@@ -9,14 +9,15 @@ import {
   composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue,
 } from "../../sync-git/base-composer.js";
 import {
-  validManifestMeta, type ElisionExpectation, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
+  validManifestMeta, type DeltaBinding, type ElisionExpectation, type GlobalManifestMeta,
+  type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { ProoflessBaseError, StageChangedError, decodeAuthorityRow } from "../errors.js";
 import type { CasRejectionReason, ManifestHeader } from "../ports.js";
-import { internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
+import { applyDeltaOpsIntoPlane, internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
 import { runStatement, selectRow, streamRows, withStatement } from "./statements.js";
 import {
   canonicalEvidenceOf, decodeTransitionBaseProof, decodeTransitionEvidence, decodeTransitionRecord,
@@ -48,7 +49,19 @@ export interface FrozenCasInputs {
   replacementOldStream?: string;
   /** The snapshot this packet's elisions were proven against (design 267 §3.2b). */
   elisionExpectation?: ElisionExpectation;
+  /** Present when the global is RELATIVE (design 269): its predecessor binding
+   * and the post-conditions the sealed artifact commits to. */
+  delta?: FrozenDeltaInputs;
   ownerToken: CasOwnerToken;
+}
+
+/** A relative global's frozen inputs. The binding is its own frozen expectation:
+ * `expected` and the transition snapshot token stay live-derived, so a
+ * predecessor that moved is a retryable rejection rather than a throw. */
+export interface FrozenDeltaInputs {
+  stageId: string;
+  binding: DeltaBinding;
+  resultFiles: number;
 }
 
 /** Canonical validated copy of the one nested packet value the caller owns. */
@@ -92,6 +105,11 @@ export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified:
   const elision = frozen.elisionExpectation;
   if (elision && ((row.state_nonce ?? "legacy") !== elision.nonce
     || (row.state_revision ?? 0) !== elision.stateRevision)) reject("elision-drift");
+  // Same sampling rule for a relative global: its ops are only meaningful against
+  // the exact predecessor they were composed from.
+  const delta = frozen.delta;
+  if (delta && ((row.state_nonce ?? "legacy") !== delta.binding.nonce
+    || (row.state_revision ?? 0) !== delta.binding.stateRevision)) reject("delta-binding");
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
   if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
@@ -140,8 +158,12 @@ function assertEvidenceAgainstVerified(
  * manifest meta, and sequence are replaced together or not at all. */
 export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: string): void {
   const generation = frozen.expected.baseGeneration + 1;
-  internStagedEntryValues(db);
-  promoteFilesIntoPlane(db, lineageId, "base", generation);
+  if (frozen.delta === undefined) {
+    internStagedEntryValues(db);
+    promoteFilesIntoPlane(db, lineageId, "base", generation);
+  } else {
+    applyDeltaOpsIntoPlane(db, lineageId, "base", generation, frozen.delta);
+  }
   const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = frozen.globalHeader!;
   runStatement(db, `UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
     trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='base'`,
