@@ -27,7 +27,7 @@ import { applyScopedRuleAuthority, prepareScopedPull } from "../scope/pull-scope
 import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord } from "../sync-state.js";
-import { savePulledState } from "./pull-state-save.js";
+import { savePulledState, type PullProvenance } from "./pull-state-save.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
@@ -64,8 +64,14 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
  * the remote we just pulled. The remote manifest is validated before it touches
  * the filesystem (never trust the network). Returns the actions taken.
  */
-export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}, trustedView?: TrustedLocalView): Promise<Action[]> {
-  return (await pullWithMetadata(root, cfg, deps, trustedView)).actions;
+export async function pull(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps = {},
+  trustedView?: TrustedLocalView,
+  provenance: PullProvenance = "standalone",
+): Promise<Action[]> {
+  return (await pullWithMetadata(root, cfg, deps, trustedView, provenance)).actions;
 }
 
 /** Pull boundary metadata used by guided setup without changing pull's public API.
@@ -78,7 +84,8 @@ export async function pullWithMetadata(
   root: string,
   cfg: WorkspaceConfig,
   deps: SyncDeps = {},
-  trustedView?: TrustedLocalView
+  trustedView?: TrustedLocalView,
+  provenance: PullProvenance = "standalone",
 ): Promise<{ actions: Action[]; initialRemoteSequence: number }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("pull");
@@ -110,7 +117,7 @@ export async function pullWithMetadata(
   surfaceResolutionReceiptReconciliation(reconciled, deps);
   return {
     actions: reconciled.status === "none"
-      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state, elisionEligible: true }, trustedView)
+      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state, provenance }, trustedView)
       : reconciled.actions,
     initialRemoteSequence: sequence,
   };
@@ -214,9 +221,10 @@ export async function applyPulledManifest(
   cfg: WorkspaceConfig,
   deps: SyncDeps,
   api: SyncRemote,
-  /** `elisionEligible` is design 267's provenance gate: the standalone pull line
-   *  sets it, and chain repair and receipt reconciliation structurally do not. */
-  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState; elisionEligible?: boolean },
+  /** `provenance` is design 267's gate: only a standalone pull owns the whole
+   *  observation its elision proof claims. Chain repair, receipt reconciliation
+   *  and push-conflict recovery either omit it or name themselves recovery. */
+  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState; provenance?: PullProvenance },
   /** Design 202, daemon-internal: passed ONLY by `pullWithMetadata`'s main line.
    *  Every other caller (resolution-receipt reconciliation, chain repair, CLI
    *  one-shots) omits it and therefore scans. */
@@ -444,7 +452,7 @@ export async function applyPulledManifest(
     root, cfg, deps, report, state, scoped, gitOutcome, sequence, manifestMeta,
     remoteGitRepos: remote.gitRepos,
     noActions: all.length === 0,
-    elisionEligible: input.elisionEligible === true,
+    provenance: input.provenance ?? "recovery",
   });
   try {
     deps.onGitDeferralsSaved?.(savedState);

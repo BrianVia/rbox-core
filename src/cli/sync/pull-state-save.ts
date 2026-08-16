@@ -24,6 +24,15 @@ import { formatCasSteps } from "./format.js";
 type GitOutcome = Awaited<ReturnType<typeof applyGitSections>>;
 type ScopedPull = Awaited<ReturnType<typeof prepareScopedPull>>;
 
+/**
+ * Which lane ran this pull. A `standalone` pull is the whole cycle — it loaded
+ * the state it reconciled against and observed every action — so it may mint a
+ * design 267 elision receipt. `recovery` is a pull nested inside another
+ * operation's retry loop (push's 409/pull-first arms): it observes a narrower
+ * slice, so it never mints one.
+ */
+export type PullProvenance = "standalone" | "recovery";
+
 export interface PullStateSave {
   root: string;
   cfg: WorkspaceConfig;
@@ -38,17 +47,17 @@ export interface PullStateSave {
   remoteGitRepos?: Record<string, GitSection> | undefined;
   /** The UNFILTERED reconcile action list was empty. `actions` is not it. */
   noActions: boolean;
-  /** Only the standalone pull line carries elision provenance. */
-  elisionEligible: boolean;
+  /** Only a standalone pull owns the whole observation a receipt claims. */
+  provenance: PullProvenance;
 }
 
 /** Every gate on minting elision provenance, in one place. A degraded mutex
  * yields no receipt because a degraded pull's git lanes are disabled, so its
  * "nothing changed" is a statement about a narrower observation. */
 export function pullElisionReceipt(
-  input: Pick<PullStateSave, "deps" | "state" | "scoped" | "manifestMeta" | "noActions" | "elisionEligible">,
+  input: Pick<PullStateSave, "deps" | "state" | "scoped" | "manifestMeta" | "noActions" | "provenance">,
 ): ElisionReceipt | undefined {
-  if (!input.elisionEligible || workspaceSyncMutexDegraded(input.deps.syncMutex)) return undefined;
+  if (input.provenance !== "standalone" || workspaceSyncMutexDegraded(input.deps.syncMutex)) return undefined;
   return elisionReceipt(input.state, {
     noActions: input.noActions,
     storedBaseIsRemote: input.scoped.storedBaseIsRemote,
