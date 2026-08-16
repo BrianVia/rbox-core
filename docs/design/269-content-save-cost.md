@@ -66,9 +66,13 @@ stay LIVE-derived and untouched — `sqlite-state-save.ts:111-116`'s
 deliberate asymmetry is preserved; a naive reuse of
 `expected.baseGeneration` would turn interleaves into
 `StageChangedError` throws that escape the recompose loop). Mismatch →
-retryable `reject` (new reason or `elision-drift`-family, mapped in
-`LEGACY_REJECTION_REASON`); the under-lock reload (`cas-translation.ts:61`
-mint site covers the rejection path) + recompose at the
+retryable `reject` in the `elision-drift` FAMILY — MANDATED (r4-F1): the
+legacy mapping must land outside {stream, nonce, owner-lost} or
+`sync-state.ts:410-411` throws instead of recomposing; `elision-drift` is
+the only shipped reason that qualifies, and `"state-revision"` maps to
+terminal `"nonce"` — the obvious-precedent trap. The under-lock reload
+(`cas-translation.ts:61` runs `loadRawStateFromStore` on the rejected
+branch, covering rebinding) + recompose at the
 `sync-state.ts:390-391` loop head with `snapshot = result.state` (`:413`)
 produces a fresh delta — no loop. A `stage-delta-v1` artifact WITHOUT a
 caller-minted binding is structurally inadmissible (`assertPairing`
@@ -84,9 +88,10 @@ plane_digest, NO file_count, NO schema change, NO new SyncState member.
 The carrier is `StateSource.baseIsUnscopedRemote?: boolean` (r3-M1 —
 the r3 receipt-based gate silently excluded push-side content saves, the
 most frequent O(N) save on a dev host): pull sets it from
-`scoped.storedBaseIsRemote`; push sets it when publishing an unscoped
-manifest (`push.ts:919` — the just-published manifest IS the new remote
-base by construction). Delta-eligible iff: kill switch on AND
+`scoped.storedBaseIsRemote`; push sets it unconditionally (`push.ts:919`; push is structurally
+unscoped — `assertMayPublish` is its first statement, `push.ts:298`).
+The name states base identity; its operational meaning is "this lane is
+audit-covered". Delta-eligible iff: kill switch on AND
 `baseIsUnscopedRemote` AND snapshot carries a minted nonce + defined
 `stateRevision` AND the packet has a global AND `forceCompleteSave`
 (§2.4) is unset. Everything else — genesis, first save, reset, repair,
@@ -110,8 +115,8 @@ the next audit. Zero durable state (ledgered in §8).
 
 | Decision | Statement |
 |---|---|
-| Relative saves | Content saves stop being self-healing rewrites. Audit = the idle-cycle content hash; detection ≈ one idle cycle on daemon hosts, heal immediate-to-next-save. |
-| Coverage gap | Receipt-less hosts (CLI-only push users, degraded mutex) and scoped workspaces NEVER run the audit: drift there is undetected while a drifted base feeds the 267 §4 chain (wrong deltas to the server). Bound: 4 external users, all daemon-based today; scoped stays complete-save (§2.3). Accept, or require a delta-path audit first. |
+| Relative saves | Content saves stop being self-healing rewrites. Audit = the idle-cycle content hash; detection ≈ one idle cycle on daemon hosts, heal immediate-to-next-save. ACCEPT this loss of per-save self-healing, or gate 269 on a stronger audit. |
+| Coverage gap | Receipt-less hosts (CLI-only push users, degraded mutex) and scoped workspaces NEVER run the audit: drift there is undetected while a drifted base feeds the 267 §4 chain (wrong deltas to the server). Bound: 4 external users, all daemon-based today. (Scoped workspaces stay complete-save — pre-existing C4 residual, NO new 269 exposure, booked in §7.) Accept, or require a delta-path audit first. |
 | New digest grammar | `stage-delta-v1` retires 235 §4 / 267 §8's standing "no new digest grammar" — explicit ratification requested. |
 
 ### 2.5 Stage grammar `stage-delta-v1`
@@ -141,14 +146,14 @@ statements clean and the negative controls trivial), applied by
 (`generations.ts:334-341`) is parameterized by table name (it hardcodes
 `CAS_FILE_TEMP` today — the port is explicit work, not automatic) and
 runs over upserts only; targeted deletes by path. The upsert carries the
-same `changed_generation` guard as promote (`generations.ts:343-344` —
+same `changed_generation` guard as promote (`generations.ts:348-354` —
 r3-m3: a recomposed delta may re-upsert an already-landed value; without
 the guard the arms diverge invisibly). NO delete-absent SQL anywhere in
 the delta path; `promoteFilesIntoPlane` and `cas_stage_files` never see
 delta rows. Negative controls both directions. Post-apply proven
 post-condition: base-plane `COUNT(*)` must equal sealed `resultFiles`,
-else refuse. The non-file half of `applyGlobal` (head, meta, chain,
-meta-wire git, generation stamping, `rebuildManifestProjection`) runs
+else refuse. The non-file writes (head/meta/chain/meta-wire git in `applyGlobal`;
+`rebuildManifestProjection` from `runTransaction`, `write-packet.ts:266`) run
 IDENTICALLY for both kinds and is MANDATORY for zero-op deltas —
 `read-snapshot.ts:196,212` reads chain/git keyed by the new generation
 (r3-m4); the existing no-meta early-return (`cas-steps.ts:155`) keeps
@@ -162,7 +167,10 @@ Refusal taxonomy (r3-m6): binding mismatch → retryable `reject`
 binding, malformed delta → `StageChangedError`-family THROWS —
 fail-closed, never retried; `runTransaction` rethrows non-Rejected
 (`write-packet.ts:274`) and `translateSavePacket`'s finally deletes the
-stages (`sqlite-state-save.ts:190-193`).
+stages (`sqlite-state-save.ts:190-193`). The binding exists in two carriers —
+sealed into the artifact (§2.5) and frozen on the CAS packet (§2.2); they
+MUST be equal or it is a `StageChangedError`-family throw (r4-F4 — a ref
+is never believed).
 
 ## 3. Riders (measured, corrected by r2+r3)
 
@@ -267,8 +275,13 @@ Added: GlobalDelta/DeltaBinding/DeltaOp types (named, exported), the
 the table-parameterized intern statements, the eligibility predicate
 (`StateSource.baseIsUnscopedRemote`) + kill switch, the heal flag
 (`StateSource.forceCompleteSave`, process-local), the COUNT
-post-condition, the consume-encoder variant (R3). NO new SyncState
-member, NO durable additions of any kind.
+post-condition, the consume-encoder variant (R3 — must still produce
+`exact_fingerprint` and every `EXACT_MATCH` column except the id,
+`generations.ts:263-267`), the new rejection reason + its
+`LEGACY_REJECTION_REASON` row (F1-constrained), and the `entry_id`
+NOT-NULL relaxation on `CAS_FILE_TEMP` (`generations.ts:272` — shipped
+TEMP DDL, no migration). NO new SyncState member, NO durable additions
+of any kind.
 Deleted/avoided: the second consume scan (R2′, both kinds), per-row
 CSPRNG mint (R3), O(N/4MB) durable stage commits (R1), r2's chain +2
 columns + schema-v2 slice + rollout tooling, r1's A2 branch and A5
