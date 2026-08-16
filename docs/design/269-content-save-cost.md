@@ -371,3 +371,12 @@ save_steady_one_changed 1,604ms — the Mac's 5.9s field save projects to
 (differential run) — pre-existing darwin debt, filed as GH #755 with the
 darwin-CI-lane case. Probe traps recorded: non-interactive SSH PATH lacks
 node; TMPDIR redirection requires mkdir -p (bit 3x today).
+
+## 10. Field close-out (2026-08-16 22:54Z, fleet on cbca36c)
+
+Mac 1-blob receive: **9.0s wall (was 20.4s)** — content state-save
+**1.2s (was 5.9s)**, inside §5's predicted 1.5-2.5s residual band
+(read-back + darwin fullfsync COMMIT floor; 268's `locks120` attribution
+visible in the span). Mac zero-change saves 0.2-0.3s. Desktop zero-change
+push unchanged 6.7-6.8s (sender = #661's territory). Both lanes recorded;
+perf close-out rule satisfied.

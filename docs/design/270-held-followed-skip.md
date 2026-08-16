@@ -446,3 +446,14 @@ surprise:
   widens by records[rel].partial.
 - Pre-existing gap noted, not owned here: no RBOX_GIT_*HELD_SKIP* flag
   is defaults-ledger-registered today; the new flag WILL be.
+
+## 8. Field close-out (2026-08-16 22:51-22:54Z, Mac, cbca36c)
+
+First post-upgrade pull re-followed 3 repos (digest minting, §4.1 item 2
+— as predicted). SECOND pull: **skippedHeld=5** — the trio flipped to
+`earlySkip=1 blocker=composer/artifact allMs=53` each (was
+3,474-3,682ms: **65× per repo**); both local-* controls unchanged at
+45-48ms. git-apply wall 10.9s (mint cycle) → **4.4s** steady — the
+remaining 3.6s is Personal/rbox-core's #752-B shredder loop
+(storedAttempt=0), this design's explicit non-goal. 3-of-3 prediction
+CONFIRMED; no residual, nothing falsified.
