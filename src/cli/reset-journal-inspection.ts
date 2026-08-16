@@ -22,7 +22,7 @@ import type {
 import type { SqliteResetInspection } from "./state-plane/reset/recovery.js";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
-import { boundedHash, boundedJsonRead, ResetCorruptionError, retryOnIdentityRace } from "./reset-io.js";
+import { boundedHash, boundedJsonRead, RESET_MATERIALIZED_BYTE_LIMIT, ResetCorruptionError, retryOnIdentityRace } from "./reset-io.js";
 import { observeResetRefs } from "./reset-z-runtime.js";
 import {
   assertProtocolLockHeld,
@@ -153,7 +153,12 @@ async function artifactIdentity(root: string, file: string): Promise<readonly un
     try {
       const s = await fs.lstat(file, { bigint: true });
       const hashed = file === statePath(root) || file === sqliteResetPaths.journal(root);
-      const controlHash = hashed ? await boundedHash(file, 512 * 1024) : undefined;
+      // The cap must be the artifact's legal size bound, not a hash budget: a
+      // real workspace's state.json is tens of MiB, and boundedStream REFUSES
+      // oversized files rather than prefix-hashing them. 512 KiB here made
+      // every fence observation — and therefore `rbox migrate` — refuse any
+      // legitimately large legacy state (field: 73 MiB desktop state.json).
+      const controlHash = hashed ? await boundedHash(file, RESET_MATERIALIZED_BYTE_LIMIT) : undefined;
       if (hashed) await assertUnmovedSince(file, s);
       return [
         s.isFile(), s.isSymbolicLink(), s.size.toString(), s.mtimeNs.toString(),
