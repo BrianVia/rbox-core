@@ -215,8 +215,32 @@ any cycle where any repo record changed.
 | `stateRevision` bump per accepted save | preserved |
 | Legacy-JSON housekeeping (marker, sanitation, nonce) | preserved |
 | Empty-packet lineage-init/reset contract | preserved + newly pinned |
-| Fresh `plane_heads`/BASE generation on same-head full save | changed: an elided cycle keeps the prior coherent generation — observable; named here for product sign-off |
+| Fresh `plane_heads`/BASE generation on same-head full save | changed: an elided cycle keeps the prior coherent generation — observable. ACCEPTED by founder 2026-08-16, conditional on the reader-audit pin below |
 | Third hash in `deleteSealedArtifact` | preserved (r1-M3 withdrawn) |
+
+### 3.4.1 Reader audit for the retained BASE generation (founder condition)
+
+The trade is admissible only because no reader treats the generation stamp as a
+freshness or change-detection signal. Every reader of `active_base_generation` /
+`plane_heads.generation` falls into one of three classes:
+
+1. **Address lookup keyed by generation** — the stamp selects which rows belong
+   to the live BASE, nothing more: the head/meta join and its invariant
+   (`store/read-snapshot.ts:50-62`), the manifest-chain cursor (`:190`), and the
+   manifest-git-section cursor (`:205`). A retained generation addresses the same
+   rows, which is exactly the intent: the content did not move.
+2. **CAS equality guards** — `write-packet.ts:101` (the transition stage's bound
+   snapshot) and `cas-steps.ts:87` (`base-generation`). Both compare for
+   equality against the caller's observed value; neither infers recency from a
+   larger number. An elided cycle leaves both operands equal, which is a match,
+   not a stale read.
+3. **The migration writer** — `migration/import-install.ts:65,92,100,111,148`
+   stamps `plan.baseHead.generation` on rows it installs. It writes the stamp;
+   it never reads one to decide whether anything changed.
+
+No reader derives "the base is current" or "something changed" from the
+generation. `write-differential.test.ts` pins the advancement on content-carrying
+saves, and the §7 fixture below pins non-advancement across elided ones.
 
 ## 4. Mechanism M2 (rescoped) — accepted projection for the elided path only
 
@@ -321,6 +345,11 @@ Remaining O(N) per no-op cycle after M1+M2, named per §5.9: state load
   `telemetryBindingId`.
 - Strict-equality projection test for the elided shape (returnedState vs
   durable reload), per `whole-state-compat.test.ts:867` precedent.
+- Retained-generation fixture (§3.4.1, founder condition): two consecutive
+  accepted elided saves leave `active_base_generation` unchanged and a full load
+  still returns state deep-equal to the pre-elision durable state; the next
+  CONTENT-carrying save advances the generation and reads back correctly.
+  Receivers act on content change, never on a freshness stamp.
 - Bench honesty (opus m-5): `scripts/bench/state-plane.ts` times
   `applySavePacketToStore` directly, so it can measure the minimal-packet
   cost but NOT the elision decision; the field trace is the authority for

@@ -195,6 +195,41 @@ test("M1 flips it: the proven no-op sends a minimal packet and stages nothing", 
   expect(saved.manifestMeta).toEqual(seed.meta);
 });
 
+test("repeated elided saves retain the BASE generation, and content still advances it", async () => {
+  // The §3.4 trade, pinned: the generation stamp addresses rows, it is not a
+  // freshness signal. Two elided cycles must leave it — and every row it
+  // addresses — exactly where the last content-carrying save left them.
+  const seed = await seededSqlite("retained-generation");
+  const generation = baseGeneration(seed.root);
+  const before = (await loadRawState(seed.root))!;
+
+  for (let cycle = 0; cycle < 2; cycle++) {
+    const live: Seeded = { ...seed, state: (await loadRawState(seed.root))! };
+    const packets: StateSavePacket[] = [];
+    const saved = await saveStateSource(live.root, live.state, pullSource(live), { apply: capturing(packets) });
+    expect(packets[0]!.global, `cycle ${cycle}`).toBeUndefined();
+    expect(baseGeneration(seed.root), `cycle ${cycle}`).toBe(generation);
+    expect(saved).toStrictEqual((await loadRawState(seed.root))!);
+  }
+  const afterElisions = (await loadRawState(seed.root))!;
+  expect({ ...afterElisions, stateRevision: before.stateRevision })
+    .toStrictEqual(before);
+
+  // …and a save that really carries content still moves the generation and is
+  // readable through it.
+  const live = (await loadRawState(seed.root))!;
+  const changed = { ...MANIFEST, files: [file("one.txt", 1), file("three.txt", 3)] };
+  const advanced = await applyStateSavePacket(seed.root, {
+    expectedStream: STREAM, expectedNonce: NONCE, sourceGlobalSeq: SEQ + 1,
+    global: { manifest: changed, manifestMeta: seed.meta }, repos: [],
+  });
+  expect(advanced.status).toBe("accepted");
+  expect(baseGeneration(seed.root)).toBe(generation + 1);
+  const reloaded = (await loadRawState(seed.root))!;
+  expect(reloaded.lastSyncedManifest.files.map((entry) => entry.path)).toEqual(["one.txt", "three.txt"]);
+  expect(reloaded.stateRevision).toBe(live.stateRevision! + 1);
+});
+
 test("the elided shape returns exactly the durable reload", async () => {
   const seed = await seededSqlite("projection");
   const saved = await saveStateSource(seed.root, seed.state, pullSource(seed));

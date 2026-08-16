@@ -237,7 +237,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // T1.1 moved the JSON CAS here; the proof-selection hoist is count-neutral.
     "src/cli/state-plane/adapters/legacy-json-store.ts": 8,
     "src/cli/sync-state.ts": 14,
-    "src/cli/sync/pull.ts": 2,
+    // 2 in sync/pull.ts before design 267 moved the pull's state-save into its
+    // own owner: the two sites were one `bases:` literal written twice, once for
+    // observedRepos and once for values. The save composes it once now.
+    "src/cli/sync/pull-state-save.ts": 1,
   });
 });
 
