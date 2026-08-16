@@ -1,7 +1,7 @@
 /* Standalone lock diagnostic — reveals exactly why workspace locking is
  * refused. Run: rbox-lockdoctor [dir]  (defaults to ~/src). Prints each step
  * and the precise thrown error; never mutates the workspace. */
-import { acquireWorkspaceSyncMutex } from "./sync-mutex.js";
+import { acquireWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
 import { refreshSystemLockIdentityLedger, resolveDarwinIdentityComponents, hostIdentityLedgerPath } from "../engine/lockfile.js";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -39,8 +39,12 @@ try {
 await fs.mkdir(path.join(dir, ".rbox"), { recursive: true }).catch(() => {});
 try {
   const m = await acquireWorkspaceSyncMutex(dir, "cli");
-  const degraded = (m as { degraded?: { reason: string } }).degraded;
-  log(`acquireWorkspaceSyncMutex: ${degraded ? `DEGRADED (reason=${degraded.reason}) ← setup would refuse here` : "OK — locking supported"}`);
+  if (workspaceSyncMutexDegraded(m)) {
+    const reason = m.lockFailure?.reason ?? m.degraded?.reason ?? "unknown";
+    log(`acquireWorkspaceSyncMutex: DEGRADED (reason=${reason}) ← setup would refuse here`);
+  } else {
+    log(`acquireWorkspaceSyncMutex: OK — locking supported`);
+  }
 } catch (e) {
   log(`acquireWorkspaceSyncMutex THREW: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`);
 }
