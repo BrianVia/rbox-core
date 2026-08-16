@@ -596,3 +596,11 @@ sample to the detail string. Evidence: issue #659 comment 5285598893.
   verdict — same class as the #695 note. Residual was docs-only this time.
   Rule reinforced: NEVER chain `gh pr merge` after a review/CI read in one
   command; read the verdict, then merge as a separate decision.
+
+- Stash-differential proved the wrong baseline (PR #743, 2026-08-15): a fold
+  agent "proved" 3 failing tests pre-existing by rerunning with its changes
+  stashed — but the branch's own feature commit was already committed, so the
+  stash removed only the fold, not the feature. All 3 were real feature
+  regressions; CI (green main) caught them. Rule: a pre-existing claim needs a
+  differential against origin/main (worktree or `git stash` PLUS checkout of
+  the merge base), never against "my changes stashed".
