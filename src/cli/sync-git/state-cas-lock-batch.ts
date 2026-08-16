@@ -7,55 +7,17 @@ interface Publication {
   finalizeDurable: () => Promise<void>;
 }
 
-const RECEIPT_BRAND: unique symbol = Symbol("state-cas-batch-receipt");
-
-export interface SealedStateCasBatchReceipt {
-  readonly acquired: number;
-  readonly blocked: number;
-  readonly flushedParents: ReadonlySet<string>;
-  readonly outcomes: ReadonlyMap<string, "acquired" | "blocked">;
-  readonly [RECEIPT_BRAND]: true;
-}
-
-const receiptState = new WeakMap<SealedStateCasBatchReceipt, { txnId?: string }>();
-
-export function consumeStateCasBatchReceipt(receipt: SealedStateCasBatchReceipt, txnId: string): void {
-  const state = receiptState.get(receipt);
-  if (!state || state.txnId !== txnId) throw new Error("state-CAS batch receipt is foreign or already consumed");
-  state.txnId = undefined;
-}
-
-function sealReceipt(
-  txnId: string,
-  outcomes: Map<string, "acquired" | "blocked">,
-  flushedParents: Set<string>,
-): SealedStateCasBatchReceipt {
-  let acquired = 0;
-  let blocked = 0;
-  for (const outcome of outcomes.values()) outcome === "acquired" ? acquired++ : blocked++;
-  const receipt = Object.freeze({
-    [RECEIPT_BRAND]: true as const,
-    acquired,
-    blocked,
-    outcomes: new Map(outcomes),
-    flushedParents: new Set(flushedParents),
-  }) as SealedStateCasBatchReceipt;
-  receiptState.set(receipt, { txnId });
-  return receipt;
-}
-
 /** One acquisition's exact namespace-durability owner. Outcomes and parents
- * seal together, so a locked journal phase cannot omit either. */
+ * flush together, so a locked journal phase cannot omit either. */
 export class StateCasAcquisitionBatch {
-  readonly #txnId: string;
   readonly #expected: Set<string>;
   readonly #publications = new Map<string, Publication>();
   readonly #outcomes = new Map<string, "acquired" | "blocked">();
   readonly #syncDirectory: SyncDirectory;
   #used = false;
+  #flushed = false;
 
-  constructor(txnId: string, expectedPaths: readonly string[], syncDirectory: SyncDirectory = fsyncDirectory) {
-    this.#txnId = txnId;
+  constructor(expectedPaths: readonly string[], syncDirectory: SyncDirectory = fsyncDirectory) {
     this.#expected = new Set(expectedPaths);
     if (this.#expected.size !== expectedPaths.length) throw new Error("duplicate state-CAS batch path");
     this.#syncDirectory = syncDirectory;
@@ -79,7 +41,7 @@ export class StateCasAcquisitionBatch {
     this.#outcomes.set(lockPath, outcome);
   }
 
-  async flushAll(): Promise<SealedStateCasBatchReceipt> {
+  async flushAll(): Promise<void> {
     if (this.#used) throw new Error("state-CAS acquisition batch already used");
     this.#used = true;
     if (this.#outcomes.size !== this.#expected.size) throw new Error("state-CAS acquisition batch is incomplete");
@@ -91,7 +53,11 @@ export class StateCasAcquisitionBatch {
     }
     if (flushError) throw flushError;
     for (const publication of this.#publications.values()) await publication.finalizeDurable();
-    return sealReceipt(this.#txnId, this.#outcomes, parents);
+    this.#flushed = true;
+  }
+
+  assertFlushed(): void {
+    if (!this.#flushed) throw new Error("state-CAS acquisition batch is not flushed");
   }
 
   #assertOpenPath(lockPath: string): void {

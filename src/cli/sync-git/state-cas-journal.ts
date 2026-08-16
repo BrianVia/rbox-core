@@ -16,9 +16,11 @@ import type { JsonObject, JsonValue } from "../../json.js";
 const JOURNAL_DIR = path.join(".rbox", "state", "git-lock-transactions", "v1");
 const HEX_32 = /^[0-9a-f]{32}$/;
 const GIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-const MAX_JOURNAL_BYTES = 1024 * 1024;
-const MAX_LINE_BYTES = MAX_JOURNAL_BYTES;
-const MAX_RECORDS = 100_003;
+export const MAX_V1_JOURNAL_BYTES = 1024 * 1024;
+export const MAX_V2_LINE_BYTES = 8 * 1024 * 1024;
+export const MAX_V2_JOURNAL_BYTES = 16 * 1024 * 1024;
+export const MAX_V2_LOCKS = 4096;
+const MAX_V2_RECORDS = MAX_V2_LOCKS + 3;
 const MAX_HOLDER_MARKER_BYTES = 1024;
 
 export interface StateCasLockProof {
@@ -52,7 +54,6 @@ export interface StateCasLockJournal {
 }
 
 export interface PreparedStateCasLocks {
-  root: string;
   journalPath: string;
   journal: StateCasLockJournal & { version: 2 };
   writer: StateCasJournalWriter;
@@ -62,14 +63,9 @@ export interface StateCasJournalHooks {
   afterDatasync?: (journalPath: string) => void | Promise<void>;
 }
 
-export interface LoadedJournal {
-  path: string;
-  journal?: StateCasLockJournal;
-}
-
 type AcquisitionRecord =
-  | { type: "acquisition"; lockPath: string; acquisition: "acquired"; observation: SerializedMarkerObservation }
-  | { type: "acquisition"; lockPath: string; acquisition: "blocked"; holderMarker: string };
+  | { type: "acquisition"; ordinal: number; observation: SerializedMarkerObservation }
+  | { type: "acquisition"; ordinal: number; blocked: true; holderMarker: string };
 
 export const stateCasJournalDir = (root: string): string => path.join(root, JOURNAL_DIR);
 
@@ -159,7 +155,8 @@ function validHolderMarker(value: JsonValue | undefined): value is string {
   return jsonString(value) && value.length <= MAX_HOLDER_MARKER_BYTES;
 }
 
-function parseV1(raw: string, journalPath?: string): StateCasLockJournal | undefined {
+export function parseV1(raw: string, journalPath?: string): StateCasLockJournal | undefined {
+  if (Buffer.byteLength(raw) > MAX_V1_JOURNAL_BYTES) return undefined;
   try {
     const value = jsonObject(JSON.parse(raw) as JsonValue);
     const owner = decodeOwner(value?.owner);
@@ -188,40 +185,41 @@ function parseHeader(value: JsonValue | undefined, journalPath?: string): (State
 }
 
 function parseV2(raw: string, journalPath?: string): StateCasLockJournal | undefined {
+  if (Buffer.byteLength(raw) > MAX_V2_JOURNAL_BYTES) return undefined;
   const lines = raw.split("\n");
-  if (raw.endsWith("\n")) lines.pop();
-  else lines.pop();
-  if (lines.length === 0 || lines.length > MAX_RECORDS) return undefined;
+  // Exactly one EOF suffix is discarded: empty when terminated, torn when not.
+  lines.pop();
+  if (lines.length === 0 || lines.length > MAX_V2_RECORDS) return undefined;
   const records: JsonValue[] = [];
   for (const line of lines) {
-    if (line.length === 0 || Buffer.byteLength(line) > MAX_LINE_BYTES) return undefined;
+    if (line.length === 0 || Buffer.byteLength(line) > MAX_V2_LINE_BYTES) return undefined;
     try { records.push(JSON.parse(line) as JsonValue); } catch { return undefined; }
   }
   const journal = parseHeader(records[0], journalPath);
   if (!journal) return undefined;
-  const locks = new Map(journal.commonDirs.flatMap((common) => common.locks.map((lock) => [lock.path, lock] as const)));
+  const locks = journal.commonDirs.flatMap((common) => common.locks);
+  if (locks.length > MAX_V2_LOCKS) return undefined;
   let phase: StateCasLockJournal["phase"] = "prepared";
   for (const record of records.slice(1)) {
     const value = jsonObject(record);
     if (!value) return undefined;
     if (value.type === "acquisition") {
-      if (phase !== "prepared" || !jsonString(value.lockPath)) return undefined;
-      const lock = locks.get(value.lockPath);
+      if (phase !== "prepared" || !Number.isSafeInteger(value.ordinal) || Number(value.ordinal) < 0) return undefined;
+      const lock = locks[Number(value.ordinal)];
       if (!lock || lock.acquisition !== undefined) return undefined;
-      if (value.acquisition === "acquired"
-        && exactKeys(value, ["type", "lockPath", "acquisition", "observation"])) {
+      if (exactKeys(value, ["type", "ordinal", "observation"])) {
         const observation = deserializeMarkerObservation(value.observation);
         if (!observation || observation.raw !== lock.marker) return undefined;
         lock.acquisition = "acquired";
         lock.observation = serializeMarkerObservation(observation);
-      } else if (value.acquisition === "blocked"
-        && exactKeys(value, ["type", "lockPath", "acquisition", "holderMarker"])
+      } else if (value.blocked === true
+        && exactKeys(value, ["type", "ordinal", "blocked", "holderMarker"])
         && validHolderMarker(value.holderMarker)) {
         lock.acquisition = "blocked";
         lock.holderMarker = value.holderMarker;
       } else return undefined;
     } else if (value.type === "locked" && exactKeys(value, ["type"])) {
-      if (phase !== "prepared" || [...locks.values()].some((lock) => lock.acquisition === undefined)) return undefined;
+      if (phase !== "prepared" || locks.some((lock) => lock.acquisition === undefined)) return undefined;
       phase = "locked";
     } else if (value.type === "committed" && exactKeys(value, ["type"])) {
       if (phase !== "locked") return undefined;
@@ -233,8 +231,9 @@ function parseV2(raw: string, journalPath?: string): StateCasLockJournal | undef
 }
 
 export function parseStateCasJournal(raw: string, journalPath?: string): StateCasLockJournal | undefined {
-  if (Buffer.byteLength(raw) > MAX_JOURNAL_BYTES) return undefined;
+  if (Buffer.byteLength(raw) > MAX_V2_JOURNAL_BYTES) return undefined;
   const firstLine = raw.slice(0, raw.indexOf("\n") < 0 ? raw.length : raw.indexOf("\n"));
+  if (Buffer.byteLength(firstLine) > MAX_V2_LINE_BYTES) return undefined;
   try {
     const first = jsonObject(JSON.parse(firstLine) as JsonValue);
     return first?.version === 2 ? parseV2(raw, journalPath) : parseV1(raw, journalPath);
@@ -248,6 +247,7 @@ export class StateCasJournalWriter {
   readonly #fileIdentity: { dev: bigint; ino: bigint };
   #handle: fs.FileHandle | undefined;
   #length: number;
+  #records: number;
 
   private constructor(
     journalPath: string,
@@ -263,12 +263,14 @@ export class StateCasJournalWriter {
     this.#fileIdentity = fileIdentity;
     this.#handle = handle;
     this.#length = length;
+    this.#records = 1;
   }
 
   static async create(root: string, journalPath: string, journal: StateCasLockJournal & { version: 2 }): Promise<StateCasJournalWriter> {
     const { phase: _phase, ...header } = journal;
     const line = `${JSON.stringify({ type: "header", ...header })}\n`;
-    if (Buffer.byteLength(line) > MAX_JOURNAL_BYTES) throw new Error("state-CAS journal header is oversized");
+    const lockCount = journal.commonDirs.reduce((count, common) => count + common.locks.length, 0);
+    if (lockCount > MAX_V2_LOCKS || Buffer.byteLength(line) > MAX_V2_LINE_BYTES) throw new Error("state-CAS journal header is oversized");
     await writeFileAtomic(journalPath, line, { mode: 0o600, exactMode: true });
     await fsyncDirectory(path.dirname(journalPath));
     const rootReal = await fs.realpath(path.resolve(root));
@@ -294,10 +296,10 @@ export class StateCasJournalWriter {
   }
 
   async append(record: AcquisitionRecord | { type: "locked" } | { type: "committed" }, hooks: StateCasJournalHooks = {}): Promise<void> {
-    await this.#ensureOpen();
-    const handle = this.#handle!;
+    const handle = await this.#ensureOpen();
     const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
-    if (bytes.length > MAX_LINE_BYTES || this.#length + bytes.length > MAX_JOURNAL_BYTES) throw new Error("state-CAS journal is oversized");
+    if (bytes.length > MAX_V2_LINE_BYTES || this.#length + bytes.length > MAX_V2_JOURNAL_BYTES
+      || this.#records + 1 > MAX_V2_RECORDS) throw new Error("state-CAS journal is oversized");
     let offset = 0;
     while (offset < bytes.length) {
       const written = await handle.write(bytes, offset, bytes.length - offset, null);
@@ -305,6 +307,7 @@ export class StateCasJournalWriter {
       offset += written.bytesWritten;
     }
     this.#length += bytes.length;
+    this.#records++;
     await handle.datasync();
     await hooks.afterDatasync?.(this.#path);
     await this.#assertPathBinding();
@@ -316,14 +319,25 @@ export class StateCasJournalWriter {
     await handle?.close();
   }
 
-  async #ensureOpen(): Promise<void> {
-    if (this.#handle) return;
+  async pathBound(): Promise<boolean> {
+    try {
+      await this.#ensureOpen();
+      await this.#assertPathBinding();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async #ensureOpen(): Promise<fs.FileHandle> {
+    if (this.#handle) return this.#handle;
     this.#handle = await fs.open(this.#path, constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW);
     try { await this.#assertPathBinding(); }
     catch (error) {
       await this.close().catch(() => {});
       throw error;
     }
+    return this.#handle;
   }
 
   async #assertPathBinding(): Promise<void> {
@@ -359,48 +373,4 @@ export async function prepareStateCasJournalDirectory(root: string): Promise<str
   const created = await ensureDirectoryChain(dir, "state-CAS journal directory");
   await fsyncCreatedDirectoryAncestors(dir, created);
   return dir;
-}
-
-export async function loadStateCasJournals(root: string): Promise<LoadedJournal[]> {
-  const dir = stateCasJournalDir(root);
-  try {
-    const rootAbsolute = path.resolve(root);
-    const rootReal = await fs.realpath(rootAbsolute);
-    let current = rootAbsolute;
-    for (const component of path.relative(rootAbsolute, dir).split(path.sep).filter(Boolean)) {
-      current = path.join(current, component);
-      const stat = await fs.lstat(current);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe state-CAS journal directory: ${current}`);
-    }
-    const dirReal = await fs.realpath(dir);
-    if (dirReal !== rootReal && !dirReal.startsWith(`${rootReal}${path.sep}`)) throw new Error("state-CAS journal directory escaped workspace");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  const names = await fs.readdir(dir).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error));
-  const loaded: LoadedJournal[] = [];
-  for (const name of names.sort()) {
-    if (!name.endsWith(".json")) continue;
-    const file = path.join(dir, name);
-    let handle: fs.FileHandle | undefined;
-    let raw: string | undefined;
-    try {
-      const before = await fs.lstat(file);
-      if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_JOURNAL_BYTES) {
-        loaded.push({ path: file });
-        continue;
-      }
-      handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const opened = await handle.stat();
-      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
-        loaded.push({ path: file });
-        continue;
-      }
-      raw = await handle.readFile("utf8");
-    } catch { raw = undefined; }
-    finally { await handle?.close().catch(() => {}); }
-    loaded.push({ path: file, journal: raw === undefined ? undefined : parseStateCasJournal(raw, file) });
-  }
-  return loaded;
 }

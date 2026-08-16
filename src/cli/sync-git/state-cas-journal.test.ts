@@ -3,12 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { formatLockMarker, publishLockMarker, serializeMarkerObservation, type ProcessIncarnation } from "../../engine/lockfile.js";
-import { parseStateCasJournal } from "./state-cas-journal.js";
+import { loadStateCasJournals } from "./state-cas-journal-loader.js";
+import { parseStateCasJournal, parseV1 } from "./state-cas-journal.js";
 import {
   acquirePreparedStateCasLocks,
   markStateCasCommitted,
   prepareStateCasLocks,
   recoverStateCasLocks,
+  stateCasJournalDir,
 } from "./state-cas-locks.js";
 
 const OWNER: ProcessIncarnation = { hostId: "a".repeat(32), bootId: "b".repeat(32), pid: 41, startTime: "1" };
@@ -51,11 +53,51 @@ test("v2 header, acquisitions, locked, and committed fold across restart", async
   expect(parsed?.commonDirs[0]?.locks.every((lock) => lock.acquisition === "acquired")).toBe(true);
 });
 
+test("2000 realistic long refs acquire and fold with more than 2x byte headroom", async () => {
+  const common = await bareCommon();
+  const count = 2000;
+  const prepared = await prepareStateCasLocks(root, { stream: "stream", stateNonce: "1".repeat(32) }, Array.from({ length: count }, (_, index) => {
+    const ref = `refs/remotes/origin/feature/team/cas-amortization-${String(index).padStart(4, "0")}`;
+    return {
+      commonDir: common,
+      lockPath: path.join(common, `${ref}.lock`),
+      proofs: [{ repo: `repositories/product-${String(index).padStart(4, "0")}`, ref, expectedOid: null }],
+    };
+  }), { identity: identity("alive") });
+  const acquired = await acquirePreparedStateCasLocks(prepared!);
+  const raw = await fs.readFile(prepared!.journalPath, "utf8");
+  expect(Buffer.byteLength(raw)).toBeLessThan(8 * 1024 * 1024);
+  expect(parseStateCasJournal(raw, prepared!.journalPath)?.commonDirs[0]?.locks.filter((lock) => lock.acquisition === "acquired")).toHaveLength(count);
+  expect(acquired.acquired).toBe(count);
+  await acquired.release();
+}, 30_000);
+
+test("prepare refuses more than 4096 locks before publishing a journal", async () => {
+  const common = path.join(root, "not-created.git");
+  const requests = Array.from({ length: 4097 }, (_, index) => ({
+    commonDir: common,
+    lockPath: path.join(common, "refs", "heads", `${index}.lock`),
+    proofs: [],
+  }));
+  await expect(prepareStateCasLocks(root, { stream: "stream", stateNonce: "1".repeat(32) }, requests, {
+    identity: identity("alive"),
+  })).rejects.toThrow("state-CAS lock count 4097 exceeds the v2 journal limit of 4096");
+  expect(await fs.lstat(stateCasJournalDir(root)).then(() => true, () => false)).toBe(false);
+});
+
 test("v1 parser remains fail-closed compatible", async () => {
   const { prepared } = await fixture();
   const v1 = { ...prepared.journal, version: 1, phase: "prepared" };
   const parsed = parseStateCasJournal(`${JSON.stringify(v1)}\n`, prepared.journalPath);
   expect(parsed).toMatchObject({ version: 1, phase: "prepared", txnId: prepared.journal.txnId });
+});
+
+test("loader refuses an oversized v1 journal at the v1 admission bound", async () => {
+  const { prepared } = await fixture();
+  await prepared.writer.close();
+  const oversized = { ...prepared.journal, version: 1, phase: "prepared", padding: "x".repeat(1024 * 1024) };
+  await fs.writeFile(prepared.journalPath, `${JSON.stringify(oversized)}\n`);
+  expect(await loadStateCasJournals(root)).toEqual([{ path: prepared.journalPath }]);
 });
 
 test("new reader recovers and retires a valid v1 acquired journal", async () => {
@@ -77,19 +119,13 @@ test("new reader recovers and retires a valid v1 acquired journal", async () => 
   expect(await fs.lstat(prepared.journalPath).then(() => true, () => false)).toBe(false);
 });
 
-test("honest v1-parser-only old-binary stand-in retains v2 without deletion or crash", async () => {
+test("released v1 parser retains a v2 journal fail-closed", async () => {
   const { prepared } = await fixture();
   const acquired = await acquirePreparedStateCasLocks(prepared);
-  const parseReleasedV1Only = (raw: string): object | undefined => {
-    try {
-      const value = JSON.parse(raw) as { version?: unknown };
-      return value.version === 1 ? value : undefined;
-    } catch { return undefined; }
-  };
   const raw = await fs.readFile(prepared.journalPath, "utf8");
-  expect(parseReleasedV1Only(raw)).toBeUndefined();
+  expect(parseV1(raw, prepared.journalPath)).toBeUndefined();
   expect(await fs.lstat(prepared.journalPath).then(() => true)).toBe(true);
-  expect(await fs.lstat(acquired.held[0]!.path).then(() => true)).toBe(true);
+  expect(await fs.lstat(prepared.journal.commonDirs[0]!.locks[0]!.path).then(() => true)).toBe(true);
 });
 
 test("strict v2 fold rejects malformed middle, duplicate outcome, and misordered phase", async () => {
@@ -104,12 +140,36 @@ test("strict v2 fold rejects malformed middle, duplicate outcome, and misordered
   expect(parseStateCasJournal(misorderedPhase, prepared.journalPath)).toBeUndefined();
 });
 
+test("strict v2 fold rejects duplicate and out-of-range ordinals", async () => {
+  const { prepared } = await fixture(2);
+  await acquirePreparedStateCasLocks(prepared);
+  const lines = (await fs.readFile(prepared.journalPath, "utf8")).trimEnd().split("\n");
+  const duplicate = [lines[0], lines[1], lines[1], ...lines.slice(2)].join("\n") + "\n";
+  const outOfRange = [...lines];
+  outOfRange[1] = JSON.stringify({ ...JSON.parse(outOfRange[1]!) as object, ordinal: 2 });
+  expect(parseStateCasJournal(duplicate, prepared.journalPath)).toBeUndefined();
+  expect(parseStateCasJournal(`${outOfRange.join("\n")}\n`, prepared.journalPath)).toBeUndefined();
+});
+
+test("strict v2 fold rejects a forged header above the lock cap", async () => {
+  const { prepared } = await fixture();
+  const header = JSON.parse((await fs.readFile(prepared.journalPath, "utf8")).trimEnd()) as {
+    commonDirs: Array<{ locks: Array<{ path: string; marker: string; proofs: unknown[] }> }>;
+  };
+  const template = header.commonDirs[0]!.locks[0]!;
+  header.commonDirs[0]!.locks = Array.from({ length: 4097 }, (_, index) => ({
+    ...template,
+    path: path.join(path.dirname(template.path), `${index}.lock`),
+  }));
+  expect(parseStateCasJournal(`${JSON.stringify(header)}\n`, prepared.journalPath)).toBeUndefined();
+});
+
 test("one torn final append is ignored and copied-marker replacement remains stale", async () => {
   const { common, prepared } = await fixture();
   const lock = prepared.journal.commonDirs[0]!.locks[0]!;
   const published = await publishLockMarker(lock.path, lock.marker);
   expect(published.status).toBe("created");
-  await fs.appendFile(prepared.journalPath, `{"type":"acquisition","lockPath":${JSON.stringify(lock.path)}`);
+  await fs.appendFile(prepared.journalPath, `{"type":"acquisition","ordinal":0`);
   await fs.unlink(lock.path);
   await fs.writeFile(lock.path, lock.marker);
   const result = await recoverStateCasLocks(root, { commonDir: common, identity: identity("dead") });

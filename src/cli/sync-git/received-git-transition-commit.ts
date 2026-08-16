@@ -12,7 +12,7 @@ import { clearFollowJournal } from "./follow.js";
 import { rebindHeldAttemptsAfterSettlement } from "./held-skip.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { chainLock, gitApplyMutationKey, gitIncomingKey, nextDeferral, repoDirOf } from "./shared.js";
-import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
+import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, type AcquiredStateCasLocks, type StateCasLockRequest } from "./state-cas-locks.js";
 
 /**
  * The received Git transition's commit half: everything between a completed
@@ -280,18 +280,20 @@ export async function withRevalidatedGitPartialApplies<T>(
     : { phase: "state-cas" as const };
   const lease = options.mutationBoundary?.enter(leaseRequest);
   let prepared: Awaited<ReturnType<typeof prepareStateCasLocks>>;
-  let held: HeldStateCasLock[] = [];
+  let acquired: AcquiredStateCasLocks | undefined;
   try {
     prepared = await timed("prepare", () => prepareStateCasLocks(
       root,
       { stream: state.stream, stateNonce: expectedStateNonce(state) },
       [...requested.entries()].map(([lockPath, request]) => ({ lockPath, commonDir: request.commonDir, proofs: request.proofs })),
     ));
-    await options.afterStateCasJournalPrepared?.();
-    if (lease?.abortRequested) throw new MutationGateClosedError();
     if (prepared) {
       const preparedLocks = prepared;
-      const acquired = await timed("acquire", () => acquirePreparedStateCasLocks(preparedLocks, {
+      acquired = await timed("acquire", () => acquirePreparedStateCasLocks(preparedLocks, {
+        beforeAcquire: async () => {
+          await options.afterStateCasJournalPrepared?.();
+          if (lease?.abortRequested) throw new MutationGateClosedError();
+        },
         beforeLockPublish: () => {
           if (lease?.abortRequested) throw new MutationGateClosedError();
         },
@@ -303,12 +305,14 @@ export async function withRevalidatedGitPartialApplies<T>(
         afterBatchDurable: options.afterStateCasBatchDurable,
         hooks: options.stateCasLockHooks,
       }));
-      held = acquired.held;
-      try { options.observeLockCounts?.(acquired.held.length, acquired.blocked.size); } catch { /* observation must not fail the CAS */ }
+      try { options.observeLockCounts?.(acquired.acquired, acquired.blocked.size); } catch { /* observation must not fail the CAS */ }
       await options.afterStateCasLocksAcquired?.();
       for (const lockPath of acquired.blocked) {
         for (const rel of requested.get(lockPath)?.rels ?? []) dropPartial(rel, outcome);
       }
+    } else {
+      await options.afterStateCasJournalPrepared?.();
+      if (lease?.abortRequested) throw new MutationGateClosedError();
     }
     await timed("revalidate-partials", () => revalidateGitPartialApplies(root, state, outcome));
     await timed("revalidate-proofs", () => revalidateCommittedBranchProofs(root, records, outcome));
@@ -321,7 +325,7 @@ export async function withRevalidatedGitPartialApplies<T>(
     });
     return saved;
   } finally {
-    await releaseStateCasLocks(prepared, held).catch(() => false);
+    await acquired?.release().catch(() => false);
     lease?.finish();
   }
 }

@@ -101,19 +101,19 @@ for (const point of ["after-journal", "after-lock-appended", "after-batch-durabl
     const prepared = await prepareStateCasLocks(root, { stream: "stream", stateNonce: "1".repeat(32) }, requests, { identity: identity("alive") });
     let expectedRecovered = 0;
     if (point === "after-lock-appended") {
-      for (const lock of prepared!.journal.commonDirs[0]!.locks.slice(0, 2)) {
+      for (const [ordinal, lock] of prepared!.journal.commonDirs[0]!.locks.slice(0, 2).entries()) {
         const published = await publishLockMarker(lock.path, lock.marker);
         expect(published.status).toBe("created");
         if (published.status !== "created") continue;
         const observation = serializeMarkerObservation(published.observation);
-        await prepared!.writer.append({ type: "acquisition", lockPath: lock.path, acquisition: "acquired", observation });
+        await prepared!.writer.append({ type: "acquisition", ordinal, observation });
         lock.acquisition = "acquired";
         lock.observation = observation;
         expectedRecovered++;
       }
       await prepared!.writer.close();
     } else if (point !== "after-journal") {
-      expectedRecovered = (await acquirePreparedStateCasLocks(prepared!)).held.length;
+      expectedRecovered = (await acquirePreparedStateCasLocks(prepared!)).acquired;
       if (point === "after-state-save") await markStateCasCommitted(prepared);
     }
     expect((await recoverStateCasLocks(root, { identity: identity("dead") })).recovered).toBe(expectedRecovered);

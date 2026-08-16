@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { formatLockMarker, observeLockMarker, publishLockMarker, releaseObservedLock, type ProcessIncarnation } from "../../engine/lockfile.js";
+import { parseStateCasJournal } from "./state-cas-journal.js";
 import {
   acquirePreparedStateCasLocks,
   classifyStateCasLockEvidence,
@@ -126,6 +127,7 @@ test("gate closure during marker staging wins before the first visible lock", as
   })).rejects.toThrow(MutationGateClosedError);
   lease.finish();
   expect(await fs.lstat(lockPath).then(() => true, () => false)).toBe(false);
+  expect(await fs.lstat(prepared!.journalPath).then(() => true, () => false)).toBe(false);
 });
 
 test("state-CAS refuses publication after common-directory inode replacement", async () => {
@@ -174,7 +176,7 @@ test("dead-owner recovery reaps the exact marker, validates Git, and retires its
     proofs: [{ repo: ".", ref: "refs/heads/main", expectedOid: null }],
   }], { identity: identity("alive") });
   const acquired = await acquirePreparedStateCasLocks(prepared!);
-  expect(acquired.held).toHaveLength(1);
+  expect(acquired.acquired).toBe(1);
 
   expect(await recoverStateCasLocks(root, { commonDir: common, identity: identity("dead") })).toMatchObject({
     recovered: 1,
@@ -232,7 +234,7 @@ test("mixed cohort recovers exact-owned lock beside changed foreign blocker", as
     { commonDir: common, lockPath: foreignPath, proofs: [{ repo: ".", ref: "refs/heads/changed", expectedOid: null }] },
   ], { identity: identity("alive") });
   const acquired = await acquirePreparedStateCasLocks(prepared!);
-  expect(acquired.held).toHaveLength(1);
+  expect(acquired.acquired).toBe(1);
   await runGit(common, ["update-ref", "refs/heads/changed", "1".repeat(40)]).catch(async () => {
     // Bare repositories reject nonexistent objects; a symbolic ref still
     // changes the proof without affecting the owned sibling.
@@ -292,6 +294,17 @@ test("a dead journal with absent locks is retained until post-recovery Git valid
   expect(await fs.lstat(prepared!.journalPath).then(() => true, () => false)).toBe(true);
 });
 
+test("a re-stringified unmodified v2 header with newline parses", async () => {
+  const common = await bareCommon();
+  const prepared = await prepareStateCasLocks(root, { stream: "stream", stateNonce: "1".repeat(32) }, [{
+    commonDir: common,
+    lockPath: path.join(common, "refs", "heads", "main.lock"),
+    proofs: [{ repo: ".", ref: "refs/heads/main", expectedOid: null }],
+  }], { identity: identity("alive") });
+  const header = JSON.parse(await fs.readFile(prepared!.journalPath, "utf8"));
+  expect(parseStateCasJournal(`${JSON.stringify(header)}\n`, prepared!.journalPath)).toMatchObject({ version: 2, phase: "prepared" });
+});
+
 for (const corruption of ["invalid-marker", "marker-owner-mismatch", "non-lock-target"] as const) {
   test(`forged journal authority is indeterminate and never deletes its named file: ${corruption}`, async () => {
     const common = await bareCommon();
@@ -313,7 +326,7 @@ for (const corruption of ["invalid-marker", "marker-owner-mismatch", "non-lock-t
     journal.commonDirs[0].locks[0].marker = raw;
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, raw);
-    await fs.writeFile(prepared!.journalPath, JSON.stringify(journal));
+    await fs.writeFile(prepared!.journalPath, `${JSON.stringify(journal)}\n`);
 
     const result = await recoverStateCasLocks(root, { identity: identity("dead") });
     expect(result.indeterminate).toBeGreaterThan(0);

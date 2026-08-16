@@ -76,13 +76,18 @@ Journal schema v2, explicit (r2-MINOR resolved, no deferred decision):
   demand (txn id, owner incarnation, common-dir identities, complete
   allowlist with per-lock markers) — one atomic write + dir fsync, before
   the first lock (178 §A.1 verbatim).
-- **Acquisition records appended**: after each successful publication, ONE
-  JSONL record `{lockPath, observation}` appended to the open journal fd
+- **Acquisition records appended**: the sorted, globally flattened header
+  allowlist assigns each lock a zero-based ordinal. After each successful
+  publication, ONE JSONL record `{type:"acquisition", ordinal, observation}`
+  is appended to the open journal fd
   followed by `fdatasync` — the same per-lock durable-provenance instant
   as today's full rewrite, at 1 fsync and O(1) bytes instead of 2 fsyncs
-  and O(N) bytes. Blocked outcomes append `{lockPath, blocked,
-  holderMarker}` the same way. The `locked` and `committed` phase records
-  are appended likewise (`locked` only after M2's flushes complete).
+  and O(N) bytes. Blocked outcomes append `{type:"acquisition", ordinal,
+  blocked:true, holderMarker}` the same way. Neither outcome repeats the lock
+  path or transaction marker. The parser binds the ordinal to its header entry;
+  duplicate, non-integer, negative, and out-of-range ordinals make the whole
+  journal indeterminate. The `locked` and `committed` phase records are appended
+  likewise (`locked` only after M2's flushes complete).
 - **Retained-fd path binding (r3-MAJ):** `fdatasync(fd)` proves the
   INODE durable, not that `journalPath` still names it. After every
   successful append-sync, before the append counts as persisted or any
@@ -93,8 +98,8 @@ Journal schema v2, explicit (r2-MINOR resolved, no deferred decision):
   authority, no hook. No extra directory fsync needed.
 - **Recovery parser v2 (strict fold, r3-MAJ):** explicit record
   discriminators (header/acquisition/locked/committed); exactly one valid
-  header, first; acquisition paths drawn from the header allowlist; at
-  most one outcome per lock, no acquired/blocked conflicts, no duplicate
+  header, first; acquisition ordinals bound to the header allowlist; at
+  most one outcome per ordinal, no acquired/blocked conflicts, no duplicate
   phase records; `locked` only after every allowlisted lock has one
   durable outcome; `committed` only after `locked`; bounded line, record
   count, and total sizes. EXACTLY ONE incomplete EOF suffix may be
@@ -103,6 +108,14 @@ Journal schema v2, explicit (r2-MINOR resolved, no deferred decision):
   journal write at `state-cas-locks.ts:207-212`); any OTHER malformed or
   misordered record makes the whole journal indeterminate — the parser
   never skips-and-continues.
+- **Three independent v2 bounds:** at most **4,096 locks** are accepted at
+  prepare time, before identity reads, directory creation, or journal
+  publication; at most **4,099 records** are folded (header + 4,096 outcomes +
+  `locked` + `committed`); each line is at most **8 MiB**; and the whole v2
+  journal is at most **16 MiB**. A representative 4,096-lock remote-feature-ref
+  shape measured 2,105,948 header bytes and 3,186,223 committed-journal bytes,
+  giving 3.98× line and 5.27× total headroom. The v1 load/parser refusal remains
+  **1 MiB**. An over-cap prepare error names both N and the 4,096 bound.
 - **Rollout contract (r3-MAJ):** journals are LOCAL transient state,
   never wire-visible — 1.x externals cannot encounter v2; 2.0 externals
   start fresh. v1 parsing is retained fail-closed alongside v2.
@@ -119,17 +132,18 @@ Journal schema v2, explicit (r2-MINOR resolved, no deferred decision):
   publication (rename-into-place) — appends mutate an existing inode and
   need no directory entry durability.
 
-### M2 — Batched directory fsyncs via a sealed receipt (r2-MAJ fixes folded)
+### M2 — Batched directory fsyncs with batch-owned flush proof (r2-MAJ fixes folded)
 
 Opt-in batching object owned by the CAS module; every other lockfile
 consumer keeps today's per-call contract. Contract, amended per r2:
 
 1. Accumulates EXACT parent directories (`path.dirname(lock.path)` — refs
    span subdirectories; never keyed by common dir).
-2. `flushAll()` → a SEALED success receipt carrying the complete
-   acquisition outcomes + flushed-parent set; `appendLocked` (the phase
-   record) accepts ONLY the sealed receipt — type-level proof that every
-   blocked outcome and parent flush was incorporated.
+2. `flushAll()` is single-use and sets the batch's private `#flushed` bit only
+   after every acquisition outcome, parent flush, and final exact readback has
+   succeeded. `appendLocked` accepts the batch itself and asserts that bit
+   immediately before appending the phase record. There is no receipt brand,
+   WeakMap, or separate consume protocol.
 3. Hook semantics (r3 ruling): `afterStateCasLockAppended` per append
    (post-fdatasync + binding check; namespace durability NOT implied);
    `afterStateCasBatchDurable` after the complete parent flush + final
@@ -147,8 +161,26 @@ consumer keeps today's per-call contract. Contract, amended per r2:
    that today's `:483/:566` path can retire past.
 6. Single-use, assertion-guarded.
 
+The successful acquisition result is the sole normal release owner: a
+single-use handle exposes counts/blockers plus `release(options?)` and privately
+holds the exact observations. The production caller can release only through
+that handle. If acquisition fails, no handle exists; acquisition performs its
+one internal cleanup and the existing fine-grained `exact` result alone decides
+journal retirement. There is no `retainJournal` option or acquisition-failure
+flag. Thus clean pre-publication aborts retire exact empty journals, while a
+failed/non-durable cleanup retains authority.
+
+### M2.5 — Pruned-parent recovery
+
+For a dead-owner non-blocked entry whose lock parent no longer exists, recovery
+walks upward only within the identity-fenced common directory, selects the
+nearest existing plain-directory ancestor, fsyncs it, and treats the entry as
+released for retirement. A missing/symlinked/non-directory ancestor or failed
+fsync remains indeterminate. This prevents a pruned ref subtree from wedging an
+otherwise exact journal forever without retiring past an undurable unlink.
+
 Publication-side per-lock directory fsync (`finalizeCreated:1381`) defers
-into the receipt; per-lock readback verification stays. A successful
+into the batch; per-lock readback verification stays. A successful
 `link` whose readback MISMATCHES is a fail-closed publication error with
 exact cleanup and journal retention — never `blocked` (r2-MINOR: no
 holder caused it; attributing one would be false evidence).
@@ -201,7 +233,7 @@ pull. Below-floor levers, ledger-recorded, founder decisions:
   copied-marker fixture :188 untouched).
 - v1/v2 journal compat: v1 fixture documents parse fail-closed identically
   pre/post; a v2 journal survives a restart into recovery.
-- Batch receipt: flush failure during acquisition → ALL links released
+- Batch flush proof: flush failure during acquisition → ALL links released
   exactly + journal retained; flush failure during release → affected
   locks report non-durable + retirement refused; later recovery re-fsyncs
   absent-entry parents before retiring (new fixture for the r2 gap);
@@ -213,6 +245,14 @@ pull. Below-floor levers, ledger-recorded, founder decisions:
 - Bench: timed acquire+release on the 140-lock fixture before/after; field
   FM re-pull; both lanes per perf close-out. M0 counter visible in the
   span (`locks<N> blocked<M>`).
+- Capacity: 2,000 realistic `refs/remotes/origin/feature/...` entries complete
+  acquire + strict fold below half the 16 MiB total bound; an N=4,097 prepare is
+  refused before journal publication. The implementation fixture measured the
+  complete locked journal at **1,317,414 bytes** for N=2,000.
+- Ownership regression: a batch-finalization failure through the production
+  `withRevalidatedGitPartialApplies` wrapper leaves no links but retains the
+  journal; dead-owner recovery re-fsyncs the cleaned link parent while the
+  journal still exists, then retires it.
 - `git-sync.test.ts:534` journal-leak guard unchanged; lint bar per house
   rules.
 

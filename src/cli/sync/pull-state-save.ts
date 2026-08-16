@@ -81,6 +81,7 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
   };
   const receipt = pullElisionReceipt(input);
   const casStepMs: Record<string, number> = {};
+  let casCounts: { locks: number; blocked: number } | undefined;
   const source: StateSource = {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
@@ -99,9 +100,10 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
     })), {
     mutationBoundary: deps.mutationBoundary,
     observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
-    observeLockCounts: (locks, blocked) => Object.assign(casStepMs, { locks, blocked }),
+    observeLockCounts: (locks, blocked) => { casCounts = { locks, blocked }; },
   });
-  report.appendDetails("state-save", { cas: casStepMs }, formatCasSteps(casStepMs));
+  const casDetails = casCounts ? { cas: casStepMs, casCounts } : { cas: casStepMs };
+  report.appendDetails("state-save", casDetails, formatCasSteps(casStepMs, casCounts));
   const settleT0 = Date.now();
   const settled = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
   report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);

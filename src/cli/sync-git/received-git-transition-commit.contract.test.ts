@@ -13,6 +13,8 @@ import { loadRawState, saveStateUnsafeLegacyOrTest, type GitPartialApply, type S
 import type { GitPullOutcome } from "./apply.js";
 import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
 import { gitIncomingKey } from "./shared.js";
+import { parseStateCasJournal } from "./state-cas-journal.js";
+import { recoverStateCasLocks, stateCasJournalDir } from "./state-cas-locks.js";
 import {
   partialRefsStillMatch,
   revalidateGitPartialApplies,
@@ -213,6 +215,7 @@ test("a gate closed before the commit boundary refuses the save and releases eve
   })).rejects.toBeInstanceOf(MutationGateClosedError);
   expect(saved).toBe(false);
   expect(await fs.readdir(path.join(repo, ".git", "refs", "heads"))).toEqual(["topic"]);
+  expect(await fs.readdir(stateCasJournalDir(root)).catch(() => [])).toEqual([]);
 });
 
 test("a commit boundary that refuses the transition stops the save even with no lock to hold", async () => {
@@ -243,6 +246,39 @@ test("a gate closed after the journal is prepared refuses before any lock is pub
   })).rejects.toBeInstanceOf(MutationGateClosedError);
   expect(saved).toBe(false);
   expect(await fs.readdir(path.join(repo, ".git", "refs", "heads"))).toEqual(["topic"]);
+  expect(await fs.readdir(stateCasJournalDir(root)).catch(() => [])).toEqual([]);
+});
+
+test("production wrapper retains authority after batch finalization cleanup until recovery re-fsyncs its parent", async () => {
+  const oid = await git("rev-parse", REF);
+  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  let saved = false;
+  await expect(withRevalidatedGitPartialApplies(root, state, {}, async () => { saved = true; }, {
+    stateCasLockHooks: { afterCreate: () => { throw new Error("injected batch-finalization failure"); } },
+  })).rejects.toThrow("injected batch-finalization failure");
+  expect(saved).toBe(false);
+  const lockParent = path.join(repo, ".git", "refs", "heads");
+  expect(await fs.lstat(path.join(lockParent, "topic.lock")).then(() => true, () => false)).toBe(false);
+  const journalDir = stateCasJournalDir(root);
+  const journals = await fs.readdir(journalDir);
+  expect(journals).toHaveLength(1);
+  const journalPath = path.join(journalDir, journals[0]!);
+  const journal = parseStateCasJournal(await fs.readFile(journalPath, "utf8"), journalPath);
+  expect(journal).toBeDefined();
+  const synced: string[] = [];
+  const recovery = await recoverStateCasLocks(root, {
+    identity: {
+      current: async () => journal!.owner,
+      probe: async () => ({ status: "dead" as const }),
+    },
+    syncDirectory: async (directory) => {
+      expect(await fs.lstat(journalPath).then(() => true, () => false)).toBe(true);
+      synced.push(directory);
+    },
+  });
+  expect(recovery).toMatchObject({ recovered: 0, indeterminate: 0 });
+  expect(synced).toEqual([lockParent]);
+  expect(await fs.lstat(journalPath).then(() => true, () => false)).toBe(false);
 });
 
 // ── branch-proof terminal revalidation ──────────────────────────────────────

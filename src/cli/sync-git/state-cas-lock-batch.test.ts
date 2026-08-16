@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import type { ProcessIncarnation } from "../../engine/lockfile.js";
 import {
-  consumeStateCasBatchReceipt,
   StateCasAcquisitionBatch,
   StateCasReleaseBatch,
 } from "./state-cas-lock-batch.js";
@@ -12,7 +11,6 @@ import {
   acquirePreparedStateCasLocks,
   prepareStateCasLocks,
   recoverStateCasLocks,
-  releaseStateCasLocks,
 } from "./state-cas-locks.js";
 
 const OWNER: ProcessIncarnation = { hostId: "a".repeat(32), bootId: "b".repeat(32), pid: 41, startTime: "1" };
@@ -44,16 +42,14 @@ async function fixture(paths: readonly string[]) {
   return { common, prepared: prepared! };
 }
 
-test("sealed acquisition receipt carries every outcome and is single-use", async () => {
+test("acquisition batch proves a complete flush and is single-use", async () => {
   const lockPath = path.join(root, "refs", "heads", "one.lock");
-  const batch = new StateCasAcquisitionBatch("a".repeat(32), [lockPath], async () => {});
+  const batch = new StateCasAcquisitionBatch([lockPath], async () => {});
   batch.deferPublication(lockPath, async () => {});
   batch.record(lockPath, "acquired");
-  const receipt = await batch.flushAll();
-  expect([...receipt.outcomes]).toEqual([[lockPath, "acquired"]]);
-  expect([...receipt.flushedParents]).toEqual([path.dirname(lockPath)]);
-  consumeStateCasBatchReceipt(receipt, "a".repeat(32));
-  expect(() => consumeStateCasBatchReceipt(receipt, "a".repeat(32))).toThrow("already consumed");
+  expect(() => batch.assertFlushed()).toThrow("not flushed");
+  await batch.flushAll();
+  expect(() => batch.assertFlushed()).not.toThrow();
   await expect(batch.flushAll()).rejects.toThrow("already used");
 });
 
@@ -76,14 +72,15 @@ test("acquisition flush failure attempts every parent, releases all links, and r
 test("release maps durability by actual parent and refuses journal retirement on one failed flush", async () => {
   const { prepared } = await fixture(["refs/heads/one.lock", "refs/tags/two.lock"]);
   const acquired = await acquirePreparedStateCasLocks(prepared);
-  const released = await releaseStateCasLocks(prepared, acquired.held, {
+  const released = await acquired.release({
     syncDirectory: async (directory) => {
       if (directory.endsWith(path.join("refs", "tags"))) throw new Error("injected release flush failure");
     },
   });
   expect(released).toBe(false);
+  await expect(acquired.release()).rejects.toThrow("already released");
   expect(await fs.lstat(prepared.journalPath).then(() => true)).toBe(true);
-  for (const lock of acquired.held) expect(await fs.lstat(lock.path).then(() => true, () => false)).toBe(false);
+  for (const lock of prepared.journal.commonDirs[0]!.locks) expect(await fs.lstat(lock.path).then(() => true, () => false)).toBe(false);
 
   const mapping = new StateCasReleaseBatch(async (directory) => {
     if (directory.endsWith("tags")) throw new Error("failed parent");
@@ -99,28 +96,45 @@ test("release maps durability by actual parent and refuses journal retirement on
 
 test("recovery re-fsyncs each absent acquired parent before retirement", async () => {
   const { prepared } = await fixture(["refs/heads/one.lock", "refs/heads/two.lock"]);
-  const acquired = await acquirePreparedStateCasLocks(prepared);
-  for (const lock of acquired.held) await fs.unlink(lock.path);
+  await acquirePreparedStateCasLocks(prepared);
+  for (const lock of prepared.journal.commonDirs[0]!.locks) await fs.unlink(lock.path);
   const synced: string[] = [];
   const result = await recoverStateCasLocks(root, {
     identity: identity("dead"),
     syncDirectory: async (directory) => { synced.push(directory); },
   });
   expect(result.indeterminate).toBe(0);
-  expect(synced).toEqual([path.dirname(acquired.held[0]!.path)]);
+  expect(synced).toEqual([path.dirname(prepared.journal.commonDirs[0]!.locks[0]!.path)]);
   expect(await fs.lstat(prepared.journalPath).then(() => true, () => false)).toBe(false);
 });
 
 test("recovery refuses retirement when absent-entry parent re-fsync fails", async () => {
   const { prepared } = await fixture(["refs/heads/one.lock"]);
-  const acquired = await acquirePreparedStateCasLocks(prepared);
-  await fs.unlink(acquired.held[0]!.path);
+  await acquirePreparedStateCasLocks(prepared);
+  await fs.unlink(prepared.journal.commonDirs[0]!.locks[0]!.path);
   const result = await recoverStateCasLocks(root, {
     identity: identity("dead"),
     syncDirectory: async () => { throw new Error("injected recovery flush failure"); },
   });
   expect(result.indeterminate).toBeGreaterThan(0);
   expect(await fs.lstat(prepared.journalPath).then(() => true)).toBe(true);
+});
+
+test("recovery fsyncs the nearest existing ancestor when a lock parent was pruned", async () => {
+  const relative = "refs/remotes/origin/feature/team/topic.lock";
+  const { common, prepared } = await fixture([relative]);
+  await acquirePreparedStateCasLocks(prepared);
+  const lockPath = prepared.journal.commonDirs[0]!.locks[0]!.path;
+  await fs.unlink(lockPath);
+  await fs.rm(path.join(common, "refs", "remotes", "origin"), { recursive: true });
+  const synced: string[] = [];
+  const result = await recoverStateCasLocks(root, {
+    identity: identity("dead"),
+    syncDirectory: async (directory) => { synced.push(directory); },
+  });
+  expect(result).toMatchObject({ recovered: 0, indeterminate: 0 });
+  expect(synced).toEqual([path.join(common, "refs", "remotes")]);
+  expect(await fs.lstat(prepared.journalPath).then(() => true, () => false)).toBe(false);
 });
 
 test("multi-directory acquisition flushes each exact parent once", async () => {
@@ -131,7 +145,7 @@ test("multi-directory acquisition flushes each exact parent once", async () => {
     path.dirname(prepared.journal.commonDirs[0]!.locks[0]!.path),
     path.dirname(prepared.journal.commonDirs[0]!.locks[2]!.path),
   ]);
-  await releaseStateCasLocks(prepared, acquired.held);
+  await acquired.release();
 });
 
 test("post-link readback mismatch is a publication error, never blocked", async () => {
@@ -142,12 +156,12 @@ test("post-link readback mismatch is a publication error, never blocked", async 
       await fs.link(source, destination);
       if (destination === mismatch) {
         await fs.unlink(destination);
-        await fs.writeFile(destination, "foreign holder\n");
+        await fs.writeFile(destination, await fs.readFile(source));
       }
     } },
   })).rejects.toThrow("changed before finalization");
   expect(await fs.lstat(prepared.journal.commonDirs[0]!.locks[0]!.path).then(() => true, () => false)).toBe(false);
-  expect(await fs.readFile(mismatch, "utf8")).toBe("foreign holder\n");
+  expect(await fs.readFile(mismatch, "utf8")).toBe(prepared.journal.commonDirs[0]!.locks[1]!.marker);
   expect(prepared.journal.commonDirs[0]!.locks[1]!.acquisition).toBeUndefined();
   expect(await fs.lstat(prepared.journalPath).then(() => true)).toBe(true);
 });
