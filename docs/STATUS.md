@@ -1,5 +1,30 @@
 # rbox status — living state snapshot
 
+## 2026-08-15/16 — SQLITE FLEET CUTOVER COMPLETE (SP-3 shipped + live)
+
+- SP-3 merged (#743, design 266 ALIGNED v4 + fold R4): genesis default at every
+  entry, lock-capability probe (EPERM-indeterminate, ephemeral refusal, "Your
+  files are safe" copy), upgrade-window CALL removed (module stub retained for
+  SP-4 per the fold R4 ruling — design self-contradiction resolved in doc).
+- Also merged: #741 SP-2.5 rig dimension, #742 identity-race retry (the shard-1
+  "flakes" were ONE product bug: unlocked state.json hash vs atomic-rename
+  writers), #744 fence hash cap (512 KiB refused any real-sized state.json —
+  73 MiB desktop state couldn't migrate), #745 PERSIST_WAL (Apple's system
+  SQLite keeps -wal/-shm after close BY DEFAULT; S0 could never hold on darwin;
+  affects released darwin binaries too — no darwin runtime CI lane exists).
+- FLEET: desktop MIGRATED (58-byte Q, 263 MB at-rest db, read-write, dev+75b7cec);
+  Mac MIGRATED (same, read-write, RboxBar relaunched — RboxBar must be quit
+  during migrate or its connection blocks at-rest); FM REJOINED via
+  `rbox pair`→`rbox connect` (new device dev_9da82ec7…), fresh track produced
+  IMMEDIATE SQLite genesis (Q before track returned — the SP-3 e2e proof),
+  daemon pull-only per 266 §9.4. Read-write flip needs explicit founder yes.
+- Soak: 30-min fleet check running; FM zero-echo + convergence to verify.
+  Desktop backup ~/Development/.rbox.pre-sqlite-backup + per-host cutover
+  records in ~/rbox-cutover-records/ retained until SP-4.
+- SP-4 (deletion) may start only after fleet soak + all 266 §9.4 criteria.
+- Queued: #49 lint-clean SP-3-touched files + init-cmd decomposition; darwin
+  runtime CI lane; FLAKE-010 pump-quiescence; Mac's 6 parked git deferrals.
+
 > Cross-host memory for Brian + agents. Update this doc when a release ships or
 > a workstream opens/closes. Deeper context: `docs/design/*` (numbered designs),
 > PR history, and per-machine Claude session memory (does not travel — this doc
