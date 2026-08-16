@@ -99,6 +99,7 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
     })), {
     mutationBoundary: deps.mutationBoundary,
     observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
+    observeLockCounts: (locks, blocked) => Object.assign(casStepMs, { locks, blocked }),
   });
   report.appendDetails("state-save", { cas: casStepMs }, formatCasSteps(casStepMs));
   const settleT0 = Date.now();

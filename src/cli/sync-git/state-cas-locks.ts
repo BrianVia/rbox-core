@@ -1,10 +1,9 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
-import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
+import { fsyncDirectory } from "../../engine/fsutil.js";
 import {
   acquireLock,
   captureCommonDirIdentity,
@@ -14,34 +13,42 @@ import {
   formatLockMarker,
   inspectLock,
   observeLockMarker,
-  parseLockMarker,
   publishLockMarker,
   releaseObservedLock,
   safeBoundLockParent,
   sameMarkerObservation,
   serializeMarkerObservation,
   systemLockIdentity,
-  validProcessIncarnation,
-  type CommonDirIdentity,
   type LockIdentitySource,
   type LockfileHooks,
   type MarkerObservation,
   type ProcessIncarnation,
-  type SerializedMarkerObservation,
 } from "../../engine/lockfile.js";
+import { consumeStateCasBatchReceipt, StateCasAcquisitionBatch, StateCasReleaseBatch, type SealedStateCasBatchReceipt } from "./state-cas-lock-batch.js";
+import {
+  boundedLockPath,
+  createStateCasJournal,
+  loadStateCasJournals,
+  prepareStateCasJournalDirectory,
+  stateCasJournalDir,
+  type JournalCommonDir,
+  type JournalLock,
+  type PreparedStateCasLocks,
+  type StateCasJournalHooks,
+  type StateCasLockJournal,
+  type StateCasLockProof,
+} from "./state-cas-journal.js";
+
+export { stateCasJournalDir } from "./state-cas-journal.js";
+export type { PreparedStateCasLocks, StateCasLockJournal, StateCasLockProof } from "./state-cas-journal.js";
 
 const execFileAsync = promisify(execFile);
-const JOURNAL_VERSION = 1 as const;
-const JOURNAL_DIR = path.join(".rbox", "state", "git-lock-transactions", "v1");
-const HEX_32 = /^[0-9a-f]{32}$/;
-const GIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 export type StateCasLockClassification =
   | "live"
   | "recoverable-rbox"
   | "stale-unattributed"
   | "indeterminate";
-
 export type JournalEvidence = "valid" | "absent" | "corrupt";
 export type OwnerEvidence = "alive" | "dead" | "unknown";
 export type MarkerEvidence = "match" | "mismatch-live" | "mismatch-dead" | "mismatch-foreign" | "error";
@@ -60,71 +67,19 @@ export function classifyStateCasLockEvidence(
   return "stale-unattributed";
 }
 
-export interface StateCasLockProof {
-  repo: string;
-  ref: string;
-  expectedOid: string | null;
-}
-
 export interface StateCasLockRequest {
   lockPath: string;
   commonDir: string;
   proofs: StateCasLockProof[];
 }
-
-interface JournalLock {
-  path: string;
-  marker: string;
-  proofs: StateCasLockProof[];
-  acquisition?: "acquired" | "blocked";
-  /** Persisted exact unlink capability. Marker bytes alone are never enough. */
-  observation?: SerializedMarkerObservation;
-}
-
-interface JournalCommonDir extends CommonDirIdentity {
-  locks: JournalLock[];
-}
-
-export interface StateCasLockJournal {
-  version: 1;
-  txnId: string;
-  phase: "prepared" | "locked" | "committed";
-  stream: string;
-  stateNonce: string;
-  owner: ProcessIncarnation;
-  commonDirs: JournalCommonDir[];
-  createdAt: string;
-}
-
-export interface PreparedStateCasLocks {
-  journalPath: string;
-  journal: StateCasLockJournal;
-}
-
 export interface HeldStateCasLock {
   path: string;
   observation: MarkerObservation;
 }
-
 export interface AcquiredStateCasLocks {
   held: HeldStateCasLock[];
   blocked: Set<string>;
 }
-
-export const stateCasJournalDir = (root: string): string => path.join(root, JOURNAL_DIR);
-
-function boundedLockPath(commonDir: string, lockPath: string): string {
-  const common = path.resolve(commonDir);
-  const lock = path.resolve(lockPath);
-  if (!lock.startsWith(`${common}${path.sep}`)) throw new Error(`Git lock escaped common directory: ${lock}`);
-  return lock;
-}
-
-async function writeJournal(prepared: PreparedStateCasLocks): Promise<void> {
-  await writeFileAtomic(prepared.journalPath, `${JSON.stringify(prepared.journal, null, 2)}\n`, { mode: 0o600, exactMode: true });
-  await fsyncDirectory(path.dirname(prepared.journalPath));
-}
-
 export async function prepareStateCasLocks(
   root: string,
   binding: { stream: string; stateNonce: string },
@@ -158,38 +113,46 @@ export async function prepareStateCasLocks(
     });
   }
   const txnId = crypto.randomBytes(16).toString("hex");
-  const dir = stateCasJournalDir(root);
-  const created = await ensureDirectoryChain(dir, "state-CAS journal directory");
-  await fsyncCreatedDirectoryAncestors(dir, created);
-  const prepared: PreparedStateCasLocks = {
-    journalPath: path.join(dir, `${txnId}.json`),
-    journal: {
-      version: JOURNAL_VERSION,
-      txnId,
-      phase: "prepared",
-      stream: binding.stream,
-      stateNonce: binding.stateNonce,
-      owner,
-      commonDirs,
-      createdAt: new Date((deps.now ?? Date.now)()).toISOString(),
-    },
+  const dir = await prepareStateCasJournalDirectory(root);
+  const journal: StateCasLockJournal & { version: 2 } = {
+    version: 2,
+    txnId,
+    phase: "prepared",
+    stream: binding.stream,
+    stateNonce: binding.stateNonce,
+    owner,
+    commonDirs,
+    createdAt: new Date((deps.now ?? Date.now)()).toISOString(),
   };
-  await writeJournal(prepared);
-  return prepared;
+  const journalPath = path.join(dir, `${txnId}.json`);
+  const writer = await createStateCasJournal(root, journalPath, journal);
+  return { root, journalPath, journal, writer };
 }
 
+async function appendLocked(prepared: PreparedStateCasLocks, receipt: SealedStateCasBatchReceipt, hooks?: StateCasJournalHooks): Promise<void> {
+  consumeStateCasBatchReceipt(receipt, prepared.journal.txnId);
+  await prepared.writer.append({ type: "locked" }, hooks);
+  prepared.journal.phase = "locked";
+  await prepared.writer.close();
+}
 export async function acquirePreparedStateCasLocks(
   prepared: PreparedStateCasLocks,
   options: {
     onFirstAcquired?: () => void | Promise<void>;
     /** Synchronous shutdown check at the actual hardlink publication edge. */
     beforeLockPublish?: () => void;
-    afterAcquisitionPersisted?: (count: number, lockPath: string) => void | Promise<void>;
+    afterLockAppended?: (count: number, lockPath: string) => void | Promise<void>;
+    afterBatchDurable?: () => void | Promise<void>;
     hooks?: LockfileHooks;
+    journalHooks?: StateCasJournalHooks;
+    syncDirectory?: (directory: string) => Promise<void>;
   } = {},
 ): Promise<AcquiredStateCasLocks> {
   const held: HeldStateCasLock[] = [];
   const blocked = new Set<string>();
+  const locks = prepared.journal.commonDirs.flatMap((common) => common.locks);
+  const batch = new StateCasAcquisitionBatch(prepared.journal.txnId, locks.map((lock) => lock.path), options.syncDirectory);
+  let outcomes = 0;
   try {
     for (const common of prepared.journal.commonDirs) {
       for (const lock of common.locks) {
@@ -204,41 +167,52 @@ export async function acquirePreparedStateCasLocks(
             options.beforeLockPublish?.();
           },
         };
-        const result = await publishLockMarker(lock.path, lock.marker, hooks);
+        const result = await publishLockMarker(lock.path, lock.marker, hooks, batch);
         if (result.status === "created") {
-          lock.acquisition = "acquired";
-          lock.observation = serializeMarkerObservation(result.observation);
+          const observation = serializeMarkerObservation(result.observation);
           held.push({ path: lock.path, observation: result.observation });
-          // Persist each acquired inode before proceeding to any later lock or
-          // state mutation. A crash before this write stays unattributed.
-          await writeJournal(prepared);
-          await options.afterAcquisitionPersisted?.(held.length, lock.path);
+          await prepared.writer.append({ type: "acquisition", lockPath: lock.path, acquisition: "acquired", observation }, options.journalHooks);
+          lock.acquisition = "acquired";
+          lock.observation = observation;
+          batch.record(lock.path, "acquired");
+          await options.afterLockAppended?.(++outcomes, lock.path);
           if (held.length === 1) await options.onFirstAcquired?.();
         } else if (result.status === "exists") {
+          let holderMarker = "unknown";
+          try { holderMarker = (await observeLockMarker(lock.path))?.raw ?? "unknown"; } catch { /* raced read */ }
+          await prepared.writer.append({ type: "acquisition", lockPath: lock.path, acquisition: "blocked", holderMarker }, options.journalHooks);
           lock.acquisition = "blocked";
+          lock.holderMarker = holderMarker;
           blocked.add(lock.path);
-          await writeJournal(prepared);
+          batch.record(lock.path, "blocked");
+          await options.afterLockAppended?.(++outcomes, lock.path);
         } else {
           throw result.error;
         }
       }
     }
-    prepared.journal.phase = "locked";
-    await writeJournal(prepared);
+    const receipt = await batch.flushAll();
+    await options.afterBatchDurable?.();
+    await appendLocked(prepared, receipt, options.journalHooks);
     return { held, blocked };
   } catch (error) {
-    await releaseStateCasLocks(prepared, held);
+    await releaseStateCasLocks(prepared, held, { retainJournal: true, syncDirectory: options.syncDirectory });
     throw error;
   }
 }
 
 export async function markStateCasCommitted(prepared: PreparedStateCasLocks | undefined): Promise<void> {
   if (!prepared) return;
-  prepared.journal.phase = "committed";
-  await writeJournal(prepared);
+  try {
+    await prepared.writer.append({ type: "committed" });
+    prepared.journal.phase = "committed";
+  } finally {
+    await prepared.writer.close().catch(() => {});
+  }
 }
 
 async function removeJournal(prepared: PreparedStateCasLocks): Promise<void> {
+  await prepared.writer.close();
   await fs.unlink(prepared.journalPath).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error;
   });
@@ -248,13 +222,18 @@ async function removeJournal(prepared: PreparedStateCasLocks): Promise<void> {
 export async function releaseStateCasLocks(
   prepared: PreparedStateCasLocks | undefined,
   held: readonly HeldStateCasLock[],
+  options: { retainJournal?: boolean; syncDirectory?: (directory: string) => Promise<void> } = {},
 ): Promise<boolean> {
   if (!prepared) return true;
   let exact = true;
+  const batch = new StateCasReleaseBatch(options.syncDirectory);
+  const releasedByPath = new Map<string, boolean>();
   for (const lock of [...held].reverse()) {
-    const released = await releaseObservedLock(lock.path, lock.observation);
-    if (!released.released || !released.durable) exact = false;
+    const released = await releaseObservedLock(lock.path, lock.observation, undefined, batch);
+    releasedByPath.set(lock.path, released.released);
   }
+  await batch.flushAll();
+  for (const lock of held) if (!releasedByPath.get(lock.path) || !batch.durable(lock.path)) exact = false;
   // A publication can fail after the final hardlink exists but before the
   // publisher can return its observation (directory fsync/readback failure).
   // Re-scan the durable allowlist before retiring its authority. This also
@@ -270,113 +249,9 @@ export async function releaseStateCasLocks(
       }
     }
   }
-  if (exact) await removeJournal(prepared);
+  await prepared.writer.close();
+  if (exact && !options.retainJournal) await removeJournal(prepared);
   return exact;
-}
-
-function parseJournal(raw: string, journalPath?: string): StateCasLockJournal | undefined {
-  try {
-    const value = JSON.parse(raw) as Partial<StateCasLockJournal>;
-    if (value.version !== 1 || !HEX_32.test(value.txnId ?? "")
-      || !["prepared", "locked", "committed"].includes(value.phase ?? "")
-      || typeof value.stream !== "string" || typeof value.stateNonce !== "string"
-      || !validProcessIncarnation(value.owner) || !Array.isArray(value.commonDirs) || value.commonDirs.length === 0
-      || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) return undefined;
-    if (journalPath !== undefined && path.basename(journalPath) !== `${value.txnId}.json`) return undefined;
-    const commonPaths = new Set<string>();
-    const lockPaths = new Set<string>();
-    for (const common of value.commonDirs) {
-      if (!common || typeof common !== "object" || typeof common.path !== "string"
-        || typeof common.realpath !== "string" || typeof common.dev !== "string"
-        || typeof common.ino !== "string" || typeof common.birthtimeNs !== "string"
-        || !Array.isArray(common.locks) || common.locks.length === 0) return undefined;
-      if (!path.isAbsolute(common.path) || path.resolve(common.path) !== common.path
-        || !path.isAbsolute(common.realpath) || path.resolve(common.realpath) !== common.realpath
-        || commonPaths.has(common.path)) return undefined;
-      commonPaths.add(common.path);
-      for (const lock of common.locks) {
-        if (!lock || typeof lock.path !== "string" || typeof lock.marker !== "string"
-          || !Array.isArray(lock.proofs) || (lock.acquisition !== undefined && lock.acquisition !== "acquired" && lock.acquisition !== "blocked")) return undefined;
-        if (lock.observation !== undefined) {
-          const observation = deserializeMarkerObservation(lock.observation);
-          if (!observation || observation.raw !== lock.marker || lock.acquisition !== "acquired") return undefined;
-        }
-        if (!path.isAbsolute(lock.path) || path.resolve(lock.path) !== lock.path
-          || !lock.path.endsWith(".lock") || lockPaths.has(lock.path)) return undefined;
-        try {
-          if (boundedLockPath(common.path, lock.path) !== lock.path) return undefined;
-        } catch {
-          return undefined;
-        }
-        lockPaths.add(lock.path);
-        const marker = parseLockMarker(lock.marker);
-        if (!marker || marker.hostId !== value.owner.hostId || marker.bootId !== value.owner.bootId
-          || marker.pid !== value.owner.pid || marker.startTime !== value.owner.startTime) return undefined;
-        for (const proof of lock.proofs) {
-          if (!proof || typeof proof !== "object" || typeof proof.repo !== "string" || proof.repo.length === 0
-            || typeof proof.ref !== "string" || !proof.ref.startsWith("refs/")
-            || (proof.expectedOid !== null && (typeof proof.expectedOid !== "string" || !GIT_OID.test(proof.expectedOid)))) return undefined;
-        }
-      }
-    }
-    return value as StateCasLockJournal;
-  } catch {
-    return undefined;
-  }
-}
-
-interface LoadedJournal {
-  path: string;
-  journal?: StateCasLockJournal;
-}
-
-async function loadJournals(root: string): Promise<LoadedJournal[]> {
-  const dir = stateCasJournalDir(root);
-  try {
-    const rootAbsolute = path.resolve(root);
-    const rootReal = await fs.realpath(rootAbsolute);
-    let current = rootAbsolute;
-    for (const component of path.relative(rootAbsolute, dir).split(path.sep).filter(Boolean)) {
-      current = path.join(current, component);
-      const stat = await fs.lstat(current);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe state-CAS journal directory: ${current}`);
-    }
-    const dirReal = await fs.realpath(dir);
-    if (dirReal !== rootReal && !dirReal.startsWith(`${rootReal}${path.sep}`)) {
-      throw new Error("state-CAS journal directory escaped workspace");
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  const names = await fs.readdir(dir).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error));
-  const loaded: LoadedJournal[] = [];
-  for (const name of names.sort()) {
-    if (!name.endsWith(".json")) continue;
-    const file = path.join(dir, name);
-    let handle: fs.FileHandle | undefined;
-    let raw: string | undefined;
-    try {
-      const before = await fs.lstat(file);
-      if (!before.isFile() || before.isSymbolicLink() || before.size > 1024 * 1024) {
-        loaded.push({ path: file });
-        continue;
-      }
-      handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const opened = await handle.stat();
-      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
-        loaded.push({ path: file });
-        continue;
-      }
-      raw = await handle.readFile("utf8");
-    } catch {
-      raw = undefined;
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-    loaded.push({ path: file, journal: raw === undefined ? undefined : parseJournal(raw, file) });
-  }
-  return loaded;
 }
 
 async function ownerEvidence(owner: ProcessIncarnation, identity: LockIdentitySource): Promise<OwnerEvidence> {
@@ -435,16 +310,19 @@ export async function recoverStateCasLocks(
     identity?: LockIdentitySource;
     /** Deterministic unlink/fsync refusal seam. */
     releaseObserved?: typeof releaseObservedLock;
+    /** Deterministic absent-entry parent durability seam. */
+    syncDirectory?: (directory: string) => Promise<void>;
   } = {},
 ): Promise<StateCasRecoveryResult> {
-  let loaded: LoadedJournal[];
+  let loaded: Awaited<ReturnType<typeof loadStateCasJournals>>;
   try {
-    loaded = await loadJournals(root);
+    loaded = await loadStateCasJournals(root);
   } catch {
     return { recovered: 0, live: 0, stale: 0, indeterminate: 1, journals: 0, recoveredCommonDirs: [] };
   }
   const identity = options.identity ?? systemLockIdentity;
   const releaseObserved = options.releaseObserved ?? releaseObservedLock;
+  const syncDirectory = options.syncDirectory ?? fsyncDirectory;
   const wanted = options.commonDir === undefined ? undefined : path.resolve(options.commonDir);
   const recoveredCommonDirs = new Set<string>();
   type AcquiredFence = Extract<Awaited<ReturnType<typeof acquireLock>>, { status: "acquired" }>;
@@ -462,6 +340,7 @@ export async function recoverStateCasLocks(
     const allJournalCommonDirsTargeted = wanted === undefined || item.journal.commonDirs.every((common) =>
       path.resolve(common.path) === wanted || path.resolve(common.realpath) === wanted);
     let retain = owner !== "dead";
+    const absentParents = new Set<string>();
     if (owner === "unknown") result.indeterminate++;
     for (const common of item.journal.commonDirs) {
       if (wanted !== undefined && path.resolve(common.path) !== wanted && path.resolve(common.realpath) !== wanted) continue;
@@ -483,7 +362,13 @@ export async function recoverStateCasLocks(
         let observed;
         try {
           const parent = await safeBoundLockParent(common.path, lock.path, { create: false });
-          if (parent === "absent") continue;
+          if (parent === "absent") {
+            if (owner === "dead" && lock.acquisition !== "blocked") {
+              result.indeterminate++;
+              retain = true;
+            }
+            continue;
+          }
           observed = await observeLockMarker(lock.path);
         }
         catch {
@@ -491,7 +376,10 @@ export async function recoverStateCasLocks(
           retain = true;
           continue;
         }
-        if (!observed) continue;
+        if (!observed) {
+          if (lock.acquisition !== "blocked") absentParents.add(path.dirname(lock.path));
+          continue;
+        }
         if (observed.raw !== lock.marker) {
           const inspection = await inspectLock(lock.path, identity);
           if (inspection.kind === "live") result.live++;
@@ -572,12 +460,22 @@ export async function recoverStateCasLocks(
       }
     }
     if (allJournalCommonDirsTargeted && !retain) {
-      retireCandidates.push({
-        path: item.path,
-        commonKeys: item.journal.commonDirs
-          .filter((common) => wanted === undefined || path.resolve(common.path) === wanted || path.resolve(common.realpath) === wanted)
-          .map((common) => path.resolve(common.realpath)),
-      });
+      let parentsDurable = true;
+      for (const parent of [...absentParents].sort()) {
+        try { await syncDirectory(parent); }
+        catch {
+          parentsDurable = false;
+          result.indeterminate++;
+        }
+      }
+      if (parentsDurable) {
+        retireCandidates.push({
+          path: item.path,
+          commonKeys: item.journal.commonDirs
+            .filter((common) => wanted === undefined || path.resolve(common.path) === wanted || path.resolve(common.realpath) === wanted)
+            .map((common) => path.resolve(common.realpath)),
+        });
+      }
     }
   }
   for (const [commonKey, fence] of recoveryFences) {

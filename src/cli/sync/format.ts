@@ -21,7 +21,7 @@ export const formatCommitTimings = (t: CommitTimings): string =>
  *  Rendered only when the server sent it (older workers omit the field). */
 const formatServerTimings = (t: CommitTimings["serverTimings"]): string =>
   t ? ` srv${fmtDetailSeconds(t.totalMs)} env${fmtDetailSeconds(t.envelopeMs)} acct${fmtDetailSeconds(t.accountingMs)} ssc${fmtDetailSeconds(t.sidecarMs)} cm${fmtDetailSeconds(t.commitMs)} mir${fmtDetailSeconds(t.mirrorMs)} rsp${fmtDetailSeconds(t.responseMs)}` : "";
-export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}${typeof t.foldLinks === "number" ? ` f${t.foldLinks}` : ""}` : ""}`;
+export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}${t.foldLinks !== undefined ? ` f${t.foldLinks}` : ""}` : ""}`;
 /** Design 232 §4.1: scanManifest owns the monotonic all-attempt wall and the
  * fixed residual decomposition. The wall argument remains a compatibility
  * fallback for synthetic/older ScanStats producers. */
@@ -45,9 +45,10 @@ export const formatApplyStats = (s: ApplyStats): string =>
   `mk${s.mkdirCalls}/cr${s.mkdirCreated} walk${s.dirComponentWalks} uniq${s.uniqueDirs} ls${s.lstatCalls} rn${s.renameCalls} stg${s.stageCalls} pre${fmtDetailSeconds(s.preflightMs)}s pool${fmtDetailSeconds(s.writePoolMs)}s sm${s.smallCount}n/${fmtDetailBytes(s.smallBytes)} lg${s.largeCount}n/${fmtDetailBytes(s.largeBytes)}`;
 export const formatPullOracleMetrics = (m: PullOracleMetrics): string =>
   `oracle prep${fmtDetailSeconds(m.prepareMs)} hash${fmtDetailSeconds(m.receiptHashMs)} indexed${m.entriesIndexed} proved${m.reposProved}`;
-export const formatCasSteps = (steps: Record<string, number>): string | undefined => {
+export const formatCasSteps = ({ locks = 0, blocked = 0, ...steps }: Record<string, number>): string => {
   const parts = Object.entries(steps).filter(([, ms]) => ms > 0).map(([step, ms]) => `${step}${fmtDetailSeconds(ms)}`);
-  return parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
+  const timing = parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
+  return [timing, `locks${locks} blocked${blocked}`].filter(Boolean).join(" ");
 };
 export const formatPushSpan = (
   name: "ack_ms" | "delta_base_ms" | "drain_wait_ms" | "matcher_ms" | "projection_casefold_ms" | "projection_diff_ms" | "projection_ignore_carry_ms" | "projection_ms" | "projection_sort_ms" | "publish_transition_ms" | "state_lineage_ms",

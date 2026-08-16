@@ -1224,6 +1224,7 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
     await handle.writeFile(raw);
     await handle.chmod(markerMode);
     await handle.sync();
+    const staged = { ...statToken(await handle.stat({ bigint: true })), raw };
     await handle.close();
     handle = undefined;
     await hooks?.afterTempFsync?.(tempPath, raw);
@@ -1231,7 +1232,7 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
       await hooks?.beforeLink?.(lockPath, raw);
       await (hooks?.link ?? fs.link)(tempPath, lockPath);
       const published = await readMarkerNoFollow(lockPath).catch(() => undefined);
-      result = published?.raw === raw ? { status: "created", observation: published } : { status: "created" };
+      result = published?.raw === raw && published.dev === staged.dev && published.inode === staged.inode ? { status: "created", observation: published } : { status: "created", observation: staged };
     } catch (error) {
       if (errno(error) === "EEXIST") result = { status: "exists" };
       else {
@@ -1285,12 +1286,13 @@ export async function publishLockMarker(
   lockPath: string,
   raw: string,
   hooks?: LockfileHooks,
+  batch?: { deferPublication(lockPath: string, finalizeDurable: () => Promise<void>): void },
 ): Promise<MarkerPublishResult> {
   if (!parseLockMarker(raw)) return { status: "error", error: new Error("invalid rbox lock marker") };
   const created = await atomicCreateMarker(lockPath, raw, hooks);
   if (created.status === "exists") return { status: "exists" };
   if (created.status !== "created") return { status: "error", error: created.error ?? new Error("lock marker publication failed") };
-  const finalized = await finalizeCreated(lockPath, raw, hooks, created.observation);
+  const finalized = await finalizeCreated(lockPath, raw, hooks, created.observation, batch);
   if (!finalized.ok) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
   return { status: "created", observation: finalized.observation };
 }
@@ -1330,10 +1332,15 @@ export async function releaseObservedLock(
   lockPath: string,
   expected: MarkerObservation,
   hook?: () => void | Promise<void>,
+  batch?: { deferRelease(lockPath: string): void },
 ): Promise<LockReleaseResult> {
   try {
     const released = await unlinkIfExact(lockPath, expected, hook);
     if (!released) return { released: false, durable: false };
+    if (batch) {
+      try { batch.deferRelease(lockPath); return { released: true, durable: false }; }
+      catch (error) { return { released: true, durable: false, error }; }
+    }
     const durable = await fsyncDirectory(path.dirname(lockPath)).then(() => true, () => false);
     return { released: true, durable };
   } catch (error) {
@@ -1366,21 +1373,30 @@ function blockerFor(inspection: Exclude<LockInspection, { kind: "absent" }>): Re
 
 async function finalizeCreated(
   lockPath: string, raw: string, hooks?: LockfileHooks, published?: MarkerRead,
+  batch?: { deferPublication(lockPath: string, finalizeDurable: () => Promise<void>): void },
 ): Promise<{ ok: true; observation: MarkerObservation } | { ok: false; cleaned: boolean; error?: unknown }> {
-  let created: MarkerRead | undefined = published;
-  if (created === undefined) {
-    try {
-      created = await readMarkerNoFollow(lockPath);
-    } catch (error) {
-      return { ok: false, cleaned: false, error };
-    }
+  let created: MarkerRead | undefined;
+  try { created = await readMarkerNoFollow(lockPath); }
+  catch (error) { return published ? finalizeCreatedFailure(lockPath, published, hooks, error) : { ok: false, cleaned: false, error }; }
+  if (!created || !published || !sameMarkerObservation(created, published) || created.raw !== raw) {
+    const error = new Error("created lock changed before finalization");
+    return published ? finalizeCreatedFailure(lockPath, published, hooks, error) : { ok: false, cleaned: false, error };
   }
-  if (!created || created.raw !== raw) {
-    return { ok: false, cleaned: false, error: new Error("created lock changed before finalization") };
+  if (batch) {
+    batch.deferPublication(lockPath, async () => {
+      const finalized = await finalizeDurableCreated(lockPath, raw, hooks, created);
+      if (!finalized.ok) throw finalized.error ?? new Error("created lock verification failed");
+    });
+    return { ok: true, observation: created };
   }
+  try { await fsyncDirectory(path.dirname(lockPath)); }
+  catch (error) { return finalizeCreatedFailure(lockPath, created, hooks, error); }
+  return finalizeDurableCreated(lockPath, raw, hooks, created);
+}
+
+async function finalizeDurableCreated(lockPath: string, raw: string, hooks: LockfileHooks | undefined, created: MarkerRead): Promise<{ ok: true; observation: MarkerObservation } | { ok: false; cleaned: boolean; error?: unknown }> {
   let failure;
   try {
-    await fsyncDirectory(path.dirname(lockPath));
     await hooks?.afterCreate?.(lockPath, raw);
     const verified = await readMarkerNoFollow(lockPath);
     if (verified && sameMarkerObservation(verified, created)) return { ok: true, observation: created };
@@ -1388,6 +1404,10 @@ async function finalizeCreated(
   } catch (error) {
     failure = error;
   }
+  return finalizeCreatedFailure(lockPath, created, hooks, failure);
+}
+
+async function finalizeCreatedFailure(lockPath: string, created: MarkerRead, hooks: LockfileHooks | undefined, failure: LockReleaseResult["error"]): Promise<{ ok: false; cleaned: boolean; error?: unknown }> {
   try {
     const cleaned = await unlinkIfExact(lockPath, created, () => hooks?.beforeCreatedCleanup?.(lockPath));
     if (cleaned) await fsyncDirectory(path.dirname(lockPath));
