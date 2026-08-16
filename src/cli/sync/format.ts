@@ -21,7 +21,7 @@ export const formatCommitTimings = (t: CommitTimings): string =>
  *  Rendered only when the server sent it (older workers omit the field). */
 const formatServerTimings = (t: CommitTimings["serverTimings"]): string =>
   t ? ` srv${fmtDetailSeconds(t.totalMs)} env${fmtDetailSeconds(t.envelopeMs)} acct${fmtDetailSeconds(t.accountingMs)} ssc${fmtDetailSeconds(t.sidecarMs)} cm${fmtDetailSeconds(t.commitMs)} mir${fmtDetailSeconds(t.mirrorMs)} rsp${fmtDetailSeconds(t.responseMs)}` : "";
-export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}${typeof t.foldLinks === "number" ? ` f${t.foldLinks}` : ""}` : ""}`;
+export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}${t.foldLinks !== undefined ? ` f${t.foldLinks}` : ""}` : ""}`;
 /** Design 232 §4.1: scanManifest owns the monotonic all-attempt wall and the
  * fixed residual decomposition. The wall argument remains a compatibility
  * fallback for synthetic/older ScanStats producers. */
