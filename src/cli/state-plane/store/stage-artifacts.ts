@@ -142,6 +142,11 @@ export function sealAndPublish(
   stageId: string,
 ): SealedPublication {
   selectRow(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+  // A sealed artifact is immutable: leaving it in WAL mode makes every later
+  // read-only verification depend on creating a -shm, which Apple's system
+  // SQLite refuses on a read-only connection (SQLITE_CANTOPEN, field 2026-08-16
+  // Mac cutover — 291 deferrals). DELETE mode makes the file self-contained.
+  selectRow(db, "PRAGMA journal_mode=DELETE");
   db.close();
   assertNoSidecars(privateFile, stageId);
   const fd = openNoFollow(privateFile, stageId);
@@ -234,7 +239,9 @@ export function openSealedArtifact(
     db = new Database(contained, { create: false, readonly: true });
     try {
       db.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA temp_store=FILE");
-      // The priming read materializes the WAL index; only then can the names go.
+      // The priming read proves the copy is a readable database before the
+      // names go. (Sealed artifacts are DELETE-mode; WAL-mode seals from
+      // builds before the darwin fix still verify on Linux and re-seal on retry.)
       selectRow(db, "SELECT count(*) AS n FROM sqlite_schema");
       for (const suffix of ["", ...SQLITE_SIDECARS]) fs.rmSync(`${contained}${suffix}`, { force: true });
     } catch (error) {
