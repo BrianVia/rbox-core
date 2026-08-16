@@ -230,6 +230,13 @@ function parseV2(raw: string, journalPath?: string): StateCasLockJournal | undef
   return journal;
 }
 
+/** First bytes of every v2 header line, derived from the real encoder so the
+ * loader's over-1MiB admission gate can never drift from what we write. */
+export const V2_HEADER_LINE_PREFIX: string = (() => {
+  const probe = JSON.stringify({ type: "header", version: 2 });
+  return probe.slice(0, probe.length - 1) + ",";
+})();
+
 export function parseStateCasJournal(raw: string, journalPath?: string): StateCasLockJournal | undefined {
   if (Buffer.byteLength(raw) > MAX_V2_JOURNAL_BYTES) return undefined;
   const firstLine = raw.slice(0, raw.indexOf("\n") < 0 ? raw.length : raw.indexOf("\n"));

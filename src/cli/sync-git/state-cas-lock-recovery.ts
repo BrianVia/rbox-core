@@ -146,6 +146,7 @@ export async function recoverStateCasLocks(
   const retireCandidates: Array<{ path: string; commonKeys: string[] }> = [];
   const result: StateCasRecoveryResult = { recovered: 0, live: 0, stale: 0, indeterminate: 0, journals: loaded.length, recoveredCommonDirs: [] };
   for (const item of loaded) {
+    // Malformed authority remains visible in startup and targeted episodes.
     if (!item.journal) {
       result.indeterminate++;
       continue;
@@ -196,10 +197,13 @@ export async function recoverStateCasLocks(
           const inspection = await inspectLock(lock.path, identity);
           if (inspection.kind === "live") result.live++;
           else if (inspection.kind !== "absent") result.stale++;
+          // A blocked entry was never ours; the journal is not needed to retain someone else's blocker.
           if (lock.acquisition !== "blocked") retain = true;
           continue;
         }
         const persisted = deserializeMarkerObservation(lock.observation);
+        // Matching bytes on a different inode are not ownership. This is the
+        // reproduced copied-marker replacement case.
         if (!persisted || !sameMarkerObservation(observed, persisted)) {
           result.stale++;
           retain = true;
@@ -262,6 +266,9 @@ export async function recoverStateCasLocks(
           }
         }
       }
+      // Validation is required even when a dead-owner journal's locks are
+      // already absent (crash after cleanup, before journal retirement). A
+      // failed validation can never disappear on the next pass.
       if (owner === "dead" && !await validateGitCommonDir(common.path)) {
         result.indeterminate++;
         retain = true;

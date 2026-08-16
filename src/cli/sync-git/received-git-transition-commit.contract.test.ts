@@ -12,7 +12,7 @@ import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/muta
 import { loadRawState, saveStateUnsafeLegacyOrTest, type GitPartialApply, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";
 import type { BranchTransitionWitness, LockedBranchProof, RepoBaseProof } from "./base-composer.js";
-import type { RepoRecordInput } from "../sync-state-model.js";
+import type { RepoRecord } from "../sync-state-model.js";
 import { gitIncomingKey } from "./shared.js";
 import { parseStateCasJournal } from "./state-cas-journal.js";
 import { recoverStateCasLocks, stateCasJournalDir } from "./state-cas-locks.js";
@@ -81,7 +81,7 @@ function stateWithPartial(value: GitPartialApply | undefined): SyncState {
     lastSyncedSequence: 1,
     lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: {} },
     repoRecords: (() => {
-      const record: RepoRecordInput = { repoGen: 1, sourceSeq: 1 };
+      const record: RepoRecord = { repoGen: 1, sourceSeq: 1 };
       if (value) record.partial = value;
       return { [REL]: record };
     })(),

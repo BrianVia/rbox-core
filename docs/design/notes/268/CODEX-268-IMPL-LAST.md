@@ -38,7 +38,7 @@ Median of five acquire+release runs:
 
 - **No commits were created.** Git failed with:
   `Unable to create .../.git/worktrees/cas-lock-amortize/index.lock: Read-only file system`
-  
+
   The work remains unstaged on `cas-lock-amortize`; nothing was pushed.
 - The final `test:affected` invocation was not green due to the unrelated memory-sensitive test described above, although that file passes alone and the larger required full suite passes.
 - The new/refactored CAS modules are all ≤500 lines, but the surgically touched pre-existing deep modules `lockfile.ts` (1,621 lines) and `pull.ts` (528 lines) remain above the literal limit. Splitting those cohesive modules would have been an out-of-scope move-only refactor.

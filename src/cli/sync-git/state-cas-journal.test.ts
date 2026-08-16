@@ -69,6 +69,12 @@ test("2000 realistic long refs acquire and fold with more than 2x byte headroom"
   expect(Buffer.byteLength(raw)).toBeLessThan(8 * 1024 * 1024);
   expect(parseStateCasJournal(raw, prepared!.journalPath)?.commonDirs[0]?.locks.filter((lock) => lock.acquisition === "acquired")).toHaveLength(count);
   expect(acquired.acquired).toBe(count);
+  // MAJOR-1 (final review): every FM-scale journal exceeds the 1 MiB v1 bound,
+  // so the loader's v2 admission gate is the only path recovery has to it —
+  // assert it BEFORE release (a clean release retires the journal).
+  const loaded = await loadStateCasJournals(root);
+  expect(loaded.length).toBe(1);
+  expect(loaded[0]?.journal?.version).toBe(2);
   await acquired.release();
 }, 30_000);
 

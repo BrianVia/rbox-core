@@ -272,3 +272,10 @@ the O(N²) journal drag (absent at N=140, dominant at N≈1500)
 additionally removed. Field FM re-pull remains the authoritative gate.
 Bench harness note: any future run MUST place fixtures on a real fs —
 /tmp is tmpfs on the dev hosts.
+
+Final-review residual (recorded): the 16 MiB total bound is the one bound
+the prepare-time N gate cannot fully cover — a pathological foreign
+holderMarker fleet (4,096 blocked locks × ~6 KB escaped) could exceed it
+mid-acquisition. Fail-closed and self-healing (links released, journal
+retained, later retired); unreachable with real git holders (~41-byte
+markers). A denial path, not a wedge.

@@ -9,7 +9,8 @@ import {
   type StateCasLockJournal,
 } from "./state-cas-journal.js";
 
-const V2_HEADER_PREFIX = Buffer.from('{"type":"header","version":2,');
+import { V2_HEADER_LINE_PREFIX } from "./state-cas-journal.js";
+const V2_HEADER_PREFIX = Buffer.from(V2_HEADER_LINE_PREFIX);
 
 export interface LoadedStateCasJournal {
   path: string;

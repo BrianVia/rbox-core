@@ -47,8 +47,9 @@ export const formatPullOracleMetrics = (m: PullOracleMetrics): string =>
   `oracle prep${fmtDetailSeconds(m.prepareMs)} hash${fmtDetailSeconds(m.receiptHashMs)} indexed${m.entriesIndexed} proved${m.reposProved}`;
 export const formatCasSteps = (steps: Record<string, number>, counts?: { locks: number; blocked: number }): string | undefined => {
   const parts = Object.entries(steps).filter(([, ms]) => ms > 0).map(([step, ms]) => `${step}${fmtDetailSeconds(ms)}`);
-  const timing = parts.length > 0 ? `cas ${parts.join(" ")}` : undefined;
-  return [timing, counts ? `locks${counts.locks} blocked${counts.blocked}` : undefined].filter(Boolean).join(" ") || undefined;
+  const fragments = [...parts];
+  if (counts) fragments.push(`locks${counts.locks} blocked${counts.blocked}`);
+  return fragments.length > 0 ? `cas ${fragments.join(" ")}` : undefined;
 };
 export const formatPushSpan = (
   name: "ack_ms" | "delta_base_ms" | "drain_wait_ms" | "matcher_ms" | "projection_casefold_ms" | "projection_diff_ms" | "projection_ignore_carry_ms" | "projection_ms" | "projection_sort_ms" | "publish_transition_ms" | "state_lineage_ms",
