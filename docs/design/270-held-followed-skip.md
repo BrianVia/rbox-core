@@ -1,6 +1,6 @@
 # 270 — Held-followed repos join the held-skip fast path
 
-Status: DRAFT r3. r3 replaces r2's *inferred* root cause with a
+Status: DRAFT r4 (serial-confirm fold: D1-D3 factual corrections + D4 blast-radius decision; both open questions RULED). r3 replaces r2's *inferred* root cause with a
 **verified** one, read out of the Mac's live durable state
 (`~/Development/.rbox/state/state.db`, `repo_records`, 2026-08-16
 20:46Z) rather than from code reading alone. The r2 mechanism SURVIVES
@@ -381,3 +381,40 @@ cost. Field close-out re-measures both lanes per the perf rule.
    list. Benign for eligibility, but it means `causallyMapped` cannot
    neutralize holds for refs the classifier stayed silent about —
    possible follow-up for the mapping's own owner, out of scope here.
+
+
+## 7. Serial-confirm fold (r4)
+
+- D1/D2 corrections: `checkoutComplete === false` IS reachable in stored
+  attempts (`apply.ts:1033` passes the live value) — the exclusion is by
+  CODE, proven as a biconditional: composer blockers exist only under a
+  pending disposition (`held-skip.ts:76`); `!checkoutComplete` there
+  unconditionally mints the `checkout-incomplete` blocker (`:103-110`);
+  that code is not admitted → composer eligibility ⟺ checkoutComplete.
+  §6-Q1 CLOSED: no GitHeldAttempt widening, no compat path.
+- D3: r2's `code !== undefined` predicate would have flipped ≥7 pins
+  (not two) — retrospective corrected; the tightening's case is stronger.
+- §6-Q2 CLOSED: ship BOTH codes. Safe-ref inputs are a strict subset of
+  the branch bracket (tags/stash are SYNCABLE → fingerprint-covered;
+  `lockedProof.safeRefs` never consults artifactsClear; stash reflog is
+  an attempt input via `finalReflogPaths`) — provable coverage, not
+  symmetry. Fixture stays.
+- D4 DECIDED: `RBOX_GIT_HELD_SKIP_COMPOSER` gates §2.1 (predicate) AND
+  §2.3 (artifact digest) together — off = digest neither observed nor
+  stored, so the flag's radius equals the change's; one self-healing
+  mismatch cycle on toggle. §2.4 (partial identity incl. pRepaired at
+  the early gate) stays UNFLAGGED: it closes a live pre-existing #641
+  hole (early skip runs before the shredder, so a pRepaired write could
+  be skipped past today) — a correctness tightening for all attempts.
+- §5 additions: control-group regression pin (existing local-* held repo
+  still skips across N cycles with the digest live); artifact-plane
+  WRITER-ORDERING requirement (every writer must land before
+  classification or inside rebindHeldAttemptsAfterSettlement's
+  pull-ref-transaction/journal-recovery reach — enumerate writers at
+  implementation, red-first case backstops); impl notes: early gate
+  gains repoDir from before.diskCtx (fail-open new reason when absent),
+  digest read sits inside the two-fingerprint bracket, §2.4 reuses
+  partialDisposition's exact canonicalization and earlySkip's input
+  widens by records[rel].partial.
+- Pre-existing gap noted, not owned here: no RBOX_GIT_*HELD_SKIP* flag
+  is defaults-ledger-registered today; the new flag WILL be.
