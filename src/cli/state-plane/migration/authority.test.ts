@@ -451,6 +451,81 @@ test("the retired upgrade window cannot reach migration or genesis", () => {
   expect(upgrade).not.toContain("migrateStateInUpgradeWindow");
 });
 
+/**
+ * The conjunct no name-based gate can make.
+ *
+ * Every check above greps for a SYMBOL. A module that imports the admission
+ * Interface and calls it through an alias, a re-export, or a value it stored
+ * first satisfies all of them while being an unreviewed genesis site. An import
+ * specifier cannot be computed — `from "…/authority-bootstrap.js"` is a static
+ * string or it is not an import — so the set of modules that can reach the
+ * module at all is exactly enumerable, and that is what this gate pins.
+ *
+ * `whole-state-compat.ts` is deliberately absent: it reaches the module through
+ * a DYNAMIC import, which keeps `bun:sqlite` out of the CLI's eager graph. That
+ * is also the one shape this gate cannot see, so it is stated here rather than
+ * silently missing.
+ */
+const EXPECTED_IMPORTERS: readonly string[] = [
+  "src/cli/adopt-cmd.ts",                  // config-to-genesis owner
+  "src/cli/daemon/daemon.ts",              // refusal catch
+  "src/cli/doctor-cmd.ts",                 // configured-root advisory probe
+  "src/cli/export-cmd.ts",                 // config-to-genesis owner
+  "src/cli/init-cmd.ts",                   // config-to-genesis owner
+  "src/cli/init-genesis-continuation.ts",  // init's continuation re-admission
+  "src/cli/local-runtime.ts",              // refusal catch
+  "src/cli/state-plane-cmd.ts",            // explicit `rbox migrate` entry
+  "src/cli/state-plane-copy.ts",           // refusal copy keyed by reason — types only
+  "src/cli/state-plane-report.ts",         // refusal rendering — types only
+  "src/cli/telemetry/queue.ts",            // refusal occurrence telemetry
+  "src/cli/track-cmd.ts",                  // config-to-genesis owner
+];
+
+test("only the enumerated modules can reach ordinary genesis admission at all", () => {
+  // Deliberately NOT `productionHits`, which strips import lines so the
+  // call-site gates cannot count a name brought into scope as a call. Here the
+  // import line IS the evidence.
+  const importers = [...new Set(
+    gitGrep("from \"[^\"]*authority-bootstrap\\.js\"", "src", "scripts", ":!*.test.ts")
+      .map((line) => line.split(":")[0]!),
+  )].sort();
+  expect(importers).toEqual([...EXPECTED_IMPORTERS].sort());
+});
+
+/**
+ * §7.1: "exactly four config-to-genesis owners with save/existing config →
+ * `.rbox` fsync → admission before mutation."
+ *
+ * The ordering is the whole safety property: a binding that reaches disk without
+ * an admitted authority behind it is the state every refusal exists to prevent.
+ * So this asserts the SEQUENCE within each owner, not merely that all three
+ * names appear somewhere in the file.
+ */
+const CONFIG_TO_GENESIS_OWNERS: readonly string[] = [
+  "src/cli/adopt-cmd.ts",
+  "src/cli/export-cmd.ts",
+  "src/cli/init-cmd.ts",
+  "src/cli/track-cmd.ts",
+];
+
+test("exactly four config-to-genesis owners save, fsync, then admit", () => {
+  const callers = [...new Set(
+    productionHits("\\badmitGenesisAuthority\\b", "src/cli/state-plane/authority-bootstrap.ts")
+      .map((line) => line.split(":")[0]!),
+  )];
+  for (const owner of CONFIG_TO_GENESIS_OWNERS) {
+    expect(callers, owner).toContain(owner);
+    const body = read(path.join(REPO, owner));
+    // Call forms only: an import line names all three and orders none of them.
+    const save = body.search(/\b(saveConfig|ensureJournalConfig)\(/);
+    const fsync = body.indexOf("fsyncDirectory(");
+    const admit = body.indexOf("admitGenesisAuthority(");
+    expect(save, `${owner} writes the binding`).toBeGreaterThanOrEqual(0);
+    expect(fsync, `${owner} fsyncs .rbox`).toBeGreaterThan(save);
+    expect(admit, `${owner} admits after the binding is durable`).toBeGreaterThan(fsync);
+  }
+});
+
 test("the halt clear has exactly one production authorization site", () => {
   // §7.9's "plus one doctor authorization site". `retryHaltedMigration` is the
   // only code in the tree that clears a halt (`halt-recovery.ts`), so a second

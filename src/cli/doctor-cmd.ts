@@ -676,21 +676,18 @@ async function checkLocking(root: string): Promise<DoctorCheck> {
   if (health.status === "ok") {
     const authority = await observeStateAuthority(root).catch(() => undefined);
     if (authority?.kind === "uninitialized") {
-      const refusal = await probeGenesisLocking(root).catch((error) => ({
-        reason: "lock-io" as const,
-        layer: "workspace" as const,
-        error,
+      const probe = await probeGenesisLocking(root).catch((error) => ({
+        refusal: { reason: "lock-io" as const, layer: "workspace" as const, error },
+        explanation: "",
       }));
-      if (refusal) {
-        const report = describeGenesisAdmissionRefusal(refusal);
-        return {
-          ok: false,
-          label: "locking",
-          status: report.finding.id,
-          message: report.finding.problem,
-          finding: report.finding,
-        };
-      }
+      const report = probe.refusal ? describeGenesisAdmissionRefusal(probe.refusal) : undefined;
+      const check: DoctorCheck = report
+        ? { ok: false, label: "locking", status: report.finding.id, message: report.finding.problem, finding: report.finding }
+        : { ok: true, label: "locking", message: "ok (.rbox/state/sync.lock)", status: "ok" };
+      // The probe says what it could and could not test. It is a hint, not the
+      // verdict: a probe that proved nothing must not read as a clean bill.
+      if (probe.explanation) check.hint = probe.explanation;
+      return check;
     }
     return {
       ok: true,

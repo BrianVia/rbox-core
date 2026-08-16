@@ -334,10 +334,10 @@ async function runLockAttempt<T>(
  * can ever be consulted. This function promises a typed outcome, so that
  * measurement arrives as one, not as a `RangeError` out of the fence.
  *
- * The mutex's other two health axes are not rechecked here: it was acquired for
- * this exact root one statement earlier, and ownership is verified where the
- * answer is consumed rather than where the handle is made — admission's
- * exclusivity-window condition, which is re-called before the M6 rename.
+ * Ownership is then re-asserted with the same `assertHealthyOwnedSyncMutex` the
+ * borrowed-mutex entry uses. The handle was minted one statement earlier, so
+ * this is redundant by construction — which is the point: it is the assertion
+ * that would have caught a handle that reported healthy while holding nothing.
  */
 export async function withStatePlaneLocks<T>(
   root: string,
@@ -351,10 +351,16 @@ export async function withStatePlaneLocks<T>(
       if (workspaceSyncMutexDegraded(mutex)) {
         return {
           held: false,
-          refusal: { code: "degraded-fence", detail: mutex.degraded?.reason ?? "identity-unavailable" },
+          refusal: {
+            code: "degraded-fence",
+            detail: mutex.degraded?.reason ?? mutex.lockFailure?.reason ?? "identity-unavailable",
+          },
         };
       }
-      const restart = await runLockAttempt(root, mutex, readInventory, fn, options);
+      const restart = await runLockAttempt(
+        root, mutex, readInventory, fn, options,
+        () => assertHealthyOwnedSyncMutex(mutex, root),
+      );
       if (!restart.restart) return { held: true, value: restart.value };
     } catch (error) {
       if (error instanceof InventoryRefused) return { held: false, refusal: error.refusal };

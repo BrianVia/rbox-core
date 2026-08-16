@@ -214,7 +214,13 @@ async function unavailableFreshMutex(
   return mode === "daemon" ? { status: "acquired", handle } : handle;
 }
 
-export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
+/** Does this handle fence nothing? True for BOTH unhealthy states: a handle
+ * holding no lock is the same fact to every consumer that guards state mutation
+ * with it. Only genesis admission needs the finer answer, and it reads
+ * `lockFailure` directly rather than through a second predicate, so no new
+ * unhealthy state can be minted that reports itself healthy here. */
+export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean =>
+  handle?.degraded !== undefined || handle?.lockFailure !== undefined;
 
 /**
  * Acquire the one workspace-wide sync mutex. CLI owners wait briefly and fail
@@ -288,13 +294,9 @@ async function acquireWorkspaceSyncMutexInternal(
       // Absence is the one state that may not fall through the legacy degraded
       // lane: it has no selected backend yet. Preserve the exact current cause
       // for genesis admission and leave disk/diagnostic state untouched.
-      const absent = await classifyStateFormat(statePath(root)).then(
-        (format) => format === "absent",
-        () => false,
-      );
-      if (absent) {
-        return unavailableFreshMutex(root, mode, result.reason, result.error, adoptAuthority);
-      }
+      // A classification failure keeps the legacy lane; only proven absence mints the handle.
+      const absent = await classifyStateFormat(statePath(root)).then((format) => format === "absent", () => false);
+      if (absent) return unavailableFreshMutex(root, mode, result.reason, result.error, adoptAuthority);
       const handle = await degradedHandle(root, options.onDegraded, result.error instanceof Error ? result.error.message : result.error ? String(result.error) : undefined);
       const fence = await inspectAdoptFence(root);
       if (adoptAuthority || fence.status === "active" || fence.status === "corrupt") {
@@ -308,10 +310,7 @@ async function acquireWorkspaceSyncMutexInternal(
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "error") {
-      const absent = await classifyStateFormat(statePath(root)).then(
-        (format) => format === "absent",
-        () => false,
-      );
+      const absent = await classifyStateFormat(statePath(root)).then((format) => format === "absent", () => false);
       if (absent) return unavailableFreshMutex(root, mode, "io", result.error, adoptAuthority);
       throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
     }

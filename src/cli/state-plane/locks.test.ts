@@ -183,6 +183,35 @@ test("a held state lock refuses the bundle rather than proceeding without it", a
 });
 
 /**
+ * The absent-state lock-failure handle is not a healthy fence.
+ *
+ * `acquireWorkspaceSyncMutex` mints a third handle shape for a workspace with no
+ * `state.json` whose lock cannot be published, so genesis admission can refuse
+ * with the exact cause instead of a generic message. That handle holds NOTHING.
+ * If it reported healthy, every consumer that gates state mutation on
+ * `workspaceSyncMutexDegraded` — including this bundle, which then hands the body
+ * a `HeldStatePlaneLocks` whose mutex is empty — would run unfenced. A reviewer
+ * probe measured exactly that: `held: true`, body executed.
+ */
+test("an absent-state workspace whose lock cannot be published refuses the bundle", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-locks-lock-failure-"));
+  await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+  expect(await classifyStateFormat(statePath(root))).toBe("absent");
+  let bodies = 0;
+  const outcome = await withStatePlaneLocks(root, async () => void (bodies += 1), {
+    mutex: {
+      lock: {
+        hooks: { link: async () => { throw Object.assign(new Error("injected storage fault"), { code: "EIO" }); } },
+      },
+    },
+  });
+  expect(bodies).toBe(0);
+  expect(outcome.held).toBeFalse();
+  if (outcome.held) throw new Error("expected a refusal");
+  expect(outcome.refusal).toEqual({ code: "degraded-fence", detail: "io" });
+});
+
+/**
  * Wave 5B replaces this test's former assertion.
  *
  * It used to pin the debt: post-`Q` the inventory read raised

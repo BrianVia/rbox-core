@@ -1,4 +1,5 @@
 import { mock } from "bun:test";
+import fs from "node:fs";
 
 const ROOT = "/tmp/rbox-daemon-folder-policy";
 const policy = {
@@ -10,7 +11,6 @@ const policy = {
 };
 let scenario = "admitted";
 let trace = [];
-let remoteCalls = 0;
 
 mock.module("../folder-authority.js", () => ({
   ensureFolderAuthority: async () => {
@@ -29,51 +29,53 @@ mock.module("../folder-inventory.js", () => ({
       ? { kind: "detached", reason: "run `rbox config add`" }
       : { kind: "admitted", generation: "catalog-1", policy };
   },
-  applyFolderPolicy: (cfg, next) => ({
-    ...cfg,
-    syncGit: next.syncGit,
-    git: { ...cfg.git, incremental: next.git.incremental },
-    respectGitignore: next.respectGitignore,
-    noDrift: next.noDrift,
-    trash: { ...next.trash },
-  }),
+  applyFolderPolicy: (cfg, next) => {
+    trace.push("apply");
+    return {
+      ...cfg,
+      syncGit: next.syncGit,
+      git: { ...cfg.git, incremental: next.git.incremental },
+      respectGitignore: next.respectGitignore,
+      noDrift: next.noDrift,
+      trash: { ...next.trash },
+    };
+  },
   folderPolicyFields: (next) => next,
   runtimeRefusal: (refusal) => new Error(`refused:${refusal.kind}:${refusal.reason}`),
 }));
 
-mock.module("../e2ee-client.js", () => ({
-  buildAuthedRemote: async () => {
-    remoteCalls++;
-    trace.push("remote");
-    return {
-      cfg: {
-        remoteWorkspaceId: "ws",
-        projectId: "root",
-        deviceId: "dev",
-        rootPath: ROOT,
-        remoteUrl: "https://credential.invalid",
-        token: "runtime-token",
-        encrypted: true,
-        kek: Buffer.alloc(32, 7),
-      },
-      deps: {},
-      remote: { fixture: true },
-    };
-  },
-}));
+fs.mkdirSync(ROOT, { recursive: true });
 
-const { buildAdmittedDaemonRuntime } = await import("./daemon.js");
-const admitted = await buildAdmittedDaemonRuntime(ROOT);
+const { RboxDaemon } = await import("./daemon.js");
+
+/** A daemon whose cfg carries the RUNTIME-ATTACHED fields `buildAuthedRemote`
+ * layered on before construction. Policy installation must overlay the folder
+ * settings onto them and preserve everything else. */
+function daemon() {
+  return new RboxDaemon(ROOT, {
+    remoteWorkspaceId: "ws",
+    projectId: "root",
+    deviceId: "dev",
+    rootPath: ROOT,
+    remoteUrl: "https://credential.invalid",
+    token: "runtime-token",
+    encrypted: true,
+    kek: Buffer.alloc(32, 7),
+  }, {}, { log: () => {} });
+}
+
+const admitted = daemon();
+await admitted.installInitialFolderPolicy();
 const admittedTrace = trace;
 
 scenario = "detached";
 trace = [];
-const detached = await buildAdmittedDaemonRuntime(ROOT).catch((error) => error.message);
+const detached = await daemon().installInitialFolderPolicy().catch((error) => error.message);
 const detachedTrace = trace;
 
 scenario = "damaged";
 trace = [];
-const damaged = await buildAdmittedDaemonRuntime(ROOT).catch((error) => error.message);
+const damaged = await daemon().installInitialFolderPolicy().catch((error) => error.message);
 
 process.stdout.write(JSON.stringify({
   admittedTrace,
@@ -81,7 +83,7 @@ process.stdout.write(JSON.stringify({
   damagedTrace: trace,
   detached,
   damaged,
-  remoteCalls,
+  matcherInstalled: admitted.matcher !== undefined,
   cfg: {
     syncGit: admitted.cfg.syncGit,
     incremental: admitted.cfg.git?.incremental,

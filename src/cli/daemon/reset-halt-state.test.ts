@@ -154,6 +154,14 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
   process.env.RBOX_DAEMON_WS_DISABLED = "1";
   process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = "1";
   process.env.RBOX_HOME = path.join(root, "runtime");
+  // The daemon never creates the folder catalog: an absent one on a bound root
+  // is a LOST one, and startup refuses rather than regenerating it.
+  await fs.mkdir(path.join(root, "runtime", ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, "runtime", ".rbox", "config.json"), JSON.stringify({
+    schemaVersion: 1,
+    globalOptions: { syncGit: false },
+    folders: [{ name: "Halt", path: root }],
+  }));
   const d = daemon();
   let watcherStarts = 0;
   let startupScans = 0;

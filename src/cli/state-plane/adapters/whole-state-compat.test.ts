@@ -733,7 +733,12 @@ test("an unretired genesis intent refuses the save before anything opens the dat
 
 test("each selected write fences exactly once and never through a static import", async () => {
   const source = fs.readFileSync(COMPAT, "utf8");
-  expect(source.split("assertAuthorityWritable(").length - 1).toBe(3);
+  // ONE fence call site, reached by all three held-lock writers. Design 266 fold
+  // R4 collapsed three inline copies into `fencedAuthorityUnderHeldLock`, which
+  // is strictly stronger than three: the writers can no longer drift apart on
+  // the order of fence, re-observation, and open.
+  expect(source.split("assertAuthorityWritable(").length - 1).toBe(1);
+  expect(source.split("await fencedAuthorityUnderHeldLock(root)").length - 1).toBe(3);
   expect(source).toContain('await import("../authority-bootstrap.js")');
   // Both read paths take a read-only handle; only the save path takes the
   // writer. 163 v13 is specifically about what a READ is allowed to do.

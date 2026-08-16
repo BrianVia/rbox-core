@@ -8,6 +8,14 @@ import { bootstrapRigAccount, connectRigDeviceB, teardownAccount } from "./pream
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
 
+/** The released binary this scenario proves the candidate against. Exported so
+ * the compatibility gate can assert the pin structurally instead of grepping
+ * this file's source text for a version-shaped string. */
+export const PINNED_RELEASED_VERSION = "1.11.4";
+/** The negative probes: released commands that must refuse a Q workspace. */
+export const RELEASED_NEGATIVE_PROBES = ["status", "sync", "doctor"] as const;
+const releasedVersionPattern = new RegExp(`(?:^|\\s)v?${PINNED_RELEASED_VERSION.replaceAll(".", "\\.")}(?:\\s|$)`);
+
 const LEGACY_ROOT = "/work/legacy-json";
 const MIXED_JSON_ROOT = "/work/mixed-legacy-json";
 const Q_ROOT = "/work/candidate-q";
@@ -48,7 +56,8 @@ export const dualBinaryState: Scenario = {
 
     try {
       await rec.step("reset isolated dual-binary roots", async () => {
-        const roots = [LEGACY_ROOT, MIXED_JSON_ROOT, Q_ROOT, ...(["status", "sync", "doctor"] as const).map((command) => `/work/old-negative-${command}`)];
+        const negatives = RELEASED_NEGATIVE_PROBES.map((command) => `/work/old-negative-${command}`);
+        const roots = [LEGACY_ROOT, MIXED_JSON_ROOT, Q_ROOT, ...negatives];
         await Promise.all([
           ctx.a.exec(["rm", "-rf", ...roots]),
           ctx.b.exec(["rm", "-rf", TAKEOVER_HOME, ...roots]),
@@ -59,8 +68,8 @@ export const dualBinaryState: Scenario = {
           ctx.a.rbox(["--version"]),
           ctx.b.rbox(["--version"]),
         ]);
-        rec.assert("A is released 1.11.4", /(?:^|\s)v?1\.11\.4(?:\s|$)/.test(oldVersion.stdout.trim()), oldVersion.stdout.trim());
-        rec.assert("candidate version differs from 1.11.4", !/(?:^|\s)v?1\.11\.4(?:\s|$)/.test(candidateVersion.stdout.trim()), candidateVersion.stdout.trim());
+        rec.assert(`A is released ${PINNED_RELEASED_VERSION}`, releasedVersionPattern.test(oldVersion.stdout.trim()), oldVersion.stdout.trim());
+        rec.assert(`candidate version differs from ${PINNED_RELEASED_VERSION}`, !releasedVersionPattern.test(candidateVersion.stdout.trim()), candidateVersion.stdout.trim());
       });
 
       await bootstrapRigAccount(ctx, rec);
@@ -104,7 +113,7 @@ export const dualBinaryState: Scenario = {
       });
 
       await rec.step("isolated 1.11.4 Q probes refuse without mutation", async () => {
-        for (const command of ["status", "sync", "doctor"] as const) {
+        for (const command of RELEASED_NEGATIVE_PROBES) {
           const snapshot = `/work/old-negative-${command}`;
           await copyTree(ctx.b, LEGACY_ROOT, ctx.a, snapshot);
           const before = await rboxTreeDigest(ctx.a, snapshot);

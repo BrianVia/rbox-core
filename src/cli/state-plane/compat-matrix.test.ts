@@ -17,7 +17,6 @@
  * NOT PROVABLE HERE — see `dual-binary rig` at the bottom.
  */
 import { expect, test } from "bun:test";
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -252,12 +251,18 @@ test("the `Q` predicate accepts only this version's marker, and a future one is 
  * name all three negative probes. The rig supplies the executable identities,
  * hashes, versions, real operations, and byte-equality assertions.
  */
-test("dual-binary rig is a registered 1.11.4 compatibility MUST", () => {
-  const scenario = fs.readFileSync(path.resolve(import.meta.dir, "../../../scripts/rig/scenarios/dual-binary-state.ts"), "utf8");
-  const registry = fs.readFileSync(path.resolve(import.meta.dir, "../../../scripts/rig/scenarios/index.ts"), "utf8");
-  expect(registry).toContain('\"dual-binary-state\": dualBinaryState');
-  expect(scenario).toContain("supportsDualBinary: true");
-  expect(scenario).toContain("1\\.11\\.4");
-  for (const command of ["status", "sync", "doctor"]) expect(scenario).toContain(`"${command}"`);
-  expect(scenario).toContain("leaves Q snapshot byte-identical");
+test("dual-binary rig is a registered 1.11.4 compatibility MUST", async () => {
+  // Structural, not textual: source text can carry every one of these strings in
+  // a comment while the scenario the runner actually loads has drifted. These are
+  // the values the rig runs on.
+  const [scenario, registry] = await Promise.all([
+    import("../../../scripts/rig/scenarios/dual-binary-state.js"),
+    import("../../../scripts/rig/scenarios/index.js"),
+  ]);
+  expect(scenario.PINNED_RELEASED_VERSION).toBe("1.11.4");
+  expect([...scenario.RELEASED_NEGATIVE_PROBES]).toEqual(["status", "sync", "doctor"]);
+  expect(scenario.dualBinaryState.supportsDualBinary).toBe(true);
+  expect(scenario.dualBinaryState.name).toBe("dual-binary-state");
+  // Registered under its own name, so `rig dual-binary-state` reaches this object.
+  expect(registry.getScenario("dual-binary-state")).toBe(scenario.dualBinaryState);
 });

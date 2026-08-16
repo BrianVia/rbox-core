@@ -83,8 +83,11 @@ describe("design 93 §6 workspace sync mutex", () => {
         },
       },
     });
-    expect(workspaceSyncMutexDegraded(cli)).toBeFalse();
+    // Unhealthy to everyone. The finer cause exists only for genesis admission;
+    // it may never make a handle holding no lock look usable to anyone else.
+    expect(workspaceSyncMutexDegraded(cli)).toBeTrue();
     expect(cli.lockFailure?.reason).toBe("hardlink-unsupported");
+    // Invocation-local: no health row, no legacy warning, nothing on disk.
     expect(surfaced).toEqual([]);
     expect(await readLockingHealth(root)).toEqual({ status: "ok" });
     await releaseWorkspaceSyncMutex(cli);

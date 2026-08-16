@@ -1,10 +1,26 @@
-/** Whole-state JSON/Q adapter. File-level selection precedes every lazy SQLite
- * import/open, so a refused authority is byte-identical afterwards. */
+/**
+ * The whole-state compatibility adapter — one selector between every whole-state
+ * caller and the two backends, keeping every caller signature and translating
+ * the store's raw `CasResult` into the `StateSaveResult` the JSON CAS has always
+ * returned. The store is reached through a DYNAMIC import: the CLI's eager
+ * static graph must stay free of `bun:sqlite` (`schema/inventory.test.ts`).
+ *
+ * NOTHING HERE OPENS A DATABASE IT HAS NOT PROVEN IT OWNS (163 v13). Selection
+ * and every refusal are decided from file-level facts — the marker's exact bytes
+ * and the SQLite header `store/open.ts` reads before connecting — so a workspace
+ * this adapter refuses is byte-identical afterwards, sidecars included.
+ */
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";
 import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
-import { repoRecordsForState, type StateSaveOptions, type StateSavePacket, type StateSaveResult, type SyncState } from "../../sync-state-model.js";
+import {
+  repoRecordsForState,
+  type StateSaveOptions,
+  type StateSavePacket,
+  type StateSaveResult,
+  type SyncState,
+} from "../../sync-state-model.js";
 import {
   StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";
@@ -15,11 +31,17 @@ import type { StateStoreHandle } from "../store/open.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
-import { applyLegacyJsonSavePacket, ensureJsonTelemetryId, loadLegacyJsonState, loadRawLegacyJsonState, saveStateUnsafeLegacyOrTest, stateLockBusyDetail } from "./legacy-json-store.js";
+import {
+  applyLegacyJsonSavePacket,
+  ensureJsonTelemetryId,
+  loadLegacyJsonState,
+  loadRawLegacyJsonState,
+  saveStateUnsafeLegacyOrTest,
+  stateLockBusyDetail,
+} from "./legacy-json-store.js";
 
 /** `.rbox/state.json` carries `Q`, and this is the database it names. */
 interface SqliteAuthority { authorityId: string; file: string }
-
 type StoreFacade = typeof import("../store-facade.js");
 
 const sqliteAuthority = (
@@ -40,10 +62,29 @@ async function selectAuthority(root: string, heldMutex?: WorkspaceSyncMutex) {
   return coordinator.requireSelected(await coordinator.admitGenesisAuthority(root, heldMutex));
 }
 
+/**
+ * Everything a writer must do after it takes `<state>.lock` and before it opens
+ * anything: clear the write fence, then re-read the marker UNDER the lock. The
+ * pre-lock selection only routed, and the authority may have flipped while this
+ * call waited. One function, so the three held-lock writers cannot drift.
+ */
+async function fencedAuthorityUnderHeldLock(root: string): Promise<SqliteAuthority> {
+  const [coordinator, fence] = await Promise.all([
+    import("../authority-bootstrap.js"),
+    import("../state-write-fence.js"),
+  ]);
+  fence.assertAuthorityWritable(root);
+  const selection = await coordinator.observeStateAuthority(root);
+  if (selection.kind !== "sqlite-store") {
+    throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
+  }
+  return sqliteAuthority(root, selection);
+}
+
 async function openAuthorityStore(authority: SqliteAuthority, readonly: boolean): Promise<{ store: StateStoreHandle; facade: StoreFacade }> {
   const facade = await import("../store-facade.js");
-  // Absent, foreign, malformed, or the wrong schema are all zero-write
-  // authority contradictions rather than backend-specific open failures.
+  // Absent, foreign, malformed, or wrong-schema are all zero-write authority
+  // contradictions rather than backend-specific open failures.
   const store = translateStoreOpenError(authority.file, () => facade.openStateStore(authority.file, { readonly }));
   if (store.header.authority_id !== authority.authorityId) {
     store.close();
@@ -73,8 +114,7 @@ export async function selectedStateForResetConsent(root: string): Promise<Pick<S
   const selection = await selectAuthority(root);
   // Absence is not a backend selection, but a standing legacy incarnation is
   // still protected reset/rebind evidence and must remain visible to consent.
-  if (selection.kind === "uninitialized") return loadRawLegacyJsonState(root);
-  if (selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
+  if (selection.kind === "uninitialized" || selection.kind === "legacy-json-store") return loadRawLegacyJsonState(root);
   const facade = await import("../store-facade.js");
   const file = sqliteResetPaths.active(root);
   const lineage = translateStoreOpenError(file, () => facade.readImmutableStoreLineage(file));
@@ -83,14 +123,11 @@ export async function selectedStateForResetConsent(root: string): Promise<Pick<S
   return lineage;
 }
 
-/**
- * Load the sync state (the reconcile base). Both backends recover a standing
+/** Load the sync state (the reconcile base). Both backends recover a standing
  * reset journal first, refuse a different stream with the same typed
  * `StreamMismatchError`, and carry the same reset-lineage provenance.
- *
  * `warningSink` is consumed by the JSON backend's own read path; the store has
- * no lenient decode to warn about.
- */
+ * no lenient decode to warn about. */
 export async function loadState(
   root: string,
   stream: string,
@@ -174,16 +211,7 @@ export async function ensureTelemetryBindingId(
   }
   try {
     if (!acquired.lock.isOwnerSync()) throw new Error("sync state telemetry lock ownership was lost");
-    const [coordinator, fence] = await Promise.all([
-      import("../authority-bootstrap.js"),
-      import("../state-write-fence.js"),
-    ]);
-    fence.assertAuthorityWritable(root);
-    const selection = await coordinator.observeStateAuthority(root);
-    if (selection.kind !== "sqlite-store") {
-      throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
-    }
-    const authority = sqliteAuthority(root, selection);
+    const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
       const bindingId = facade.ensureStoreTelemetryBindingId(
@@ -201,8 +229,7 @@ export async function ensureTelemetryBindingId(
   }
 }
 
-/** Apply one generation-CAS packet under `<state>.lock`. Rejection is
- * whole-packet on both backends. */
+/** Apply one generation-CAS packet under `<state>.lock`. Rejection is whole-packet on both backends. */
 export async function applyStateSavePacket(
   root: string,
   packet: StateSavePacket,
@@ -253,22 +280,7 @@ async function saveThroughStore(
   }
   try {
     if (!lock.isOwnerSync()) return { status: "busy", detail: "state lock ownership was lost" };
-    // The state-plane write fence, once per save, under the held state lock.
-    // Its small file-level module owns the one combined recovery predicate and
-    // cannot open SQLite or dispatch either protocol.
-    const [coordinator, fence] = await Promise.all([
-      import("../authority-bootstrap.js"),
-      import("../state-write-fence.js"),
-    ]);
-    fence.assertAuthorityWritable(root);
-    // Re-selected under the lock: the pre-lock selection only routed, and the
-    // authority may have flipped while this save waited for the lock. This is
-    // the SQLite analogue of the JSON path's pre-rename `assertStatePublishable`.
-    const selection = await coordinator.observeStateAuthority(root);
-    if (selection.kind !== "sqlite-store") {
-      throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
-    }
-    const authority = sqliteAuthority(root, selection);
+    const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
       return translateCasResult(await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)), store, facade);
@@ -283,6 +295,7 @@ async function saveThroughStore(
 /** Complete the already-authorized reset-lineage stream replacement through the
  * selected authority. JSON retains its historical whole-document projection;
  * SQLite changes the stream and applies the packet in one transaction. */
+
 export async function replaceResetLineageStream(
   root: string,
   authorizedSnapshot: SyncState,
@@ -315,13 +328,7 @@ export async function replaceResetLineageStream(
     if (!acquired.lock.isOwnerSync()) {
       throw new StateWriteRefusedError("state-lock-lease-lost", statePath(root));
     }
-    const [coordinator, fence] = await Promise.all([
-      import("../authority-bootstrap.js"),
-      import("../state-write-fence.js"),
-    ]);
-    fence.assertAuthorityWritable(root);
-    const selection = await coordinator.observeStateAuthority(root);
-    if (selection.kind !== "sqlite-store") throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
+    const authority = await fencedAuthorityUnderHeldLock(root);
     const inventory = await inventoryResetNamespace(root);
     let exactResetArchive = false;
     for (const archive of inventory.archives) {
@@ -334,7 +341,6 @@ export async function replaceResetLineageStream(
     if (!exactResetArchive) {
       throw new Error("sync state stream replacement lacks an exact SQLite reset archive");
     }
-    const authority = sqliteAuthority(root, selection);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
       // Authorized-replacement L4 contract: the tuple must be re-read after the
@@ -377,16 +383,11 @@ type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["r
 
 /**
  * Exhaustive by construction: a new `CasRejectionReason` fails to compile here
- * rather than reaching a caller as an unhandled reason, and `StateSaveResult`
- * is not widened to carry the store's finer vocabulary.
- *
- * Only five of these are reachable from a caller's packet. A-1 binds
- * `lineageId`, `stateRevision`, `baseGeneration`, and `localRevision` from the
- * live token rather than from the packet, so their rejections describe a store
- * that moved under the held state lock — a stale snapshot, which is what the
- * JSON vocabulary calls a nonce (identity) or global-sequence (base plane)
- * mismatch. Exported so every row — including the four a test cannot reach
- * through the CAS — is pinned rather than merely compiled.
+ * rather than reaching a caller unhandled, and `StateSaveResult` is not widened
+ * to carry the store's finer vocabulary. Only five rows are reachable from a
+ * caller's packet; the rest describe a store that moved under the held state
+ * lock, which the JSON vocabulary calls a nonce or global-sequence mismatch.
+ * Exported so the unreachable rows are pinned rather than merely compiled.
  */
 export const LEGACY_REJECTION_REASON = {
   lineage: "nonce", stream: "stream", nonce: "nonce",

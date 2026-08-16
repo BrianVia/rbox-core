@@ -65,6 +65,7 @@ const STATE_ORDER_OWNERS = new Map([
   ["src/cli/state-plane/adapters/whole-state-compat.ts", new Set([
     "applyStateSavePacket",
     "ensureTelemetryBindingId",
+    "fencedAuthorityUnderHeldLock",
     "loadRawState",
     "loadState",
     "replaceResetLineageStream",
@@ -95,6 +96,7 @@ const STATE_ORDER_CALLEES = new Set([
   "admitGenesisAuthority",
   "assertHealthyOwnedSyncMutex",
   "assertAuthorityWritable",
+  "fencedAuthorityUnderHeldLock",
   "markResetLineageProvenance",
   "openAuthorityStore",
   "recoverStandingResetJournal",

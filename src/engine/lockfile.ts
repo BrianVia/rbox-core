@@ -170,6 +170,11 @@ interface AtomicCreateResult {
   status: "created" | "exists" | "unsupported" | "error";
   reason?: Exclude<LockUnsupportedReason, "identity-unavailable">;
   error?: unknown;
+  /** The publication's own identity, read in the same breath as the link that
+   * made it visible. Every later decision about "is that marker still MINE"
+   * uses this tuple; marker BYTES cannot answer it, because a retry in this
+   * process republishes the identical bytes over a freed inode. */
+  observation?: MarkerRead;
 }
 
 interface ReapBlocker {
@@ -1225,7 +1230,8 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
     try {
       await hooks?.beforeLink?.(lockPath, raw);
       await (hooks?.link ?? fs.link)(tempPath, lockPath);
-      result = { status: "created" };
+      const published = await readMarkerNoFollow(lockPath).catch(() => undefined);
+      result = published?.raw === raw ? { status: "created", observation: published } : { status: "created" };
     } catch (error) {
       if (errno(error) === "EEXIST") result = { status: "exists" };
       else {
@@ -1248,15 +1254,25 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
     residues.add(tempPath);
     ownedTempResidues.set(lockPath, residues);
     // If the hardlink was published, remove only the exact marker this call
-    // wrote. The bounded temp name may remain for a later retry to clean; a
-    // visible lock must not remain as invented contention after this refusal.
+    // wrote — by the identity captured at publication, never by bytes, since
+    // this process republishes identical bytes on every retry. The bounded temp
+    // name may remain for a later retry to clean; a visible lock must not remain
+    // as invented contention after this refusal.
     if (result!.status === "created") {
+      let rolledBack = false;
       try {
-        if (await unlinkIfExact(lockPath, raw)) await fsyncDirectory(dir);
+        const published = result!.observation;
+        rolledBack = published !== undefined && await unlinkIfExact(lockPath, published);
+        if (rolledBack) await fsyncDirectory(dir);
       } catch {
         // The cleanup error remains the typed result. A changed successor is
         // deliberately never unlinked.
       }
+      // Both removals failed, so a marker this process owns is visible with no
+      // owner that will ever release it. Without this the next acquisition in
+      // this process reads it as a LIVE lock held by itself and waits forever.
+      // The ledger is the module's existing answer to exactly that state.
+      if (!rolledBack) staleOwnedMarkers.set(lockPath, raw);
     }
     return { status: "error", error };
   }
@@ -1274,7 +1290,7 @@ export async function publishLockMarker(
   const created = await atomicCreateMarker(lockPath, raw, hooks);
   if (created.status === "exists") return { status: "exists" };
   if (created.status !== "created") return { status: "error", error: created.error ?? new Error("lock marker publication failed") };
-  const finalized = await finalizeCreated(lockPath, raw, hooks);
+  const finalized = await finalizeCreated(lockPath, raw, hooks, created.observation);
   if (!finalized.ok) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
   return { status: "created", observation: finalized.observation };
 }
@@ -1348,12 +1364,16 @@ function blockerFor(inspection: Exclude<LockInspection, { kind: "absent" }>): Re
   return { inspection, kind: "foreign", reason: "foreign" };
 }
 
-async function finalizeCreated(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<{ ok: true; observation: MarkerObservation } | { ok: false; cleaned: boolean; error?: unknown }> {
-  let created: MarkerRead | undefined;
-  try {
-    created = await readMarkerNoFollow(lockPath);
-  } catch (error) {
-    return { ok: false, cleaned: false, error };
+async function finalizeCreated(
+  lockPath: string, raw: string, hooks?: LockfileHooks, published?: MarkerRead,
+): Promise<{ ok: true; observation: MarkerObservation } | { ok: false; cleaned: boolean; error?: unknown }> {
+  let created: MarkerRead | undefined = published;
+  if (created === undefined) {
+    try {
+      created = await readMarkerNoFollow(lockPath);
+    } catch (error) {
+      return { ok: false, cleaned: false, error };
+    }
   }
   if (!created || created.raw !== raw) {
     return { ok: false, cleaned: false, error: new Error("created lock changed before finalization") };
@@ -1391,7 +1411,7 @@ async function acquireFence(
     const raw = formatLockMarker(marker);
     const created = await atomicCreateMarker(fencePath, raw, hooks, markerMode);
     if (created.status === "created") {
-      const finalized = await finalizeCreated(fencePath, raw, hooks);
+      const finalized = await finalizeCreated(fencePath, raw, hooks, created.observation);
       if (finalized.ok) return { status: "acquired", lock: new OwnedLock(fencePath, marker, raw, finalized.observation, identity, hooks) };
       if (finalized.cleaned) return { status: "retry" };
       staleOwnedMarkers.set(fencePath, raw);
@@ -1543,7 +1563,7 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
   for (let attempt = 0; attempt < 3; attempt++) {
     const created = await atomicCreateMarker(lockPath, raw, options.hooks, options.markerMode);
     if (created.status === "created") {
-      const finalized = await finalizeCreated(lockPath, raw, options.hooks);
+      const finalized = await finalizeCreated(lockPath, raw, options.hooks, created.observation);
       if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, finalized.observation, identity, options.hooks) };
       if (finalized.cleaned) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
       staleOwnedMarkers.set(lockPath, raw);

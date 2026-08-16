@@ -148,45 +148,92 @@ export async function admitGenesisAuthority(
           refusal: admissionRefusal("state", error.outcome.reason, error.outcome.error),
         };
       }
+      // `error` and every other non-`unsupported` outcome: the acquisition
+      // failed for a reason the lock layer did not classify. "io" is what that
+      // is; naming it `link-capacity` would assert a diagnosis nobody made.
       return {
         kind: "refused",
-        refusal: admissionRefusal("state", "link-capacity", error.outcome.error),
+        refusal: admissionRefusal("state", "io", error.outcome.error),
       };
     }
     throw error;
   }
 }
 
-/** Doctor's advisory configured-root probe. It performs the same real
- * same-directory hardlink acquisitions but never admits genesis. */
-export async function probeGenesisLocking(root: string): Promise<GenesisAdmissionRefusal | undefined> {
-  const [{ acquireLock }, fs, path, paths] = await Promise.all([
+export interface GenesisLockingProbe {
+  /** Absent when every directory the probe could test published a lock. */
+  readonly refusal?: GenesisAdmissionRefusal;
+  /** What was tested, what was not, and why — empty only when the probe reached
+   * a refusal before observing anything. A directory that reported its probe
+   * lock held is named here rather than counted as a pass. */
+  readonly explanation: string;
+}
+
+/**
+ * Doctor's advisory configured-root probe: can this filesystem publish the
+ * hardlink locks genesis needs, in the directories genesis needs them?
+ *
+ * Doctor's §1.1 contract is ZERO mutation, so this creates no directory an
+ * uninitialized root does not already have — it tests the nearest EXISTING
+ * ancestor instead, and says which one. It also never touches a real lock path:
+ * a probe that took `sync.lock` would be a diagnostic that can block the very
+ * operation the operator runs next. The probe names are unique per invocation
+ * and belong to no protocol, so nothing else can be waiting on them.
+ */
+export async function probeGenesisLocking(root: string): Promise<GenesisLockingProbe> {
+  const [{ acquireLock }, fs, path] = await Promise.all([
     import("../../engine/lockfile.js"),
     import("node:fs/promises"),
     import("node:path"),
-    import("./paths.js"),
   ]);
-  const stateDir = path.join(root, ".rbox", "state");
-  await fs.mkdir(stateDir, { recursive: true });
-  const probes = [
-    { layer: "workspace" as const, file: path.join(stateDir, "sync.lock") },
-    { layer: "state" as const, file: paths.stateLockPath(root) },
+  const exists = async (dir: string): Promise<boolean> =>
+    fs.stat(dir).then((entry) => entry.isDirectory(), () => false);
+  const rboxDir = path.join(root, ".rbox");
+  const stateDir = path.join(rboxDir, "state");
+  // Each genesis lock lives in a different directory, so each is its own answer:
+  // `.rbox/state.json.lock` beside the authority, `.rbox/state/sync.lock` in the
+  // state directory a fresh root may not have yet.
+  const layers = [
+    { layer: "state" as const, dir: rboxDir },
+    { layer: "workspace" as const, dir: stateDir },
   ];
-  for (const probe of probes) {
-    const acquired = await acquireLock(probe.file);
-    if (acquired.status === "held") continue;
+  const tested: string[] = [];
+  const skipped: string[] = [];
+  for (const { layer, dir } of layers) {
+    if (!await exists(dir)) {
+      skipped.push(`${path.relative(root, dir) || "."} does not exist yet, so its locking is untested`);
+      continue;
+    }
+    const file = path.join(dir, `.rbox-locking-probe.${process.pid}.${hex32()}.lock`);
+    const acquired = await acquireLock(file);
     if (acquired.status === "unsupported") {
-      return admissionRefusal(probe.layer, acquired.reason, acquired.error);
+      return {
+        refusal: admissionRefusal(layer, acquired.reason, acquired.error),
+        explanation: probeStory(tested, skipped),
+      };
     }
     if (acquired.status === "error") {
-      return { reason: "lock-io", layer: probe.layer, error: acquired.error };
+      return { refusal: { reason: "lock-io", layer, error: acquired.error }, explanation: probeStory(tested, skipped) };
+    }
+    if (acquired.status === "held") {
+      // A unique name nobody else knows cannot be legitimately contended, so
+      // this is an anomaly rather than a refusal — but it is not a pass either,
+      // and the operator is told rather than shown a clean bill of health.
+      skipped.push(`${path.relative(root, dir) || "."} reported its probe lock already held; its locking is untested`);
+      continue;
     }
     const released = await acquired.lock.release();
     if (!released.released || !released.durable) {
-      return admissionRefusal(probe.layer, "io", released.error);
+      return { refusal: admissionRefusal(layer, "io", released.error), explanation: probeStory(tested, skipped) };
     }
+    tested.push(path.relative(root, dir) || ".");
   }
-  return undefined;
+  return { explanation: probeStory(tested, skipped) };
+}
+
+function probeStory(tested: readonly string[], skipped: readonly string[]): string {
+  const parts = tested.length > 0 ? [`locking works in ${tested.join(" and ")}`] : [];
+  return [...parts, ...skipped].join("; ");
 }
 
 /** Fresh ids for a fresh attempt. Genesis calls this at most once and never on

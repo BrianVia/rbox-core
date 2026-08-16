@@ -181,8 +181,25 @@ that current doctor invocation directly re-observes `lock-indeterminate` or
 
 | Refusal | `ok` | `label` | `status` | `message` | `hint` | `finding` |
 |---|---|---|---|---|---|---|
-| `lock-indeterminate` | `false` | `locking` | `state-genesis/lock-indeterminate` | the exact problem above | omitted | the same central id, `blocked` severity, problem, and safety copy |
-| `lock-io` | `false` | `locking` | `state-genesis/lock-io` | the exact problem above | omitted | the same central id, `blocked` severity, problem, and safety copy |
+| `lock-indeterminate` | `false` | `locking` | `state-genesis/lock-indeterminate` | the exact problem above | the probe's own explanation, omitted when empty | the same central id, `blocked` severity, problem, and safety copy |
+| `lock-io` | `false` | `locking` | `state-genesis/lock-io` | the exact problem above | the probe's own explanation, omitted when empty | the same central id, `blocked` severity, problem, and safety copy |
+| `lock-unsupported` | `false` | `locking` | `state-genesis/lock-unsupported` | the exact problem above | the probe's own explanation, omitted when empty | the same central id, `blocked` severity, problem, and safety copy |
+| `lock-identity-unavailable` | `false` | `locking` | `state-genesis/lock-identity-unavailable` | the exact problem above | the probe's own explanation, omitted when empty | the same central id, `blocked` severity, problem, and safety copy |
+
+**Amendment (fold R4).** All four rows are authorized, not two. The probe
+performs real acquisitions, so `hardlink-unsupported` and `identity-unavailable`
+are outcomes it can directly observe; enumerating only two left the other two
+renderable by the same code path with no design row behind them. Every row still
+requires the CURRENT invocation's own probe to observe it.
+
+**Amendment (fold R4).** The probe's zero-mutation contract is explicit about
+directories and names. It creates nothing: it tests the nearest EXISTING
+directory (`.rbox`, then `.rbox/state` when present) and skips the rest with an
+explanation rather than creating it, and it acquires only unique probe-scoped
+names — never `sync.lock` or `state.json.lock`, which are real protocol locks a
+diagnostic must not be able to take. `held` on a name nobody else knows is an
+anomaly, not a pass: it is named in the returned explanation instead of being
+counted as proven-working locking.
 
 The row has no invented durable evidence and no self-referential doctor command;
 the human finding omits `command` because doctor cannot know which front-door
@@ -455,6 +472,21 @@ event law; C0–C9 cross-entry restarts converge; adoption never mutates before 
 directory/tar export uses private held-lock Q and publishes no `.rbox`; and JSON
 upgrade performs zero state-plane call/read/mutation/output.
 
+**Amendment (fold R4) — catalog regeneration after remote create.** Add the row:
+a front door that reaches the folder catalog on a root whose catalog is absent
+must be differentiated against the pre-flip oracle, because the reorder changed
+what an absent catalog MEANS. Pre-flip, folder authority ran before any remote or
+binding effect, so an absent catalog with existing bindings always refused and
+nothing had yet been written. Post-flip it runs after `saveConfig` + fsync +
+admission, so the same absence is now reachable with this operation's own binding
+already on disk.
+
+The consequence, and the row's assertion: regeneration is admitted ONLY where the
+inventory is exactly the root this operation just bound. Every other reader —
+above all the daemon — still refuses, and a re-track, a rebind init, and a daemon
+start on a lost-catalog root must all produce the pre-flip refusal. The reorder
+buys refusal-before-publication; it must not buy silent regeneration.
+
 ## 6. Test and suite dispositions
 
 All existing SP-1, SP-2a, and SP-2b ledgers remain MUST. No case disappears
@@ -547,6 +579,24 @@ candidate.
   observation evaluates no SQLite/genesis/lock chunk (doctor's explicit
   configured-root advisory probe is the named exception); and
 - CODEMAP updates changed ownership without deleting the retired module line.
+
+**Amendment (fold R4) — `admittedFirstBinding` as a named requirement.**
+
+| Field | Value |
+|---|---|
+| Requirement | `ensureFolderAuthority` accepts a first-binding capability that lets an absent folder catalog be initialized from a one-row inventory naming exactly the admitted root |
+| Why it exists | The flip moved folder authority AFTER `saveConfig` + fsync + admission, so a front door that crashes between binding and catalog now leaves a bound root with no catalog. Only the operation that CREATED that binding can regenerate without loss |
+| Owner | `folder-authority.ts`; `folder-catalog-generate.ts` owns the narrowed initializer |
+| Admitted call sites | `adopt-cmd.ts` (`!current`), `init-cmd.ts` (`!prev`), `track-cmd.ts` (this invocation created the binding). Each is scoped to a proof that the binding did not pre-exist |
+| Forbidden call sites | The daemon, in both `reloadWorkspaceConfigIfChanged` and `installInitialFolderPolicy`. The daemon never creates a binding, so an absent catalog there is a LOST catalog and the protected refusal stands |
+| Deletion condition | SP-4, once front-door catalog publication is atomic with the binding write; the flag goes away with the crash window it exists for |
+
+The daemon ruling is the protected behavior: regeneration cannot reconstruct
+local labels, ordering, global defaults, inheritance choices, overrides not
+reflected by current binding policy, or unbound and missing entries. A host with
+a lost catalog and a sole binding must refuse and be repaired, never silently
+regenerate. Gate: a lost-catalog + existing-binding root refuses through both the
+daemon and the re-track path.
 
 ### 7.2 Current size and performance anchors
 

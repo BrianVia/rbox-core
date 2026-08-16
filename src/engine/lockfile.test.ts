@@ -537,6 +537,52 @@ describe("atomic lock construction and ownership", () => {
     expect(await fs.readdir(root)).toEqual([]);
   });
 
+  /**
+   * The temp removal AND the rollback both fail, which strands a marker this
+   * process published and can no longer release.
+   *
+   * The rollback is defeated the only way it can be: a same-bytes successor on a
+   * fresh inode. Marker bytes carry a random token, so the sole producer of
+   * identical bytes is a retry of this very acquisition — which is exactly the
+   * marker a byte-only comparison would delete out from under its new owner.
+   * With the successor preserved, the visible marker is one nobody will release,
+   * and it is the in-process ledger that has to know this process owns it.
+   */
+  test("a stranded publication is reclaimed rather than left as permanent contention", async () => {
+    const stranding = (root: string, lockPath: string, raw: string) => ({
+      identity: identity(),
+      token: () => "b".repeat(32),
+      hooks: {
+        unlinkTemp: async () => {
+          await fs.unlink(lockPath);
+          await fs.writeFile(lockPath, raw);
+          throw Object.assign(new Error("cleanup failed"), { code: "EIO" });
+        },
+      },
+    });
+    const raw = formatLockMarker(marker({ token: "b".repeat(32) }));
+
+    const root = await tempDir();
+    const lockPath = path.join(root, "stranded.lock");
+    expect((await acquireLock(lockPath, stranding(root, lockPath, raw))).status).toBe("error");
+    // The successor survived: rollback compares publication identity, not bytes.
+    expect(await fs.readFile(lockPath, "utf8")).toBe(raw);
+
+    // Pre-fix this returned `held` forever: a live marker owned by a caller that
+    // had already given up, with nothing left to release it.
+    const reclaimed = await acquireLock(lockPath, { identity: identity() });
+    expect(reclaimed.status).toBe("acquired");
+    if (reclaimed.status === "acquired") await reclaimed.lock.release();
+
+    const otherRoot = await tempDir();
+    const otherPath = path.join(otherRoot, "stranded.lock");
+    expect((await acquireLock(otherPath, stranding(otherRoot, otherPath, raw))).status).toBe("error");
+    // A new acquirer that observes the publisher gone must not invent contention.
+    const afterDeath = await acquireLock(otherPath, { identity: identity({ 700: { status: "dead" } }) });
+    expect(afterDeath.status).toBe("acquired");
+    if (afterDeath.status === "acquired") await afterDeath.lock.release();
+  });
+
   test("create verification failure cleans up only the exact marker", async () => {
     const root = await tempDir();
     const lockPath = path.join(root, "verify.lock");

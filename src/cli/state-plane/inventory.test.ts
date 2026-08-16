@@ -106,9 +106,15 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // The SQLite save boundary: the lock, then the ONE write fence, then the
   // selection re-read under that lock, and only then a database open.
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectAuthority"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "observeStateAuthority", "openAuthorityStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "observeStateAuthority", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "assertAuthorityWritable", "observeStateAuthority", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
+  // Design 266 fold R4: the fence + under-lock re-observation the three held-lock
+  // writers each performed inline now has ONE owner, enumerated below. Each
+  // writer delegates its recognition to it, the same discipline
+  // `loadLegacyJsonState` uses for `loadRawLegacyJsonState`, so the ordered
+  // chain is still proved end to end — with one hop instead of three copies.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "fencedAuthorityUnderHeldLock", kind: "write", sites: 0, guards: ["assertAuthorityWritable", "observeStateAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "fencedAuthorityUnderHeldLock", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "fencedAuthorityUnderHeldLock", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "fencedAuthorityUnderHeldLock", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureJsonTelemetryId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 

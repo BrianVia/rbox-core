@@ -833,7 +833,11 @@ export class RboxDaemon {
     this.log(`io priority: ${lowerIoPriority()}`);
 
     // Pull fallback is account-scoped and intentionally starts outside/before
-    // the workspace mutex. A slow sync startup cannot delay key release.
+    // the workspace mutex. A slow sync startup cannot delay key release, and
+    // design 189 pins that: the flight must complete while startup is still
+    // blocked on a contended mutex. It therefore cannot be sequenced behind
+    // admission — and it does not need to be, because it touches no workspace
+    // state a refused daemon would have to un-touch.
     this.keyDeliveryFlight?.enqueue();
 
     // Fresh-state admission precedes every activity/binding sidecar. A direct
@@ -2860,10 +2864,11 @@ export class RboxDaemon {
           return;
         }
       }
-      // Admission has already selected Q/JSON at every operation boundary. If a
-      // first-binding crash predated the catalog, this is the downstream repair
-      // point; it must never run before fresh genesis.
-      const state = await ensureFolderAuthority({ currentRoot: this.root, admittedFirstBinding: true });
+      // The daemon never created this binding, so a missing catalog here is a
+      // LOST catalog, not an un-published one. Regenerating it would discard
+      // labels, ordering, and overrides that regeneration cannot reconstruct, so
+      // ordinary authority activation refuses and the operator repairs.
+      const state = await ensureFolderAuthority({ currentRoot: this.root });
       const admission = await observeFolderAdmission(this.root, state);
       if (admission.kind !== "admitted") {
         this.setFolderAdmissionHalt(runtimeRefusal(admission).message);
@@ -2913,7 +2918,7 @@ export class RboxDaemon {
    * authority. Contended startup defers the same work to the operation boundary
    * that performs admission under the scheduler-owned mutex. */
   private async installInitialFolderPolicy(): Promise<void> {
-    const state = await ensureFolderAuthority({ currentRoot: this.root, admittedFirstBinding: true });
+    const state = await ensureFolderAuthority({ currentRoot: this.root });
     const admission = await observeFolderAdmission(this.root, state);
     if (admission.kind !== "admitted") throw runtimeRefusal(admission);
     this.cfg = applyFolderPolicy(this.cfg, admission.policy);
@@ -3042,27 +3047,6 @@ export function createDaemonShutdownHandler(deps: {
 }
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
-export async function buildDaemonRuntime(
-  root: string,
-  warningSink?: (line: string) => void,
-): Promise<Awaited<ReturnType<typeof buildAuthedRemote>>> {
-  return buildAuthedRemote(root, Date.now, warningSink);
-}
-
-/** Test/embedding compatibility seam for the established-authority folder
- * policy contract. Production startup uses `buildDaemonRuntime` and installs
- * policy only after genesis admission in `start()` above. */
-export async function buildAdmittedDaemonRuntime(
-  root: string,
-  warningSink?: (line: string) => void,
-): Promise<Awaited<ReturnType<typeof buildAuthedRemote>>> {
-  const state = await ensureFolderAuthority({ currentRoot: root });
-  const admission = await observeFolderAdmission(root, state);
-  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
-  const { cfg, deps, remote } = await buildDaemonRuntime(root, warningSink);
-  return { cfg: applyFolderPolicy(cfg, admission.policy), deps, remote };
-}
-
 export async function runDaemon(root: string): Promise<void> {
   const logger = new RotatingDaemonLogger(root, () => new Date(), fsSync);
   const bootId = logger.bootId;
@@ -3077,7 +3061,7 @@ export async function runDaemon(root: string): Promise<void> {
     finish,
   });
   try {
-    const { cfg, deps } = await buildDaemonRuntime(root, logger.log); // E2EE transport + injected KEK
+    const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
       // Transport only — `refreshScopeAuthority` is what actually decides, and can

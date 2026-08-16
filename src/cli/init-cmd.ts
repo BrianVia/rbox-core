@@ -504,8 +504,8 @@ async function executeInitPlan(
     }
     requireSelected(genesisAdmission);
 
-    // Lock refusal precedes catalog, journal, and source mutation.
-    const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root, admittedFirstBinding: true });
+    // 266 §7.1 authority-before-binding; !prev because init also rebinds.
+    const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root, admittedFirstBinding: !prev });
     const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(plan.root));
     if (opts.adoption) {
       if (plan.workspace.kind !== "join" || plan.firstSync !== "sync") throw new Error("invalid adoption execution route");
