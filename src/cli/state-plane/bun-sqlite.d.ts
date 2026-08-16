@@ -22,5 +22,11 @@ declare module "bun:sqlite" {
     prepare(sql: string): Statement;
     transaction<Args extends unknown[], Result>(callback: (...args: Args) => Result): (...args: Args) => Result;
     close(throwOnError?: boolean): void;
+    fileControl(op: number, value?: number | Uint8Array): number;
+    fileControl(zDbName: string, op: number, value?: number | Uint8Array): number;
   }
+
+  export const constants: {
+    readonly SQLITE_FCNTL_PERSIST_WAL: number;
+  };
 }
