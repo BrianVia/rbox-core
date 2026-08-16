@@ -12,13 +12,14 @@ import { expect, test } from "bun:test";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import type { JsonValue } from "../../../json.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
-import type { GitHeldAttempt, RepoRecordInput } from "../../sync-state-model.js";
+import type { DeltaBinding, DeltaOp, GitHeldAttempt, RepoRecordInput } from "../../sync-state-model.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { REPO_RECORD_KEYS } from "../codecs/repo-record.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
 import { canonicalJson, domainHash } from "./codecs.js";
 import { RepoTransitionDigestBuilder, type SourceStageBinding } from "./repo-transition-v1.js";
 import { StageDigestBuilder, STAGE_GIT_ROLES, type StageCounts } from "./stage-semantic-v1.js";
+import { StageDeltaDigestBuilder, type DeltaCounts } from "./stage-delta-v1.js";
 
 const STAGE_ID = "1".repeat(32);
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
@@ -432,4 +433,74 @@ test("repo-transition-v1 moves for every binding, evidence, row, and snapshot di
     }],
   ]);
   assertAllDistinct(base, new Map([...variants].map(([name, shape]) => [name, transitionDigest(shape)])));
+});
+
+/* ------------------------------------------------------------ delta grammar */
+
+interface DeltaShape {
+  stageId: string;
+  plane: "base" | "local";
+  header: ManifestHeader;
+  binding: DeltaBinding;
+  ops: DeltaOp[];
+  counts?: DeltaCounts;
+}
+
+const DELTA_BASE: DeltaShape = {
+  stageId: STAGE_ID,
+  plane: "base",
+  header: HEADER,
+  binding: { nonce: "e".repeat(32), stateRevision: 7 },
+  ops: [
+    { kind: "upsert", entry: ENTRIES[0]! },
+    { kind: "delete", path: "b/gone" },
+    { kind: "upsert", entry: ENTRIES[2]! },
+  ],
+};
+
+function deltaDigest(shape: DeltaShape): string {
+  const builder = new StageDeltaDigestBuilder(shape.stageId, shape.plane, shape.header, shape.binding);
+  let upserts = 0;
+  let deletes = 0;
+  for (const op of shape.ops) {
+    if (op.kind === "upsert") {
+      builder.upsert(op.entry.path, encodeFileEntry(op.entry).canonical);
+      upserts++;
+    } else {
+      builder.delete(op.path);
+      deletes++;
+    }
+  }
+  return builder.seal(shape.counts ?? { upserts, deletes, resultFiles: 4 });
+}
+
+test("stage-delta-v1 base construction is pinned", () => {
+  expect(deltaDigest(DELTA_BASE)).toBe("4f2cd5e55d94ee17695df746c334a65c3bb99578c12df4a954cd0f30ca296cba");
+});
+
+test("stage-delta-v1 moves for every dimension it frames", () => {
+  const base = deltaDigest(DELTA_BASE);
+  const [first, second, third] = DELTA_BASE.ops as [DeltaOp, DeltaOp, DeltaOp];
+  const variants = new Map<string, DeltaShape>([
+    ["stage id", { ...DELTA_BASE, stageId: "2".repeat(32) }],
+    ["plane", { ...DELTA_BASE, plane: "local" }],
+    ["header generatedAt", { ...DELTA_BASE, header: { ...HEADER, generatedAt: "2026-07-28T10:00:01.000Z" } }],
+    ["header complete", { ...DELTA_BASE, header: { ...HEADER, complete: false } }],
+    ["binding nonce", { ...DELTA_BASE, binding: { nonce: "f".repeat(32), stateRevision: 7 } }],
+    ["binding stateRevision", { ...DELTA_BASE, binding: { nonce: "e".repeat(32), stateRevision: 8 } }],
+    ["op order", { ...DELTA_BASE, ops: [second, first, third] }],
+    ["op count", { ...DELTA_BASE, ops: [first, second] }],
+    ["op kind", { ...DELTA_BASE, ops: [first, { kind: "upsert", entry: ENTRIES[1]! }, third] }],
+    ["delete path", { ...DELTA_BASE, ops: [first, { kind: "delete", path: "b/other" }, third] }],
+    ["upsert value", { ...DELTA_BASE, ops: [{ kind: "upsert", entry: { ...ENTRIES[0]!, size: 99 } }, second, third] }],
+    ["resultFiles", { ...DELTA_BASE, counts: { upserts: 2, deletes: 1, resultFiles: 5 } }],
+  ]);
+  assertAllDistinct(base, new Map([...variants].map(([name, shape]) => [name, deltaDigest(shape)])));
+});
+
+test("stage-delta-v1 refuses counts that disagree with what it framed", () => {
+  expect(() => deltaDigest({ ...DELTA_BASE, counts: { upserts: 1, deletes: 1, resultFiles: 4 } }))
+    .toThrow("do not match expected");
+  expect(() => deltaDigest({ ...DELTA_BASE, counts: { upserts: 2, deletes: 1, resultFiles: -1 } }))
+    .toThrow("nonnegative");
 });
