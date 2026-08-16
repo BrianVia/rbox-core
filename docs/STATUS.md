@@ -2,6 +2,14 @@
 
 ## 2026-08-16 — SP-3 CLOSE-OUT: fleet soak CLEAN on da28ddc
 
+- Post-cutover propagation bench (5 rounds, 602-byte change, desktop→Mac,
+  da28ddc): publish→applied median ~11.7s; Mac pull wall 18.3–18.7s for a
+  1-blob 0-wire change; desktop zero-change push ~7s. Receiver alone exceeds
+  the ≤10s yardstick — evidence on GH #748 (P1, whole-state save) and #749
+  (P2, 50s mutex-acquire stall, no holder attribution). Delta-scoped apply
+  (task #17) is the lever. JSON-era differential NOT run (round-6 records are
+  the baseline if wanted).
+
 - Darwin trilogy fixed + field-validated (#745 PERSIST_WAL, #746 sealed
   DELETE-mode, #747 containment keeps private names — Apple's system SQLite
   cannot read unlinked databases, probe matrix in PR). Soak: desktop + Mac
