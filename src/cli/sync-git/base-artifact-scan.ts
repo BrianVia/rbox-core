@@ -1,8 +1,10 @@
 import { gitRaw } from "../../engine/git-spawn.js";
+import { hashBytes } from "../../engine/hash.js";
 import {
   BASE_ABSENT_PREFIX,
   BASE_PRESENT_KEEP_PREFIX,
   BASE_PRESENT_PREFIX,
+  SETTLED_ABSENCE_PREFIX,
   basePresentKeepRef,
   inspectBaseAbsentArtifactRef,
   inspectBasePresentArtifactRef,
@@ -12,6 +14,7 @@ import {
   type BaseAbsentPayload,
   type BasePresentPayload,
 } from "./base-artifacts.js";
+import { P_REPAIR_Q_PREFIX } from "./p-repair.js";
 import type { ArtifactBinding } from "./repo-lineage.js";
 
 export interface BaseArtifactScan {
@@ -37,6 +40,25 @@ type ArtifactNamespaceClassification =
 
 async function listRefs(repoDir: string, prefix: string): Promise<string[]> {
   return (await gitRaw(repoDir, ["for-each-ref", "--format=%(refname)", prefix])).split("\n").filter(Boolean);
+}
+
+/** Every rbox-owned base/recovery artifact namespace, in one place. */
+export const ARTIFACT_PLANE_PREFIXES: readonly string[] = [
+  BASE_ABSENT_PREFIX,
+  BASE_PRESENT_PREFIX,
+  BASE_PRESENT_KEEP_PREFIX,
+  SETTLED_ABSENCE_PREFIX,
+  P_REPAIR_Q_PREFIX,
+];
+
+/** Exact refname+oid identity of the artifact plane the BASE composer reads.
+ * gitFingerprint excludes these refs by construction (they are non-syncable),
+ * so held-skip binds them here instead of widening the fingerprint. */
+export async function readArtifactPlaneDigest(repoDir: string): Promise<string> {
+  const lines = (await gitRaw(repoDir, [
+    "for-each-ref", "--format=%(refname) %(objectname)", ...ARTIFACT_PLANE_PREFIXES,
+  ])).split("\n").filter(Boolean).sort();
+  return hashBytes(Buffer.from(lines.join("\n")));
 }
 
 /** Strictly classify every A/P/K ref in the shared common-dir namespace. Foreign

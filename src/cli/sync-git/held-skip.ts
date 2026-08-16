@@ -15,8 +15,9 @@ import {
   type SyncState,
   type TypedBlocker,
 } from "../config.js";
+import { readArtifactPlaneDigest } from "./base-artifact-scan.js";
 import { carryRepoBaseProof, recordOriginLineage } from "./base-composer.js";
-import type { ComposeRepoBaseResult, RepoBaseLockedProof } from "./base-composer.js";
+import { gitHeldSkipComposerEnabled, sortedTypedBlockers } from "./held-blockers.js";
 import {
   GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS,
   GIT_FINGERPRINT_VERSION,
@@ -30,95 +31,6 @@ const HELD_SKIP_SAFETY_FLOOR_MS = 60 * 60 * 1000;
 
 export const gitHeldSkipEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.RBOX_GIT_HELD_SKIP !== "0";
-
-export const gitOwnershipHeldSkipEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  env.RBOX_GIT_OWNERSHIP_HELD_SKIP !== "0";
-
-export const gitOwnershipNoEscalateEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  env.RBOX_GIT_OWNERSHIP_NO_ESCALATE !== "0";
-
-export function sortedTypedBlockers(blockers: readonly TypedBlocker[]): TypedBlocker[] {
-  const byKey = new Map<string, TypedBlocker>();
-  for (const blocker of blockers) byKey.set(canonicalString(blocker), blocker);
-  return [...byKey.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, blocker]) => ({ ...blocker }));
-}
-
-export function heldBlockersAllowSkip(
-  blockers: readonly TypedBlocker[],
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return blockers.length > 0 && blockers.every((blocker) =>
-    blocker.reason === "local-commits"
-      || blocker.reason === "local-stash"
-      || blocker.reason === "local-index"
-      || blocker.reason === "local-operation"
-      || blocker.reason === "deletion-pending"
-      || (blocker.reason === "worktree-ownership" && gitOwnershipHeldSkipEnabled(env)));
-}
-
-export function ownershipBlockersArePerRefOnly(blockers: readonly TypedBlocker[]): boolean {
-  return blockers.length > 0 && blockers.every((blocker) =>
-    blocker.provenance === "ref-plane" && blocker.reason === "worktree-ownership");
-}
-
-/**
- * Convert a pending BASE-composer disposition into durable typed blockers while
- * dropping only the synthetic blockers caused by the same allowlisted ref holds.
- * The mapping is deliberately provenance/ref based: human text is never authority.
- */
-export function blockersAfterComposer(input: {
-  classification: readonly TypedBlocker[];
-  disposition: ComposeRepoBaseResult["disposition"];
-  holds: readonly ComposeRepoBaseResult["holds"][number][];
-  checkoutComplete: RepoBaseLockedProof["checkoutComplete"];
-}): TypedBlocker[] {
-  const classification = sortedTypedBlockers(input.classification);
-  if (input.disposition !== "pending") return classification;
-
-  // Causal normalization is independent of rollout eligibility. In particular,
-  // disabling ownership held-skip must not reintroduce whole-repo escalation.
-  const causallyClassifiable = classification.length > 0 && classification.every((blocker) =>
-    blocker.reason === "local-commits"
-      || blocker.reason === "local-stash"
-      || blocker.reason === "local-index"
-      || blocker.reason === "deletion-pending"
-      || blocker.reason === "worktree-ownership");
-  const causallyMapped = (hold: ComposeRepoBaseResult["holds"][number]): boolean =>
-    classification.some((blocker) => blocker.provenance === "ref-plane"
-      && blocker.ref === hold.ref
-      && ((blocker.reason === "local-commits" && hold.code === "missing-branch-proof")
-        || (blocker.reason === "deletion-pending" && hold.code === "missing-branch-proof")
-        || (blocker.reason === "local-stash" && hold.code === "missing-safe-ref-proof")
-        || (blocker.reason === "worktree-ownership" && hold.code === "missing-branch-proof")));
-  const unmatchedHolds = causallyClassifiable && input.checkoutComplete
-    ? input.holds.filter((hold) => !causallyMapped(hold))
-    : [...input.holds];
-  const composer: TypedBlocker[] = unmatchedHolds.map((hold) => ({
-    provenance: "composer",
-    reason: "artifact",
-    ref: hold.ref,
-    code: hold.code,
-    detail: `BASE composer hold ${hold.code} at ${hold.ref}`,
-  }));
-  if (!input.checkoutComplete) {
-    composer.push({
-      provenance: "composer",
-      reason: "artifact",
-      code: "checkout-incomplete",
-      detail: "BASE composer checkout proof is incomplete",
-    });
-  }
-  // A pending disposition with no concrete hold and no incomplete-checkout
-  // evidence must remain non-vacuously blocking rather than gaining eligibility.
-  if (composer.length === 0 && classification.length === 0) {
-    composer.push({
-      provenance: "composer",
-      reason: "artifact",
-      detail: "BASE composer retained an unexplained pending disposition",
-    });
-  }
-  return sortedTypedBlockers([...classification, ...composer]);
-}
 
 export interface HeldInputObservation {
   incomingKey: string;
@@ -135,6 +47,8 @@ export interface HeldInputObservation {
   stateNonce: string;
   baseOriginsHash: string;
   partialDisposition: string;
+  /** Present only while RBOX_GIT_HELD_SKIP_COMPOSER is on (design 270). */
+  artifactPlaneDigest?: string;
 }
 
 export interface ObserveHeldInputsOptions {
@@ -181,6 +95,12 @@ export function heldClassifierInputKey(incoming: GitSection): string {
   return gitIncomingKey({ ...incoming, bundleSha: "", packChain: undefined });
 }
 
+/** The one canonicalization of a repo's partial apply, shared by the observation
+ * bracket and the early gate so both compare identical bytes. */
+export function heldPartialDisposition(incoming: GitSection, partial: GitPartialApply | undefined): string {
+  return canonicalString(partial ? { ...partial, incomingKey: heldClassifierInputKey(incoming) } : null);
+}
+
 export async function readWorktreeRegistryDigest(repoDir: string): Promise<string | undefined> {
   const worktrees = await listWorktrees(repoDir);
   if (worktrees.length === 0) return undefined;
@@ -223,9 +143,10 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       opts.boundOrigins ?? opts.record?.branchBaseOrigins ?? null,
     ])));
     const incomingKey = heldClassifierInputKey(opts.incoming);
-    const partialDisposition = canonicalString(opts.partial
-      ? { ...opts.partial, incomingKey }
-      : null);
+    const partialDisposition = heldPartialDisposition(opts.incoming, opts.partial);
+    const artifactPlaneDigest = gitHeldSkipComposerEnabled()
+      ? await readArtifactPlaneDigest(ctx.repoDir)
+      : undefined;
     const after = await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath, { includeIndexDependencies: true });
     const worktreeRegistryDigest = await readWorktreeRegistryDigest(ctx.repoDir);
     if (!after.dependenciesComplete || before.hash !== after.hash || before.diskCtx?.kind !== after.diskCtx?.kind
@@ -233,7 +154,7 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       || before.diskCtx?.commonDir !== after.diskCtx?.commonDir
       || !worktreeRegistryDigest
       || worktreeRegistryBefore !== worktreeRegistryDigest) return undefined;
-    return {
+    const observation: HeldInputObservation = {
       incomingKey,
       classifierInputKey: incomingKey,
       effectiveBaseIndexProjection: opts.effectiveBaseIndexProjection,
@@ -249,6 +170,8 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       baseOriginsHash,
       partialDisposition,
     };
+    if (artifactPlaneDigest !== undefined) observation.artifactPlaneDigest = artifactPlaneDigest;
+    return observation;
   } catch {
     return undefined;
   }
@@ -311,6 +234,8 @@ export async function earlyHeldAttemptDecision(input: {
   relPath: string;
   incoming: GitSection;
   attempt: GitHeldAttempt;
+  /** The durable partial as it stood before this pull's frame. */
+  partial?: GitPartialApply;
   nowMs?: number;
 }): Promise<EarlyHeldAttemptDecision> {
   const nowMs = input.nowMs ?? Date.now();
@@ -323,10 +248,22 @@ export async function earlyHeldAttemptDecision(input: {
   if (heldClassifierInputKey(input.incoming) !== input.attempt.classifierInputKey) {
     return { matches: false, reason: "classifier-key" };
   }
+  // Unflagged: the early gate runs before the attempt shredder, so a pRepaired
+  // or checkout-progress write is otherwise invisible to it (design 270 §2.4).
+  if (heldPartialDisposition(input.incoming, input.partial) !== input.attempt.partialDisposition) {
+    return { matches: false, reason: "partial-disposition" };
+  }
   try {
     const before = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
     );
+    if (gitHeldSkipComposerEnabled()) {
+      const repoDir = before.diskCtx?.repoDir;
+      if (!repoDir) return { matches: false, reason: "artifact-plane-unavailable" };
+      if (await readArtifactPlaneDigest(repoDir) !== input.attempt.artifactPlaneDigest) {
+        return { matches: false, reason: "artifact-plane" };
+      }
+    }
     const after = await gitFingerprint(
       gitFingerprintRun("per-decision"), input.root, input.relPath, { includeIndexDependencies: true },
     );
@@ -349,10 +286,6 @@ export function createHeldAttempt(
 ): GitHeldAttempt {
   const { maxFingerprintTimestampMs: _max, ...inputs } = observation;
   return { ...inputs, blockers: sortedTypedBlockers(blockers), at };
-}
-
-export function sameHeldOutcome(a: readonly TypedBlocker[], b: readonly TypedBlocker[]): boolean {
-  return canonicalString(sortedTypedBlockers(a)) === canonicalString(sortedTypedBlockers(b));
 }
 
 /** Rebind completed held attempts after all correctness-required P/K settlements.

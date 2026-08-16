@@ -9,7 +9,7 @@ import {
   type RepoBaseValue,
 } from "./base-composer.js";
 import { firstReason, type FollowProgress } from "./follow.js";
-import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, ownershipBlockersArePerRefOnly } from "./held-skip.js";
+import { blockersAfterComposer, gitOwnershipNoEscalateEnabled, ownershipBlockersArePerRefOnly } from "./held-blockers.js";
 
 /**
  * The exact repository and wire section a follow transition is bound to. The

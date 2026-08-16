@@ -5,19 +5,21 @@ import type { GitDeferral, GitHeldAttempt, GitPartialApply, RepoRecord, TypedBlo
 import type { GitApplyRepoResult } from "./apply-metrics.js";
 import type { GitFingerprint } from "./fingerprint.js";
 import {
-  createHeldAttempt,
-  earlyHeldAttemptDecision,
-  gitHeldSkipEnabled,
   gitOwnershipNoEscalateEnabled,
-  heldAttemptFloorElapsed,
-  heldAttemptMatches,
-  heldAttemptMismatchField,
   heldBlockersAllowSkip,
-  incomingIndexArtifactDescriptor,
-  observeHeldInputs,
   ownershipBlockersArePerRefOnly,
   sameHeldOutcome,
   sortedTypedBlockers,
+} from "./held-blockers.js";
+import {
+  createHeldAttempt,
+  earlyHeldAttemptDecision,
+  gitHeldSkipEnabled,
+  heldAttemptFloorElapsed,
+  heldAttemptMatches,
+  heldAttemptMismatchField,
+  incomingIndexArtifactDescriptor,
+  observeHeldInputs,
   type ObserveHeldInputsOptions,
 } from "./held-skip.js";
 
@@ -90,7 +92,11 @@ export interface HeldClassificationInput {
 
 export interface HeldRepoDecision {
   /** Layer A: the cheap pre-frame skip, before any per-repo probe or lock work. */
-  earlySkip(input: { pending: boolean; attempt: GitHeldAttempt | undefined }): Promise<boolean>;
+  earlySkip(input: {
+    pending: boolean;
+    attempt: GitHeldAttempt | undefined;
+    partial: GitPartialApply | undefined;
+  }): Promise<boolean>;
   /** Layer B: the authoritative check, after the follower branch protocol settled. */
   steadySkip(input: HeldSteadyInput): Promise<boolean>;
   /** Store the attempt a completed classification proved. */
@@ -173,7 +179,8 @@ export function createHeldDecisionPlane(env: HeldDecisionEnv): HeldDecisionPlane
           const priorAttempt = input.pending && incoming ? input.attempt : undefined;
           const decision = gitHeldSkipEnabled() && priorAttempt
             ? await addTimedMs(timings, "heldInputMs", () => earlyHeldAttemptDecision({
-                root: env.root, relPath, incoming: incoming!, attempt: priorAttempt, nowMs: env.now?.(),
+                root: env.root, relPath, incoming: incoming!, attempt: priorAttempt,
+                partial: input.partial, nowMs: env.now?.(),
               }))
             : { matches: false, reason: priorAttempt ? "disabled" : "no-attempt" };
           if (trace) trace.earlyReason = decision.reason;
@@ -288,7 +295,9 @@ export function createHeldDecisionPlane(env: HeldDecisionEnv): HeldDecisionPlane
         emitTrace({ result, wallMs }) {
           if (!trace || !timings) return;
           const deferral = env.deferrals.standingApply(relPath);
-          if (trace.blocker === "none" && result === "deferred" && deferral) trace.blocker = `apply/${deferral.reason}`;
+          // Composer-held repos report `applied`, so gating on `deferred` blinded
+          // the diagnostic on exactly the population it explains (design 270 §1.2).
+          if (trace.blocker === "none" && deferral) trace.blocker = `apply/${deferral.reason}`;
           const namedMs = timings.fetchDecryptMs + timings.bundleVerifyMs + timings.gitImportMs
             + timings.classifyMs + timings.standingProofMs;
           env.log(`git-sync held-trace repo=${JSON.stringify(relPath)} storedAttempt=${trace.storedAttempt ? 1 : 0} earlySkip=${trace.earlySkip ? 1 : 0} matchConsulted=${trace.matchConsulted ? 1 : 0} mismatch=${trace.mismatch} earlyReason=${trace.earlyReason} blocker=${trace.blocker} fetchDecryptMs=${Math.round(timings.fetchDecryptMs)} verifyMs=${Math.round(timings.bundleVerifyMs)} importMs=${Math.round(timings.gitImportMs)} classifyMs=${Math.round(timings.classifyMs)} supersessionProofMs=${Math.round(timings.standingProofMs)} otherMs=${Math.round(Math.max(0, wallMs - namedMs))} allMs=${wallMs}`);

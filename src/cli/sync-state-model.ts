@@ -247,6 +247,8 @@ export interface GitHeldAttempt {
   stateNonce: string;
   baseOriginsHash: string;
   partialDisposition: string;
+  /** Fingerprint-excluded rbox artifact refs; absent while design 270's flag is off. */
+  artifactPlaneDigest?: string;
   at: string;
 }
 
