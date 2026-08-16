@@ -77,14 +77,15 @@ test("a source without branch authority keeps prior BASE and marks the exact can
   expect(packet.repos[0]?.newRecord.pending).toEqual(candidate);
 });
 
-test("true genesis is durably fenced before Git mutation while an existing legacy baseline is not upgraded", async () => {
+test("unadmitted genesis refuses capable-lineage mutation while an existing legacy baseline is not upgraded", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-lineage-genesis-"));
   const legacyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-lineage-legacy-"));
   try {
     const genesis: SyncState = { stream: "stream", lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } };
-    const capable = await ensureCapableStateLineage(root, genesis);
-    expect(capable.stateNonce).toMatch(/^[0-9a-f]{32}$/);
-    expect((await loadRawState(root))?.stateNonce).toBe(capable.stateNonce);
+    await expect(ensureCapableStateLineage(root, genesis)).rejects.toMatchObject({
+      reason: "authority-uninitialized",
+    });
+    expect(await loadRawState(root)).toBeUndefined();
 
     const legacy: SyncState = { stream: "stream", lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "old", files: [] } };
     await saveStateUnsafeLegacyOrTest(legacyRoot, legacy);

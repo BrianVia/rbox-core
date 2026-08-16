@@ -269,6 +269,7 @@ function stateFinding(root: string, check: DoctorChecks["state"]): TriageFinding
 
 function lockingFinding(root: string, check: DoctorChecks["locking"]): TriageFinding | undefined {
   if (check.ok) return undefined;
+  if (check.finding) return check.finding;
   if (check.status === "starved") {
     return {
       id: "sync-lock-contention",

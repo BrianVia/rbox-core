@@ -45,6 +45,42 @@ test("a corrupt binding registry blocks silent initialization instead of publish
   expect(await catalogAbsent()).toBe(true);
 });
 
+/**
+ * The refusal the daemon depends on.
+ *
+ * A host whose catalog was lost still has its bindings, so the inventory is not
+ * empty and regeneration would "succeed" — publishing a catalog stripped of
+ * labels, ordering, global defaults, inheritance, and overrides that nothing can
+ * reconstruct. The daemon never created the binding it is running, so it has no
+ * standing to make that call; it asks for ordinary authority and refuses.
+ */
+test("a lost catalog on a root the caller did not just bind refuses instead of regenerating", async () => {
+  const root = path.join(home, "bound-folder");
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_bound",
+    projectId: "root",
+    deviceId: "dev_1",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+    syncGit: true,
+  }));
+  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
+  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
+    schemaVersion: 1,
+    entries: [{
+      root,
+      workspaceId: "ws_bound",
+      boundAt: "2026-08-11T00:00:00.000Z",
+      lastSeenAt: "2026-08-11T00:00:00.000Z",
+    }],
+  }));
+
+  await expect(ensureFolderAuthority({ currentRoot: root })).rejects.toThrow(/regenerate/);
+  expect(await catalogAbsent()).toBe(true);
+});
+
 test("a dangling desired row with no binding refuses silent initialization toward regenerate", async () => {
   const ghostRoot = path.join(home, "ghost-folder");
   const desiredDir = path.join(rboxDir(), "daemons", "ghost-abcd1234");

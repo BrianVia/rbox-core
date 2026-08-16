@@ -610,30 +610,12 @@ exports[`design 130 reset crash/recovery matrix legacy initiation normalization 
   },
 }
 `;
+
 exports[`P E7b JSON no-state eligibility remains neutral with none: E0 E7b pre-port byte differential none 1`] = `
 {
   "after": {
-    ".rbox/": "state.json:f,state:d",
-    ".rbox/state.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMCwKICAibGFzdFN5bmNlZFNlcXVlbmNlIjogMCwKICAibGFzdFN5bmNlZE1hbmlmZXN0IjogewogICAgImdlbmVyYXRlZEF0IjogIiIsCiAgICAiZmlsZXMiOiBbXQogIH0sCiAgInJlcG9SZWNvcmRzIjoge30KfQ==",
-      "bytes": 220,
-      "sha256": "88de302f35bcd71472f1ff531355bb347c1a07d541fc04c4ac1de15c2a971fa5",
-    },
-    ".rbox/state/": "last-writer.json:f,reserve-1mib.bin:f,state-incarnation.json:f",
-    ".rbox/state/last-writer.json": {
-      "bodyBase64": "eyJ2ZXJzaW9uIjoxLCJ3cml0ZXJWZXJzaW9uIjoiPHZvbGF0aWxlOndyaXRlclZlcnNpb24+Iiwid3JpdHRlbkF0TXMiOiI8dm9sYXRpbGU6d3JpdHRlbkF0TXM+Iiwic3RhdGVCb2R5U2hhMjU2IjoiODhkZTMwMmYzNWJjZDcxNDcyZjFmZjUzMTM1NWJiMzQ3YzFhMDdkNTQxZmMwNGM0YWMxZGUxNWMyYTk3MWZhNSIsInN0YXRlU2l6ZUJ5dGVzIjoyMjAsInN0YXRlTXRpbWVNcyI6Ijx2b2xhdGlsZTpzdGF0ZU10aW1lTXM+Iiwic3RhdGVEZXYiOiI8dm9sYXRpbGU6c3RhdGVEZXY+Iiwic3RhdGVJbm8iOiI8dm9sYXRpbGU6c3RhdGVJbm8+In0=",
-      "bytes": 308,
-      "sha256": "f7e33848ca67a75b63da06948794077c044116800e83182573a7f5616b46264e",
-    },
-    ".rbox/state/reserve-1mib.bin": {
-      "bytes": 1048576,
-      "sha256": "95cf2901bd1fb57435cd437bd4d73e7a29e8ada79a3d6deb02c9bd8136fa18cc",
-    },
-    ".rbox/state/state-incarnation.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMAp9",
-      "bytes": 102,
-      "sha256": "8515b1fd6f59da3f75ed05279e054a3d89f7594eacfdda44c02ae4231c93f550",
-    },
+    ".rbox/": "state:d",
+    ".rbox/state/": "",
   },
   "before": {
     ".rbox/": "",
@@ -646,27 +628,8 @@ exports[`P E7b JSON no-state eligibility remains neutral with none: E0 E7b pre-p
 exports[`P E7b JSON no-state eligibility remains neutral with unselected-db: E0 E7b pre-port byte differential unselected-db 1`] = `
 {
   "after": {
-    ".rbox/": "state.json:f,state:d",
-    ".rbox/state.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMCwKICAibGFzdFN5bmNlZFNlcXVlbmNlIjogMCwKICAibGFzdFN5bmNlZE1hbmlmZXN0IjogewogICAgImdlbmVyYXRlZEF0IjogIiIsCiAgICAiZmlsZXMiOiBbXQogIH0sCiAgInJlcG9SZWNvcmRzIjoge30KfQ==",
-      "bytes": 220,
-      "sha256": "88de302f35bcd71472f1ff531355bb347c1a07d541fc04c4ac1de15c2a971fa5",
-    },
-    ".rbox/state/": "last-writer.json:f,reserve-1mib.bin:f,state-incarnation.json:f,state.db:f",
-    ".rbox/state/last-writer.json": {
-      "bodyBase64": "eyJ2ZXJzaW9uIjoxLCJ3cml0ZXJWZXJzaW9uIjoiPHZvbGF0aWxlOndyaXRlclZlcnNpb24+Iiwid3JpdHRlbkF0TXMiOiI8dm9sYXRpbGU6d3JpdHRlbkF0TXM+Iiwic3RhdGVCb2R5U2hhMjU2IjoiODhkZTMwMmYzNWJjZDcxNDcyZjFmZjUzMTM1NWJiMzQ3YzFhMDdkNTQxZmMwNGM0YWMxZGUxNWMyYTk3MWZhNSIsInN0YXRlU2l6ZUJ5dGVzIjoyMjAsInN0YXRlTXRpbWVNcyI6Ijx2b2xhdGlsZTpzdGF0ZU10aW1lTXM+Iiwic3RhdGVEZXYiOiI8dm9sYXRpbGU6c3RhdGVEZXY+Iiwic3RhdGVJbm8iOiI8dm9sYXRpbGU6c3RhdGVJbm8+In0=",
-      "bytes": 308,
-      "sha256": "f7e33848ca67a75b63da06948794077c044116800e83182573a7f5616b46264e",
-    },
-    ".rbox/state/reserve-1mib.bin": {
-      "bytes": 1048576,
-      "sha256": "95cf2901bd1fb57435cd437bd4d73e7a29e8ada79a3d6deb02c9bd8136fa18cc",
-    },
-    ".rbox/state/state-incarnation.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMAp9",
-      "bytes": 102,
-      "sha256": "8515b1fd6f59da3f75ed05279e054a3d89f7594eacfdda44c02ae4231c93f550",
-    },
+    ".rbox/": "state:d",
+    ".rbox/state/": "state.db:f",
     ".rbox/state/state.db": {
       "bodyBase64": "cmVzaWR1ZTp1bnNlbGVjdGVkLWRiCg==",
       "bytes": 22,
@@ -690,32 +653,13 @@ exports[`P E7b JSON no-state eligibility remains neutral with unselected-db: E0 
 exports[`P E7b JSON no-state eligibility remains neutral with orphan-candidate: E0 E7b pre-port byte differential orphan-candidate 1`] = `
 {
   "after": {
-    ".rbox/": "state.json:f,state:d",
-    ".rbox/state.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMCwKICAibGFzdFN5bmNlZFNlcXVlbmNlIjogMCwKICAibGFzdFN5bmNlZE1hbmlmZXN0IjogewogICAgImdlbmVyYXRlZEF0IjogIiIsCiAgICAiZmlsZXMiOiBbXQogIH0sCiAgInJlcG9SZWNvcmRzIjoge30KfQ==",
-      "bytes": 220,
-      "sha256": "88de302f35bcd71472f1ff531355bb347c1a07d541fc04c4ac1de15c2a971fa5",
-    },
-    ".rbox/state/": "last-writer.json:f,reserve-1mib.bin:f,reset-candidates:d,state-incarnation.json:f",
-    ".rbox/state/last-writer.json": {
-      "bodyBase64": "eyJ2ZXJzaW9uIjoxLCJ3cml0ZXJWZXJzaW9uIjoiPHZvbGF0aWxlOndyaXRlclZlcnNpb24+Iiwid3JpdHRlbkF0TXMiOiI8dm9sYXRpbGU6d3JpdHRlbkF0TXM+Iiwic3RhdGVCb2R5U2hhMjU2IjoiODhkZTMwMmYzNWJjZDcxNDcyZjFmZjUzMTM1NWJiMzQ3YzFhMDdkNTQxZmMwNGM0YWMxZGUxNWMyYTk3MWZhNSIsInN0YXRlU2l6ZUJ5dGVzIjoyMjAsInN0YXRlTXRpbWVNcyI6Ijx2b2xhdGlsZTpzdGF0ZU10aW1lTXM+Iiwic3RhdGVEZXYiOiI8dm9sYXRpbGU6c3RhdGVEZXY+Iiwic3RhdGVJbm8iOiI8dm9sYXRpbGU6c3RhdGVJbm8+In0=",
-      "bytes": 308,
-      "sha256": "f7e33848ca67a75b63da06948794077c044116800e83182573a7f5616b46264e",
-    },
-    ".rbox/state/reserve-1mib.bin": {
-      "bytes": 1048576,
-      "sha256": "95cf2901bd1fb57435cd437bd4d73e7a29e8ada79a3d6deb02c9bd8136fa18cc",
-    },
+    ".rbox/": "state:d",
+    ".rbox/state/": "reset-candidates:d",
     ".rbox/state/reset-candidates/": "33333333333333333333333333333333.db:f",
     ".rbox/state/reset-candidates/33333333333333333333333333333333.db": {
       "bodyBase64": "cmVzaWR1ZTpvcnBoYW4tY2FuZGlkYXRlCg==",
       "bytes": 25,
       "sha256": "3bc4f78ab041bdd9a206b5b4bca1c3ae1e4ba25c78f27ced47dfc37159289adf",
-    },
-    ".rbox/state/state-incarnation.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMAp9",
-      "bytes": 102,
-      "sha256": "8515b1fd6f59da3f75ed05279e054a3d89f7594eacfdda44c02ae4231c93f550",
     },
   },
   "before": {
@@ -736,33 +680,14 @@ exports[`P E7b JSON no-state eligibility remains neutral with orphan-candidate: 
 exports[`P E7b JSON no-state eligibility remains neutral with orphan-archive: E0 E7b pre-port byte differential orphan-archive 1`] = `
 {
   "after": {
-    ".rbox/": "state.json:f,state:d",
-    ".rbox/state.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMCwKICAibGFzdFN5bmNlZFNlcXVlbmNlIjogMCwKICAibGFzdFN5bmNlZE1hbmlmZXN0IjogewogICAgImdlbmVyYXRlZEF0IjogIiIsCiAgICAiZmlsZXMiOiBbXQogIH0sCiAgInJlcG9SZWNvcmRzIjoge30KfQ==",
-      "bytes": 220,
-      "sha256": "88de302f35bcd71472f1ff531355bb347c1a07d541fc04c4ac1de15c2a971fa5",
-    },
-    ".rbox/state/": "last-writer.json:f,lineages:d,reserve-1mib.bin:f,state-incarnation.json:f",
-    ".rbox/state/last-writer.json": {
-      "bodyBase64": "eyJ2ZXJzaW9uIjoxLCJ3cml0ZXJWZXJzaW9uIjoiPHZvbGF0aWxlOndyaXRlclZlcnNpb24+Iiwid3JpdHRlbkF0TXMiOiI8dm9sYXRpbGU6d3JpdHRlbkF0TXM+Iiwic3RhdGVCb2R5U2hhMjU2IjoiODhkZTMwMmYzNWJjZDcxNDcyZjFmZjUzMTM1NWJiMzQ3YzFhMDdkNTQxZmMwNGM0YWMxZGUxNWMyYTk3MWZhNSIsInN0YXRlU2l6ZUJ5dGVzIjoyMjAsInN0YXRlTXRpbWVNcyI6Ijx2b2xhdGlsZTpzdGF0ZU10aW1lTXM+Iiwic3RhdGVEZXYiOiI8dm9sYXRpbGU6c3RhdGVEZXY+Iiwic3RhdGVJbm8iOiI8dm9sYXRpbGU6c3RhdGVJbm8+In0=",
-      "bytes": 308,
-      "sha256": "f7e33848ca67a75b63da06948794077c044116800e83182573a7f5616b46264e",
-    },
+    ".rbox/": "state:d",
+    ".rbox/state/": "lineages:d",
     ".rbox/state/lineages/": "44444444444444444444444444444444:d",
     ".rbox/state/lineages/44444444444444444444444444444444/": "5555555555555555555555555555555555555555555555555555555555555555.db:f",
     ".rbox/state/lineages/44444444444444444444444444444444/5555555555555555555555555555555555555555555555555555555555555555.db": {
       "bodyBase64": "cmVzaWR1ZTpvcnBoYW4tYXJjaGl2ZQo=",
       "bytes": 23,
       "sha256": "99256a3249b16c1b59defa10f6da16d6ebdecb5a2eb230f7ed7cd7e1a8984fe6",
-    },
-    ".rbox/state/reserve-1mib.bin": {
-      "bytes": 1048576,
-      "sha256": "95cf2901bd1fb57435cd437bd4d73e7a29e8ada79a3d6deb02c9bd8136fa18cc",
-    },
-    ".rbox/state/state-incarnation.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMAp9",
-      "bytes": 102,
-      "sha256": "8515b1fd6f59da3f75ed05279e054a3d89f7594eacfdda44c02ae4231c93f550",
     },
   },
   "before": {
@@ -784,32 +709,13 @@ exports[`P E7b JSON no-state eligibility remains neutral with orphan-archive: E0
 exports[`P E7b JSON no-state eligibility remains neutral with inert-temp: E0 E7b pre-port byte differential inert-temp 1`] = `
 {
   "after": {
-    ".rbox/": "state.json:f,state:d",
-    ".rbox/state.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMCwKICAibGFzdFN5bmNlZFNlcXVlbmNlIjogMCwKICAibGFzdFN5bmNlZE1hbmlmZXN0IjogewogICAgImdlbmVyYXRlZEF0IjogIiIsCiAgICAiZmlsZXMiOiBbXQogIH0sCiAgInJlcG9SZWNvcmRzIjoge30KfQ==",
-      "bytes": 220,
-      "sha256": "88de302f35bcd71472f1ff531355bb347c1a07d541fc04c4ac1de15c2a971fa5",
-    },
-    ".rbox/state/": "last-writer.json:f,reserve-1mib.bin:f,reset-candidates:d,state-incarnation.json:f",
-    ".rbox/state/last-writer.json": {
-      "bodyBase64": "eyJ2ZXJzaW9uIjoxLCJ3cml0ZXJWZXJzaW9uIjoiPHZvbGF0aWxlOndyaXRlclZlcnNpb24+Iiwid3JpdHRlbkF0TXMiOiI8dm9sYXRpbGU6d3JpdHRlbkF0TXM+Iiwic3RhdGVCb2R5U2hhMjU2IjoiODhkZTMwMmYzNWJjZDcxNDcyZjFmZjUzMTM1NWJiMzQ3YzFhMDdkNTQxZmMwNGM0YWMxZGUxNWMyYTk3MWZhNSIsInN0YXRlU2l6ZUJ5dGVzIjoyMjAsInN0YXRlTXRpbWVNcyI6Ijx2b2xhdGlsZTpzdGF0ZU10aW1lTXM+Iiwic3RhdGVEZXYiOiI8dm9sYXRpbGU6c3RhdGVEZXY+Iiwic3RhdGVJbm8iOiI8dm9sYXRpbGU6c3RhdGVJbm8+In0=",
-      "bytes": 308,
-      "sha256": "f7e33848ca67a75b63da06948794077c044116800e83182573a7f5616b46264e",
-    },
-    ".rbox/state/reserve-1mib.bin": {
-      "bytes": 1048576,
-      "sha256": "95cf2901bd1fb57435cd437bd4d73e7a29e8ada79a3d6deb02c9bd8136fa18cc",
-    },
+    ".rbox/": "state:d",
+    ".rbox/state/": "reset-candidates:d",
     ".rbox/state/reset-candidates/": ".rbox-tmp-1-1-inert.db:f",
     ".rbox/state/reset-candidates/.rbox-tmp-1-1-inert.db": {
       "bodyBase64": "cmVzaWR1ZTppbmVydC10ZW1wCg==",
       "bytes": 19,
       "sha256": "c49ea0fbaf7167ab0140d7b8116ea01559ff1e92892f63a93f05985eb7d2c108",
-    },
-    ".rbox/state/state-incarnation.json": {
-      "bodyBase64": "ewogICJzdHJlYW0iOiAibmV3LXN0cmVhbSIsCiAgInN0YXRlTm9uY2UiOiAiNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYiLAogICJzdGF0ZVJldmlzaW9uIjogMAp9",
-      "bytes": 102,
-      "sha256": "8515b1fd6f59da3f75ed05279e054a3d89f7594eacfdda44c02ae4231c93f550",
     },
   },
   "before": {

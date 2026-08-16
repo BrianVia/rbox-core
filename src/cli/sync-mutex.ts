@@ -1,11 +1,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/lockfile.js";
+import {
+  acquireLock,
+  type AcquireLockOptions,
+  type LockUnsupportedReason,
+  type OwnedLock,
+} from "../engine/lockfile.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { resolveDaemonLogSources } from "./daemon-control.js";
 import { inspectAdoptFence } from "./adopt-journal.js";
+import { classifyStateFormat } from "./state-plane/authority-marker.js";
+import { statePath } from "./state-plane/paths.js";
 
 export type SyncMutexMode = "cli" | "daemon";
+type WorkspaceLockFailureReason = LockUnsupportedReason | "io";
 
 export interface WorkspaceSyncMutex {
   readonly root: string;
@@ -15,6 +23,10 @@ export interface WorkspaceSyncMutex {
    * the real underlying error (identity resolution, ledger I/O, or link failure)
    * so surfaces can show WHY instead of a generic filesystem message. */
   readonly degraded?: { reason: string; detail?: string };
+  /** Invocation-local cause retained only when an absent workspace cannot mint
+   * its real mutex. Unlike `degraded`, this writes no health row and emits no
+   * legacy warning; genesis admission turns it into an ephemeral refusal. */
+  readonly lockFailure?: { reason: WorkspaceLockFailureReason; error?: unknown };
   /** Exact on-disk lock marker used to bind adoption continuation/recovery. */
   readonly incarnation: string;
   /** Set before release is attempted so a stale handle can never be replayed. */
@@ -133,12 +145,13 @@ export async function readLockingHealth(root: string): Promise<LockingHealth> {
 }
 
 function daemonContention(result: Extract<Awaited<ReturnType<typeof acquireLock>>, { status: "held" }>): Extract<DaemonMutexResult, { status: "contended" }> {
-  return {
+  const contention: Extract<DaemonMutexResult, { status: "contended" }> = {
     status: "contended",
     holderKey: result.holderKey,
     blockerKind: result.blockerKind,
-    ...(result.warningReason ? { warningReason: result.warningReason } : {}),
   };
+  if (result.warningReason) contention.warningReason = result.warningReason;
+  return contention;
 }
 
 async function degradedHandle(root: string, onDegraded?: (message: string) => void, detail?: string): Promise<WorkspaceSyncMutex> {
@@ -152,10 +165,62 @@ async function degradedHandle(root: string, onDegraded?: (message: string) => vo
       // Surfacing is advisory; the entire point of this bucket is never-fatal sync.
     }
   }
-  return { root, degraded: { reason: "identity-unavailable", ...(detail ? { detail } : {}) }, incarnation: "degraded", released: false };
+  const degraded: NonNullable<WorkspaceSyncMutex["degraded"]> = detail ? { reason: "identity-unavailable", detail } : { reason: "identity-unavailable" };
+  return { root, degraded, incarnation: "degraded", released: false };
 }
 
-export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
+function lockFailureHandle(
+  root: string,
+  reason: WorkspaceLockFailureReason,
+  error: NonNullable<WorkspaceSyncMutex["lockFailure"]>["error"],
+  adoptAuthority?: { kind: "resume" | "abort" | "clean"; journalId: string },
+): WorkspaceSyncMutex {
+  const lockFailure: NonNullable<WorkspaceSyncMutex["lockFailure"]> = error === undefined ? { reason } : { reason, error };
+  const handle: WorkspaceSyncMutex = {
+    root,
+    lockFailure,
+    incarnation: "lock-unavailable",
+    released: false,
+  };
+  return adoptAuthority ? { ...handle, adoptAuthority } : handle;
+}
+
+async function unavailableFreshMutex(
+  root: string,
+  mode: SyncMutexMode,
+  reason: WorkspaceLockFailureReason,
+  error: NonNullable<WorkspaceSyncMutex["lockFailure"]>["error"],
+  adoptAuthority?: { kind: "resume" | "abort" | "clean"; journalId: string },
+): Promise<WorkspaceSyncMutex | DaemonMutexResult> {
+  const handle = lockFailureHandle(root, reason, error, adoptAuthority);
+  const fence = await inspectAdoptFence(root);
+  const authorized = adoptAuthority !== undefined
+    && fence.status !== "none" && fence.status !== "corrupt"
+    && fence.journalId === adoptAuthority.journalId
+    && (adoptAuthority.kind === "clean" ? fence.status === "terminal" : fence.status === "active");
+  if ((fence.status === "active" || fence.status === "corrupt") && !authorized
+    || adoptAuthority !== undefined && !authorized) {
+    if (mode === "daemon") {
+      return {
+        status: "contended",
+        holderKey: fence.status === "active" ? `adopt-${fence.journalId}` : "adopt-corrupt",
+        blockerKind: "fence",
+        warningReason: "fence",
+      };
+    }
+    const detail = fence.status === "corrupt" ? ` (${fence.reason})` : "";
+    throw new Error(`workspace has an incomplete adoption${detail}; run \`rbox adopt status|resume|abort\``);
+  }
+  return mode === "daemon" ? { status: "acquired", handle } : handle;
+}
+
+/** Does this handle fence nothing? True for BOTH unhealthy states: a handle
+ * holding no lock is the same fact to every consumer that guards state mutation
+ * with it. Only genesis admission needs the finer answer, and it reads
+ * `lockFailure` directly rather than through a second predicate, so no new
+ * unhealthy state can be minted that reports itself healthy here. */
+export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean =>
+  handle?.degraded !== undefined || handle?.lockFailure !== undefined;
 
 /**
  * Acquire the one workspace-wide sync mutex. CLI owners wait briefly and fail
@@ -226,6 +291,12 @@ async function acquireWorkspaceSyncMutexInternal(
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "unsupported") {
+      // Absence is the one state that may not fall through the legacy degraded
+      // lane: it has no selected backend yet. Preserve the exact current cause
+      // for genesis admission and leave disk/diagnostic state untouched.
+      // A classification failure keeps the legacy lane; only proven absence mints the handle.
+      const absent = await classifyStateFormat(statePath(root)).then((format) => format === "absent", () => false);
+      if (absent) return unavailableFreshMutex(root, mode, result.reason, result.error, adoptAuthority);
       const handle = await degradedHandle(root, options.onDegraded, result.error instanceof Error ? result.error.message : result.error ? String(result.error) : undefined);
       const fence = await inspectAdoptFence(root);
       if (adoptAuthority || fence.status === "active" || fence.status === "corrupt") {
@@ -238,7 +309,11 @@ async function acquireWorkspaceSyncMutexInternal(
       }
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
-    if (result.status === "error") throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
+    if (result.status === "error") {
+      const absent = await classifyStateFormat(statePath(root)).then((format) => format === "absent", () => false);
+      if (absent) return unavailableFreshMutex(root, mode, "io", result.error, adoptAuthority);
+      throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
+    }
     if (mode === "daemon") return daemonContention(result);
     if (!waitSurfaced) {
       waitSurfaced = true;

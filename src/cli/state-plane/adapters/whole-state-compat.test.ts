@@ -246,10 +246,13 @@ test("settled JSON preserves wrong-root, ownership-lost, and degraded adapter be
   expect(rboxResidue(degradedState)).toEqual(degradedResidue);
 });
 
-test("an absent state document is still the JSON backend's first run", async () => {
+test("an absent state document selects no backend and direct load refuses to manufacture JSON", async () => {
   const root = await workspace("absent");
-  expect((await loadState(root, STREAM)).lastSyncedSequence).toBe(0);
+  const before = snapshot(root);
+  await expect(loadState(root, STREAM)).rejects.toThrow(/no sync-record authority/);
   expect(await loadRawState(root)).toBeUndefined();
+  expect(await fsp.lstat(statePath(root)).catch(() => undefined)).toBeUndefined();
+  expect(snapshot(root)).toEqual(before);
 });
 
 test("a healthy held-mutex load admits absent state and re-selects the genesis store", async () => {
@@ -301,7 +304,7 @@ for (const markerPublished of [true, false]) {
       await plantResumeIntent(root, authorityId!);
       if (!markerPublished) await fsp.rm(statePath(root));
 
-      const beforeResume = await import("../authority-bootstrap.js");
+      const beforeResume = await import("../state-write-fence.js");
       expect(() => beforeResume.assertAuthorityWritable(root)).toThrow(StateWriteRefusedError);
       const recovered = await loadState(root, STREAM, () => undefined, mutex);
       expect(await readAuthorityMarkerId(statePath(root))).toBe(authorityId!);
@@ -730,7 +733,12 @@ test("an unretired genesis intent refuses the save before anything opens the dat
 
 test("each selected write fences exactly once and never through a static import", async () => {
   const source = fs.readFileSync(COMPAT, "utf8");
-  expect(source.split("assertAuthorityWritable(").length - 1).toBe(3);
+  // ONE fence call site, reached by all three held-lock writers. Design 266 fold
+  // R4 collapsed three inline copies into `fencedAuthorityUnderHeldLock`, which
+  // is strictly stronger than three: the writers can no longer drift apart on
+  // the order of fence, re-observation, and open.
+  expect(source.split("assertAuthorityWritable(").length - 1).toBe(1);
+  expect(source.split("await fencedAuthorityUnderHeldLock(root)").length - 1).toBe(3);
   expect(source).toContain('await import("../authority-bootstrap.js")');
   // Both read paths take a read-only handle; only the save path takes the
   // writer. 163 v13 is specifically about what a READ is allowed to do.

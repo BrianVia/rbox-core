@@ -9,7 +9,8 @@
  * creating — `--no-interactive` (or a non-TTY) keeps the unattended create-new path.
  */
 import path from "node:path";
-import { loadConfig, loadRawState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { fsyncDirectory } from "../engine/fsutil.js";
+import { loadConfig, loadRawState, RBOX_DIR, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { enrolledDeviceId } from "./e2ee-keystore.js";
@@ -25,6 +26,9 @@ import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import type { ScopeTransactionDeps } from "./scope/scope-transaction.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { recordFolder, setFolderOptions, type FolderOptions } from "./folder-config.js";
+import { admitGenesisAuthority, observeStateAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
+import { RboxApi } from "./remote.js";
+import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -92,16 +96,13 @@ export async function track(
   if (includes.length > 0 && flags.workspace === undefined) {
     throw new Error("--include chooses folders of an existing workspace — use it with --workspace <id>");
   }
-  // Do this after cheap argument validation but before a create call or binding
-  // write: a missing catalog with existing bindings requires regeneration.
-  const folderAuthority = await ensureFolderAuthority({ currentRoot: root });
-  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === root);
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
   const { credentialsForStrictFlow, loadCredentials } = await import("./credentials.js");
   const creds = credentialsForStrictFlow(await (deps.loadCredentials ?? loadCredentials)());
   if (creds?.accountId) await assertNoPendingGenesis(creds.accountId);
   const initialPrev = await loadConfig(root).catch(() => undefined);
+  const initialAuthority = await observeStateAuthority(root);
   const initialState = await loadRawState(root);
   const initialStream = initialState?.stream ?? (initialPrev ? syncStreamId(initialPrev) : undefined);
 
@@ -110,6 +111,21 @@ export async function track(
   // enforced on first sync, so binding stays offline here.
   let workspaceId = flags.workspace;
   let pickedName: string | undefined; // picker-supplied label, cached locally for `rbox status`
+  const requestedSyncGit = flags.git !== "false";
+  const requestedRespectGitignore = flags["respect-gitignore"] === "true";
+  const matchingUninitializedBinding = initialAuthority.kind === "uninitialized"
+    && initialPrev !== undefined
+    && path.resolve(initialPrev.rootPath) === root
+    && initialPrev.remoteUrl === remoteUrl
+    && initialPrev.projectId === projectId
+    && initialPrev.syncGit === requestedSyncGit
+    && initialPrev.respectGitignore === requestedRespectGitignore
+    && (flags.name === undefined || initialPrev.name === flags.name)
+    && (workspaceId === undefined || workspaceId === initialPrev.remoteWorkspaceId);
+  if (matchingUninitializedBinding) {
+    workspaceId = initialPrev.remoteWorkspaceId;
+    pickedName = initialPrev.name;
+  }
   if (!workspaceId) {
     // On a TTY (and not explicitly --no-interactive), ASK before creating: a bare
     // `rbox track <dir>` used to silently create a brand-new workspace even when you
@@ -159,8 +175,18 @@ export async function track(
   const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
   // This write carries the scope cursor forward — including the journaled intent it
   // deliberately preserves — so it is a scope-cursor writer like any other.
+  // Folder authority used to run here BEFORE the create call and the binding
+  // write, so a missing catalog with existing bindings demanded regeneration
+  // while nothing had been written yet. Design 266 moved it after admission:
+  // a lock refusal must precede every catalog, registry, and source effect.
+  //
+  // `rbox track` also re-tracks an already-bound root, so whether THIS
+  // invocation created the binding is the only thing that licenses regenerating
+  // an absent catalog. On a re-track an absent catalog is a LOST one.
+  let createdTheBinding = false;
   const cfg = await withScopeTransitionLock(root, () => withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
     const prev = await loadConfig(root).catch(() => undefined);
+    createdTheBinding = prev === undefined;
     const currentState = await loadRawState(root);
     const currentStream = currentState?.stream ?? (prev ? syncStreamId(prev) : undefined);
     if (currentStream && currentStream !== nextStream) {
@@ -182,8 +208,8 @@ export async function track(
       token: "", // token comes from `rbox login` (per-machine credential), never config
       // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
       // non-git root; pass --git false to opt out.
-      syncGit: flags.git !== "false",
-      respectGitignore: flags["respect-gitignore"] === "true",
+      syncGit: requestedSyncGit,
+      respectGitignore: requestedRespectGitignore,
       ...(prev?.scope ? {
         scope: [...prev.scope],
         ...(prev.scopeGeneration === undefined ? {} : { scopeGeneration: prev.scopeGeneration }),
@@ -194,8 +220,19 @@ export async function track(
       ...(pickedName ? { name: pickedName } : {}),
     };
     await saveConfig(root, next);
+    await fsyncDirectory(path.join(root, RBOX_DIR));
+    const admission = await admitGenesisAuthority(root, syncMutex);
+    if (admission.kind === "refused" && creds) {
+      await reportGenesisLockUnsupported(
+        admission.refusal,
+        new RboxApi(creds.remoteUrl, creds.token, next.remoteWorkspaceId, next.projectId),
+      );
+    }
+    requireSelected(admission);
     return next;
   }), deps.scopeDeps?.lockWaitMs);
+  const folderAuthority = await ensureFolderAuthority({ currentRoot: root, admittedFirstBinding: createdTheBinding });
+  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === root);
   // Design 211: this machine's durable record of the binding, so `rbox status
   // --all` can find a tracked folder that never started background sync.
   await rememberBinding(root, {

@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { realHashFileForTests, overrideHashFileForTests } from "../../engine/hash.js";
 import { push, pull } from "../sync.js";
-import { loadState, syncStreamId } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 // A scan-deferred path (mutated between the walk's stat and its deferred hash,
@@ -113,6 +113,10 @@ beforeEach(async () => {
     accountEpoch: 0,
     keyEpoch: 0,
   };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   resetHashFile?.();

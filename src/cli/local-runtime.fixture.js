@@ -16,6 +16,9 @@ let admission = {
     trash: { days: 7, maxBytes: 99 },
   },
 };
+/** The exact function the fixture's observer supplies, so the remote builder can
+ * prove the caller's sink reached it by identity rather than by category. */
+const WARNING_SINK = () => {};
 let authorityCalls = 0;
 let admissionCalls = 0;
 
@@ -31,9 +34,19 @@ mock.module("./sync-mutex.js", () => ({
   },
 }));
 
+mock.module("./state-plane/authority-bootstrap.js", () => ({
+  admitGenesisAuthority: async (root, heldMutex) => {
+    if (root !== ROOT) throw new Error(`unexpected root: ${root}`);
+    if (heldMutex !== mutex) throw new Error("genesis admission did not receive the held lease");
+    trace.push("genesis:admitted");
+    return { kind: "selected", authority: { kind: "sqlite-store", format: "authority-marker", authorityId: "fixture" } };
+  },
+  requireSelected: (result) => result.authority,
+}));
+
 mock.module("./e2ee-client.js", () => ({
   buildAuthedRemote: async (root, _now, warningSink) => {
-    if (root !== ROOT || typeof warningSink !== "function") throw new Error("observer wiring lost");
+    if (root !== ROOT || warningSink !== WARNING_SINK) throw new Error("observer wiring lost");
     trace.push("remote:built");
     return {
       cfg: {
@@ -143,7 +156,7 @@ mock.module("./sync/sync.js", () => ({
 const { LocalRuntime } = await import("./local-runtime.js");
 const runtime = new LocalRuntime(ROOT);
 const observer = {
-  warningSink: () => {},
+  warningSink: WARNING_SINK,
   onProgress: () => {},
   onGitLog: () => {},
   onGitProgress: () => {},

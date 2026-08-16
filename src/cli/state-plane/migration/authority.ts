@@ -125,9 +125,8 @@ function publish(
 /**
  * The driver. Classify, dispatch, handle, repeat.
  *
- * `onProgress` is bound by the entry site rather than threaded through the
- * coordinator (lane 2D's amendment 2): genesis has no progress surface, so a
- * sink on `establishStateAuthority` would be a parameter only one branch reads.
+ * `onProgress` is bound by the explicit command entry. Genesis is owned by
+ * ordinary admission and never enters this migration driver.
  */
 export async function runMigration(
   root: string, entry: EntryProof, onProgress: MigrationProgressSink = () => undefined,

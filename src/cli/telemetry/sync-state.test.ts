@@ -123,7 +123,7 @@ test("T6: absent JSON refuses without manufacturing state", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-absent-"));
   try {
     await expect(ensureTelemetryBindingId(root, "s", () => Buffer.from("0011223344556677", "hex"))).rejects.toThrow(
-      "sync state is absent",
+      "no sync-record authority",
     );
     await expect(fs.readFile(path.join(root, ".rbox", "state.json"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await fs.rm(root, { recursive: true, force: true }); }

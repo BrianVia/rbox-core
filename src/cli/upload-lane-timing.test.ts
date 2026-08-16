@@ -31,6 +31,7 @@ test("RBOX_LANE_TIMING=1 push reports upload lane timing for file blobs", () => 
     import { push } from "./src/cli/sync.js";
     import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "./src/cli/e2ee-fake-server.js";
     import { uploadLaneTiming, uploadLaneTimingSummary } from "./src/cli/sync-recovery.js";
+    import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./src/cli/config.js";
 
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-upload-lane-test-"));
     try {
@@ -38,6 +39,10 @@ test("RBOX_LANE_TIMING=1 push reports upload lane timing for file blobs", () => 
       const secrets = await bootstrapOnto(server, "acct_lane", "dev_lane", 1_900_000_000_000);
       const remote = remoteFor(server, secrets, "acct_lane", "ws_lane", 1_900_000_005_000);
       const cfg = await cfgFor(root, secrets, remote, "ws_lane");
+      await saveStateUnsafeLegacyOrTest(root, {
+        stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+        lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+      });
 
       await fs.writeFile(path.join(root, "a.txt"), "alpha\\n");
       await fs.writeFile(path.join(root, "b.txt"), "bravo\\n");
@@ -99,6 +104,7 @@ test("E2EE batched push lane timing counts each unique blob once", () => {
     import { RboxApi } from "./src/cli/remote.js";
     import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "./src/cli/e2ee-fake-server.js";
     import { uploadLaneTiming } from "./src/cli/upload-lane-timing.js";
+    import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./src/cli/config.js";
 
     const accountId = "acct_batch_lane";
     const workspaceId = "ws_batch_lane";
@@ -171,6 +177,10 @@ test("E2EE batched push lane timing counts each unique blob once", () => {
       const api = new RboxApi("https://api.test", "tok", workspaceId, projectId);
       const remote = remoteFor(api, secrets, accountId, workspaceId, 1_900_000_005_000);
       const cfg = await cfgFor(root, secrets, remote, workspaceId);
+      await saveStateUnsafeLegacyOrTest(root, {
+        stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+        lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+      });
       await fs.writeFile(path.join(root, "a.txt"), "shared payload\\n");
       await fs.writeFile(path.join(root, "b.txt"), "shared payload\\n");
       await fs.writeFile(path.join(root, "c.txt"), "unique payload\\n");

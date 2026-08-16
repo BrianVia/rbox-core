@@ -36,6 +36,8 @@ export class StateFormatTooNewError extends Error {
 }
 
 export type StateWriteRefusalReason =
+  /** No JSON or SQLite authority exists and this caller did not perform held-lock genesis. */
+  | "authority-uninitialized"
   /** The publication lock is held by another process right now. */
   | "state-lock-unavailable"
   /** The publication lock could not be evaluated (I/O or marker failure). */
@@ -60,6 +62,7 @@ export class StateWriteRefusedError extends Error {
 }
 
 const REFUSAL_MESSAGES: Record<StateWriteRefusalReason, string> = {
+  "authority-uninitialized": "this folder has no sync-record authority yet; refusing to create legacy state outside genesis admission",
   "state-lock-unavailable": "another rbox process is saving this folder's sync records; refusing to save over it",
   "state-lock-error": "this folder's sync-record lock could not be checked; refusing to save without it",
   "state-lock-lease-lost": "this folder's sync-record lock was lost mid-save; refusing to publish",

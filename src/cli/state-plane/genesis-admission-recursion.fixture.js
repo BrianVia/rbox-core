@@ -38,7 +38,9 @@ await fs.mkdir(paths.sqliteResetPaths.stateRoot(root), { recursive: true });
 
 const mutex = await mutexes.acquireWorkspaceSyncMutex(root, "cli");
 try {
-  let selection = await admitGenesisAuthority(root, mutex);
+  let admitted = await admitGenesisAuthority(root, mutex);
+  if (admitted.kind !== "selected") throw new Error("fixture admission refused");
+  let selection = admitted.authority;
   if (format === "q-intent") {
     if (selection.kind !== "sqlite-store") throw new Error("fixture did not establish Q");
     const active = paths.sqliteResetPaths.active(root);
@@ -57,7 +59,9 @@ try {
       },
       staging: { dev: stat.dev, ino: stat.ino },
     }));
-    selection = await admitGenesisAuthority(root, mutex);
+    admitted = await admitGenesisAuthority(root, mutex);
+    if (admitted.kind !== "selected") throw new Error("fixture recovery refused");
+    selection = admitted.authority;
   }
   process.stdout.write(JSON.stringify({
     format,

@@ -1,5 +1,5 @@
 /**
- * Fresh 2.0 install: bind-only track, explicit genesis before the first sync,
+ * Fresh 2.0 install: bind-only track publishes genesis before the first sync,
  * pair a second device, and prove both genesis authorities converge.
  */
 import { GUEST } from "../lib/config.js";
@@ -45,8 +45,7 @@ export const sqliteFreshInstall: Scenario = {
         return id;
       });
 
-      await rec.step("[A] genesis before first sync", async () => {
-        await ctx.a.rbox(["migrate", GUEST.workDir], { cwd: GUEST.workDir });
+      await rec.step("[A] track publishes genesis before first sync", async () => {
         const authority = await readDeviceStateAuthority(ctx.a, GUEST.workDir);
         const state = await readDeviceSyncState(ctx.a, GUEST.workDir);
         rec.assert("A genesis precedes first sync", authority.originKind === "genesis"
@@ -65,8 +64,9 @@ export const sqliteFreshInstall: Scenario = {
           "--git", "false",
         ], { cwd: GUEST.workDir });
       });
-      await rec.step("[B] genesis + first sync", async () => {
-        await ctx.b.rbox(["migrate", GUEST.workDir], { cwd: GUEST.workDir });
+      await rec.step("[B] track publishes genesis + first sync", async () => {
+        const authority = await readDeviceStateAuthority(ctx.b, GUEST.workDir);
+        rec.assert("B genesis precedes first sync", authority.originKind === "genesis", JSON.stringify(authority));
         await ctx.b.rbox(["sync"], { cwd: GUEST.workDir });
       });
 

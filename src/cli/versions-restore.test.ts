@@ -8,6 +8,7 @@ import type { E2eeRemote } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "./e2ee-fake-server.js";
 import { push } from "./sync.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 
 const NOW = 1_900_000_000_000;
 const ACCT = "acct_vh";
@@ -34,6 +35,10 @@ async function twoVersions(): Promise<{ server: FakeServer; remote: E2eeRemote; 
   const root = await tmp();
   const remote = remoteFor(server, secrets, ACCT, WS, NOW + 5000);
   const cfg = await cfgFor(root, secrets, remote, WS);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 
   await fs.writeFile(path.join(root, FILE), V1);
   expect((await push(root, cfg, { remote })).sequence).toBe(1);

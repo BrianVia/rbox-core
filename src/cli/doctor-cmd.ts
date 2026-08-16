@@ -30,6 +30,8 @@ import { listWorktrees } from "../cli/sync-git/git-state.js";
 import { formatBinaryBytes } from "./quota-format.js";
 import { emitJson } from "./json.js";
 import { observeWorkspace, type LocalWorkspaceObservation } from "./workspace-observation.js";
+import { observeStateAuthority, probeGenesisLocking } from "./state-plane/authority-bootstrap.js";
+import { describeGenesisAdmissionRefusal } from "./state-plane-report.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const SECTION_STRING_CAP_BYTES = 2 * 1024;
@@ -672,6 +674,21 @@ async function addDirectorySize(root: string, relDir: string, matcher: IgnoreMat
 async function checkLocking(root: string): Promise<DoctorCheck> {
   const health = await readLockingHealth(root);
   if (health.status === "ok") {
+    const authority = await observeStateAuthority(root).catch(() => undefined);
+    if (authority?.kind === "uninitialized") {
+      const probe = await probeGenesisLocking(root).catch((error) => ({
+        refusal: { reason: "lock-io" as const, layer: "workspace" as const, error },
+        explanation: "",
+      }));
+      const report = probe.refusal ? describeGenesisAdmissionRefusal(probe.refusal) : undefined;
+      const check: DoctorCheck = report
+        ? { ok: false, label: "locking", status: report.finding.id, message: report.finding.problem, finding: report.finding }
+        : { ok: true, label: "locking", message: "ok (.rbox/state/sync.lock)", status: "ok" };
+      // The probe says what it could and could not test. It is a hint, not the
+      // verdict: a probe that proved nothing must not read as a clean bill.
+      if (probe.explanation) check.hint = probe.explanation;
+      return check;
+    }
     return {
       ok: true,
       label: "locking",

@@ -12,8 +12,7 @@ unreachable from the selector; post-Q crash would strand after deletion).
 Founder chose finish-first: 262 v2 is now the parent plan for a 4-slice
 "finish the state plane" loop (SP-1 genesis admission → SP-2 port the three
 JSON-owned behaviors → SP-3 default flip + fleet cutover incl. FM rejoin →
-SP-4 the deletion, closes arch-#42). Tasks #43-46. SP-1 design (263) is
-being drafted by codex in worktree arch-42. FLEET: desktop clean/canonical;
+SP-4 the deletion, closes arch-#42). Tasks #43-46. SP-1/SP-2/SP-2b MERGED (#736/#737/#740); SP-2.5 rig dimension at PR #741 (flake reruns); SP-3 design 266 ALIGNED v4. FLEET: desktop clean/canonical;
 Mac converged to 6 residual git deferrals whose take-theirs batch REFUSES
 ("could not complete safely" ×4, "local commits changed while confirming",
 2nd "P settlement BASE disappeared" sighting) — parked as a named defect

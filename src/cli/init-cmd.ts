@@ -9,9 +9,10 @@
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fsyncDirectory } from "../engine/fsutil.js";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace, RboxApi } from "./remote.js";
-import { loadConfig, loadConfigIfPresent, loadRawState, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadConfigIfPresent, loadRawState, RBOX_DIR, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
@@ -46,6 +47,14 @@ import { summarizeCaseCollisions } from "./sync-cmd.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { recordFolder, setFolderOptions, type FolderOptions, type FolderOptionsPatch } from "./folder-config.js";
 import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
+import { admitGenesisAuthority, requireSelected } from "./state-plane/authority-bootstrap.js";
+import { reportGenesisLockUnsupported } from "./telemetry/queue.js";
+import { selectedStateForResetConsent } from "./sync-state-store.js";
+import {
+  assertOrdinaryInitContinuation,
+  ordinaryInitContinuation,
+  type OrdinaryInitContinuation,
+} from "./init-genesis-continuation.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -223,7 +232,7 @@ export async function runInit(
     process.exitCode = 1;
     return undefined;
   }
-  await preflightInitRebind(plan, opts.resetConsent);
+  const ordinaryContinuation = await preflightInitRebind(plan, opts.resetConsent);
   let adoptConsent = opts.adoptConsent;
   const adoptRequested = gathered.adopt === "true" || adoptConsent !== undefined;
   const nonEmptyJoin = plan.workspace.kind === "join" && await rootHasAdoptableContent(plan.root);
@@ -240,15 +249,17 @@ export async function runInit(
       if (accepted) adoptConsent = mintInteractiveAdoptConsent({ root: plan.root, stream, workspaceId: plan.workspace.id });
     }
   }
-  return executeInitPlan(plan, gathered.bootstrap, {
+  const executionOptions: Parameters<typeof executeInitPlan>[2] = {
     summary: opts.summary !== false,
     recoveryKit: recoveryKitOptionsFromFlags(gathered),
     newDevice: gathered["new-device"] === "true",
     guidedSetup: opts.guidedSetup === true,
     resetConsent: opts.resetConsent,
     credentialResult,
-    ...(adoptConsent ? { adoption: { consent: adoptConsent } } : {}),
-  });
+  };
+  if (adoptConsent) executionOptions.adoption = { consent: adoptConsent };
+  if (ordinaryContinuation) executionOptions.ordinaryContinuation = ordinaryContinuation;
+  return executeInitPlan(plan, gathered.bootstrap, executionOptions);
 }
 
 /**
@@ -257,13 +268,15 @@ export async function runInit(
  * witness minted by its consequence prompt.
  */
 export async function preflightInitRebind(
-  plan: Pick<InitPlan, "root" | "remoteUrl" | "workspace">,
+  plan: Pick<InitPlan, "root" | "remoteUrl" | "workspace" | "syncGit" | "respectGitignore" | "scope">,
   consent?: ResetConsentWitness,
-): Promise<void> {
-  const prev = await loadConfig(plan.root).catch(() => undefined);
-  const raw = await loadRawState(plan.root);
+): Promise<OrdinaryInitContinuation | undefined> {
+  const continuation = await ordinaryInitContinuation(plan, consent !== undefined);
+  if (continuation) return continuation;
+  const prev = await loadConfigIfPresent(plan.root);
+  const raw = await selectedStateForResetConsent(plan.root);
   const oldStream = raw?.stream ?? (prev ? syncStreamId(prev) : undefined);
-  if (!oldStream) return;
+  if (!oldStream) return undefined;
   const nextKnown = plan.workspace.kind === "join"
     ? syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: plan.workspace.id, projectId: plan.workspace.project })
     : undefined;
@@ -288,6 +301,7 @@ export async function preflightInitRebind(
     || !intentMatches) {
     throw new RebindConsentRequiredError(plan.root);
   }
+  return undefined;
 }
 
 export function initRebindNeedsReset(
@@ -375,13 +389,10 @@ async function executeInitPlan(
     resetConsent?: ResetConsentWitness;
     credentialResult?: CredentialLoadResult;
     adoption?: { consent: AdoptConsentWitness };
+    ordinaryContinuation?: OrdinaryInitContinuation;
   },
   continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
-  // Authority must exist before remote or binding effects. Initializing after
-  // saveConfig would misclassify this command's new binding as pre-catalog data.
-  const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root });
-  const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(plan.root));
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
   if (plan.auth === "bootstrap-login") {
@@ -407,6 +418,8 @@ async function executeInitPlan(
   try {
     if (continuation) {
       ({ workspaceId, syncMutex, ownsSyncMutex } = adoptPrecreatedWorkspaceResources(plan, continuation));
+    } else if (opts.ordinaryContinuation) {
+      workspaceId = opts.ordinaryContinuation.workspaceId;
     } else if (plan.workspace.kind === "new" && opts.resetConsent) {
       const created = await createWorkspaceWithConsent(
         opts.resetConsent,
@@ -432,6 +445,9 @@ async function executeInitPlan(
   let deviceId!: string;
   let adoptionJournal: AdoptJournal | undefined;
   try {
+    if (opts.ordinaryContinuation) {
+      await assertOrdinaryInitContinuation(plan, opts.ordinaryContinuation);
+    }
     // 3. Write the per-device binding (token injected at runtime, never persisted).
     //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
     //    its sync baseline describes the OLD stream — reconciling the new one against
@@ -477,12 +493,23 @@ async function executeInitPlan(
       // Design 212: scope is a property of THIS binding, never of the workspace.
       ...(plan.scope ? { scope: plan.scope, scopeGeneration: 1 } : {}),
     };
+    await saveConfig(plan.root, cfg);
+    await fsyncDirectory(path.join(plan.root, RBOX_DIR));
+    const genesisAdmission = await admitGenesisAuthority(plan.root, syncMutex);
+    if (genesisAdmission.kind === "refused") {
+      await reportGenesisLockUnsupported(
+        genesisAdmission.refusal,
+        new RboxApi(creds.remoteUrl, creds.token, workspaceId, plan.workspace.project),
+      );
+    }
+    requireSelected(genesisAdmission);
+
+    // 266 §7.1 authority-before-binding; !prev because init also rebinds.
+    const folderAuthority = await ensureFolderAuthority({ currentRoot: plan.root, admittedFirstBinding: !prev });
+    const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === path.resolve(plan.root));
     if (opts.adoption) {
       if (plan.workspace.kind !== "join" || plan.firstSync !== "sync") throw new Error("invalid adoption execution route");
       consumeAdoptConsent(opts.adoption.consent, { root: plan.root, stream: nextStream, workspaceId });
-      // Inventory is part of phase 0 and therefore runs only while the exact
-      // healthy workspace mutex is held. It remains before journal publication
-      // and before the first source namespace mutation.
       const inventory = await inventoryAdoptionSource(plan.root);
       adoptionJournal = await startAdoption({
         root: plan.root,
@@ -498,7 +525,6 @@ async function executeInitPlan(
       }, inventory, syncMutex);
       if (adoptionJournal.phase === "paused") throw new Error("adoption paused while retaining source; run `rbox adopt status|resume|abort`");
     }
-    await saveConfig(plan.root, cfg);
     // Design 211: record the binding for `rbox status --all` / `doctor --all`.
     // `setup` (guided and keyed) binds through here, so this one call covers it.
     await rememberBinding(plan.root, {

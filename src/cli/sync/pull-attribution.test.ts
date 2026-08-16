@@ -15,7 +15,7 @@ import {
 } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { applyPulledManifest, MassDeleteGuardError, push, type SyncDeps, TrustedViewRefusalError, type TrustedLocalView } from "../sync.js";
-import type { WorkspaceConfig } from "../config.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "../config.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
 
@@ -101,6 +101,13 @@ async function makeRoot(prefix: string): Promise<string> {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
   roots.push(root);
   await fs.mkdir(path.join(root, ".rbox/state"), { recursive: true });
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(config(root)),
+    stateNonce: "a".repeat(32),
+    stateRevision: 0,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
   return root;
 }
 

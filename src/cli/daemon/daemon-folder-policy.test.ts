@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-test("daemon startup admits and applies policy before constructing runtime", async () => {
+test("daemon startup admits and applies folder policy before it operates", async () => {
   const child = Bun.spawn([
     process.execPath,
     new URL("./daemon-folder-policy.fixture.js", import.meta.url).pathname,
@@ -13,10 +13,11 @@ test("daemon startup admits and applies policy before constructing runtime", asy
   expect(exit, stderr).toBe(0);
   const result = JSON.parse(stdout);
 
-  expect(result.admittedTrace).toEqual(["authority", "admission", "remote"]);
+  expect(result.admittedTrace).toEqual(["authority", "admission", "apply"]);
+  // A refusal applies nothing: the daemon parks with its boot cfg untouched.
   expect(result.detachedTrace).toEqual(["authority", "admission"]);
   expect(result.damagedTrace).toEqual(["authority"]);
-  expect(result.remoteCalls).toBe(1);
+  expect(result.matcherInstalled).toBe(true);
   expect(result.detached).toContain("rbox config add");
   expect(result.damaged).toContain("exact parse failure");
   expect(result.damaged).toContain("rbox config regenerate");

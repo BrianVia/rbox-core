@@ -16,7 +16,7 @@ import {
   writeGuidedGenesisPullNotice,
   runInit,
 } from "./init-cmd.js";
-import { loadState, saveConfig } from "./config.js";
+import { loadConfig, loadState, saveConfig } from "./config.js";
 import type { InitPlan } from "./init-plan.js";
 import { resolveInitPlan } from "./init-plan.js";
 import { mintSetupCreateConsent, mintSetupExistingConsent } from "./reset-consent.js";
@@ -27,6 +27,7 @@ import { saveDevice } from "./e2ee-keystore.js";
 import { authorityMarkerBytes } from "./state-plane/authority-marker.js";
 import { sqliteResetPaths, statePath } from "./state-plane/paths.js";
 import { createStateStore } from "./state-plane/store/open.js";
+import { assertOrdinaryInitContinuation } from "./init-genesis-continuation.js";
 
 function gitPushPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
   return {
@@ -245,6 +246,44 @@ function plan(root: string, workspace: InitPlan["workspace"]): InitPlan {
     respectGitignoreExplicit: false,
   };
 }
+
+test("ordinary create-new retry recognizes and revalidates only the exact durable-config/absent window", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-init-genesis-retry-"));
+  const next = {
+    ...plan(root, { kind: "new" as const, project: "root", name: "Retry Workspace" }),
+    scope: ["src", "docs"],
+  };
+  try {
+    await saveConfig(root, {
+      schema: "e2ee/v1",
+      remoteUrl: next.remoteUrl,
+      remoteWorkspaceId: "ws_created_once",
+      projectId: "root",
+      name: "Retry Workspace",
+      rootPath: root,
+      deviceId: "dev_retry",
+      token: "",
+      syncGit: next.syncGit,
+      respectGitignore: next.respectGitignore,
+      scope: ["src", "docs"],
+    });
+
+    const continuation = await preflightInitRebind(next);
+    expect(continuation).toEqual({ workspaceId: "ws_created_once" });
+    await expect(assertOrdinaryInitContinuation(next, continuation!)).resolves.toBeUndefined();
+
+    await saveConfig(root, {
+      ...await loadConfig(root),
+      respectGitignore: !next.respectGitignore,
+    });
+    await expect(assertOrdinaryInitContinuation(next, continuation!)).rejects.toThrow(
+      "incomplete init binding changed before genesis admission",
+    );
+    await expect(preflightInitRebind(next)).rejects.toThrow(/without setup confirmation/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("direct init refuses a differing existing binding; setup witness passes preflight", async () => {
   const fixture = await rebindFixture();

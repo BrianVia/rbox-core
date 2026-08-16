@@ -243,29 +243,26 @@ test("the `Q` predicate accepts only this version's marker, and a future one is 
 });
 
 // ---------------------------------------------------------------------------
-// ROW 5 — the dual-binary rig. DELIBERATELY NOT PROVED HERE.
+// ROW 5 — the released dual-binary rig is a required registered gate.
 
 /**
- * The only row this file cannot honestly close.
- *
- * 222 §7.6 requires the real skew scenario to run a PUBLISHED, SIGNED release
- * against a candidate workspace — never a local build, because a local build
- * shares this checkout's source and would prove nothing about what a customer
- * actually has installed. Row 1 above drives the pre-`Q` code path in THIS
- * process, which proves the barrier logic; it cannot prove that the binary a
- * customer downloaded contains that logic.
- *
- * Owner: the fleet rig, not this suite.
- *   - artifact: the signed stable `v1.11.0` release from
- *     `releases/v1.11.0/rbox-<platform>`, digest pinned against
- *     `releases/version.json.sig` at rig-setup time.
- *   - scenario: a candidate-migrated workspace handed to that binary for
- *     `rbox status`, `rbox sync`, and `rbox doctor`; expected outcome is the
- *     `format-too-new` copy, exit 1, and a byte-identical `.rbox` afterwards.
- *   - the reverse leg (1.11.0 writes, candidate reads and migrates) is Row 2's
- *     real-world twin.
- *
- * `test.todo` rather than a silent gap: the matrix stays visibly incomplete
- * until the rig scenario exists.
+ * The unit process cannot impersonate a released executable. Its MUST is the
+ * structural half: keep a distinct-binary scenario registered, pin 1.11.4, and
+ * name all three negative probes. The rig supplies the executable identities,
+ * hashes, versions, real operations, and byte-equality assertions.
  */
-test.todo("dual-binary rig: signed v1.11.0 over a candidate-migrated workspace (fleet rig owns this)");
+test("dual-binary rig is a registered 1.11.4 compatibility MUST", async () => {
+  // Structural, not textual: source text can carry every one of these strings in
+  // a comment while the scenario the runner actually loads has drifted. These are
+  // the values the rig runs on.
+  const [scenario, registry] = await Promise.all([
+    import("../../../scripts/rig/scenarios/dual-binary-state.js"),
+    import("../../../scripts/rig/scenarios/index.js"),
+  ]);
+  expect(scenario.PINNED_RELEASED_VERSION).toBe("1.11.4");
+  expect([...scenario.RELEASED_NEGATIVE_PROBES]).toEqual(["status", "sync", "doctor"]);
+  expect(scenario.dualBinaryState.supportsDualBinary).toBe(true);
+  expect(scenario.dualBinaryState.name).toBe("dual-binary-state");
+  // Registered under its own name, so `rig dual-binary-state` reaches this object.
+  expect(registry.getScenario("dual-binary-state")).toBe(scenario.dualBinaryState);
+});

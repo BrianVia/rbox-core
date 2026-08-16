@@ -133,14 +133,14 @@ async function barrierWitness(context: AdmissionContext): Promise<AdmissionRefus
 }
 
 /**
- * 163:2413 (`MIGRATION-EXCLUSIVITY-v11`) — the caller is inside one of the two
- * admitted windows and the complete lock set is still live-owned at this
+ * 163:2413 (`MIGRATION-EXCLUSIVITY-v11`) — the caller is inside the explicit
+ * migration window and the complete lock set is still live-owned at this
  * instant. Admission is re-called verbatim immediately before the M6 rename, so
  * this is a re-verification, never a cached fact.
  */
 async function exclusivityWindow(context: AdmissionContext): Promise<AdmissionRefusal | undefined> {
   const { entry, locks } = context.entry;
-  if (entry !== "upgrade-stop-window" && entry !== "foreground-migrate") {
+  if (entry !== "foreground-migrate") {
     return { code: "migration-not-exclusive", detail: `unadmitted entry point ${String(entry)}` };
   }
   if (locks.underRepositoryFence !== true) return { code: "migration-not-exclusive", detail: "the repository fence is not held" };

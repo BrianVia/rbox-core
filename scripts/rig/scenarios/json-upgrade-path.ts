@@ -6,7 +6,7 @@
 import { GUEST } from "../lib/config.js";
 import { compareFingerprints, fingerprintTree } from "../lib/convergence.js";
 import {
-  installLegacyJsonStateFixture,
+  installLegacyJsonWorkspaceFixture,
   readDeviceStateAuthority,
   readDeviceSyncState,
 } from "../lib/state-view.js";
@@ -14,14 +14,6 @@ import { createRecorder, errMsg } from "./harness.js";
 import { bootstrapRigAccount, connectRigDeviceB, teardownAccount } from "./preamble.js";
 import type { RigCtx, Scenario, ScenarioReport } from "./types.js";
 import { finalizeReport } from "./types.js";
-
-async function remoteWorkspaceId(ctx: RigCtx): Promise<string> {
-  const config = JSON.parse(await ctx.a.readFile(`${GUEST.workDir}/.rbox/workspace.json`)) as {
-    remoteWorkspaceId?: string;
-  };
-  if (!config.remoteWorkspaceId) throw new Error("workspace.json missing remoteWorkspaceId");
-  return config.remoteWorkspaceId;
-}
 
 export const jsonUpgradePath: Scenario = {
   name: "json-upgrade-path",
@@ -35,14 +27,11 @@ export const jsonUpgradePath: Scenario = {
         await ctx.a.mkdirp(GUEST.workDir);
         await ctx.a.writeFile(`${GUEST.workDir}/legacy.txt`, "existing JSON workspace\n");
       });
-      const workspaceId = await rec.step("[A] track + install JSON authority fixture", async () => {
-        await ctx.a.rbox([
-          "track", GUEST.workDir, "--no-interactive", "--remote", ctx.apiUrl, "--git", "false",
-        ], { cwd: GUEST.workDir });
-        await installLegacyJsonStateFixture(ctx.a, GUEST.workDir);
+      const workspaceId = await rec.step("[A] construct pre-candidate JSON authority fixture", async () => {
+        const id = await installLegacyJsonWorkspaceFixture(ctx.a, GUEST.workDir, ctx.apiUrl);
         const authority = await readDeviceStateAuthority(ctx.a, GUEST.workDir);
         rec.assert("A starts with JSON authority", authority.format === "json", JSON.stringify(authority));
-        return remoteWorkspaceId(ctx);
+        return id;
       });
 
       await rec.step("[A] existing JSON workspace first sync", async () => {
@@ -60,7 +49,6 @@ export const jsonUpgradePath: Scenario = {
           "track", GUEST.workDir, "--workspace", workspaceId, "--remote", ctx.apiUrl,
           "--git", "false",
         ], { cwd: GUEST.workDir });
-        await ctx.b.rbox(["migrate", GUEST.workDir], { cwd: GUEST.workDir });
         await ctx.b.rbox(["sync"], { cwd: GUEST.workDir });
         const authority = await readDeviceStateAuthority(ctx.b, GUEST.workDir);
         rec.assert("B uses genesis SQLite authority", authority.originKind === "genesis", JSON.stringify(authority));

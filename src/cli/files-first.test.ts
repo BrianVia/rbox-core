@@ -110,6 +110,13 @@ beforeEach(async () => {
     accountId: "acct_ff", accountEpoch: 0, keyEpoch: 0,
   };
   deps = { remote, backoff: noBackoff, onGitLog: () => {} };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: STREAM,
+    lastSyncedSequence: 0,
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   if (savedFlag === undefined) delete process.env.RBOX_FILES_FIRST;

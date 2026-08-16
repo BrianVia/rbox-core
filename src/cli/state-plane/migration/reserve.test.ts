@@ -17,6 +17,7 @@ import {
   streamDigest,
 } from "./reserve.js";
 import { applyStateSavePacket } from "../../sync-state-store.js";
+import { statePath } from "../paths.js";
 
 async function workspace(prefix: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -147,6 +148,9 @@ test("a header whose version field is not a semver is malformed, not adopted", a
 
 test("a state save leaves a reserve behind for a future upgrade", async () => {
   const root = await workspace("rbox-reserve-after-save-");
+  await fs.writeFile(statePath(root), JSON.stringify({
+    stream: "stream", lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  }, null, 2));
   const result = await applyStateSavePacket(root, {
     expectedStream: "stream", expectedNonce: "legacy", sourceGlobalSeq: 0, repos: [],
   });

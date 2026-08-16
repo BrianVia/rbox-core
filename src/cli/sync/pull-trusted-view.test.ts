@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 
 import { PhaseReport, scanManifest, type Action, type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
 import { applyPulledManifest, MassDeleteGuardError, pull, push, TrustedViewRefusalError, type SyncDeps, type TrustedLocalView } from "../sync.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "../config.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 
@@ -97,6 +97,13 @@ beforeEach(async () => {
     accountEpoch: 0,
     keyEpoch: 0,
   };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    stateNonce: "a".repeat(32),
+    stateRevision: 0,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => fs.rm(root, { recursive: true, force: true }));
 

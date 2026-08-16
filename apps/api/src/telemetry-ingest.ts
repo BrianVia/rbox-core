@@ -92,7 +92,7 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
   },
   safety_event: {
     numbers: [{ field: "count", ...COUNT }],
-    enums: [{ field: "eventType", values: ["mass_delete_breaker", "scan_fault"] }],
+    enums: [{ field: "eventType", values: ["mass_delete_breaker", "scan_fault", "genesis_lock_unsupported"] }],
   },
   git_capture: {
     numbers: [

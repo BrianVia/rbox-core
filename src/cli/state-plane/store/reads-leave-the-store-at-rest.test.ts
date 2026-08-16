@@ -30,7 +30,6 @@ import { saveStateUnsafeLegacyOrTest } from "../../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
 import { materializeManifestFromStore } from "../adapters/read-only.js";
 import { applyStateSavePacket, loadRawState, loadState, replaceResetLineageStream } from "../adapters/whole-state-compat.js";
-import { establishStateAuthority } from "../authority-bootstrap.js";
 import { StateWriteRefusedError } from "../errors.js";
 import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
 import { runMigration } from "../migration/authority.js";
@@ -116,10 +115,10 @@ test("materializeManifest — the wire snapshot projection", async () => {
   });
 });
 
-test("establishStateAuthority — the terminal-sqlite active-store proof", async () => {
+test("explicit migration — the terminal-sqlite active-store proof", async () => {
   await readsLeaveTheWorkspaceUntouched((root) =>
     withStatePlaneLocks(root, (locks: HeldStatePlaneLocks) =>
-      establishStateAuthority(root, { entry: "foreground-migrate", locks } as EntryProof, runMigration)));
+      runMigration(root, { entry: "foreground-migrate", locks } as EntryProof)));
 });
 
 /** A write is not a read, but it shares the obligation: the store it commits to

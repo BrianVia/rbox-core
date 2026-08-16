@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
-import { loadState, saveState } from "../sync-state-store.js";
+import { loadState, saveState, saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { planScopeIntent, resumeScopeIntent, runScopeTransition, type ScopeTransactionDeps } from "./scope-transaction.js";
 
 let home: string;
@@ -21,6 +21,10 @@ beforeEach(async () => {
   process.env.RBOX_HOME = home;
   process.env.HOME = home;
   await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: "https://api.test::ws_txn::root", stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 
 afterEach(async () => {

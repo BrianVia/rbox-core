@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { pull, push, type SyncDeps } from "../sync.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "../config.js";
 import { type CommitResult, type SyncRemote } from "../remote.js";
 import { type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
@@ -99,6 +99,10 @@ beforeEach(async () => {
     accountEpoch: 0,
     keyEpoch: 0,
   };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+    lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+  });
 });
 afterEach(async () => {
   delete process.env.RBOX_MASS_DELETE_MIN;

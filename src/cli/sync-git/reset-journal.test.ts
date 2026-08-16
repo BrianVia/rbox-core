@@ -32,7 +32,7 @@ import {
   validateResetJournalV2,
   type ResetZEntry,
 } from "../reset-journal.js";
-import { applyStateSavePacket, loadState, resetSyncState, saveConfig, saveStateUnsafeLegacyOrTest, type StateSavePacket, type SyncState } from "../config.js";
+import { applyStateSavePacket, loadRawState, loadState, resetSyncState, saveConfig, saveStateUnsafeLegacyOrTest, type StateSavePacket, type SyncState } from "../config.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { mintSetupExistingConsent } from "../reset-consent.js";
 import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
@@ -793,7 +793,7 @@ for (const residue of ["none", "unselected-db", "orphan-candidate", "orphan-arch
       log.mockRestore();
       error.mockRestore();
     }
-    expect((await loadState(root, "new-stream")).stream).toBe("new-stream");
+    expect(await loadRawState(root)).toBeUndefined();
     if (residuePath) expect(await fs.readFile(residuePath, "utf8")).toBe(`residue:${residue}\n`);
     expect({ before, after: await byteLevelProtocolFixture(), stdout, stderr })
       .toMatchSnapshot(`E0 E7b pre-port byte differential ${residue}`);
@@ -908,26 +908,48 @@ for (const timing of X_TIMINGS) {
     expect((await readResetJournal(root))?.phase).toBe("z-retired");
   });
 
-  test(`X6 E0 publishWholeState preserves competing state at ${timing}`, async () => {
-    await fs.rm(stateFile());
-    const lock = await acquireStateLock();
-    let competing: Buffer;
-    if (timing === "stale-entry") {
-      await lock.release();
-      competing = await commitAcceptedSave(competingPacket("competing-genesis", "legacy", 1));
-    } else {
-      const original = lock.isOwner.bind(lock);
-      lock.isOwner = async () => {
-        const owned = await original();
-        await lock.release();
-        competing = await commitAcceptedSave(competingPacket("competing-genesis", "legacy", 1));
-        return owned;
+  // Two shapes of competing writer, because they are not the same evidence.
+  // Raw bytes prove the lease check alone protects the file. A committed save
+  // proves it against the writer the state plane actually admits — one that
+  // arrives through `applyStateSavePacket` on a root seeded with explicit legacy
+  // JSON (§6), which is the only way a legacy save reaches this file post-flip.
+  for (const competitor of ["raw-bytes", "committed-save"] as const) {
+    test(`X6 E0 publishWholeState preserves a competing ${competitor} writer at ${timing}`, async () => {
+      await fs.rm(stateFile());
+      if (competitor === "committed-save") {
+        // Unstamped legacy JSON — the shape `"legacy"` is the CAS sentinel for.
+        await saveStateUnsafeLegacyOrTest(root, {
+          stream: "competing-genesis",
+          lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+        });
+      }
+      const lock = await acquireStateLock();
+      let competing!: Buffer;
+      const compete = async (): Promise<void> => {
+        if (competitor === "raw-bytes") {
+          competing = Buffer.from('{"stream":"competing-legacy"}\n');
+          await fs.writeFile(stateFile(), competing);
+        } else {
+          competing = await commitAcceptedSave(competingPacket("competing-genesis", "legacy", 1));
+        }
       };
-    }
-    await expect(publishWholeState(stateFile(), '{"stream":"stale-genesis"}\n', lock))
-      .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
-    expect(await fs.readFile(stateFile())).toEqual(competing!);
-  });
+      if (timing === "stale-entry") {
+        await lock.release();
+        await compete();
+      } else {
+        const original = lock.isOwner.bind(lock);
+        lock.isOwner = async () => {
+          const owned = await original();
+          await lock.release();
+          await compete();
+          return owned;
+        };
+      }
+      await expect(publishWholeState(stateFile(), '{"stream":"stale-genesis"}\n', lock))
+        .rejects.toMatchObject({ reason: "state-lock-lease-lost" });
+      expect(await fs.readFile(stateFile())).toEqual(competing);
+    });
+  }
 
   test(`X7 last-writer witness preserves competing witness at ${timing}`, async () => {
     const sampled = await commitAcceptedSave(competingPacket("old-stream", "1".repeat(32), 10));

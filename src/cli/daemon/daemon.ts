@@ -143,7 +143,7 @@ import {
 } from "./daemon-pull-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
-import { TelemetryQueue } from "../telemetry/queue.js";
+import { reportGenesisLockUnsupported, TelemetryQueue } from "../telemetry/queue.js";
 import { telemetryEnabled } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
@@ -163,6 +163,8 @@ import {
   rboxKeyDeliveryApi,
   type KeyDeliveryFlightPort,
 } from "./key-delivery-fulfill.js";
+import { admitGenesisAuthority, GenesisAdmissionRefusedError, requireSelected } from "../state-plane/authority-bootstrap.js";
+import { describeGenesisAdmissionRefusal, renderOperatorReport } from "../state-plane-report.js";
 import {
   RemoteWakeupChannel,
   type PullWakeupReceipt,
@@ -830,6 +832,27 @@ export class RboxDaemon {
     // ...and the DISK race too (design 49): macOS throttle tier / linux BE-7.
     this.log(`io priority: ${lowerIoPriority()}`);
 
+    // Pull fallback is account-scoped and intentionally starts outside/before
+    // the workspace mutex. A slow sync startup cannot delay key release, and
+    // design 189 pins that: the flight must complete while startup is still
+    // blocked on a contended mutex. It therefore cannot be sequenced behind
+    // admission — and it does not need to be, because it touches no workspace
+    // state a refused daemon would have to un-touch.
+    this.keyDeliveryFlight?.enqueue();
+
+    // Fresh-state admission precedes every activity/binding sidecar. A direct
+    // startup refusal is therefore fully ephemeral apart from the existing log
+    // and optional occurrence telemetry.
+    const admissionMutex = await this.acquireSyncMutexFn(this.root);
+    if (admissionMutex.status === "acquired") {
+      try {
+        requireSelected(await admitGenesisAuthority(this.root, admissionMutex.handle));
+        await this.installInitialFolderPolicy();
+      } finally {
+        await releaseWorkspaceSyncMutex(admissionMutex.handle);
+      }
+    }
+
     // Record the binding FIRST. `rbox start` cleared the previous one before
     // spawning us, and every reader treats "no binding" as an unproven daemon —
     // so any work before this write is a window in which third parties cannot
@@ -872,9 +895,6 @@ export class RboxDaemon {
     this.startActivityHeartbeat();
     this.startAmbientStatusHeartbeat();
     this.startTelemetryTimers();
-    // Pull fallback is account-scoped and intentionally starts outside/before
-    // the workspace mutex. A slow sync startup cannot delay key release.
-    this.keyDeliveryFlight?.enqueue();
     // The direct startup scan is an operation too. Acquire the same mutex and
     // execute the universal journal boundary before loadState or scan work.
     const startupMutex = await this.acquireSyncMutexFn(this.root);
@@ -890,6 +910,8 @@ export class RboxDaemon {
               if (!boundaryBootstrapped) this.seedFromState(initialState);
               await this.adoptionCacheGenerationBoundary();
               if (this.stopped) return;
+              if (!await this.folderOperationBoundary(startupMutex.handle)) return;
+              if (!await this.acknowledgeFolderPolicyRecycle(startupMutex.handle)) return;
               await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: initialState.lastSyncedManifest, mode: this.watcherScanMode() });
               if (this.stopped) return;
               this.pruneCache();
@@ -1545,7 +1567,13 @@ export class RboxDaemon {
     // The contended-start path reaches genesis here, under the scheduler's
     // already-held mutex, before any adoption or folder-policy scan. Keep this
     // unconditional: a resident base may predate a surviving genesis intent.
-    await this.loadSyncBase(syncMutex);
+    try {
+      await this.loadSyncBase(syncMutex);
+    } catch (error) {
+      if (!(error instanceof GenesisAdmissionRefusedError)) throw error;
+      await this.reportGenesisAdmissionRefusal(error, true);
+      return false;
+    }
     if (!await this.folderOperationBoundary(syncMutex)) return false;
     await this.recoverOwnedLocksAtBoundary();
     if (this.stopped) return false;
@@ -1560,6 +1588,24 @@ export class RboxDaemon {
     }
     this.pushTerminalBlocked = false;
     return true;
+  }
+
+  async reportGenesisAdmissionRefusal(
+    error: GenesisAdmissionRefusedError,
+    deduplicate: boolean,
+  ): Promise<void> {
+    const report = describeGenesisAdmissionRefusal(error.refusal);
+    const message = renderOperatorReport(report).join(" ");
+    if (deduplicate) {
+      this.errRepeat = message === this.lastErrMsg ? this.errRepeat + 1 : 1;
+      this.lastErrMsg = message;
+      if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
+        this.log(`${message}${this.errRepeat === 1 ? "" : ` (x${this.errRepeat})`}`);
+      }
+    } else {
+      this.log(message);
+    }
+    await reportGenesisLockUnsupported(error.refusal, this.api, this.telemetry);
   }
 
   /**
@@ -2818,6 +2864,10 @@ export class RboxDaemon {
           return;
         }
       }
+      // The daemon never created this binding, so a missing catalog here is a
+      // LOST catalog, not an un-published one. Regenerating it would discard
+      // labels, ordering, and overrides that regeneration cannot reconstruct, so
+      // ordinary authority activation refuses and the operator repairs.
       const state = await ensureFolderAuthority({ currentRoot: this.root });
       const admission = await observeFolderAdmission(this.root, state);
       if (admission.kind !== "admitted") {
@@ -2862,6 +2912,17 @@ export class RboxDaemon {
     } catch (error) {
       this.setFolderAdmissionHalt(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  /** Install folder policy only after direct-start genesis has selected an
+   * authority. Contended startup defers the same work to the operation boundary
+   * that performs admission under the scheduler-owned mutex. */
+  private async installInitialFolderPolicy(): Promise<void> {
+    const state = await ensureFolderAuthority({ currentRoot: this.root });
+    const admission = await observeFolderAdmission(this.root, state);
+    if (admission.kind !== "admitted") throw runtimeRefusal(admission);
+    this.cfg = applyFolderPolicy(this.cfg, admission.policy);
+    this.matcher = buildIgnoreMatcher(this.root, { respectGitignore: this.cfg.respectGitignore === true });
   }
 
   private setFolderAdmissionHalt(reason: string): void {
@@ -2986,17 +3047,6 @@ export function createDaemonShutdownHandler(deps: {
 }
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
-export async function buildAdmittedDaemonRuntime(
-  root: string,
-  warningSink?: (line: string) => void,
-): Promise<Awaited<ReturnType<typeof buildAuthedRemote>>> {
-  const state = await ensureFolderAuthority({ currentRoot: root });
-  const admission = await observeFolderAdmission(root, state);
-  if (admission.kind !== "admitted") throw runtimeRefusal(admission);
-  const { cfg, deps, remote } = await buildAuthedRemote(root, Date.now, warningSink);
-  return { cfg: applyFolderPolicy(cfg, admission.policy), deps, remote };
-}
-
 export async function runDaemon(root: string): Promise<void> {
   const logger = new RotatingDaemonLogger(root, () => new Date(), fsSync);
   const bootId = logger.bootId;
@@ -3011,7 +3061,7 @@ export async function runDaemon(root: string): Promise<void> {
     finish,
   });
   try {
-    const { cfg, deps } = await buildAdmittedDaemonRuntime(root, logger.log); // E2EE transport + injected KEK
+    const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
       // Transport only — `refreshScopeAuthority` is what actually decides, and can
@@ -3022,7 +3072,13 @@ export async function runDaemon(root: string): Promise<void> {
     });
     process.on("SIGTERM", shutdown);
     process.on("SIGINT", shutdown);
-    await daemon.start();
+    try {
+      await daemon.start();
+    } catch (error) {
+      if (!(error instanceof GenesisAdmissionRefusedError)) throw error;
+      await daemon.reportGenesisAdmissionRefusal(error, false);
+      return;
+    }
     await stopped;
   } finally {
     process.removeListener("SIGTERM", shutdown);

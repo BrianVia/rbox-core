@@ -1,51 +1,24 @@
-/**
- * The state-authority coordinator (design 222 §1.3).
- *
- * Genesis and migration never see each other: `genesis.ts` imports nothing from
- * `migration/`, `migration/**` imports nothing from `genesis.ts`, and this is
- * the one module permitted to import both (§7.9). It carries no protocol of its
- * own — it asks genesis whether the workspace is its business, and otherwise
- * runs migration.
- *
- * It also owns the state-plane write fence, because the fence is one policy
- * spanning both domains and the boundary gate leaves exactly one module able to
- * express it.
- */
+/** File-level state-authority observation, ordinary SQLite genesis admission,
+ * and the state-plane write fence. Explicit migration has its own command owner;
+ * this module never dispatches between genesis and migration. */
 import { randomBytes } from "node:crypto";
+import type { LockUnsupportedReason } from "../../engine/lockfile.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 import { classifyStateFormat, readAuthorityMarkerId } from "./authority-marker.js";
-import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
-import type { GenesisIds, GenesisInspection, GenesisOutcome } from "./genesis.js";
+import { StateAuthorityCorruptError } from "./errors.js";
+import type { GenesisIds } from "./genesis.js";
 // Not from `genesis.js`: the fence's reachable graph must contain no SQLite.
 import { readGenesisIntent } from "./genesis-intent.js";
-import type { EntryProof } from "./locks.js";
-import type { MigrationOutcome } from "./migration/authority.js";
-import { blocksSqliteWrites } from "./migration/control-codec.js";
-import { readCanonicalControl } from "./migration/control-publication.js";
 import { statePath } from "./paths.js";
+import { GENESIS_ADMISSION_REFUSAL_COPY } from "../state-plane-copy.js";
 
-/** M-9's `runMigration`, with its progress sink already bound by the entry site
- * (lane 2D's amendment 2: genesis has no progress surface, so a sink on this
- * module's signature would be a parameter only one branch reads).
- *
- * Wave 5A collapsed 2D's `MigrationDriver<M>`/`AuthorityOutcome<M>` generics onto
- * the real `MigrationOutcome`, which `migration/authority.ts` now declares. It
- * stays an INJECTED function rather than a direct call: binding the sink is the
- * entry site's job, and injection is what lets the coordinator's own tests drive
- * the dispatch and the C8 re-inspect without standing up a whole migration. The
- * duplicate-declaration gate confirms `MigrationOutcome` is declared exactly
- * once, in the module that owns the protocol. */
-export type MigrationDriver = (root: string, entry: EntryProof) => Promise<MigrationOutcome>;
-
-export type AuthorityOutcome =
-  | { readonly domain: "genesis"; readonly outcome: GenesisOutcome }
-  | { readonly domain: "migration"; readonly outcome: MigrationOutcome };
-
-/** The durable state backend selected from `.rbox/state.json` alone. */
-export type StateAuthoritySelection =
+/** The durable state backend observed from `.rbox/state.json` alone. Absence is
+ * not a legacy backend: it is the lack of any selected authority. */
+export type StateAuthorityObservation =
+  | { readonly kind: "uninitialized"; readonly format: "absent" }
   | {
       readonly kind: "legacy-json-store";
-      readonly format: "absent" | "json" | "foreign";
+      readonly format: "json" | "foreign";
     }
   | {
       readonly kind: "sqlite-store";
@@ -57,8 +30,9 @@ export type StateAuthoritySelection =
  * Observe the state authority without taking locks, opening SQLite, or reading
  * admission records. Only an exact authority marker selects the store.
  */
-export async function selectStateAuthority(root: string): Promise<StateAuthoritySelection> {
+export async function observeStateAuthority(root: string): Promise<StateAuthorityObservation> {
   const format = await classifyStateFormat(statePath(root));
+  if (format === "absent") return { kind: "uninitialized", format };
   if (format !== "authority-marker") return { kind: "legacy-json-store", format };
   const authorityId = await readAuthorityMarkerId(statePath(root));
   if (authorityId === undefined) {
@@ -70,6 +44,40 @@ export async function selectStateAuthority(root: string): Promise<StateAuthority
   return { kind: "sqlite-store", format, authorityId };
 }
 
+export type GenesisAdmissionRefusal = {
+  readonly reason:
+    | "lock-unsupported"
+    | "lock-indeterminate"
+    | "lock-identity-unavailable"
+    | "lock-io";
+  readonly layer: "workspace" | "state";
+  readonly error?: unknown;
+};
+
+export type GenesisAdmissionResult =
+  | {
+      readonly kind: "selected";
+      readonly authority: Exclude<StateAuthorityObservation, { kind: "uninitialized" }>;
+    }
+  | { readonly kind: "refused"; readonly refusal: GenesisAdmissionRefusal };
+
+/** Typed exception used only by adapters whose existing signature cannot carry
+ * the result union (foreground/daemon state loading). */
+export class GenesisAdmissionRefusedError extends Error {
+  constructor(readonly refusal: GenesisAdmissionRefusal) {
+    const copy = GENESIS_ADMISSION_REFUSAL_COPY[refusal.reason].human;
+    super(`${copy.problem}\n${copy.safety}`);
+    this.name = "GenesisAdmissionRefusedError";
+  }
+}
+
+export function requireSelected(
+  result: GenesisAdmissionResult,
+): Exclude<StateAuthorityObservation, { kind: "uninitialized" }> {
+  if (result.kind === "refused") throw new GenesisAdmissionRefusedError(result.refusal);
+  return result.authority;
+}
+
 /**
  * Complete genesis admission for a caller that already owns the workspace
  * mutex. The handle is borrowed, and the returned selection is always a fresh
@@ -78,106 +86,154 @@ export async function selectStateAuthority(root: string): Promise<StateAuthority
 export async function admitGenesisAuthority(
   root: string,
   heldMutex: WorkspaceSyncMutex,
-): Promise<StateAuthoritySelection> {
+): Promise<GenesisAdmissionResult> {
   const intent = readGenesisIntent(root);
-  const selection = await selectStateAuthority(root);
-  if (intent === undefined && selection.format !== "absent") return selection;
+  const selection = await observeStateAuthority(root);
+  if (intent === undefined && selection.kind !== "uninitialized") {
+    return { kind: "selected", authority: selection };
+  }
 
-  const [{ withGenesisAdmissionLocks }, genesis] = await Promise.all([
+  if (heldMutex.lockFailure) {
+    return { kind: "refused", refusal: admissionRefusal("workspace", heldMutex.lockFailure.reason, heldMutex.lockFailure.error) };
+  }
+  if (heldMutex.degraded !== undefined || !heldMutex.lock) {
+    return {
+      kind: "refused",
+      refusal: admissionRefusal("workspace", "identity-unavailable", heldMutex.degraded?.detail),
+    };
+  }
+
+  const [{ StateLockAcquisitionError, withGenesisAdmissionLocks }, genesis] = await Promise.all([
     import("./locks.js"),
     import("./genesis.js"),
   ]);
-  return withGenesisAdmissionLocks(root, heldMutex, async (locks) => {
-    const lockedIntent = readGenesisIntent(root);
-    const lockedSelection = await selectStateAuthority(root);
-    if (lockedIntent === undefined && lockedSelection.format !== "absent") return lockedSelection;
+  try {
+    return await withGenesisAdmissionLocks(root, heldMutex, async (locks): Promise<GenesisAdmissionResult> => {
+      const lockedIntent = readGenesisIntent(root);
+      const lockedSelection = await observeStateAuthority(root);
+      if (lockedIntent === undefined && lockedSelection.kind !== "uninitialized") {
+        return { kind: "selected", authority: lockedSelection };
+      }
 
-    const outcome = await genesis.establish(root, mintIds, locks);
-    const fresh = await selectStateAuthority(root);
-    const survivingIntent = readGenesisIntent(root);
-    if ((outcome.kind === "established" || outcome.kind === "already-established")
-      && (fresh.kind !== "sqlite-store" || survivingIntent !== undefined)) {
-      throw new StateAuthorityCorruptError(
-        statePath(root),
-        "genesis completed without publishing a settled SQLite authority",
-      );
+      const outcome = await genesis.establish(root, mintIds, locks);
+      const fresh = await observeStateAuthority(root);
+      const survivingIntent = readGenesisIntent(root);
+      if ((outcome.kind === "established" || outcome.kind === "already-established")
+        && (fresh.kind !== "sqlite-store" || survivingIntent !== undefined)) {
+        throw new StateAuthorityCorruptError(
+          statePath(root),
+          "genesis completed without publishing a settled SQLite authority",
+        );
+      }
+      // A same-window legacy race is genesis's one owned refusal/cleanup case.
+      // The fresh file-level observation is then the selected legacy authority.
+      if (outcome.kind === "refused" && outcome.reason === "legacy-present"
+        && fresh.kind === "legacy-json-store" && survivingIntent === undefined) {
+        return { kind: "selected", authority: fresh };
+      }
+      if (fresh.kind === "uninitialized" || survivingIntent !== undefined) {
+        throw new StateAuthorityCorruptError(
+          statePath(root),
+          `genesis stopped without selecting a settled authority (${outcome.kind})`,
+        );
+      }
+      return { kind: "selected", authority: fresh };
+    });
+  } catch (error) {
+    if (error instanceof StateLockAcquisitionError) {
+      if (error.outcome.status === "held") throw error;
+      if (error.outcome.status === "unsupported") {
+        return {
+          kind: "refused",
+          refusal: admissionRefusal("state", error.outcome.reason, error.outcome.error),
+        };
+      }
+      // `error` and every other non-`unsupported` outcome: the acquisition
+      // failed for a reason the lock layer did not classify. "io" is what that
+      // is; naming it `link-capacity` would assert a diagnosis nobody made.
+      return {
+        kind: "refused",
+        refusal: admissionRefusal("state", "io", error.outcome.error),
+      };
     }
-    return fresh;
-  });
+    throw error;
+  }
+}
+
+export interface GenesisLockingProbe {
+  /** Absent when every directory the probe could test published a lock. */
+  readonly refusal?: GenesisAdmissionRefusal;
+  /** What was tested, what was not, and why — empty only when the probe reached
+   * a refusal before observing anything. A directory that reported its probe
+   * lock held is named here rather than counted as a pass. */
+  readonly explanation: string;
 }
 
 /**
- * The one thing both entry points call, under an already-held lock bundle
- * (§3.2: the caller wraps this in `withStatePlaneLocks` and passes the proof).
+ * Doctor's advisory configured-root probe: can this filesystem publish the
+ * hardlink locks genesis needs, in the directories genesis needs them?
  *
- * One re-inspect, for the one outcome that changes the answer (§1.3 C8). A
- * genesis attempt that finds an `L` has appeared refuses `legacy-present` after
- * removing its own artifacts and retiring its intent — which leaves an ordinary
- * migration candidate. Dispatching again in the same pass is what makes
- * §6.1's "run `rbox migrate`" true. A second genesis claim is impossible once
- * the intent is gone, so it is corruption rather than a third pass.
+ * Doctor's §1.1 contract is ZERO mutation, so this creates no directory an
+ * uninitialized root does not already have — it tests the nearest EXISTING
+ * ancestor instead, and says which one. It also never touches a real lock path:
+ * a probe that took `sync.lock` would be a diagnostic that can block the very
+ * operation the operator runs next. The probe names are unique per invocation
+ * and belong to no protocol, so nothing else can be waiting on them.
  */
-export async function establishStateAuthority(
-  root: string, entry: EntryProof, runMigration: MigrationDriver,
-): Promise<AuthorityOutcome> {
-  const first = await dispatch(root, entry, runMigration);
-  if (!isLegacyPresent(first)) return first;
-
-  const second = await dispatch(root, entry, runMigration);
-  if (second.domain === "genesis") {
-    throw new StateAuthorityCorruptError(
-      statePath(root),
-      "genesis claimed this workspace again after retiring its intent over legacy JSON",
-    );
+export async function probeGenesisLocking(root: string): Promise<GenesisLockingProbe> {
+  const [{ acquireLock }, fs, path] = await Promise.all([
+    import("../../engine/lockfile.js"),
+    import("node:fs/promises"),
+    import("node:path"),
+  ]);
+  const exists = async (dir: string): Promise<boolean> =>
+    fs.stat(dir).then((entry) => entry.isDirectory(), () => false);
+  const rboxDir = path.join(root, ".rbox");
+  const stateDir = path.join(rboxDir, "state");
+  // Each genesis lock lives in a different directory, so each is its own answer:
+  // `.rbox/state.json.lock` beside the authority, `.rbox/state/sync.lock` in the
+  // state directory a fresh root may not have yet.
+  const layers = [
+    { layer: "state" as const, dir: rboxDir },
+    { layer: "workspace" as const, dir: stateDir },
+  ];
+  const tested: string[] = [];
+  const skipped: string[] = [];
+  for (const { layer, dir } of layers) {
+    if (!await exists(dir)) {
+      skipped.push(`${path.relative(root, dir) || "."} does not exist yet, so its locking is untested`);
+      continue;
+    }
+    const file = path.join(dir, `.rbox-locking-probe.${process.pid}.${hex32()}.lock`);
+    const acquired = await acquireLock(file);
+    if (acquired.status === "unsupported") {
+      return {
+        refusal: admissionRefusal(layer, acquired.reason, acquired.error),
+        explanation: probeStory(tested, skipped),
+      };
+    }
+    if (acquired.status === "error") {
+      return { refusal: { reason: "lock-io", layer, error: acquired.error }, explanation: probeStory(tested, skipped) };
+    }
+    if (acquired.status === "held") {
+      // A unique name nobody else knows cannot be legitimately contended, so
+      // this is an anomaly rather than a refusal — but it is not a pass either,
+      // and the operator is told rather than shown a clean bill of health.
+      skipped.push(`${path.relative(root, dir) || "."} reported its probe lock already held; its locking is untested`);
+      continue;
+    }
+    const released = await acquired.lock.release();
+    if (!released.released || !released.durable) {
+      return { refusal: admissionRefusal(layer, "io", released.error), explanation: probeStory(tested, skipped) };
+    }
+    tested.push(path.relative(root, dir) || ".");
   }
-  return second;
+  return { explanation: probeStory(tested, skipped) };
 }
 
-/**
- * The state-plane write fence, as ONE exported predicate, called at the SQLite
- * save boundary under the already-held state lock.
- *
- * A durable migration control that blocks writes and an unretired genesis
- * intent are the same policy — authority recovery has not finished — so they
- * are one branch and one refusal reason.
- *
- * FILE-LEVEL ONLY, NEVER A SQLITE OPEN (163 v13, lane 2D). This runs on every
- * SQLite save. A read-only open creates `-wal`/`-shm` on its first read and
- * cannot remove them, so an open here would deposit debris on the hot path and
- * manufacture the very at-rest violation 163 halts over.
- *
- * Both readers are deliberately imported from modules whose import graphs
- * contain no `bun:sqlite`, which is what makes an open here unreachable rather
- * than merely absent — a snapshot cannot see an open that checkpoints and
- * removes its own sidecars before returning. `authority-bootstrap.test.ts`
- * walks that graph and carries 163 v13's read-only-open negative control.
- */
-export function assertAuthorityWritable(root: string): void {
-  const control = readCanonicalControl(root);
-  if (control && blocksSqliteWrites(control)) {
-    refuse(root, `migration ${control.migrationId} is at ${control.witness.phase}`);
-  }
-  const intent = readGenesisIntent(root);
-  if (intent) refuse(root, `genesis attempt ${intent.authorityId} has not been retired`);
-}
-
-async function dispatch(
-  root: string, entry: EntryProof, runMigration: MigrationDriver,
-): Promise<AuthorityOutcome> {
-  const genesis = await import("./genesis.js");
-  if (claimsGenesis(root, await genesis.inspect(root, entry.locks))) {
-    return { domain: "genesis", outcome: await genesis.establish(root, mintIds, entry.locks) };
-  }
-  return { domain: "migration", outcome: await runMigration(root, entry) };
-}
-
-/** §1.3: genesis claims a workspace with no authority and no migration control,
- * or one carrying an exact genesis intent. `genesis.inspect` answers the first
- * half and leaves the control to its caller, so the control read lives here —
- * the boundary forbids genesis from performing it. */
-function claimsGenesis(root: string, inspection: GenesisInspection): boolean {
-  if (inspection.intent) return true;
-  return inspection.claims && readCanonicalControl(root) === undefined;
+function probeStory(tested: readonly string[], skipped: readonly string[]): string {
+  const parts = tested.length > 0 ? [`locking works in ${tested.join(" and ")}`] : [];
+  return [...parts, ...skipped].join("; ");
 }
 
 /** Fresh ids for a fresh attempt. Genesis calls this at most once and never on
@@ -190,12 +246,18 @@ function hex32(): string {
   return randomBytes(16).toString("hex");
 }
 
-function isLegacyPresent(outcome: AuthorityOutcome): boolean {
-  return outcome.domain === "genesis"
-    && outcome.outcome.kind === "refused"
-    && outcome.outcome.reason === "legacy-present";
-}
-
-function refuse(root: string, detail: string): never {
-  throw new StateWriteRefusedError("authority-recovery-pending", statePath(root), detail);
+function admissionRefusal(
+  layer: GenesisAdmissionRefusal["layer"],
+  reason: LockUnsupportedReason | "io",
+  error?: GenesisAdmissionRefusal["error"],
+): GenesisAdmissionRefusal {
+  const refusalReason = reason === "hardlink-unsupported"
+    ? "lock-unsupported"
+    : reason === "indeterminate"
+      ? "lock-indeterminate"
+      : reason === "identity-unavailable"
+        ? "lock-identity-unavailable"
+        : "lock-io";
+  if (error === undefined) return { reason: refusalReason, layer };
+  return { reason: refusalReason, layer, error };
 }

@@ -10,6 +10,7 @@ import {
   adoptClaimedStateStore,
   createStateStore,
   openStateStore,
+  readImmutableStoreLineage,
 } from "../store/open.js";
 
 const roots: string[] = [];
@@ -177,15 +178,15 @@ test("the header gate refuses a symlink, a foreign page size, and a non-WAL jour
 });
 
 test("a corrupt body and a directory at the state path stay typed refusals", () => {
-  // Each shape has an intact header, so the gate admits it and the refusal has
+  // Each damage has an intact header, so the gate admits it and the refusal has
   // to come from `validateOpen` — which only types it if nothing touched the
   // database first.
-  const shapes = {
+  const damages = {
     "page 1 body": (target: string) => patchHeader(target, (bytes) => bytes.fill(0x58, 100, 4096)),
     "truncated mid-page": (target: string) => fs.truncateSync(target, 6000),
     "page count lie": (target: string) => patchHeader(target, (bytes) => bytes.writeUInt32BE(9999, 28)),
   };
-  for (const damage of Object.values(shapes)) {
+  for (const damage of Object.values(damages)) {
     const corrupt = file();
     createStateStore(corrupt, genesis).close();
     damage(corrupt);
@@ -238,6 +239,29 @@ test("failed create removes only its own claim and every SQLite sidecar", () => 
   expect(fs.readFileSync(existing)).toEqual(before);
 });
 
+test("the immutable lineage read carries a genesis lineage that has not yet minted a nonce", () => {
+  // Genesis is the default for absent state (design 266), so a tracked but
+  // never-synced workspace has a settled authority whose nonce and revision are
+  // still unset. Reset/rebind consent reads this lineage before the first save,
+  // and refusing it there strands `rbox setup` on every freshly tracked folder.
+  const withNonce = file();
+  createStateStore(withNonce, genesis).close();
+  expect(readImmutableStoreLineage(withNonce)).toEqual({
+    authorityId: genesis.authorityId,
+    stream: genesis.stream,
+    stateNonce: genesis.stateNonce,
+    stateRevision: genesis.stateRevision,
+  });
+
+  const preFirstSave = file();
+  const { stateNonce: _nonce, stateRevision: _revision, ...unsaved } = genesis;
+  createStateStore(preFirstSave, unsaved).close();
+  expect(readImmutableStoreLineage(preFirstSave)).toEqual({
+    authorityId: genesis.authorityId,
+    stream: genesis.stream,
+  });
+});
+
 test("an exact zero-byte 0600 claim is adopted through the ordinary initializer", () => {
   const target = file();
   fs.closeSync(fs.openSync(target, "wx", 0o600));
@@ -254,21 +278,21 @@ test("an exact zero-byte 0600 claim is adopted through the ordinary initializer"
 });
 
 test("adoption refusals do not delete an unowned claim", () => {
-  for (const shape of ["identity", "bytes", "mode", "sidecar"] as const) {
+  for (const claim of ["identity", "bytes", "mode", "sidecar"] as const) {
     const target = file();
     fs.closeSync(fs.openSync(target, "wx", 0o600));
     const stat = fs.lstatSync(target);
-    if (shape === "bytes") fs.writeFileSync(target, "foreign");
-    if (shape === "mode") fs.chmodSync(target, 0o640);
-    if (shape === "sidecar") fs.writeFileSync(`${target}-wal`, "foreign");
-    const expected = shape === "identity"
+    if (claim === "bytes") fs.writeFileSync(target, "foreign");
+    if (claim === "mode") fs.chmodSync(target, 0o640);
+    if (claim === "sidecar") fs.writeFileSync(`${target}-wal`, "foreign");
+    const expected = claim === "identity"
       ? { dev: stat.dev, ino: stat.ino + 1 }
       : { dev: stat.dev, ino: stat.ino };
     expect(() => adoptClaimedStateStore(target, expected, (db) => {
       installGenesisLineage(db, genesis);
     })).toThrow();
     expect(fs.existsSync(target)).toBe(true);
-    if (shape === "sidecar") expect(fs.readFileSync(`${target}-wal`, "utf8")).toBe("foreign");
+    if (claim === "sidecar") expect(fs.readFileSync(`${target}-wal`, "utf8")).toBe("foreign");
   }
 });
 

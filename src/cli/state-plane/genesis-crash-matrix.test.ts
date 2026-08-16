@@ -36,13 +36,14 @@ import os from "node:os";
 import path from "node:path";
 import { checkStateMigration } from "../doctor-state-plane.js";
 import { saveConfig, type WorkspaceConfig } from "../workspace-config.js";
-import { assertAuthorityWritable, selectStateAuthority } from "./authority-bootstrap.js";
+import { observeStateAuthority } from "./authority-bootstrap.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { establish, readGenesisIntent, type GenesisIds } from "./genesis.js";
 import { rboxResidue, rboxResiduePaths } from "./migration/fault-rig.js";
 import { inodeOf as inodeKey, replaceUnderNewInode } from "./migration/inode-fixtures.js";
 import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
+import { assertAuthorityWritable } from "./state-write-fence.js";
 import { openStateStore, stateStoreDatabase } from "./store/open.js";
 
 // Protocol-only tests use an owned in-memory witness. Real-entry and lock tests
@@ -379,7 +380,7 @@ async function convergePostQ(root: string, ids: GenesisIds): Promise<void> {
     expect(await establish(root, () => freshIds(), publicationLocks(root)))
       .toEqual({ kind: "already-established" });
   } else {
-    expect(await selectStateAuthority(root)).toEqual({
+    expect(await observeStateAuthority(root)).toEqual({
       kind: "sqlite-store", format: "authority-marker", authorityId: ids.authorityId,
     });
   }

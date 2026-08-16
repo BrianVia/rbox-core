@@ -17,9 +17,10 @@ export interface DeviceStateAuthority {
 export async function readDeviceStateAuthority(
   device: Device,
   root: string,
+  env?: Record<string, string>,
 ): Promise<DeviceStateAuthority> {
   const script = `import { classifyStateFormat } from '/app/src/cli/state-plane/authority-marker.ts';
-import { selectStateAuthority } from '/app/src/cli/state-plane/authority-bootstrap.ts';
+import { observeStateAuthority } from '/app/src/cli/state-plane/authority-bootstrap.ts';
 import { sqliteResetPaths, statePath } from '/app/src/cli/state-plane/paths.ts';
 import { openStateStore, stateStoreDatabase } from '/app/src/cli/state-plane/store/open.ts';
 const root = process.argv[1];
@@ -27,7 +28,7 @@ const format = await classifyStateFormat(statePath(root));
 if (format !== 'authority-marker') {
   process.stdout.write(JSON.stringify({ format }));
 } else {
-  const selection = await selectStateAuthority(root);
+  const selection = await observeStateAuthority(root);
   if (selection.kind !== 'sqlite-store') throw new Error('authority marker did not select SQLite');
   const store = openStateStore(sqliteResetPaths.active(root), { readonly: true });
   try {
@@ -46,32 +47,46 @@ if (format !== 'authority-marker') {
     store.close();
   }
 }`;
-  const result = await device.exec(["bun", "-e", script, root]);
+  const result = await device.exec(["bun", "-e", script, root], { env });
   return JSON.parse(result.stdout) as DeviceStateAuthority;
 }
 
-/**
- * Install the old authority shape after bind-only `track`, before any sync entry
- * can admit genesis. This is a rig fixture, not a product hook: it uses the
- * existing explicit compatibility/test writer and refuses to replace any state.
- */
-export async function installLegacyJsonStateFixture(device: Device, root: string): Promise<void> {
-  const script = `import { loadConfig, syncStreamId } from '/app/src/cli/workspace-config.ts';
-import { classifyStateFormat } from '/app/src/cli/state-plane/authority-marker.ts';
-import { statePath } from '/app/src/cli/state-plane/paths.ts';
+/** Build a bound JSON workspace without entering a candidate command. This
+ * fixture exists so the upgrade-path rig can prove candidate entry preserves an
+ * authority that predates the candidate, now that ordinary `track` publishes Q. */
+export async function installLegacyJsonWorkspaceFixture(
+  device: Device,
+  root: string,
+  remoteUrl: string,
+): Promise<string> {
+  const script = `import { credentialsForStrictFlow, loadCredentials } from '/app/src/cli/credentials.ts';
+import { enrolledDeviceId } from '/app/src/cli/e2ee-keystore.ts';
+import { ensureFolderAuthority } from '/app/src/cli/folder-authority.ts';
+import { recordFolder } from '/app/src/cli/folder-catalog-mutate.ts';
+import { createRemoteWorkspace } from '/app/src/cli/remote.ts';
+import { saveConfig, syncStreamId } from '/app/src/cli/workspace-config.ts';
 import { saveStateUnsafeLegacyOrTest } from '/app/src/cli/sync-state-store.ts';
-const root = process.argv[1];
-const before = await classifyStateFormat(statePath(root));
-if (before !== 'absent') throw new Error('legacy fixture requires absent state, found ' + before);
-const config = await loadConfig(root);
+const [root, remoteUrl] = process.argv.slice(1);
+const creds = credentialsForStrictFlow(await loadCredentials());
+if (!creds?.accountId) throw new Error('legacy fixture requires enrolled credentials');
+const workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, 'root');
+const deviceId = await enrolledDeviceId(creds.accountId) ?? creds.deviceId;
+const config = {
+  schema: 'e2ee/v1', remoteWorkspaceId: workspaceId, projectId: 'root', deviceId,
+  rootPath: root, remoteUrl, token: '', syncGit: false, respectGitignore: false,
+};
+await ensureFolderAuthority();
+await saveConfig(root, config);
+await recordFolder(root, { options: { syncGit: false, respectGitignore: false } });
 await saveStateUnsafeLegacyOrTest(root, {
-  stream: syncStreamId(config),
-  lastSyncedSequence: 0,
+  stream: syncStreamId(config), lastSyncedSequence: 0,
   lastSyncedManifest: { generatedAt: '', files: [] },
 });
-const after = await classifyStateFormat(statePath(root));
-if (after !== 'json') throw new Error('legacy fixture did not publish JSON authority');`;
-  await device.exec(["bun", "-e", script, root]);
+process.stdout.write(workspaceId);`;
+  const result = await device.exec(["bun", "-e", script, root, remoteUrl]);
+  const workspaceId = result.stdout.trim();
+  if (!workspaceId) throw new Error("legacy fixture did not return a workspace id");
+  return workspaceId;
 }
 
 /** Read logical state through the product adapter; state.json may contain JSON or Q. */

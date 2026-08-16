@@ -37,7 +37,17 @@ const ACCT = "acct_sync";
 const WS = "ws_sync";
 
 const remoteFor = (server: FakeServer, secrets: DeviceSecrets): E2eeRemote => harnessRemote(server, secrets, ACCT, WS, NOW + 5000);
-const cfgFor = (root: string, secrets: DeviceSecrets, remote: E2eeRemote): Promise<WorkspaceConfig> => harnessCfg(root, secrets, remote, WS);
+const cfgFor = async (root: string, secrets: DeviceSecrets, remote: E2eeRemote): Promise<WorkspaceConfig> => {
+  const cfg = await harnessCfg(root, secrets, remote, WS);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 0,
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+  return cfg;
+};
 const hex = (n: number) => n.toString(16).padStart(64, "0");
 const shaBytes = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 

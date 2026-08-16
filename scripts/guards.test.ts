@@ -30,7 +30,7 @@ async function makeFixture(options: { duplicateSplitName?: boolean; missingDedic
   const ordinary = options.duplicateSplitName ? ["duplicate", "duplicate"] : ["sync one", "sync two"];
   await put(root, "src/cli/sync-git/git-sync.test.ts", [...configured, ...ordinary].map((name) => `test(${JSON.stringify(name)}, () => {});`).join("\n"));
   await put(root, "src/cli/e2ee-sync.test.ts", 'test("e2ee transport", () => {});\n');
-  await put(root, "src/engine/git-nested.test.ts", 'test("nested one", () => {});\n');
+  await put(root, "src/cli/sync-git/git-nested.test.ts", 'test("nested one", () => {});\n');
   await put(root, "src/cli/prompt.ts", "export const prompt = true;\n");
   await put(root, "src/cli/prompt-ink.tsx", 'import React from "react";\nimport { render } from "ink";\nvoid React; void render;\n');
   if (options.strayImport) {

@@ -102,8 +102,8 @@ migrated legacy workspace also has that marker.
 
 Two FAST scenarios pin the lifecycle edges:
 
-- `sqlite-fresh-install`: bind-only `track` → explicit genesis via `rbox migrate`
-  before sequence 0's first sync → pair/track/genesis a second device → converge.
+- `sqlite-fresh-install`: bind-only `track` publishes genesis Q before sequence
+  0's first sync → pair/track/genesis a second device → converge.
 - `json-upgrade-path`: install an existing JSON-authority fixture through the
   compatibility/test writer, sync it without conversion, pair a genesis-SQLite
   peer on the same build, round-trip B→A, and require convergence while A remains JSON.
@@ -245,10 +245,18 @@ Runs persist A and B mode, SHA-256, observed `rbox --version`, and compiled host
 path in `report.json` and `report.md`. Different effective binary contents are
 refused unless the scenario explicitly declares dual-binary support; a declared
 differential also fails before scenario assertions if both guests report the same
-version. No current scenario declares dual-binary support. The SP-2.5 authority
-scenarios are same-build gates: `sqlite-fresh-install` proves genesis on both
-devices and `json-upgrade-path` proves candidate JSON↔SQLite compatibility, not
-released-old binary interoperability.
+version. `dual-binary-state` is the one declared differential gate. Run it with
+released 1.11.4 on A and the exact candidate on B:
+
+```sh
+bun run rig run dual-binary-state \
+  --binary-a /absolute/path/rbox-1.11.4-linux \
+  --binary-b /absolute/path/rbox-candidate-linux
+```
+
+The runner persists both canonical host paths, SHA-256 values, and observed
+versions. The SP-2.5 `sqlite-fresh-install` and `json-upgrade-path` scenarios
+remain same-build gates.
 
 ## What's next
 

@@ -10,7 +10,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { repoCtxFromDisk } from "../../cli/sync-git/git-state.js";
-import { acquireLock, type OwnedLock } from "../../engine/lockfile.js";
+import { acquireLock, type LockAcquireResult, type OwnedLock } from "../../engine/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../cli/sync-git/protocol-locks.js";
 import { repositoryIdentityForContext, repositoryIdentityHash } from "../../cli/sync-git/repo-lineage.js";
 import { ResetMemoryAdmissionError } from "../reset-io.js";
@@ -46,7 +46,7 @@ export interface HeldStatePlaneLocks {
 }
 
 /** The two admitted ways to be inside an exclusivity window (163:184). */
-export type EntryPoint = "upgrade-stop-window" | "foreground-migrate";
+export type EntryPoint = "foreground-migrate";
 export interface EntryProof {
   readonly entry: EntryPoint;
   readonly locks: HeldStatePlaneLocks;
@@ -101,6 +101,16 @@ export type StatePlaneLockStage =
   | "fenced-recheck"
   | "reset-recovery"
   | "body";
+
+/** The canonical state-lock publication failed before the operation body ran.
+ * Genesis translates this invocation-local value into its closed refusal copy;
+ * migration retains its existing outer error/report policy. */
+export class StateLockAcquisitionError extends Error {
+  constructor(readonly outcome: Exclude<LockAcquireResult, { status: "acquired" }>) {
+    super(`state-plane locks refused: the sync state lock is unavailable (${outcome.status})`);
+    this.name = "StateLockAcquisitionError";
+  }
+}
 
 interface RepositoryRequest extends RepositoryProtocolFenceRequest {
   readonly relPath: string;
@@ -286,7 +296,7 @@ async function runLockAttempt<T>(
     await options.onStage?.("fence");
     const acquired = await acquireLock(stateLockPath(root));
     if (acquired.status !== "acquired") {
-      throw new Error(`state-plane locks refused: the sync state lock is unavailable (${acquired.status})`);
+      throw new StateLockAcquisitionError(acquired);
     }
     const stateLock = acquired.lock;
     try {
@@ -324,10 +334,10 @@ async function runLockAttempt<T>(
  * can ever be consulted. This function promises a typed outcome, so that
  * measurement arrives as one, not as a `RangeError` out of the fence.
  *
- * The mutex's other two health axes are not rechecked here: it was acquired for
- * this exact root one statement earlier, and ownership is verified where the
- * answer is consumed rather than where the handle is made — admission's
- * exclusivity-window condition, which is re-called before the M6 rename.
+ * Ownership is then re-asserted with the same `assertHealthyOwnedSyncMutex` the
+ * borrowed-mutex entry uses. The handle was minted one statement earlier, so
+ * this is redundant by construction — which is the point: it is the assertion
+ * that would have caught a handle that reported healthy while holding nothing.
  */
 export async function withStatePlaneLocks<T>(
   root: string,
@@ -341,10 +351,16 @@ export async function withStatePlaneLocks<T>(
       if (workspaceSyncMutexDegraded(mutex)) {
         return {
           held: false,
-          refusal: { code: "degraded-fence", detail: mutex.degraded?.reason ?? "identity-unavailable" },
+          refusal: {
+            code: "degraded-fence",
+            detail: mutex.degraded?.reason ?? mutex.lockFailure?.reason ?? "identity-unavailable",
+          },
         };
       }
-      const restart = await runLockAttempt(root, mutex, readInventory, fn, options);
+      const restart = await runLockAttempt(
+        root, mutex, readInventory, fn, options,
+        () => assertHealthyOwnedSyncMutex(mutex, root),
+      );
       if (!restart.restart) return { held: true, value: restart.value };
     } catch (error) {
       if (error instanceof InventoryRefused) return { held: false, refusal: error.refusal };

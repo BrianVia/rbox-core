@@ -208,6 +208,12 @@ beforeEach(async () => {
   remote = new LoopRemote();
   cfgA = workspaceConfig(rootA, "device-A");
   cfgB = workspaceConfig(rootB, "device-B");
+  for (const [root, cfg] of [[rootA, cfgA], [rootB, cfgB]] as const) {
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg), stateNonce: "a".repeat(32), stateRevision: 0,
+      lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] },
+    });
+  }
   logsA = [];
   logsB = [];
   depsA = { remote, backoff: noBackoff, onGitLog: (line) => logsA.push(line) };

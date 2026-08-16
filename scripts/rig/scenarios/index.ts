@@ -19,6 +19,7 @@ import { worktreeSquashLifecycle } from "./worktree-squash-lifecycle.js";
 import { webPairing } from "./web-pairing.js";
 import { sqliteFreshInstall } from "./sqlite-fresh-install.js";
 import { jsonUpgradePath } from "./json-upgrade-path.js";
+import { dualBinaryState } from "./dual-binary-state.js";
 
 export const SCENARIOS = {
   "onboard-smoke": onboardSmoke,
@@ -40,6 +41,7 @@ export const SCENARIOS = {
   "chaos-restart": chaosRestart,
   "sqlite-fresh-install": sqliteFreshInstall,
   "json-upgrade-path": jsonUpgradePath,
+  "dual-binary-state": dualBinaryState,
 } satisfies Record<string, Scenario>;
 
 /**

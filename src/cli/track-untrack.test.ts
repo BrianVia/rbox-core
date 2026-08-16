@@ -6,9 +6,10 @@ import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
 import { main } from "./main-dispatch.js";
 import { withInteractionPolicy } from "./prompt-policy.js";
-import { findRoot, loadConfig, saveConfig } from "./config.js";
+import { findRoot, loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import { desiredStatePath } from "./autostart-cmd.js";
+import { folderCatalogPath } from "./rbox-paths.js";
 
 let dir: string;
 let home: string;
@@ -105,11 +106,18 @@ test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async (
   expect(await findRoot(root)).toBeUndefined();
 });
 
-test("track is bind-only: it persists config but does NOT create state.json (no first sync)", async () => {
+test("re-tracking a bound root with a lost folder catalog refuses instead of regenerating it", async () => {
+  const { root } = await track(dir, { workspace: "ws_abc123" }, "https://api.test");
+  await fs.rm(folderCatalogPath(), { force: true });
+  await expect(track(dir, { workspace: "ws_abc123" }, "https://api.test")).rejects.toThrow(/regenerate/);
+});
+
+test("track is bind-only: it persists config and Q but performs no first sync", async () => {
   const { root } = await track(dir, { workspace: "ws_x" }, "https://api.test");
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
-  // state.json is written by sync, not by track — proves no first sync happened.
-  await expect(fs.access(path.join(root, ".rbox", "state.json"))).rejects.toThrow();
+  expect(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8")).toMatch(/^RBOX-SQLITE-AUTHORITY-v1\n[0-9a-f]{32}\n$/);
+  const state = await loadState(root, syncStreamId(await loadConfig(root)));
+  expect(state.lastSyncedSequence).toBe(0);
 });
 
 test("untrack also removes the global daemon runtime dir (no orphans under ~/.rbox)", async () => {
