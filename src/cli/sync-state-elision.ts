@@ -17,13 +17,6 @@ import {
   type SyncState,
 } from "./sync-state-model.js";
 
-/** The snapshot a composition's elisions were proven against (§3.2b). It rides
- * the packet, and BOTH backends re-check it against live state under the lock. */
-export interface ElisionExpectation {
-  nonce: string;
-  stateRevision: number;
-}
-
 /** Pull-owned evidence, gathered before the state lock is taken. */
 export interface ElisionReceipt {
   /** The UNFILTERED reconcile action list was empty. `actions` is not that list:

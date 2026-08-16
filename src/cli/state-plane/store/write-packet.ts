@@ -6,8 +6,7 @@
  * the ones the sealed artifacts authenticate — never a caller's parallel claim. */
 import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
-import type { GlobalManifestMeta } from "../../sync-state-model.js";
-import type { ElisionExpectation } from "../../sync-state-elision.js";
+import type { ElisionExpectation, GlobalManifestMeta } from "../../sync-state-model.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { StageChangedError } from "../errors.js";

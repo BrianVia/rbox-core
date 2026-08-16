@@ -6,7 +6,6 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import type { JsonValue } from "../json.js";
-import type { ElisionExpectation } from "./sync-state-elision.js";
 import type { AcquireLockOptions, OwnedLock } from "../engine/lockfile.js";
 import type { ConfigStatToken } from "./sync-git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
@@ -349,6 +348,10 @@ export interface RepoTransition {
 
 export type FileOnlyManifest = Omit<Manifest, "gitRepos"> & { gitRepos?: never };
 
+/** The snapshot a composition's elisions were proven against (design 267 §3.2b).
+ * Both backends re-check it against live state under the canonical state lock. */
+export interface ElisionExpectation { nonce: string; stateRevision: number }
+
 export interface StateSavePacket {
   expectedStream: string;
   expectedNonce: string;
@@ -359,8 +362,8 @@ export interface StateSavePacket {
   elisionExpectation?: ElisionExpectation;
 }
 
-/** An accepted save of ANY kind advances stateRevision, so revision equality is
- * the one scalar proving nothing interleaved since the composer's load. */
+/** An accepted save of ANY kind advances stateRevision, so revision equality
+ * proves nothing interleaved since the composer's load. */
 export function elisionExpectationDrifted(packet: StateSavePacket, live: SyncState): boolean {
   const expected = packet.elisionExpectation;
   if (expected === undefined) return false;
@@ -376,9 +379,9 @@ export type StateSaveResult =
 
 export interface StateSaveOptions {
   lock?: AcquireLockOptions;
-  /** Design 267 §4: a complete caller-composed accepted state for a save whose
-   * every section was elided. The adapter overlays the CAS token fields onto it
-   * instead of re-reading the whole store. Every other save shape reads back. */
+  /** Design 267 §4: the accepted state a fully-elided save already holds. The
+   * adapter overlays the CAS token fields onto it instead of reading the whole
+   * store back. Every other save shape, and every rejection, still reads back. */
   acceptedProjection?: SyncState;
   /** Complete-reset fence already owns both the protocol state class and the
    * physical state lock. The writer must assert and reuse it, never re-enter. */

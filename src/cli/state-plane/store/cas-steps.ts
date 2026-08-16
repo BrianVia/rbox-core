@@ -9,9 +9,8 @@ import {
   composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue,
 } from "../../sync-git/base-composer.js";
 import {
-  validManifestMeta, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
+  validManifestMeta, type ElisionExpectation, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
-import type { ElisionExpectation } from "../../sync-state-elision.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
