@@ -197,9 +197,10 @@ export interface SealedArtifactRef {
 
 /**
  * Verify and open one sealed artifact by copy-while-hashing it into the lock-owned
- * private directory. After a priming read materializes SQLite's WAL index, the
- * copy and its sidecars are unlinked: from then on the connection reads anonymous
- * inodes that no pathname can reach, and cleanup is automatic on close.
+ * private directory. The copy keeps its private name for the accessor's lifetime —
+ * Apple's system SQLite cannot read an unlinked database — so isolation comes from
+ * the 0700 private directory only the held lock's owner can name, plus the byte
+ * hash proven during the copy. close() destroys the directory.
  */
 export function openSealedArtifact(
   directory: string,
@@ -239,14 +240,13 @@ export function openSealedArtifact(
     db = new Database(contained, { create: false, readonly: true });
     try {
       db.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA temp_store=FILE");
-      // The priming read proves the copy is a readable database before the
-      // names go. (Sealed artifacts are DELETE-mode; WAL-mode seals from
-      // builds before the darwin fix still verify on Linux and re-seal on retry.)
+      // The priming read proves the copy is a readable database. The copy KEEPS
+      // its name until close: Apple's system SQLite cannot read an unlinked
+      // database (every post-unlink read fails SQLITE_IOERR — field 2026-08-16
+      // Mac cutover), so containment rests on the 0700 private directory only
+      // the held lock's owner can name, plus the hash proof taken during copy.
       selectRow(db, "SELECT count(*) AS n FROM sqlite_schema");
-      for (const suffix of ["", ...SQLITE_SIDECARS]) fs.rmSync(`${contained}${suffix}`, { force: true });
     } catch (error) {
-      // The handle must never outlive the names: an unclosed anonymous inode is
-      // a leak nothing can reach to clean up.
       db.close();
       throw error;
     }
