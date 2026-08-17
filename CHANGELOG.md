@@ -34,8 +34,13 @@ All notable changes to rbox are recorded here. The format follows
 - If rbox genuinely cannot work out your folder configuration during an upgrade,
   it now leaves the running sync alone instead of stopping it, and prints the
   command that actually fixes it (`rbox config regenerate`) rather than
-  `rbox stop && rbox start`, which failed the same way. Each workspace is
-  decided on its own, so one unhappy folder no longer holds up the rest.
+  `rbox stop && rbox start`, which failed the same way.
+- Upgrades now decide each workspace's folder admission on its own, so one
+  folder rbox will not run (say, one it can no longer find) leaves that
+  workspace's sync running and untouched while every other workspace upgrades.
+  Rebuilding a missing folder configuration is still a whole-machine step: if
+  anything on the machine cannot be reproduced, no workspace is restarted until
+  you fix it.
 
 ## [2.0.0-beta.4] - 2026-08-16
 

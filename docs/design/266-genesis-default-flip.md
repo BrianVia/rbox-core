@@ -612,6 +612,35 @@ a lost catalog and a sole binding must refuse and be repaired, never silently
 regenerate. Gate: a lost-catalog + existing-binding root refuses through both the
 daemon and the re-track path.
 
+**Amendment 2026-08-17 (design 276 F1.3) — R4 RETIRED EARLY, and the daemon
+ruling above is DELIBERATELY REVERSED.**
+
+R4's deletion condition was "SP-4, once front-door catalog publication is atomic
+with the binding write". It is retired ahead of that condition because 276 F1.3
+subsumes the requirement rather than satisfying it: the capability is no longer
+narrowed to the operation that created the binding, so `admittedFirstBinding`,
+`initializeFolderCatalogAfterFirstBinding`, and the admitted/forbidden call-site
+split all disappear. `ensureFolderAuthority` now initializes an absent catalog
+whenever generation would omit NOTHING (zero skipped rows, zero unavailable
+evidence), whoever is asking — the crash window R4 existed for is covered by the
+same rule.
+
+The forbidden-call-site ruling (`reloadWorkspaceConfigIfChanged`,
+`installInitialFolderPolicy`) is reversed under the founder's ruling that #688
+is the #1 stable-tag blocker: a 1.x home is precisely "a lost catalog and a sole
+binding" from the daemon's point of view, so the protected refusal WAS the brick.
+What is preserved is the loss argument, now stated exactly: a row generation
+would DROP (skipped or evidence-unavailable) still refuses everywhere, and a
+`damaged` catalog keeps its consent gate. Labels and ordering are derived, and
+per-folder policy round-trips through the binding — see 276 F1.3 for the
+residual (catalog-only editors must persist policy into the binding) and its
+pin.
+
+The R4 gate above is replaced by: (a) a lost catalog whose every folder is a
+discoverable binding initializes through the daemon, `bootResume`, `rbox
+upgrade`, and the re-track path; (b) a lost catalog with any skipped row still
+refuses through all of them.
+
 ### 7.2 Current size and performance anchors
 
 At `44f0e917`, the corrected formerly blank anchors are `reset-state.ts` 461 /
