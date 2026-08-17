@@ -1,4 +1,5 @@
 import path from "node:path";
+import { workspaceRelativeRepo } from "./workspace-relative.js";
 import fs from "node:fs/promises";
 import { findRoot as findWorkspaceRoot } from "./config.js";
 import { rememberResolvedRoot } from "./binding-registry.js";
@@ -99,17 +100,6 @@ function workspaceRequiredError(): Error {
  *  workspace's background sync, and routes setup to the bare-`rbox` front door. */
 function startWorkspaceRequiredError(): Error {
   return new Error("Not inside a synced folder. Run `rbox` to get started, or pass the folder: rbox start <path>");
-}
-
-/** A repo argument as the workspace names it. Anything outside the workspace
- * throws, so a mistyped path refuses instead of reporting on nothing. */
-function workspaceRelativeRepo(root: string, arg: string): string {
-  const rel = path.relative(root, path.resolve(arg)).split(path.sep).join("/");
-  if (rel === "") return ".";
-  if (rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) {
-    throw new Error(`${arg} is not inside this synced folder`);
-  }
-  return rel;
 }
 
 async function resolveRoot(arg: string | undefined): Promise<string> {
@@ -701,45 +691,14 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "git": {
-      const sub = positional[0];
-      if (sub === "deferrals") {
-        if (positional.length !== 1 || (flags.brief === "true" && jsonMode)) {
-          fail("usage: rbox git deferrals [--brief | --json]");
-          break;
-        }
-        const root = await resolveRoot(undefined);
-        const { gitDeferralsCmd } = await import("./git/deferrals-command.js");
-        const code = await gitDeferralsCmd(root, { brief: flags.brief === "true", json: jsonMode }, { now: deps.now });
+      const { dispatchGitCommand, GitUsageError } = await import("./git/git-dispatch.js");
+      try {
+        const code = await dispatchGitCommand({ positional, flags, jsonMode, resolveRoot, now: deps.now });
         if (code !== 0) process.exitCode = code;
-        break;
+      } catch (error) {
+        if (!(error instanceof GitUsageError)) throw error;
+        fail(error.message);
       }
-      if (sub === "republish") {
-        const target = positional[1];
-        if (!target || positional.length !== 2) {
-          fail("usage: rbox git republish <repo> [--json]");
-          break;
-        }
-        const root = await resolveRoot(target);
-        const { gitRepublishCmd } = await import("./git/republish-command.js");
-        const code = await withWorkspaceSyncMutex(root, (syncMutex) =>
-          gitRepublishCmd(root, target, syncMutex, { json: jsonMode }, { now: deps.now }));
-        if (code !== 0) process.exitCode = code;
-        break;
-      }
-      const repo = positional[1];
-      const verb = positional[2] ?? "show-me";
-      if (sub !== "resolve" || !repo || positional.length > 3 || !["show-me", "take-theirs", "keep-mine"].includes(verb)) {
-        fail("usage: rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming]");
-        break;
-      }
-      const root = await resolveRoot(repo);
-      const { gitResolveCmd } = await import("./git/resolve-command.js");
-      const code = await gitResolveCmd(root, repo, verb as "show-me" | "take-theirs" | "keep-mine", {
-        json: jsonMode,
-        confirm: flags.confirm,
-        forceDiscardIncoming: flags["force-discard-incoming"] === "true",
-      });
-      if (code !== 0) process.exitCode = code;
       break;
     }
     case "shell-init": {

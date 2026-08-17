@@ -16,6 +16,8 @@ import type { CheckoutCapabilityProbe } from "../sync-git/checkout-txn.js";
 import type { SyncMutexOptions } from "../sync-mutex.js";
 import type { SyncDeps } from "../sync/deps.js";
 import type { PushResult } from "../sync/push.js";
+// TYPE-ONLY: no runtime edge, so this module stays the leaf its header promises.
+import type { ResolveOutput } from "./resolve-presentation.js";
 
 export type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 
@@ -51,6 +53,13 @@ export interface GitResolveDeps {
   hostname?: () => string;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** The decided, already-sanitized result of one invocation, handed over as a
+   * TYPED value. `rbox git resolve --under` runs the single-repo command in
+   * process and needs its outcome; without this it would serialize to JSON and
+   * reparse an `unknown` shape inside the same process, which is a parse with
+   * no boundary to justify it. Never a second output surface: emission is
+   * unchanged and this observer cannot alter it. */
+  observeOutput?: (output: ResolveOutput) => void;
   /** Test seam for heartbeat scheduling; production remains ten seconds. */
   progressIntervalMs?: number;
   /** Test seam for proving heartbeat lifecycle without waiting on wall time. */

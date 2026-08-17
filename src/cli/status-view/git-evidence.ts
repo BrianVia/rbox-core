@@ -71,11 +71,21 @@ export interface GitIncomingFacts {
  */
 export type GitEvidenceTier = "pinned" | "record" | "none";
 
+export interface GitLocalWork {
+  files: GitLocalFileChange[];
+  total: number;
+  /** Commits on this computer the last sync never carried away. */
+  commits: number;
+  /** Files git does not track. The take-theirs backup CANNOT contain these, and
+   * saying so is the whole point of the preview's "NOT copied" line. */
+  untracked: number;
+}
+
 export interface GitRepoEvidence {
   repo: string;
   tier: GitEvidenceTier;
   localBranch?: string;
-  local?: { files: GitLocalFileChange[]; total: number };
+  local?: GitLocalWork;
   incoming?: GitIncomingFacts;
   /** Files changed on BOTH computers — the lead risk number on every surface
    * that shows two sides. Only meaningful at tier `pinned`. */
@@ -157,7 +167,7 @@ function incomingTip(incoming: GitSection): IncomingTip {
 
 interface LocalSide {
   localBranch?: string;
-  local: GitRepoEvidence["local"];
+  local: GitLocalWork;
 }
 
 async function localSide(repoDir: string, base: GitSection | undefined, budget: Budget): Promise<LocalSide> {
@@ -172,7 +182,13 @@ async function localSide(repoDir: string, base: GitSection | undefined, budget: 
     const stat = await fs.stat(path.join(repoDir, file.path)).catch(() => undefined);
     if (stat) file.editedAt = stat.mtimeMs;
   }));
-  const side: LocalSide = { local: { files, total: files.length } };
+  const commits = Number.parseInt(
+    (await budget.run(() => read(repoDir, ["rev-list", "--count", `${anchor}..HEAD`]), "")).trim(), 10);
+  const untracked = (await budget.run(() => read(repoDir, ["ls-files", "--others", "--exclude-standard"]), ""))
+    .split("\n").filter(Boolean).length;
+  const side: LocalSide = {
+    local: { files, total: files.length, commits: Number.isFinite(commits) ? commits : 0, untracked },
+  };
   if (branch) side.localBranch = branch;
   return side;
 }

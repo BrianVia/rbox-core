@@ -17,6 +17,7 @@ import type { SyncMetrics } from "./metrics.js";
 import type { StatusRemoteHead } from "./status-view.js";
 import type { BriefAccountSummary } from "./status-view/brief.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
+import type { GitRepoEvidence } from "./status-view/git-evidence.js";
 import type { StatusDeferralDisplayDetails, StatusRefreshReceipt } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import type { LockingHealth } from "./sync-mutex.js";
@@ -24,6 +25,28 @@ import type { UpdateCheckState } from "./update-check.js";
 import type { FolderAdmission } from "./folder-inventory.js";
 
 export type StatusMode = "json" | "verbose" | "brief" | "git";
+
+/** Presentation-only options: none of them change WHICH repos are paused, so
+ * none of them reach the projection. */
+export interface StatusRenderOptions {
+  all?: boolean;
+  /** Design 273 S2: two-sided evidence, computed by the manual command that may
+   * spawn git. Absent on every ambient path, which keeps the listing renderable
+   * from state alone. */
+  evidence?: (row: GitDeferralRepoProjection) => GitRepoEvidence | undefined;
+  /** `rbox status --git <repo>`: the uncapped single-repo view instead of the
+   * grouped listing. */
+  repo?: string;
+}
+
+/** Exactly what the two Git-pause surfaces read from a detail projection. Named
+ * so `status-render-git.ts` does not have to import the whole projection type
+ * (and, through it, the renderer it is imported BY). */
+export interface StatusGitDetailSource {
+  git: StatusGitProjection;
+  hygieneDetails: StatusDeferralDisplayDetails;
+  now: number;
+}
 
 export interface StatusRequest<M extends StatusMode> {
   mode: M;

@@ -22,16 +22,17 @@ import {
   type BriefStatusSnapshot,
 } from "./status-view/brief.js";
 import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
-import { renderGitRepoDetail } from "./status-view/git-evidence-render.js";
-import { gitPauseCounts, loudRows, renderGitPauseListing, type EvidenceLookup, type GitPauseListingOptions } from "./status-view/git-story-render.js";
-import { sanitizeTerminalText } from "./status-view/text.js";
+import { gitPauseCounts, loudRows } from "./status-view/git-story-render.js";
+import { renderGitPauseSection, renderGitSingleRepo } from "./status-render-git.js";
+import { statusStaleLockDetail } from "./status-maintenance.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
-import { statusStaleLockDetail } from "./status-maintenance.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
-import type { StatusMode, WorkspaceStatusProjection } from "./status-contract.js";
+import type { StatusMode, StatusRenderOptions, WorkspaceStatusProjection } from "./status-contract.js";
+
+export type { StatusRenderOptions } from "./status-contract.js";
 
 type HaltProjection = Extract<WorkspaceStatusProjection<StatusMode>, { kind: "reset-halt" }>;
 type DetailProjection<M extends StatusMode> = Extract<WorkspaceStatusProjection<M>, { kind: "detail" }>;
@@ -76,19 +77,6 @@ function verboseWorkspaceHeading(workspace: DetailProjection<StatusMode>["worksp
   return `${style.bold("workspace")} ${label} ${style.dim(`· rbox ${RBOX_VERSION}`)}`;
 }
 
-/** Presentation-only options: `--all` changes how many rows print, not which
- * repos are paused, so it never reaches the projection. */
-export interface StatusRenderOptions {
-  all?: boolean;
-  /** Design 273 S2: two-sided evidence, computed by the manual command that may
-   * spawn git. Absent on every ambient path, which keeps the listing renderable
-   * from state alone. */
-  evidence?: EvidenceLookup;
-  /** `rbox status --git <repo>`: the uncapped single-repo view instead of the
-   * grouped listing. */
-  repo?: string;
-}
-
 /** Selects the one surface a projection's mode admits. */
 export function renderWorkspaceStatusSurface<M extends StatusMode>(
   projection: WorkspaceStatusProjection<M>,
@@ -106,28 +94,6 @@ export function renderWorkspaceStatusSurface<M extends StatusMode>(
     return { surface: "lines", lines: renderGitSingleRepo(projection as DetailProjection<"git">, options.repo, options), daemonRunning };
   }
   return { surface: "lines", lines: renderStatusBrief(projection as DetailProjection<"brief" | "git">, options), daemonRunning };
-}
-
-/** `rbox status --git <repo>` (design 273 S2). One repo, both sides, no group
- * summary and no per-group cap — the reader already narrowed the question. */
-function renderGitSingleRepo(
-  projection: DetailProjection<"git">,
-  repo: string,
-  options: StatusRenderOptions,
-): string[] {
-  const row = projection.git.projectedRepos.find((candidate) => candidate.repo === repo);
-  if (!row) return [`${sanitizeTerminalText(repo)} — git sync is not paused here.`];
-  const lines = renderGitRepoDetail(row, options.evidence?.(row), projection.now);
-  if (row.resolvable) {
-    lines.push("");
-    lines.push(`  See what's waiting:            rbox git resolve ${row.repo} show-me`);
-    lines.push(`  Keep this computer's work:     rbox git resolve ${row.repo} keep-mine`);
-    lines.push(`  Take the other computer's:     rbox git resolve ${row.repo} take-theirs --confirm <token from show-me>`);
-    lines.push(`  Preview either first:          add --dry-run`);
-  } else if (row.story.action.kind === "instruction") {
-    lines.push(`  ${row.story.action.text}`);
-  }
-  return lines;
 }
 
 export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender {
@@ -324,16 +290,7 @@ export function renderStatusBrief(
   // Design 273 S2: the grouped full-path listing replaces the per-repo
   // record/companion pair. That record grammar is untouched — it is the daemon
   // LOG line, whose redaction classifier is byte-frozen against it.
-  if (gitDetail) {
-    const listing: GitPauseListingOptions = {
-      now,
-      all: options.all === true,
-      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane),
-    };
-    if (options.evidence) listing.evidence = options.evidence;
-    lines.push("");
-    lines.push(...renderGitPauseListing(git.projectedRepos, listing));
-  }
+  if (gitDetail) lines.push(...renderGitPauseSection(projection, workspace.root, options));
   return lines;
 }
 

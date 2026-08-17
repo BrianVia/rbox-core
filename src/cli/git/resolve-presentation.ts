@@ -188,6 +188,7 @@ export function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps,
   const out = deps.stdout ?? console.log;
   const err = deps.stderr ?? console.error;
   const safe = safeResolveOutput(output, root);
+  deps.observeOutput?.(safe);
   if (json) {
     out(JSON.stringify(safe, (key, value) => typeof value === "string" && key !== "snapshot"
       ? value.replace(/\b[0-9a-f]{40}\b/gi, "[commit]")
