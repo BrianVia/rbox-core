@@ -667,3 +667,23 @@ test("a curated deferral detail projects and renders without touching displayRea
   expect(renderGitDeferralCompanion({ reason: "artifact", canResolve: false, canKeepMine: false }))
     .not.toContain(detail);
 });
+
+/** Curated prose is bounded at the RENDERER: a persisted record written by an
+ * older, wider, or corrupted author must never produce an unbounded line, and
+ * prose reads from its head, so the head is what survives. */
+test("an over-long persisted detail is head-truncated in the companion line", () => {
+  const long = `${"detail ".repeat(60)}tail-marker`;
+  const rendered = renderGitDeferralCompanion({
+    reason: "artifact", canResolve: false, canKeepMine: false, detail: long,
+  });
+
+  expect(rendered).not.toContain("tail-marker");
+  expect(rendered).toContain("…");
+  expect(rendered).toContain("detail detail");
+  const bare = renderGitDeferralCompanion({ reason: "artifact", canResolve: false, canKeepMine: false });
+  expect(Array.from(rendered).length - Array.from(bare).length).toBeLessThanOrEqual(121);
+  // A detail at the bound is rendered whole, with no ellipsis of its own.
+  const exact = "x".repeat(120);
+  expect(renderGitDeferralCompanion({ reason: "artifact", canResolve: false, canKeepMine: false, detail: exact }))
+    .toContain(exact);
+});

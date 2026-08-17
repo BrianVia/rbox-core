@@ -473,9 +473,7 @@ export function renderGitDeferralCompanion(input: {
   detail?: string;
 }): string {
   const presentation = gitDeferralReasonPresentation(input.reason);
-  // Curated at one author and path-free by contract, so it is sanitized but not
-  // tail-truncated the way an arbitrary path or branch label is.
-  const curated = input.detail ? ` ${sanitizeTerminalText(input.detail)}` : "";
+  const curated = input.detail ? ` ${boundedCuratedDetail(input.detail)}` : "";
   const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).${curated}`;
   if (input.reason === "stale-unattributed" && input.staleLockDetail) {
     const detail = input.staleLockDetail;
@@ -532,6 +530,17 @@ const truncateDetail = (d: string): string => {
   const clean = sanitizeTerminalText(d);
   const cps = Array.from(clean);
   return cps.length > DETAIL_MAX ? `…${cps.slice(-(DETAIL_MAX - 1)).join("")}` : clean;
+};
+
+/** Longest curated deferral `detail` rendered in the status companion line. */
+const CURATED_DETAIL_MAX = 120;
+/** Curated prose reads from its HEAD, so an over-long persisted value keeps the
+ *  head and loses the tail — the opposite of {@link truncateDetail}, which keeps
+ *  a path's meaningful basename. A persisted record written by an older, wider,
+ *  or corrupted author must never render an unbounded line. */
+const boundedCuratedDetail = (d: string): string => {
+  const cps = Array.from(sanitizeTerminalText(d));
+  return cps.length > CURATED_DETAIL_MAX ? `${cps.slice(0, CURATED_DETAIL_MAX - 1).join("")}…` : cps.join("");
 };
 
 /**
