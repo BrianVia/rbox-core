@@ -175,22 +175,27 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     bookkeeping: { promoteDaemonModeIntent: running },
   };
 
-  // Design 138 F2b: this branch precedes every state read. The classifier and
-  // health reader are both read-only, so a direct status invocation can explain
-  // an unsafe standing transaction without helping the daemon mutate its side-file.
-  const [resetInspection, resetHealth] = await Promise.all([
-    port.inspectResetJournal(root, syncStreamId(cfg)),
-    port.readResetHaltHealth(root),
-  ]);
+  // Design 138 F2b: this branch precedes every state read, and the classifier is
+  // read-only, so a direct status invocation can explain an unsafe standing
+  // transaction without helping the daemon mutate anything.
+  //
+  // Design 276 F2.4: the second halt source is the LIVE daemon's own lifecycle,
+  // projected through its ambient heartbeat, not the health-halt.json side-file
+  // — a file this surface no longer reads at all. It cannot outlive the
+  // condition by more than a heartbeat, and a dead daemon needs no file because
+  // status already reports `daemon.running === false`.
+  //
   // Design 276 F2.1: `w1` early-returns here as well. It is NOT a halt, but it
   // must never fall through to `readState`, whose recovery path would take the
   // workspace sync mutex and attempt a rival writer takeover against the live
   // daemon — the exact rivalry design 138 F2b makes status read-only to avoid.
-  if (resetInspection.status === "halt" || resetInspection.status === "w1" || resetHealth !== undefined) {
+  const resetInspection = await port.inspectResetJournal(root, syncStreamId(cfg));
+  const daemonHalted = observedDaemon.trustedAmbient?.resetLifecycle === "halted";
+  if (resetInspection.status === "halt" || resetInspection.status === "w1" || daemonHalted) {
     const halt: StatusHaltProjection & { probes: StatusHaltProbes } = {
       kind: "reset-halt",
       ...common,
-      halted: resetInspection.status === "halt" || resetHealth !== undefined,
+      halted: resetInspection.status === "halt" || daemonHalted,
       reason: resetInspection.status === "halt" ? resetInspection.reason : "recovering",
       probes: probes.mode === "brief" || probes.mode === "git"
         ? { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials) }

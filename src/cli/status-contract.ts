@@ -12,7 +12,6 @@ import type { AmbientWorkspaceObservation } from "./workspace-observation.js";
 import type { PathWarningsV1 } from "./path-warnings.js";
 import type { PopulateStatusV1 } from "./populate-status.js";
 import type { ResetSafetyInspection } from "./reset-halt-inspection.js";
-import type { ResetHaltHealthV1 } from "./reset-health.js";
 import type { SyncMetrics } from "./metrics.js";
 import type { StatusRemoteHead } from "./status-view.js";
 import type { BriefAccountSummary } from "./status-view/brief.js";
@@ -95,7 +94,6 @@ export interface StatusReadPort<M extends StatusMode> {
    * admission for the complete projection. */
   readFolderAdmission?: (root: string) => Promise<FolderAdmission>;
   inspectResetJournal: (root: string, stream: string) => Promise<ResetSafetyInspection>;
-  readResetHaltHealth: (root: string) => Promise<ResetHaltHealthV1 | undefined>;
   readState: (root: string, stream: string) => Promise<SyncState>;
   readPathWarnings: (root: string) => Promise<PathWarningsV1 | undefined>;
   readTrashStats: (root: string) => Promise<TrashStats | undefined>;

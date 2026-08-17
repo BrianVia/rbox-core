@@ -15,7 +15,6 @@ import { readPathWarnings } from "./path-warnings.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
-import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
 import { fetchWithDeadline } from "./remote/resilient.js";
 import type { BriefAccountSummary, BriefIdentitySource } from "./status-view/brief.js";
@@ -165,7 +164,6 @@ export function createStatusReadPort<M extends StatusMode>(mode: M, deps: Status
     readWorkspaceObservation: deps.observeWorkspace,
     readFolderAdmission: async (root) => observeFolderAdmission(root, await inspectFolderCatalog()),
     inspectResetJournal: inspectResetJournalSafety,
-    readResetHaltHealth,
     readState: loadState,
     readPathWarnings: deps.readPathWarnings ?? readPathWarnings,
     readTrashStats: (root) => trashStats(root).catch(() => undefined),

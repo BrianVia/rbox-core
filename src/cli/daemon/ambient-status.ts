@@ -31,6 +31,11 @@ export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degrad
 export type AmbientOperationKind = "pull" | "push";
 export type DaemonMode = "pull-only" | "read-write";
 export type AmbientWatcherTrust = "suspect" | "fused";
+/** Design 276 F2.4: the daemon's own reset-recovery lifecycle. Three halt
+ * reasons (bootstrap disagreement, a loadSyncBase throw, a non-terminal
+ * recovery) have no classifier signature, so this heartbeat-written projection
+ * is what keeps them visible to a status surface that reads no side-file. */
+export type AmbientResetLifecycle = "ready" | "halted" | "recovering" | "bootstrapping";
 
 export interface AmbientGitDeferral {
   repo: string;
@@ -66,6 +71,8 @@ export interface AmbientDaemonStatusV1 {
   attentionReason?: AmbientAttentionReason;
   /** Visibility-only watcher trust. Absence is unknown/old-writer, not trusted. */
   watcherTrust?: AmbientWatcherTrust;
+  /** Additive under schemaVersion 1: absence is an older writer, never "ready". */
+  resetLifecycle?: AmbientResetLifecycle;
   /** The rows a human is shown: quiet transients excluded (design 273 P5), so
    * this count and `rbox status --git` cannot disagree. */
   deferredRepos?: number;
@@ -129,6 +136,7 @@ export interface AmbientStatusProjectionInput {
   want?: Partial<Record<PumpOp, boolean>>;
   watcherDegraded?: boolean;
   trustState?: "trusted" | AmbientWatcherTrust;
+  resetLifecycle?: AmbientResetLifecycle;
   ownershipLost?: boolean;
   currentPath?: string;
   repoRecords?: Record<string, RepoRecord>;
@@ -138,6 +146,7 @@ const STATES = new Set<AmbientDaemonState>(["synced", "syncing", "attention", "p
 const MODES = new Set<DaemonMode>(["pull-only", "read-write"]);
 const REASONS = new Set<AmbientAttentionReason>(["halt", "out-of-storage", "watcher-degraded", "ownership-lost", "unknown-error"]);
 const WATCHER_TRUST = new Set<AmbientWatcherTrust>(["suspect", "fused"]);
+const RESET_LIFECYCLES = new Set<AmbientResetLifecycle>(["ready", "halted", "recovering", "bootstrapping"]);
 const PHASES = new Set<TransferPhase>(["scan", "gitcap", "encrypt", "upload", "download"]);
 const MUTATION_PHASES = new Set<MutationPhase>(["file-apply", "git-prepare", "git-commit", "state-cas"]);
 
@@ -296,6 +305,7 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
     operation: op,
     attentionReason: state === "attention" ? reason ?? "unknown-error" : undefined,
     watcherTrust: input.trustState === "suspect" || input.trustState === "fused" ? input.trustState : undefined,
+    resetLifecycle: input.resetLifecycle,
     deferredRepos,
     deferredNeedsYou: split.needsYou,
     deferredSelfHealing: split.selfHealing,
@@ -378,6 +388,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.bootId !== undefined && (typeof j.bootId !== "string" || j.bootId.length < 1 || j.bootId.length > 128 || /[\r\n\p{Cc}]/u.test(j.bootId))) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
     if (j.watcherTrust !== undefined && !WATCHER_TRUST.has(j.watcherTrust as AmbientWatcherTrust)) return undefined;
+    if (j.resetLifecycle !== undefined && !RESET_LIFECYCLES.has(j.resetLifecycle as AmbientResetLifecycle)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
     if (j.deferredNeedsYou !== undefined && !uint(j.deferredNeedsYou)) return undefined;
     if (j.deferredSelfHealing !== undefined && !uint(j.deferredSelfHealing)) return undefined;
@@ -394,6 +405,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.bootId !== undefined) out.bootId = j.bootId;
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
     if (j.watcherTrust !== undefined) out.watcherTrust = j.watcherTrust as AmbientWatcherTrust;
+    if (j.resetLifecycle !== undefined) out.resetLifecycle = j.resetLifecycle as AmbientResetLifecycle;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
     if (j.deferredNeedsYou !== undefined) out.deferredNeedsYou = j.deferredNeedsYou;
     if (j.deferredSelfHealing !== undefined) out.deferredSelfHealing = j.deferredSelfHealing;

@@ -2301,6 +2301,7 @@ export class RboxDaemon {
         watcherDegraded: watcherTrust.degraded,
         trustState: watcherTrust.state,
         ownershipLost: this.ownershipWindDownStarted,
+        resetLifecycle: this.resetLifecycle,
         currentPath: this.activeProgressPath,
         repoRecords: this.syncBase ? projectedRepoRecords(this.syncBase) : undefined,
       }),
