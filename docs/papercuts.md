@@ -651,3 +651,15 @@ Inspect each against its original (same path, without the
 the rest. A repo whose ONLY remaining comparable content is conflict copies
 defers with reason `conflict-copies` until you clear them — that hold is
 deliberate, not a permissions problem.
+
+## 2026-08-17 — git-lane status is illegible at fleet scale (founder-hit)
+Trying to answer "what exactly is wedged on FM and what would resolve do", the
+founder had to watch an LLM sed/awk around our own UX. Defects hit in one
+sitting: (1) `rbox status --git` ellipsizes repo paths ("…itiv/…"); (2) the
+headline count ("103 git repos need attention") does not match the enumerable
+listing (52 deferrals) and nothing names the other 51 (held repos are counted
+but never listed); (3) no complete machine-readable parity (`--json`
+git.deferrals is right, but nothing tells a human it exists or that headline ≠
+listing); (4) no `rbox git resolve --dry-run` / batch mode — per-repo verb
+only, so a 52-repo sweep means 52 hand-typed commands. A user without an agent
+cannot make this decision from our surfaces.
