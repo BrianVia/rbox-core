@@ -36,20 +36,22 @@ const isNonNegativeInteger = (v: number | undefined): v is number => v !== undef
 const isNonNegativeSafeInteger = (v: number | undefined): v is number => v !== undefined && Number.isSafeInteger(v) && v >= 0;
 const isObj = <T>(v: T): v is T & object => v !== null && typeof v === "object" && !Array.isArray(v);
 
-/** The wire shape of a device id: what device enrollment issues (`dev_<hex>`), what a
- *  client-supplied API key carries, and the environment-credential literal "env". */
-const DEVICE_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
+/** Manifest hygiene, not trust: enrollment is rigorous, so a device id is never
+ *  shape-policed (real ids include the environment-credential literal "env" and
+ *  client-supplied API keys). Only an unbounded one is refused. */
+export const MAX_DEVICE_ID_LENGTH = 200;
 /** True only for a primitive string: every other wire value differs from its own
  *  string spelling (`5 !== "5"`, `["a"] !== "a"`), so this narrows a value the
  *  declared type claims is a string without a runtime type interrogation. */
 const isWireString = (value: WireCandidate<string | undefined>): value is string => value === `${value}`;
 
-/** The ONE reader rule for `GitSection.deviceId` (design 274 D1), shared with the
- *  producer so the stamp is written and read against a single shape. A missing,
- *  mistyped, miscased, or oversized stamp reads as ABSENT — the section carries no
- *  author, never an error. */
+/** The ONE rule for `GitSection.deviceId` (design 274 D1), shared by the producer
+ *  and every reader so the stamp is written and read against a single contract. An
+ *  absent, mistyped, empty, or oversized stamp reads as ABSENT — the section simply
+ *  carries no author, never an error. Readers that DISPLAY the value sanitize it at
+ *  their own render boundary, exactly as they do server-supplied labels. */
 export const gitSectionDeviceId = (deviceId: WireCandidate<string | undefined>): string | undefined =>
-  isWireString(deviceId) && DEVICE_ID_RE.test(deviceId) ? deviceId : undefined;
+  isWireString(deviceId) && deviceId.length > 0 && deviceId.length <= MAX_DEVICE_ID_LENGTH ? deviceId : undefined;
 
 /** Pure check-ref-format subset for the only namespace design 130 admits. */
 function validTombstoneBranchRef(ref: string): boolean {
@@ -447,12 +449,12 @@ export function validateGitSection(input: WireCandidate<Partial<GitSection>>): G
   // whole manifest) fatal. The consuming config lane validates it, logs once,
   // and treats an invalid field as absent; Git state remains independently safe
   // to apply because none of the logic below consumes `config`.
-  // Design 274 D1: `deviceId` is an additive attribution field, validated by the SAME
-  // reader-tolerance rule as `config` above — a hostile, oversized, or mistyped stamp
-  // must never make the section (and therefore the whole manifest) fatal, because this
-  // validator also runs fail-closed inside the state codecs. `gitSectionDeviceId` is the
-  // one reader gate: everything that consumes the stamp goes through it and sees an
-  // out-of-shape value as no author at all.
+  // Design 274 D1: `deviceId` is an additive attribution field, tolerated by the SAME
+  // reader rule as `config` above — an empty, oversized, or mistyped stamp must never
+  // make the section (and therefore the whole manifest) fatal, because this validator
+  // also runs fail-closed inside the state codecs. `gitSectionDeviceId` is the one
+  // gate: everything that consumes the stamp goes through it and sees an unusable
+  // value as no author at all.
   // design 43 §2: refScope is mandatory — it gates apply-side ref deletion (§7).
   if (s.refScope !== "all" && s.refScope !== "scoped") return { ok: false, reason: "bad refScope" };
   return { ok: true };

@@ -116,9 +116,9 @@ export interface GitSection {
   refScope: GitRefScope;
   generatedAt: string;
   /** The device that CAPTURED this section (design 274 D1). Absent means the author
-   *  is unknown — an old writer, a carried pre-274 section, or a local id outside
-   *  the wire shape — and every reader degrades to unnamed copy. Never an identity
-   *  input: it is excluded from every key/fingerprint by construction. */
+   *  is unknown — an old writer or a carried pre-274 section — and every reader
+   *  degrades to unnamed copy. Never an identity input: it is excluded from every
+   *  key/fingerprint by construction. */
   deviceId?: string;
 }
 

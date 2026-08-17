@@ -108,9 +108,9 @@ export interface GitCaptureOptions {
    * live repository still equals it before returning a publish candidate. */
   resolution?: boolean;
   /** design 274 D1: this machine's device id, stamped as the section's author.
-   * Producer-omit: a value outside the wire shape is left off entirely rather
-   * than published, so a receiver never has to interpret one. Absent for the
-   * direct engine callers, which author nothing a receiver attributes. */
+   * The fleet's enrollment is trusted, so the value is not shape-policed; an
+   * empty or unbounded one is simply left off. Absent for the direct engine
+   * callers, which author nothing a receiver attributes. */
   deviceId?: string;
   /** Deterministic capture-race seams. Production never supplies these. */
   testHooks?: {

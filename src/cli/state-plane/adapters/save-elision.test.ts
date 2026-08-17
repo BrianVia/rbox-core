@@ -5,7 +5,7 @@
  * and reads the durable result back.
  */
 import { afterEach, expect, test } from "bun:test";
-import { canonicalManifestHashStreaming } from "../../../engine/index.js";
+import { canonicalManifestHashStreaming, type GitSection } from "../../../engine/index.js";
 import { manifestFromMeta, type StateSavePacket, type SyncState } from "../../sync-state-model.js";
 import { elisionReceipt } from "../../sync-state-elision.js";
 import { composeStateSavePacket, saveStateSource, type StateSource } from "../../sync-state.js";
@@ -212,4 +212,26 @@ test("the hash operand is the meta reconstruction, not the local git projection"
   expect(packets[0]!.global).toBeUndefined();
   expect(packets[0]!.elisionExpectation).toBeDefined();
   expect(saved).toStrictEqual((await loadRawState(seed.root))!);
+});
+
+test("274: a first-seen author stamp costs one non-elided save per repo, then elides again", async () => {
+  // Design 274 D1's second named receiver cost. `recordWouldNotChange` compares
+  // whole records, so the delta that first carries a `deviceId` the stored base
+  // lacks is a real record change: one repo transition, one repoGen bump. It
+  // happens once per repo and the steady state is elided exactly as before.
+  const seed = await seededSqlite("274-author-stamp");
+  const stamped = { ...SECTION, deviceId: "dev_desktop" };
+  const save = async (base: GitSection): Promise<string[]> => {
+    const state = (await loadRawState(seed.root))!;
+    const packets: StateSavePacket[] = [];
+    const source = pullSource({ ...seed, state }, { values: { bases: { repo: base } } });
+    await saveStateSource(seed.root, state, source, { apply: capturing(packets) });
+    return packets[0]!.repos.map((repo) => repo.relPath);
+  };
+
+  expect(await save(SECTION)).toEqual(["repo"]);
+  expect(await save(SECTION)).toEqual([]);
+  expect(await save(stamped)).toEqual(["repo"]);
+  expect(await save(stamped)).toEqual([]);
+  expect((await loadRawState(seed.root))!.repoRecords!.repo!.base).toEqual(stamped);
 });
