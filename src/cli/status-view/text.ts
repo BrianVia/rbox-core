@@ -75,3 +75,17 @@ export const boundedCuratedDetail = (d: string): string => {
 export function humanBytes(bytes: number): string {
   return formatDecimalBytes(bytes);
 }
+
+/** "paused 3 days" / "paused 2 hours" / "paused (since unknown)". The shared
+ * `ageBucket` clips to coarse floors ("1d" for a three-day wait), which reads as
+ * a measurement and understates every chronic pause. */
+export function pausedFor(iso: string, now: number): string {
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at) || at > now) return "paused (since unknown)";
+  const seconds = Math.floor((now - at) / 1000);
+  const say = (value: number, unit: string): string => `paused ${value} ${unit}${value === 1 ? "" : "s"}`;
+  if (seconds < 90) return "paused just now";
+  if (seconds < 5400) return say(Math.round(seconds / 60), "minute");
+  if (seconds < 86_400) return say(Math.round(seconds / 3600), "hour");
+  return say(Math.floor(seconds / 86_400), "day");
+}

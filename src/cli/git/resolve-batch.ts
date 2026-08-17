@@ -25,7 +25,8 @@
  */
 import { isInteractive, promptInput } from "../prompt.js";
 import type { GitDeferralRepoProjection } from "../status-view/git-projection.js";
-import { gitDeferralEvidence, type GitRepoEvidence } from "../status-view/git-evidence.js";
+import { gitDeferralEvidence } from "../status-view/git-evidence.js";
+import type { GitRepoEvidence } from "../status-view/git-evidence-model.js";
 import { sanitizeTerminalText } from "../status-view/text.js";
 import type { RepoRecordsByPath } from "../sync-state-model.js";
 import { repoDirOf } from "../sync-git/shared.js";

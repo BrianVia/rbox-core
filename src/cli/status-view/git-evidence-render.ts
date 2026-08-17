@@ -18,9 +18,8 @@
  * thing a person is deciding about: files you also changed here.
  */
 import type { GitDeferralRepoProjection } from "./git-projection.js";
-import type { GitIncomingFacts, GitLocalFileChange, GitRepoEvidence } from "./git-evidence.js";
-import { pausedFor } from "./git-story-render.js";
-import { sanitizeTerminalText } from "./text.js";
+import type { GitIncomingFacts, GitLocalFileChange, GitRepoEvidence } from "./git-evidence-model.js";
+import { pausedFor, sanitizeTerminalText } from "./text.js";
 
 /** Longest peer-authored commit subject rendered. A subject is one line of
  * prose; a longer one is an authoring accident or an attack, and either way the

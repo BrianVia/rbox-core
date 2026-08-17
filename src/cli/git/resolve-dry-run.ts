@@ -20,7 +20,7 @@
  */
 import path from "node:path";
 import { hashBytes } from "../../engine/hash.js";
-import type { GitRepoEvidence } from "../status-view/git-evidence.js";
+import type { GitRepoEvidence } from "../status-view/git-evidence-model.js";
 import type { GitResolveVerb } from "./resolve-contract.js";
 
 /** The exact directory `resolve-take-theirs.ts` passes to `quarantineLocal`.

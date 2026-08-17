@@ -10,6 +10,9 @@ import type { GitSection } from "../../engine/types.js";
 import { writePendingPins } from "../sync-git/pending-pins.js";
 import type { RepoRecord } from "../sync-state-model.js";
 import { gitDeferralEvidence } from "./git-evidence.js";
+import { renderGitRepoDetail } from "./git-evidence-render.js";
+import { projectGitDeferralRepos } from "./git-projection.js";
+import { gitPauseCounts, gitPauseHeadline, renderGitPauseListing, renderGitPauseSummary } from "./git-story-render.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -159,4 +162,58 @@ test("evidence spawns git; the projection it extends still spawns none", async (
   expect(spawns.length).toBeGreaterThan(0);
   // MANDATORY on every read: see the module header.
   expect(spawns.every((args) => args[0] === "--no-optional-locks")).toBe(true);
+});
+
+// ── the two disciplines evidence() must not break ────────────────────────────
+
+/** A real ESC byte, built rather than pasted so the source stays readable. */
+const ESC = String.fromCharCode(27);
+
+const projected = (reason: "local-edits" | "conflict") => projectGitDeferralRepos([{
+  repo: "acme/checkout",
+  deferral: {
+    lane: "apply", reason, deferredSince: "2026-08-14T00:00:00.000Z",
+    reasonSince: "2026-08-14T00:00:00.000Z", lastSeen: "2026-08-14T00:00:00.000Z",
+  },
+}], Date.parse("2026-08-17T00:00:00.000Z"));
+
+test("project() and every human surface it feeds spawn ZERO git processes", () => {
+  // Design 273 P1: the daemon, the status headline, doctor and the prompt
+  // sidecar all run this chain on every cycle. evidence() is the ONLY operation
+  // allowed to reach git, and it is reachable from manual commands alone.
+  const rows = projected("local-edits");
+  const spawns: string[][] = [];
+  setGitSpawnObserver((_root, args) => { spawns.push([...args]); });
+  const now = Date.parse("2026-08-17T00:00:00.000Z");
+  gitPauseHeadline(gitPauseCounts(rows));
+  renderGitPauseListing(rows, { now });
+  renderGitPauseSummary(rows, now);
+  renderGitRepoDetail(rows[0]!, undefined, now);
+  expect(spawns).toEqual([]);
+});
+
+test("a commit subject carrying terminal escapes renders inert and bounded", () => {
+  const rows = projected("conflict");
+  const hostile = `${ESC}[31mDANGER${ESC}[0m${"x".repeat(500)}`;
+  const lines = renderGitRepoDetail(rows[0]!, {
+    repo: "acme/checkout",
+    tier: "pinned",
+    localBranch: "main",
+    local: {
+      files: [{ path: `${ESC}[2Jsrc/pay.ts`, added: 1, removed: 0 }],
+      total: 1, commits: 1, untracked: 0,
+    },
+    incoming: {
+      branch: `${ESC}[1mmain`,
+      commitsAhead: 2,
+      newest: { subject: hostile, date: "2026-08-16T00:00:00.000Z" },
+      files: ["src/pay.ts"],
+    },
+    overlap: 1,
+  }, Date.parse("2026-08-17T00:00:00.000Z")).join("\n");
+  expect(lines).not.toContain(ESC);
+  expect(lines).toContain("DANGER");
+  // Bounded, not merely stripped: an unbounded peer string is its own defect.
+  expect(lines.split("\n").every((line) => line.length < 300)).toBe(true);
+  expect(lines).toContain("1 of them is a file you also changed here ⚠");
 });

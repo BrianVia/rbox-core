@@ -17,10 +17,12 @@
  * `git-render.ts`, whose head-truncation is part of a frozen redaction contract.
  */
 import type { GitDeferralRepoProjection } from "./git-projection.js";
-import { evidenceRisk, type GitRepoEvidence } from "./git-evidence.js";
+import { evidenceRisk, type GitRepoEvidence } from "./git-evidence-model.js";
 import { evidenceRowSuffix } from "./git-evidence-render.js";
 import { storyHeadline } from "./git-stories.js";
-import { boundedCuratedDetail, sanitizeTerminalText, truncateDetail } from "./text.js";
+import { boundedCuratedDetail, pausedFor, sanitizeTerminalText, truncateDetail } from "./text.js";
+
+export { pausedFor } from "./text.js";
 
 /** The evidence reading for one row, when the caller computed any. Absent for
  * every surface that must stay git-free, and for repos whose evidence degraded. */
@@ -46,19 +48,6 @@ const repos = (count: number): string => `${count} repo${count === 1 ? "" : "s"}
 
 const DAY_MS = 86_400_000;
 
-/** "paused 3 days" / "paused 2 hours" / "paused (since unknown)". The shared
- * `ageBucket` clips to coarse floors ("1d" for a three-day wait), which reads as
- * a measurement and understates every chronic pause. */
-export function pausedFor(iso: string, now: number): string {
-  const at = Date.parse(iso);
-  if (!Number.isFinite(at) || at > now) return "paused (since unknown)";
-  const seconds = Math.floor((now - at) / 1000);
-  const say = (value: number, unit: string): string => `paused ${value} ${unit}${value === 1 ? "" : "s"}`;
-  if (seconds < 90) return "paused just now";
-  if (seconds < 5400) return say(Math.round(seconds / 60), "minute");
-  if (seconds < 86_400) return say(Math.round(seconds / 3600), "hour");
-  return say(Math.floor(seconds / 86_400), "day");
-}
 
 /**
  * S1: the two-number split every glance surface shows. `undefined` when nothing

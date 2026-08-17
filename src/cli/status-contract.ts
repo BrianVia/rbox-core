@@ -17,7 +17,7 @@ import type { SyncMetrics } from "./metrics.js";
 import type { StatusRemoteHead } from "./status-view.js";
 import type { BriefAccountSummary } from "./status-view/brief.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
-import type { GitRepoEvidence } from "./status-view/git-evidence.js";
+import type { GitRepoEvidence } from "./status-view/git-evidence-model.js";
 import type { StatusDeferralDisplayDetails, StatusRefreshReceipt } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import type { LockingHealth } from "./sync-mutex.js";
