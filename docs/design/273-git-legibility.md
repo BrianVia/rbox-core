@@ -345,9 +345,15 @@ the split counts. `rbox git deferrals --json` schema stays; additive only.
 | device-label cache file | one refresh site off `rbox device list` wire call | labels join the signed roster |
 | `--dry-run`, `--under`, `--expect-repos`, `restore-backup` | resolve surface | none — they ARE the product fix |
 
-Zero new RepoRecord members; zero SQLite schema changes (the frozen-DDL
-fingerprint gate, state-plane schema/inventory bijection, and
-compat-matrix make any such change a breaking one — rejected).
+Zero new RepoRecord members; zero SQLite schema changes. Compat context
+(founder ruling, 2026-08-17): 2.0 runs only on the founder fleet —
+breaking state/wire changes are ALLOWED in this window. r2 still chooses
+zero schema changes because the pin/record-restore primitives are simpler
+than new persisted fields on the merits, not because a change is
+forbidden. Consequence for P4: `GitSection.deviceId` may ship as a plain
+first-class field now (still excluded from section identity by design
+choice, with the differential test) rather than as a compat-shaped
+optional.
 
 ## Protected functionality
 
