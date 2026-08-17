@@ -1,6 +1,13 @@
 # 276 — Upgrades are safe: un-brick 1.x→2.0 (#688) and stop the false W1 halts (#765)
 
-Status: DRAFT r1 (recon-grounded; every anchor verified by the recon pass)
+Status: r2 (r1 adversarial review REVISE — four HIGH clusters folded: the
+"lossless regeneration" concept deleted for the existing auto-init
+primitive; the liveStores consult relocated into the state-plane
+classifier; the short W1 backoff promoted to first-class; status halt
+visibility rebuilt on an ambient lifecycle projection instead of the
+poison-pill file. FOUNDER NOTE: F1.3 supersedes the 2026-08-13 #688
+de-scope ("externals start fresh; guard only") — today's ranking of #688
+as the #1 stable-tag blocker is read as fresh direction; veto if wrong.)
 Issues: closes #688, closes #765. Stable-tag blocker pair (the two ways an
 external user's upgrade leaves sync down or lying about being down).
 
@@ -51,54 +58,112 @@ anyway because :957 samples lifecycle before the pump at :958.
 1. **Containment (one line, ships regardless):** `restartDesiredDaemon`'s
    bare `catch {` surfaces `error.message` — the user sees
    "run `rbox config regenerate`" instead of a remedy that re-fails.
-2. **Up-front guard:** `restartDaemonsAfterUpgrade` checks folder
-   admission BEFORE the stop at upgrade-cmd.ts:163. If admission would
-   refuse, the daemon is left RUNNING on the old binary and the flow
-   reports exactly what to run — an upgrade must never trade a working
-   1.x daemon for a stopped 2.0 one.
-3. **Non-lossy auto-regenerate:** `prepareFolderRegeneration` already
-   computes the loss report (folder-config-cmd.ts:97+). When the
-   regeneration is provably LOSSLESS (empty loss description, no omitted
-   bindings), the upgrade/start path performs it automatically —
-   consent is for LOSS, not for the mechanical rewrite (the zero-binding
-   auto-path at folder-authority.ts:26 is precedent). Lossy cases keep
-   the consent gate and the honest message. Both message producers
-   (folder-catalog-publish.ts:179 AND folder-inventory.ts:99 "damaged")
-   updated — the recon proved a fix at one does not cover the other.
+2. **Up-front guard, PER WORKSPACE, via the existing seam:** the check
+   lives inside `cycleOneDaemon` BEFORE the `stop(root)` at
+   upgrade-cmd.ts:163 (a per-workspace refusal must not stop other
+   workspaces' daemons), and reuses the `trustedFolderAdmission` token
+   pattern `bootResume` already demonstrates (boot-resume.ts:45 →
+   daemon-state.ts:73 honors it and skips the re-check) — check and
+   restart become atomic in the sense that matters; residual TOCTOU is
+   bounded by the token's generation and by leaving the daemon running
+   on refusal. An upgrade must never trade a working 1.x daemon for a
+   stopped 2.0 one. ("Old daemon + new binary on disk" is already a
+   supported state: DEPLOYMENTS.md's binary-swap installer transits it on
+   every fleet upgrade, and compat-matrix.test.ts:264-273 pins the
+   dual-binary scenario — cited as evidence, not asserted.)
+3. **Auto-init on the ABSENT case (review-corrected — the "lossless
+   regeneration" concept is DELETED):** the #688 machine has NO catalog,
+   and the absent case has nothing to lose BY CONSTRUCTION — the
+   regeneration/consent machinery exists to REPLACE an existing catalog
+   and its "loss description" is a constant string (never empty;
+   folder-catalog-generate.ts:149-155 — r1's predicate was not
+   computable). The codebase already owns auto-init twice:
+   `initializeFolderCatalog` → `publishNoReplace` (catalog lock +
+   O_EXCL + durable rename + loser reconciliation,
+   folder-catalog-publish.ts:340-365) and
+   `initializeFolderCatalogAfterFirstBinding`
+   (folder-catalog-generate.ts:131-147). The fix is a GUARD WIDENING at
+   folder-authority.ts:26: auto-initialize when zero SKIPPED and zero
+   evidenceUnavailable bindings (not only zero bindings). Semantics are
+   proven round-trip-safe: generated catalogs snapshot per-folder policy
+   via `snapshotPreCatalogPolicy`, the exact inverse of
+   `folderPolicyFields` (pinned by folder-catalog-generate.test.ts:93);
+   labels/ordering are derived, which is loss only relative to a catalog
+   that existed. `damaged` (bytes exist, loss real) keeps the consent
+   gate verbatim; both message producers (folder-catalog-publish.ts:179
+   AND folder-inventory.ts:99) stay accurate.
+   FOUNDER SUPERSESSION NOTE: the 2026-08-13 #688 comment de-scoped
+   in-place upgrades to "up-front guard only". Today's #1-blocker
+   ranking is read as superseding that; with the concept deleted this is
+   a ~2-line guard widening on an existing owner, not a new mechanism.
+4. **bootResume covered (review finding — the SECOND bricked entry
+   point):** boot-resume.ts:32 calls `ensureFolderAuthority()` unguarded
+   before the loop, so autostart (login item / systemd) bricks every
+   workspace silently on a 1.x home. Because F1.3's fix lives at
+   `ensureFolderAuthority` (the one owner), bootResume heals with it;
+   validation covers it explicitly.
 
 ### F2 (#765) — W1 stops masquerading as a halt
 
-1. **Route, don't retune:** the adapter at reset-journal.ts:197-215 stops
-   flattening `w1` into `status:"halt"`; it becomes recoverable, so
-   `resetOperationBoundary` proceeds into the existing loadState-driven
-   recovery (`recoverOrdinaryWalCrash` path) instead of parking for an
-   hour. `enterResetHalt` gains the typed row (widen
-   ResetSafetyInspection's halt variant with the classifier row —
-   recovery.ts:155-158 already carries it) so genuinely terminal rows
-   (W2/W3/J0) keep the hour and the log gate, and readiness
-   (`remoteWakeup.setReady`) does not flap: W1 is "recovering", never
-   "halted".
-2. **Own-handle consult:** before classifying SW as W1, the boundary
-   consults the in-process `liveStores` registry
-   (store/open.ts:160-215, the existing
-   `ownedStateStoreWriterForReset`/`closeOwnedStateStoreReadersForReset`
-   seam): a live daemon-owned handle for state.db is decisive proof of a
-   live store, not a crash — the boot race becomes structurally
-   impossible within one process. Cross-process observers (the sqlite3
-   incident) are covered by recovery-instead-of-halt plus one short
-   re-inspection backoff; no new lock convention.
-3. **Status trusts the classifier:** status-projection.ts:181-195's
-   `|| resetHealth !== undefined` becomes classifier-only;
-   health-halt.json only decorates (haltedAt/prior reason), per
-   reset-health.ts:46-47's own authority comment. The one load-bearing
-   reader (`resetOperationBoundary`'s `persisted` at daemon.ts:1283 —
-   forces re-recovery after restart) is UNCHANGED. The test pinning the
-   wrong behavior (status-cmd.test.ts:365-374) inverts. `rbox doctor
-   reset-journal` already classifier-only — the two surfaces stop
-   disagreeing by construction.
-4. **"ready" stops lying:** daemon.ts:957 samples lifecycle AFTER the
-   first pump (or the ready line states "recovering") so the log cannot
-   print ready above a halt.
+1. **Route, don't retune — for the DAEMON; status renders w1 as
+   recovering WITHOUT falling through:** the adapter at
+   reset-journal.ts:197-215 stops flattening `w1` into `status:"halt"`
+   for recovery-capable callers; `resetOperationBoundary` proceeds into
+   the existing loadState-driven recovery (verified reachable:
+   inspectStanding w1 → settleStandingResetUnderHeldFence →
+   recoverOrdinaryWalCrash under the canonical state lock,
+   reset-journal.ts:337-345). `enterResetHalt` gains the typed row so
+   terminal rows (W2/W3/J0) keep the hour + log gate, and W1 is
+   "recovering" (readiness does not flap). CRITICAL carve-out (review
+   finding 7): `rbox status` keeps an EARLY RETURN on w1, rendered as a
+   non-halt "recovering" projection — it must NEVER fall through to
+   readState, whose loadState path would acquire the sync mutex and
+   attempt a rival W1 takeover against the live daemon (design 138 F2b:
+   status is read-only; a second-process status during the #765 trigger
+   would otherwise hard-error on "reset checkpoint remained busy").
+2. **Own-handle consult lives in the STATE-PLANE CLASSIFIER, not the
+   daemon boundary (review finding 8):** `inspectSqliteReset`/
+   `classifySqliteResetPredecode` consults the in-process `liveStores`
+   registry (store/open.ts:160-215; precedent: lifecycle.ts:58) — a
+   live owned writer handle for state.db proves SW is a live store, not
+   a crash. Every surface (daemon, status, doctor) then agrees for free,
+   and the deeper loadState→takeover path cannot race the process's own
+   handle either. Soundness: a crashed-and-restarted process has an
+   EMPTY registry (module-level WeakRef set) so a genuine crash is never
+   masked; worker threads / a second daemon have their own module
+   instance and fall back to today's behavior — stated, not implied.
+3. **Short W1 re-inspection backoff — FIRST-CLASS (review finding 9;
+   this, not routing, fixes the reported symptom):** when a w1-derived
+   recovery FAILS (e.g. checkpoint busy because a foreign reader is
+   still attached — store/open.ts:203), the daemon RE-INSPECTS first
+   (sidecars usually vanish minutes later; classifier steady → no halt
+   at all), else retries on a bounded short backoff (seconds, N
+   attempts), escalating to the existing hourly halt only after N.
+   Owner: the daemon reset-retry policy beside RESET_RECOVERY_RETRY_MS;
+   the short backoff must NOT shorten the halt log gate (the constant
+   currently does double duty — split it). Deletion condition: the
+   classifier gains cross-process ownership input.
+4. **Status halt visibility rebuilt on the ambient lifecycle (review
+   finding 10 — the stronger primitive; r1's classifier-only cut would
+   have DELETED real visibility):** three enterResetHalt reasons have no
+   classifier signature (bootstrapAgreement failure daemon.ts:1273;
+   loadSyncBase throw :1294-1296; non-terminal recovery :1301) and
+   health-halt.json is today their ONLY trace. Fix: project the daemon's
+   `resetLifecycle` into AmbientDaemonStatusV1 (heartbeat-written, so it
+   cannot outlive the condition by more than a heartbeat); status
+   renders halts from classifier ∪ live-ambient-lifecycle and DROPS its
+   health-halt.json read entirely. The file keeps exactly ONE reader
+   (resetOperationBoundary's persisted re-recovery trigger,
+   daemon.ts:1283) — one fewer authority than today, the stale-file
+   false halt dies, every daemon-side halt stays visible, and a dead
+   daemon needs no file (status already reports daemon.running===false).
+   status-cmd.test.ts:365 is design-138 visibility, NOT a bug pin — it
+   is preserved (via the ambient path), not inverted.
+5. **"ready" stops lying (backstop, not fix):** re-read resetLifecycle
+   after the first pump (daemon.ts:957-959) and pick the message; stays
+   honest even after F2.1/F2.2 remove the boot race. (The :953
+   setReady pre-sampling is self-correcting via enterResetHalt — noted
+   so nobody "fixes" it twice.)
 
 ## Protected functionality
 
@@ -124,15 +189,22 @@ anyway because :957 samples lifecycle before the pump at :958.
   auto-regenerates and restarts cleanly, (d) lossy case refuses with the
   loss report and keeps the old daemon up. Upgrade-restart admission
   test added to upgrade-daemons.test.ts (recon: no such test exists).
-- #765 red-first: (a) foreign-sidecar fixture (zero-byte -wal/-shm
-  beside a steady store) — today halts for an hour, fix recovers within
-  one boundary pass; (b) boot-race test: boundary inspection while a
-  live in-process writer handle is open classifies live-store, not W1;
-  (c) status with stale health-halt.json + clean classifier renders
-  syncing-normally-with-decoration (inverting status-cmd.test.ts:365);
-  (d) crash-rig W1 (real SIGKILL) still converges to S0 — the genuine
-  crash case must stay covered by recovery.ts's takeover, now reached
-  WITHOUT the hour wait; (e) ready-line ordering.
+- #765 red-first: (a) foreign-sidecar fixture — today halts an hour, fix
+  recovers within one boundary pass; WITH the reader still attached, the
+  assertion is "refused on short bounded backoff without a one-hour
+  halt", not merely "no halt" (anti-trivial-pass); (b) boot-race:
+  classifier consulted while a live in-process writer handle is open →
+  live-store, not W1; crashed-and-restarted process (empty registry) →
+  still W1 (genuine-crash non-masking); (c) `rbox status` performs ZERO
+  store mutation and takes NO workspace mutex while the classifier reads
+  w1 (the read-only property design 138 F2b protects); (d) a
+  bootstrapAgreement-failure halt is STILL visible in rbox status via
+  the ambient projection (the regression r1's cut would have shipped);
+  (e) stale health-halt.json + clean classifier + live daemon → syncing
+  normally; (f) crash-rig W1 (real SIGKILL) still converges to S0
+  without the hour wait; (g) ready-line ordering.
+- #688: bootResume on a 1.x-shaped home heals (the silent second entry
+  point).
 - Field acceptance: on one fleet host, `sqlite3 file:...?mode=ro` against
   the live store (the #765 trigger, deliberately) followed by a status
   check within a minute — syncing normally, no halt; and a full
@@ -144,10 +216,12 @@ anyway because :957 samples lifecycle before the pump at :958.
 
 | Mechanism | Owner | Deletion condition |
 |---|---|---|
-| up-front admission check in restartDaemonsAfterUpgrade | upgrade-cmd | 2.0 stable ubiquitous; 1.x support window ends |
-| lossless auto-regenerate branch | folder-authority (one owner, both message producers) | folder catalog v2 makes 1.x configs unrepresentable |
+| per-workspace admission check in cycleOneDaemon (trustedFolderAdmission token) | upgrade-cmd | 2.0 stable ubiquitous; 1.x support window ends |
+| absent-case auto-init guard widening | folder-authority (heals upgrade AND bootResume) | folder catalog v2 makes 1.x configs unrepresentable |
 | typed classifier row through ResetSafetyInspection | reset-journal adapter | reset plane v2 |
-| liveStores consult in the boundary | daemon resetOperationBoundary | classifier gains cross-process ownership input |
+| liveStores consult in classifySqliteResetPredecode | state-plane classifier | classifier gains cross-process ownership input |
+| short W1 re-inspection backoff (bounded, N attempts, then hourly) | daemon reset-retry policy (split from the log-gate constant) | classifier gains cross-process ownership input |
+| resetLifecycle in AmbientDaemonStatusV1 (replaces status's health-file read) | daemon heartbeat writer | reset plane v2 unified halt surface |
 
 ## Non-goals
 
