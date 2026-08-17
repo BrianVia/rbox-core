@@ -1,6 +1,7 @@
 # 274 — Sender device naming: "take via-desktop's version"
 
-Status: DRAFT r1
+Status: r2 (r1 adversarial review: REVISE, 9-point delta folded here; the
+identity-exclusion and carry claims survived adversarial checking)
 Origin: split from design 273 P4 (final serial review, r3.1); founder
 directive 2026-08-17: "Use the real device name like via-desktop." Root
 user report: Max — "keep-mine / take-theirs meant nothing."
@@ -12,12 +13,22 @@ this design needs NO breaking change — the field is additive everywhere.
 Every surface that today says "another computer" / "the other computer" /
 "your other computer(s)" names the actual computer when rbox knows it:
 "Waiting from via-desktop (branch main, 4 commits newer than yours)".
-Degrade chain, in order: server label → device id (`dev_a1b2c3d4`) →
-today's copy ("another computer"). A revoked device renders "a computer no
-longer on your account". NEVER a guessed name: the id comes from the
-section's own stamp, not from who last pushed the manifest (a carried
-section's pusher is routinely the wrong machine — the failure mode this
-design exists to avoid).
+Degrade chain, in order: server label → today's copy ("another
+computer"). The raw device id NEVER occupies the subject/possessive slot
+("take dev_a1b2c3d4's version" is a second meaningless token, worse than
+the generic copy for the non-technical users this serves); it may appear
+only as a parenthetical on the evidence header — "Waiting from another
+computer (dev_a1b2c3d4)" — for diagnostics. There is NO revoked rung: the
+device-list endpoint filters revoked rows out (apps/api/src/auth/
+devices.ts:19), so "revoked" is indistinguishable from "enrolled since
+last refresh" — rendering a status claim off absence violates the
+never-guess rule. (Server-side revoked rendering would need an API change
+— separate product decision, out of scope.) NEVER a guessed name: the id
+comes from the section's own stamp, not from who last pushed the manifest
+(a carried section's pusher is routinely the wrong machine).
+Possessive grammar: a label containing whitespace or an apostrophe drops
+to the non-possessive construction ("Taking the version from Brian's
+MacBook Pro") so copy never renders "…Pro's's version".
 
 ## D1. Stamp the author at capture: `GitSection.deviceId?`
 
@@ -26,11 +37,18 @@ design exists to avoid).
   positional on `capturePlannedGitSection` — shared.ts:278 already has 14;
   recon gap 1). Value: `cfg.deviceId` (workspace-config.ts:26). Optional so
   non-sync-git `captureGitState` callers are untouched.
-- Wire-additive, verified by recon:
-  - `validateGitSection` (manifest-validate.ts:394-437) tolerates unknown
-    keys; 274 adds explicit validation anyway — hostile-wire bound:
-    optional string, `^dev_[A-Za-z0-9-]{1,64}$`-shaped charset/length
-    check (it lands in render copy; recon risk 5).
+- Wire-additive, verified by recon + review:
+  - Validation is PRODUCER-OMIT + READER-TOLERATE (r1's strict reader
+    regex was a BLOCKER: real device ids include env-credential "env" and
+    client-supplied API-key ids `^[A-Za-z0-9_-]{8,96}$` without the dev_
+    prefix, and `validateGitSection` runs fail-closed inside the state
+    codecs — encodeGitSection/encodeRepoRecord — so a strict gate would
+    have made a CI/agent workspace author sections its own state plane
+    refuses to persist). Producer: stamp only when the local id matches
+    `^[A-Za-z0-9_-]{1,96}$`, else omit. Reader: an invalid/oversized
+    deviceId is treated as ABSENT and degrades to today's copy — same
+    rule as refScope (design 93 v12, manifest-validate.ts:428-433:
+    reader-side invalidity must never make the section/manifest fatal).
   - state codecs round-trip unknown fields (`canonicalJson` preserves;
     decode returns parsed object) — no schema change, no migration.
   - the server never sees sections (E2EE manifests; apps/api has no
@@ -47,42 +65,68 @@ design exists to avoid).
   so a future refactor cannot fold it in and churn held-skip/carry.
 - Forced audit checkpoints (the feature's compile fence): BOTH
   `GIT_SECTION_FIELD_COVERAGE` maps gain `deviceId: true`
-  (base-composer.ts:10-31 AND state-plane/codecs/coverage.ts) — they are
-  byte-identical duplicates; 274 unifies them into one imported map
-  (recon risk 9) rather than editing two.
+  (base-composer.ts:10-31 AND state-plane/codecs/coverage.ts:83-104).
+  They stay SEPARATE: they are two independent compile fences with
+  different audiences (composer-family audit vs codec audit); unifying
+  them would reduce a future field to one forced audit instead of two —
+  r1's "unification" was scope creep that weakened a safety property,
+  cut on review.
 - Known, intended substitution: `normalizeOutgoingGitSections`
   (publisher-tombstones.ts:199-201) replaces a re-captured section with
   the pending one when incoming keys match — the pending section is the
   true author's, so its deviceId winning is CORRECT; documented at the
   site with a test.
-- Named one-time churn: `sectionsDiffer` deep-equality
-  (plan-accumulator.ts:290) sees old-advertised (no field) vs new-capture
-  (field) as changed → one extra publish per repo per fleet host after
-  rollout. Accepted (founder fleet, beta window); stated in the PR body.
+- Churn ledger (review-corrected): the publish-side churn claimed in r1
+  likely DOES NOT EXIST — unchanged repos carry by object reference (the
+  !== short-circuit fires before deep equality), and changed repos already
+  differ via generatedAt; withdraw unless measurement shows otherwise.
+  The REAL one-time receiver-side costs, each once per repo:
+  - apply.ts:1229 steady-skip fast path misses once (stamped incoming vs
+    unstamped stored BASE), then self-heals (sanitize + composeRepoBase
+    both retain the stamp);
+  - sync-state-elision.ts:118 recordWouldNotChange misses once (repoGen
+    bump, CAS-token invalidation for concurrent readers).
+  Both named, both measured on one host in PR-A (perf-differential rule).
 - Old sections (every currently-paused repo) have no stamp → degrade
   chain's tail; names appear organically as repos re-capture.
 
-## D2. Device-label directory: `~/.rbox/device-labels/<accountId>.json`
+## D2. Device-label cache: `~/.rbox/device-labels.json`
 
 - Source of truth: `GET /v1/auth/devices` (existing; response
   `{devices:[{device_id,label,created_at,last_seen_at,last_seen_version,isSelf}]}`,
   auth-command-wire.ts:47, apps/api/src/auth/devices.ts:17-23). Labels
   default to hostname at login (device-login.ts:629), so "via-desktop"
   exists server-side today.
-- Cache file follows the machine-scoped `update-check.ts:39-82` pattern
-  exactly: RBOX_HOME-aware path, 0o700 dir / 0o600 file, tolerant
-  parse-to-undefined on any malformed field, TTL `due()` check. Keyed by
-  accountId (device lists are account-scoped; e2ee-keystore precedent).
-- Refresh owner (ONE writer): a daemon interval beside the update-check
-  timer (`runDeviceLabelRefreshIfDue`, daemon.ts:1323 pattern), TTL ~6h,
-  plus a free refresh whenever `rbox device list` runs. CLI render paths
-  only READ the cache — never fetch (status/resolve stay offline-fast).
-- Render helper (one owner, used by every surface):
-  `deviceDisplayName(deviceId, cache)` → label → id → undefined
-  (undefined = keep today's copy). Revoked entries render "a computer no
-  longer on your account". Labels are USER TEXT from the server: pass
-  through `sanitizeTerminalText` with a bound (~40 chars) at render, like
-  every other remote-authored string.
+- ONE machine-scoped file on the `account-profile.ts` pattern (NOT a
+  per-account directory — one credential document exists per machine, the
+  accountId is optional in legacy credentials so a keyed path can be
+  unconstructible, and a directory accumulates stale accounts with no
+  pruner): the file self-declares its `accountId`, guarded read returns
+  undefined on mismatch, 0o700/0o600, tolerant parse-to-undefined, TTL
+  check (update-check.ts:75-82 shape), cleared beside
+  `clearAccountProfile()` on logout. Display metadata, not internal
+  state — the plain-JSON/SQLite rule is satisfied deliberately (same
+  class as account-profile.json/update-check.json); stated here so the
+  state-plane reviewer sees it was decided, not defaulted.
+- Writers: N daemons on a multi-workspace host share the file — write
+  with `writeFileAtomic` and accept redundant refreshes after TTL
+  (r1's "ONE writer" was false; the daemon interval —
+  `runDeviceLabelRefreshIfDue`, src/cli/daemon/daemon.ts:1323 pattern,
+  TTL ~6h — is authenticated, unlike the update check it imitates).
+  Priming so daemon-less hosts aren't blind: populate at LOGIN
+  (device-login already holds a token, one listDevicesAuth call away) and
+  opportunistically from authenticated commands that already reached the
+  server (account-profile.ts:73 scheduleAccountProfileWrite shape —
+  fire-and-forget, failure-absorbing), plus `rbox device list`. CLI
+  render paths only READ — never fetch.
+- Render helper (one owner): `deviceDisplayName(deviceId, cache)` →
+  label → undefined (undefined = keep today's copy; the raw id is
+  NOT a rung — see Product bar). Labels are USER TEXT from the server:
+  through the existing `sanitizeTerminalText` + bound (~40 chars) at the
+  established sanitization boundary (git-evidence-render.ts:11), not a
+  new one. `isSelf` comes from the server response (devices.ts:22,
+  computed against the calling token) — recorded, not computed locally;
+  staleness after a re-pair is cosmetic.
 - `rbox device list --json` currently DROPS `label` (recon gap 6) — fixed
   here (additive JSON field).
 - Deletion condition: if labels ever join the signed device roster, the
@@ -94,6 +138,13 @@ Plumbing: `GitIncomingFacts` (git-evidence-model.ts:23-39) gains
 `deviceId?`/`deviceLabel?`, populated at git-evidence.ts:169/:206 — that
 alone reaches every 273-era surface. `GitResolveShow`/resolve-contract
 gains the field for `printShow` (recon gap 10: trace and thread it).
+The 273 story headline map is OUT OF SCOPE and stays literal data (its
+closed-table discipline is the r4 lesson; one row's marginal payoff does
+not justify function-valued rows). Names apply to: the group ACTION line
+(git-story-render.ts:140), the evidence renderers, dry-run, show-me, AND
+resolve-batch.ts (:110,:158,:159,:164,:170,:183 — the multi-repo surface
+most exposed to mixed senders; the mixed/unknown-sender rule below binds
+it explicitly).
 
 With a name (label or id) the copy becomes:
 - evidence header: `Waiting from via-desktop (branch main, 4 commits newer than yours):`
@@ -134,8 +185,7 @@ With a name (label or id) the copy becomes:
 | Mechanism | Owner | Deletion condition |
 |---|---|---|
 | `GitSection.deviceId?` (stamp at capture) | capture.ts composition point | wire v-next makes it required |
-| unified GIT_SECTION_FIELD_COVERAGE map | one shared module | none (replaces two duplicates — net -1 concept) |
-| `~/.rbox/device-labels/<accountId>.json` + daemon TTL refresh | the daemon refresh interval | labels join the signed roster |
+| `~/.rbox/device-labels.json` (accountId-self-declaring) + refresh sites | daemon interval + login/opportunistic priming; cleared on logout | labels join the signed roster |
 | `deviceDisplayName` render helper | status-view (or shared text module) | none — it IS the product fix |
 
 ## Validation
@@ -150,24 +200,35 @@ With a name (label or id) the copy becomes:
   validateGitSection; hostile LABEL from the server renders sanitized and
   bounded.
 - Cache: malformed file → undefined (tolerant parse); TTL respected;
-  missing cache → id fallback; revoked → "no longer on your account";
-  accountId keying (two accounts don't cross labels).
+  missing cache/unknown id → generic copy (no id rung, no revoked rung).
 - Degrade: unstamped section (every pre-274 pause) renders today's copy
   verbatim — zero regression on existing fleet state (replay the 273
   field fixtures unchanged).
 - One-time publish churn measured on one host and named in the PR body.
 - Surfaces: banned-word suite still green; singular/plural with names;
   mixed-sender group keeps generic copy (test).
+- Steady-skip + write-elision one-time misses measured on one host
+  (before/after per the perf close-out rule); publish-churn claim
+  verified absent or withdrawn with evidence.
+- Cache: mismatched accountId → undefined; logout clears; atomic write
+  under concurrent daemons; possessive-grammar rule fixture (whitespace
+  and apostrophe labels).
 - Field acceptance: after fleet roll + one capture cycle on desktop, the
   Mac/FM listings name `via-desktop` for newly-paused desktop-authored
   changes.
 
-## Sequencing
+## Sequencing (two PRs — review-corrected)
 
-One PR (stamp + validation + coverage-map unification + cache + renders +
-tests). No prerequisite decompositions: touched large files
-(resolve-presentation 222, git-evidence-render, git-stories 148) all have
-headroom; doctor-triage.ts is NOT touched (7-byte ratchet).
+1. **PR-A (sync-plane, user-visibly inert):** the stamp + producer-omit
+   shape gate + reader tolerance + both coverage-map rows + identity
+   regression locks + the two one-time-miss measurements. Bakes on the
+   fleet so the field exists on receivers before any copy promises it.
+2. **PR-B (pure Adapter):** label cache + priming + deviceDisplayName +
+   the ~15 copy sites + possessive rule + mixed-sender rule. Revertible
+   alone.
+No prerequisite decompositions: touched large files (resolve-presentation
+222, git-evidence-render, git-stories 148) have headroom; doctor-triage.ts
+is NOT touched (7-byte ratchet).
 
 ## Non-goals
 
