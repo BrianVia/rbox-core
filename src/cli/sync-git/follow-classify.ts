@@ -227,7 +227,9 @@ export async function classifyCheckout(args: {
   const reason = firstReason(reasons);
   const provenance = args.boundary ? "boundary" as const : "checkout" as const;
   const blockers = [...reasons].map((item) => blockerForReason(item, provenance, details.join("; ")));
-  return reason
-    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
-    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
+  const classified: CheckoutClassification = reason
+    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false }
+    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived };
+  if (breadcrumbVetoGate) classified.breadcrumbVetoGate = breadcrumbVetoGate;
+  return classified;
 }

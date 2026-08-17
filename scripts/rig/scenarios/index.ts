@@ -21,6 +21,7 @@ import { webPairing } from "./web-pairing.js";
 import { sqliteFreshInstall } from "./sqlite-fresh-install.js";
 import { jsonUpgradePath } from "./json-upgrade-path.js";
 import { dualBinaryState } from "./dual-binary-state.js";
+import { pullOnlyConflictCopies } from "./pull-only-conflict-copies.js";
 
 export const SCENARIOS = {
   "onboard-smoke": onboardSmoke,
@@ -44,6 +45,7 @@ export const SCENARIOS = {
   "sqlite-fresh-install": sqliteFreshInstall,
   "json-upgrade-path": jsonUpgradePath,
   "dual-binary-state": dualBinaryState,
+  "pull-only-conflict-copies": pullOnlyConflictCopies,
 } satisfies Record<string, Scenario>;
 
 /**
@@ -80,6 +82,10 @@ export const SCENARIOS = {
  * goes GREEN on today's defective product and RED once p-settlement is fixed.
  * Wiring a scenario that passes on a live defect into a gate would be worse than
  * useless. Run it on demand: `bun run rig run git-rebuild-settlement`.
+ * pull-only-conflict-copies is EXCLUDED for now (design 272 §7): it is the only
+ * scenario that drives `rbox start --pull-only`, and it has not yet run against a
+ * live container fleet. An unmeasured scenario does not belong in the every-PR
+ * gate; run it on demand and promote it once a real run is on record.
  */
 export const FAST_SUITE = [
   "sqlite-fresh-install",

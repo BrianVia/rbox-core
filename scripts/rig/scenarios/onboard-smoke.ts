@@ -29,7 +29,7 @@ export const onboardSmoke: Scenario = {
       // Provision: seed the ~100-file corpus + a deterministic symlink (historic
       // shapes), then the full bootstrap→push→pair→join→pull handshake.
       await provisionPair(ctx, rec, {
-        seedShape: "tiny",
+        corpus: "tiny",
         seedNum: 1,
         afterSeedA: async (a) => {
           await a.exec(["sh", "-c", `cd '${GUEST.workDir}' && printf 'rig' > ${SYMLINK_TARGET} && ln -s ${SYMLINK_TARGET} ${SYMLINK}`]);

@@ -47,6 +47,7 @@ decision — a guard-armed hold gets its OWN deferral reason, `conflict-copies`
 (§2.7) — and r5's B-r5-1/B-r5-2, r4's B-r4-1…B-r4-5, r3's D1/D2, r2's
 B1/R1–R5/m1–m3 and r1's C1/C2/M3–M7/m8–m10 all held.)
 Every file:line below re-verified against `main` on 2026-08-16.
+Implementation deviations: `notes/272/IMPL-DEVIATIONS.md`.
 
 Evidence: GH #659 (re-scoped 2026-08-16) — FM wedged 103 repos for 20+ hours
 on 944 of rbox's OWN `.conflict.*` copies. Recon proved the oracle already

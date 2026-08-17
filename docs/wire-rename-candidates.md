@@ -130,3 +130,14 @@ Format: field — file:line — suggested name — blast radius.
   leave the two spellings disagreeing.
 - **Status:** deliberately NOT renamed by design 269's lint sweep — a
   cross-module contract owned by the git plane, out of that fold's scope.
+
+## `git-shapes` (rig scenario id)
+
+- **Anchor:** `scripts/rig/scenarios/index.ts:12,35` (`gitShapes`),
+  `scripts/rig/scenarios/git-shapes.ts` (`name: "git-shapes"`).
+- **Suggested name:** `git-layouts` — the scenario walks repository LAYOUTS
+  (nested, pointer, bare, submodule), not "shapes".
+- **Blast radius:** the id is typed by hand
+  (`bun run rig run git-shapes`) and recorded in every rig report. The symbol deliberately matches the id;
+  renaming only the symbol would make the registry disagree with the CLI. Flip
+  both together when the rig's scenario vocabulary next changes.

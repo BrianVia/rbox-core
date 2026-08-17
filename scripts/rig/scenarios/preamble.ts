@@ -23,8 +23,8 @@ import { parsePairToken } from "./types.js";
 export const CONCURRENCY = "16";
 
 export interface ProvisionOpts {
-  /** Seed a deterministic corpus on A before init (shape name, e.g. "tiny"). */
-  seedShape?: string;
+  /** Seed a deterministic corpus on A before init (generator name, e.g. "tiny"). */
+  corpus?: string;
   /** Corpus seed (content varies, shape fixed). Default 1. */
   seedNum?: number;
   /** Extra per-device seeding on A after the corpus, before init (e.g. a symlink). */
@@ -152,9 +152,9 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
 
   // 2. A: seed corpus (optional) + any scenario-specific extra (symlink, …). The
   //    workspace dir must exist before init even when nothing is seeded.
-  if (opts.seedShape) {
+  if (opts.corpus) {
     await rec.step("[A] seed corpus", async () => {
-      await ctx.a.seedCorpus(GUEST.workDir, opts.seedShape!, opts.seedNum ?? 1);
+      await ctx.a.seedCorpus(GUEST.workDir, opts.corpus!, opts.seedNum ?? 1);
       if (opts.afterSeedA) await opts.afterSeedA(ctx.a);
     });
   } else {

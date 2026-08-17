@@ -373,8 +373,8 @@ export class Device {
    * (shape, seed) → byte-identical tree; the shape deliberately includes empty and
    * duplicate-content files (design 56 §9 regression shapes).
    */
-  async seedCorpus(dir: string, shape: string, seed: number): Promise<void> {
+  async seedCorpus(dir: string, corpusName: string, seed: number): Promise<void> {
     await this.mkdirp(dir);
-    await this.exec(["bun", GUEST.corpusEntry, dir, shape, String(seed)]);
+    await this.exec(["bun", GUEST.corpusEntry, dir, corpusName, String(seed)]);
   }
 }

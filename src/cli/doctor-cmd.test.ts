@@ -180,7 +180,7 @@ async function makeWorkspace(): Promise<string> {
 function recordFetches(): string[] {
   const calls: string[] = [];
   globalThis.fetch = ((input: RequestInfo | URL) => {
-    calls.push(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+    calls.push(input instanceof URL ? input.toString() : input instanceof Request ? input.url : input);
     return Promise.resolve(new Response("disabled in test", { status: 503 }));
   }) as typeof fetch;
   return calls;

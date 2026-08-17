@@ -178,16 +178,13 @@ export function freshBriefActive(
   const raw = daemonRunning ? activity?.active : undefined;
   const age = raw ? now - Date.parse(raw.at) : Number.POSITIVE_INFINITY;
   if (!raw || !Number.isFinite(age) || age < 0 || age >= ACTIVE_STALE_MS) return undefined;
-  return {
-    phase: raw.phase,
-    done: raw.done,
-    total: raw.total,
-    ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
-    ...(raw.bytesDone !== undefined ? { bytesDone: raw.bytesDone } : {}),
-    ...(raw.bytesTotal !== undefined ? { bytesTotal: raw.bytesTotal } : {}),
-    ...(raw.bytesPerSecond !== undefined ? { bytesPerSecond: raw.bytesPerSecond } : {}),
-    ...(raw.etaSeconds !== undefined ? { etaSeconds: raw.etaSeconds } : {}),
-  };
+  const progress: BriefTransferProgress = { phase: raw.phase, done: raw.done, total: raw.total };
+  if (raw.detail !== undefined) progress.detail = raw.detail;
+  if (raw.bytesDone !== undefined) progress.bytesDone = raw.bytesDone;
+  if (raw.bytesTotal !== undefined) progress.bytesTotal = raw.bytesTotal;
+  if (raw.bytesPerSecond !== undefined) progress.bytesPerSecond = raw.bytesPerSecond;
+  if (raw.etaSeconds !== undefined) progress.etaSeconds = raw.etaSeconds;
+  return progress;
 }
 
 export const WS_TRUST_MS = 60_000;
@@ -428,10 +425,10 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       remediationClass,
       canResolve,
       canKeepMine,
-      ...(additional.length ? { alsoDeferred: `Also deferred: ${additional.join("; ")}.` } : {}),
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
-      ...(checkout === undefined ? {} : { checkout }),
     };
+    if (additional.length) row.alsoDeferred = `Also deferred: ${additional.join("; ")}.`;
+    if (checkout !== undefined) row.checkout = checkout;
     if (display.detail !== undefined) row.detail = display.detail;
     projected.push(row);
   }
