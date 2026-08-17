@@ -39,7 +39,7 @@ const isObj = <T>(v: T): v is T & object => v !== null && typeof v === "object" 
 /** Manifest hygiene, not trust: enrollment is rigorous, so a device id is never
  *  shape-policed (real ids include the environment-credential literal "env" and
  *  client-supplied API keys). Only an unbounded one is refused. */
-export const MAX_DEVICE_ID_LENGTH = 200;
+const MAX_DEVICE_ID_LENGTH = 200;
 /** True only for a primitive string: every other wire value differs from its own
  *  string spelling (`5 !== "5"`, `["a"] !== "a"`), so this narrows a value the
  *  declared type claims is a string without a runtime type interrogation. */
