@@ -1,7 +1,8 @@
 # 273 — Git-lane legibility: one evidence model, plain-English surfaces
 
-Status: r3 (r1: two adversarial lanes, REVISE ×2, folded; r2: final serial
-review, REVISE with a bounded delta, folded here). Scope cuts in r3: P4
+Status: ALIGNED r3.1 (r1: two adversarial lanes, REVISE ×2, folded; r2:
+final serial review, REVISE with bounded delta, folded; r3 delta-confirm:
+ALIGNED, editorial residuals R1-R5 folded in r3.1). Scope cuts: P4
 (sender deviceId + label cache) split to its own follow-up design;
 `rbox git restore-backup` split to its own small design, with 273's batch
 take-theirs DEPENDING on it landing first.
@@ -155,6 +156,12 @@ ahead-count, and the incoming file list straight from git — always fresh,
 no cache, no staleness, no schema change, no old-binary tier for NEW
 pauses. Cost (named trade): retained pack objects for the hold's lifetime.
 
+Tier-1 evidence rests on imported objects surviving until gc; unreachable
+objects are protected by `gc.pruneExpire` (default 2 weeks), a
+user-configurable knob — a repo pruned early (e.g. `gc.pruneExpire=now`)
+degrades to tier 2, never to a broken read (every git read tolerates
+missing objects by falling back a tier).
+
 Degrade ladder (per repo, field-by-field, never blocking):
 1. pin present → full two-sided evidence;
 2. no pin (pre-273 pause, or pre-follow deferrals like `unsupported`/
@@ -172,8 +179,8 @@ Final review: P4 is a wire field + an identity-exclusion analysis across
 `gitIncomingKey`/carry fingerprints + a new local label cache + a
 revocation degrade chain — its own design (claims number 274). In 273,
 every surface says "another computer" (honest, and already the shipped
-vocabulary, resolve-presentation.ts:42-51); the projection carries an
-optional device-label slot so 274 plugs in without re-touching renderers.
+vocabulary, resolve-presentation.ts:42-51). 274 adds its own label slot
+when it has a value to put in it — no speculative field here.
 PRODUCT NOTE for the founder: Max's "name the actual computer" ask
 arrives one design later, not in 273's first ship.
 
@@ -360,13 +367,18 @@ Taking the other computer's version would:
   - NOT copy: 2 brand-new files you never added to git, and ignored
     files — those stay where they are on disk, untouched
 To actually do it, run the same command without --dry-run.
-Undo later with: rbox git restore-backup conductor-workspaces/acme/checkout-flow
+Your backup would be saved at .rbox/git-quarantine/1f3a9c2e8b7d4a01/ — keep it until you're sure.
 ```
+
+(The "Undo later with: rbox git restore-backup <repo>" closing line is
+GATED on the restore design (275) shipping its command — until then the
+dry-run points at the directory only; never print a command that does not
+exist.)
 
   (Real path, real contents: quarantineLocal bundles syncable refs + a
   `git stash create` of tracked modified/staged content + index/op-state
   copies — quarantine.ts:18-45. Copy never promises more.)
-- **`rbox git restore-backup` — SPLIT to its own design (#762's
+- **`rbox git restore-backup` — SPLIT to design 275 (#762's
   completion).** The final review moved it out (review clustering +
   its own safety surface): restore must materialize into an ISOLATED
   `git worktree add .rbox/git-restored/<ts>` — never the current
@@ -429,8 +441,9 @@ the split counts. `rbox git deferrals --json` schema stays; additive only.
 | per-row `quiet` flag (single computation of the transient rule) | the projection | 2.0 unified pause record |
 | `--dry-run`, `--under`, `--expect-repos` | resolve surface | none — they ARE the product fix |
 
-(Moved out: `GitSection.deviceId` + device-label cache → design 274;
-`restore-backup` → its own design; both referenced above.)
+(Moved out: `GitSection.deviceId` + device-label cache → design 274
+"sender attribution"; `restore-backup` → design 275 "git backup restore";
+numbers claimed now per playbook.)
 
 Zero new RepoRecord members; zero SQLite schema changes. Compat context
 (founder ruling, 2026-08-17): 2.0 runs only on the founder fleet —
@@ -520,8 +533,7 @@ optional.
   and deferrals --json (quiet-labeled), absent from headline/prompt.
 - Batch boundary check calls the identical snapshotId
   (resolve-command.ts:176-178); --expect-repos mismatch refuses.
-- P4: identity functions exclude deviceId (differential incomingKey/carry
-  test); revoked/missing label degrade chain.
+- (deviceId/label validation rows belong to design 274, not here.)
 - Evidence safety: zero git spawns on daemon path
   (setGitSpawnObserver); no `.git/index` mtime/content change after
   `status --git` on a dirty repo; per-repo timeout degrade.
