@@ -9,6 +9,15 @@ import { readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { beginResetJournal, resetJournalPath } from "../reset-journal.js";
 import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
 import { acquireLock } from "../../engine/lockfile.js";
+import { Database } from "bun:sqlite";
+import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../state-plane/locks.js";
+import { runMigration } from "../state-plane/migration/authority.js";
+import { sqliteResetPaths } from "../state-plane/paths.js";
+import {
+  RESET_RECOVERY_RETRY_MS,
+  RESET_WAL_CRASH_RETRY_ATTEMPTS,
+  RESET_WAL_CRASH_RETRY_MS,
+} from "./reset-halt-policy.js";
 
 interface HaltInternals {
   cache: HashCache;
@@ -16,6 +25,7 @@ interface HaltInternals {
   resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping";
   resetHaltIdentity?: string;
   resetRetryTimer?: ReturnType<typeof setTimeout>;
+  nextResetRetryAt: number;
   safetyTimer?: unknown;
   deepTimer?: unknown;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -56,6 +66,70 @@ function daemon(logs: string[] = []): HaltInternals {
     log: (line) => void logs.push(line),
   }) as HaltInternals;
 }
+
+const NOW = Date.parse("2026-07-17T12:00:00.000Z");
+
+/** Machine-produced SQLite authority: the real migration, never a planted DB. */
+async function migrateToSqliteAuthority(): Promise<void> {
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  const outcome = await withStatePlaneLocks(root, (locks: HeldStatePlaneLocks) =>
+    runMigration(root, { entry: "foreground-migrate", locks } as EntryProof));
+  if (!outcome.held || outcome.value.kind !== "migrated") {
+    throw new Error(`fixture did not migrate: ${JSON.stringify(outcome)}`);
+  }
+}
+
+/**
+ * Design 276 F2.3 validation (a). A foreign `-wal` beside a steady store is an
+ * ordinary WAL crash the daemon owns. Before 276 the adapter demoted it to a
+ * halt and the workspace stopped syncing for an hour; it must now recover inside
+ * one boundary pass.
+ */
+test("a foreign sidecar recovers within one boundary pass instead of halting for an hour", async () => {
+  await migrateToSqliteAuthority();
+  await fs.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
+  const d = daemon();
+  d.cache = new HashCache();
+
+  expect(await d.resetOperationBoundary()).toBe(true);
+  expect(d.resetLifecycle).toBe("ready");
+  expect(await readResetHaltHealth(root)).toBeUndefined();
+  expect(await fs.lstat(`${sqliteResetPaths.active(root)}-wal`).catch(() => undefined)).toBeUndefined();
+});
+
+/**
+ * The anti-trivial-pass half of validation (a). With a foreign reader still
+ * attached the takeover genuinely cannot complete, and the assertion is NOT
+ * "no halt" — it is "refused on a short bounded backoff", escalating to the
+ * hourly fail-closed halt only after the attempts are spent.
+ */
+test("a still-attached foreign reader is refused on a short backoff before any hourly halt", async () => {
+  await migrateToSqliteAuthority();
+  const foreign = new Database(sqliteResetPaths.active(root));
+  foreign.exec("BEGIN");
+  foreign.query("SELECT count(*) AS n FROM store_meta").get();
+  const d = daemon();
+  d.cache = new HashCache();
+  try {
+    for (let attempt = 1; attempt <= RESET_WAL_CRASH_RETRY_ATTEMPTS; attempt++) {
+      expect(await d.resetOperationBoundary()).toBe(false);
+      expect(d.resetLifecycle).toBe("recovering");
+      expect(await readResetHaltHealth(root)).toBeUndefined();
+      expect(d.nextResetRetryAt).toBeLessThanOrEqual(NOW + RESET_WAL_CRASH_RETRY_MS);
+    }
+    expect(await d.resetOperationBoundary()).toBe(false);
+    expect(d.resetLifecycle).toBe("halted");
+    // Either observable shape of "a foreign reader is still attached": the
+    // strict checkpoint reports busy, or the post-takeover S0 check still sees
+    // the reader's sidecars.
+    expect((await readResetHaltHealth(root))?.reason).toMatch(/busy|at-rest S0/);
+    expect(d.nextResetRetryAt).toBe(NOW + RESET_RECOVERY_RETRY_MS);
+  } finally {
+    foreign.exec("ROLLBACK");
+    foreign.close();
+    if (d.resetRetryTimer) clearTimeout(d.resetRetryTimer);
+  }
+});
 
 test("warm syncBase cannot bypass the unconditional pump boundary", async () => {
   const d = daemon();
@@ -190,6 +264,37 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
     expect(watcherStarts).toBe(1);
     expect(d.safetyTimer).toBe(safety);
     expect(d.deepTimer).toBe(deep);
+  } finally {
+    await d.stop();
+    if (previousWs === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED; else process.env.RBOX_DAEMON_WS_DISABLED = previousWs;
+    if (previousReliability === undefined) delete process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED; else process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = previousReliability;
+    if (previousHome === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = previousHome;
+  }
+});
+
+/**
+ * Design 276 F2.5 validation (g). The first pump runs its own reset boundary, so
+ * a lifecycle sampled before it is stale — that is how "rbox daemon ready"
+ * printed for a daemon that had just halted (#765).
+ */
+test("the ready line reports the lifecycle the first pump left behind", async () => {
+  const previousWs = process.env.RBOX_DAEMON_WS_DISABLED;
+  const previousReliability = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED;
+  const previousHome = process.env.RBOX_HOME;
+  process.env.RBOX_DAEMON_WS_DISABLED = "1";
+  process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = "1";
+  process.env.RBOX_HOME = path.join(root, "ready-line-runtime");
+  const logs: string[] = [];
+  const d = new RboxDaemon(root, cfg, {} as never, {
+    pullOnly: true,
+    log: (line) => void logs.push(line),
+    acquireSyncMutex: async () => ({ status: "contended", holderKey: "test-holder", blockerKind: "live" }),
+  }) as HaltInternals;
+  d.pump = async () => { d.resetLifecycle = "halted"; };
+  try {
+    await d.start();
+    expect(logs).toContain("rbox daemon live but sync halted pending reset-journal recovery");
+    expect(logs.some((line) => line.startsWith("rbox daemon ready"))).toBe(false);
   } finally {
     await d.stop();
     if (previousWs === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED; else process.env.RBOX_DAEMON_WS_DISABLED = previousWs;

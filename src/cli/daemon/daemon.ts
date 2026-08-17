@@ -154,7 +154,12 @@ import { formatPushResiduals, formatPushSpan } from "../sync/format.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
-import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
+import {
+  RESET_RECOVERY_RETRY_MS,
+  RESET_WAL_CRASH_RETRY_ATTEMPTS,
+  RESET_WAL_CRASH_RETRY_MS,
+  ResetHaltLogGate,
+} from "./reset-halt-policy.js";
 import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
 import { reconcileGitDeferrals, type DeferralHygieneCursor } from "../sync-git/deferral-hygiene.js";
 import { gitDivergenceStatus } from "../sync-git/status.js";
@@ -386,6 +391,8 @@ export class RboxDaemon {
   private nextResetRetryAt = Number.NEGATIVE_INFINITY;
   private resetHaltIdentity?: string;
   private resetHaltReason?: string;
+  /** Design 276 F2.3: consecutive W1 takeover failures in the current episode. */
+  private walCrashRetries = 0;
   private readonly resetHaltLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
   /** Sole owner of repository topology, absence authority, and the Linux
@@ -954,12 +961,16 @@ export class RboxDaemon {
     this.remoteWakeup.activate();
     this.startUpdateChecks();
 
-    if (this.resetLifecycle === "ready") {
-      await this.pump();
-      this.log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
-    } else {
-      this.log("rbox daemon live but sync halted pending reset-journal recovery");
-    }
+    // Design 276 F2.5: the pump runs its own reset boundary, so the lifecycle
+    // sampled before it cannot be trusted to describe the daemon afterwards —
+    // that pre-sampling is how "rbox daemon ready" printed for a daemon that had
+    // just halted. Re-read it here and say what is true. (The `setReady` call
+    // above samples early on purpose: it is self-correcting through
+    // `enterResetHalt`, which sets readiness false itself.)
+    if (this.resetLifecycle === "ready") await this.pump();
+    this.log(this.resetLifecycle === "ready"
+      ? this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)"
+      : "rbox daemon live but sync halted pending reset-journal recovery");
   }
 
   /**
@@ -1252,6 +1263,10 @@ export class RboxDaemon {
     this.resetHaltIdentity = identity;
     this.resetHaltReason = reason;
     this.nextResetRetryAt = this.now() + RESET_RECOVERY_RETRY_MS;
+    // A pending short W1 backoff must not survive an escalation and fire the
+    // retry inside the hour this halt just claimed (design 276 F2.3).
+    if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
+    this.resetRetryTimer = undefined;
     if (changed) {
       await writeResetHaltHealth(this.root, {
         reason,
@@ -1261,6 +1276,26 @@ export class RboxDaemon {
     }
     if (this.resetHaltLogGate.shouldLog(reason, this.now())) this.log(`sync halted: reset journal cannot be processed (${reason})`);
     this.scheduleResetRetry();
+  }
+
+  /**
+   * Design 276 F2.3. A W1 writer takeover fails when something else still holds
+   * the store ("reset checkpoint remained busy"), which is a race, not a
+   * corruption: the foreign reader detaches in seconds. Re-inspect first — a
+   * classifier that reads steady again means there was never anything to halt
+   * for — then retry on a short bounded backoff. Only after the attempts are
+   * spent does the caller fall through to the hourly fail-closed halt.
+   * Readiness is deliberately untouched: W1 is recovering, not halted, and a
+   * flapping ready flag would churn the remote wakeup channel.
+   */
+  private async retryWalCrashRecovery(): Promise<boolean> {
+    if (this.walCrashRetries >= RESET_WAL_CRASH_RETRY_ATTEMPTS) return false;
+    this.walCrashRetries++;
+    const reinspected = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
+    this.resetLifecycle = "recovering";
+    this.nextResetRetryAt = this.now() + (reinspected.status === "none" ? 0 : RESET_WAL_CRASH_RETRY_MS);
+    this.scheduleResetRetry();
+    return true;
   }
 
   private async bootstrapAgreement(state: SyncState): Promise<boolean> {
@@ -1297,13 +1332,17 @@ export class RboxDaemon {
         // loadState owns the classifier-gated forward-recovery implementation.
         state = await this.loadSyncBase(heldMutex);
       } catch (error) {
+        if (walCrash && await this.retryWalCrashRecovery()) return false;
         await this.enterResetHalt(error instanceof Error ? error.message : String(error), inspection.status === "recoverable" ? inspection.journalIdentityHash : undefined);
         return false;
       }
       const after = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
       if (after.status !== "none") {
         if (after.status === "halt") await this.enterResetHalt(after.reason, after.journalIdentityHash);
-        else if (after.status === "w1") await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
+        else if (after.status === "w1") {
+          if (await this.retryWalCrashRecovery()) return false;
+          await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
+        }
         else await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
         return false;
       }
@@ -1314,6 +1353,7 @@ export class RboxDaemon {
       this.remoteWakeup.setReady(true);
       this.resetHaltIdentity = undefined;
       this.resetHaltReason = undefined;
+      this.walCrashRetries = 0;
       this.nextResetRetryAt = Number.NEGATIVE_INFINITY;
       if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
       this.resetRetryTimer = undefined;
