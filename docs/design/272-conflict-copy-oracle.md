@@ -1,6 +1,24 @@
 # 272 — rbox-minted conflict copies must not gate the git-plane oracle
 
-Status: **DRAFT r8** (folds the r7 delta-confirm — a small, surgical round. One
+Status: **ALIGNED (r9)** (folds the r8 delta-confirm — the final round, all
+transcription. The r8 confirm re-verified every decision in code and found no
+blocker: it walked `gitReasonOf`'s normalization by hand, found no vocabulary
+collisions beyond the two known superstring pairs, and confirmed the
+declaration-index claim (11/12) load-bearing. Three fixes, all in the trace and
+the pins, none in the mechanism. **C-r8-1**: §2.7's trace hop 2 conflated two
+caller families — `doctor-cmd.ts:249`/`:255`/`:261` carry the why-derived detail
+(producer `sync-git/apply.ts:1063`), while `:246` parses the `git deferred`
+family whose fragment is `renderGitDeferralLine`'s LABEL
+(`status-view.ts:439-457`, written at `daemon/daemon.ts:305`), so
+`label: "conflict copies"` is load-bearing exactly as the constant's plural is
+(§2.7's copy block; `ref-read-unreadable`'s label already mis-buckets its own
+family as `unreadable` — pre-existing, noted, out of scope). **C-r8-2**: §7's
+doctor pin is restated over the exported seam `redactGitLogLines`, since
+`gitReasonOf` is module-private — two inputs, one per channel; §0's
+two-exported-symbols count is unchanged. Plus nits: the C-r7-1 example now uses
+the literal-token producer, §2.3 retitled, §6 headed through r8. r8's own
+fold — everything below — held unchanged.
+r8 folded the r7 delta-confirm — a small, surgical round. One
 blocker, B-r7-1: **the `why` string carries the reason token**, so
 `CONFLICT_COPY_POPULATION_WHY` must read `"repo population emptied by
 conflict-copies exclusion"` (PLURAL). `follow-classify.ts:139` pushes
@@ -174,7 +192,7 @@ preceded by exactly one dot-free token. Unlikely; not impossible.
 reserves `*.<token>.<14 digits>.conflict*` in every synced tree. It is not
 unforgeable and this design does not pretend otherwise; §3 and §5 price it.
 
-### 2.3 Addressing-scoped matching, SCOPED to the projection root (B1) — correct addressing
+### 2.3 Root-scoped matching (B1)
 
 r2 identified an inversion in r1's unscoped ancestor rule, confirmed here.
 r3's delta-confirm then showed this scoping kills one *instance* of the
@@ -660,17 +678,30 @@ verifiable in three hops:
 1. `follow-classify.ts:139` pushes `oracle.why` **verbatim** into `details` —
    the reason id it `add`s alongside is a separate channel that never enters the
    deferral log line.
-2. The log line is what `gitReasonOf`'s callers parse: `doctor-cmd.ts:246`
-   (`git deferred <age>: <detail> on …`), `:249` (`git-sync deferred <repo>:
-   <detail>`), and `:255` (`git-sync WARNING <repo>: <detail>`) each hand it the
-   captured **detail fragment**, i.e. the `why`.
+2. The log line is what `gitReasonOf`'s callers parse, and the callers split
+   into two families that hand it **different strings**:
+   - `doctor-cmd.ts:249` (`git-sync deferred <repo>: <detail>`), `:255`
+     (`git-sync WARNING <repo>: <detail>`) and `:261` (the `git-sync applied`
+     held-refs arm) carry the **why-derived detail** — `:249`'s producer is
+     `src/cli/sync-git/apply.ts:1063`, `glog(\`git-sync deferred ${rel}:
+     ${follow.detail}\`)`, and `follow.detail` is the `details` array
+     `follow-classify.ts:139` pushed `oracle.why` into. This is the `why` half.
+   - `doctor-cmd.ts:246` parses the `git deferred <age>: <fragment> on
+     <checkout> (<repo>)` family, and there the fragment is **not** the `why`
+     at all: it is `renderGitDeferralLine`'s rendered **label**
+     (`status-view.ts:439-457`, the `gitDeferralReasonText(input.reason)` call
+     at `:456` → `DEFERRAL_REASON_PRESENTATION[reason].label`), written to the
+     daemon log at `src/cli/daemon/daemon.ts:305`. So this family round-trips
+     the reason id through its user-facing LABEL and back through
+     `gitReasonOf`.
 3. `gitReasonOf` normalizes with `detail.toLowerCase().replace(/[ _]+/g, "-")`
    (`doctor-cmd.ts:214`), which folds spaces and underscores to hyphens but
    leaves existing hyphens alone.
 
-So the ONLY way the doctor's support-bundle bucket can land on
+So on the `why` half the ONLY way the doctor's support-bundle bucket can land on
 `conflict-copies` is for the normalized `why` to literally contain the substring
-`conflict-copies`. A singular `"…conflict-copy exclusion"` normalizes to
+`conflict-copies` (the label half is pinned separately, in the copy block
+below). A singular `"…conflict-copy exclusion"` normalizes to
 `conflict-copy`, which does not contain `conflict-copies`, falls through to the
 `"conflict"` member, and buckets as `conflict` no matter how the declaration is
 ordered. Hence the constant's plural: `CONFLICT_COPY_POPULATION_WHY =
@@ -697,8 +728,12 @@ member containing it.
 vocabulary does NOT satisfy it vacuously today: `"ref-read-unreadable"` and
 `"unreadable"` are exactly such a pair, and the declaration
 (`sync-state-model.ts:130-134`) already puts the superstring first — indices
-**11** and **12**. That ordering is load-bearing right now: swap the two and
-every `refs could not be read` detail buckets as plain `unreadable`. (The
+**11** and **12**. That ordering is load-bearing right now: swap the two and a
+detail carrying the literal token — `ref-read-unreadable: <marker>` — buckets as
+plain `unreadable`. (The example must be the literal-token producer, not the
+prose "refs could not be read": that phrasing is rescued order-independently by
+the fallback regex at `doctor-cmd.ts:228`, so it proves nothing about
+declaration order. C-r8-1.) The
 `local-edits`/`local-index`/`local-operation`/`local-commits`/`local-stash`
 family shares only a PREFIX, so it is not an instance of the rule either way.)
 `conflict-copies` therefore adds the **second** pair to a rule the code has been
@@ -767,6 +802,25 @@ ratchet, the proof-indeterminate refusal gains reason-aware copy.
   transient: false,
 },
 ```
+
+**`label: "conflict copies"` is LOAD-BEARING too, not prose (C-r8-1).** The
+plural and the exact wording carry the same duty the constant carries, by the
+second channel §2.7's trace names: the label is what
+`renderGitDeferralLine` writes into the `git deferred <age>: <fragment> on …`
+daemon-log line (`status-view.ts:456`, written at `daemon/daemon.ts:305`), and
+`doctor-cmd.ts:246` hands that fragment straight to `gitReasonOf`.
+`"conflict copies"` normalizes (`toLowerCase().replace(/[ _]+/g, "-")`) to
+`conflict-copies` and buckets correctly; a singular `"conflict copy"`, or a
+reworded `"rbox conflict backups"`, normalizes to something the vocabulary does
+not contain and falls through to `"conflict"` — the identical B-r7-1 defect
+reached through the label instead of the `why`. Reword this label only together
+with the declaration order and §7's second pin.
+
+*Noted, not fixed:* `ref-read-unreadable`'s label `"unreadable Git refs"`
+normalizes to `unreadable-git-refs`, which contains `unreadable` but not
+`ref-read-unreadable`, so that family's `git deferred` lines already mis-bucket
+as `unreadable` today. Pre-existing and out of scope here; recorded because it
+is the same channel this note pins.
 
 `transient: false` is deliberate and load-bearing: the hold does not clear on
 its own, and `transient` feeds `remediationClass` at `status-view.ts:404-412`.
@@ -1091,7 +1145,7 @@ been observed in the field yet. The
 measured benefit today is 14 single-entry extras removed; the measured
 false-positive cost today is zero.
 
-## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4, r5, r6, r7)
+## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4, r5, r6, r7, r8)
 
 Six groups, in the order they were decided: **two r8 entries**, then **two r7
 entries**, then **two r6
@@ -1279,14 +1333,30 @@ comparison.
      NOT `unreadable` (`follow-classify.ts:139`); and an oracle
      `indeterminate` with any other `why` still adds `unreadable` — the
      negative half, without which an over-broad match test passes.
-  2. `gitReasonOf` (`doctor-cmd.ts:213`) over **the exported constant itself**:
-     `expect(gitReasonOf(CONFLICT_COPY_POPULATION_WHY)).toBe("conflict-copies")`.
-     Asserting over a hand-authored literal ("…conflict-copies…") is barred: it
-     would stay green if the constant's wording drifted back to the singular,
-     which is precisely the B-r7-1 defect — the test must consume the same
-     string the guard emits. It covers BOTH halves at once (the plural wording
-     and the enum-ORDER dependency §2.7 names), and it is the one site no type
-     checks.
+  2. the doctor's reason inference, asserted **through the exported seam**
+     (C-r8-2). `gitReasonOf` is module-private (`doctor-cmd.ts:213`, no
+     `export`); the exported entry point is `redactGitLogLines` (`:279`), which
+     reaches it via `classifyGitLogMessage` and emits the bucket as the
+     `git-sync ${klass} reason=${reason} age=${age}` key at `:272`. Two inputs,
+     one per §2.7 channel:
+     - the **`why` half**, over the exported constant itself — never a
+       hand-authored literal:
+       `expect(redactGitLogLines("git-sync deferred r: " +
+       CONFLICT_COPY_POPULATION_WHY)).toBe("git-sync deferred
+       reason=conflict-copies age=-")` (the `git-sync deferred <repo>: <detail>`
+       arm at `:247-249`; `age` stays `"-"` because only the `git deferred`
+       arm captures a bucket). A literal `"…conflict-copies…"` would stay green
+       if the constant drifted back to the singular, which is precisely the
+       B-r7-1 defect — the test must consume the same string the guard emits.
+     - the **label half**, pinning `DEFERRAL_REASON_PRESENTATION`'s
+       `label: "conflict copies"`:
+       `expect(redactGitLogLines("git deferred 1h: conflict copies on branch
+       main (r)")).toBe("git-sync deferred reason=conflict-copies age=1h")`
+       (the `:243-246` arm). Without the label pin a reworded label silently
+       re-buckets every `git deferred` line for this reason as `conflict`.
+     Between them these cover the plural wording, the label wording, and the
+     enum-ORDER dependency §2.7 names — the one site no type checks — and they
+     add **no export**: §0's two-exported-symbols count is unchanged.
   3. **the ORDER INVARIANT itself, not just this instance (C-r6-3, corrected by
      C-r7-1):** over `GIT_DEFERRAL_REASONS`, for every pair `(a, b)` with
      `a !== b` and `a.includes(b)`, assert `indexOf(a) < indexOf(b)`. This is
