@@ -93,6 +93,11 @@ export async function observeLegacyResetPhysical(
 
 export type ResetJournalInspection =
   | { status: "none" }
+  /** Design 276 F2.1: an ordinary WAL crash on the SQLite authority. There is no
+   * journal to recover, and it is not a halt: `loadState` completes the writer
+   * takeover in place. Each Adapter decides — the daemon recovers, status
+   * renders it as recovering, doctor reports it. */
+  | { status: "w1" }
   | { status: "halt"; reason: string; journalIdentityHash?: string; journal?: ResetJournal | SQLiteResetJournalV2; observation?: ResetArtifactObservation; decodeError?: ResetJournalDecodeError }
   | {
     status: "recoverable";

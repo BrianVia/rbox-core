@@ -39,7 +39,7 @@ type DetailProjection<M extends StatusMode> = Extract<WorkspaceStatusProjection<
 
 type ResetHaltJsonPayload = {
   workspace: { id: string; name: string | null; root: string };
-  halted: true;
+  halted: boolean;
   reason: HaltProjection["reason"];
   daemon: { running: boolean; pid: number | null; watcherTrust: "suspect" | "fused" | null };
   credential: ReturnType<typeof credentialStatusJson>;
@@ -108,7 +108,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
       daemonRunning,
       payload: {
         workspace: { id: workspace.id, name: workspace.name ?? null, root: workspace.root },
-        halted: true,
+        halted: projection.halted,
         reason: projection.reason,
         daemon: { running: daemon.running, pid: daemon.pid ?? null, watcherTrust: daemon.watcherTrust ?? null },
         credential: credentialStatusJson(credentials),
@@ -118,6 +118,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
   if (probes.mode !== "verbose") {
     const rendered = renderBriefStatus({
       kind: "reset-halt",
+      halted: projection.halted,
       workspaceLabel: briefWorkspaceLabel(workspace.name, path.basename(workspace.root)),
       daemonRunning: daemon.running,
       account: probes.account,
@@ -129,7 +130,9 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
     const diagnostic = credentialStatusJson(credentials);
     lines.push(`  ${style.yellow(`credential-degraded: ${String(diagnostic.reason)} (${String(diagnostic.variable ?? diagnostic.path)})`)}`);
   }
-  lines.push(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${projection.reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
+  lines.push(projection.halted
+    ? `  ${style.yellow(`sync halted: a state-recovery record can't be processed (${projection.reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`
+    : `  ${style.cyan("sync recovering: an unclean shutdown left write-ahead state the daemon replays in place. Files on disk are untouched; no action needed.")}`);
   lines.push(`  ${style.dim("background sync:")} ${daemon.stale
     ? style.yellow(`running but bound to a previous workspace (pid ${daemon.pid})`)
     : daemon.running ? style.green(`${runningDaemonLabel(daemon.version, daemon.mode)} (pid ${daemon.pid})`) : style.yellow("stopped")}`);

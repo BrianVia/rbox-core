@@ -76,6 +76,9 @@ export interface BriefTransferProgress {
 export type BriefStatusSnapshot =
   | {
       kind: "reset-halt";
+      /** Design 276 F2.1: false is the non-halt `w1` recovery, which stops sync
+       * for one boundary pass rather than until an operator intervenes. */
+      halted: boolean;
       workspaceLabel: string;
       daemonRunning: boolean;
       account: BriefAccountSummary;
@@ -274,11 +277,17 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   if (snapshot.kind === "reset-halt") {
     return {
       daemonRunning: snapshot.daemonRunning,
-      lines: [
-        `${snapshot.workspaceLabel} · sync needs attention`,
-        "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
-        briefIdentityLine(snapshot.account),
-      ],
+      lines: snapshot.halted
+        ? [
+          `${snapshot.workspaceLabel} · sync needs attention`,
+          "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
+          briefIdentityLine(snapshot.account),
+        ]
+        : [
+          `${snapshot.workspaceLabel} · recovering state`,
+          "↻ replaying write-ahead state after an unclean shutdown",
+          briefIdentityLine(snapshot.account),
+        ],
     };
   }
 

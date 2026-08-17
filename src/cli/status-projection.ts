@@ -182,10 +182,15 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     port.inspectResetJournal(root, syncStreamId(cfg)),
     port.readResetHaltHealth(root),
   ]);
-  if (resetInspection.status === "halt" || resetHealth !== undefined) {
+  // Design 276 F2.1: `w1` early-returns here as well. It is NOT a halt, but it
+  // must never fall through to `readState`, whose recovery path would take the
+  // workspace sync mutex and attempt a rival writer takeover against the live
+  // daemon — the exact rivalry design 138 F2b makes status read-only to avoid.
+  if (resetInspection.status === "halt" || resetInspection.status === "w1" || resetHealth !== undefined) {
     const halt: StatusHaltProjection & { probes: StatusHaltProbes } = {
       kind: "reset-halt",
       ...common,
+      halted: resetInspection.status === "halt" || resetHealth !== undefined,
       reason: resetInspection.status === "halt" ? resetInspection.reason : "recovering",
       probes: probes.mode === "brief" || probes.mode === "git"
         ? { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials) }

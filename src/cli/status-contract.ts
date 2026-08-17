@@ -234,6 +234,10 @@ export type StatusModeProbes =
 
 export interface StatusHaltProjection extends StatusProjectionCommon {
   kind: "reset-halt";
+  /** Design 276 F2.1: the state-recovery fast path also carries the non-halt
+   * `w1` case, where an unclean shutdown left write-ahead state the daemon
+   * replays in place. False means "recovering", not "sync stopped". */
+  halted: boolean;
   reason: string;
 }
 

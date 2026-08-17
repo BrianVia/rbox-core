@@ -1285,8 +1285,12 @@ export class RboxDaemon {
       await this.enterResetHalt(inspection.reason, inspection.journalIdentityHash);
       return false;
     }
-    if (inspection.status === "recoverable") this.resetLifecycle = "recovering";
-    if (inspection.status === "recoverable" || this.resetLifecycle !== "ready" || persisted) {
+    // Design 276 F2.1: `w1` is an ordinary WAL crash with no journal. It routes
+    // into the same loadState-driven recovery — which owns the writer takeover —
+    // instead of the halt the adapter used to demote it to.
+    const walCrash = inspection.status === "w1";
+    if (inspection.status === "recoverable" || walCrash) this.resetLifecycle = "recovering";
+    if (inspection.status === "recoverable" || walCrash || this.resetLifecycle !== "ready" || persisted) {
       this.resetLifecycle = "recovering";
       let state: SyncState;
       try {
@@ -1299,6 +1303,7 @@ export class RboxDaemon {
       const after = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
       if (after.status !== "none") {
         if (after.status === "halt") await this.enterResetHalt(after.reason, after.journalIdentityHash);
+        else if (after.status === "w1") await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
         else await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
         return false;
       }
