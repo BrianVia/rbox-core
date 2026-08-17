@@ -1,5 +1,58 @@
 # rbox status — living state snapshot
 
+## 2026-08-17 (night 2) — 271+272 SHIPPED: P-settlement landing + conflict-copy oracle
+
+- **Merged to main and live on all 3 hosts (812202e):** PR #760 (design 271,
+  5 design rounds + 3 review passes) — first-BASE landing via observed-landing
+  authority, typed base-absent hold (create-shaped P only), resolve legibility
+  (2 error classes, 3 typed refusal codes, GitDeferral.detail + 4 carriers,
+  refusal copy never claims "nothing changed" post-commit). PR #763 (design
+  272, NINE design rounds — see step-out lesson below) — conflict grammar
+  gets one owner (isRboxConflictArtifact + conflictName co-located),
+  comparableFor replaces 7 hand-copied exclusions, empty-population guard
+  (grammar-emptied match → indeterminate), new `conflict-copies` deferral
+  reason with plain copy, top-level conflictCopies status count (counts
+  minted OBJECTS). apply-receipt.ts decomposed (receiver-paths.ts) to BELOW
+  its original ratchet pin. Rig git-rebuild-settlement flipped green.
+- **Field state:** count line live on all hosts (desktop 11, Mac 11, FM 24
+  objects); 271's detail companion rendering on Mac. Probe propagation
+  desktop→Mac ~41-46s, desktop→FM ~51s (1 file; sender lane #661 still the
+  pole; git-apply within-pull 0.6-0.8s/107 repos). Standing wedges did NOT
+  self-heal: held-skip (270) correctly skips unchanged-incoming holds, so
+  Mac's 6 + FM's 52 deferrals need explicit resolve or fresh incoming.
+  FOUNDER RULING: no sweep — the decision surfaced product gaps instead
+  (#764: status legibility + reason-vocabulary English + resolve dry-run/
+  batch; the session transcript is the requirements doc). #659 stays OPEN
+  (oracle fixed; field-close evidence = a future resolve wave or organic
+  incoming draining the standing set).
+- **Deployment gate:** prod API must learn `conflict-copies`
+  (SERVER_GIT_DEFERRAL_REASONS) before fleet CLI emits it at scale.
+  FOUNDER CHOSE fleet-now-promote-later: fleet devices in the new hold get
+  sync-state telemetry dropped by prod ingest until the next production
+  promotion (production is 198 commits behind main — promotion is its own
+  deliberate session). External users unaffected (stable builds never emit
+  the reason).
+- Issues: CLOSED #752 (via #760). FILED #761 (reset repair lock inversion,
+  pre-existing), #762 (quarantine pointer on artifact refusal + last raw
+  reasons ride the resolve-command split), #764 (git-lane legibility,
+  founder-hit). Flake registered: issue-501 write-amplification shard pin
+  (green-on-rerun eligible, attempt-1 evidence).
+- **Process lessons (memory-saved):** long review loop (≥4-5 rounds) =
+  step-out trigger — 272 bundled five mechanisms and paid nine rounds;
+  split designs instead. Builders widening a safety gate must pause and
+  report (271's widened arming hid the projection-vs-record P0; the
+  parallel wave caught it). Founder permission-loops answered with
+  legibility complaints = extract product requirements, stop re-asking.
+  Convergence bar: the merged artifact must read as designed-once ("the
+  version you'd write by the end") — enforced as an explicit pre-merge pass.
+- **Queued next (founder-ranked):** #661 sender lane (P1, soak doubles as
+  baseline), #660 CI shard leaks (parallel), #664 evidence pass (passive),
+  #535 echo-clobber (data-safety sleeper), full /improve-codebase-architecture
+  + /antislop-codebase sweeps (opus fan-outs, fold into #671 roadmap) during
+  the soak, 2.0 decision trio for founder (#688/#667/#702). resolve-command.ts
+  sits ~10 bytes under its ratchet — next touch = the split (#762's vehicle).
+- Mac RBOX_TRACE_HELD=1 still armed (disarm at next routine restart).
+
 ## 2026-08-16 (night) — PERF ARC COMPLETE: 6 PRs, v2.0.0-beta.3 to next
 
 - **Shipped + field-verified on the fleet (cbca36c):** #750 delta-scoped
