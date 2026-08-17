@@ -1,7 +1,8 @@
 # 272 — rbox-minted conflict copies must not gate the git-plane oracle
 
-Status: **DRAFT r3** (folds the r2 confirm: blocker B1, corrections R1–R5,
-minors m1–m3; r1's C1/C2/M3–M7/m8–m10 held).
+Status: **DRAFT r4** (folds the r3 delta-confirm: blockers D1 — the `scopedScan`
+restructure — and D2 — the empty-population guard — plus corrections 3–6 and the
+two anchor fixes; r2's B1/R1–R5/m1–m3 and r1's C1/C2/M3–M7/m8–m10 held).
 Every file:line below re-verified against `main` @ `b9bb83d5d` on 2026-08-16.
 
 Evidence: GH #659 (re-scoped 2026-08-16) — FM wedged 103 repos for 20+ hours
@@ -11,26 +12,39 @@ true hole. Parents: design 224 (ignore-plane ruling: silent un-syncing is
 worse than over-syncing), 236 (litter classes get reclassified at the gate,
 not instrumented), 244 (echo-publish + conflict-retry containment).
 
-## 0. Concept ledger (m2)
+## 0. Concept ledger (m2, corrected in r4)
 
-**Two exported symbols**, one new concept ("rbox conflict artifact"):
+**ONE exported symbol**, one new concept ("rbox conflict artifact"):
 
 | Symbol | Home | Deletion condition |
 |---|---|---|
 | `isRboxConflictArtifact(component: string): boolean` — the name grammar, on ONE path component | `src/engine/conflict-name.ts` (new; sits with `conflictName`'s grammar, re-exported from `reconcile.ts`) | conflict copies stop being minted into the workspace |
-| `comparable(rel, kind, root, eq): boolean` — the oracle's single "is this path compared at all?" answer | `src/engine/apply-receipt.ts` | never: it *replaces* five hand-copied expressions |
+
+Two **module-private** mechanisms inside `src/engine/apply-receipt.ts`, neither
+exported and neither pinned by a direct call in a test:
+
+| Mechanism | Why it exists | Deletion condition |
+|---|---|---|
+| `comparable(rel, kind, root, eq): boolean` — the oracle's single "is this path compared at all?" answer | *replaces* five hand-copied exclusion expressions | never, while the oracle has two sides |
+| the per-prove **empty-population guard** (§2.4) — one boolean recording that the conflict grammar emptied a comparison population | a zero-pair alignment is otherwise a vacuous `match` (D2) | the grammar stops being an exclusion reason |
+
+`comparable` is deliberately NOT exported: every consumer is inside
+`apply-receipt.ts`, and §7 pins it behaviorally through the two oracles rather
+than by calling it. Same for the guard boolean.
 
 **All four spends of `isRboxConflictArtifact`** — and nowhere else:
 
-1. inside `comparable()` (§2.4), the only oracle-side consumer;
-2. `counts.conflictCopies` in `rbox status` (§4), over `localManifest.files`;
+1. inside `comparable()` (§2.5), the only oracle-side consumer;
+2. `counts.conflictCopies` in `rbox status` (§4), over the local manifest;
 3. the papercut-documented recovery recipe (§4) — user-facing, no code;
 4. its own unit fixtures (§7).
 
 Net expression count goes **down**: five hand-copied exclusion expressions in
-`apply-receipt.ts` collapse to five `comparable()` calls, and the sixth
-possible drift site (the `"other"` arm, §2.5) is decided explicitly rather
-than left implicit.
+`apply-receipt.ts` collapse to **seven `comparable()` call sites** (five table
+rows in §2.5; two of those rows carry a dir arm and a leaf arm), and the eighth
+possible drift site (the `"other"` arm, §2.6) is decided explicitly rather than
+left implicit. Five rows, seven calls — the two counts measure different things
+and §2.5 owns both.
 
 ## 1. Problem — the ring, and why pull-only hosts make it permanent
 
@@ -125,9 +139,12 @@ preceded by exactly one dot-free token. Unlikely; not impossible.
 reserves `*.<token>.<14 digits>.conflict*` in every synced tree. It is not
 unforgeable and this design does not pretend otherwise; §3 and §5 price it.
 
-### 2.3 Ancestor matching, SCOPED to the projection root (B1 — blocker)
+### 2.3 Ancestor matching, SCOPED to the projection root (B1) — correct addressing
 
 r2 identified an inversion in r1's unscoped ancestor rule, confirmed here.
+r3's delta-confirm then showed this scoping kills one *instance* of the
+vacuous-match shape, not the shape; §2.4 owns the safety property, and this
+subsection is now scoped to what it actually buys: correct addressing.
 
 **The failure.** `project(rel, eq)` filters the manifest by the same predicate
 the walk uses. If the repo's own root — or any ancestor of it — matched, then
@@ -146,9 +163,10 @@ DIRECTORY names: `apply.ts:296-307` (trash disabled ⇒ a squatting directory is
 `moveAside`d whole under a conflict name) and `trash.ts:250-252` (restore onto
 an occupied target diverts to `conflictName`, and the restored entry may be a
 directory — `claimUnclobberedName` takes `st.isDirectory()` explicitly). And
-`discoverGitRepos` (`src/engine/git-discover.ts:28-60`) descends every
-non-ignored directory: conflict-named directories are not ignored, so a repo
-underneath one IS discovered and IS proved.
+`discoverGitRepos` descends every non-ignored directory — `walkDir`
+(`src/engine/git-discover.ts:46`), descent loop `:58-62`, pruned only by
+`prunesForGitDiscovery`/`ignores` at `:61` — so conflict-named directories are
+not ignored, a repo underneath one IS discovered and IS proved.
 
 **Adopted fix — option 1.** `comparable()` takes the normalized projection
 root and tests only components **at or below** it:
@@ -164,13 +182,80 @@ For `root = "."` this is every component, as before. For `root = "a.dev_x.
 <ts>.conflict/repo"` the ancestor `a.dev_x.<ts>.conflict` is skipped and the
 repo compares normally; a conflict-named directory *inside* that repo still
 prunes its subtree. This keeps §2.3's whole point (a conflict-named directory
-is one excluded object, not N extras) while making the vacuous-match shape
-unreachable.
+is one excluded object, not N extras) and removes the ANCESTOR instance of the
+vacuous match — a repo is no longer misclassified by a name that belongs to its
+caller's addressing rather than to its content.
+
+**No threading is required for `root`.** `project()` is the only caller of
+`normalizeRel` and always runs before either walk, so every call site already
+holds the normalized root and can pass it unchanged. Recorded here because the
+signature's cheapness depends on that ordering: a future caller that walks
+without projecting first would have to normalize itself.
+
+**Claim, narrowed (r4).** Root-scoping is **correct addressing**, not the
+safety property. A repo whose entire comparable population sits under a single
+conflict-named directory **at or below its own root** still lands on the same
+empty-both-sides chain — same `apply.ts:307` whole-directory eviction, applied
+to the repo's one content directory. §2.4 is what makes that class safe.
 
 **Pin (§7): a repo whose root or ancestor matches the grammar must NOT return
 `match` when its working tree diverges.**
 
-### 2.4 ONE predicate, five sites (M5, m3)
+### 2.4 The empty-population guard (D2) — a zero-pair prove is not a match
+
+The deeper primitive behind B1: **a prove that compared zero entries because
+the conflict grammar removed them is `indeterminate`, not `match`.** Root
+scoping (§2.3) removes one instance; this removes the class — ancestor, self,
+and at-or-below alike.
+
+**Where the vacuous match comes from.** With both populations empty,
+`compareEntries` (`apply-receipt.ts:306-311`) calls `alignPaths` (`:274-304`),
+which over an empty key set builds zero `pairs` and zero `samples` and returns
+`{ kind: "match", pairs: [] }` at `:303`; `compareEntries` then filters zero
+pairs, finds `samples.length === 0`, and returns the `MATCH` singleton at
+`:311`. Nothing on that path can distinguish "nothing to compare" from
+"everything agreed".
+
+**The mechanism, in its smallest form.** One boolean per prove, owned by the
+oracle instance's in-flight proof:
+
+- It is set **exactly when `comparable()` returns `false` for an entry because
+  of the conflict grammar** — the grammar arm, not `hardExcluded` and not the
+  matcher — **during THIS walk of THIS prove**. It is not a workspace-level or
+  cached fact: a copy excluded on a previous prove of another repo leaves it
+  unset here.
+- Both walks (`inventory`, `scopedScan`) and the manifest-side filter in
+  `project()` feed the same boolean, so a grammar exclusion on either side
+  arms it. That preserves §3's symmetry contract: the two sides cannot disagree
+  about whether the grammar was in play.
+
+**The verdict rule**, applied where the prove reads its alignment:
+
+| Aligned pairs | Guard boolean | Verdict |
+|---|---|---|
+| zero | **set** | `indeterminate("repo population emptied by conflict-copy exclusion")` |
+| zero | unset | `match` — exactly today's behavior, unchanged |
+| ≥ one | either | today's behavior, unchanged |
+
+The named reason is a fail-closed verdict, which the git plane already knows
+how to carry (`whyFromScanError`'s peers at `:266-272` all land the same way,
+and §2.5's `scanDeferred` note describes the identical class). It defers the
+repo instead of blessing it — the safe direction, and the direction B1 showed
+matters.
+
+**The empty-`git init` discrimination.** A genuinely empty repo (`git init`,
+no files, nothing in the applied manifest) must still settle `match`, or every
+freshly created repo on the fleet becomes permanently indeterminate. It does:
+its zero pairs come with **no grammar exclusion observed**, so the boolean is
+unset and the table's second row applies. The guard is "the conflict grammar is
+why the population is empty", never "the population is empty" — that
+distinction is the whole mechanism, and §7 fixtures both sides of it.
+
+**Cost, stated.** One boolean, one branch, one new verdict reason. It buys the
+deletion of the entire vacuous-match class, and it makes §2.3 optional as a
+*safety* argument while remaining required as an *addressing* one.
+
+### 2.5 ONE predicate, five sites / seven calls (M5, m3, D1)
 
 Today the same exclusion logic is hand-copied five times in
 `src/engine/apply-receipt.ts` — re-verified:
@@ -192,7 +277,36 @@ concept: every call site already knows it statically.
 
 **Call-site count after the change (m3): seven** — `:469`, `:636`, `:736`,
 the dir and leaf arms of `:616`, and the dir and leaf arms of `:713`. The
-`"other"` arms (`:622`, `:720`) deliberately do NOT call it; §2.5 says why.
+`"other"` arms deliberately do NOT call it; §2.6 says why.
+
+**Required restructure of `scopedScan`'s child loop (D1 — blocker).** The two
+walks do not have the same shape today, and a literal substitution flips
+`scopedScan` fail-open. `inventory` (`:614-625`) makes the `"other"` arm a
+SIBLING of the leaf arm (`:621`), so swapping `:619`/`:623` for `comparable()`
+leaves `:622` genuinely untouched. `scopedScan` (`:711-722`) NESTS its
+`"other"` throw *inside* the leaf guard — `:718` is the guard, `:719` computes
+the type, `:720` throws. Replace `:718` with `comparable(childRel, "leaf",
+root, eq)` as written and a conflict-grammar FIFO fails the guard and is
+**silently skipped**: `:720` is never reached. §2.6's "`:720` does not call
+`comparable()`" is true textually and false behaviorally — the routing decision
+for `:720` is made one level up at `:718`.
+
+So the change to `scopedScan` is not a substitution, it is a restructure: hoist
+the type computation above the guard so the child loop takes `inventory`'s
+shape —
+
+```ts
+const type = child.isSymbolicLink() ? "symlink" : child.isFile() ? "file" : "other";
+if (type === "other") { if (!this.matcher.ignores(childRel)) throw new Error("unsupported-entry"); }
+else if (comparable(childRel, "leaf", root, eq)) await scanLeaf(childRel, type);
+```
+
+The `"other"` check precedes `comparable()` on both walks, which is the point:
+without it, one prove could reach `inventory` (`:500`) and fall through to
+`scopedScan` (`:530`) and get `indeterminate` on one path and a silent skip on
+the other — **oracle asymmetry inside a single prove**, satisfying §3's first
+protected contract in form while breaking it in behavior. m3's count is
+unaffected: still seven `comparable()` call sites.
 
 **Named out of scope, with their behavior stated:**
 
@@ -209,7 +323,7 @@ the dir and leaf arms of `:616`, and the dir and leaf arms of `:713`. The
 Explicitly NOT built: no GC/expiry of conflict copies; no publish-lane change;
 no new ignore rules; no oracle asymmetry.
 
-### 2.5 The `"other"` arm stays fail-closed (R1)
+### 2.6 The `"other"` arm stays fail-closed (R1, restructured by D1)
 
 `apply-receipt.ts:622` and `:720` today throw `unsupported-entry` for a
 special file (FIFO, socket, device) unless the matcher ignores it; the throw
@@ -217,18 +331,26 @@ becomes `indeterminate` via `whyFromScanError`. `apply-receipt.test.ts:393-400`
 pins exactly the ignored case ("ignored special entries are removed
 symmetrically", `mkfifo` ⇒ `match`).
 
-**Decision: do NOT route the `"other"` arm through `comparable()`.** Doing so
-would turn a conflict-grammar FIFO from a fail-closed `indeterminate` into a
-silent symmetric skip — a fail-closed → fail-open flip, on the exact axis B1
-just showed is the dangerous direction. `conflictName` never produces a
-special file (`moveAside` renames whatever was there, and only a user could
-`mkfifo` a grammar-matching name), so the case is adversarial-only.
+**Decision: do NOT route the `"other"` arm through `comparable()`, on either
+walk.** Doing so would turn a conflict-grammar FIFO from a fail-closed
+`indeterminate` into a silent symmetric skip — a fail-closed → fail-open flip,
+on the exact axis B1 just showed is the dangerous direction. `conflictName`
+never produces a special file (`moveAside` renames whatever was there, and only
+a user could `mkfifo` a grammar-matching name), so the case is
+adversarial-only.
+
+"Does not call `comparable()`" is a claim about **routing**, not about text:
+`inventory:622` already satisfies it, and `scopedScan:720` satisfies it only
+after §2.5's restructure lifts it out from under the leaf guard. Both arms keep
+their own `!ignores` test, which is why the existing pin stays green.
 
 Consequence, stated: a grammar-matching special file yields
 `indeterminate`/`unreadable` for its repo, not `local-edits` and not `match`.
 `apply-receipt.test.ts:393` is **unchanged and must stay green** — it exercises
-the *matcher*-ignored path, which this design does not touch. A new sibling
-pins the conflict-grammar FIFO at `indeterminate`.
+the *matcher*-ignored path, which this design does not touch, and it asserts
+through `pullOracle(...).proveRepo(...)`, i.e. the `inventory` side only. A new
+sibling pins the conflict-grammar FIFO at `indeterminate` on **both** oracles
+(§7).
 
 ## 3. Protected contract, and the complete consumer list (M4, R2)
 
@@ -257,15 +379,25 @@ Every consumer whose observable behavior changes:
    (`apply-receipt.ts:99-101`) can no longer name such a path.
 3. **Waived / keep-mine flows** lose a `local-edits` reason they previously
    saw. Same intent, same note.
-4. **The durable `oracleReceipt` hash.** `resolution-intent.ts:115` stores
-   `oracle.receiptHash(rel)` into the resolution binding
-   (`sync-state-model.ts:270`), and `resolve-command.ts:1046-1051` recomputes
-   that binding at confirm time and compares it by `JSON.stringify` equality,
-   setting `boundaryMismatch` when it differs. For a repo containing conflict
-   copies the receipt hashes a different entry population before and after this
-   change — so *client skew across the upgrade fails closed*: a `--show`
-   snapshot taken by one version and confirmed by the other refuses and asks
-   for a fresh `--show`, rather than applying a stale intent.
+4. **The `oracleReceipt` hash (re-anchored in r4).** `resolution-intent.ts:115`
+   puts `oracle.receiptHash(rel)` into the snapshot identity as the
+   `oracleReceipt` field — `sync-state-model.ts:270` is that field's TYPE
+   declaration, not a persistence site. The binding is never written to disk;
+   it escapes the process only as the confirmation snapshot id, so "durable" was
+   wrong and is dropped. The cross-version gate is that id:
+   `snapshotId(identity)` (`resolve-command.ts:144`, called at `:293`) becomes
+   `snapshot.public.snapshot`, printed for the user at `:352`
+   (`keepMineConfirmCommand`); a later `rbox git resolve --confirm <snapshot>`
+   recomputes the identity and compares — `:761`, `:797`, `:896` — emitting
+   `snapshot-mismatch` on any difference. Because `oracleReceipt` is a field of
+   that identity, a receipt-population change across the upgrade changes the id
+   and the confirm refuses. So *client skew across the upgrade fails closed*: a
+   `--show` snapshot taken by one version and confirmed by the other asks for a
+   fresh `--show` rather than applying a stale intent.
+   (`resolve-command.ts:1046-1051` is a separate, IN-PROCESS boundary re-prove
+   against `confirmedIdentity` (`:1019`) that sets `boundaryMismatch`; same
+   binary on both sides, so it cannot exhibit version skew and is not the gate
+   cited here.)
 5. **Repo-scope addressing (B1).** A repo at or under a conflict-named
    component compares exactly as today — §2.3's scoping is what buys that.
 
@@ -274,32 +406,71 @@ Every consumer whose observable behavior changes:
 A silent exclusion is how litter becomes permanent, so a surface is IN scope.
 
 **`counts.conflictCopies`** joins `StatusLocalCountsBase`
-(`src/cli/status-contract.ts:121-131`) beside the existing `conflictSnapshots:
+(`src/cli/status-contract.ts:120-131`) beside the existing `conflictSnapshots:
 { total, prunable }` — which is the *git ref* namespace
 (`src/cli/sync-git/conflict-retention.ts`, `refs/rbox-conflict/`, 90-day
 prune). Different objects, adjacent surface; the rendering must not blur them
 (`status-render.ts:270-271` prints "conflict snapshots"; the new line reads
 "conflict copies").
 
-Source: the local manifest the projection already holds —
-`localManifest.files.filter(…)` (`status-projection.ts:371` computes
-`trackedFiles` from exactly that array). Zero new scan, and the **same
-predicate** as the oracle exclusion, so the count can never disagree with what
-was excluded.
+Source: a local manifest that is already in hand on whichever branch runs. Zero
+new scan, and the **same predicate** as the oracle exclusion, so the count can
+never disagree with what was excluded.
 
-**Daemon branch, exactly on the `strandedIgnored` precedent (R3)** — design
-224 §2.3 solved this identical problem and its shape is copied verbatim:
+**The `strandedIgnored` precedent, taken for its WIRE shape only (R3, corrected
+by r4).** Design 224 §2.3 solved the same *surface* problem, and its full chain
+is `local-file-projection.ts:39` (`strandedIgnored = ignoredBase.length`,
+produced) → `push.ts:647` (`deps.onStrandedIgnoredObserved?.(…)`) →
+`daemon.ts:1864` (the hook stores it) → `daemon.ts:370` (the daemon field) →
+`daemon.ts:2272` (emitted into the activity snapshot) → `activity.ts:77`
+(optional field) → `status-projection.ts:302`/`:361` → `status-contract.ts:222`
+and the JSON/human surfaces at `status-render.ts:150`, `:318`, `:273`.
 
-- `activity.ts:76-78`: `conflictCopies?: number` declared **optional**, with
-  `sourceVersion` staying **`1`** (an older daemon simply omits the field; the
-  version is not a feature flag).
+**Its value rides the PUSH lane.** `strandedIgnored` is only ever observed
+inside `push.ts:647`, which is why `activity.ts:74-76` documents the field as
+absent for "a daemon … that has not pushed since start". Copying that source
+verbatim would leave `counts.conflictCopies` **permanently undefined on FM** —
+the pull-only host whose 103-repo wedge this design exists to fix. Unacceptable.
+
+**Verified: the computed branch does not rescue it either.** `rbox status` picks
+its branch at `status-projection.ts:258-260`/`:295`: whenever
+`trustedLocalSnapshot` (`:74-93`) succeeds — daemon running, owning the
+workspace, with a fresh, settled, matching-base `activity.local` — status reads
+the **daemon** branch and never runs the computed scan at `:344-379`. A
+pull-only daemon does satisfy that: `enqueueActivityWrite`
+(`daemon.ts:2407-2421`) writes `activity.local` on every activity write with no
+pull-only condition, and `localSnapshot` (`daemon.ts:2259-2275`) derives it from
+`this.local.manifest`. So on a live FM the computed branch is not reached, and
+"pull-only hosts read the computed branch" would be false.
+
+**Decision: source the count off the local manifest on BOTH branches,
+independent of the push lane.**
+
+- **Daemon branch:** computed inside `localSnapshot` (`daemon.ts:2259-2275`)
+  from `this.local.manifest.files`, exactly beside `trackedFiles` at `:2267`.
+  That manifest is maintained by scans and pull-applied patches
+  (`daemon.ts:1926`, `:2015`, `:2575`) with no push involvement, so the count is
+  present on a pull-only host. No new daemon field, no new hook, no new lane.
+- **Computed branch:** `localManifest.files.filter(…)` at
+  `status-projection.ts:361-371`, where `trackedFiles` already reads
+  `localManifest.files.length`.
+- **Populate branch** (`:319-343`) has no local manifest and reports
+  `undefined`, which renders as nothing — see below.
+
+**Wire shape, copied verbatim from the precedent:**
+
+- `activity.ts`: `conflictCopies?: number` declared **optional** beside
+  `strandedIgnored` at `:77`, with `sourceVersion` staying **`1`** (an older
+  daemon simply omits the field; the version is not a feature flag).
 - `activity.ts:152`: guard clause extended to
   `(local.conflictCopies === undefined || uint(local.conflictCopies))`.
 - `activity.ts:166`: conditional copy —
   `if (local.conflictCopies !== undefined) decoded.conflictCopies = …`.
 - `status-projection.ts:302` reads it from `trusted.local` on the daemon
   branch; `:361` from the freshly projected value; `:455`'s pattern
-  (`if (x !== undefined) detail.x = x`) carries it.
+  (`if (x !== undefined) detail.x = x`) carries it, and
+  `status-render.ts:150`/`:318` emit it on both branches the way
+  `strandedIgnored`'s comment at `:148-149` already prescribes.
 - **When a v1 daemon omits it**, the value is `undefined` and the renderer
   prints **nothing** — exactly `strandedIgnoredLine`'s contract
   (`status-view.ts:927-933`: `if (!count || count <= 0) return undefined`).
@@ -337,16 +508,23 @@ turns out to matter. A 15th hit sits under `.rbox/trash/…` and is excluded:
 
 | `%y` / `%Y` | Count | What they are |
 |---|---|---|
-| `f` / `f` | 6 | regular files: two `.env` copies, three `163-…conflict.md` design-doc copies under `.claude/worktrees`, one `settings.local…conflict.json` |
+| `f` / `f` | 6 | regular files: **three** `.env` copies (`Dfinitiv/savvy-core/studio/frontend`, `Personal/mach-email`, `Personal/rbox-core`) and **three** `163-…conflict.md` design-doc copies under `Personal/rbox-core/.claude/worktrees` |
 | `l` / `d` | 8 | **symlinks whose targets are directories** — all eight are `node_modules.dev_<32hex>.<ts>.conflict` under `Dfinitiv/savvy-core/.claude/worktrees/*` |
+
+**Correction (r4).** r3's breakdown read "two `.env` … one
+`settings.local…conflict.json`", double-booking the `.rbox/trash` 15th hit that
+the same paragraph excludes: the `settings.local…conflict.json` is that trash
+hit and is NOT one of the 14. The re-executed census confirms 3 + 3.
 
 Two distinct `dev_<32 hex>` tokens; **zero** `local`/`trash` tokens; **zero**
 `~N` tails; **zero** user-authored files; and **zero true directories**
 (`find -type d` over the same grammar returns nothing).
 
-**Conclusion A — benefit.** 14 rbox mints, 12 of them inside git-repo
-subtrees, each one an extra that holds its repo `local-edits` today. That is
-the wedge, measured.
+**Conclusion A — benefit.** 14 rbox mints, and `git rev-parse` puts **all 14**
+inside a git repo — not 12 as r3 stated. The membership: `savvy-core` ×1, its
+three `.claude/worktrees` repos ×8, `mach-email` ×1, `rbox-core` ×1, its two
+`.claude/worktrees` repos ×3. Each is an extra that holds its repo
+`local-edits` today. That is the wedge, measured.
 
 **Conclusion B — cost, and a correction to the r2 framing.** r2 read the 8 as
 "directories" and drew *subtree-scale* benefit from them. They are **symlinks**
@@ -359,12 +537,34 @@ evidence supports 14 single-entry extras — nothing subtree-scale.
 Subtree scale is therefore a **code-derived** argument on both sides, not a
 field-observed one, and it is honest to say so: `apply.ts:307` and
 `trash.ts:250-252` *can* mint a true conflict-named directory (that is §2.3's
-motivation), and B1's vacuous-match *is* the same scale in the wrong direction
-(that is §2.3's scoping). Neither has been observed in the field yet. The
-measured benefit today is 12 subtree extras removed; the measured
+motivation), and the vacuous match *is* the same scale in the wrong direction
+(that is §2.3's scoping and, for the class D2 found, §2.4's guard). Neither has
+been observed in the field yet. The
+measured benefit today is 14 single-entry extras removed; the measured
 false-positive cost today is zero.
 
-## 6. Alternative recorded and REJECTED (m10)
+## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4)
+
+Three r4 ledger entries first, then the standing rejection:
+
+- **Root-scoping (§2.3) as the safety property — DEMOTED, not removed.** r3
+  claimed it made "the vacuous-match shape unreachable". It removes the ancestor
+  instance only; the at-or-below instance survives it. Kept because correct
+  addressing is still worth having on its own terms (a repo must not be
+  reclassified by a name belonging to its caller), but the safety claim now
+  belongs to §2.4's guard. Deletion condition unchanged: it goes when conflict
+  copies stop being minted.
+- **Literal substitution of `comparable()` at `scopedScan:718` — REJECTED
+  (D1).** It reads as the smallest possible change and is a fail-closed →
+  fail-open flip for grammar-matching special files. §2.5's restructure is the
+  smallest change that is actually behavior-preserving on the `"other"` axis.
+- **Exporting `comparable()` and pinning it directly — REJECTED (decision 6).**
+  Every consumer lives in `apply-receipt.ts`; exporting it would add a public
+  symbol whose only client would be a test. §7 pins it through the two oracles
+  instead, which is also the only way to catch the `scopedScan`/`inventory`
+  asymmetry D1 found.
+
+**Mint relocation, the standing rejection:**
 
 **Mint conflict copies into `.rbox/conflicts/<repo>/…` instead of as workspace
 siblings.** It would end the wedge with no oracle change at all, so the
@@ -390,15 +590,28 @@ comparison.
 - Symmetric-drop twin of the disproven-title pin: a matching path drops from
   BOTH the manifest side and the walk side.
 - Ancestor: a conflict-named directory **inside** a repo prunes its subtree.
-- **B1 pin (new, blocking):** a repo whose ROOT — and, separately, a repo whose
+- **B1 pin (blocking):** a repo whose ROOT — and, separately, a repo whose
   ANCESTOR — matches the grammar must NOT return `match` when its working tree
   diverges from the applied manifest. Without §2.3's root scoping this test
   returns `match`; that is the red state it must fail from.
-- **`"other"` arm (R1):** `apply-receipt.test.ts:393-400` stays green
-  unchanged; a new sibling pins a conflict-grammar FIFO at `indeterminate`,
-  not `match`.
-- `comparable`'s seven call sites pinned so a future edit cannot reintroduce an
-  eighth hand-copy.
+- **Empty-population guard, both fixtures (D2 — blocking):**
+  1. a repo whose only content directory is conflict-named (so every comparable
+     entry on both sides is excluded by the grammar, with the repo root itself
+     NOT matching) returns `indeterminate` with the population-emptied reason,
+     never `match`. Without §2.4's guard this returns `match` — the red state.
+  2. a genuinely empty repo (`git init`, no files, empty applied manifest) still
+     returns `match`. This is the discrimination the guard exists to keep; a
+     guard written as "population is empty" turns this fixture red, which is
+     precisely how the pair is worth having.
+- **`"other"` arm (R1, D1):** `apply-receipt.test.ts:393-400` stays green
+  unchanged; a new sibling pins a conflict-grammar FIFO at `indeterminate`, not
+  `match`, on **both** oracles — `pullOracle(...).proveRepo(...)` for the
+  `inventory` path (which `:398` already exercises alone) and
+  `oracleFromState({...}).proveRepo(...)` for the `scopedScan` path. The
+  state-oracle half is the one that fails without §2.5's restructure.
+- `comparable`'s seven call sites pinned **behaviorally, through the two
+  oracles** (it is module-private, §0), so a future edit cannot reintroduce an
+  eighth hand-copy or resurrect the two walks' shape difference.
 - Note: the `type-flip` rig's conflict assertions use a LOOSE glob
   (`'${FLIP}.*conflict*'` at `scripts/rig/scenarios/type-flip.ts:32`,
   `/\.conflict/` at `:86`). Those are convergence assertions, deliberately
@@ -416,7 +629,10 @@ exist today:
    `this.rbox(["start"])`. `rbox start --pull-only` exists
    (`src/cli/help-registry.ts:230-233`) but the rig cannot request it. An argv
    passthrough plus a pull-only preamble arm is in scope here and is the only
-   way to exercise the FM shape in CI.
+   way to exercise the FM shape in CI. That arm carries §4's non-negotiable:
+   with a pull-only daemon live and never having pushed, `rbox status` must
+   still report `counts.conflictCopies` — the assertion that the count did not
+   inherit `strandedIgnored`'s push-lane dependency.
 
 **Field — sequenced, not opportunistic.** No wave on a live fleet host. After
 the fleet drains, mint a deliberate wave in a **dedicated scratch workspace**
