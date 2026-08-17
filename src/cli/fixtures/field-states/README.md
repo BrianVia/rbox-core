@@ -23,6 +23,12 @@ Recorded human output at capture time, for reconciliation tests:
   attention (oldest: 1 day)" while `--git` listed 52 — the fixture holds 52
   records, so the projection replay must either reproduce 103 (explaining
   the mechanism) or prove the headline defective (GH #764 defect 2).
+  UPDATE 2026-08-17 12:28 UTC: after a daemon restart (GH #765 incident)
+  the SAME 52-record population renders "52 git repos need attention" —
+  so the 103 was transient/stale, not a stable double-count; the replay
+  test should assert 52 and the 103 mechanism hunt moves to #764's
+  investigation notes (suspects: pre-restart stale daemon projection, or
+  a since-drained population).
 - Mac at capture: "3 git repos need attention (oldest: 2 days)" — matches
   the 3 rows.
 - FM shell sidecar `.rbox/state/shell.deferrals` held 51 lines (50-row
