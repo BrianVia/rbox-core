@@ -94,7 +94,7 @@ status branches, sourced from `rawLocalManifest` (`status-projection.ts:352-354`
    - resolve refusal copy: `git/resolve-presentation.ts:125-146`.
    - coverage: `status-view.test.ts:163-169` and
      `sync-git/deferral-precedence.test.ts:11-19` cover it automatically.
-   - **the one non-mechanical site:** `doctor-cmd.ts:213-217`'s `gitReasonOf`
+   - **the one non-mechanical site:** `doctor-cmd.ts:213-217`'s `logRedactionReasonOf`
      iterates `GIT_DEFERRAL_REASON_SET` in declaration order and returns the
      first member the detail `includes(...)`, so `"conflict"` would swallow
      `"conflict-copies"`. Fix: place the new member **before** `"conflict"` in

@@ -2,7 +2,7 @@
 
 Status: **ALIGNED (r9)** (folds the r8 delta-confirm — the final round, all
 transcription. The r8 confirm re-verified every decision in code and found no
-blocker: it walked `gitReasonOf`'s normalization by hand, found no vocabulary
+blocker: it walked `logRedactionReasonOf`'s normalization by hand, found no vocabulary
 collisions beyond the two known superstring pairs, and confirmed the
 declaration-index claim (11/12) load-bearing. Three fixes, all in the trace and
 the pins, none in the mechanism. **C-r8-1**: §2.7's trace hop 2 conflated two
@@ -14,7 +14,7 @@ family whose fragment is `renderGitDeferralLine`'s LABEL
 (§2.7's copy block; `ref-read-unreadable`'s label already mis-buckets its own
 family as `unreadable` — pre-existing, noted, out of scope). **C-r8-2**: §7's
 doctor pin is restated over the exported seam `redactGitLogLines`, since
-`gitReasonOf` is module-private — two inputs, one per channel; §0's
+`logRedactionReasonOf` is module-private — two inputs, one per channel; §0's
 two-exported-symbols count is unchanged. Plus nits: the C-r7-1 example now uses
 the literal-token producer, §2.3 retitled, §6 headed through r8. r8's own
 fold — everything below — held unchanged.
@@ -662,9 +662,9 @@ footprint. Every site, anchored:
 | Resolve refusal copy | `src/cli/git/resolve-presentation.ts:125-146` (`refusalMessage`'s `Record<GitDeferralReason, string>`) | one sentence; the `Record` type makes omission a compile error |
 | Coverage test | `status-view.test.ts:163-169` | iterates `GIT_DEFERRAL_REASONS` asserting non-empty label/text/repair — it covers the new member automatically, and fails if the presentation entry is missing. Its second half (`:170-174`) pins the unknown-reason FALLBACK (`"future-reason"` ⇒ "unrecognized Git issue", `transient: false`) and is untouched by adding a member |
 | Precedence test | `src/cli/sync-git/deferral-precedence.test.ts:11-19` | set-equality of enum vs precedence vs rank — covers it automatically |
-| Doctor reason inference | `src/cli/doctor-cmd.ts:43`, `:213-217` (`gitReasonOf`) | **see the ordering hazard below** |
+| Doctor reason inference | `src/cli/doctor-cmd.ts:43`, `:213-217` (`logRedactionReasonOf`) | **see the ordering hazard below** |
 
-**The one non-mechanical site: `doctor-cmd.ts`'s `gitReasonOf` (`:213-217`).**
+**The one non-mechanical site: `doctor-cmd.ts`'s `logRedactionReasonOf` (`:213-217`).**
 It infers a reason from a free-text detail by iterating
 `GIT_DEFERRAL_REASON_SET` and returning the first member the normalized detail
 `includes(...)`. Set iteration follows declaration order, and `"conflict"`
@@ -673,13 +673,13 @@ be classified `conflict`, silently. Fix: place `"conflict-copies"` **before**
 `"conflict"` in the `GIT_DEFERRAL_REASONS` declaration (`sync-state-model.ts:130`).
 
 **The trace that makes the `why` string load-bearing (B-r7-1).** The reason id
-NEVER reaches `gitReasonOf`; only the `why` does, and the whole path is
+NEVER reaches `logRedactionReasonOf`; only the `why` does, and the whole path is
 verifiable in three hops:
 
 1. `follow-classify.ts:139` pushes `oracle.why` **verbatim** into `details` —
    the reason id it `add`s alongside is a separate channel that never enters the
    deferral log line.
-2. The log line is what `gitReasonOf`'s callers parse, and the callers split
+2. The log line is what `logRedactionReasonOf`'s callers parse, and the callers split
    into two families that hand it **different strings**:
    - `doctor-cmd.ts:249` (`git-sync deferred <repo>: <detail>`), `:255`
      (`git-sync WARNING <repo>: <detail>`) and `:261` (the `git-sync applied`
@@ -694,8 +694,8 @@ verifiable in three hops:
      at `:456` → `DEFERRAL_REASON_PRESENTATION[reason].label`), written to the
      daemon log at `src/cli/daemon/daemon.ts:305`. So this family round-trips
      the reason id through its user-facing LABEL and back through
-     `gitReasonOf`.
-3. `gitReasonOf` normalizes with `detail.toLowerCase().replace(/[ _]+/g, "-")`
+     `logRedactionReasonOf`.
+3. `logRedactionReasonOf` normalizes with `detail.toLowerCase().replace(/[ _]+/g, "-")`
    (`doctor-cmd.ts:214`), which folds spaces and underscores to hyphens but
    leaves existing hyphens alone.
 
@@ -719,7 +719,7 @@ and nothing type-checks it.
 **The general invariant behind that fix (C-r6-3).** `"conflict-copies"` before
 `"conflict"` is one instance of a rule the vocabulary now has to keep:
 **any `GIT_DEFERRAL_REASONS` member that is a superstring of another member must
-precede that member in the declaration.** `gitReasonOf` returns the FIRST
+precede that member in the declaration.** `logRedactionReasonOf` returns the FIRST
 `includes()` hit while iterating `GIT_DEFERRAL_REASON_SET`
 (`doctor-cmd.ts:213-217`), and that set is built from the declaration in order
 (`:43`), so a shorter member declared earlier permanently shadows every longer
@@ -752,7 +752,7 @@ array has no way to see that the list is not freely sortable. One line, above
 `:138-148`:
 
 ```ts
-/** Order is load-bearing for `gitReasonOf` (doctor-cmd.ts:213): a member that is
+/** Order is load-bearing for `logRedactionReasonOf` (doctor-cmd.ts:213): a member that is
  *  a SUPERSTRING of another must be declared before it, or the shorter one
  *  shadows it. Pinned by the invariant test; do not sort this list. */
 ```
@@ -766,7 +766,7 @@ compile-time** (precedence ranking, telemetry restatement, status-view copy,
 resolve refusal copy — each fails `tsc` until the member is handled), **three
 are carried automatically by existing tests** (the telemetry length pin, which
 is a one-digit edit; the status-view coverage test; the precedence test), and
-**one — `doctor-cmd`'s `gitReasonOf` — is unenforced by anything**, which is
+**one — `doctor-cmd`'s `logRedactionReasonOf` — is unenforced by anything**, which is
 precisely why decision C-r6-3 above adds a test for it. Adding a member is
 mechanical everywhere except that last row.
 
@@ -809,7 +809,7 @@ plural and the exact wording carry the same duty the constant carries, by the
 second channel §2.7's trace names: the label is what
 `renderGitDeferralLine` writes into the `git deferred <age>: <fragment> on …`
 daemon-log line (`status-view.ts:456`, written at `daemon/daemon.ts:305`), and
-`doctor-cmd.ts:246` hands that fragment straight to `gitReasonOf`.
+`doctor-cmd.ts:246` hands that fragment straight to `logRedactionReasonOf`.
 `"conflict copies"` normalizes (`toLowerCase().replace(/[ _]+/g, "-")`) to
 `conflict-copies` and buckets correctly; a singular `"conflict copy"`, or a
 reworded `"rbox conflict backups"`, normalizes to something the vocabulary does
@@ -1160,19 +1160,19 @@ mislabeled that third group — those entries predate r4.
 
 - **A singular `why` — `"repo population emptied by conflict-copy exclusion"` —
   REJECTED (B-r7-1).** It reads better and it silently breaks the one surface
-  that re-infers the reason from text. `gitReasonOf` normalizes with
+  that re-infers the reason from text. `logRedactionReasonOf` normalizes with
   `toLowerCase().replace(/[ _]+/g, "-")` (`doctor-cmd.ts:214`) and tests
   `includes()` per member: `conflict-copy` does not contain `conflict-copies`,
   so the detail falls through to `"conflict"` and the doctor support-bundle
   bucket is wrong no matter where `"conflict-copies"` sits in the declaration.
   The plural is not cosmetic — it is the join between the two vocabularies.
   Adopted wording in §0; trace in §2.7.
-- **Pinning `gitReasonOf` with a hand-authored literal detail string —
+- **Pinning `logRedactionReasonOf` with a hand-authored literal detail string —
   REJECTED (B-r7-1).** A test written as
-  `gitReasonOf("… conflict-copies …")` passes on a build whose constant has
+  `logRedactionReasonOf("… conflict-copies …")` passes on a build whose constant has
   drifted back to the singular, i.e. it is green in exactly the failure this
   round exists to catch. §7 asserts over the **exported constant** instead:
-  `expect(gitReasonOf(CONFLICT_COPY_POPULATION_WHY)).toBe("conflict-copies")`.
+  `expect(logRedactionReasonOf(CONFLICT_COPY_POPULATION_WHY)).toBe("conflict-copies")`.
 
 **r7:**
 
@@ -1335,9 +1335,9 @@ comparison.
      `indeterminate` with any other `why` still adds `unreadable` — the
      negative half, without which an over-broad match test passes.
   2. the doctor's reason inference, asserted **through the exported seam**
-     (C-r8-2). `gitReasonOf` is module-private (`doctor-cmd.ts:213`, no
+     (C-r8-2). `logRedactionReasonOf` is module-private (`doctor-cmd.ts:213`, no
      `export`); the exported entry point is `redactGitLogLines` (`:279`), which
-     reaches it via `classifyGitLogMessage` and emits the bucket as the
+     reaches it via `classifyGitLogLineForRedaction` and emits the bucket as the
      `git-sync ${klass} reason=${reason} age=${age}` key at `:272`. Two inputs,
      one per §2.7 channel:
      - the **`why` half**, over the exported constant itself — never a

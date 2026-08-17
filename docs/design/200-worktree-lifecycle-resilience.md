@@ -3226,7 +3226,7 @@ path scrubber. `redactGitLogLines` (`doctor-cmd.ts:171-215`) is a **fail-closed
 allowlist**: a line is processed only if it starts with `git-sync `, `git-sync:`,
 `git deferred` or `lock starved:` (`doctor-cmd.ts:181-182`), and a recognized line is
 **rewritten into a closed enum** — the free text where a path would live is discarded, not
-masked (`classifyGitLogMessage`, `doctor-cmd.ts:129-166`, consumed at `:196`). So a path
+masked (`classifyGitLogLineForRedaction`, `doctor-cmd.ts:129-166`, consumed at `:196`). So a path
 inside a well-formed `git-sync deferred …` line is safe today. But:
 
 - Ordinary daemon-log lines occurring **before** the first Git-family line pass through
@@ -3337,7 +3337,7 @@ must not promise self-clearance unconditionally; where an exit exists it comes f
 blocker's own detail line and from `renderGitDeferralCompanion` (`status-view.ts:475-481`, which
 consumes `presentation.repair` and is otherwise reason-tolerant), not from this shared copy.
 
-**Doctor classification.** `gitReasonOf` (`doctor-cmd.ts:107-127`) first matches any
+**Doctor classification.** `logRedactionReasonOf` (`doctor-cmd.ts:107-127`) first matches any
 `GIT_DEFERRAL_REASON_SET` member as a substring, and that set is **derived from the tuple**
 (`doctor-cmd.ts:23` imports it, `:34` builds the set), so `deletion-pending` classifies itself once it
 is in the tuple. Add one explicit regex arm **before** the `local-commits` arm at `:115` — otherwise a

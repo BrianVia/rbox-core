@@ -77,13 +77,11 @@ interface StoryInput {
   action: GitStoryAction;
 }
 
-const story = (code: GitStoryCode, input: StoryInput): GitStory => ({
-  code,
-  headline: input.headline,
-  ...(input.plural === undefined ? {} : { headlinePlural: input.plural }),
-  action: input.action,
-  needsYou: input.needsYou,
-});
+function story(code: GitStoryCode, input: StoryInput): GitStory {
+  const built: GitStory = { code, headline: input.headline, action: input.action, needsYou: input.needsYou };
+  if (input.plural !== undefined) built.headlinePlural = input.plural;
+  return built;
+}
 
 /** The one literal sentence a story hands the reader, when it has one. Stories
  * whose action is a command block or a per-row repair have none. */

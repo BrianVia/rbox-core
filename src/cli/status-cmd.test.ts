@@ -598,7 +598,7 @@ test("status --git aggregate and detail use one consistent repo projection", asy
   expect(out).toContain("rbox paused git sync in 3 repos.");
   expect(out).toContain("1 repo — this computer has commits your other computers never got");
   expect(out).toContain("1 repo — you changed files here that were never synced");
-  expect(out).toContain("1 repo — git was busy here — rbox retries on its own");
+  expect(out).toContain("1 repo — git was busy here");
   expect(out).toContain("   zeta   paused 15 days");
   expect(out).toContain("   alpha   paused 2 days");
   expect(out).toContain("   beta   paused 2 days");
@@ -606,6 +606,33 @@ test("status --git aggregate and detail use one consistent repo projection", asy
   expect(out).not.toContain("git deferred ");
   expect(out).not.toContain("0123456789abcdef");
   for (const banned of ["deferral", "quarantine", "dry run"]) expect(out.toLowerCase()).not.toContain(banned);
+});
+
+test("design 273 validation row: headline, group sums and the JSON population are ONE number", async () => {
+  await saveDeferralState();
+  const listing = await captureStatus({ git: true });
+  const json = JSON.parse(await captureStatus({ json: true })) as {
+    git: { deferredRepos: { repo: string; needsYou: boolean; quiet: boolean }[] };
+  };
+
+  const headline = /⚠ (\d+) repos? (?:is|are) waiting on you/.exec(listing);
+  const healing = /(\d+) more (?:is|are) sorting/.exec(listing);
+  const needsYou = Number(headline?.[1] ?? 0);
+  const selfHealing = Number(healing?.[1] ?? 0);
+
+  // Group sums: every "N repos — <story>" header in the listing.
+  const groupSum = [...listing.matchAll(/^(\d+) repos? — /gm)].reduce((sum, m) => sum + Number(m[1]), 0);
+  const total = /rbox paused git sync in (\d+) repos?\./.exec(listing);
+  const loudJson = json.git.deferredRepos.filter((repo) => !repo.quiet);
+
+  expect(needsYou + selfHealing).toBe(groupSum);
+  expect(groupSum).toBe(Number(total?.[1]));
+  expect(groupSum).toBe(loudJson.length);
+  expect(loudJson.filter((repo) => repo.needsYou)).toHaveLength(needsYou);
+
+  // And the pointer to the listing is not printed on top of the listing.
+  expect(listing).not.toContain("See them:  rbox status --git");
+  expect(await captureStatus({})).toContain("See them:  rbox status --git");
 });
 
 test("full and --git status add one actionable companion while JSON and the shared line stay frozen", async () => {
@@ -1053,7 +1080,7 @@ test("review M6: status hygiene failures retain deferrals through both call site
   const out = await captureStatusWithDeps({}, d);
 
   expect(calls).toBe(2);
-  expect(out).toContain("1 repo is sorting itself out.");
+  expect(out).toContain("rbox paused git sync in 1 repo and is sorting it out on its own.");
   expect(repoRecordsForState(await loadState(root, stream)).repo?.deferrals?.capture?.reason).toBe("git-busy");
 });
 

@@ -51,6 +51,8 @@ export type BriefHaltReason =
 export interface BriefGitAttention {
   needsYou: number;
   selfHealing: number;
+  /** The grouped listing follows this headline, so the pointer to it is noise. */
+  listed?: boolean;
 }
 
 export interface BriefPopulateProgress {

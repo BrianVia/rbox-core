@@ -273,7 +273,7 @@ export function renderStatusBrief(
     daemonVersionSkew: daemon.versionSkew,
     locking: projection.locking,
     ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
-    ...(loudGitRepos.length > 0 ? { git: gitPauseCounts(loudGitRepos) } : {}),
+    ...(loudGitRepos.length > 0 ? { git: { ...gitPauseCounts(loudGitRepos), listed: gitDetail } } : {}),
     ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
     ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
     now,
@@ -292,7 +292,11 @@ export function renderStatusBrief(
   // LOG line, whose redaction classifier is byte-frozen against it.
   if (gitDetail) {
     lines.push("");
-    lines.push(...renderGitPauseListing(git.projectedRepos, { now, all: options.all === true }));
+    lines.push(...renderGitPauseListing(git.projectedRepos, {
+      now,
+      all: options.all === true,
+      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane),
+    }));
   }
   return lines;
 }
