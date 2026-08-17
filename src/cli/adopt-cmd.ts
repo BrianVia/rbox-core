@@ -163,10 +163,7 @@ async function ensureJournalConfig(
   }
   requireSelected(stateAdmission);
 
-  const state = await ensureFolderAuthority({
-    currentRoot: journal.workspace.root,
-    admittedFirstBinding: !current,
-  });
+  const state = await ensureFolderAuthority({ currentRoot: journal.workspace.root });
 
   if (!current) {
     // Downstream catalog effects happen only after state authority is selected.

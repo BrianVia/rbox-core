@@ -116,32 +116,16 @@ export function generateFolderCatalog(inventory: FolderGenerationInventory): Gen
   return { bytes, catalog, skipped: inventory.skipped.map((entry) => ({ ...entry })) };
 }
 
+/** Publish a catalog for a home that has none. Admissible only when generation
+ * omits nothing: every discoverable binding is reproduced from its own
+ * pre-catalog policy, so a skipped row — the one thing generation would drop —
+ * refuses instead (design 276 F1.3). Evidence gaps are refused by generation. */
 export async function initializeFolderCatalog(
   inventory: FolderGenerationInventory,
   options: { publication?: FolderCatalogPublicationOptions } = {},
 ): Promise<FolderCatalogSnapshot> {
-  if (inventory.discoverableBindings.length !== 0) {
-    throw new Error("silent folder configuration initialization requires zero discoverable bindings");
-  }
-  const generated = generateFolderCatalog(inventory);
-  return (await publishNoReplace(generated.bytes, options.publication)).snapshot;
-}
-
-/** Crash-continuation initializer for the first successfully admitted binding.
- * Ordinary authority activation still refuses any discoverable binding. This
- * narrower capability accepts exactly the named root and no skipped/evidence-
- * unavailable rows, so it cannot silently regenerate an older lost catalog. */
-export async function initializeFolderCatalogAfterFirstBinding(
-  inventory: FolderGenerationInventory,
-  root: string,
-  options: { publication?: FolderCatalogPublicationOptions } = {},
-): Promise<FolderCatalogSnapshot> {
-  const expected = expandFolderPath(path.resolve(root));
-  const only = inventory.discoverableBindings.length === 1
-    ? expandFolderPath(path.resolve(inventory.discoverableBindings[0]!.root))
-    : undefined;
-  if (only !== expected || inventory.skipped.length !== 0 || (inventory.evidenceUnavailable?.length ?? 0) !== 0) {
-    throw new Error("first-binding folder configuration initialization requires exactly the admitted root");
+  if (inventory.skipped.length !== 0) {
+    throw new Error("silent folder configuration initialization requires an inventory with zero skipped roots");
   }
   const generated = generateFolderCatalog(inventory);
   return (await publishNoReplace(generated.bytes, options.publication)).snapshot;

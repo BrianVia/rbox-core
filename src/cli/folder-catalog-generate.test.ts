@@ -95,7 +95,7 @@ test("generation sorts normalized paths before naming and emits complete reparsa
   expect(generated.skipped).toEqual([{ root: "/dangling", reason: "missing" }]);
 });
 
-test("silent initialization requires zero discoverable bindings and adopts a hand-authored winner", async () => {
+test("silent initialization requires zero skipped roots and adopts a hand-authored winner", async () => {
   await isolate();
   const empty = await inventory([]);
   const winner = serializeFolderCatalog({ schemaVersion: 1, globalOptions: {}, folders: [{ name: "Winner", path: "/winner" }] });
@@ -107,7 +107,8 @@ test("silent initialization requires zero discoverable bindings and adopts a han
     },
   });
   expect(snapshot.catalog.folders[0]?.name).toBe("Winner");
-  await expect(initializeFolderCatalog(await inventory([binding("/bound")]))).rejects.toThrow(/zero discoverable/);
+  await expect(initializeFolderCatalog(await inventory([], [{ root: "/dropped", reason: "the folder does not exist" }])))
+    .rejects.toThrow(/zero skipped/);
 });
 
 test("two simultaneous first-run generators converge on one complete winner", async () => {
@@ -115,20 +116,20 @@ test("two simultaneous first-run generators converge on one complete winner", as
   const state = await inspectFolderCatalog();
   const first: FolderGenerationInventory = {
     revision: state.revision,
-    discoverableBindings: [],
-    skipped: [{ root: "/first", reason: "not discoverable" }],
+    discoverableBindings: [{ root: "/first", binding: binding("/first") }],
+    skipped: [],
   };
   const second: FolderGenerationInventory = {
     revision: state.revision,
-    discoverableBindings: [],
-    skipped: [{ root: "/second", reason: "not discoverable" }],
+    discoverableBindings: [{ root: "/second", binding: binding("/second") }],
+    skipped: [],
   };
   const [left, right] = await Promise.all([initializeFolderCatalog(first), initializeFolderCatalog(second)]);
   expect(left.catalog).toEqual(right.catalog);
   expect((await inspectFolderCatalog()).kind).toBe("authoritative");
 });
 
-test("authority silently initializes a fresh machine and refuses absence with bindings", async () => {
+test("authority silently initializes a fresh machine and a lost catalog it can fully reproduce", async () => {
   const { base } = await isolate();
   expect((await ensureFolderAuthority()).snapshot.catalog.folders).toEqual([]);
 
@@ -136,7 +137,8 @@ test("authority silently initializes a fresh machine and refuses absence with bi
   const bound = path.join(base, "bound");
   await fs.mkdir(path.join(bound, ".rbox"), { recursive: true });
   await fs.writeFile(path.join(bound, ".rbox", "workspace.json"), JSON.stringify(binding(bound)));
-  await expect(ensureFolderAuthority({ currentRoot: bound })).rejects.toThrow(/rbox config regenerate/);
+  const healed = await ensureFolderAuthority({ currentRoot: bound });
+  expect(healed.snapshot.catalog.folders.map((folder) => folder.path)).toEqual([bound]);
 });
 
 test("authority reports exact damaged reason and a repair-copy path", async () => {
