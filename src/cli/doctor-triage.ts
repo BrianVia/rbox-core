@@ -17,7 +17,8 @@ import type { AdoptFenceInspection } from "./adopt-journal.js";
 import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
-import { renderGitPauseSummary } from "./status-view/git-story-render.js";
+import { storyInstruction } from "./status-view/git-stories.js";
+import { loudRows, renderGitPauseSummary } from "./status-view/git-story-render.js";
 import { ageBucket } from "./status-view/text.js";
 import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
@@ -98,19 +99,8 @@ function repoArg(repo: string): string {
   return repo.startsWith("-") ? `./${repo}` : repo;
 }
 
-/** A repo whose class AND incoming state both admit a resolve command. Design
- * 273 P2: `remediationClass` is consulted FIRST. An ownership hold carries
- * `pending`, so `canKeepMine` alone would hand a `keep-mine` command to a repo
- * whose own story says no command is needed. */
-const offersResolve = (repo: GitDeferralRepoProjection): boolean =>
-  repo.remediationClass !== "ownership-hold"
-  && repo.remediationClass !== "capture"
-  && repo.remediationClass !== "config"
-  && (repo.canResolve || repo.canKeepMine);
-
 function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: number): TriageFinding {
   const age = ageBucket(repo.oldestDeferredSince, now);
-  const resolvable = offersResolve(repo);
   const command = repo.canKeepMine
     ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`)
     : scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`);
@@ -124,16 +114,18 @@ function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: num
     ? "info"
     : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
   const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
-  const advice = repo.story.action ? ` What to do: ${repo.story.action}.` : "";
+  const instruction = storyInstruction(repo.story);
+  const advice = instruction ? ` What to do: ${instruction}.` : "";
   const finding: TriageFinding = {
     id: `git-paused:${repo.repo}`,
     severity,
     problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)}: ${repo.story.headline}.`.replace("  ", " "),
     safety: `${safety}${quietNote}${advice}`,
   };
-  // No command rather than a wrong one: `command` is a promise that the line
-  // below it will run against the very state that produced this finding.
-  if (resolvable) finding.command = command;
+  // No command rather than a wrong one, and `resolvable` is the PROJECTION's
+  // predicate (design 273 P2) — doctor and the status listing diverged the
+  // moment each kept its own copy of the rule.
+  if (repo.resolvable) finding.command = command;
   return finding;
 }
 
@@ -499,8 +491,15 @@ export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
   };
 }
 
-function headline(triage: WorkspaceTriage): string {
-  const actionable = triage.findings.filter((finding) => finding.severity !== "info").length;
+const isGitPaused = (finding: TriageFinding): boolean => finding.id.startsWith("git-paused:");
+
+/** The count must be the count of THINGS PRINTED: the human render collapses
+ * every paused repo into ONE git block, so counting 48 repo findings above a
+ * single block taught the reader that rbox cannot count. */
+function headline(triage: WorkspaceTriage, gitCollapsedItems: number): string {
+  const actionable = triage.findings
+    .filter((finding) => finding.severity !== "info" && !isGitPaused(finding)).length
+    + gitCollapsedItems;
   if (actionable === 0) return "Everything is syncing normally.";
   return actionable === 1 ? "1 thing needs your attention." : `${actionable} things need your attention.`;
 }
@@ -518,12 +517,14 @@ export function renderWorkspaceTriage(
   now = Date.now(),
 ): string[] {
   const lines = [`${style.bold("rbox doctor")} — ${triage.workspace} ${style.dim(`(${triage.root})`)}`, ""];
-  lines.push(headline(triage));
+  // The git block is one item, and only when it says someone must act.
+  const gitCollapsedItems = gitRows.length > 0 && loudRows(gitRows).some((row) => row.story.needsYou) ? 1 : 0;
+  lines.push(headline(triage, gitCollapsedItems));
   if (gitRows.length > 0) {
     lines.push("");
     for (const line of renderGitPauseSummary(gitRows, now)) lines.push(line);
   }
-  triage.findings.filter((finding) => !finding.id.startsWith("git-paused:")).forEach((finding, index) => {
+  triage.findings.filter((finding) => !isGitPaused(finding)).forEach((finding, index) => {
     lines.push("");
     const marker = finding.severity === "info" ? style.dim("note") : `${index + 1}.`;
     lines.push(`${marker} ${finding.problem}`);

@@ -72,12 +72,17 @@ export function gitDeferralReasonText(reason: string): string {
   return gitDeferralReasonPresentation(reason).label;
 }
 
-/** Preserve the legacy operational tie while giving deletion-pending its deliberate display slot. */
+/** Preserve the legacy operational tie while giving deletion-pending its deliberate display slot.
+ *
+ * `local-operation` outranks `local-index` (design 273 S2): a half-finished
+ * rebase always dirties the index too, so index-first meant the unfinished-
+ * operation story could never fire on the repo it was written for — the reader
+ * was told "you have uncommitted work" about a repo stuck mid-rebase. */
 function gitDeferralReasonPrecedence(reason: string): number {
   switch (reason) {
     case "local-edits": return 0;
-    case "local-index": return 1;
-    case "local-operation": return 2;
+    case "local-operation": return 1;
+    case "local-index": return 2;
     case "local-commits": return 3;
     case "local-stash": return 4;
     case "deletion-pending": return 5;
@@ -130,6 +135,10 @@ export interface GitDeferralRepoProjection {
    * `git deferrals --json` render them LABELLED, so a flapping repo whose
    * `deferredSince` keeps resetting stays visible to the support flow. */
   quiet: boolean;
+  /** THE predicate for "may a surface print a resolve command for this repo?".
+   * `remediationClass` is consulted first, then the incoming state — one owner,
+   * so doctor and the listing cannot disagree about the same repo. */
+  resolvable: boolean;
   canResolve: boolean;
   canKeepMine: boolean;
   alsoDeferred?: string;
@@ -170,7 +179,12 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       || a.lane.localeCompare(b.lane)
       || a.reason.localeCompare(b.reason)
     );
-    const display = ordered[0]!;
+    // Actionability is LANE-COMPLETE. A repo whose oldest lane is a quiet
+    // ownership hold and whose second lane is an unreadable repo needs a person,
+    // so display precedence picks among the lanes that need one first —
+    // otherwise the repo renders under a story that says "nothing to do" and
+    // disappears from every attention surface.
+    const display = (ordered.find((lane) => gitStoryFor(lane.reason, lane.detail).needsYou) ?? ordered[0])!;
     const oldest = [...lanes].sort((a, b) =>
       parsedDeferralTime(a.deferredSince, now) - parsedDeferralTime(b.deferredSince, now)
       || a.lane.localeCompare(b.lane)
@@ -180,9 +194,11 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
     const knownReason = isKnownGitDeferralReason(display.reason);
     const canResolve = knownReason && hasGitResolutionIncoming(record);
     const canKeepMine = knownReason && Boolean(record?.pending);
+    // `ownership-hold` is a claim about the WHOLE repo ("rbox left this alone
+    // and nobody needs to act"), so one non-ownership lane disqualifies it.
     const remediationClass: GitDeferralRemediationClass = !knownReason
       ? "apply-unavailable"
-      : display.reason === "worktree-ownership"
+      : lanes.every((lane) => lane.reason === "worktree-ownership")
       ? "ownership-hold"
       : presentation.transient
       ? "transient"
@@ -212,6 +228,10 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       remediationClass,
       story: gitStoryFor(display.reason, display.detail),
       quiet,
+      resolvable: remediationClass !== "ownership-hold"
+        && remediationClass !== "capture"
+        && remediationClass !== "config"
+        && canResolve,
       canResolve,
       canKeepMine,
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),

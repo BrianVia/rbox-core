@@ -123,7 +123,7 @@ const findingById = (findings: TriageFinding[], id: string): TriageFinding | und
 const ACCOUNT_LEVEL = /^(rbox login|rbox upgrade|rbox key |rbox subscribe |rbox track |brew )/;
 
 function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): TriageInputs["deferrals"][number] {
-  return {
+  const row = {
     repo: String(over.repo ?? "savvy-core"),
     oldestDeferredSince: new Date(NOW - 20 * 3600_000).toISOString(),
     displayReason: "local-commits",
@@ -140,6 +140,15 @@ function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): Triage
     bytesChanged: false,
     ...over,
   } as TriageInputs["deferrals"][number];
+  // Derived exactly as the projection derives it, so a fixture cannot hand
+  // doctor a row the projection could never produce.
+  return {
+    ...row,
+    resolvable: row.remediationClass !== "ownership-hold"
+      && row.remediationClass !== "capture"
+      && row.remediationClass !== "config"
+      && row.canResolve,
+  };
 }
 
 async function writeActivity(body: DaemonActivity): Promise<void> {
@@ -1012,4 +1021,38 @@ test("doctor SAYS the git population at summary altitude, and keeps every row in
   expect(rendered).toContain("full detail: rbox status --git");
   // Twelve near-identical paragraphs is not a diagnosis a person can read.
   expect(rendered.split("repos/app-").length - 1).toBe(0);
+});
+
+test("every number doctor prints is derivable from the others", () => {
+  const checks = healthyChecks();
+  checks.enrollment = { ok: false, label: "encryption", message: "device key is missing" };
+  const rows = Array.from({ length: 48 }, (_, i) => deferral({
+    repo: `repos/app-${i}`,
+    oldestDeferredSince: new Date(NOW - (i + 1) * 3600_000).toISOString(),
+  }));
+  const triage = triageWorkspace(inputs({ checks, daemon: STOPPED, deferrals: rows }));
+  const rendered = renderWorkspaceTriage(triage, rows, NOW);
+  const text = rendered.join("\n");
+
+  // The collapsed git block is ONE thing to deal with; the other two are the
+  // numbered items. "48 things need your attention" over a single git block and
+  // two numbered items was the defect.
+  expect(text).toContain("3 things need your attention.");
+  const numbered = rendered.filter((line) => /^\d+\. /.test(line));
+  expect(numbered).toHaveLength(2);
+  expect(text).toContain("git · 48 repos paused");
+  expect(text).toContain("48 waiting on you");
+});
+
+test("a git population that only sorts itself out is not counted as needing attention", () => {
+  const rows = [deferral({
+    repo: "repos/healing",
+    displayReason: "git-busy",
+    remediationClass: "transient",
+    story: gitStoryFor("git-busy"),
+  })];
+  const triage = triageWorkspace(inputs({ deferrals: rows, daemon: STOPPED }));
+  const text = renderWorkspaceTriage(triage, rows, NOW).join("\n");
+  expect(text).toContain("1 thing needs your attention.");
+  expect(text).toContain("1 sorting itself out");
 });

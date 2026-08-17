@@ -73,6 +73,7 @@ const row = (over: Partial<GitDeferral> & { repo: string; ageMs: number }): GitD
     lastSeen: since,
   };
   if (over.detail !== undefined) deferral.detail = over.detail;
+  if (over.bytesChanged !== undefined) deferral.bytesChanged = over.bytesChanged;
   return { repo: over.repo, deferral, record: withPending };
 };
 
@@ -111,7 +112,8 @@ test("a deferral re-set every 60s for an hour stays visible to the support flow"
   const flapping = projectGitDeferralRepos([row({ repo: "flapper", ageMs: 30_000, reason: "local-edits" })], NOW);
   expect(flapping[0]!.quiet).toBe(true);
   expect(gitPauseHeadline(gitPauseCounts(loudRows(flapping)))).toEqual([]);
-  expect(renderGitPauseListing(flapping, { now: NOW })).toEqual(["No git repos are paused."]);
+  expect(renderGitPauseListing(flapping, { now: NOW }))
+    .toEqual(["Nothing needs you — 1 repo paused in the last few minutes and usually sorts itself out."]);
   const summary = renderGitPauseSummary(flapping, NOW).join("\n");
   expect(summary).toContain("1 repo paused");
   expect(summary).toContain("recently paused, usually self-heals");
@@ -272,13 +274,174 @@ test("a self-healing group never also asks the reader to choose a side", () => {
   expect(listing).toContain("If any are still here tomorrow: rbox doctor");
 });
 
-test("the unreadable story carries its per-reason repair text", () => {
+test("the unreadable story carries its per-reason repair text on its own line, and never a resolve command", () => {
   const rows = projectGitDeferralRepos([
     row({ repo: "a", ageMs: 86_400_000, reason: "unreadable" }),
     row({ repo: "b", ageMs: 86_400_000, reason: "containment" }),
   ], NOW);
+  const lines = renderGitPauseListing(rows, { now: NOW });
+  expect(lines).toContain("2 repos — rbox can't read or manage them right now");
+  // Own line, not concatenated onto the repo row.
+  expect(lines).toContain("      Restore repository readability and permissions, then let sync retry.");
+  expect(lines.join("\n")).toContain("so it stays within the workspace");
+  // The design rule: a group prints only commands EVERY repo supports, and a
+  // repo rbox cannot read would refuse every resolve verb.
+  // The story's action is `repair-text`, so no surface even asks whether these
+  // rows could resolve — the group offers the repair, never a verb.
+  expect(lines.join("\n")).not.toContain("rbox git resolve");
+  expect(rows.every((r) => r.story.action.kind === "repair-text")).toBe(true);
+});
+
+test("a group header agrees in number at one repo and at many", () => {
+  const one = renderGitPauseListing(
+    projectGitDeferralRepos([row({ repo: "a", ageMs: 86_400_000, reason: "unreadable" })], NOW),
+    { now: NOW },
+  );
+  expect(one).toContain("1 repo — rbox can't read or manage this repo right now");
+  for (const reason of GIT_DEFERRAL_REASONS) {
+    const many = renderGitPauseListing(
+      projectGitDeferralRepos([
+        row({ repo: "a", ageMs: 86_400_000, reason }),
+        row({ repo: "b", ageMs: 86_400_000, reason }),
+      ], NOW),
+      { now: NOW },
+    ).join("\n");
+    // No group header may say "this repo"/"it" about two of them.
+    const header = many.split("\n").find((line) => line.startsWith("2 repos — "))!;
+    expect(header).not.toContain("this repo");
+    expect(header).not.toContain(" left it alone");
+  }
+});
+
+test("the 'other' story hands the reader to support instead of dead-ending", () => {
+  const rows = projectGitDeferralRepos([row({ repo: "a", ageMs: 86_400_000, reason: "other" })], NOW);
   const listing = renderGitPauseListing(rows, { now: NOW }).join("\n");
-  expect(listing).toContain("rbox can't read or manage this repo right now");
-  expect(listing).toContain("Restore repository readability and permissions");
-  expect(listing).toContain("so it stays within the workspace");
+  expect(listing).toContain("Send this to support:");
+  expect(listing).toContain("rbox doctor --report");
+});
+
+test("ages line up in a column whatever the path lengths are", () => {
+  const listing = renderGitPauseListing(projectGitDeferralRepos([
+    row({ repo: "short", ageMs: 86_400_000, reason: "conflict" }),
+    row({ repo: "a/much/longer/repo/path", ageMs: 2 * 86_400_000, reason: "conflict" }),
+  ], NOW), { now: NOW });
+  const columns = listing.filter((line) => line.startsWith("   ") && line.includes("paused "))
+    .map((line) => line.indexOf("paused "));
+  expect(new Set(columns).size).toBe(1);
+});
+
+test("no rendered line carries a control character (the group key is not the separator)", () => {
+  const listing = renderGitPauseListing(projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 86_400_000, reason: "conflict" }),
+  ], NOW), { now: NOW }).join("\n");
+  expect(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(listing)).toBe(false);
+});
+
+// ------------------------------------------------------------- lane-complete
+
+test("an ownership hold beside an unreadable lane still needs a person", () => {
+  const [mixed] = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 5 * 86_400_000, reason: "worktree-ownership" }),
+    row({ repo: "a", ageMs: 86_400_000, reason: "unreadable", lane: "capture" }),
+  ], NOW);
+  expect(mixed!.story.needsYou).toBe(true);
+  expect(mixed!.story.code).toBe("repo-unreadable");
+  expect(mixed!.remediationClass).not.toBe("ownership-hold");
+  expect(mixed!.resolvable).toBe(false);
+  // The oldest lane still owns the age the reader sees.
+  expect(mixed!.oldestDeferredSince).toBe(new Date(NOW - 5 * 86_400_000).toISOString());
+  expect(gitPauseCounts(loudRows([mixed!]))).toEqual({ needsYou: 1, selfHealing: 0, total: 1 });
+});
+
+test("an ownership hold beside a config lane is not an ownership hold", () => {
+  const [mixed] = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 5 * 86_400_000, reason: "worktree-ownership" }),
+    row({ repo: "a", ageMs: 86_400_000, reason: "config", lane: "config" }),
+  ], NOW);
+  expect(mixed!.remediationClass).toBe("config");
+  expect(mixed!.story.needsYou).toBe(true);
+  expect(mixed!.resolvable).toBe(false);
+});
+
+test("a half-finished git operation outranks the index it necessarily dirtied", () => {
+  const [repo] = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 86_400_000, reason: "local-index" }),
+    row({ repo: "a", ageMs: 86_400_000, reason: "local-operation", lane: "capture" }),
+  ], NOW);
+  expect(repo!.story.code).toBe("unfinished-git-operation");
+});
+
+test("the index story says uncommitted work, not staged work", () => {
+  expect(gitStoryFor("local-index").headline).toBe("you have uncommitted work here");
+});
+
+// ------------------------------------------------------------------ actions
+
+test("a self-healing group escalates once it has been retrying for over a day", () => {
+  const young = projectGitDeferralRepos([row({ repo: "a", ageMs: 3600_000 * 3, reason: "git-busy" })], NOW);
+  const youngLines = renderGitPauseListing(young, { now: NOW });
+  expect(youngLines).toContain("   rbox is handling these on its own — nothing to do");
+  expect(youngLines).toContain("   If any are still here tomorrow: rbox doctor");
+  // The headline never also says it: one handling sentence per group.
+  expect(youngLines.join("\n").match(/on its own/g)).toHaveLength(1);
+
+  const old = renderGitPauseListing(
+    projectGitDeferralRepos([row({ repo: "a", ageMs: 3 * 86_400_000, reason: "git-busy" })], NOW),
+    { now: NOW },
+  );
+  expect(old).toContain("   rbox has been retrying these for over a day — that is longer than it should take.");
+  expect(old.join("\n")).toContain("Get a closer look:");
+  expect(old.join("\n")).not.toContain("nothing to do");
+});
+
+test("keep-mine says what it will show you before you commit to it", () => {
+  const lines = renderGitPauseListing(
+    projectGitDeferralRepos([row({ repo: "a", ageMs: 86_400_000, reason: "conflict" })], NOW),
+    { now: NOW },
+  );
+  const keepMine = lines.findIndex((line) => line.includes("rbox git resolve <repo> keep-mine"));
+  expect(keepMine).toBeGreaterThan(-1);
+  const clarifier = lines[keepMine + 1]!;
+  expect(clarifier.trimEnd()).toBe(
+    `${" ".repeat(lines[keepMine]!.indexOf("rbox git resolve"))}(shows you what you'd drop, then gives you the confirm command)`,
+  );
+});
+
+/** The indented second line under a repo row — six spaces, then content. */
+const isDetailLine = (line: string): boolean => line.startsWith("      ") && !line.startsWith("       ");
+
+test("a repo row carries its load-bearing companion detail, and nothing else", () => {
+  const plain = projectGitDeferralRepos([row({ repo: "plain", ageMs: 86_400_000, reason: "conflict" })], NOW);
+  expect(renderGitPauseListing(plain, { now: NOW }).filter(isDetailLine)).toEqual([]);
+
+  const detailed = projectGitDeferralRepos([
+    row({ repo: "copies", ageMs: 86_400_000, reason: "conflict-copies", detail: "only conflict-copies remain here, so the comparison was skipped." }),
+  ], NOW);
+  expect(renderGitPauseListing(detailed, { now: NOW }))
+    .toContain("      only conflict-copies remain here, so the comparison was skipped.");
+
+  const changed = projectGitDeferralRepos([row({ repo: "dirty", ageMs: 86_400_000, reason: "conflict", bytesChanged: true })], NOW);
+  expect(renderGitPauseListing(changed, { now: NOW }))
+    .toContain("      working files changed here since the pause");
+
+  const busy = projectGitDeferralRepos([row({ repo: "busy", ageMs: 86_400_000, reason: "stale-unattributed" })], NOW);
+  expect(renderGitPauseListing(busy, {
+    now: NOW,
+    staleLocks: () => ({ lockCount: 2, oldestAgeMs: 7200_000, samplePath: "busy/.git/index.lock" }),
+  })).toContain("      2 stable locks with no live owner, for example busy/.git/index.lock");
+});
+
+// ----------------------------------------------------------------- headline
+
+test("a population that only sorts itself out never warns", () => {
+  expect(gitPauseHeadline({ needsYou: 0, selfHealing: 4 }))
+    .toEqual(["rbox paused git sync in 4 repos and is sorting them out on its own.", "  See them:  rbox status --git"]);
+  expect(gitPauseHeadline({ needsYou: 0, selfHealing: 1 })[0])
+    .toBe("rbox paused git sync in 1 repo and is sorting it out on its own.");
+});
+
+test("the pointer to the listing is dropped when the listing follows", () => {
+  expect(gitPauseHeadline({ needsYou: 2, selfHealing: 0, listed: true }))
+    .toEqual(["⚠ 2 repos are waiting on you — rbox paused git sync there so nothing you did gets overwritten."]);
+  expect(gitPauseHeadline({ needsYou: 0, selfHealing: 2, listed: true })).toHaveLength(1);
 });

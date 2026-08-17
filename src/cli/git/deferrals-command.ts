@@ -7,6 +7,7 @@ import {
   syncStreamId,
 } from "../config.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "../status-view/git-projection.js";
+import { storyInstruction } from "../status-view/git-stories.js";
 import { ageBucket } from "../status-view/text.js";
 import { serializeGitDeferralLanes } from "../sync-git/git-deferral-json.js";
 import { shQuote } from "../shell-quote.js";
@@ -49,7 +50,7 @@ function checkoutBrief(checkout: GitDeferralRepoProjection["checkout"]): string 
 function remediationLines(repo: GitDeferralRepoProjection): string[] {
   const lines = [`Diagnosis: ${briefField(repo.reasonText)}`, `Repair: ${briefField(repo.repairText)}`];
   if (repo.remediationClass === "ownership-hold") {
-    lines.push(briefField(repo.story.action ?? repo.story.headline));
+    lines.push(briefField(storyInstruction(repo.story) ?? repo.story.headline));
   } else if (repo.remediationClass === "transient") {
     lines.push("Let normal sync retry while the repository is quiet. If both ages keep growing, inspect `rbox status` and the daemon logs.");
   } else if (repo.remediationClass === "capture") {
@@ -59,7 +60,7 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
   } else if (repo.remediationClass === "apply-unavailable") {
     lines.push("The resolver has no deferred incoming state. Let sync fetch or rebuild it; inspect `rbox status` and daemon logs if this persists.");
   }
-  if (shouldOfferResolve(repo)) {
+  if (repo.resolvable) {
     lines.push("Your repository is healthy; only rbox's bookkeeping is paused while Git state from your other computer waits.");
     lines.push(repo.canKeepMine
       ? "Choose `keep-mine` to keep this computer's version and publish it to your other computers, or `take-theirs` to use the version from your other computer and set aside this computer's Git changes."
@@ -72,11 +73,6 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
 /** Design 273 P2: `remediationClass` is consulted BEFORE `canResolve`. An
  * ownership hold carries `pending` and so passes the incoming-state test, but
  * its story says no command is needed — offering one is the defect. */
-function shouldOfferResolve(repo: GitDeferralRepoProjection): boolean {
-  if (repo.remediationClass === "ownership-hold") return false;
-  return repo.canResolve && (repo.displayLane === "apply" || repo.remediationClass === "transient");
-}
-
 /** Design 273 P5: this surface renders the FULL population and LABELS the quiet
  * rows rather than hiding them — a repo whose pause keeps flapping never ages
  * past the quiet window, and support has to be able to see it. */
@@ -155,7 +151,7 @@ export async function gitDeferralsCmd(
       write(`Checkout: ${checkoutBrief(repo.checkout)}`);
       if (repo.alsoDeferred) write(briefField(repo.alsoDeferred));
       for (const line of remediationLines(repo)) write(line);
-      if (shouldOfferResolve(repo)) {
+      if (repo.resolvable) {
         write(resolveCommand(path.resolve(root), repo.repo));
         if (repo.canKeepMine) write(resolveCommand(path.resolve(root), repo.repo, undefined, "keep-mine"));
         write(resolveCommand(path.resolve(root), repo.repo, "<token-printed-by-show-me>"));
