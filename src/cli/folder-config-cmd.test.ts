@@ -106,6 +106,24 @@ test("human and JSON views project every inventory row without using machine tri
   }))).toThrow(/not supported/);
 });
 
+/** `rbox config` is read-shaped, but on a 1.x home activation WRITES the
+ *  catalog (design 276 F1.3). A file appearing in silence is not acceptable. */
+test("a bare config view says so when it had to initialize the catalog first", async () => {
+  const root = path.join(scratch, "precatalog");
+  await fs.mkdir(root, { recursive: true });
+  await writeBinding(root);
+  await writeRegistry(root, `ws_${path.basename(root)}`);
+
+  const lines: string[] = [];
+  await folderConfigCmd([], { json: false, yes: false }, { write: (line) => lines.push(line) });
+  expect(lines[0]).toContain(`initialized ${folderCatalogPath()}`);
+  expect((await inspectFolderCatalog()).kind).toBe("authoritative");
+
+  lines.length = 0;
+  await folderConfigCmd([], { json: false, yes: false }, { write: (line) => lines.push(line) });
+  expect(lines.join("\n")).not.toContain("initialized ");
+});
+
 test("add is idempotent, accepts an existing overlap, and refuses a newly introduced overlap", async () => {
   const parent = path.join(scratch, "parent");
   const child = path.join(parent, "child");

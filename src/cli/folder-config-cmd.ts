@@ -69,10 +69,16 @@ export function renderFolderConfig(
 }
 
 async function show(options: FolderConfigCommandOptions, write: (line: string) => void): Promise<void> {
+  // Activation can WRITE here (a 1.x home has no catalog, design 276 F1.3), and
+  // a read-shaped command must not create a file in silence.
+  const initialized = (await inspectFolderCatalog()).kind === "absent";
   const state = await ensureFolderAuthority();
   const inventory = await listFolderInventory(state);
   if (options.json) emitJson(projectFolderConfigJson(state, inventory.rows));
-  else for (const line of renderFolderConfig(state, inventory.rows)) write(line);
+  else {
+    if (initialized) write(`initialized ${folderCatalogPath()} from the folders already bound on this machine`);
+    for (const line of renderFolderConfig(state, inventory.rows)) write(line);
+  }
 }
 
 async function add(rawPath: string, write: (line: string) => void): Promise<void> {

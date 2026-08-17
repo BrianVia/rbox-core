@@ -158,7 +158,7 @@ test("stale-only restart failure prints the stale summary first and preserves th
     log: (line) => logs.push(line),
   })).rejects.toThrow("upgrade installed, but one or more live daemons could not be restarted");
   expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
-  expect(logs[1]).toContain("restart failed; run rbox stop && rbox start");
+  expect(logs[1]).toContain("restart failed: private failure");
   expect(logs.join("\n")).not.toContain("already up to date");
 });
 
@@ -376,6 +376,31 @@ test("one refused workspace leaves its daemon running while every other workspac
   expect(actions).toEqual([`stop:${healthy.key}`, `start:${healthy.key}`]);
   expect(logs.join("\n")).toContain(`daemon ${detached.key}: left running`);
   expect(logs.join("\n")).toContain("rbox config add");
+});
+
+/** The scope of the per-workspace claim: FOLDER ADMISSION is decided per
+ *  workspace, but catalog INITIALIZATION reads one home-global inventory, so a
+ *  single unreproducible row refuses every workspace at once. Pinned so nobody
+ *  reads the per-workspace refusal as a per-workspace initialization. */
+test("one ghost desired row refuses every workspace, healthy ones included", async () => {
+  const healthy = await runtime("home-global-healthy", 601, { catalog: false });
+  const second = await runtime("home-global-second", 602, { catalog: false });
+  await ghostDesiredRow();
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: (pid) => pid === 601 || pid === 602,
+    currentWorkspaceId: (root) => `ws-${path.basename(root)}`,
+    stopDaemon: async (root) => void actions.push(`stop:${workspaceKey(root)}`),
+    startDaemon: async (root) => { actions.push(`start:${workspaceKey(root)}`); return "started"; },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(actions).toEqual([]);
+  for (const target of [healthy, second]) {
+    expect(logs.join("\n")).toContain(`daemon ${target.key}: left running`);
+  }
+  expect(logs.join("\n")).toContain("rbox config regenerate");
 });
 
 test("a genuine restart failure reports the underlying reason, not just a re-runnable remedy", async () => {

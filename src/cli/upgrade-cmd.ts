@@ -180,8 +180,8 @@ async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle)
   }
   try {
     await stop(root);
-  } catch {
-    log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
+  } catch (error) {
+    log(`daemon ${key}: restart failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
   if (admission === undefined) {
