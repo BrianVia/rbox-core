@@ -7,11 +7,12 @@ import type { LockfileHooks } from "../../engine/lockfile.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { expectedStateNonce, repoRecordsForState, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";
-import { carryRepoBaseProof, recordOriginLineage, type RepoBaseProof } from "./base-composer.js";
+import { authorityGovernedRefs, type RepoBaseProof } from "./base-composer.js";
 import { clearFollowJournal } from "./follow.js";
 import { rebindHeldAttemptsAfterSettlement } from "./held-skip.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
-import { chainLock, gitApplyMutationKey, gitIncomingKey, nextDeferral, repoDirOf } from "./shared.js";
+import { chainLock, gitApplyMutationKey, repoDirOf } from "./shared.js";
+import { carryUnreadableRefDatabase, deferPostCasSettlementRefusal, dropPartial } from "./committed-transition-withdrawal.js";
 import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, type AcquiredStateCasLocks, type StateCasLockRequest } from "./state-cas-locks.js";
 
 /**
@@ -55,10 +56,6 @@ function effectivePartial(
 ): GitPartialApply | undefined {
   const transition = outcome.partial?.[rel];
   return transition === null ? undefined : transition ?? records[rel]?.partial;
-}
-
-function dropPartial(rel: string, outcome: GitPullOutcome): void {
-  outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
 }
 
 /** Re-prove partial crash hints immediately before the state CAS. */
@@ -154,56 +151,6 @@ async function planStateCasLocks(
   };
 }
 
-/** A ref database that has become unreadable is evidence about the reader, not
- * about the transition: the composed BASE is withdrawn in favour of the prior
- * durable one, the incoming section returns to pending, and the proof is kept
- * only so its artifacts still settle. This never fails the pull. */
-function carryUnreadableRefDatabase(
-  rel: string,
-  proof: RepoBaseProof,
-  prior: RepoRecord | undefined,
-  outcome: GitPullOutcome,
-): void {
-  const candidate = outcome.gitRepos?.[rel];
-  if (candidate) {
-    outcome.gitPendingRemote = { ...(outcome.gitPendingRemote ?? {}), [rel]: candidate };
-  }
-  if (prior?.base) outcome.gitRepos = { ...(outcome.gitRepos ?? {}), [rel]: prior.base };
-  else if (outcome.gitRepos) delete outcome.gitRepos[rel];
-  if (prior?.branchBaseOrigins) {
-    outcome.branchBaseOrigins = { ...(outcome.branchBaseOrigins ?? {}), [rel]: prior.branchBaseOrigins };
-  } else if (outcome.branchBaseOrigins) {
-    delete outcome.branchBaseOrigins[rel];
-  }
-  dropPartial(rel, outcome);
-  outcome.artifactSettlementProofs = {
-    ...(outcome.artifactSettlementProofs ?? {}),
-    [rel]: proof,
-  };
-  const retainedLineage = recordOriginLineage(prior?.branchBaseOrigins) ?? "legacy-untrusted";
-  outcome.repoProofs = {
-    ...(outcome.repoProofs ?? {}),
-    [rel]: carryRepoBaseProof(retainedLineage),
-  };
-  const existingTransition = outcome.deferrals?.[rel];
-  const existing = existingTransition === null
-    ? undefined
-    : existingTransition?.apply ?? prior?.deferrals?.apply;
-  const now = new Date().toISOString();
-  const transition = existingTransition && existingTransition !== null ? { ...existingTransition } : {};
-  transition.apply = nextDeferral(
-    "apply",
-    existing,
-    "ref-read-unreadable",
-    now,
-    candidate ? gitIncomingKey(candidate) : undefined,
-  );
-  outcome.deferrals = {
-    ...(outcome.deferrals ?? {}),
-    [rel]: transition,
-  };
-}
-
 /** Under the held locks, re-read every branch proof's terminal and A artifact.
  * A terminal that moved is a hard failure: the composed BASE would otherwise
  * claim a state the repository no longer has. */
@@ -213,7 +160,8 @@ async function revalidateCommittedBranchProofs(
   outcome: GitPullOutcome,
 ): Promise<void> {
   for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {})) {
-    if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
+    if (proof.authority.kind !== "observed-landing" && proof.authority.kind !== "pull-ref-transaction"
+      && proof.authority.kind !== "journal-recovery") continue;
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
     if (!ctx) throw new Error(`branch proof repository disappeared for ${rel}`);
     const strict = await readAllRefsStrict(ctx.repoDir);
@@ -222,6 +170,15 @@ async function revalidateCommittedBranchProofs(
       continue;
     }
     const live = strict.refs;
+    if (proof.authority.kind === "observed-landing") {
+      // An observed landing carries no per-ref witness, so the CAS-time proof
+      // that its composed BASE is still real is this re-read of every branch AND
+      // safe ref it installed. A moved ref withdraws; it never fails the pull.
+      const governed = authorityGovernedRefs(outcome.gitRepos?.[rel]);
+      const moved = Object.entries(governed).some(([ref, value]) => (live[ref] ?? null) !== value);
+      if (moved) carryUnreadableRefDatabase(rel, proof, records[rel], outcome, "git-busy");
+      continue;
+    }
     for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses)) {
       const locked = proof.lockedProof.branches[ref];
       const terminal = witness.kind === "present" ? witness.nextOid : null;
@@ -361,6 +318,7 @@ export async function settleCommittedBranchArtifacts(
       if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);
+      let refused = false;
       for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses).sort(([a], [b]) => a.localeCompare(b))) {
         const binding = { lineageHash: witness.lineageHash, repositoryIdentityHash: witness.repositoryIdentityHash };
         if (witness.kind === "absent") {
@@ -385,8 +343,15 @@ export async function settleCommittedBranchArtifacts(
         });
         if (settled.status === "settled") state = settled.state;
         else if (settled.status === "absent" || settled.status === "moved") continue;
-        else throw new Error(`P settlement refused for ${rel}:${ref}: ${settled.reason}`);
+        else {
+          state = await deferPostCasSettlementRefusal({ root, state, relPath: rel });
+          refused = true;
+          break;
+        }
       }
+      // Binding this repository's attempt would bind it to a post-settlement
+      // state it never reached; unbound fails closed at the next steadySkip.
+      if (refused) continue;
 
       const completedAttempt = outcome.attempt?.[rel];
       if (completedAttempt) attemptsToRebind.push({ relPath: rel, attempt: completedAttempt });

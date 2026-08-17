@@ -430,6 +430,75 @@ test("an unreadable ref database carries the prior BASE and defers instead of fa
   });
 });
 
+// ── observed-landing (first BASE) CAS-time re-read, design 271 §2.5 ──────────
+
+const TAG = "refs/tags/v1";
+
+/** A BASE-less record whose pull composed a FIRST BASE over one branch and one
+ * safe ref under observed-landing authority. */
+async function landingFixture() {
+  const tip = await git("rev-parse", REF);
+  await git("tag", "v1", tip);
+  const observedRefs = { [REF]: tip, [TAG]: tip };
+  const landed = section(observedRefs);
+  const state = await persist(stateWithPartial(undefined));
+  const proof: RepoBaseProof = {
+    authority: { kind: "observed-landing", lineageHash: "L", observedRefs },
+    lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
+  };
+  const outcome: GitPullOutcome = { repoProofs: { [REL]: proof }, gitRepos: { [REL]: landed } };
+  return { tip, state, proof, outcome, landed };
+}
+
+test("an observed landing whose refs still stand keeps its first BASE", async () => {
+  const { state, outcome, landed } = await landingFixture();
+
+  await expect(withRevalidatedGitPartialApplies(root, state, outcome, async () => "saved")).resolves.toBe("saved");
+
+  expect(outcome.gitRepos?.[REL]).toEqual(landed);
+  expect(outcome.gitPendingRemote).toBeUndefined();
+  expect(outcome.deferrals).toBeUndefined();
+});
+
+test("an unreadable ref database withdraws the first BASE as ref-read-unreadable", async () => {
+  const { state, outcome, landed } = await landingFixture();
+  await fs.writeFile(path.join(repo, ".git", "packed-refs"), "garbage\n");
+
+  await expect(withRevalidatedGitPartialApplies(root, state, outcome, async () => "saved")).resolves.toBe("saved");
+
+  // A BASE-less record restores to no BASE at all.
+  expect(outcome.gitRepos?.[REL]).toBeUndefined();
+  expect(outcome.gitPendingRemote).toEqual({ [REL]: landed });
+  expect(outcome.deferrals?.[REL]?.apply).toMatchObject({ lane: "apply", reason: "ref-read-unreadable" });
+  expect(outcome.repoProofs?.[REL]?.authority.kind).toBe("pull-carry");
+});
+
+test("a BRANCH ref moved inside the CAS window withdraws the first BASE as git-busy", async () => {
+  const { tip, state, outcome, landed } = await landingFixture();
+  const tree = await git("rev-parse", `${tip}^{tree}`);
+  const moved = await git("commit-tree", tree, "-p", tip, "-m", "concurrent");
+  await git("update-ref", REF, moved, tip);
+
+  await expect(withRevalidatedGitPartialApplies(root, state, outcome, async () => "saved")).resolves.toBe("saved");
+
+  expect(outcome.gitRepos?.[REL]).toBeUndefined();
+  expect(outcome.gitPendingRemote).toEqual({ [REL]: landed });
+  expect(outcome.deferrals?.[REL]?.apply).toMatchObject({ lane: "apply", reason: "git-busy" });
+});
+
+test("a SAFE ref moved inside the CAS window withdraws the first BASE as git-busy", async () => {
+  const { tip, state, outcome, landed } = await landingFixture();
+  const tree = await git("rev-parse", `${tip}^{tree}`);
+  const moved = await git("commit-tree", tree, "-p", tip, "-m", "concurrent tag");
+  await git("update-ref", TAG, moved, tip);
+
+  await expect(withRevalidatedGitPartialApplies(root, state, outcome, async () => "saved")).resolves.toBe("saved");
+
+  expect(outcome.gitRepos?.[REL]).toBeUndefined();
+  expect(outcome.gitPendingRemote).toEqual({ [REL]: landed });
+  expect(outcome.deferrals?.[REL]?.apply).toMatchObject({ lane: "apply", reason: "git-busy" });
+});
+
 // ── post-CAS A/P/K settlement ───────────────────────────────────────────────
 
 test("the carry fallback's retained proof still retires its standing P after the save", async () => {
