@@ -31,10 +31,8 @@ export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degrad
 export type AmbientOperationKind = "pull" | "push";
 export type DaemonMode = "pull-only" | "read-write";
 export type AmbientWatcherTrust = "suspect" | "fused";
-/** Design 276 F2.4: the daemon's own reset-recovery lifecycle. Three halt
- * reasons (bootstrap disagreement, a loadSyncBase throw, a non-terminal
- * recovery) have no classifier signature, so this heartbeat-written projection
- * is what keeps them visible to a status surface that reads no side-file. */
+/** Design 276 F2.4: halts with no classifier signature are visible to a status
+ * surface only through this heartbeat-written lifecycle. */
 export type AmbientResetLifecycle = "ready" | "halted" | "recovering" | "bootstrapping";
 
 export interface AmbientGitDeferral {
@@ -71,7 +69,7 @@ export interface AmbientDaemonStatusV1 {
   attentionReason?: AmbientAttentionReason;
   /** Visibility-only watcher trust. Absence is unknown/old-writer, not trusted. */
   watcherTrust?: AmbientWatcherTrust;
-  /** Additive under schemaVersion 1: absence is an older writer, never "ready". */
+  /** Additive under schemaVersion 1; absence means an older writer. */
   resetLifecycle?: AmbientResetLifecycle;
   /** The rows a human is shown: quiet transients excluded (design 273 P5), so
    * this count and `rbox status --git` cannot disagree. */
@@ -336,21 +334,20 @@ export function pausedAmbientDaemonStatus(
   now = Date.now(),
   previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "watcherTrust" | "deferredRepos" | "deferredNeedsYou" | "deferredSelfHealing" | "oldestDeferralAgeSeconds" | "deferrals">,
 ): AmbientDaemonStatusV1 {
-  const paused: AmbientDaemonStatusV1 = {
+  return stripUndefined({
     schemaVersion: 1,
     daemonVersion: RBOX_VERSION,
     state: "paused",
     heartbeatAt: new Date(now).toISOString(),
     sequence: previous?.sequence ?? null,
     lastSyncedAt: previous?.lastSyncedAt ?? null,
-  };
-  if (previous?.watcherTrust !== undefined) paused.watcherTrust = previous.watcherTrust;
-  if (previous?.deferredRepos !== undefined) paused.deferredRepos = previous.deferredRepos;
-  if (previous?.deferredNeedsYou !== undefined) paused.deferredNeedsYou = previous.deferredNeedsYou;
-  if (previous?.deferredSelfHealing !== undefined) paused.deferredSelfHealing = previous.deferredSelfHealing;
-  if (previous?.oldestDeferralAgeSeconds !== undefined) paused.oldestDeferralAgeSeconds = previous.oldestDeferralAgeSeconds;
-  if (previous?.deferrals !== undefined) paused.deferrals = previous.deferrals.slice(0, 5);
-  return paused;
+    watcherTrust: previous?.watcherTrust,
+    deferredRepos: previous?.deferredRepos,
+    deferredNeedsYou: previous?.deferredNeedsYou,
+    deferredSelfHealing: previous?.deferredSelfHealing,
+    oldestDeferralAgeSeconds: previous?.oldestDeferralAgeSeconds,
+    deferrals: previous?.deferrals?.slice(0, 5),
+  }) as AmbientDaemonStatusV1;
 }
 
 export function findWorkspaceRootSync(start: string): string | undefined {
@@ -393,23 +390,23 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.deferredNeedsYou !== undefined && !uint(j.deferredNeedsYou)) return undefined;
     if (j.deferredSelfHealing !== undefined && !uint(j.deferredSelfHealing)) return undefined;
     if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
-    const out: AmbientDaemonStatusV1 = {
+    const out = stripUndefined({
       schemaVersion: 1,
       state: j.state as AmbientDaemonState,
       heartbeatAt: j.heartbeatAt,
       sequence: j.sequence,
       lastSyncedAt: j.lastSyncedAt,
-    };
-    if (j.daemonVersion !== undefined) out.daemonVersion = j.daemonVersion;
-    if (j.mode !== undefined) out.mode = j.mode as DaemonMode;
-    if (j.bootId !== undefined) out.bootId = j.bootId;
-    if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
-    if (j.watcherTrust !== undefined) out.watcherTrust = j.watcherTrust as AmbientWatcherTrust;
-    if (j.resetLifecycle !== undefined) out.resetLifecycle = j.resetLifecycle as AmbientResetLifecycle;
-    if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
-    if (j.deferredNeedsYou !== undefined) out.deferredNeedsYou = j.deferredNeedsYou;
-    if (j.deferredSelfHealing !== undefined) out.deferredSelfHealing = j.deferredSelfHealing;
-    if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
+      daemonVersion: j.daemonVersion,
+      mode: j.mode,
+      bootId: j.bootId,
+      attentionReason: j.attentionReason,
+      watcherTrust: j.watcherTrust,
+      resetLifecycle: j.resetLifecycle,
+      deferredRepos: j.deferredRepos,
+      deferredNeedsYou: j.deferredNeedsYou,
+      deferredSelfHealing: j.deferredSelfHealing,
+      oldestDeferralAgeSeconds: j.oldestDeferralAgeSeconds,
+    }) as AmbientDaemonStatusV1;
     if (j.deferrals !== undefined) {
       const items = Array.isArray(j.deferrals) ? j.deferrals : [];
       out.deferrals = items.slice(0, 5).flatMap((item) => {
