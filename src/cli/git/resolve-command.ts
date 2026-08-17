@@ -126,11 +126,11 @@ export class ManualBaseProofIncompleteError extends Error {
 
 /** Curated, path-free refusal text for the five typed resolve sites. */
 const RESOLVE_TYPED_REFUSAL = {
-  "incomplete-checkout": "the incoming checkout could not be published for every ref; nothing was resolved — retry after Git state settles",
+  "incomplete-checkout": "the incoming checkout was published for some refs but not all; the resolution is incomplete — retry after Git state settles",
   "journal-recovery": "the published checkout journal could not be recovered; retry after Git state settles, or inspect the local recovery copy",
-  artifact: "the standing present-artifact could not be settled; nothing was resolved — retry after Git state settles",
+  artifact: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
   "manual-lineage-proof": "this repository's Git lineage proof is unavailable; retry after Git state settles",
-  "manual-base-proof": "the resolved Git state could not be fully proven; nothing was changed — retry after Git state settles",
+  "manual-base-proof": "the resolution may have partially applied and could not be fully proven — retry after Git state settles",
 } as const;
 
 interface ResolveSnapshot {
@@ -628,7 +628,7 @@ export async function gitResolveCmd(
       : await recoverFirst(root, rel, ctx, state);
     state = recovered.state;
     if (recovered.error || !ctx) {
-      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: "journal recovery could not complete; retry after Git state settles, or inspect the local recovery copy" }, json, deps, root);
+      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
       return 1;
     }
 

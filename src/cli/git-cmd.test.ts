@@ -1421,7 +1421,7 @@ test("the standing-artifact refusal replaces its raw hold reason with curated te
   const output = lines.at(-1)!;
   expect(JSON.parse(output)).toEqual({
     status: "refused", verb: "take-theirs", repo: "repo", code: "artifact",
-    message: "the standing present-artifact could not be settled; nothing was resolved — retry after Git state settles",
+    message: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
   });
   // The raw hold reason names the namespace it refused; none of it may leak.
   expect(output).not.toContain("rbox-local/base-present");
@@ -1431,7 +1431,7 @@ test("the standing-artifact refusal replaces its raw hold reason with curated te
 
 test("the incomplete-checkout refusal emits its own code and curated text on both surfaces", async () => {
   await fixture();
-  const message = "the incoming checkout could not be published for every ref; nothing was resolved — retry after Git state settles";
+  const message = "the incoming checkout was published for some refs but not all; the resolution is incomplete — retry after Git state settles";
   const json: string[] = [];
   expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: (await show([])).snapshot },
     deps(json, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
@@ -1449,7 +1449,7 @@ test("the incomplete-checkout refusal renders the same curated text for a human"
   expect(await gitResolveCmd(root, receiver, "take-theirs", { confirm: (await show([])).snapshot },
     deps(human, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
   expect(human.filter((line) => !line.startsWith("take-theirs: ")).join("\n"))
-    .toContain("the incoming checkout could not be published for every ref");
+    .toContain("the incoming checkout was published for some refs but not all");
   expect(human.join("\n")).not.toContain(root);
 });
 

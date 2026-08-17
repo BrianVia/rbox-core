@@ -29,7 +29,7 @@ the ALIGNED-round folds. Work order only.
 6. §2.6/§2.7: base-composer safe-ref ordering fix (:551-556 arm moved
    after the :557 scope gate); resolve: two typed error classes (the
    makeIntended :931/:1001 sites) + three emit-and-return sites
-   (:1074/:1076/:1078 — :1078's curated text REPLACES pSettled.error);
+   (now :1117/:1123/:1131 after review-round rebases — the artifact site's curated text REPLACES pSettled.error);
    :1082 catch-all keeps the sanitized default (security tests
    git-cmd.test.ts:1279-1308 are a PROTECTED CONTRACT); GitDeferral
    gains optional detail (author = the deferral-writing site; three
