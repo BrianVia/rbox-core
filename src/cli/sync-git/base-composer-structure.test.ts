@@ -225,9 +225,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/follow-classify.ts": 1,
     "src/cli/sync-git/p-repair-state.ts": 1,
     "src/cli/sync-git/p-settlement.ts": 1,
-    // The unreadable-terminal carry moved with its owner
-    // (CommitReceivedGitTransition); the allowlist follows ownership.
-    "src/cli/sync-git/received-git-transition-commit.ts": 1,
+    // The unreadable-terminal carry moved with its owner again: design 271 gave
+    // both of a commit's withdrawals one module. The allowlist follows
+    // ownership, so the count moved rather than grew.
+    "src/cli/sync-git/committed-transition-withdrawal.ts": 1,
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan-accumulator.ts": 1,

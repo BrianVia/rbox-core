@@ -82,6 +82,10 @@ interface GitResolveDeps {
   mutexOptions?: SyncMutexOptions;
   /** Test seam for the closed proof-refusal mapping after a real snapshot. */
   forceProofIndeterminate?: boolean;
+  /** Test seam for the two mutex-body refusals whose real trigger is a crash or
+   *  concurrent-writer window inside the follow. Names the site; the emission,
+   *  curated text, code and exit status are the production ones. */
+  forceMutexBodyRefusal?: "incomplete-checkout" | "journal-recovery";
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */
   beforeSecondProof?: () => Promise<void>;
   /** Test seam: runs immediately before keep-mine reloads every confirmed input. */
@@ -104,6 +108,31 @@ type HumanReason = Extract<GitDeferralReason,
 
 type SnapshotIdentity = GitResolutionBinding;
 
+/** `makeIntended` is a callback the follow executor invokes; it cannot emit and
+ * return, so its two refusals travel as classes the outer catch classifies. */
+export class ManualLineageProofUnavailableError extends Error {
+  constructor() {
+    super("manual lineage proof unavailable");
+    this.name = "ManualLineageProofUnavailableError";
+  }
+}
+
+export class ManualBaseProofIncompleteError extends Error {
+  constructor() {
+    super("manual BASE proof is incomplete");
+    this.name = "ManualBaseProofIncompleteError";
+  }
+}
+
+/** Curated, path-free refusal text for the five typed resolve sites. */
+const RESOLVE_TYPED_REFUSAL = {
+  "incomplete-checkout": "the incoming checkout was published for some refs but not all; the resolution is incomplete — retry after Git state settles",
+  "journal-recovery": "the published checkout journal could not be recovered; retry after Git state settles, or inspect the local recovery copy",
+  artifact: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
+  "manual-lineage-proof": "this repository's Git lineage proof is unavailable; retry after Git state settles",
+  "manual-base-proof": "the resolution may have partially applied and could not be fully proven — retry after Git state settles",
+} as const;
+
 interface ResolveSnapshot {
   public: GitResolveShow;
   identity: SnapshotIdentity;
@@ -115,6 +144,9 @@ interface ResolveSnapshot {
 
 export type ResolveRefusalCode =
   | "sync-busy" | "proof-indeterminate" | "journal-recovery" | "no-incoming" | "mutex-degraded" | "operation-failed"
+  /** Design 271 §2.7: the five literal refusals inside the resolve mutex body,
+   *  each answering "why" instead of collapsing into `operation-failed`. */
+  | "incomplete-checkout" | "manual-lineage-proof" | "manual-base-proof"
   /** Design 212: this binding syncs part of the workspace, or its scope witnesses
    *  disagree. Either way keep-mine cannot publish from here. */
   | ScopeHaltCondition
@@ -547,6 +579,12 @@ export async function gitResolveCmd(
     return 1;
   }
   const now = deps.now ?? (() => new Date());
+  // Extends the shipped show-me stderr seam to the two mutating verbs. stdout
+  // stays byte-clean, so --json is unchanged.
+  const stepWrite = deps.stderr ?? console.error;
+  const step = (phase: string): void => {
+    if (verb !== "show-me") stepWrite(`${verb}: ${phase}…`);
+  };
   const confirmedKeepMine = verb === "keep-mine" && options.confirm !== undefined;
   if (verb === "keep-mine") {
     // Design 212 §3.1b layer 2: keep-mine publishes. Refuse before the remote,
@@ -590,7 +628,7 @@ export async function gitResolveCmd(
       : await recoverFirst(root, rel, ctx, state);
     state = recovered.state;
     if (recovered.error || !ctx) {
-      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: "journal recovery could not complete; retry after Git state settles, or inspect the local recovery copy" }, json, deps, root);
+      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
       return 1;
     }
 
@@ -635,6 +673,7 @@ export async function gitResolveCmd(
     }
     let branchProtocol: FollowerBranchProtocol | undefined;
     if (verb === "take-theirs") {
+      step("settling standing Git protocol artifacts");
       const preflight = await preflightManualPresentArtifacts({ root, rel, ctx, state });
       if (preflight.status === "hold") {
         emit({ status: "refused", verb, repo: rel, code: "artifact", message: preflight.reason }, json, deps, root);
@@ -836,6 +875,7 @@ export async function gitResolveCmd(
         syncMutex: mutex,
         warningSink: deps.stderr,
       };
+      step("publishing this computer's version");
       const result = deps.confirmedPush
         ? await deps.confirmedPush({ cfg: env.cfg, deps: syncDeps, resolution })
         : await scanManifestForPush(root, env.cfg, syncDeps).then((local) =>
@@ -915,6 +955,7 @@ export async function gitResolveCmd(
       return 1;
     }
 
+    step("setting this computer's Git state aside");
     const quarantine = await quarantineLocal(ctx, path.join(root, ".rbox", "git-quarantine", hashBytes(Buffer.from(rel)).slice(0, 16)), `${Date.now()}`);
     await pinDisplaced(ctx.repoDir, snapshot.protectedOids, {
       ref: `resolve:${rel}`,
@@ -928,7 +969,7 @@ export async function gitResolveCmd(
     const previousRecord: RepoRecordInput = inputRecord(record);
     const manualEpisode = crypto.randomBytes(16).toString("hex");
     const makeIntended = (progress: FollowProgress): FollowIntended => {
-      if (!branchProtocol) throw new Error("manual lineage proof unavailable");
+      if (!branchProtocol) throw new ManualLineageProofUnavailableError();
       const branchDecisions: Record<string, ManualBranchDecision> = {};
       const branches: Record<string, RepoBaseLockedProof["branches"][string]> = {};
       for (const [ref, witness] of Object.entries(progress.branchWitnesses ?? {})) {
@@ -998,7 +1039,7 @@ export async function gitResolveCmd(
         baseProof.authority,
         baseProof.lockedProof,
       );
-      if (composed.disposition !== "terminal") throw new Error("manual BASE proof is incomplete");
+      if (composed.disposition !== "terminal") throw new ManualBaseProofIncompleteError();
       const next: RepoRecordInput = {
         ...previousRecord,
         sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence),
@@ -1016,6 +1057,7 @@ export async function gitResolveCmd(
       intended = { record: next, expectedRepoGen: record.repoGen, relPath: rel, previousRecord, baseProof };
       return intended;
     };
+    step("publishing the incoming checkout");
     const confirmedIdentity = JSON.stringify(snapshot.identity);
     const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
     const follow = await followDivergedRepo({
@@ -1071,23 +1113,40 @@ export async function gitResolveCmd(
       }
       return 1;
     }
-    if (Object.keys(follow.heldRefs).length || !intended) throw new Error("manual resolution published an incomplete checkout");
+    if (deps.forceMutexBodyRefusal === "incomplete-checkout" || Object.keys(follow.heldRefs).length || !intended) {
+      emit({ status: "refused", verb, repo: rel, code: "incomplete-checkout", message: RESOLVE_TYPED_REFUSAL["incomplete-checkout"] }, json, deps, root);
+      return 1;
+    }
+    step("landing the published checkout");
     const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
-    if (landed.recovery.status !== "keep") throw new Error("published checkout journal could not be recovered");
+    if (deps.forceMutexBodyRefusal === "journal-recovery" || landed.recovery.status !== "keep") {
+      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
+      return 1;
+    }
+    step("settling Git protocol artifacts");
     const pSettled = await settleCommittedManualPresentArtifacts({ root, rel, ctx, state: landed.state, incoming });
-    if (pSettled.error) throw new Error(pSettled.error);
+    // The hold reason stringifies arbitrary errors and may carry filesystem
+    // paths, so the curated text REPLACES it rather than appending to it.
+    if (pSettled.error) {
+      emit({ status: "refused", verb, repo: rel, code: "artifact", message: RESOLVE_TYPED_REFUSAL.artifact }, json, deps, root);
+      return 1;
+    }
     emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps, root);
     return 0;
   }, mutexOptions);
   return run.catch((error) => {
     const busy = error instanceof WorkspaceSyncBusyError;
     const timedOut = error instanceof WorkspaceSyncTimeoutError;
+    const classified: ResolveRefusalCode | undefined = error instanceof ManualLineageProofUnavailableError
+      ? "manual-lineage-proof"
+      : error instanceof ManualBaseProofIncompleteError ? "manual-base-proof" : undefined;
     emit({
       status: "refused",
       verb,
       repo: rel,
-      code: busy || timedOut ? "sync-busy" : "operation-failed",
-      message: timedOut ? "timed out waiting for the current sync cycle to finish; try again"
+      code: classified ?? (busy || timedOut ? "sync-busy" : "operation-failed"),
+      message: classified ? RESOLVE_TYPED_REFUSAL[classified]
+        : timedOut ? "timed out waiting for the current sync cycle to finish; try again"
         : busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first"
         : "the Git resolution could not complete safely; no confirmation can be reused",
     }, json, deps, root);

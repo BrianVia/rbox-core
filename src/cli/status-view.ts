@@ -336,7 +336,7 @@ function gitDeferralReasonPrecedence(reason: string): number {
 export interface GitDeferralDisplayEntry {
   repo: string;
   deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">
-    & Partial<Pick<GitDeferral, "reasonSince">>;
+    & Partial<Pick<GitDeferral, "reasonSince" | "detail">>;
   record?: RepoRecord;
 }
 
@@ -358,6 +358,8 @@ export interface GitDeferralRepoProjection {
   alsoDeferred?: string;
   bytesChanged: boolean;
   checkout?: GitDeferral["checkout"];
+  /** The displayed lane's curated detail, verbatim. Never a composed string. */
+  detail?: string;
 }
 
 const parsedDeferralTime = (iso: string, now: number): number => {
@@ -411,7 +413,7 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
           ? "config"
           : canResolve ? "apply-resolvable" : "apply-unavailable";
     const additional = ordered.slice(1).map((lane) => `${lane.lane} — ${gitDeferralReasonPresentation(lane.reason).label}`);
-    projected.push({
+    const row: GitDeferralRepoProjection = {
       repo,
       oldestDeferredSince: oldest.deferredSince,
       displayReason: display.reason,
@@ -426,7 +428,9 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       ...(additional.length ? { alsoDeferred: `Also deferred: ${additional.join("; ")}.` } : {}),
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
       ...(checkout === undefined ? {} : { checkout }),
-    });
+    };
+    if (display.detail !== undefined) row.detail = display.detail;
+    projected.push(row);
   }
   return projected.sort((a, b) =>
     parsedDeferralTime(a.oldestDeferredSince, now) - parsedDeferralTime(b.oldestDeferredSince, now)
@@ -465,9 +469,12 @@ export function renderGitDeferralCompanion(input: {
   canResolve: boolean;
   canKeepMine: boolean;
   staleLockDetail?: { lockCount: number; oldestAgeMs: number; samplePath: string };
+  /** Curated at the deferral-writing site; rendered verbatim, never composed. */
+  detail?: string;
 }): string {
   const presentation = gitDeferralReasonPresentation(input.reason);
-  const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).`;
+  const curated = input.detail ? ` ${boundedCuratedDetail(input.detail)}` : "";
+  const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).${curated}`;
   if (input.reason === "stale-unattributed" && input.staleLockDetail) {
     const detail = input.staleLockDetail;
     const count = `${detail.lockCount} stable lock${detail.lockCount === 1 ? "" : "s"}`;
@@ -523,6 +530,17 @@ const truncateDetail = (d: string): string => {
   const clean = sanitizeTerminalText(d);
   const cps = Array.from(clean);
   return cps.length > DETAIL_MAX ? `…${cps.slice(-(DETAIL_MAX - 1)).join("")}` : clean;
+};
+
+/** Longest curated deferral `detail` rendered in the status companion line. */
+const CURATED_DETAIL_MAX = 120;
+/** Curated prose reads from its HEAD, so an over-long persisted value keeps the
+ *  head and loses the tail — the opposite of {@link truncateDetail}, which keeps
+ *  a path's meaningful basename. A persisted record written by an older, wider,
+ *  or corrupted author must never render an unbounded line. */
+const boundedCuratedDetail = (d: string): string => {
+  const cps = Array.from(sanitizeTerminalText(d));
+  return cps.length > CURATED_DETAIL_MAX ? `${cps.slice(0, CURATED_DETAIL_MAX - 1).join("")}…` : cps.join("");
 };
 
 /**

@@ -16,6 +16,7 @@ import {
   readBasePresentArtifact,
 } from "./base-artifacts.js";
 import { gitRaw, setGitSpawnObserver } from "../../engine/git-spawn.js";
+import { errMsg } from "./shared.js";
 import type { RepoIdentityV1 } from "./repo-lineage.js";
 import { lastWriterWitnessPath, recordLastWriterWitness, type LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
 import {
@@ -1202,6 +1203,59 @@ describe("design 130 reset A/P lifecycle", () => {
     const recovery = (await git(fixture.repo, "for-each-ref", "--format=%(refname)", `refs/rbox-recovery/base-absent/v1/${fixture.binding.lineageHash}`)).split("\n").filter(Boolean);
     expect(recovery).toHaveLength(1);
     expect((await archivedOldState()).repoRecords?.repo?.base?.refs[branch]).toBe(fixture.prior);
+  });
+
+  /** A P whose episode CREATED its ref: `priorOid` is null, which is the one
+   *  shape an absent BASE cannot classify as moved. */
+  async function installRefCreatingP(fixture: Awaited<ReturnType<typeof protocolRepo>>, episode = "e".repeat(32)) {
+    const created = "refs/heads/created";
+    const prepared = await prepareBasePresentArtifact(fixture.repo, fixture.binding, created, episode, null, fixture.next);
+    await gitRaw(fixture.repo, ["update-ref", "--stdin", "--create-reflog", "-m", episode], {
+      stdin: ["start", ...prepared.transactionLines, `create ${created} ${fixture.next}`, "prepare", "commit", ""].join("\n"),
+    });
+    return created;
+  }
+
+  /** Design 271 §2.1: reset stays a refusal for a BASE-less record, and its
+   *  message names the typed code so the field can tell the shapes apart. */
+  test("a create-shaped standing P over a record with NO serialized BASE refuses, naming base-absent", async () => {
+    const fixture = await protocolRepo();
+    await installRefCreatingP(fixture);
+    await saveStateUnsafeLegacyOrTest(root, {
+      ...oldState(),
+      lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: { repo: section(fixture.prior) } },
+      repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
+    });
+
+    await expect(resetSyncState(root, resetDestination, undefined, resetConsent()))
+      .rejects.toThrow("unpreservable P for repo (base-absent)");
+    expect((await loadState(root, "old-stream", () => {})).stream).toBe("old-stream");
+  });
+
+  /** The base-absent hold must NOT preempt the moved/base-shape classification
+   *  for an advancing P: that classification is what routes reset to bounded
+   *  P-repair, and preempting it turned a repairable reset into a throw. */
+  test("an advancing standing P over a BASE-less record still routes to bounded P-repair", async () => {
+    const fixture = await protocolRepo();
+    await installP(fixture, "f".repeat(32));
+    await saveStateUnsafeLegacyOrTest(root, {
+      ...oldState(),
+      lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: { repo: section(fixture.prior) } },
+      repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
+    });
+
+    let outcome = "completed";
+    try {
+      await resetSyncState(root, resetDestination, undefined, resetConsent());
+    } catch (error) {
+      outcome = errMsg(error);
+    }
+
+    // Whatever bounded P-repair then concludes is this shape's PRE-EXISTING
+    // behaviour (this fixture reaches the repair's own lock acquisition); the
+    // one thing the entry test must never do is answer for it.
+    expect(outcome).not.toContain("base-absent");
+    expect(outcome).not.toContain("BASE absent");
   });
 
   test("malformed K and unpreservable moved-P reflog refuse without cutting over", async () => {

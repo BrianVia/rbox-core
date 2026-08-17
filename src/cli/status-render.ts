@@ -288,6 +288,7 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
         staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
+        detail: deferral.detail,
       })}`);
     }
   }
@@ -383,6 +384,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
         staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
+        detail: deferral.detail,
       })}`);
     }
   }

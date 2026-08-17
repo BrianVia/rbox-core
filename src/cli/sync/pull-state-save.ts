@@ -106,7 +106,7 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
   const casDetails = casCounts ? { cas: casStepMs, casCounts } : { cas: casStepMs };
   report.appendDetails("state-save", casDetails, formatCasSteps(casStepMs, casCounts));
   const settleT0 = Date.now();
-  const settled = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
+  const settled = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary, deps.onGitLog);
   report.appendDetails("state-save", { settleArtifactsMs: Date.now() - settleT0 }, `settle${((Date.now() - settleT0) / 1000).toFixed(1)}`);
   return settled;
 }

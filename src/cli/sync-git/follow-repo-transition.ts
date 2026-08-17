@@ -3,6 +3,7 @@ import { DEFERRAL_LANES, type GitDeferralReason, type GitDeferrals, type RepoRec
 import type { GitDeferralUpdates } from "../sync-state.js";
 import {
   composeRepoBase,
+  observedLandingRepoBaseProof,
   type ComposeRepoBaseResult,
   type RepoBaseLockedProof,
   type RepoBaseProof,
@@ -58,7 +59,9 @@ export type FollowExecutionReceipt = {
 /**
  * Everything the composer may observe besides its two receipts. The BASE
  * composition inputs are built by the caller so design-130's persisted-BASE
- * write allowlist keeps counting genuine BASE construction at its one site.
+ * write allowlist keeps counting genuine BASE construction at its one site —
+ * one site that now composes under either of two authorities (§2.3 of design
+ * 271), never two sites.
  */
 export interface FollowCommitInput {
   readonly identity: FollowTransitionIdentity;
@@ -68,6 +71,9 @@ export interface FollowCommitInput {
     readonly prior: RepoBaseValue;
     readonly candidate: RepoBaseValue;
   };
+  /** Refs read off disk after this follow published them. Present only when the
+   * caller armed a first-BASE landing; it authorizes nothing on its own. */
+  readonly landingObservation?: Readonly<Record<string, string>>;
 }
 
 export type FollowPartialDirective =
@@ -84,7 +90,9 @@ export type FollowDeferralDirective =
 export interface FollowBaseAdvance {
   readonly proof: RepoBaseProof;
   /** Named for the applied-manifest slot, not `base`, so the design-130 BASE
-   * write allowlist keeps flagging only genuine persisted BASE writes. */
+   * write allowlist keeps flagging only genuine persisted BASE writes — one site,
+   * now composing under either of two authorities (§2.3 of design 271), which is
+   * an advance of an existing BASE or the FIRST BASE a BASE-less record earns. */
   readonly appliedSection: GitSection | null;
   /** Absent leaves any standing branch provenance exactly as it is. */
   readonly branchOrigins: RepoRecord["branchBaseOrigins"] | undefined;
@@ -133,14 +141,28 @@ function assertBound(
   }
 }
 
-/** The one pull-ref-transaction proof constructor of the follow path. */
+/**
+ * The one BASE-proof constructor of the follow path, under either of two
+ * authorities: `observed-landing` when the record has NO serialized BASE and the
+ * caller armed a landing observation — the only way a first BASE is ever earned,
+ * since every unmoved ref would otherwise lack a per-ref witness — and
+ * `pull-ref-transaction` in every other case.
+ */
 export function followBaseProof(
-  identity: FollowTransitionIdentity,
+  input: FollowCommitInput,
   proof: StandingBranchProofReceipt,
   progress: FollowProgress,
   checkoutComplete: boolean,
 ): RepoBaseProof {
+  const identity = input.identity;
   assertBound(identity, proof);
+  if (input.baseComposition.prior.base === undefined && input.landingObservation) {
+    return observedLandingRepoBaseProof(input.landingObservation, proof.lineageHash, {
+      repoKind: identity.repoKind,
+      effectiveRefScope: identity.effectiveRefScope,
+      checkoutComplete,
+    });
+  }
   const branches: RepoBaseLockedProof["branches"] = { ...(progress.branchLockedProofs ?? {}) };
   const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(
     Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => {
@@ -211,7 +233,7 @@ export function composeFollowAuthority(
   progress: FollowProgress,
   checkoutComplete: boolean,
 ): FollowAuthorityComposition {
-  const baseProof = followBaseProof(input.identity, proof, progress, checkoutComplete);
+  const baseProof = followBaseProof(input, proof, progress, checkoutComplete);
   const composed = composeRepoBase(
     input.baseComposition.prior,
     input.baseComposition.candidate,

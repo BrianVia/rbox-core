@@ -206,6 +206,45 @@ test("an observed-landing proof installs the refs it saw, and holds any the cand
   expect(forged.holds.some((h) => h.ref === "refs/heads/evil" && h.code === "missing-branch-proof")).toBe(true);
 });
 
+test("an observed-landing proof lands a FIRST BASE for a record that has none", () => {
+  const landing = observedLandingRepoBaseProof({ "refs/heads/main": U }, LIN);
+  const composed = composeRepoBase({}, { base: section(U) }, landing.authority, landing.lockedProof);
+
+  expect(composed.disposition).toBe("terminal");
+  expect(composed.base?.refs["refs/heads/main"]).toBe(U);
+  // Origin-less by construction: no BranchBaseOrigin is minted or carried.
+  expect(composed.branchBaseOrigins).toBeUndefined();
+});
+
+test("a deferred checkout can never land a first BASE, even with a valid observation", () => {
+  const landing = observedLandingRepoBaseProof({ "refs/heads/main": U }, LIN, {
+    repoKind: "dir", effectiveRefScope: "all", checkoutComplete: false,
+  });
+  const composed = composeRepoBase({}, { base: section(U) }, landing.authority, landing.lockedProof);
+
+  expect(composed.disposition).toBe("pending");
+  expect(composed.base).toBeUndefined();
+});
+
+test("a pointer or scoped repository whose section names a safe ref takes scope-refused", () => {
+  const withTag: GitSection = { ...section(U), refs: { "refs/heads/main": U, "refs/tags/v1": U } };
+  const observed = { "refs/heads/main": U, "refs/tags/v1": U };
+  const scoped = observedLandingRepoBaseProof(observed, LIN, {
+    repoKind: "pointer", effectiveRefScope: "all", checkoutComplete: true,
+  });
+  const composed = composeRepoBase({}, { base: withTag }, scoped.authority, scoped.lockedProof);
+
+  expect(composed.disposition).toBe("pending");
+  expect(composed.holds.some((h) => h.ref === "refs/tags/v1" && h.code === "scope-refused")).toBe(true);
+  expect(composed.base).toBeUndefined();
+
+  // The dir/all caller keeps today's behaviour: the safe ref installs.
+  const dirAll = observedLandingRepoBaseProof(observed, LIN);
+  const landed = composeRepoBase({}, { base: withTag }, dirAll.authority, dirAll.lockedProof);
+  expect(landed.disposition).toBe("terminal");
+  expect(landed.base?.refs["refs/tags/v1"]).toBe(U);
+});
+
 test("blanket migration authority is refused by the JSON store no matter what", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-blanket-store-"));
   try {

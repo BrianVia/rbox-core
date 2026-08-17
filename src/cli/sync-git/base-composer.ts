@@ -548,17 +548,17 @@ export function composeRepoBase(
       holds.push({ ref, code: "missing-safe-ref-proof" });
       continue;
     }
+    if (lockedProof.repoKind !== "dir" || lockedProof.effectiveRefScope !== "all") {
+      safeRefsValid = false;
+      holds.push({ ref, code: "scope-refused" });
+      continue;
+    }
     if (authority.kind === "observed-landing") {
       // Same rule as branches: a safe ref installs only at its observed value.
       if ((authority.observedRefs[ref] ?? null) !== after) {
         safeRefsValid = false;
         holds.push({ ref, code: after === null ? "missing-safe-ref-proof" : "mismatched-safe-ref-proof" });
       }
-      continue;
-    }
-    if (lockedProof.repoKind !== "dir" || lockedProof.effectiveRefScope !== "all") {
-      safeRefsValid = false;
-      holds.push({ ref, code: "scope-refused" });
       continue;
     }
     const witness = authoritySafeWitness(authority, ref);
@@ -634,11 +634,21 @@ export function carryRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBasePr
 export function observedLandingRepoBaseProof(
   observedRefs: Readonly<Record<string, string>>,
   lineageHash = "legacy-untrusted",
+  identity: ObservedLandingLockedIdentity = { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true },
 ): RepoBaseProof {
   return {
     authority: { kind: "observed-landing", lineageHash, observedRefs },
-    lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
+    lockedProof: { ...identity, branches: {}, safeRefs: {} },
   };
+}
+
+/** The locked-proof identity an observed landing composes under. `dir`/`all`
+ * was the constructor's hardcoded literal; every caller now states its own. */
+export interface ObservedLandingLockedIdentity {
+  readonly repoKind: RepoBaseLockedProof["repoKind"];
+  readonly effectiveRefScope: GitRefScope;
+  /** A deferred checkout composes false, which keeps the section pending. */
+  readonly checkoutComplete: boolean;
 }
 
 /**

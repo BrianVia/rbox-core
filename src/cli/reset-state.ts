@@ -167,7 +167,9 @@ async function prepareResetArtifactsUnderFence<T>(
           root, stream: state.stream, state: currentState, relPath: repo.relPath,
           ctx: repo.ctx, binding: repo.binding, p, stateSaveOptions: { heldLock: heldStateLock },
         });
-        if (exact.status === "hold") throw new Error(`reset refused: unpreservable P for ${repo.relPath}: ${exact.reason}`);
+        if (exact.status === "hold") {
+          throw new Error(`reset refused: unpreservable P for ${repo.relPath}${exact.code ? ` (${exact.code})` : ""}: ${exact.reason}`);
+        }
         if (exact.status === "settled") {
           currentState = exact.state;
           continue;

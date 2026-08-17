@@ -11,7 +11,7 @@ import { checkoutJournalDir } from "../cli/sync-git/journal.js";
 import { repoCtx } from "../cli/sync-git/git-state.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd } from "./git/deferrals-command.js";
-import { gitResolveCmd } from "./git/resolve-command.js";
+import { gitResolveCmd, ManualBaseProofIncompleteError, ManualLineageProofUnavailableError } from "./git/resolve-command.js";
 import { safeResolveText, type GitResolveShow } from "./git/resolve-presentation.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { settleCommittedBranchArtifacts } from "./sync-git/received-git-transition-commit.js";
@@ -380,7 +380,9 @@ test("show-me JSON is exhaustive while only human local-only presentation is cap
   }))).toBe(0);
   const hiddenOid = subjectOids.get(hiddenSubject!)!;
   expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${hiddenOid}`)).toBe(hiddenOid);
-  expect(takeErr).toEqual([]);
+  // Design 271 §2.7.6: take-theirs reports its steps on stderr; stdout stays
+  // byte-clean for --json.
+  expect(takeErr.filter((line) => !line.startsWith("take-theirs: "))).toEqual([]);
 });
 
 test("show-me heartbeat timers are cleared in finally", async () => {
@@ -1353,4 +1355,113 @@ test("resolve maps indeterminate proof, journal recovery, and degraded mutex to 
   expect(degraded.at(-1)).not.toContain("private identity failure");
   expect(confirmedPushCalls).toBe(0);
   expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending).toEqual(pendingBefore);
+});
+
+/**
+ * Design 271 §2.7: the two refusals inside `makeIntended` cannot emit and
+ * return, so they travel as error classes the outer catch classifies into their
+ * own code and curated, path-free message — never the generic catch-all.
+ */
+test("the two makeIntended error classes classify into their own resolve codes", async () => {
+  await fixture();
+  const cases = [
+    { error: new ManualLineageProofUnavailableError(), code: "manual-lineage-proof" },
+    { error: new ManualBaseProofIncompleteError(), code: "manual-base-proof" },
+  ] as const;
+  for (const { error, code } of cases) {
+    const lines: string[] = [];
+    expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true }, deps(lines, {
+      build: async () => { throw error; },
+    }))).toBe(1);
+    const output = lines.at(-1)!;
+    const parsed = JSON.parse(output);
+    expect(parsed.code).toBe(code);
+    expect(parsed.status).toBe("refused");
+    expect(parsed.message).not.toContain("/");
+    expect(output).not.toMatch(/[\r\n\u001b]/);
+  }
+});
+
+test("take-theirs and keep-mine report their steps on stderr, never on stdout", async () => {
+  await fixture();
+  const out: string[] = [];
+  const err: string[] = [];
+  await gitResolveCmd(root, receiver, "take-theirs", { json: true }, deps([], {
+    stdout: (line: string) => out.push(line),
+    stderr: (line: string) => err.push(line),
+  }));
+  expect(err.some((line) => line.startsWith("take-theirs: "))).toBe(true);
+  for (const line of out) expect(line.startsWith("take-theirs: ")).toBe(false);
+  // Every stdout line stays parseable JSON under --json.
+  for (const line of out) expect(() => JSON.parse(line)).not.toThrow();
+});
+
+/**
+ * Design 271 §2.7: the three refusals in the resolve mutex body emit their own
+ * code and curated, path-free text instead of collapsing into the catch-all.
+ * `artifact` is the one whose raw hold reason exists at all — it is REPLACED,
+ * never appended, because it stringifies arbitrary errors and may name paths.
+ */
+test("the standing-artifact refusal replaces its raw hold reason with curated text", async () => {
+  const { incoming } = await fixture();
+  const current = await show([]);
+  const lines: string[] = [];
+
+  const code = await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines, {
+    // A foreign artifact planted inside the protocol namespace during the
+    // follow: the post-landing settlement scan refuses it.
+    beforeSecondProof: async () => {
+      await git(receiver, "update-ref",
+        `refs/rbox-local/base-present/v2/${"a".repeat(64)}/${"b".repeat(64)}`,
+        incoming.refs["refs/heads/main"]!);
+    },
+  }));
+
+  expect(code).toBe(1);
+  const output = lines.at(-1)!;
+  expect(JSON.parse(output)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "artifact",
+    message: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
+  });
+  // The raw hold reason names the namespace it refused; none of it may leak.
+  expect(output).not.toContain("rbox-local/base-present");
+  expect(output).not.toContain(root);
+  expect(output).not.toMatch(/[\r\n\u001b]/);
+});
+
+test("the incomplete-checkout refusal emits its own code and curated text on both surfaces", async () => {
+  await fixture();
+  const message = "the incoming checkout was published for some refs but not all; the resolution is incomplete — retry after Git state settles";
+  const json: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: (await show([])).snapshot },
+    deps(json, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
+  expect(JSON.parse(json.at(-1)!)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "incomplete-checkout", message,
+  });
+  expect(json.at(-1)).not.toContain(root);
+  expect(json.at(-1)).not.toMatch(/[\r\n\u001b]/);
+
+});
+
+test("the incomplete-checkout refusal renders the same curated text for a human", async () => {
+  await fixture();
+  const human: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { confirm: (await show([])).snapshot },
+    deps(human, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
+  expect(human.filter((line) => !line.startsWith("take-theirs: ")).join("\n"))
+    .toContain("the incoming checkout was published for some refs but not all");
+  expect(human.join("\n")).not.toContain(root);
+});
+
+test("the journal-recovery refusal emits its own code and curated text", async () => {
+  await fixture();
+  const json: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: (await show([])).snapshot },
+    deps(json, { forceMutexBodyRefusal: "journal-recovery" }))).toBe(1);
+  expect(JSON.parse(json.at(-1)!)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "journal-recovery",
+    message: "the published checkout journal could not be recovered; retry after Git state settles, or inspect the local recovery copy",
+  });
+  expect(json.at(-1)).not.toContain(root);
+  expect(json.at(-1)).not.toMatch(/[\r\n\u001b]/);
 });

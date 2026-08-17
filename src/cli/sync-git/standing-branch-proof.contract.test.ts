@@ -296,6 +296,22 @@ describe("SettleStandingBranchProof", () => {
     expect(effects.trace.calls).toEqual(["settle"]);
   });
 
+  test("a base-absent settlement hold opens a landing instead of an artifact deferral", async () => {
+    const effects = port({
+      settleExactArtifact: async () => ({ status: "hold", reason: "P settlement BASE absent", code: "base-absent" }),
+    });
+    const bound = input({ protocol: protocol({ presentArtifacts: [preparedRef("refs/heads/main")] }) });
+    const result = await settleStandingBranchProof(bound, effects);
+
+    expect(result.kind).toBe("landing");
+    if (result.kind !== "landing") throw new Error("unreachable");
+    expect(result.protocol).toBe(bound.protocol);
+    expect(result.carry).toEqual({ state: bound.state, base: undefined, recoveredRecord: undefined });
+    // The P is deliberately left standing: nothing settled it.
+    expect(result.protocol.presentArtifacts).toHaveLength(1);
+    expect(effects.trace.calls).toEqual(["settle"]);
+  });
+
   test("an absent standing artifact stops the loop without refreshing the protocol", async () => {
     const bound = input({ protocol: protocol({ presentArtifacts: [] }) });
     const effects = port({ settleExactArtifact: async () => ({ status: "absent" }) });
