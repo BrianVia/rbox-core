@@ -90,7 +90,9 @@ export type FollowDeferralDirective =
 export interface FollowBaseAdvance {
   readonly proof: RepoBaseProof;
   /** Named for the applied-manifest slot, not `base`, so the design-130 BASE
-   * write allowlist keeps flagging only genuine persisted BASE writes. */
+   * write allowlist keeps flagging only genuine persisted BASE writes — one site,
+   * now composing under either of two authorities (§2.3 of design 271), which is
+   * an advance of an existing BASE or the FIRST BASE a BASE-less record earns. */
   readonly appliedSection: GitSection | null;
   /** Absent leaves any standing branch provenance exactly as it is. */
   readonly branchOrigins: RepoRecord["branchBaseOrigins"] | undefined;

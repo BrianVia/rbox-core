@@ -3153,3 +3153,84 @@ test("design 270: an rbox artifact ref written between cycles forces the next pu
   });
   expect(restored.outcome.gitApplyMetrics?.results.skipped).toBe(1);
 });
+
+/** The wedged shape of design 271: a materialized receiver whose record carries
+ * NO serialized BASE. `localDivergedFromBase` (shared.ts:117) makes an absent
+ * BASE unconditional local divergence, which is what routes it through the
+ * follow at all. `hidden` reproduces the OTHER way a BASE leaves the manifest
+ * projection (sync-state-records.ts:144-145) while the record keeps it. */
+async function landingFixture(hidden?: Partial<RepoRecord>): Promise<{ state: SyncState; incoming: GitSection; prior: RepoRecord }> {
+  await commit("one\n", "landing-c1");
+  await commit("two\n", "landing-c2");
+  const base = await capture();
+  await materialize(base);
+  // The sender publishes a NEW BRANCH only: the receiver's checkout, worktree
+  // and index stay exactly where materialization left them, so the sole reason
+  // this repository routes through the follow is its absent BASE.
+  await git(sender, "branch", "feature/two");
+  const incoming = await capture();
+  const materialized = stateWith(base);
+  const prior = materialized.repoRecords!.repo!;
+  const record: RepoRecord = hidden
+    ? { ...prior, ...hidden }
+    : { repoGen: prior.repoGen, sourceSeq: prior.sourceSeq };
+  const state: SyncState = {
+    ...materialized,
+    // Exactly what stateFromRepoRecords projects for each of these records.
+    lastSyncedManifest: { ...materialized.lastSyncedManifest, gitRepos: {} },
+    repoRecords: { repo: record },
+  };
+  await saveStateUnsafeLegacyOrTest(workspace, state);
+  return { state, incoming, prior };
+}
+
+test("design 271: a BASE-less record lands its FIRST BASE under observed-landing authority", async () => {
+  const { state, incoming } = await landingFixture();
+
+  const { outcome } = await applyIncoming(state, incoming);
+
+  expect(outcome.repoProofs?.repo?.authority.kind).toBe("observed-landing");
+  expect(outcome.gitRepos?.repo).toEqual(incoming);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+});
+
+test("design 271: the published journal intent composes BEFORE the observation and carries no first BASE", async () => {
+  const { state, incoming } = await landingFixture();
+
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-journal-write") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-journal-write");
+
+  const journalRoot = path.join(workspace, ".rbox", "state", "git-journal");
+  const journalDir = path.join(journalRoot, (await fs.readdir(journalRoot))[0]!);
+  const journal = JSON.parse(await fs.readFile(path.join(journalDir, "journal.json"), "utf8")) as {
+    intended?: { record?: RepoRecord };
+  };
+  expect(journal.intended).toBeDefined();
+  expect(journal.intended?.record?.base).toBeUndefined();
+});
+
+/** F1: the manifest projection HIDES a durable BASE for a structurally-absent or
+ * removed repository. Arming on that projection would mint a replacement BASE
+ * with no per-ref witness and drop the record's branch origins, so the arming
+ * authority is the RECORD itself. */
+for (const [label, hidden] of [
+  ["structurally absent", { repoAbsent: true }],
+  ["removal-marked", { removedKey: "removed-identity-1" }],
+] as const) {
+  test(`design 271: a ${label} record whose BASE is hidden from the projection never arms a landing`, async () => {
+    const { state, incoming, prior } = await landingFixture(hidden);
+
+    const { outcome } = await applyIncoming(state, incoming);
+
+    expect(outcome.repoProofs?.repo?.authority.kind).toBe("pull-ref-transaction");
+    // Composition holds exactly as it did before: the unmoved branch has no
+    // per-ref witness, so the section stays pending and no BASE is written.
+    expect(outcome.gitRepos?.repo).toBeUndefined();
+    expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+    // The record's durable BASE and its origins survive untouched.
+    expect(outcome.branchBaseOrigins?.repo).toBeUndefined();
+    expect(prior.base).toBeDefined();
+  });
+}

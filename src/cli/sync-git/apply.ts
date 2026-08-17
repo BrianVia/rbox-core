@@ -1043,14 +1043,6 @@ opts: {
           });
         },
       }));
-      // Read AFTER the follow published its refs and BEFORE either transition
-      // composes: the intended journal record and the held-attempt binding above
-      // deliberately compose without it. A record with NO serialized BASE can
-      // never earn one from per-ref witnesses alone, whether or not a P stands.
-      if (baseSec === undefined) {
-        const observed = await readAllRefsStrict(repoDir);
-        if (observed.status !== "unreadable") landingObservation = observed.refs;
-      }
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") {
         clearAttempt(rel);
@@ -1078,6 +1070,19 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
 
+      // Read AFTER the follow published its refs and BEFORE the transition
+      // composes: the intended journal record and the held-attempt binding above
+      // deliberately compose without it. The arming authority is the RECORD's own
+      // BASE, not the manifest projection — a removed or structurally-absent
+      // repository is hidden from that projection (sync-state-records.ts:144-145)
+      // while keeping a durable BASE that must never be replaced by a landing.
+      // The legacy and deferred paths returned above: neither can land a first
+      // BASE (a deferred outcome composes checkoutComplete:false ⇒ pending), so
+      // they never pay for this read.
+      if (records[rel]?.base === undefined && baseSec === undefined) {
+        const observed = await readAllRefsStrict(repoDir);
+        if (observed.status !== "unreadable") landingObservation = observed.refs;
+      }
       await commitFollowTransition(composeFollowRepoTransition(followComposition(), {
         relPath: rel,
         incomingKey: incomingKey!,
