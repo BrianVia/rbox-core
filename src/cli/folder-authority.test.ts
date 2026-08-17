@@ -32,6 +32,30 @@ async function catalogAbsent(): Promise<boolean> {
   }
 }
 
+/** A 1.x-shaped bound folder: a `.rbox/` binding and nothing else. */
+async function boundFolder(name: string, policy: { syncGit?: boolean } = {}): Promise<string> {
+  const root = path.join(home, name);
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_bound",
+    projectId: "root",
+    deviceId: "dev_1",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+    ...policy,
+  }));
+  return root;
+}
+
+async function writeBindingRegistry(...entries: { root: string; workspaceId: string }[]): Promise<void> {
+  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
+  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
+    schemaVersion: 1,
+    entries: entries.map((entry) => ({ ...entry, boundAt: "2026-08-11T00:00:00.000Z", lastSeenAt: "2026-08-11T00:00:00.000Z" })),
+  }));
+}
+
 test("a genuinely fresh machine silently initializes an empty authoritative catalog", async () => {
   const state = await ensureFolderAuthority();
   expect(state.kind).toBe("authoritative");
@@ -54,27 +78,8 @@ test("a corrupt binding registry blocks silent initialization instead of publish
  * row generation would DROP (the skipped case below) still refuses.
  */
 test("an absent catalog with only discoverable bindings initializes instead of demanding regenerate", async () => {
-  const root = path.join(home, "bound-folder");
-  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
-  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
-    remoteWorkspaceId: "ws_bound",
-    projectId: "root",
-    deviceId: "dev_1",
-    rootPath: root,
-    remoteUrl: "https://api.test",
-    token: "",
-    syncGit: true,
-  }));
-  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
-  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
-    schemaVersion: 1,
-    entries: [{
-      root,
-      workspaceId: "ws_bound",
-      boundAt: "2026-08-11T00:00:00.000Z",
-      lastSeenAt: "2026-08-11T00:00:00.000Z",
-    }],
-  }));
+  const root = await boundFolder("bound-folder", { syncGit: true });
+  await writeBindingRegistry({ root, workspaceId: "ws_bound" });
 
   const state = await ensureFolderAuthority({ currentRoot: root });
   expect(state.snapshot.folders.map((folder) => folder.normalizedPath)).toEqual([root]);
@@ -83,24 +88,11 @@ test("an absent catalog with only discoverable bindings initializes instead of d
 });
 
 test("an absent catalog with a binding whose evidence would be dropped still refuses", async () => {
-  const root = path.join(home, "bound-folder");
-  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
-  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
-    remoteWorkspaceId: "ws_bound",
-    projectId: "root",
-    deviceId: "dev_1",
-    rootPath: root,
-    remoteUrl: "https://api.test",
-    token: "",
-  }));
-  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
-  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
-    schemaVersion: 1,
-    entries: [
-      { root, workspaceId: "ws_bound", boundAt: "2026-08-11T00:00:00.000Z", lastSeenAt: "2026-08-11T00:00:00.000Z" },
-      { root: path.join(home, "gone"), workspaceId: "ws_gone", boundAt: "2026-08-11T00:00:00.000Z", lastSeenAt: "2026-08-11T00:00:00.000Z" },
-    ],
-  }));
+  const root = await boundFolder("bound-folder");
+  await writeBindingRegistry(
+    { root, workspaceId: "ws_bound" },
+    { root: path.join(home, "gone"), workspaceId: "ws_gone" },
+  );
 
   await expect(ensureFolderAuthority({ currentRoot: root })).rejects.toThrow(/regenerate/);
   expect(await catalogAbsent()).toBe(true);

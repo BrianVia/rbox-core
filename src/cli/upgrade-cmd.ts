@@ -165,12 +165,16 @@ interface DaemonCycle {
  * a folder configuration this binary would refuse must never cost the user a
  * working daemon (design 276 F1.2). The admitted token is then handed to the
  * restart, so the check and the start share one catalog generation. A refusal is
- * this workspace's alone — every other workspace still upgrades. */
+ * this workspace's alone — every other workspace still upgrades.
+ *
+ * Every failure names its real reason, never a remedy that re-fails: `rbox stop
+ * && rbox start` runs the same admission this cycle just failed (276 F1.1). */
 async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle): Promise<boolean> {
-  // Undefined means this workspace is not being restarted at all: its desired
-  // state is stopped, so stopping it needs no admission.
+  // A workspace whose desired state is stopped is never restarted, so stopping
+  // it needs no admission and holds no admitted token.
+  const restarting = row.desired.state !== "stopped";
   let admission: Awaited<ReturnType<typeof requireFolderAdmission>> | undefined;
-  if (row.desired.state !== "stopped") {
+  if (restarting) {
     try {
       admission = await requireFolderAdmission(root);
     } catch (error) {
@@ -184,17 +188,10 @@ async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle)
     log(`daemon ${key}: restart failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
-  if (admission === undefined) {
+  if (!admission) {
     log(`daemon ${key}: stopped (desired state is stopped)`);
     return true;
   }
-  return await restartDesiredDaemon({ root, key, row, stop, start, log }, admission);
-}
-
-async function restartDesiredDaemon(
-  { key, row, start, log }: DaemonCycle,
-  admission: Awaited<ReturnType<typeof requireFolderAdmission>>,
-): Promise<boolean> {
   try {
     const resumeMode = row.desired.pendingModeIntent ?? (row.desired.pullOnly === true ? "pull-only" : "read-write");
     if (!await resumeDesiredDaemon(row.desired, { startDaemon: start, trustedFolderAdmission: admission })) {
@@ -204,8 +201,6 @@ async function restartDesiredDaemon(
     log(`daemon ${key}: restarted${resumeMode === "pull-only" ? " (pull-only)" : ""}`);
     return true;
   } catch (error) {
-    // The real reason, not a remedy that re-fails: `rbox stop && rbox start`
-    // runs the same admission this restart just failed (design 276 F1.1).
     log(`daemon ${key}: restart failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }

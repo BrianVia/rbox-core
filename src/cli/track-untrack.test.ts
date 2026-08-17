@@ -107,11 +107,10 @@ test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async (
   expect(await findRoot(root)).toBeUndefined();
 });
 
-// Design 276 F1.3 replaced the "a re-track cannot regenerate a lost catalog"
-// rule: a catalog whose every folder is still a discoverable binding is
-// reproduced exactly, so refusing only cost the user a working machine. A
-// catalog generation would have to DROP something still refuses toward
-// `rbox config regenerate` (folder-authority.test.ts).
+// Design 276 F1.3: a lost catalog whose every folder is still a discoverable
+// binding is reproduced exactly, so activation rebuilds it. Only a catalog
+// generation would have to DROP a row refuses toward `rbox config regenerate`
+// (folder-authority.test.ts).
 test("re-tracking a bound root rebuilds a lost folder catalog it can fully reproduce", async () => {
   const { root } = await track(dir, { workspace: "ws_abc123" }, "https://api.test");
   await fs.rm(folderCatalogPath(), { force: true });
