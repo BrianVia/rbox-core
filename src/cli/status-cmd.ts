@@ -2,7 +2,8 @@ import { emitJson } from "./json.js";
 import type { BriefIdentitySource } from "./status-view/brief.js";
 import { refreshStatusDeferralAssertions } from "./status-maintenance.js";
 import { projectWorkspaceStatusDetail } from "./status-projection.js";
-import { renderWorkspaceStatusSurface, type StatusSurfaceRender } from "./status-render.js";
+import { renderWorkspaceStatusSurface, type StatusRenderOptions, type StatusSurfaceRender } from "./status-render.js";
+import { gitDeferralEvidence } from "./status-view/git-evidence.js";
 import type { StatusCacheHint, StatusMode, WorkspaceStatusProjection } from "./status-contract.js";
 import { createStatusReadPort, defaultStatusDeps, type StatusCmdDeps } from "./status-read-port.js";
 import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";
@@ -20,6 +21,9 @@ export interface StatusCmdOptions {
   git?: boolean;
   /** With `--git`: print the one-line form for every paused repo. */
   all?: boolean;
+  /** With `--git`: the uncapped two-sided view of ONE repo (design 273 S2),
+   * workspace-relative. */
+  gitRepo?: string;
   now?: Date;
 }
 
@@ -95,10 +99,36 @@ export async function statusCmdWithDeps(
 ): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
   const mode: StatusMode = opts.json ? "json" : opts.verbose ? "verbose" : opts.git === true ? "git" : "brief";
-  return emitStatusSurface(renderWorkspaceStatusSurface(
-    await projectOnce(root, mode, deps),
-    opts.all === true ? { all: true } : {},
-  ));
+  const projection = await projectOnce(root, mode, deps);
+  const options: StatusRenderOptions = await gitEvidenceOption(root, mode, projection, opts.gitRepo);
+  if (opts.all === true) options.all = true;
+  if (opts.gitRepo !== undefined) options.repo = opts.gitRepo;
+  return emitStatusSurface(renderWorkspaceStatusSurface(projection, options));
+}
+
+/**
+ * Design 273 P1: `evidence()` is the Module's MANUAL-ONLY operation, so it is
+ * invoked here — on the `--git` surface a person typed — and never from
+ * `projectOnce`, which the daemon, the headline and doctor also run.
+ */
+async function gitEvidenceOption(
+  root: string,
+  mode: StatusMode,
+  projection: WorkspaceStatusProjection<StatusMode>,
+  repo: string | undefined,
+): Promise<StatusRenderOptions> {
+  if (mode !== "git" || projection.kind !== "detail") return {};
+  const rows = projection.git.projectedRepos;
+  const wanted = repo === undefined ? rows : rows.filter((row) => row.repo === repo);
+  const records = projection.git.records;
+  const readings = await gitDeferralEvidence({
+    root,
+    records: new Map(wanted.flatMap((row) => {
+      const record = records[row.repo];
+      return record ? [[row.repo, record] as const] : [];
+    })),
+  });
+  return { evidence: (row) => readings.get(row.repo) };
 }
 
 function emitStatusSurface(rendered: StatusSurfaceRender): StatusCmdResult {

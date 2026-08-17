@@ -50,6 +50,8 @@ import { partialRefsStillMatch } from "./received-git-transition-commit.js";
 import { fingerprintHitProbe, loadGitDivergenceCache } from "./divergence-cache.js";
 import { gitFingerprintRun } from "./fingerprint.js";
 import { gitConfigHash } from "./config-lane.js";
+import { reconcilePendingPins, writePendingPins } from "./pending-pins.js";
+import type { OwnedRefMutationBoundary } from "./pins.js";
 
 interface KeySnapshot<T> {
   present: boolean;
@@ -172,6 +174,9 @@ opts: {
     heldNow?: () => number;
     warningSink?: (message: string) => void;
     mutationBoundary?: MutationBoundary;
+    /** Design 273 P3: the daemon observation lease for rbox-owned ref writes, so
+     * the pin sweep is never attributed to the user. */
+    ownedRefMutationBoundary?: OwnedRefMutationBoundary;
     /** Tests only: observes/injects the anchored empty-directory removal call. */
     sweepRmdir?: RepoSkeletonSweepOptions["rmdir"];
     /** Tests only: observes repos admitted to the serialized apply work. */
@@ -332,6 +337,20 @@ opts: {
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     const getDiskCtx = asyncMemo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
     const commonDirGroup = commonDirGroupFor(await getDiskCtx());
+    // Design 273 P3: the ONE pin lifecycle authority, once per repo per pull,
+    // before any branch that could return early. It reads the record standing at
+    // the start of this pull, so a pin this pull is about to write survives and
+    // every pin no record names — resolved, cleared, superseded, or orphaned by a
+    // crash between the pin write and the record write — is collected here.
+    const pinCtx = await getDiskCtx();
+    if (pinCtx) {
+      const heldIncoming = records[rel]?.pending;
+      await reconcilePendingPins(
+        pinCtx.repoDir, pinCtx.commonDir, rel,
+        heldIncoming && gitIncomingKey(heldIncoming),
+        opts.ownedRefMutationBoundary,
+      ).catch(() => {});
+    }
     const receivedConfig = createReceivedGitConfig({
       root,
       relPath: rel,
@@ -992,6 +1011,26 @@ opts: {
             : null;
         if (transition.deferral.kind === "clear") clearDeferral(rel, "apply");
         else setDeferral(rel, "apply", transition.deferral.reason, incomingKey, await checkoutOf(repoDir));
+        // Design 273 P3: pinned HERE, on the paused branch only, from the same
+        // incoming section the record write beside it carries. `cleanupRefs` has
+        // already dropped the staging namespace, so without this the imported
+        // objects are unreachable and every evidence surface has to go to the
+        // network. Unconditional per-follow pinning would cost two spawns per
+        // repo per pull against a ≤10s propagation target, for repos that are
+        // about to apply and never need evidence at all.
+        // Keyed from `transition.pending`, NOT from this pull's wire section:
+        // on a carried or retained section the two diverge, and a pin written
+        // under the wire key is unreadable to both readers (which derive the key
+        // from the record) and collected by the next sweep as an orphan.
+        if (transition.pending) {
+          const pinCtx = await getDiskCtx();
+          if (pinCtx) {
+            await writePendingPins(
+              pinCtx.repoDir, rel, gitIncomingKey(transition.pending), transition.pending,
+              opts.ownedRefMutationBoundary,
+            ).catch(() => {});
+          }
+        }
         if (transition.publishJournal) publishedJournals.push(rel);
       };
       const classificationWorktreeRegistryDigest = await readWorktreeRegistryDigest(repoDir);

@@ -1466,3 +1466,377 @@ test("the journal-recovery refusal emits its own code and curated text", async (
   expect(json.at(-1)).not.toContain(root);
   expect(json.at(-1)).not.toMatch(/[\r\n\u001b]/);
 });
+
+// ── design 273 S4: preview, and batch selection ──────────────────────────────
+
+/** Every file under the workspace by content, for the zero-write assertion.
+ * Lock files are excluded BY NAME and nothing else is: taking the workspace sync
+ * mutex is how a resolve command serializes against the daemon, so a preview
+ * takes it too, and excluding the lock is honest where excluding a directory
+ * would quietly hide the thing being tested. */
+async function workspaceFingerprint(dir: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const walk = async (abs: string, rel: string): Promise<void> => {
+    for (const entry of await fs.readdir(abs, { withFileTypes: true })) {
+      const childAbs = path.join(abs, entry.name);
+      const childRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isDirectory()) { await walk(childAbs, childRel); continue; }
+      if (!entry.isFile()) { out.set(childRel, entry.isSymbolicLink() ? "symlink" : "other"); continue; }
+      if (childRel.endsWith(".lock") || childRel.includes("/locks/")) continue;
+      const stat = await fs.stat(childAbs);
+      out.set(childRel, `${stat.size}:${(await fs.readFile(childAbs)).toString("base64")}`);
+    }
+  };
+  await walk(dir, "");
+  return out;
+}
+
+const fingerprintDiff = (before: Map<string, string>, after: Map<string, string>): string[] => [
+  ...[...after.keys()].filter((key) => !before.has(key)).map((key) => `added ${key}`),
+  ...[...before.keys()].filter((key) => !after.has(key)).map((key) => `removed ${key}`),
+  ...[...before.keys()].filter((key) => after.has(key) && after.get(key) !== before.get(key)).map((key) => `changed ${key}`),
+];
+
+test("take-theirs --dry-run changes nothing on disk and points at the real backup directory", async () => {
+  await fixture();
+  const before = await workspaceFingerprint(root);
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { dryRun: true }, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual([]);
+  // Negative control: an assertion that cannot see a write is not an assertion.
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "touched by the control\n");
+  expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual(["changed repo/tracked.txt"]);
+
+  const { backupDirFor } = await import("./git/resolve-dry-run.js");
+  const text = lines.join("\n");
+  expect(lines[0]).toBe("This is a preview — nothing on this computer changed.");
+  expect(text).toContain(`${backupDirFor("repo")}/`);
+  expect(text).toContain("NOT copy:");
+  expect(text).toContain("you never added to git, and ignored");
+  expect(text).toContain("files — those stay where they are on disk, untouched");
+  expect(text).toContain("To actually do it, run the same command without --dry-run.");
+  expect(text).toContain("keep it until you're sure");
+  // Design 275 owns the restore command; printing one that does not exist is
+  // worse than printing none.
+  expect(text).not.toContain("restore-backup");
+});
+
+test("keep-mine --dry-run changes nothing on disk and never claims the other computer loses work", async () => {
+  await fixture();
+  const before = await workspaceFingerprint(root);
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { dryRun: true }, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual([]);
+  const text = lines.join("\n");
+  expect(text).toContain("publish this computer's version");
+  expect(text).toContain("The other computer's work is not deleted");
+});
+
+test("--under makes the verb positional[1]; a repo argument beside it is a usage error", async () => {
+  const { parseResolveArgs, GitUsageError } = await import("./git/git-dispatch.js");
+  // The shipped defect: this spelling parsed `take-theirs` as the REPO.
+  expect(parseResolveArgs(["resolve", "take-theirs"], { under: "conductor" }))
+    .toEqual({ under: "conductor", verb: "take-theirs" });
+  expect(parseResolveArgs(["resolve", "repo", "keep-mine"], {}))
+    .toEqual({ repo: "repo", verb: "keep-mine" });
+  expect(parseResolveArgs(["resolve", "repo"], {})).toEqual({ repo: "repo", verb: "show-me" });
+  expect(parseResolveArgs(["resolve"], { under: "." })).toEqual({ under: ".", verb: "show-me" });
+  // A repo positional AND --under name different populations; refuse rather than
+  // guess which one was meant.
+  expect(() => parseResolveArgs(["resolve", "repo", "keep-mine"], { under: "." })).toThrow(GitUsageError);
+  // `--under` with no value would otherwise select the whole machine.
+  expect(() => parseResolveArgs(["resolve", "keep-mine"], { under: "true" })).toThrow(GitUsageError);
+  expect(() => parseResolveArgs(["resolve", "repo", "not-a-verb"], {})).toThrow(GitUsageError);
+});
+
+test("batch take-theirs refuses, naming the missing undo AND the real repos", async () => {
+  await fixture();
+  const lines: string[] = [];
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "take-theirs" }, reading, {
+    stdout: (line: string) => lines.push(line),
+  })).toBe(1);
+  const text = lines.join("\n");
+  expect(text).toContain("will not take the other computer's version in bulk");
+  // Real names, not a placeholder the reader has to translate into a path they
+  // were never shown.
+  expect(text).toContain("rbox git resolve repo take-theirs --dry-run");
+  expect(text).not.toContain("<repo>");
+});
+
+/** The rows + records every batch surface reads, from the fixture's real state. */
+async function batchReading() {
+  const { projectGitDeferralRepos } = await import("./status-view/git-projection.js");
+  const records = repoRecordsForState(await loadState(root, syncStreamId(cfg)));
+  const rows = projectGitDeferralRepos(Object.entries(records).flatMap(([repo, record]) =>
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])));
+  return { rows, records };
+}
+
+test("batch --dry-run performs ZERO writes — it never stages a repo to preview it", async () => {
+  await fixture();
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  const before = await workspaceFingerprint(root);
+  const lines: string[] = [];
+  const spawns: string[][] = [];
+  setGitSpawnObserver((_root, args) => { spawns.push([...args]); });
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", dryRun: true }, reading, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual([]);
+  // Positive control: the evidence read DOES spawn git, so an observer that saw
+  // nothing at all would mean the assertion below never had anything to check.
+  expect(spawns.length).toBeGreaterThan(0);
+  // The frozen-token loop stages every repo — network fetch and pack import. A
+  // preview that reached it would be changing what it describes.
+  expect(spawns.some((args) => args.includes("fetch") || args.includes("index-pack") || args.includes("unbundle"))).toBe(false);
+  const text = lines.join("\n");
+  // P2: the mode leads.
+  expect(lines[0]).toBe("This is a preview — nothing on this computer changed.");
+  expect(text).toContain("To actually do it, run the same command without --dry-run.");
+  // P3: header row, listing vocabulary.
+  expect(text).toContain("also changed elsewhere");
+  expect(text).toContain("why it's paused");
+  expect(text).not.toContain("on both ⚠");
+});
+
+test("batch show-me --dry-run answers like the single-repo verb instead of staging", async () => {
+  await fixture();
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  const before = await workspaceFingerprint(root);
+  const lines: string[] = [];
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "show-me", dryRun: true }, reading, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual([]);
+  expect(lines.join("\n")).toContain("`show-me` only reads; it never changes anything here");
+});
+
+test("a real batch run leads with intent, not with a preview disclaimer", async () => {
+  await fixture();
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  const lines: string[] = [];
+  await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine" }, reading, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+  }));
+  expect(lines[0]).toContain("About to keep this computer's work in");
+  expect(lines.join("\n")).not.toContain("This is a preview");
+});
+
+test("--yes alone is not the scriptable twin: it needs --expect-repos, and a mismatch refuses", async () => {
+  const { incoming } = await fixture();
+  const incomingTip = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, incomingTip);
+  await git(receiver, "reset", "--hard", incomingTip);
+  await fs.rm(path.join(receiver, ".git", "ORIG_HEAD"), { force: true });
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+
+  const bare: string[] = [];
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", yes: true }, reading, deps(bare, {
+    stdout: (line: string) => bare.push(line), stderr: () => {},
+  }))).toBe(1);
+  expect(bare.join("\n")).toContain("--yes needs --expect-repos <n>");
+
+  const wrong: string[] = [];
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", yes: true, expectRepos: 98 }, reading, deps(wrong, {
+    stdout: (line: string) => wrong.push(line), stderr: () => {},
+  }))).toBe(1);
+  const text = wrong.join("\n");
+  expect(text).toContain("--expect-repos 98 does not match");
+  expect(text).toContain("rbox would act on 1 repo");
+  expect(text).toContain("Nothing changed.");
+});
+
+test("--under refuses the flags it cannot honour instead of ignoring them", async () => {
+  const { parseResolveArgs, GitUsageError } = await import("./git/git-dispatch.js");
+  expect(() => parseResolveArgs(["resolve", "keep-mine"], { under: ".", json: "true" })).toThrow(GitUsageError);
+  expect(() => parseResolveArgs(["resolve", "keep-mine"], { under: ".", confirm: "abc" })).toThrow(GitUsageError);
+  expect(() => parseResolveArgs(["resolve", "keep-mine"], { under: ".", "expect-repos": "many" })).toThrow(GitUsageError);
+  // --expect-repos is meaningless for a single repo, which is always one repo.
+  expect(() => parseResolveArgs(["resolve", "repo", "keep-mine"], { "expect-repos": "3" })).toThrow(GitUsageError);
+  expect(parseResolveArgs(["resolve", "keep-mine"], { under: ".", "expect-repos": "12" }))
+    .toEqual({ under: ".", verb: "keep-mine", expectRepos: 12 });
+});
+
+test("batch --force-discard-incoming refuses without promising a list it never prints", async () => {
+  const lines: string[] = [];
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", forceDiscardIncoming: true },
+    { rows: [], records: {} }, { stdout: (line: string) => lines.push(line) })).toBe(1);
+  const text = lines.join("\n");
+  expect(text).toContain("never applied to a whole folder");
+  // The old copy said "rbox lists the repos that need it" and then returned
+  // without listing anything.
+  expect(text).toContain("Run the same command WITHOUT it");
+});
+
+test("batch keep-mine never accepts a blanket --force-discard-incoming", async () => {
+  const lines: string[] = [];
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", forceDiscardIncoming: true },
+    { rows: [], records: {} }, { stdout: (line: string) => lines.push(line) })).toBe(1);
+  expect(lines.join("\n")).toContain("one repo at a time");
+});
+
+test("batch skips a repo whose state changed between the preview and the mutation", async () => {
+  const { incoming } = await fixture();
+  // Same shape the single-repo keep-mine preview test uses: a repo strictly
+  // AHEAD of the incoming tip, so the preview offers a token instead of the
+  // both-sides-changed refusal.
+  const incomingTip = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, incomingTip);
+  await git(receiver, "reset", "--hard", incomingTip);
+  await fs.rm(path.join(receiver, ".git", "ORIG_HEAD"), { force: true });
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
+  const lines: string[] = [];
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const { projectGitDeferralRepos } = await import("./status-view/git-projection.js");
+  const records = repoRecordsForState(await loadState(root, syncStreamId(cfg)));
+  const rows = projectGitDeferralRepos(Object.entries(records).flatMap(([repo, record]) =>
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])));
+  const code = await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine", yes: true, expectRepos: 1 }, { rows, records }, deps(lines, {
+    stdout: (line: string) => lines.push(line),
+    stderr: () => {},
+    // Runs immediately before keep-mine reloads every confirmed input, i.e. the
+    // mutation boundary. A new local commit moves the snapshot the preview froze.
+    beforeConfirmRecheck: async () => { await commit(receiver, "moved\n", "moved-after-preview"); },
+  }));
+  const text = lines.join("\n");
+  expect(text).toContain("Skipped 1 repo that changed while rbox was working — run the command again for that one:");
+  expect(text).toContain("Published 0 repos.");
+  expect(code).toBe(0);
+});
+
+test("batch selection reads the projection's own resolvable predicate and the --under prefix", async () => {
+  const { selectBatchRepos } = await import("./git/resolve-batch.js");
+  const { projectGitDeferralRepos } = await import("./status-view/git-projection.js");
+  const section = (await fixture()).incoming;
+  // Real rows from the real projection: `resolvable` must be the predicate the
+  // listing and doctor consult, not a boolean this test decided.
+  const entry = (repo: string, reason: "local-edits" | "conflict" | "worktree-ownership") => ({
+    repo,
+    deferral: {
+      lane: "apply" as const, reason, deferredSince: "2026-08-16T00:00:00.000Z",
+      reasonSince: "2026-08-16T00:00:00.000Z", lastSeen: "2026-08-16T00:00:00.000Z",
+    },
+    record: { repoGen: 1, sourceSeq: 1, pending: section } satisfies RepoRecord,
+  });
+  const rows = projectGitDeferralRepos([
+    entry("acme/checkout", "local-edits"),
+    entry("acme/admin", "conflict"),
+    entry("acme/held", "worktree-ownership"),
+    entry("other/app", "local-edits"),
+  ], Date.parse("2026-08-17T00:00:00.000Z"));
+  expect(rows.find((row) => row.repo === "acme/held")!.resolvable).toBe(false);
+  expect(selectBatchRepos(rows, { under: "acme" }).map((row) => row.repo).sort())
+    .toEqual(["acme/admin", "acme/checkout"]);
+  expect(selectBatchRepos(rows, { under: "." }).map((row) => row.repo).sort())
+    .toEqual(["acme/admin", "acme/checkout", "other/app"]);
+  expect(selectBatchRepos(rows, { under: ".", group: "local-edits" }).map((row) => row.repo).sort())
+    .toEqual(["acme/checkout", "other/app"]);
+});
+
+test("a dry-run over an unreadable repo says UNKNOWN, never 'nothing to save'", async () => {
+  const { renderResolveDryRun, backupDirFor } = await import("./git/resolve-dry-run.js");
+  const unreadable = renderResolveDryRun("repo", "take-theirs", undefined).join("\n");
+  // The inverted danger: a reader decides a destructive command is free exactly
+  // when rbox is least able to say so.
+  expect(unreadable).not.toContain("there is nothing of yours here to save");
+  expect(unreadable).toContain("rbox could not read this repo, so it cannot tell you");
+  expect(unreadable).toContain("the backup is still made");
+  // The pointer SURVIVES an unknown — that is when it matters most.
+  expect(unreadable).toContain(`Your backup would be saved at ${backupDirFor("repo")}/`);
+
+  const timedOut = renderResolveDryRun("repo", "take-theirs", {
+    repo: "repo", tier: "pinned", timedOut: true,
+    local: { files: [], total: 0, commits: 0, untracked: 0 },
+  }).join("\n");
+  expect(timedOut).toContain("ran out of time reading this repo");
+  expect(timedOut).toContain("the backup is still made");
+
+  // Only a SUCCESSFUL empty read drops the pointer.
+  const provenEmpty = renderResolveDryRun("repo", "take-theirs", {
+    repo: "repo", tier: "pinned",
+    local: { files: [], total: 0, commits: 0, untracked: 0 },
+  }).join("\n");
+  expect(provenEmpty).not.toContain("Your backup would be saved at");
+  expect(provenEmpty).toContain("(0 files, 0 commits)");
+});
+
+test("keep-mine dry-run reports an unknown overlap as unknown", async () => {
+  const { renderResolveDryRun } = await import("./git/resolve-dry-run.js");
+  const unknown = renderResolveDryRun("repo", "keep-mine", {
+    repo: "repo", tier: "pinned",
+    local: { files: [], total: 3, commits: 1, untracked: 0 },
+  }).join("\n");
+  expect(unknown).toContain("could not check whether the two computers changed the same files");
+});
+
+test("a repo whose preview refuses is COUNTED and NAMED, never silently dropped", async () => {
+  await fixture();
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  const lines: string[] = [];
+  // The bare fixture's keep-mine preview refuses (both computers changed the
+  // branch), which is exactly the case that used to vanish: absent from the
+  // table, absent from the count, absent from the report.
+  await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine" }, reading, deps(lines, {
+    stdout: (line: string) => lines.push(line), stderr: () => {},
+  }));
+  const text = lines.join("\n");
+  expect(text).toContain("rbox cannot keep this computer's work in 1 repo right now");
+  expect(text).toContain("rbox git resolve repo keep-mine");
+});
+
+test("a non-interactive run without --yes refuses and names the exact scriptable form", async () => {
+  const { incoming } = await fixture();
+  const incomingTip = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, incomingTip);
+  await git(receiver, "reset", "--hard", incomingTip);
+  await fs.rm(path.join(receiver, ".git", "ORIG_HEAD"), { force: true });
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const lines: string[] = [];
+  // The test process has no TTY, so this is the real headless path — it must
+  // refuse rather than hang on a prompt or proceed unasked.
+  expect(await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine" }, await batchReading(), deps(lines, {
+    stdout: (line: string) => lines.push(line), stderr: () => {},
+  }))).toBe(1);
+  const text = lines.join("\n");
+  expect(text).toContain("Add --yes --expect-repos 1 to run this without a terminal.");
+  expect(text).toContain("Nothing changed.");
+});
+
+test("the batch total never presents an unread repo's zero as a fact", async () => {
+  const { previewTableForTest } = await import("./git/resolve-batch.js");
+  const read = { repo: "a", tier: "pinned" as const, local: { files: [], total: 4, commits: 1, untracked: 0 }, overlap: 0 };
+  const bothRead = previewTableForTest([
+    { repo: "a", evidence: read, why: "you changed files here" },
+    { repo: "b", evidence: { ...read, repo: "b" }, why: "you changed files here" },
+  ]).join("\n");
+  expect(bothRead).toContain("Total: 2 repos · 8 files you changed here get published");
+  expect(bothRead).not.toContain("rbox could read");
+
+  const oneUnread = previewTableForTest([
+    { repo: "a", evidence: read, why: "you changed files here" },
+    { repo: "b", evidence: undefined, why: "you changed files here" },
+  ]).join("\n");
+  // The unread repo contributes 0; presenting that sum unqualified is the same
+  // defect as the dry run's "nothing to save".
+  expect(oneUnread).toContain("Total: 2 repos · 4 files you changed here get published across the 1 of them rbox could read");
+});

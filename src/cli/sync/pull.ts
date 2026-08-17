@@ -439,6 +439,7 @@ export async function applyPulledManifest(
       degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
       warningSink: deps.warningSink,
       mutationBoundary: deps.mutationBoundary,
+      ownedRefMutationBoundary: deps.ownedRefMutationBoundary,
       sourceGlobalSeq: sequence,
       scope: projection,
     })

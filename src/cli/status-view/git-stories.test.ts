@@ -453,3 +453,28 @@ test("the pointer to the listing is dropped when the listing follows", () => {
     .toEqual(["⚠ 2 repos are waiting on you — rbox paused git sync there so nothing you did gets overwritten."]);
   expect(gitPauseHeadline({ needsYou: 0, selfHealing: 2, listed: true })).toHaveLength(1);
 });
+
+test("the dry-run surface keeps the same jargon bar as the listing", async () => {
+  const { renderResolveDryRun } = await import("../git/resolve-dry-run.js");
+  const surface = [
+    ...renderResolveDryRun("acme/checkout", "take-theirs", undefined),
+    ...renderResolveDryRun("acme/checkout", "keep-mine", undefined),
+    ...renderResolveDryRun("acme/checkout", "show-me", undefined),
+  ].join("\n").toLowerCase();
+  for (const banned of BANNED_HUMAN_WORDS) {
+    // The ONE declared exception (design 273 S4, verbatim): the preview names
+    // the directory the reader will actually see on disk, and glosses it once —
+    // "rbox calls this the git quarantine". Hiding the name of a folder the user
+    // is being pointed at is worse than using the word.
+    if (banned === "quarantine") {
+      expect(surface).toContain("(rbox calls this the git quarantine)");
+      expect(surface.split("quarantine").length - 1).toBe(surface.split(".rbox/git-quarantine").length);
+      continue;
+    }
+    expect(surface).not.toContain(banned);
+  }
+  for (const reason of GIT_DEFERRAL_REASONS) {
+    if (reason === "conflict" || reason === "other" || reason === "artifact") continue;
+    expect(surface).not.toContain(reason);
+  }
+});

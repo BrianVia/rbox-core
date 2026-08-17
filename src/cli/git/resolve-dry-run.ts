@@ -1,0 +1,135 @@
+/**
+ * `--dry-run` — design 273 S4's honest preview.
+ *
+ * The complaint this answers is that "keep-mine / take-theirs meant nothing":
+ * both verbs are one-way doors whose blast radius a reader could only discover
+ * by walking through one. The preview says what would change, what would be
+ * saved first, and — the part every previous copy omitted — what the save does
+ * NOT cover.
+ *
+ * It performs ZERO writes. It never stages the incoming bundle and never runs
+ * the artifact preflight; it composes the same {@link GitRepoEvidence} reading
+ * the status surfaces use, so a preview cannot mutate the state it is
+ * describing. The backup PATH it prints is computed by the same expression
+ * take-theirs uses, so the pointer is real rather than illustrative.
+ *
+ * The copy is bounded by what `quarantineLocal` actually writes: syncable refs
+ * plus a `git stash create` of tracked modified and staged content, plus index
+ * and operation-state copies. Untracked and ignored files are not in it, and
+ * this is the only surface that says so.
+ */
+import path from "node:path";
+import { hashBytes } from "../../engine/hash.js";
+import type { GitRepoEvidence } from "../status-view/git-evidence-model.js";
+import type { GitResolveVerb } from "./resolve-contract.js";
+
+/** The exact directory `resolve-take-theirs.ts` passes to `quarantineLocal`.
+ * Workspace-relative for display: an absolute path in a preview is noise, and
+ * the user runs their next command from the workspace anyway. */
+export function backupDirFor(rel: string): string {
+  return path.posix.join(".rbox", "git-quarantine", hashBytes(Buffer.from(rel)).slice(0, 16));
+}
+
+const count = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * A SUCCESSFUL read proving there is nothing of yours here. Absent, partial and
+ * timed-out readings are not proof of emptiness — this is the one question where
+ * "rbox does not know" and "there is nothing" have opposite consequences.
+ */
+const provesNothingLocal = (evidence: GitRepoEvidence | undefined): boolean => {
+  const local = evidence?.local;
+  return local !== undefined && evidence?.timedOut !== true && local.total === 0 && local.commits === 0;
+};
+
+function savedLines(evidence: GitRepoEvidence | undefined): string[] {
+  const local = evidence?.local;
+  const lead = "  - first save a copy of your committed and work-in-progress changes to";
+  if (local === undefined || evidence?.timedOut === true) {
+    // Reporting an unknown as "nothing to save" inverts the danger: the reader
+    // decides a destructive command is free precisely when rbox is least able to
+    // say so. The backup is still made either way, and the copy says that.
+    return [
+      lead,
+      "    files git tracks (rbox could not read this repo, so it cannot tell you",
+      "    how much that is — the backup is still made) here:",
+    ];
+  }
+  return [lead, `    files git tracks (${count(local.total, "file")}, ${count(local.commits, "commit")}) here:`];
+}
+
+function notCopiedLines(evidence: GitRepoEvidence | undefined): string[] {
+  const untracked = evidence?.local?.untracked;
+  const newFiles = untracked !== undefined && untracked > 0
+    ? `${count(untracked, "brand-new file")} you never added to git, and ignored`
+    : "brand-new files you never added to git, and ignored";
+  return [
+    `  - NOT copy: ${newFiles}`,
+    "    files — those stay where they are on disk, untouched",
+  ];
+}
+
+function takeTheirsLines(rel: string, evidence: GitRepoEvidence | undefined): string[] {
+  const ahead = evidence?.incoming?.commitsAhead;
+  const newer = ahead === undefined ? "" : ` (${count(ahead, "commit")} newer)`;
+  const backup = backupDirFor(rel);
+  const lines = [
+    "Taking the other computer's version would:",
+    `  - switch this repo to their version${newer}`,
+    ...savedLines(evidence),
+    `      ${backup}/  (rbox calls this the git quarantine)`,
+    ...notCopiedLines(evidence),
+    "To actually do it, run the same command without --dry-run.",
+  ];
+  // The closing pointer is dropped ONLY when a successful read proved there is
+  // nothing of yours to back up. An unreadable repo keeps it — that is exactly
+  // the case where the reader most needs to know where to look afterwards.
+  // Deliberately a DIRECTORY, not a command: `rbox git restore-backup` ships
+  // with design 275, and printing a command that does not exist is worse than
+  // printing none.
+  if (!provesNothingLocal(evidence)) {
+    lines.push(`Your backup would be saved at ${backup}/ — keep it until you're sure.`);
+  }
+  return lines;
+}
+
+function keepMineLines(evidence: GitRepoEvidence | undefined): string[] {
+  const ahead = evidence?.incoming?.commitsAhead;
+  const waiting = ahead === undefined
+    ? "  - leave the other computer's waiting work unapplied here"
+    : `  - leave the other computer's waiting work unapplied here (${count(ahead, "commit")})`;
+  const overlap = evidence?.overlap;
+  const both = overlap === undefined
+    ? ["  - rbox could not check whether the two computers changed the same files here"]
+    : overlap > 0
+      ? [`  - ⚠ ${count(overlap, "file")} changed on BOTH computers; the other computer keeps its own copy either way`]
+      : [];
+  return [
+    "Keeping this computer's work would:",
+    "  - publish this computer's version, so your other computers follow it",
+    waiting,
+    ...both,
+    "The other computer's work is not deleted — it stays there, and rbox stops",
+    "trying to bring it here.",
+    "To actually do it, run the same command without --dry-run.",
+  ];
+}
+
+/**
+ * The preview for one repo and one verb. `show-me` is already read-only, so its
+ * preview states that plainly rather than inventing a hypothetical.
+ */
+export function renderResolveDryRun(
+  rel: string,
+  verb: GitResolveVerb,
+  evidence: GitRepoEvidence | undefined,
+): string[] {
+  const lines = ["This is a preview — nothing on this computer changed."];
+  if (evidence?.timedOut === true) {
+    lines.push("(rbox ran out of time reading this repo, so some numbers below are missing.)");
+  }
+  if (verb === "take-theirs") lines.push(...takeTheirsLines(rel, evidence));
+  else if (verb === "keep-mine") lines.push(...keepMineLines(evidence));
+  else lines.push("`show-me` only reads; it never changes anything here, with or without --dry-run.");
+  return lines;
+}

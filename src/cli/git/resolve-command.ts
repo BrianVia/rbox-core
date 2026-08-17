@@ -51,6 +51,8 @@ import {
 } from "./resolve-contract.js";
 import { buildSnapshot, incomingFor, strictOwnedBranches, type ResolveSnapshot } from "./resolve-evidence.js";
 import { emit } from "./resolve-presentation.js";
+import { renderResolveDryRun } from "./resolve-dry-run.js";
+import { gitDeferralEvidence } from "../status-view/git-evidence.js";
 import { runKeepMineResolve } from "./resolve-keep-mine.js";
 import { runTakeTheirsResolve } from "./resolve-take-theirs.js";
 
@@ -106,7 +108,7 @@ export async function gitResolveCmd(
   root: string,
   repoArg: string,
   verb: GitResolveVerb = "show-me",
-  options: { json?: boolean; confirm?: string; forceDiscardIncoming?: boolean } = {},
+  options: { json?: boolean; confirm?: string; forceDiscardIncoming?: boolean; dryRun?: boolean } = {},
   deps: GitResolveDeps = {},
 ): Promise<number> {
   const json = options.json === true;
@@ -210,6 +212,15 @@ export async function gitResolveCmd(
         }, json, deps, root);
         return 1;
       }
+    }
+    // Design 273 S4. Placed HERE deliberately: every refusal above is a read, and
+    // the first thing below is take-theirs' artifact preflight, which settles
+    // standing artifacts — a write. A preview that ran past this point would be
+    // changing the state it claims to be describing.
+    if (options.dryRun === true) {
+      const readings = await gitDeferralEvidence({ root, records: new Map([[rel, record]]) });
+      for (const line of renderResolveDryRun(rel, verb, readings.get(rel))) (deps.stdout ?? console.log)(line);
+      return 0;
     }
     let branchProtocol: FollowerBranchProtocol | undefined;
     if (verb === "take-theirs") {

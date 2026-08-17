@@ -22,14 +22,17 @@ import {
   type BriefStatusSnapshot,
 } from "./status-view/brief.js";
 import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
-import { gitPauseCounts, loudRows, renderGitPauseListing } from "./status-view/git-story-render.js";
+import { gitPauseCounts, loudRows } from "./status-view/git-story-render.js";
+import { gitRepoFallbackNote, renderGitPauseSection, renderGitSingleRepo } from "./status-render-git.js";
+import { statusStaleLockDetail } from "./status-maintenance.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
-import { statusStaleLockDetail } from "./status-maintenance.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
-import type { StatusMode, WorkspaceStatusProjection } from "./status-contract.js";
+import type { StatusMode, StatusRenderOptions, WorkspaceStatusProjection } from "./status-contract.js";
+
+export type { StatusRenderOptions } from "./status-contract.js";
 
 type HaltProjection = Extract<WorkspaceStatusProjection<StatusMode>, { kind: "reset-halt" }>;
 type DetailProjection<M extends StatusMode> = Extract<WorkspaceStatusProjection<M>, { kind: "detail" }>;
@@ -74,12 +77,6 @@ function verboseWorkspaceHeading(workspace: DetailProjection<StatusMode>["worksp
   return `${style.bold("workspace")} ${label} ${style.dim(`· rbox ${RBOX_VERSION}`)}`;
 }
 
-/** Presentation-only options: `--all` changes how many rows print, not which
- * repos are paused, so it never reaches the projection. */
-export interface StatusRenderOptions {
-  all?: boolean;
-}
-
 /** Selects the one surface a projection's mode admits. */
 export function renderWorkspaceStatusSurface<M extends StatusMode>(
   projection: WorkspaceStatusProjection<M>,
@@ -93,7 +90,13 @@ export function renderWorkspaceStatusSurface<M extends StatusMode>(
   if (projection.probes.mode === "verbose") {
     return { surface: "lines", lines: renderStatusVerbose(projection as DetailProjection<"verbose">), daemonRunning };
   }
-  return { surface: "lines", lines: renderStatusBrief(projection as DetailProjection<"brief" | "git">, options), daemonRunning };
+  const detail = projection as DetailProjection<"brief" | "git">;
+  const repo = projection.probes.mode === "git" ? options.repo : undefined;
+  const single = repo === undefined ? undefined : renderGitSingleRepo(detail, repo, options);
+  if (single) return { surface: "lines", lines: single, daemonRunning };
+  const lines = renderStatusBrief(detail, options);
+  if (repo !== undefined) lines.unshift(...gitRepoFallbackNote(repo));
+  return { surface: "lines", lines, daemonRunning };
 }
 
 export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender {
@@ -290,11 +293,7 @@ export function renderStatusBrief(
   // Design 273 S2: the grouped full-path listing replaces the per-repo
   // record/companion pair. That record grammar is untouched — it is the daemon
   // LOG line, whose redaction classifier is byte-frozen against it.
-  if (gitDetail) {
-    lines.push("");
-    lines.push(...renderGitPauseListing(git.projectedRepos, { now, all: options.all === true,
-      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane) }));
-  }
+  if (gitDetail) lines.push(...renderGitPauseSection(projection, workspace.root, options));
   return lines;
 }
 

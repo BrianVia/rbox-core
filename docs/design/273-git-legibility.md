@@ -170,9 +170,24 @@ Verified properties:
   sweep subsumes hold-clear/resolve/incomingKey-change event pruning and
   every crash/reset orphan path (crash between update-ref and record
   write, state reset, repo removal).
-- Disk bound: measured on the real FM 103-repo state before PR-C merges;
-  recorded as a named trade (retained pack objects for the hold's
-  lifetime).
+- **Disk bound — MEASURED (PR-C), gate closed.** `writePendingPins` writes
+  REFS ONLY; it never writes an object, because the pack objects were already
+  resident from the follow that imported them. The incremental cost of P3 at
+  pin time is therefore exactly the ref bytes: **41 B per pin ref**. Over an
+  FM-scale state (52 of 103 repos carrying `pending`): **2 KB / 11 KB / 43 KB
+  apparent** at 1 / 5 / 20 pinned refs per repo, or **208 KiB / 1.0 MiB /
+  4.1 MiB allocated** once 4 KiB directory blocks are counted. The only other
+  cost is DEFERRED reclamation: objects a pin keeps reachable are not released
+  by `gc` for the hold's lifetime, where unpinned they would have gone at
+  `gc.pruneExpire` (default 2 weeks). That deferral is the named trade.
+- **Sweep steady-state cost — MEASURED (PR-C).** `pinnedKeys` reads BOTH ref
+  storage forms (loose `readdir` + `packed-refs`) unconditionally. A
+  loose-directory gate was implemented and REJECTED on evidence:
+  `git pack-refs --all` prunes the scoped directories, so the gate would have
+  hidden every packed pin from its own collector. The read it would have saved
+  is **11 µs per repo, ~1 ms per pull across 103 repos** against a ≤10s
+  propagation target. Zero git spawns in the steady state; the only spawns are
+  the `for-each-ref` + `update-ref` pair when orphans actually exist.
 
 With the objects durably local, evidence() reads commit subjects,
 ahead-count, and the incoming file list straight from git — always fresh,
@@ -195,6 +210,19 @@ Degrade ladder (per repo, field-by-field, never blocking):
    already network-stages on demand (resolve-command.ts:694-699).
 
 FM's current 103 are tier 2 until their next incoming update.
+
+**Evidence read cost, and its unbounded tail (PR-C).** Each repo carries a 3s
+wall-clock budget and degrades field-by-field when it expires. There is
+deliberately **no aggregate bound**: 103 repos each spending their full budget
+is 5 minutes of `status --git` in the pathological case. Measured on a
+synthetic FM-shaped fixture (103 repos, 40 tracked files each, 12 locally
+modified, 52 pinned to tier 1): **1.34 s total, ~13 ms per repo**, three
+consecutive samples within 11 ms of each other, with all 52 pinned repos
+yielding an exact overlap. The tail is NAMED, not mechanized — an aggregate
+deadline would have to decide which repos get dropped, and a listing that
+silently omits repos is the defect this design exists to close. If the tail is
+ever observed in the field, the fix is an aggregate budget with an explicit
+"N repos not read" line, not a quiet truncation.
 
 ### P4. Sender naming — CUT from 273 (own follow-up design)
 
@@ -467,7 +495,27 @@ exist.)
   Confirmation scales with blast radius: interactive batch take-theirs
   requires typing the repo COUNT; scriptable twin is
   `--yes --expect-repos <n>` (a script written against 3 repos cannot
-  silently act on 98). Batch keep-mine NEVER accepts a blanket
+  silently act on 98). PR-C makes `--expect-repos` REQUIRED beside `--yes`:
+  `--yes` alone would have been the very reflex the count exists to prevent.
+
+  **The frozen-count trade, in full (PR-C).** `--expect-repos` and the typed
+  count are both compared against the FROZEN count — the repos batch will
+  actually act on. That count can be SMALLER than the dry run's list in two
+  distinct ways, and both are surfaced rather than absorbed:
+  1. **needs-force split** — a repo whose publish would discard incoming work
+     is removed from the batch and listed for a separate, explicitly-scoped
+     invocation (batch never takes a blanket `--force-discard-incoming`);
+  2. **preview refusals** — a repo whose keep-mine preview refuses (busy,
+     mid-operation, a snapshot that moved) is removed too. These are counted
+     and NAMED with a per-repo command; a repo silently missing from a batch
+     report is indistinguishable from one rbox handled.
+
+  The dry run cannot know either split without staging every repo, which is
+  exactly what a preview must not do, so it previews the SELECTED population,
+  says the acted-on number can be smaller, and declines to print a
+  `--expect-repos` value it cannot yet compute. The gap between the previewed
+  and acted-on populations is the accepted price of a preview that performs
+  zero writes. Batch keep-mine NEVER accepts a blanket
   `--force-discard-incoming`: repos needing force are listed and require
   separate, explicitly-scoped invocations, with forewarning copy in the
   group header ("in some repos the other computer's newer work can't be
@@ -488,6 +536,13 @@ Total: 98 repos · 412 files you changed here get saved to backups
 (unchanged machine contract — stated explicitly to prevent consumer
 drift), ages, actionability, evidence when computed. Ambient JSON gains
 the split counts. `rbox git deferrals --json` schema stays; additive only.
+
+**Exception (PR-C): `--json` is a USAGE ERROR with `--under`.** Batch composes
+one report from N per-repo outcomes; there is no per-repo document to emit and
+no batch schema was designed. Refusing is the honest answer — silently ignoring
+the flag is how a script believes it asked for machine output and got prose.
+Machine output for batch is a follow-up, and it should be designed as its own
+shape rather than back-formed from the single-repo document.
 
 ## Requirement ledger (new mechanisms, each with owner + deletion condition)
 

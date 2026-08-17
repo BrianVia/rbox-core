@@ -389,6 +389,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     deferrals: gitDeferrals,
     projectedRepos,
     localRepoProjections: projectGitDeferralRepos(localGitEntries, now),
+    records: statusRecords,
     deferredRepos: projectedRepos.length,
     bytesChangedDeferrals: projectedRepos.filter((repo) => repo.bytesChanged).length,
   };
