@@ -16,9 +16,10 @@ Every surface that today says "another computer" / "the other computer" /
 Degrade chain, in order: server label → today's copy ("another
 computer"). The raw device id NEVER occupies the subject/possessive slot
 ("take dev_a1b2c3d4's version" is a second meaningless token, worse than
-the generic copy for the non-technical users this serves); it may appear
-only as a parenthetical on the evidence header — "Waiting from another
-computer (dev_a1b2c3d4)" — for diagnostics. There is NO revoked rung: the
+the generic copy for the non-technical users this serves); it does not
+appear on human surfaces at all — `--json` already carries `deviceId` for
+diagnostics (the parenthetical variant was cut on delta-confirm as the
+last fragment of the deleted rung). There is NO revoked rung: the
 device-list endpoint filters revoked rows out (apps/api/src/auth/
 devices.ts:19), so "revoked" is indistinguishable from "enrolled since
 last refresh" — rendering a status claim off absence violates the
@@ -146,7 +147,7 @@ resolve-batch.ts (:110,:158,:159,:164,:170,:183 — the multi-repo surface
 most exposed to mixed senders; the mixed/unknown-sender rule below binds
 it explicitly).
 
-With a name (label or id) the copy becomes:
+With a name (label only) the copy becomes:
 - evidence header: `Waiting from via-desktop (branch main, 4 commits newer than yours):`
 - overlap: `3 also changed on via-desktop ⚠`
 - listing action: `or take via-desktop's version: …`
@@ -175,7 +176,7 @@ With a name (label or id) the copy becomes:
   recon: old validators accept unknown keys).
 - renderGitDeferralLine log grammar + redaction classifier byte-stable
   (the daemon LOG line does not gain names).
-- Resolve sanitization contract: labels/ids bounded + sanitized at render;
+- Resolve sanitization contract: labels bounded + sanitized at render;
   the projection is not a sanitized boundary.
 - Story vocabulary discipline (273): noun stays "computer"; names replace
   "another computer"/"the other computer" only, never the story grammar.
@@ -196,15 +197,14 @@ With a name (label or id) the copy becomes:
   name on C (fixture-level; the pass-through reference test).
 - Pending-substitution: normalizeOutgoingGitSections keeps the pending
   author's stamp (site test).
-- Hostile wire: over-long/miscased/ANSI-bearing deviceId rejected by
-  validateGitSection; hostile LABEL from the server renders sanitized and
-  bounded.
+- Hostile wire: over-long/miscased/ANSI-bearing deviceId is treated as
+  ABSENT and the section still validates; the surface degrades to today's
+  copy. Hostile LABEL from the server renders sanitized and bounded.
 - Cache: malformed file → undefined (tolerant parse); TTL respected;
   missing cache/unknown id → generic copy (no id rung, no revoked rung).
 - Degrade: unstamped section (every pre-274 pause) renders today's copy
   verbatim — zero regression on existing fleet state (replay the 273
   field fixtures unchanged).
-- One-time publish churn measured on one host and named in the PR body.
 - Surfaces: banned-word suite still green; singular/plural with names;
   mixed-sender group keeps generic copy (test).
 - Steady-skip + write-elision one-time misses measured on one host
