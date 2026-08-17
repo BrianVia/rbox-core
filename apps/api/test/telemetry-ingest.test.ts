@@ -338,7 +338,9 @@ describe("POST /v1/fleet/sync-state", () => {
       { ...base, oldestDeferralAgeMs: null },
       { ...base, deferralReasons: [] },
       { ...base, deferralReasons: ["not-a-reason"] },
-      { ...base, deferralReasons: Array.from({ length: 19 }, () => "local-edits") },
+      // Over the cap, which IS the vocabulary size — derived, so growing the
+      // vocabulary cannot silently turn this case valid (it did, once).
+      { ...base, deferralReasons: Array.from({ length: SERVER_GIT_DEFERRAL_REASONS.length + 1 }, () => "local-edits") },
     ];
     const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: invalid }) }), testEnv(), devicePrincipal(a));
     expect(await response.json()).toEqual({ accepted: 0, dropped: invalid.length });

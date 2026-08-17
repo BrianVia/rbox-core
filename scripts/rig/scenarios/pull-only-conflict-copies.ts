@@ -8,8 +8,11 @@
  *
  * Two things are asserted that no other scenario can reach:
  *
- * 1. The copy B minted inside a synced subtree does NOT wedge the repo — B keeps
- *    pulling A's later writes instead of parking on "working tree differs".
+ * 1. The copy B minted inside a synced subtree does not park that subtree — B keeps
+ *    pulling A's later writes. NOTE: `provisionPair` never runs `git init`, so this
+ *    is the PLAIN-FILE lane only. §7's git-plane arm ("minting inside a git repo
+ *    subtree does not wedge the repo") has no rig coverage yet — see
+ *    `docs/design/notes/272/IMPL-DEVIATIONS.md`.
  * 2. §4's non-negotiable: with a pull-only daemon LIVE and never having pushed,
  *    `rbox status --json` still reports `conflictCopies`. `strandedIgnored` rides the
  *    push lane and is absent on this device; the new count must not have inherited
@@ -33,8 +36,16 @@ const STATUS_POLL_MS = 2_000;
 const CLASH = `${GUEST.workDir}/pkg/clash.txt`;
 const LATER = `${GUEST.workDir}/pkg/later.txt`;
 
+/** `conflictName`'s grammar (`src/engine/conflict-name.ts`): the 14-digit stamp and
+ *  the literal `.conflict` are the parts a shell glob can hold it to, so the rig
+ *  counts the same objects `countConflictCopies` does rather than anything merely
+ *  containing the word. */
+const CONFLICT_GLOB = "*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].conflict*";
+
 interface BriefStatusJson {
   conflictCopies?: number;
+  /** The push-lane count. MUST stay absent here — see the §4 step below. */
+  strandedIgnored?: number;
   /** Emitted only for a live-daemon snapshot — its presence is the proof the
    *  count came from the daemon rather than this invocation's own scan. */
   local?: { source?: string };
@@ -80,7 +91,7 @@ export const pullOnlyConflictCopies: Scenario = {
       await rec.step("[B] pull-only daemon reconciles and keeps B's version aside", async () => {
         const out = await waitForPath(ctx.b, CLASH, (c) => c === "published-by-A", PROPAGATE_TIMEOUT_MS);
         rec.assert("A's version won at the live path", out.ok, out.ok ? `${out.elapsedMs}ms` : `timeout after ${out.elapsedMs}ms`);
-        const find = `find '${GUEST.workDir}/pkg' -name '*.conflict*' -print 2>/dev/null | LC_ALL=C sort`;
+        const find = `find '${GUEST.workDir}/pkg' -name '${CONFLICT_GLOB}' -print 2>/dev/null | LC_ALL=C sort`;
         const minted = (await ctx.b.exec(["sh", "-c", find], { allowFail: true })).stdout.split("\n").map((l) => l.trim()).filter(Boolean);
         rec.assert("B kept its own version as a conflict copy", minted.length >= 1, minted.join(", ") || "none found");
       });
@@ -96,6 +107,10 @@ export const pullOnlyConflictCopies: Scenario = {
         });
         rec.assert("status --json reports the minted copies", out.ok, JSON.stringify(out.value).slice(0, 200));
         rec.assert("the count came from the live daemon, not a local scan", out.value.local?.source === "daemon", String(out.value.local?.source));
+        // The whole point of the pull-only arm: strandedIgnored rides the push lane
+        // and must be ABSENT on a never-pushed device. If it shows up, the two counts
+        // share a dependency and this scenario proves nothing about conflictCopies.
+        rec.assert("strandedIgnored is absent on a never-pushed device", out.value.strandedIgnored === undefined, String(out.value.strandedIgnored));
       });
 
       // The copy must not park the subtree: A's next write still lands on B.

@@ -56,7 +56,8 @@ export {
 export { scanManifest, createScanStats, applyWatchEvents, compareManifestPaths, statsStableAcrossHash, isPresentButUnreadableError, type ScanStats, type ScanTimingStats, type ScanResidualBuckets, type ScanAttemptStats, type DirProbeSample, type DirProbeSink, type WatchEvent, type WatchEventKind } from "./manifest.js";
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
-export { reconcile, conflictName, countConflictCopies, type Action } from "./reconcile.js";
+export { reconcile, type Action } from "./reconcile.js";
+export { conflictName, countConflictCopies } from "./conflict-name.js";
 export {
   conservativeReceiverEquivalentPath,
   oracleFromPull,

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertWithinRoot, claimUnclobberedName, errCode, isAbsent } from "./fsutil.js";
-import { conflictName } from "./reconcile.js";
+import { conflictName } from "./conflict-name.js";
 
 /**
  * The local trash tier (design 50): the pull writer never destroys bytes it

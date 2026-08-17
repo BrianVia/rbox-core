@@ -1,9 +1,7 @@
-import path from "node:path";
+import { conflictName } from "./conflict-name.js";
 import { sameContent } from "./diff.js";
 import { indexByPath } from "./diff.js";
 import type { FileEntry, Manifest } from "./types.js";
-
-export { countConflictCopies } from "./conflict-name.js";
 
 /**
  * A single change to apply to the local working tree to bring it in line with
@@ -76,12 +74,4 @@ export function reconcile(
     // (!r && l): remote deleted, local modified → keep local, no local action.
   }
   return actions;
-}
-
-/** `dir/index.ts` → `dir/index.<device>.<YYYYMMDDHHMMSS>.conflict.ts` */
-export function conflictName(p: string, device: string, nowIso: string): string {
-  const ext = path.posix.extname(p);
-  const stem = p.slice(0, p.length - ext.length);
-  const ts = nowIso.replace(/[-:T]/g, "").slice(0, 14);
-  return `${stem}.${device}.${ts}.conflict${ext}`;
 }

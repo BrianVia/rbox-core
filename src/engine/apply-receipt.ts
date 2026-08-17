@@ -608,7 +608,7 @@ class ManifestOracle implements AppliedManifestOracle {
       } else if (scope.kind === "dir") {
         await walk(rel);
       } else {
-        return { kind: "indeterminate", why: "unsupported entry type in repo subtree" };
+        throw new ScanFailed("unsupported-entry");
       }
       return { kind: "ok", entries, tokens };
     } catch (error) {
