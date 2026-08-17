@@ -107,8 +107,10 @@ anyway because :957 samples lifecycle before the pump at :958.
 
 1. **Route, don't retune — for the DAEMON; status renders w1 as
    recovering WITHOUT falling through:** the adapter at
-   reset-journal.ts:197-215 stops flattening `w1` into `status:"halt"`
-   for recovery-capable callers; `resetOperationBoundary` proceeds into
+   reset-journal.ts:197-215 surfaces `w1` as its OWN TYPED VARIANT —
+   neither halt nor journal-recoverable (there is no journal); each
+   Adapter decides: daemon recovers, status early-returns as recovering,
+   doctor reports. One type, ZERO caller modes (no recoveryCapable flag); `resetOperationBoundary` proceeds into
    the existing loadState-driven recovery (verified reachable:
    inspectStanding w1 → settleStandingResetUnderHeldFence →
    recoverOrdinaryWalCrash under the canonical state lock,
@@ -169,11 +171,13 @@ anyway because :957 samples lifecycle before the pump at :958.
 
 - Explicit-command-only state conversion (`rbox migrate`); the rig's
   json-upgrade-path MUST stays green — 276 converts nothing.
-- Lossy regeneration keeps its consent gate verbatim (TTY or --yes).
+- `damaged`-catalog regeneration keeps its consent gate verbatim (TTY
+  or --yes).
 - W2/W3/J0 halts keep fail-closed semantics, the hour retry, the log
   gate, and `rbox doctor reset-journal --quarantine` flows.
 - health-halt.json write/clear sites unchanged (daemon.ts:1256/:1315);
-  only the status read's authority changes.
+  status no longer reads the file AT ALL (F2.4); its sole remaining
+  reader is resetOperationBoundary's persisted trigger at daemon.ts:1283.
 - The at-rest reads discipline (reads-leave-the-store-at-rest.test.ts)
   unchanged — the own-handle consult is a classification input, not a
   license for readers to leave sidecars.
@@ -185,10 +189,13 @@ anyway because :957 samples lifecycle before the pump at :958.
 - #688 red-first: a fixture 1.x-shaped home (bindings present, no
   catalog) through `restartDaemonsAfterUpgrade` — today's path asserts
   the misdiagnosed message + stopped daemon; the fix asserts (a) daemon
-  left running on refusal, (b) exact remedy printed, (c) lossless case
-  auto-regenerates and restarts cleanly, (d) lossy case refuses with the
-  loss report and keeps the old daemon up. Upgrade-restart admission
-  test added to upgrade-daemons.test.ts (recon: no such test exists).
+  left running on refusal, (b) exact remedy printed, (c) absent-catalog +
+  zero-skipped case auto-initializes and restarts cleanly, (d) a case
+  with skipped/evidence-unavailable bindings refuses, leaves the daemon
+  running, and prints the `rbox config regenerate` remedy, (e) a
+  `damaged` catalog still refuses and keeps its consent gate.
+  Upgrade-restart admission test added to upgrade-daemons.test.ts
+  (recon: no such test exists).
 - #765 red-first: (a) foreign-sidecar fixture — today halts an hour, fix
   recovers within one boundary pass; WITH the reader still attached, the
   assertion is "refused on short bounded backoff without a one-hour
