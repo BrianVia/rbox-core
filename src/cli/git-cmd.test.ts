@@ -11,7 +11,7 @@ import { checkoutJournalDir } from "../cli/sync-git/journal.js";
 import { repoCtx } from "../cli/sync-git/git-state.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd } from "./git/deferrals-command.js";
-import { gitResolveCmd } from "./git/resolve-command.js";
+import { gitResolveCmd, ManualBaseProofIncompleteError, ManualLineageProofUnavailableError } from "./git/resolve-command.js";
 import { safeResolveText, type GitResolveShow } from "./git/resolve-presentation.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { settleCommittedBranchArtifacts } from "./sync-git/received-git-transition-commit.js";
@@ -380,7 +380,9 @@ test("show-me JSON is exhaustive while only human local-only presentation is cap
   }))).toBe(0);
   const hiddenOid = subjectOids.get(hiddenSubject!)!;
   expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${hiddenOid}`)).toBe(hiddenOid);
-  expect(takeErr).toEqual([]);
+  // Design 271 §2.7.6: take-theirs reports its steps on stderr; stdout stays
+  // byte-clean for --json.
+  expect(takeErr.filter((line) => !line.startsWith("take-theirs: "))).toEqual([]);
 });
 
 test("show-me heartbeat timers are cleared in finally", async () => {
@@ -1353,4 +1355,43 @@ test("resolve maps indeterminate proof, journal recovery, and degraded mutex to 
   expect(degraded.at(-1)).not.toContain("private identity failure");
   expect(confirmedPushCalls).toBe(0);
   expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending).toEqual(pendingBefore);
+});
+
+/**
+ * Design 271 §2.7: the two refusals inside `makeIntended` cannot emit and
+ * return, so they travel as error classes the outer catch classifies into their
+ * own code and curated, path-free message — never the generic catch-all.
+ */
+test("the two makeIntended error classes classify into their own resolve codes", async () => {
+  await fixture();
+  const cases = [
+    { error: new ManualLineageProofUnavailableError(), code: "manual-lineage-proof" },
+    { error: new ManualBaseProofIncompleteError(), code: "manual-base-proof" },
+  ] as const;
+  for (const { error, code } of cases) {
+    const lines: string[] = [];
+    expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true }, deps(lines, {
+      build: async () => { throw error; },
+    }))).toBe(1);
+    const output = lines.at(-1)!;
+    const parsed = JSON.parse(output);
+    expect(parsed.code).toBe(code);
+    expect(parsed.status).toBe("refused");
+    expect(parsed.message).not.toContain("/");
+    expect(output).not.toMatch(/[\r\n\u001b]/);
+  }
+});
+
+test("take-theirs and keep-mine report their steps on stderr, never on stdout", async () => {
+  await fixture();
+  const out: string[] = [];
+  const err: string[] = [];
+  await gitResolveCmd(root, receiver, "take-theirs", { json: true }, deps([], {
+    stdout: (line: string) => out.push(line),
+    stderr: (line: string) => err.push(line),
+  }));
+  expect(err.some((line) => line.startsWith("take-theirs: "))).toBe(true);
+  for (const line of out) expect(line.startsWith("take-theirs: ")).toBe(false);
+  // Every stdout line stays parseable JSON under --json.
+  for (const line of out) expect(() => JSON.parse(line)).not.toThrow();
 });

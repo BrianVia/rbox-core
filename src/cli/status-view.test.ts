@@ -642,3 +642,28 @@ test("healthDetailLines surfaces the stranded line only when non-zero", () => {
   expect(healthDetailLines({ ...snapshot, strandedIgnored: 4 }).join("\n"))
     .toContain("4 files match your ignore rules but are still synced");
 });
+
+/** Design 271 §2.7.5: the curated detail rides the display lane into the row
+ * and the companion, and never touches `displayReason`, which is a CODE. */
+test("a curated deferral detail projects and renders without touching displayReason", () => {
+  const detail = "the standing present-artifact could not be settled after its BASE was committed";
+  const projected = projectGitDeferralRepos([
+    { repo: "repo", deferral: { lane: "apply", reason: "artifact", deferredSince: iso(3600), reasonSince: iso(120), detail } },
+  ], NOW);
+
+  expect(projected[0]?.detail).toBe(detail);
+  expect(projected[0]?.displayReason).toBe("artifact");
+  expect(renderGitDeferralCompanion({
+    reason: projected[0]!.displayReason,
+    canResolve: false,
+    canKeepMine: false,
+    detail: projected[0]!.detail,
+  })).toContain(detail);
+  // A lane with no curated text renders exactly as before.
+  const bare = projectGitDeferralRepos([
+    { repo: "repo", deferral: { lane: "apply", reason: "artifact", deferredSince: iso(3600), reasonSince: iso(120) } },
+  ], NOW);
+  expect(bare[0]?.detail).toBeUndefined();
+  expect(renderGitDeferralCompanion({ reason: "artifact", canResolve: false, canKeepMine: false }))
+    .not.toContain(detail);
+});

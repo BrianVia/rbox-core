@@ -47,3 +47,26 @@ test("gitDivergenceStatus projects durable lanes read-only even when git sync is
     ],
   });
 });
+
+/** Design 271 §2.7.5: `detail` is curated once at the deferral-writing site and
+ * must survive every projection surface between state and the rendered row. */
+test("a curated deferral detail reaches the divergence projection verbatim", async () => {
+  const since = "2026-07-01T00:00:00.000Z";
+  const detail = "the standing present-artifact could not be settled after its BASE was committed";
+  const state: SyncState = {
+    stream: "s",
+    lastSyncedSequence: 1,
+    lastSyncedManifest: { generatedAt: since, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 2,
+        sourceSeq: 1,
+        deferrals: {
+          apply: { lane: "apply", reason: "artifact", deferredSince: since, reasonSince: since, lastSeen: since, detail },
+        },
+      },
+    },
+  };
+  const status = await gitDivergenceStatus("/unused", { syncGit: false } as WorkspaceConfig, state);
+  expect(status.deferrals).toEqual([{ relPath: "repo", lane: "apply", reason: "artifact", deferredSince: since, detail }]);
+});

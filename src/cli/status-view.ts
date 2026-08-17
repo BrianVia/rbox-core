@@ -336,7 +336,7 @@ function gitDeferralReasonPrecedence(reason: string): number {
 export interface GitDeferralDisplayEntry {
   repo: string;
   deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">
-    & Partial<Pick<GitDeferral, "reasonSince">>;
+    & Partial<Pick<GitDeferral, "reasonSince" | "detail">>;
   record?: RepoRecord;
 }
 
@@ -358,6 +358,8 @@ export interface GitDeferralRepoProjection {
   alsoDeferred?: string;
   bytesChanged: boolean;
   checkout?: GitDeferral["checkout"];
+  /** The displayed lane's curated detail, verbatim. Never a composed string. */
+  detail?: string;
 }
 
 const parsedDeferralTime = (iso: string, now: number): number => {
@@ -411,7 +413,7 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
           ? "config"
           : canResolve ? "apply-resolvable" : "apply-unavailable";
     const additional = ordered.slice(1).map((lane) => `${lane.lane} — ${gitDeferralReasonPresentation(lane.reason).label}`);
-    projected.push({
+    const row: GitDeferralRepoProjection = {
       repo,
       oldestDeferredSince: oldest.deferredSince,
       displayReason: display.reason,
@@ -426,7 +428,9 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       ...(additional.length ? { alsoDeferred: `Also deferred: ${additional.join("; ")}.` } : {}),
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
       ...(checkout === undefined ? {} : { checkout }),
-    });
+    };
+    if (display.detail !== undefined) row.detail = display.detail;
+    projected.push(row);
   }
   return projected.sort((a, b) =>
     parsedDeferralTime(a.oldestDeferredSince, now) - parsedDeferralTime(b.oldestDeferredSince, now)
@@ -465,9 +469,14 @@ export function renderGitDeferralCompanion(input: {
   canResolve: boolean;
   canKeepMine: boolean;
   staleLockDetail?: { lockCount: number; oldestAgeMs: number; samplePath: string };
+  /** Curated at the deferral-writing site; rendered verbatim, never composed. */
+  detail?: string;
 }): string {
   const presentation = gitDeferralReasonPresentation(input.reason);
-  const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).`;
+  // Curated at one author and path-free by contract, so it is sanitized but not
+  // tail-truncated the way an arbitrary path or branch label is.
+  const curated = input.detail ? ` ${sanitizeTerminalText(input.detail)}` : "";
+  const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).${curated}`;
   if (input.reason === "stale-unattributed" && input.staleLockDetail) {
     const detail = input.staleLockDetail;
     const count = `${detail.lockCount} stable lock${detail.lockCount === 1 ? "" : "s"}`;

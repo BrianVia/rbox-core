@@ -177,6 +177,9 @@ export interface GitDeferral {
   bytesChanged?: boolean;
   /** D4 r2 F5: this checkpoint was classified once for subjectKey. */
   reproof?: boolean;
+  /** Curated by the deferral-WRITING site only; never composed or extended by a
+   * codec, projection, or renderer, and never folded into `reason`. */
+  detail?: string;
 }
 
 export const DEFERRAL_LANES = ["apply", "capture", "config"] as const satisfies readonly GitDeferral["lane"][];

@@ -42,6 +42,7 @@ export interface GitDivergenceStatus {
     reason: GitDeferral["reason"];
     deferredSince: string;
     bytesChanged?: boolean;
+    detail?: string;
   }>;
   /** Repos whose config snapshot could not be stabilized/read. These count as
    * divergent and render as the explicit indeterminate `config: checking` state. */
@@ -100,6 +101,7 @@ export async function gitDivergenceStatus(
         deferredSince: deferral.deferredSince,
       };
       if (deferral.bytesChanged !== undefined) projected.bytesChanged = deferral.bytesChanged;
+      if (deferral.detail !== undefined) projected.detail = deferral.detail;
       deferrals.push(projected);
     }
   }

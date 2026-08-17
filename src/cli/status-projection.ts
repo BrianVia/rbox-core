@@ -336,6 +336,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
           deferredSince: d.deferredSince,
         };
         if (d.bytesChanged !== undefined) projected.bytesChanged = d.bytesChanged;
+        if (d.detail !== undefined) projected.detail = d.detail;
         return projected;
       }),
       conflictSnapshots,

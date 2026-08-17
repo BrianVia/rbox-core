@@ -163,6 +163,8 @@ export function nextDeferral(
   now: string,
   subjectKey?: string,
   checkout?: GitDeferral["checkout"],
+  /** Curated at this call site or omitted; never carried over from `current`. */
+  detail?: string,
 ): GitDeferral {
   return {
     lane,
@@ -174,6 +176,7 @@ export function nextDeferral(
     ...(checkout === undefined ? {} : { checkout }),
     ...(current?.bytesChanged === undefined ? {} : { bytesChanged: current.bytesChanged }),
     ...(current?.reproof === undefined || current.subjectKey !== subjectKey ? {} : { reproof: current.reproof }),
+    ...(detail === undefined ? {} : { detail }),
   };
 }
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
