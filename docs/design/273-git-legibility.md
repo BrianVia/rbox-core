@@ -1,11 +1,14 @@
 # 273 — Git-lane legibility: one evidence model, plain-English surfaces
 
-Status: DRAFT r2 (r1 reviewed by two adversarial lanes; both REVISE verdicts
-folded — r2 deletes all three r1 persisted fields in favor of existing
-primitives)
-Issues: closes #764; carries #762 (backup pointer + restore); the
-resolve-command.ts ratchet split is a hard prerequisite PR. Feeds #659 field
-close.
+Status: r3 (r1: two adversarial lanes, REVISE ×2, folded; r2: final serial
+review, REVISE with a bounded delta, folded here). Scope cuts in r3: P4
+(sender deviceId + label cache) split to its own follow-up design;
+`rbox git restore-backup` split to its own small design, with 273's batch
+take-theirs DEPENDING on it landing first.
+Issues: closes #764; #762's dry-run backup pointer lands here, its restore
+command lands in the split design. The resolve-command.ts AND
+status-view.ts ratchet decompositions are a hard prerequisite PR. Feeds
+#659 field close.
 Origin: founder session 2026-08-17 (docs/papercuts.md git-lane entry) plus
 Max's report that "keep-mine / take-theirs meant nothing".
 
@@ -75,35 +78,77 @@ The Module exposes exactly two operations:
 ### P2. Ownership holds keep their deferral record (deletes `heldSince`)
 
 The invisible-51 defect exists because "don't nag about ownership holds"
-was implemented by DELETING the record (deferral `{kind:"clear"}` at
-follow-repo-transition.ts:349-357 and the apply.ts mirror, plus the
-second hold-writer clean-materialization.ts:255-268). r2: keep the
-deferral (reason `worktree-ownership`, existing enum member), and add an
-`ownership-hold` remediation class that NO attention surface escalates —
-display policy where display policy belongs (`remediationClass` is the
-existing seam, status-view.ts:344). `GitDeferral.deferredSince` is already
-carried across rewrites, so ages are free. Zero new persisted fields.
+was implemented by DELETING the record. THREE sites participate, all must
+change together (r2 review found the third, which runs every pull):
+- follow-repo-transition.ts:349-357 — `deferral: {kind:"clear"}` on
+  ownership-only holds → becomes `{kind:"set", reason:"worktree-ownership"}`;
+- apply.ts:941-945 mirror (`delete effectiveDeferrals.apply`) → same;
+- **held-decision.ts:157-167 `retain()`** — the steady-state held-skip
+  path calls `env.deferrals.clearApply(relPath)` for ownership-only prior
+  attempts ON EVERY SKIPPING PULL. It must `restandApply` instead, or the
+  record restored at the follow site is re-deleted one pull later AND the
+  clear/set cycle resets `deferredSince` (shared.ts:171), producing
+  permanently-quiet repos under P5.
+  (Correction from r1: clean-materialization.ts:255-268 SETS a
+  worktree-ownership deferral — it is a hold site, not a clear site; no
+  change there.)
 
-Risks to differentially test: `hasGitResolutionIncoming`
-(status-view.ts:370-372), deferral-hygiene machinery, and the daemon
-`attentionReason` (daemon/ambient-status.ts:211-221 — verified: does not
-key on deferral count, so no new nagging). The
-`RBOX_GIT_OWNERSHIP_NO_ESCALATE` flag's meaning shifts from "clear the
-record" to "class the record"; flag owner/deletion condition unchanged.
+Display policy where it belongs: add an `ownership-hold` remediation
+class (`remediationClass` is the existing seam, status-view.ts:344).
+Ordering rule for EVERY command-emitting or severity-assigning surface
+(doctor, status, prompt sidecar, JSON): `remediationClass` is consulted
+BEFORE `canResolve`/`canKeepMine` — ownership holds have
+`record.pending`, so `canKeepMine` is true (status-view.ts:406) and
+doctor-triage.ts:98-118 would otherwise print `keep-mine` for a repo
+whose story says "no command needed", and its age-only severity rule
+would mark ~51 multi-day holds `blocked`. `ownership-hold` emits NO
+resolve command and NO attention/blocked severity anywhere.
+
+Telemetry ledger line: sync-state telemetry (`deferralReasons`,
+telemetry/sync-state.ts:12-20,77-81) will show a one-time step change
+(~+51 `worktree-ownership` rows on the founder fleet). The class is
+reported but excluded from any deferral-count alerting; the PR-B body
+names the expected step so health checks don't read it as a regression.
+
+Differential tests: `hasGitResolutionIncoming` (status-view.ts:370-372),
+deferral hygiene, daemon `attentionReason` (ambient-status.ts:211-221 —
+verified age/count-free), doctor-triage severity+command for the class,
+AND a held-decision-plane test: a repo held on ownership across N
+consecutive skipping pulls keeps ONE deferral with monotonically growing
+age. The `RBOX_GIT_OWNERSHIP_NO_ESCALATE` flag's meaning shifts from
+"clear the record" to "class the record"; owner/deletion condition
+unchanged.
 
 ### P3. Pin incoming tips while paused (deletes `incomingSummary`)
 
-While a repo is deferred/held with an incoming section, the follow path
-pins the staged incoming tips under `refs/rbox-pending/<incomingKey>/…`
-before `cleanupRefs` deletes the scratch namespace
-(follow.ts:69, follow-staging.ts:99). Verified properties:
+While a repo is deferred/held with an incoming section, pin the incoming
+tips under `refs/rbox-pending/<incomingKey>/…`. Placement: AFTER the held
+classification edge, conditionally on the deferred/held branch only — the
+imported objects survive `cleanupRefs` (follow.ts:66-69) until gc, so the
+pin is written from the incoming section's oids next to the record write
+it must stay consistent with. No unconditional per-follow pin (that would
+cost two `update-ref` spawns per repo per pull against the ≤10s target).
+Verified properties:
 - invisible to ref sync (`isSyncableRef` admits only heads/tags/stash,
   engine/manifest-validate.ts:329-331);
-- invisible to the design-270 held-skip fingerprint (fingerprint.ts:188-196
-  filters through `isSyncableRef`);
-- `pins.ts` already owns a scratch-pin namespace with staleness pruning —
-  the prune owner extends to `rbox-pending` (pins die when the hold
-  clears, on resolve, and on incomingKey change).
+- invisible to the design-270 held-skip fingerprint — BOTH loose-ref
+  (fingerprint.ts:188-196) and packed-refs identity (fingerprint.ts:199-221)
+  filter through `isSyncableRef`, so even `git pack-refs` of a pin stays
+  invisible; also excluded from user quarantine bundles (refs.ts:22-25
+  excludes `refs/rbox-*`).
+- **Lifecycle owner: the record writer — NOT pins.ts' age pruner.**
+  `pruneStaleScratchRefs` is a deliberate 1-hour age cutoff
+  (pins.ts:23,81-97); applying it to `rbox-pending` would delete the
+  evidence for every hold older than an hour (i.e. exactly the FM
+  population). `rbox-pending` is LIFETIME-scoped: the authority is a
+  per-pull reconciliation sweep — delete any `refs/rbox-pending/<key>`
+  whose `<key>` is not the repo's current record `incomingKey`. That one
+  sweep subsumes hold-clear/resolve/incomingKey-change event pruning and
+  every crash/reset orphan path (crash between update-ref and record
+  write, state reset, repo removal).
+- Disk bound: measured on the real FM 103-repo state before PR-C merges;
+  recorded as a named trade (retained pack objects for the hold's
+  lifetime).
 
 With the objects durably local, evidence() reads commit subjects,
 ahead-count, and the incoming file list straight from git — always fresh,
@@ -121,7 +166,18 @@ Degrade ladder (per repo, field-by-field, never blocking):
 
 FM's current 103 are tier 2 until their next incoming update.
 
-### P4. Sender naming: stamp at capture; never guess
+### P4. Sender naming — CUT from 273 (own follow-up design)
+
+Final review: P4 is a wire field + an identity-exclusion analysis across
+`gitIncomingKey`/carry fingerprints + a new local label cache + a
+revocation degrade chain — its own design (claims number 274). In 273,
+every surface says "another computer" (honest, and already the shipped
+vocabulary, resolve-presentation.ts:42-51); the projection carries an
+optional device-label slot so 274 plugs in without re-touching renderers.
+PRODUCT NOTE for the founder: Max's "name the actual computer" ask
+arrives one design later, not in 273's first ship.
+
+The original P4 mechanism (kept as 274's starting point):
 
 The locally reachable device id names the last *pusher* of the manifest
 head — on a multi-host fleet that can be a computer that never touched the
@@ -141,24 +197,41 @@ repo. Naming the wrong computer is Max's complaint inverted, so r2:
 - Until a section carries `deviceId`, ALL copy says "another computer" —
   never a guessed name.
 
-### P5. One population rule
+### P5. One population, one rule, a per-row `quiet` flag
 
-The transient quiet filter (TRANSIENT_DEFERRAL_QUIET_MS = 10 min,
-status-projection.ts:41-70) applies to EVERY surface: headline, listing,
-doctor, ambient/daemon count, JSON counts. Repos inside the quiet window
-are omitted everywhere (they usually self-heal unseen); when one crosses
-the window between runs the count grows — accepted and explicable, unlike
-today's cross-surface disagreement. Population = quiet-filtered deferrals
-(now including ownership-class) — after P2 there is no second "held"
-population; the invariant is one rule, one count.
+ONE population (all deferrals, ownership class included — after P2 there
+is no second "held" population) with the transient quiet rule
+(TRANSIENT_DEFERRAL_QUIET_MS = 10 min, status-projection.ts:41-70)
+computed ONCE as a per-row `quiet: boolean` on the projection.
+- Headline, listing, ambient/daemon count, and the prompt sidecar OMIT
+  quiet rows — one count everywhere users glance.
+- `rbox doctor` and `rbox git deferrals --json` render the FULL
+  population and LABEL quiet rows ("recently paused, usually
+  self-heals") — a repo whose deferral flaps (clear/set resetting
+  `deferredSince`) stays visible to the support flow. Validation row: a
+  deferral re-set every 60s for an hour is visible in doctor.
+- Enumerated surface list bound by this rule: headline, `status --git`,
+  doctor, ambient JSON, status `--json`, deferrals `--json`, AND the zsh
+  prompt sidecar `renderShellDeferrals` (activity.ts:417-460 — today
+  unfiltered, 50 rows + a `.`-rooted overflow row that would put a
+  git warning in EVERY directory after P2). Prompt policy:
+  `ownership-hold` rows are excluded from the sidecar entirely — the
+  prompt carries only actionable rows.
 
 ## Story vocabulary (exhaustive, type-gated)
 
-A closed map `satisfies Record<GitDeferralReason | HeldRefReason, Story>`
-(same discipline as DEFERRAL_REASON_PRESENTATION, status-view.ts:288-308)
-— the compiler forces every future reason to pick a story. Story codes are
-code symbols + optional `--json` fields; `reason` remains the machine
-contract; NO wire/persisted renames.
+A closed map `satisfies Record<GitDeferralReason, Story | ((detail?:
+string) => Story)>` (same discipline as DEFERRAL_REASON_PRESENTATION,
+status-view.ts:288-308) — the compiler forces every future reason to pick
+a story. (No `HeldRefReason` type exists or is invented: the held-ref
+values are already collapsed into `GitDeferralReason` by
+`followHeldDeferralReason`, follow-repo-transition.ts:195-208.) The
+`artifact` entry is the one function-valued row, and it is FAIL-CLOSED:
+default `sync-download-failed`; upgrade to `settle-failed` only on a
+typed detail that positively proves a post-apply settle. A fixture
+asserts the "was saved first" sentence never renders without a quarantine
+path on disk. Story codes are code symbols + optional `--json` fields;
+`reason` remains the machine contract; NO wire/persisted renames.
 
 | story | maps from | human copy (group header) |
 |---|---|---|
@@ -293,23 +366,35 @@ Undo later with: rbox git restore-backup conductor-workspaces/acme/checkout-flow
   (Real path, real contents: quarantineLocal bundles syncable refs + a
   `git stash create` of tracked modified/staged content + index/op-state
   copies — quarantine.ts:18-45. Copy never promises more.)
-- **`rbox git restore-backup <repo>` (NEW — #762's completion).** Lists
-  this repo's quarantine backups (newest first, dated); restoring
-  materializes the bundle's refs under `refs/rbox-restored/<ts>/…`, checks
-  out a branch `rbox-restored-<date>` at the saved tip, and applies the
-  saved stash commit as working-tree changes; never force-moves existing
-  branches. Copy explains what appeared and how to compare. Scriptable
-  twin: `--list --json` / `--yes`. Without restore, batch take-theirs is
-  a one-way door and users will not (should not) walk through it.
-- **Batch:** selector is `--under <folder>` (path primitive, re-typeable,
-  stable under re-classification); `--group <story>` exists only as an
-  ADDITIONAL filter; workspace-wide batch is spelled `--under .`. The
-  preview table is computed once, the repo list FROZEN; execution
-  re-verifies each repo's snapshot token equivalent and non-fatally skips
-  any repo whose state changed, reporting skips at the end (this replaces
-  the per-repo hand-carried token FOR BATCH ONLY — named requirement: the
-  freeze+reverify mechanism must be argued equivalent to the single-repo
-  token in the spec).
+- **`rbox git restore-backup` — SPLIT to its own design (#762's
+  completion).** The final review moved it out (review clustering +
+  its own safety surface): restore must materialize into an ISOLATED
+  `git worktree add .rbox/git-restored/<ts>` — never the current
+  checkout, whose contents take-theirs just replaced; applying the saved
+  stash onto the live tree would be a three-way merge against the wrong
+  base. 273's dry-run prints the backup path today; the restore command
+  ships in its design. **273's batch take-theirs DEPENDS on that design
+  landing first** — batch without an undo is a one-way door.
+- **Batch grammar (literal — the repo positional becomes optional):**
+  `rbox git resolve --under <folder> take-theirs --dry-run`
+  `rbox git resolve --under <folder> take-theirs --yes --expect-repos 98`
+  Dispatch rule: when `--under` is present the verb is `positional[1]`
+  and a repo positional is a usage error (today
+  `rbox git resolve --under X take-theirs` silently parses
+  `take-theirs` as the REPO, main-dispatch.ts:706-709 — the naive
+  spelling misparses, so the dispatch change is load-bearing).
+  `restore-backup` is a new `sub`, not a resolve verb. `--group <story>`
+  exists only as an ADDITIONAL filter to `--under`; workspace-wide is
+  spelled `--under .`.
+- **Batch freeze/reverify:** preview computed once, repo list FROZEN;
+  execution re-verifies each repo at the mutation boundary by calling the
+  IDENTICAL `snapshotId` function the single-repo token flow uses
+  (resolve-command.ts:176-178, recomputed under the lock at :823-840) and
+  non-fatally skips any repo whose state changed, reporting skips at the
+  end. Honesty note (not "token equivalence"): this preserves the token's
+  state-change-detection property exactly; it does NOT bind consent to a
+  per-repo reviewed preview — `--expect-repos <n>` binds consent to a
+  count. That is the named, accepted trade for batch.
   Confirmation scales with blast radius: interactive batch take-theirs
   requires typing the repo COUNT; scriptable twin is
   `--yes --expect-repos <n>` (a script written against 3 repos cannot
@@ -339,11 +424,13 @@ the split counts. `rbox git deferrals --json` schema stays; additive only.
 
 | Mechanism | Owner | Deletion condition |
 |---|---|---|
-| `refs/rbox-pending/*` pins + prune | the one staging site inside followDivergedRepo + pins.ts prune | a future design making incoming durable elsewhere |
-| `ownership-hold` remediation class (replaces record-clearing) | follow-repo-transition/apply/clean-materialization hold sites | 2.0 unified pause record |
-| `GitSection.deviceId` (optional, identity-excluded) | capture site | wire v2 makes it first-class |
-| device-label cache file | one refresh site off `rbox device list` wire call | labels join the signed roster |
-| `--dry-run`, `--under`, `--expect-repos`, `restore-backup` | resolve surface | none — they ARE the product fix |
+| `refs/rbox-pending/*` pins | record writer at the held classification edge; per-pull incomingKey reconciliation sweep is the prune authority | a future design making incoming durable elsewhere |
+| `ownership-hold` remediation class (replaces record-clearing at all THREE sites incl. held-decision retain()) | the hold/skip sites | 2.0 unified pause record |
+| per-row `quiet` flag (single computation of the transient rule) | the projection | 2.0 unified pause record |
+| `--dry-run`, `--under`, `--expect-repos` | resolve surface | none — they ARE the product fix |
+
+(Moved out: `GitSection.deviceId` + device-label cache → design 274;
+`restore-backup` → its own design; both referenced above.)
 
 Zero new RepoRecord members; zero SQLite schema changes. Compat context
 (founder ruling, 2026-08-17): 2.0 runs only on the founder fleet —
@@ -368,6 +455,15 @@ optional.
 - Wire shapes: optional additions only; sourceVersion 1;
   SERVER_GIT_DEFERRAL_REASONS untouched (stories are render-side).
 - Daemon log line grammar for the redaction classifier (S3 rule).
+  Scoping: S2's "full paths, never truncated" applies to the STATUS
+  renderer only; the emitted LOG line keeps `truncateDetail`
+  (status-view.ts:520-533) so the redaction regex and its privacy bound
+  hold. Renaming `gitReasonOf` updates the reason-declaration-order
+  comment at sync-state-model.ts:129-131 (anchor there already stale).
+- New surface registration: `--dry-run`/`--under`/`--expect-repos` get
+  help-registry entries (help-registry.test.ts), zsh completions
+  (completions.test.ts), and JSON dispatch rows (dispatch-json.test.ts);
+  confirm `--dry-run` is not a reserved global flag.
 - Design-270 held-skip fast path: `--no-optional-locks` on all evidence
   git calls; pin namespace excluded from fingerprints (verified above).
 - Steady-state sync loop: project() is git-free; daemon spawns zero git
@@ -376,16 +472,24 @@ optional.
 
 ## Sequencing (three PRs)
 
-1. **PR-A (prereq):** resolve-command.ts split. Evidence/presentation
-   move into the extended projection Module + a shared renderer;
-   resolve-presentation.ts shrinks to resolve-specific glue; BOTH ratchet
-   pins lowered (no-ratchet-repins; ALLOWED list is closed —
-   state-plane/file-size.test.ts:45-47 — so no new allowlist entries).
-2. **PR-B:** P2 ownership-record restore + P5 population rule + stories +
-   S1/S2/S3 rendering + JSON.
-3. **PR-C:** P3 pins + evidence() + single-repo view + S4 (dry-run,
-   batch, restore-backup) + P4 deviceId stamp/label cache (its identity
-   analysis may split it out).
+1. **PR-A (prereq — honest label: ratchet-driven decomposition,
+   mechanical, no semantics):** decompose BOTH files at their ceilings —
+   `resolve-command.ts` (1118 nonblank / 59,105 B vs 59,115 B ceiling: 10
+   bytes headroom) AND `status-view.ts` (914 nonblank / 49,990 B vs
+   51,804 B ceiling: ~48 lines — the story table alone would blow it).
+   `status-projection.ts` (22 lines headroom) is the third pressure
+   point. Target modules, each <400 nonblank / 25 KiB, NO `ALLOWED`
+   additions in any PR (list is closed, file-size.test.ts:45-47): e.g.
+   `status-view/story-map.ts`, `status-view/git-projection.ts`,
+   `status-view/git-render.ts`, plus the resolve split. Both existing
+   pins re-recorded DOWNWARD in the same PR. The `GitResolveShow`
+   absorption claim belongs to the PR where it lands (B/C), not A.
+2. **PR-B:** P2 ownership-record restore (all three sites) + P5
+   population/quiet rule + stories + S1/S2/S3 rendering + JSON +
+   telemetry ledger note.
+3. **PR-C:** P3 pins + evidence() + single-repo view + S4 dry-run +
+   batch keep-mine/`--under` scaffolding. Batch take-theirs gates on the
+   restore-backup design landing.
 
 ## Non-goals
 
@@ -404,11 +508,18 @@ optional.
 - Story map: compiler-gated exhaustive; a fixture per reason asserts no
   banned word appears on the human surface.
 - P2 differential: pre/post behavior of hasGitResolutionIncoming,
-  deferral hygiene, daemon attentionReason — ownership holds visible, not
-  escalated.
+  deferral hygiene, daemon attentionReason, doctor-triage severity and
+  command emission — ownership holds visible, never escalated, never
+  handed a resolve command; held-decision-plane test: one deferral with
+  monotonically growing age across N skipping pulls.
 - P3: pin invisible to ref sync + held-skip fingerprint (extend
-  fingerprint tests); prune on resolve/clear/incomingKey change; evidence
-  correct after daemon restart (durability).
+  fingerprint tests); reconciliation sweep collects orphans from crash
+  between pin and record write, state reset, and repo removal; evidence
+  correct after daemon restart (durability); measured disk bound on FM.
+- P5: a deferral re-set every 60s for an hour stays visible in doctor
+  and deferrals --json (quiet-labeled), absent from headline/prompt.
+- Batch boundary check calls the identical snapshotId
+  (resolve-command.ts:176-178); --expect-repos mismatch refuses.
 - P4: identity functions exclude deviceId (differential incomingKey/carry
   test); revoked/missing label degrade chain.
 - Evidence safety: zero git spawns on daemon path
