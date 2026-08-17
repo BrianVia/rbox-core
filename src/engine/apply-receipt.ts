@@ -7,10 +7,28 @@ import { hashBytes, hashFile } from "./hash.js";
 import { HashCache, type HashCacheStatIdentity } from "./hashcache.js";
 import type { IgnoreMatcher } from "./ignore.js";
 import { isAbsent } from "./fsutil.js";
-import { isSafeRelPath } from "./manifest-validate.js";
 import { statsStableAcrossHash } from "./manifest.js";
+import {
+  hardExcluded,
+  inProjection,
+  matchesConflictGrammarBelow,
+  normalizeRel,
+  probeReceiverEquivalence,
+  receiverEquivalentPath,
+  type ReceiverEquivalence,
+} from "./receiver-paths.js";
 import type { Action } from "./reconcile.js";
 import type { FileEntry, Manifest } from "./types.js";
+
+export {
+  conservativeReceiverEquivalentPath,
+  probeReceiverEquivalence,
+  receiverEquivalentCollisionNames,
+  receiverEquivalentPath,
+  setReceiverEquivalenceProbeForTests,
+  type ReceiverEquivalence,
+  type ReceiverEquivalenceProbe,
+} from "./receiver-paths.js";
 
 export type OracleVerdict =
   | { kind: "match" }
@@ -30,19 +48,6 @@ export type PullOracleObservation =
   | { kind: "prepare"; ms: number; entriesIndexed: number }
   | { kind: "receipt-hash"; ms: number }
   | { kind: "repo-proved" };
-
-export interface ReceiverEquivalence {
-  caseAliases: boolean;
-  unicodeAliases: boolean;
-}
-
-export type ReceiverEquivalenceProbe = (root: string) => Promise<ReceiverEquivalence>;
-let injectedReceiverEquivalenceProbe: ReceiverEquivalenceProbe | undefined;
-
-/** Test seam shared by the manifest oracle and Git receiver-collision guards. */
-export function setReceiverEquivalenceProbeForTests(probe: ReceiverEquivalenceProbe | undefined): void {
-  injectedReceiverEquivalenceProbe = probe;
-}
 
 type TokenKind = "absent" | "file" | "dir" | "symlink" | "other";
 interface FsToken {
@@ -66,11 +71,19 @@ interface ProofRecord {
   tokens?: ProofTokens;
 }
 
+type ComparableKind = "leaf" | "dir";
+type Comparable = (rel: string, kind: ComparableKind) => boolean;
+interface ConflictGrammarSink {
+  hit: boolean;
+}
+
 interface Projected {
   expected: FileEntry[];
   oracle: FileEntry[];
   preScan: FileEntry[];
   touchedKeys: Set<string>;
+  armed: ConflictGrammarSink;
+  comparable: Comparable;
 }
 
 interface ReceiptSource {
@@ -167,67 +180,10 @@ function canonicalReceipt(kind: "pull" | "state", rel: string, expected: FileEnt
   return hashBytes(Buffer.from(JSON.stringify({ version: 1, kind, rel, expected: sort(expected), observed: sort(observed) })));
 }
 
-function normalizeRel(rel: string): string | undefined {
-  if (rel === ".") return rel;
-  if (!isSafeRelPath(rel) || path.posix.normalize(rel) !== rel) return undefined;
-  return rel;
-}
+export const CONFLICT_COPY_POPULATION_WHY = "repo population emptied by conflict-copies exclusion";
 
-function equivalentPart(value: string, eq: ReceiverEquivalence): string {
-  let result = value;
-  if (eq.unicodeAliases) result = result.normalize("NFC");
-  if (eq.caseAliases) result = result.toLowerCase();
-  return result;
-}
-
-export function receiverEquivalentPath(value: string, eq: ReceiverEquivalence): string {
-  return value.split("/").map((part) => equivalentPart(part, eq)).join("/");
-}
-
-/** Repo targets and ref stores can alias independently of worktree behavior
- * (for example packed versus loose refs, or state later moved to APFS).
- * The key approximates Unicode FULL case folding, not just toLowerCase():
- * upper-then-lower collapses one-way foldings like final sigma (ς → Σ → σ)
- * that a single lowercase pass leaves distinct while APFS/HFS+ fold tables
- * treat them as one caseless class. Exhaustive per-filesystem fold tables are
- * unknowable statically — this key is a deliberately conservative superset
- * used only to DEFER on collision, never to authorize anything. */
-export function conservativeReceiverEquivalentPath(value: string): string {
-  return value
-    .split("/")
-    .map((part) => part.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC"))
-    .join("/");
-}
-
-export function receiverEquivalentCollisionNames(
-  names: Iterable<string>,
-  key: (value: string) => string = conservativeReceiverEquivalentPath,
-): Set<string> {
-  const groups = new Map<string, Set<string>>();
-  for (const name of names) {
-    const canonical = key(name);
-    const values = groups.get(canonical) ?? new Set<string>();
-    values.add(name);
-    groups.set(canonical, values);
-  }
-  return new Set([...groups.values()].filter((values) => values.size > 1).flatMap((values) => [...values]));
-}
-
-function inProjection(candidate: string, rel: string, eq: ReceiverEquivalence): boolean {
-  if (rel === ".") return true;
-  const c = candidate.split("/");
-  const r = rel.split("/");
-  if (c.length < r.length) return false;
-  for (let i = 0; i < r.length; i++) {
-    if (equivalentPart(c[i]!, eq) !== equivalentPart(r[i]!, eq)) return false;
-  }
-  return true;
-}
-
-function hardExcluded(candidate: string, eq: ReceiverEquivalence): boolean {
-  const parts = candidate.replace(/\/+$/, "").split("/");
-  if (parts.length > 0 && equivalentPart(parts[0]!, eq) === equivalentPart(".rbox", eq)) return true;
-  return parts.some((part) => equivalentPart(part, eq) === equivalentPart(".git", eq));
+function downgradeIfEmptied(verdict: OracleVerdict, armed: ConflictGrammarSink, pairs: number): OracleVerdict {
+  return verdict.kind === "match" && pairs === 0 && armed.hit ? indeterminate(CONFLICT_COPY_POPULATION_WHY) : verdict;
 }
 
 async function lstatWithoutSymlinkParents(root: string, rel: string): Promise<Stats> {
@@ -263,12 +219,17 @@ function groupPaths<V extends { path: string }>(entries: V[], eq: ReceiverEquiva
   return out;
 }
 
-function whyFromScanError(error: unknown): string | undefined {
-  if (!(error instanceof Error)) return undefined;
-  if (error.message === "unsupported-entry") return "unsupported entry type in repo subtree";
-  if (error.message === "directory-churn") return "repo directory changed during proof";
-  if (error.message === "scan-churn") return "repo subtree changed during scoped scan";
-  return undefined;
+const SCAN_FAILURE_WHY = {
+  "unsupported-entry": "unsupported entry type in repo subtree",
+  "directory-churn": "repo directory changed during proof",
+  "scan-churn": "repo subtree changed during scoped scan",
+} as const;
+type ScanFailure = keyof typeof SCAN_FAILURE_WHY;
+
+class ScanFailed extends Error {
+  constructor(readonly failure: ScanFailure) {
+    super(SCAN_FAILURE_WHY[failure]);
+  }
 }
 
 async function alignPaths<T extends { path: string }, U extends { path: string }>(
@@ -309,38 +270,6 @@ async function compareEntries(left: FileEntry[], right: FileEntry[], eq: Receive
   if (aligned.kind === "mismatch") return { kind: "mismatch", sample: aligned.sample };
   const samples = aligned.pairs.filter(([a, b]) => !sameSemantic(a, b)).map(([a]) => a.path);
   return samples.length > 0 ? mismatch(samples) : MATCH;
-}
-
-async function defaultReceiverEquivalenceProbe(root: string): Promise<ReceiverEquivalence> {
-  const parent = path.join(root, ".rbox", "state", "tmp");
-  await fs.mkdir(parent, { recursive: true });
-  const probe = await fs.mkdtemp(path.join(parent, "apply-receipt-probe-"));
-  try {
-    const aliases = async (first: string, second: string): Promise<boolean> => {
-      const a = path.join(probe, first);
-      const b = path.join(probe, second);
-      await fs.writeFile(a, "probe", { flag: "wx" });
-      try {
-        const [sa, sb] = await Promise.all([fs.lstat(a), fs.lstat(b)]);
-        return sa.dev === sb.dev && sa.ino === sb.ino;
-      } catch (error) {
-        if (isAbsent(error)) return false;
-        throw error;
-      } finally {
-        await fs.rm(a, { force: true });
-      }
-    };
-    return {
-      caseAliases: await aliases("a.rbox-probe-A", "a.rbox-probe-a"),
-      unicodeAliases: await aliases("é.rbox-probe", "e\u0301.rbox-probe"),
-    };
-  } finally {
-    await fs.rm(probe, { recursive: true, force: true });
-  }
-}
-
-export async function probeReceiverEquivalence(root: string): Promise<ReceiverEquivalence> {
-  return (injectedReceiverEquivalenceProbe ?? defaultReceiverEquivalenceProbe)(root);
 }
 
 class ManifestOracle implements AppliedManifestOracle {
@@ -436,7 +365,7 @@ class ManifestOracle implements AppliedManifestOracle {
       oracleMap: indexByPath(this.oracleManifest),
       preMap: indexByPath(source.preScan),
       touched: source.touched,
-      ...(source.invalidWhy ? { invalidWhy: source.invalidWhy } : {}),
+      invalidWhy: source.invalidWhy,
     };
     this.prepared = prepared;
     if (startedAt !== undefined) {
@@ -457,6 +386,23 @@ class ManifestOracle implements AppliedManifestOracle {
     return hash;
   }
 
+  /** Components AT OR ABOVE `root` are the caller's addressing, not content:
+   *  `proveRepo(rel)` addresses this repo BY that path, so neither an ancestor's
+   *  name nor the repo's OWN name component is evidence about what the repo
+   *  contains. Only components strictly below `root` are content. */
+  private comparableFor(root: string, eq: ReceiverEquivalence, armed: ConflictGrammarSink): Comparable {
+    return (rel, kind) => {
+      if (hardExcluded(rel, eq)) return false;
+      if (matchesConflictGrammarBelow(rel, root)) {
+        armed.hit = true;
+        return false;
+      }
+      if (kind === "leaf") return !this.matcher.ignores(rel);
+      const dirForm = `${rel}/`;
+      return !(this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm));
+    };
+  }
+
   private project(rel: string, eq: ReceiverEquivalence): Projected | OracleVerdict {
     const prepared = this.getPrepared();
     if (prepared.invalidWhy) return indeterminate(prepared.invalidWhy);
@@ -465,8 +411,11 @@ class ManifestOracle implements AppliedManifestOracle {
     if ([...this.scanDeferred].some((candidate) => inProjection(candidate, normalized, eq))) {
       return indeterminate("scan deferred in repo subtree");
     }
+    const armed: ConflictGrammarSink = { hit: false };
+    const comparable = this.comparableFor(normalized, eq, armed);
+    // `inProjection` stays leftmost: this walks the WHOLE manifest, and only the short-circuit stops foreign entries arming `armed`.
     const filter = (map: Map<string, FileEntry>): FileEntry[] => [...map.values()].filter((entry) =>
-      inProjection(entry.path, normalized, eq) && !hardExcluded(entry.path, eq) && !this.matcher.ignores(entry.path));
+      inProjection(entry.path, normalized, eq) && comparable(entry.path, "leaf"));
     const expected = filter(prepared.expectedMap);
     const oracle = filter(prepared.oracleMap);
     const preScan = filter(prepared.preMap);
@@ -474,6 +423,8 @@ class ManifestOracle implements AppliedManifestOracle {
       expected,
       oracle,
       preScan,
+      armed,
+      comparable,
       touchedKeys: new Set([...prepared.touched].filter((candidate) => inProjection(candidate, normalized, eq)).map((candidate) => receiverEquivalentPath(candidate, eq))),
     };
   }
@@ -497,7 +448,7 @@ class ManifestOracle implements AppliedManifestOracle {
       return this.settle(rel, semantic);
     }
 
-    const inventory = await this.inventory(rel, eq);
+    const inventory = await this.inventory(rel, eq, projected.comparable);
     if (inventory.kind === "indeterminate") {
       const verdict = indeterminate(inventory.why);
       return this.settle(rel, verdict);
@@ -537,6 +488,8 @@ class ManifestOracle implements AppliedManifestOracle {
       inventory.tokens.entries.set(actual.path, verified.token);
     }
 
+    const downgraded = downgradeIfEmptied(semantic, projected.armed, projected.expected.length);
+    if (downgraded !== semantic) return this.settle(rel, downgraded);
     const receiptHash = this.receipt(this.kind, rel, projected.oracle, projected.expected);
     this.records.set(rel, { verdict: semantic, receiptHash, tokens: semantic.kind === "match" ? inventory.tokens : undefined });
     return semantic;
@@ -596,7 +549,7 @@ class ManifestOracle implements AppliedManifestOracle {
     }
   }
 
-  private async inventory(rel: string, eq: ReceiverEquivalence): Promise<{ kind: "ok"; entries: InventoryEntry[]; tokens: ProofTokens } | { kind: "indeterminate"; why: string }> {
+  private async inventory(rel: string, eq: ReceiverEquivalence, comparable: Comparable): Promise<{ kind: "ok"; entries: InventoryEntry[]; tokens: ProofTokens } | { kind: "indeterminate"; why: string }> {
     const entries: InventoryEntry[] = [];
     const tokens: ProofTokens = { entries: new Map(), directories: new Map() };
     const walk = async (dirRel: string): Promise<void> => {
@@ -615,17 +568,16 @@ class ManifestOracle implements AppliedManifestOracle {
         const childRel = dirRel === "." ? child.name : `${dirRel}/${child.name}`;
         if (hardExcluded(childRel, eq)) continue;
         if (child.type === "dir") {
-          const dirForm = `${childRel}/`;
-          if (this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm)) continue;
+          if (!comparable(childRel, "dir")) continue;
           await walk(childRel);
         } else if (child.type === "other") {
-          if (!this.matcher.ignores(childRel)) throw new Error("unsupported-entry");
-        } else if (!this.matcher.ignores(childRel)) {
+          if (!this.matcher.ignores(childRel)) throw new ScanFailed("unsupported-entry");
+        } else if (comparable(childRel, "leaf")) {
           entries.push({ path: childRel, type: child.type });
         }
       }
       const after = await readToken(absDir);
-      if (!sameToken(before, after)) throw new Error("directory-churn");
+      if (!sameToken(before, after)) throw new ScanFailed("directory-churn");
       tokens.directories.set(dirRel, after);
     };
     try {
@@ -633,7 +585,7 @@ class ManifestOracle implements AppliedManifestOracle {
       if (scope.kind === "absent") {
         tokens.entries.set(rel, scope);
       } else if (scope.kind === "file" || scope.kind === "symlink") {
-        if (!hardExcluded(rel, eq) && !this.matcher.ignores(rel)) entries.push({ path: rel, type: scope.kind });
+        if (comparable(rel, "leaf")) entries.push({ path: rel, type: scope.kind });
         tokens.entries.set(rel, scope);
       } else if (scope.kind === "dir") {
         await walk(rel);
@@ -642,7 +594,7 @@ class ManifestOracle implements AppliedManifestOracle {
       }
       return { kind: "ok", entries, tokens };
     } catch (error) {
-      const why = whyFromScanError(error) ?? "repo subtree inventory could not be read";
+      const why = error instanceof ScanFailed ? error.message : "repo subtree inventory could not be read";
       return { kind: "indeterminate", why };
     }
   }
@@ -656,7 +608,7 @@ class ManifestOracle implements AppliedManifestOracle {
   }
 
   private async scanAndCompareProjected(rel: string, eq: ReceiverEquivalence, projected: Projected): Promise<OracleVerdict> {
-    const scanned = await this.scopedScan(rel, eq);
+    const scanned = await this.scopedScan(rel, eq, projected.comparable);
     if (scanned.kind === "indeterminate") {
       const verdict = indeterminate(scanned.why);
       return this.settle(rel, verdict);
@@ -665,12 +617,14 @@ class ManifestOracle implements AppliedManifestOracle {
     if (verdict.kind === "indeterminate") {
       return this.settle(rel, verdict);
     }
+    const downgraded = downgradeIfEmptied(verdict, projected.armed, scanned.files.length);
+    if (downgraded !== verdict) return this.settle(rel, downgraded);
     const receiptHash = this.receipt(this.kind, rel, projected.oracle, scanned.files);
     this.records.set(rel, { verdict, receiptHash, tokens: verdict.kind === "match" ? scanned.tokens : undefined });
     return verdict;
   }
 
-  private async scopedScan(rel: string, eq: ReceiverEquivalence): Promise<CompleteScan> {
+  private async scopedScan(rel: string, eq: ReceiverEquivalence, comparable: Comparable): Promise<CompleteScan> {
     const files: FileEntry[] = [];
     const tokens: ProofTokens = { entries: new Map(), directories: new Map() };
     const cache = await this.getHashCache();
@@ -679,23 +633,23 @@ class ManifestOracle implements AppliedManifestOracle {
       const abs = this.abs(leafRel);
       const before = await fs.lstat(abs);
       const kind = tokenKind(before);
-      if (expectedType && kind !== expectedType) throw new Error("scan-churn");
+      if (expectedType && kind !== expectedType) throw new ScanFailed("scan-churn");
       if (kind === "symlink") {
         const target = await fs.readlink(abs);
         const after = await readToken(abs);
-        if (!sameToken(tokenFromStat(before), after)) throw new Error("scan-churn");
+        if (!sameToken(tokenFromStat(before), after)) throw new ScanFailed("scan-churn");
         files.push({ path: leafRel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 });
         tokens.entries.set(leafRel, after);
         return;
       }
-      if (kind !== "file") throw new Error("unsupported-entry");
+      if (kind !== "file") throw new ScanFailed("unsupported-entry");
       await fs.access(abs, constants.R_OK);
       let sha256 = cache.lookup(leafRel, before.mtimeMs, before.size, before.ctimeMs);
       let after = tokenFromStat(before);
       if (!sha256) {
         sha256 = await hashFile(abs, before.size);
         const post = await fs.lstat(abs);
-        if (!statsStableAcrossHash(before, post)) throw new Error("scan-churn");
+        if (!statsStableAcrossHash(before, post)) throw new ScanFailed("scan-churn");
         after = tokenFromStat(post);
         cache.record(leafRel, { mtimeMs: post.mtimeMs, size: post.size, ctimeMs: post.ctimeMs, sha256 });
       }
@@ -706,23 +660,23 @@ class ManifestOracle implements AppliedManifestOracle {
     const walk = async (dirRel: string): Promise<void> => {
       const absDir = this.abs(dirRel);
       const before = await readToken(absDir);
-      if (before.kind !== "dir") throw new Error("scan-churn");
+      if (before.kind !== "dir") throw new ScanFailed("scan-churn");
       const children = await fs.readdir(absDir, { withFileTypes: true });
       for (const child of children) {
         const childRel = dirRel === "." ? child.name : `${dirRel}/${child.name}`;
         if (hardExcluded(childRel, eq)) continue;
         if (child.isDirectory()) {
-          const dirForm = `${childRel}/`;
-          if (this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm)) continue;
+          if (!comparable(childRel, "dir")) continue;
           await walk(childRel);
-        } else if (!this.matcher.ignores(childRel)) {
+        } else {
           const type: DirCacheChild["type"] = child.isSymbolicLink() ? "symlink" : child.isFile() ? "file" : "other";
-          if (type === "other") throw new Error("unsupported-entry");
-          await scanLeaf(childRel, type);
+          if (type === "other") {
+            if (!this.matcher.ignores(childRel)) throw new ScanFailed("unsupported-entry");
+          } else if (comparable(childRel, "leaf")) await scanLeaf(childRel, type);
         }
       }
       const after = await readToken(absDir);
-      if (!sameToken(before, after)) throw new Error("scan-churn");
+      if (!sameToken(before, after)) throw new ScanFailed("scan-churn");
       tokens.directories.set(dirRel, after);
     };
 
@@ -733,14 +687,14 @@ class ManifestOracle implements AppliedManifestOracle {
       } else if (scope.kind === "dir") {
         await walk(rel);
       } else if (scope.kind === "file" || scope.kind === "symlink") {
-        if (!hardExcluded(rel, eq) && !this.matcher.ignores(rel)) await scanLeaf(rel, scope.kind);
+        if (comparable(rel, "leaf")) await scanLeaf(rel, scope.kind);
       } else {
-        throw new Error("unsupported-entry");
+        throw new ScanFailed("unsupported-entry");
       }
       files.sort((a, b) => a.path.localeCompare(b.path));
       return { kind: "ok", files, tokens };
     } catch (error) {
-      const why = whyFromScanError(error) ?? "repo subtree could not be scanned";
+      const why = error instanceof ScanFailed ? error.message : "repo subtree could not be scanned";
       return { kind: "indeterminate", why };
     }
   }
@@ -784,7 +738,7 @@ export function oracleFromPull(opts: {
       expected: { generatedAt: opts.preScan.generatedAt, files: [...expected.values()] },
       preScan: opts.preScan,
       touched,
-      ...(invalidWhy ? { invalidWhy } : {}),
+      invalidWhy,
     };
   };
   return new ManifestOracle("pull", opts.root, opts.matcher, source, opts.oracle, opts.scanDeferred, opts.dircache, opts.hashcache, opts.observer);

@@ -18,7 +18,7 @@ import {
   type IgnoreMatcher,
   type Manifest,
 } from "./index.js";
-import type { OracleVerdict } from "./apply-receipt.js";
+import { CONFLICT_COPY_POPULATION_WHY, type OracleVerdict } from "./apply-receipt.js";
 
 const roots: string[] = [];
 const blocked: string[] = [];
@@ -66,6 +66,8 @@ async function scanFixture(root: string, matcher: IgnoreMatcher = buildIgnoreMat
 function pullOracle(root: string, fixture: Awaited<ReturnType<typeof scanFixture>>, actions: Action[] = [], truth = fixture.preScan, scanDeferred = fixture.deferred) {
   return oracleFromPull({ preScan: fixture.preScan, actions, oracle: truth, matcher: fixture.matcher, dircache: fixture.dircache, hashcache: fixture.hashcache, root, scanDeferred });
 }
+
+const runningAsRoot = (): boolean => process.getuid?.() === 0;
 
 function expectNotMatch(verdict: OracleVerdict): void {
   expect(verdict.kind).not.toBe("match");
@@ -257,7 +259,7 @@ test("scan-deferred paths intersecting only this projection are indeterminate", 
 });
 
 test("a real unreadable state file is indeterminate even with a matching hash cache token", async () => {
-  if (typeof process.getuid === "function" && process.getuid() === 0) return;
+  if (runningAsRoot()) return;
   const root = await tmp();
   const secret = path.join(root, "repo/secret");
   await fs.writeFile(secret, "secret");
@@ -358,7 +360,7 @@ test("oracleFromState scans only the requested subtree and hashes observed misma
   await fs.writeFile(path.join(root, "outside/trap"), "trap");
   const base = await scanManifest(root);
   const outside = path.join(root, "outside");
-  if (!(typeof process.getuid === "function" && process.getuid() === 0)) {
+  if (!runningAsRoot()) {
     await fs.chmod(outside, 0o000);
     blocked.push(outside);
   }
@@ -438,4 +440,103 @@ test("receiver-equivalent spellings require one identity and oracle collisions a
     const disk = fixture.preScan.files.find((entry) => entry.path === "repo/Case.txt")!;
     expect((await pullOracle(root, fixture, [], manifest([{ ...disk, path: "repo/case.txt" }])).proveRepo("repo")).kind).toBe("mismatch");
   }
+});
+
+const CTS = "20260816041610";
+const stateOracle = (root: string, base: Manifest) => oracleFromState({ base, matcher: buildIgnoreMatcher(root), root });
+
+test("a conflict copy below the repo root drops from BOTH the manifest side and the walk side", async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, "repo/tracked.txt"), "keep");
+  await fs.writeFile(path.join(root, `repo/tracked.dev_x.${CTS}.conflict.txt`), "minted");
+  const fixture = await scanFixture(root);
+  const tracked = fixture.preScan.files.find((entry) => entry.path === "repo/tracked.txt")!;
+  const copy = fixture.preScan.files.find((entry) => entry.path === `repo/tracked.dev_x.${CTS}.conflict.txt`)!;
+
+  // walk side: on disk, absent from the applied manifest — today's #659 extra.
+  expect((await pullOracle(root, fixture, [], manifest([tracked])).proveRepo("repo")).kind).toBe("match");
+  expect((await stateOracle(root, manifest([tracked])).proveRepo("repo")).kind).toBe("match");
+  // manifest side: in the applied manifest, removed from disk.
+  await fs.rm(path.join(root, `repo/tracked.dev_x.${CTS}.conflict.txt`));
+  expect((await stateOracle(root, manifest([tracked, copy])).proveRepo("repo")).kind).toBe("match");
+});
+
+test("a conflict-named directory INSIDE a repo prunes its whole subtree", async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, "repo/tracked.txt"), "keep");
+  await fs.mkdir(path.join(root, `repo/evicted.dev_x.${CTS}.conflict`), { recursive: true });
+  await fs.writeFile(path.join(root, `repo/evicted.dev_x.${CTS}.conflict/inner.txt`), "inner");
+  const fixture = await scanFixture(root);
+  const tracked = fixture.preScan.files.find((entry) => entry.path === "repo/tracked.txt")!;
+
+  expect((await pullOracle(root, fixture, [], manifest([tracked])).proveRepo("repo")).kind).toBe("match");
+  expect((await stateOracle(root, manifest([tracked])).proveRepo("repo")).kind).toBe("match");
+});
+
+test("a repo addressed BY a conflict-named root or ancestor still compares its contents", async () => {
+  for (const rel of [`r.dev_x.${CTS}.conflict`, `anc.dev_x.${CTS}.conflict/r`]) {
+    const root = await tmp();
+    await fs.mkdir(path.join(root, rel), { recursive: true });
+    await fs.writeFile(path.join(root, rel, "tracked.txt"), "old");
+    const fixture = await scanFixture(root);
+    const tracked = fixture.preScan.files.find((entry) => entry.path === `${rel}/tracked.txt`)!;
+    await fs.writeFile(path.join(root, rel, "tracked.txt"), "diverged from the applied manifest");
+
+    // `mismatch` positively, never `indeterminate`: an "at or below" regression
+    // empties both populations, arms the guard, and would satisfy "not match".
+    expect((await pullOracle(root, fixture, [], manifest([tracked])).proveRepo(rel)).kind).toBe("mismatch");
+    expect((await stateOracle(root, manifest([tracked])).proveRepo(rel)).kind).toBe("mismatch");
+  }
+});
+
+test("a population the conflict grammar emptied is indeterminate, not a vacuous match", async () => {
+  const root = await tmp();
+  await fs.mkdir(path.join(root, `repo/only.dev_x.${CTS}.conflict`), { recursive: true });
+  await fs.writeFile(path.join(root, `repo/only.dev_x.${CTS}.conflict/a.txt`), "a");
+  const fixture = await scanFixture(root);
+  const copy = fixture.preScan.files.find((entry) => entry.path === `repo/only.dev_x.${CTS}.conflict/a.txt`)!;
+
+  // :541 — manifest x manifest, through the pull oracle.
+  const pull = await pullOracle(root, fixture, [], manifest([copy])).proveRepo("repo");
+  expect(pull).toEqual({ kind: "indeterminate", why: CONFLICT_COPY_POPULATION_WHY });
+  // :669 — disk x manifest, through the state oracle.
+  const state = await stateOracle(root, manifest([copy])).proveRepo("repo");
+  expect(state).toEqual({ kind: "indeterminate", why: CONFLICT_COPY_POPULATION_WHY });
+});
+
+test("a genuinely empty repo still matches — the guard is the grammar, never an empty population", async () => {
+  const root = await tmp();
+  await git(path.join(root, "repo"), ["init", "-q"]);
+  const fixture = await scanFixture(root);
+
+  expect((await pullOracle(root, fixture, [], manifest([])).proveRepo("repo")).kind).toBe("match");
+  expect((await stateOracle(root, manifest([])).proveRepo("repo")).kind).toBe("match");
+});
+
+test("a downgraded prove mints no receipt credential and its hold survives the next boundary", async () => {
+  const root = await tmp();
+  await fs.mkdir(path.join(root, `repo/only.dev_x.${CTS}.conflict`), { recursive: true });
+  await fs.writeFile(path.join(root, `repo/only.dev_x.${CTS}.conflict/a.txt`), "a");
+  const fixture = await scanFixture(root);
+  const copy = fixture.preScan.files.find((entry) => entry.path === `repo/only.dev_x.${CTS}.conflict/a.txt`)!;
+  const oracle = pullOracle(root, fixture, [], manifest([copy]));
+
+  expect((await oracle.proveRepo("repo")).kind).toBe("indeterminate");
+  expect(oracle.receiptHash("repo")).toBeUndefined();
+  expect(await oracle.reproveRepo("repo")).toEqual({ kind: "indeterminate", why: CONFLICT_COPY_POPULATION_WHY });
+});
+
+test("a conflict-grammar special file stays fail-closed on BOTH walks", async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, "repo/tracked.txt"), "keep");
+  const fixture = await scanFixture(root);
+  const tracked = fixture.preScan.files.find((entry) => entry.path === "repo/tracked.txt")!;
+  const fifo = Bun.spawn(["mkfifo", path.join(root, `repo/pipe.dev_x.${CTS}.conflict`)], { stdout: "ignore", stderr: "pipe" });
+  if (await fifo.exited !== 0) return;
+
+  // A surviving comparable pair keeps the population non-empty, so only the
+  // `unsupported-entry` throw can produce this why.
+  const unsupported = { kind: "indeterminate", why: "unsupported entry type in repo subtree" };
+  expect(await pullOracle(root, fixture, [], manifest([tracked])).proveRepo("repo")).toEqual(unsupported);
+  expect(await stateOracle(root, manifest([tracked])).proveRepo("repo")).toEqual(unsupported);
 });

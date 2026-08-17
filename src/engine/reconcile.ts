@@ -3,6 +3,8 @@ import { sameContent } from "./diff.js";
 import { indexByPath } from "./diff.js";
 import type { FileEntry, Manifest } from "./types.js";
 
+export { isRboxConflictArtifact } from "./conflict-name.js";
+
 /**
  * A single change to apply to the local working tree to bring it in line with
  * the remote, decided by a three-way comparison (base = last-synced).
