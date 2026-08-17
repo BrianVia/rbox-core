@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { buildIgnoreMatcher, effectiveIgnoreRules, HashCache, scanManifest } from "../engine/index.js";
-import { loadState, syncStreamId } from "./config.js";
+import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { confirmDestructive } from "./prompt.js";
 import { localFileObservationForScan, makeDeferErrnoReporter, pushManifest } from "./sync.js";
@@ -14,7 +14,7 @@ import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
 import { assertNoUnevaluatedPurgeDeletes } from "./sync/policy.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { setFolderOptions } from "./folder-config.js";
-import { observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
+import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "./folder-inventory.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -73,7 +73,12 @@ export async function setRespectGitignore(root: string, raw: string | undefined)
   const value = parseOnOff(raw);
   if (value === undefined) throw new Error("usage: rbox ignore --respect-gitignore <on|off>");
   await admittedPolicy(root);
-  await setFolderOptions(root, { respectGitignore: value });
+  const policy = await setFolderOptions(root, { respectGitignore: value });
+  // The catalog is authoritative, but the binding must stay a COMPLETE
+  // pre-catalog snapshot of the policy: an absent catalog is reinitialized from
+  // the bindings (design 276 F1.3), so a catalog-only edit would come back
+  // silently reverted. Every catalog-only policy editor owes the binding this.
+  await saveConfig(root, applyFolderPolicy(await loadConfig(root), policy));
   console.log(`respectGitignore: ${value ? "on" : "off"}`);
   if (value) {
     console.log(`already-synced ignored files are carried forward. Run \`rbox ignore --purge\` to delete those stale copies explicitly.`);
