@@ -26,6 +26,7 @@
 import { isInteractive, promptInput } from "../prompt.js";
 import type { GitDeferralRepoProjection } from "../status-view/git-projection.js";
 import { gitDeferralEvidence } from "../status-view/git-evidence.js";
+import { evidenceRisk } from "../status-view/git-evidence-model.js";
 import type { GitRepoEvidence } from "../status-view/git-evidence-model.js";
 import { sanitizeTerminalText } from "../status-view/text.js";
 import type { RepoRecordsByPath } from "../sync-state-model.js";
@@ -42,6 +43,9 @@ export interface GitResolveBatchOptions {
   verb: GitResolveVerb;
   dryRun?: boolean;
   yes?: boolean;
+  /** The repo count the caller believes it is acting on. Required beside `--yes`;
+   * a mismatch refuses. */
+  expectRepos?: number;
   forceDiscardIncoming?: boolean;
 }
 
@@ -100,33 +104,52 @@ interface Frozen {
   snapshot: string;
 }
 
+/** The overlap clause, spelled exactly as the `status --git` listing spells it —
+ * two vocabularies for the same number is how a reader learns to distrust both. */
 function evidenceCell(evidence: GitRepoEvidence | undefined): string {
   const local = evidence?.local;
-  if (!local) return "";
-  const both = evidence?.overlap ?? 0;
-  const mine = `${local.total} yours`;
-  return both > 0 ? `${mine}, ${both} on both ⚠` : mine;
+  if (!local) return "not read";
+  if (evidence?.overlap === undefined) return "can't compare";
+  return evidence.overlap > 0 ? `${evidence.overlap} also changed on another computer ⚠` : "none changed elsewhere";
 }
 
-function previewTable(
-  frozen: readonly Frozen[],
+interface PreviewRow {
+  repo: string;
+  evidence: GitRepoEvidence | undefined;
+  why: string;
+}
+
+const previewRows = (
   rows: readonly GitDeferralRepoProjection[],
   readings: ReadonlyMap<string, GitRepoEvidence>,
-): string[] {
-  const width = Math.max(0, ...frozen.map((entry) => sanitizeTerminalText(entry.repo).length));
-  const lines: string[] = [];
-  let bothTotal = 0;
-  let fileTotal = 0;
-  for (const entry of frozen) {
-    const evidence = readings.get(entry.repo);
-    bothTotal += evidence?.overlap ?? 0;
-    fileTotal += evidence?.local?.total ?? 0;
-    const waiting = rows.find((row) => row.repo === entry.repo)?.story.headline ?? "";
-    lines.push(`   ${sanitizeTerminalText(entry.repo).padEnd(width, " ")}   ${evidenceCell(evidence).padEnd(20, " ")} ${waiting}`);
-  }
-  lines.push("");
-  lines.push(`Total: ${repos(frozen.length)} · ${fileTotal} files you changed here get published`);
+): PreviewRow[] => rows
+  .map((row) => ({ repo: row.repo, evidence: readings.get(row.repo), why: row.story.headline }))
+  // Risk-first, matching the listing: the repos both computers touched lead, and
+  // the ones rbox could not compare rank above the ones it proved safe.
+  .sort((a, b) => evidenceRisk(b.evidence) - evidenceRisk(a.evidence) || a.repo.localeCompare(b.repo));
+
+const HEADERS = ["repo", "your files", "also changed elsewhere", "why it's paused"] as const;
+
+/** A four-column table sized from its own contents, headers included — padding to
+ * a guessed constant misaligned the moment a count reached three digits. */
+function previewTable(entries: readonly PreviewRow[]): string[] {
+  const cells = entries.map((entry) => [
+    sanitizeTerminalText(entry.repo),
+    entry.evidence?.local === undefined ? "—" : String(entry.evidence.local.total),
+    evidenceCell(entry.evidence),
+    entry.why,
+  ]);
+  const widths = HEADERS.map((header, column) =>
+    Math.max(header.length, ...cells.map((row) => row[column]!.length)));
+  const line = (row: readonly string[]): string =>
+    `   ${row.map((cell, column) => (column === row.length - 1 ? cell : cell.padEnd(widths[column]!, " "))).join("   ")}`.trimEnd();
+  const lines = [line(HEADERS), ...cells.map(line), ""];
+  const fileTotal = entries.reduce((total, entry) => total + (entry.evidence?.local?.total ?? 0), 0);
+  const bothTotal = entries.reduce((total, entry) => total + (entry.evidence?.overlap ?? 0), 0);
+  const uncompared = entries.filter((entry) => entry.evidence?.overlap === undefined).length;
+  lines.push(`Total: ${repos(entries.length)} · ${fileTotal} files you changed here get published`);
   if (bothTotal > 0) lines.push(`       ${bothTotal} of those files also changed on another computer ⚠`);
+  if (uncompared > 0) lines.push(`       ${repos(uncompared)} rbox could not compare with the other computer`);
   return lines;
 }
 
@@ -136,13 +159,24 @@ const FORCE_FOREWARNING = [
   "either way. Run those one at a time:",
 ];
 
-const TAKE_THEIRS_REFUSAL = [
+const takeTheirsRefusal = (selected: readonly GitDeferralRepoProjection[]): string[] => [
   "rbox will not take the other computer's version in bulk yet.",
   "Doing it one repo at a time saves a backup you can go back to; there is no",
   "command to put those backups back yet, so a bulk switch would be a one-way",
   "door across every repo at once. That command is being built — until it ships,",
-  "run take-theirs per repo:",
-  "  rbox git resolve <repo> take-theirs --dry-run",
+  "run take-theirs one repo at a time:",
+  // Real repo names, so the reader can copy a line rather than translate a
+  // placeholder into the path they were never shown.
+  ...selected.slice(0, 5).map((row) => `   rbox git resolve ${sanitizeTerminalText(row.repo)} take-theirs --dry-run`),
+  ...(selected.length > 5 ? [`   … and ${selected.length - 5} more (see rbox status --git)`] : []),
+];
+
+const FORCE_REFUSAL = [
+  "--force-discard-incoming is never applied to a whole folder: it means throwing",
+  "away work the other computer is waiting to send, and that decision belongs to",
+  "one repo at a time.",
+  "Run the same command WITHOUT it — rbox lists the repos that need it, and you",
+  "run those individually.",
 ];
 
 /**
@@ -157,21 +191,56 @@ export async function gitResolveBatchCmd(
   deps: GitResolveDeps = {},
 ): Promise<number> {
   const write = deps.stdout ?? console.log;
+  const dryRun = options.dryRun === true;
+  const under = sanitizeTerminalText(options.under);
+  const selected = selectBatchRepos(input.rows, options);
   if (options.verb === "take-theirs") {
-    for (const line of TAKE_THEIRS_REFUSAL) write(line);
+    for (const line of takeTheirsRefusal(selected)) write(line);
     return 1;
   }
   if (options.forceDiscardIncoming === true) {
-    write("--force-discard-incoming can only be given to one repo at a time; rbox lists the repos that need it.");
+    for (const line of FORCE_REFUSAL) write(line);
     return 1;
   }
-  const selected = selectBatchRepos(input.rows, options);
   if (selected.length === 0) {
-    write(`No paused repos under ${sanitizeTerminalText(options.under)} can be resolved this way.`);
+    write(`No paused repos under ${under} can be resolved this way.`);
     return 0;
   }
   if (options.verb === "show-me") {
+    if (dryRun) {
+      // Matches the single-repo verb's answer rather than inventing a
+      // hypothetical — and, critically, does NOT stage every selected repo to
+      // say so.
+      write("`show-me` only reads; it never changes anything here, with or without --dry-run.");
+      write(`It would show you ${repos(selected.length)} under ${under}.`);
+      return 0;
+    }
     for (const row of selected) await gitResolveCmd(root, repoDirOf(root, row.repo), "show-me", {}, deps);
+    return 0;
+  }
+
+  const evidenceFor = async (rows: readonly GitDeferralRepoProjection[]): Promise<Map<string, GitRepoEvidence>> =>
+    gitDeferralEvidence({
+      root,
+      records: new Map(rows.flatMap((row) => {
+        const record = input.records[row.repo];
+        return record ? [[row.repo, record] as const] : [];
+      })),
+    });
+
+  // A preview must not be able to change what it describes. Freezing a
+  // confirmation token per repo means STAGING each one — network fetches and
+  // pack imports — so the dry run never reaches that loop and reads only what
+  // `status --git` reads. Tokens are execution-only.
+  if (dryRun) {
+    write("This is a preview — nothing on this computer changed.");
+    write(`Keeping this computer's work would publish ${repos(selected.length)} under ${under}:`);
+    for (const line of previewTable(previewRows(selected, await evidenceFor(selected)))) write(line);
+    write("");
+    write("rbox re-checks each repo when you run it for real, and asks separately");
+    write("about any repo whose incoming work cannot be kept alongside yours.");
+    write("To actually do it, run the same command without --dry-run.");
+    if (options.yes === true) write(`For a script, pass: --yes --expect-repos ${selected.length}`);
     return 0;
   }
 
@@ -186,41 +255,53 @@ export async function gitResolveBatchCmd(
     if (preview.confirm.forceDiscardIncoming) needsForce.push(row.repo);
     else frozen.push({ repo: row.repo, snapshot: preview.confirm.snapshot });
   }
-
-  const readings = await gitDeferralEvidence({
-    root,
-    records: new Map(frozen.flatMap((entry) => {
-      const record = input.records[entry.repo];
-      return record ? [[entry.repo, record] as const] : [];
-    })),
-  });
-  write(`Keeping this computer's work in ${repos(frozen.length)} under ${sanitizeTerminalText(options.under)}:`);
-  for (const line of previewTable(frozen, selected, readings)) write(line);
+  const frozenRows = selected.filter((row) => frozen.some((entry) => entry.repo === row.repo));
+  write(`About to keep this computer's work in ${repos(frozen.length)} under ${under}:`);
+  for (const line of previewTable(previewRows(frozenRows, await evidenceFor(frozenRows)))) write(line);
   if (needsForce.length > 0) {
     write("");
     for (const line of FORCE_FOREWARNING) write(line);
     for (const repo of needsForce) write(`   rbox git resolve ${sanitizeTerminalText(repo)} keep-mine`);
   }
-  if (options.dryRun === true) {
-    write("");
-    write("This is a preview — nothing on this computer changed.");
-    write("To actually do it, run the same command without --dry-run.");
-    return 0;
-  }
   if (frozen.length === 0) return 0;
-  if (!await confirmedCount(frozen.length, options.yes === true, write)) {
+  // Consent is bound to the count that will actually be acted on, which is the
+  // FROZEN count — the repos needing a separate command are not part of it.
+  if (options.expectRepos !== undefined && options.expectRepos !== frozen.length) {
+    write("");
+    write(`--expect-repos ${options.expectRepos} does not match: rbox would act on ${repos(frozen.length)}.`);
+    write("Nothing changed. Re-run with the right number once you have looked at the list.");
+    return 1;
+  }
+  if (!await confirmedCount(frozen.length, options, write)) {
     write("Nothing changed.");
     return 1;
   }
   return await executeFrozen(root, frozen, deps, write);
 }
 
-/** Confirmation scales with blast radius: the reader types the COUNT, so consent
- * cannot be a reflex, and `--yes` is its scriptable twin. */
-async function confirmedCount(count: number, yes: boolean, write: (line: string) => void): Promise<boolean> {
-  if (yes) return true;
+/**
+ * Confirmation scales with blast radius: the reader types the COUNT, so consent
+ * cannot be a reflex.
+ *
+ * `--yes` alone is NOT the scriptable twin — a script written against three
+ * repos would silently act on ninety-eight the day the fleet drifted. `--yes`
+ * requires `--expect-repos <n>`, which is checked against the frozen count
+ * before this is reached, so the scriptable path binds consent to a number the
+ * script's author actually wrote down.
+ */
+async function confirmedCount(
+  count: number,
+  options: GitResolveBatchOptions,
+  write: (line: string) => void,
+): Promise<boolean> {
+  if (options.yes === true) {
+    if (options.expectRepos !== undefined) return true;
+    write("");
+    write(`--yes needs --expect-repos <n> so a script cannot act on a number nobody chose. Here that is --expect-repos ${count}.`);
+    return false;
+  }
   if (!isInteractive()) {
-    write(`Add --yes to run this without a terminal (${repos(count)}).`);
+    write(`Add --yes --expect-repos ${count} to run this without a terminal.`);
     return false;
   }
   const typed = await promptInput({ message: `Type ${count} to keep this computer's work in ${repos(count)}:` });
@@ -247,7 +328,8 @@ async function executeFrozen(
   write("");
   write(`Published ${repos(published.length)}.`);
   if (skipped.length > 0) {
-    write(`Skipped ${repos(skipped.length)} that changed while rbox was working — run the command again for those:`);
+    const those = skipped.length === 1 ? "that one" : "those";
+    write(`Skipped ${repos(skipped.length)} that changed while rbox was working — run the command again for ${those}:`);
     for (const repo of skipped) write(`   ${sanitizeTerminalText(repo)}`);
   }
   if (failed.length > 0) {

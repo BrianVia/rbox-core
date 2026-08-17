@@ -14,20 +14,12 @@ import { gitDeferralReasonPresentation } from "../status-view/git-projection.js"
 import { sanitizeTerminalText } from "../status-view/text.js";
 import { shQuote } from "../shell-quote.js";
 import type { ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
-import type { GitResolveDeps, GitResolveVerb, ResolveRefusalCode } from "./resolve-contract.js";
+import type { GitResolveDeps, GitResolveShow, ResolveOutput } from "./resolve-contract.js";
 
-export interface GitResolveShow {
-  status: "show-me";
-  repo: string;
-  incomingCheckout: { kind: "branch" | "detached"; label?: string };
-  localOnlyCommits: Array<{ labels: string[]; subject: string }>;
-  oracle: "clean" | "dirty" | "indeterminate";
-  index: "matches-incoming" | "diverged" | "absent" | "indeterminate";
-  operationState: "matches-incoming" | "diverged";
-  stash: "clean" | "diverged" | "not-owned";
-  deferrals: Array<{ lane: string; reason: string; deferredSince: string; ageSeconds: number; bytesChanged?: boolean }>;
-  snapshot: string;
-}
+// Re-exported so the many importers that learned these names here keep working;
+// the definitions now live in the contract, which owns the command's vocabulary.
+export type { GitResolveShow, ResolveOutput } from "./resolve-contract.js";
+
 
 const HUMAN_LOCAL_ONLY_CAP = 50;
 
@@ -167,22 +159,6 @@ export function refusalMessage(reason: GitDeferralReason): string {
   return messages[reason];
 }
 
-export type ResolveOutput =
-  | GitResolveShow
-  | { status: "resolved"; verb: "take-theirs"; repo: string; snapshot: string; quarantine: string }
-  | {
-      status: "preview";
-      verb: "keep-mine";
-      repo: string;
-      message: string;
-      current: GitResolveShow;
-      discardReport: ResolutionDiscardReport;
-      confirm: { snapshot: string; forceDiscardIncoming: boolean };
-    }
-  | { status: "snapshot-mismatch"; verb: "take-theirs" | "keep-mine"; repo: string; message: string; current: GitResolveShow; discardReport?: ResolutionDiscardReport }
-  | { status: "refused"; verb: GitResolveVerb; repo: string; code: ResolveRefusalCode; message: string; current?: GitResolveShow }
-  | { status: "published"; verb: "keep-mine"; repo: string; sequence: number }
-  | { status: "ack-uncertain"; verb: "keep-mine"; repo: string; message: string };
 
 export function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: string): void {
   const out = deps.stdout ?? console.log;

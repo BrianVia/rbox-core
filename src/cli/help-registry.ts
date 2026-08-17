@@ -136,12 +136,16 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "status",
     group: "GETTING STARTED",
     summary: "synced-folder + background-sync state",
-    usage: "rbox status [path] [--all] [--json | --verbose | --git]",
+    usage: "rbox status [path] [--all] [--json | --verbose | --git [<repo>]]",
     flags: [
       { flag: "--all", desc: "show every locally known synced folder (cannot be combined with a path); with --git, list every paused repo instead of the first few per group" },
       { flag: "--json", desc: "print JSON" },
       { flag: "--verbose", desc: "print the complete legacy status detail" },
       { flag: "--git", desc: "explain every repo where rbox paused Git sync, and what to do about it" },
+    ],
+    notes: [
+      "`rbox status <path>` reports on the synced folder at that path.",
+      "With --git, a path that names a paused repo shows just that repo, both sides in full: `rbox status --git conductor-workspaces/acme/checkout-flow`. Any other path keeps its usual meaning and reports on the whole folder.",
     ],
   },
   {
@@ -308,7 +312,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "git resolve",
     group: "SYNCING",
     summary: "inspect or resolve a deferred Git checkout",
-    usage: "rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming] [--dry-run]",
+    usage: "rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming] [--dry-run]  |  rbox git resolve --under <folder> [show-me|keep-mine] [--group <story>] [--dry-run] [--yes --expect-repos <n>]",
     flags: [
       { flag: "--json", desc: "print a typed JSON result (commit OIDs are omitted)" },
       { flag: "--confirm <token>", desc: "confirm the exact snapshot printed by show-me", takesValue: true },
@@ -316,7 +320,8 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--dry-run", desc: "show what the command would do, and what it would save first; changes nothing" },
       { flag: "--under <folder>", desc: "act on every paused repo under a folder instead of one repo; the verb follows it", takesValue: true },
       { flag: "--group <story>", desc: "with --under: narrow to repos paused for one reason", takesValue: true },
-      { flag: "--yes", desc: "with --under: skip the typed confirmation (for scripts)" },
+      { flag: "--yes", desc: "with --under: skip the typed confirmation; requires --expect-repos" },
+      { flag: "--expect-repos <n>", desc: "with --under --yes: refuse unless exactly n repos would change", takesValue: true },
     ],
     notes: [
       "The default verb is show-me.",
@@ -325,6 +330,7 @@ export const COMMAND_HELP: CommandHelp[] = [
       "Try --dry-run first: it prints what would change and where your backup would be saved.",
       "With --under <folder> the repository argument is omitted and the verb comes next, e.g. `rbox git resolve --under . keep-mine --dry-run`. Use `--under .` for the whole workspace.",
       "--under supports show-me and keep-mine. take-theirs stays one repo at a time until the command that restores its backup ships.",
+      "Batch asks you to type the repo count. For scripts use `--yes --expect-repos <n>`, so a script written for 3 repos cannot act on 98.",
     ],
   },
   {

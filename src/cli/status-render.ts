@@ -23,7 +23,7 @@ import {
 } from "./status-view/brief.js";
 import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
 import { gitPauseCounts, loudRows } from "./status-view/git-story-render.js";
-import { renderGitPauseSection, renderGitSingleRepo } from "./status-render-git.js";
+import { gitRepoFallbackNote, renderGitPauseSection, renderGitSingleRepo } from "./status-render-git.js";
 import { statusStaleLockDetail } from "./status-maintenance.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
@@ -90,10 +90,13 @@ export function renderWorkspaceStatusSurface<M extends StatusMode>(
   if (projection.probes.mode === "verbose") {
     return { surface: "lines", lines: renderStatusVerbose(projection as DetailProjection<"verbose">), daemonRunning };
   }
-  if (projection.probes.mode === "git" && options.repo !== undefined) {
-    return { surface: "lines", lines: renderGitSingleRepo(projection as DetailProjection<"git">, options.repo, options), daemonRunning };
-  }
-  return { surface: "lines", lines: renderStatusBrief(projection as DetailProjection<"brief" | "git">, options), daemonRunning };
+  const detail = projection as DetailProjection<"brief" | "git">;
+  const repo = projection.probes.mode === "git" ? options.repo : undefined;
+  const single = repo === undefined ? undefined : renderGitSingleRepo(detail, repo, options);
+  if (single) return { surface: "lines", lines: single, daemonRunning };
+  const lines = renderStatusBrief(detail, options);
+  if (repo !== undefined) lines.unshift(...gitRepoFallbackNote(repo));
+  return { surface: "lines", lines, daemonRunning };
 }
 
 export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender {

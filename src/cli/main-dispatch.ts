@@ -492,7 +492,11 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         now: deps.now?.(),
       };
       if (flags.git === "true" && positional[0] !== undefined) {
-        statusOptions.gitRepo = workspaceRelativeRepo(root, positional[0]);
+        // The workspace root itself is never a repo SELECTOR — that spelling is
+        // how `rbox status --git <another workspace>` reaches this command, and
+        // it means "report on that workspace".
+        const candidate = workspaceRelativeRepo(root, positional[0]);
+        if (candidate !== ".") statusOptions.gitRepo = candidate;
       }
       await statusCmd(root, statusOptions);
       break;

@@ -51,6 +51,7 @@ import { fingerprintHitProbe, loadGitDivergenceCache } from "./divergence-cache.
 import { gitFingerprintRun } from "./fingerprint.js";
 import { gitConfigHash } from "./config-lane.js";
 import { reconcilePendingPins, writePendingPins } from "./pending-pins.js";
+import type { OwnedRefMutationBoundary } from "./pins.js";
 
 interface KeySnapshot<T> {
   present: boolean;
@@ -173,6 +174,9 @@ opts: {
     heldNow?: () => number;
     warningSink?: (message: string) => void;
     mutationBoundary?: MutationBoundary;
+    /** Design 273 P3: the daemon observation lease for rbox-owned ref writes, so
+     * the pin sweep is never attributed to the user. */
+    ownedRefMutationBoundary?: OwnedRefMutationBoundary;
     /** Tests only: observes/injects the anchored empty-directory removal call. */
     sweepRmdir?: RepoSkeletonSweepOptions["rmdir"];
     /** Tests only: observes repos admitted to the serialized apply work. */
@@ -341,8 +345,11 @@ opts: {
     const pinCtx = await getDiskCtx();
     if (pinCtx) {
       const heldIncoming = records[rel]?.pending;
-      await reconcilePendingPins(pinCtx.repoDir, pinCtx.commonDir, rel, heldIncoming && gitIncomingKey(heldIncoming))
-        .catch(() => {});
+      await reconcilePendingPins(
+        pinCtx.repoDir, pinCtx.commonDir, rel,
+        heldIncoming && gitIncomingKey(heldIncoming),
+        opts.ownedRefMutationBoundary,
+      ).catch(() => {});
     }
     const receivedConfig = createReceivedGitConfig({
       root,
@@ -1011,9 +1018,18 @@ opts: {
         // network. Unconditional per-follow pinning would cost two spawns per
         // repo per pull against a ≤10s propagation target, for repos that are
         // about to apply and never need evidence at all.
-        if (transition.pending && incomingKey) {
+        // Keyed from `transition.pending`, NOT from this pull's wire section:
+        // on a carried or retained section the two diverge, and a pin written
+        // under the wire key is unreadable to both readers (which derive the key
+        // from the record) and collected by the next sweep as an orphan.
+        if (transition.pending) {
           const pinCtx = await getDiskCtx();
-          if (pinCtx) await writePendingPins(pinCtx.repoDir, rel, incomingKey, transition.pending).catch(() => {});
+          if (pinCtx) {
+            await writePendingPins(
+              pinCtx.repoDir, rel, gitIncomingKey(transition.pending), transition.pending,
+              opts.ownedRefMutationBoundary,
+            ).catch(() => {});
+          }
         }
         if (transition.publishJournal) publishedJournals.push(rel);
       };

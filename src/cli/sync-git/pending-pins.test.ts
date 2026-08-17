@@ -121,3 +121,42 @@ test("evidence survives a daemon restart: pins are durable refs, not process sta
   await exec("git", ["-C", root, "gc", "--prune=now", "-q"]);
   expect(await readPendingPins(root, ".", "keyA")).toEqual([oids[0]!]);
 });
+
+test("a pin keyed from a CARRIED section is readable — key comes from the record, not the wire", async () => {
+  const { root, oids } = await repoWithCommits(2);
+  const { gitIncomingKey } = await import("./shared.js");
+  // The divergence M4 names: this pull's wire section and the section the record
+  // actually retains are different objects with different keys.
+  const wire = sectionFor({ "refs/heads/main": oids[1]! });
+  const carried = sectionFor({ "refs/heads/main": oids[0]! });
+  expect(gitIncomingKey(wire)).not.toBe(gitIncomingKey(carried));
+
+  // Production writes from the RETAINED section, so both readers — which derive
+  // the key from that same record — find it.
+  await writePendingPins(root, ".", gitIncomingKey(carried), carried);
+  expect(await readPendingPins(root, ".", gitIncomingKey(carried))).toEqual([oids[0]!]);
+  // And the sweep, which also reads the record, keeps it.
+  await reconcilePendingPins(root, gitDirOf(root), ".", gitIncomingKey(carried));
+  expect(await readPendingPins(root, ".", gitIncomingKey(carried))).toEqual([oids[0]!]);
+});
+
+test("every rbox-owned ref write takes the daemon observation lease", async () => {
+  const { root, oids } = await repoWithCommits(1);
+  const entered: string[] = [];
+  let finished = 0;
+  const boundary = {
+    enterOwnedRefMutation: async (repoDir: string) => {
+      entered.push(repoDir);
+      return { finish: async () => { finished++; } };
+    },
+  };
+  const incoming = sectionFor({ "refs/heads/main": oids[0]! });
+  await writePendingPins(root, ".", "keyA", incoming, boundary);
+  // Deleting a PACKED pin rewrites packed-refs under packed-refs.lock; unleased,
+  // the daemon attributes that churn to the user.
+  await exec("git", ["-C", root, "pack-refs", "--all"]);
+  await reconcilePendingPins(root, gitDirOf(root), ".", undefined, boundary);
+  expect(entered).toEqual([root, root]);
+  expect(finished).toBe(2);
+  expect(await readPendingPins(root, ".", "keyA")).toEqual([]);
+});

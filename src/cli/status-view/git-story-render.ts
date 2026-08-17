@@ -141,6 +141,9 @@ function resolveLines(group: StoryGroup): string[] {
     lines.push(" ".repeat(COMMAND_COLUMN) + "(shows you what you'd drop, then gives you the confirm command)");
   }
   lines.push(commandLine("or take the other computer's version:", "rbox git resolve <repo> take-theirs --confirm <token from show-me>"));
+  // The batch grammar is undiscoverable from a per-repo command line, and a
+  // fleet-scale pause is exactly where a reader needs to know it exists.
+  lines.push("   Several at once: add --under <folder> and --dry-run (see rbox git resolve --help).");
   return lines;
 }
 
@@ -245,6 +248,7 @@ export function renderGitPauseListing(
     if (hidden > 0) {
       lines.push(`   … ${hidden} more not shown`);
       lines.push("   the full list:        rbox status --git --all");
+      lines.push("   one repo in detail:   rbox status --git <repo>");
     }
     lines.push(...groupActionLines(group, options.now));
   }

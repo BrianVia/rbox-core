@@ -233,6 +233,8 @@ export function gitStoryFor(reason: string, detail?: string): GitStory {
 export const BANNED_HUMAN_WORDS = [
   "deferral",
   "deferred",
+  // "held" names rbox's internal classification, never the reader's situation.
+  "held",
   "quarantine",
   "dry run",
   "git index",

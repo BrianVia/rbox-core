@@ -12,11 +12,13 @@
  * - never write `.git/index`. A refreshed index changes the design-270 held-skip
  *   fingerprint of every paused repo a status command touched, so a read surface
  *   would be invalidating the fast path it exists to explain. `--no-optional-locks`
- *   is on EVERY invocation, and it is NOT sufficient on its own: measured on git
- *   2.54, porcelain `git diff <commit>` refreshes and rewrites the index despite
- *   the flag, while the plumbing `git diff-index` does not. The reads below are
- *   plumbing for that reason, and a test asserts the index bytes and mtime after
- *   evidence over a dirty, stat-stale repo.
+ *   is on EVERY invocation, and the reads are additionally PLUMBING
+ *   (`diff-index`, `diff-tree`) rather than porcelain. Porcelain `git diff
+ *   <commit>` was observed rewriting the index despite the flag on at least one
+ *   platform/version pair here; a second reviewer could not reproduce it on
+ *   Linux git 2.54.0. The disagreement is itself the argument — plumbing is
+ *   strictly safer and costs nothing, and the invariant is test-gated on the
+ *   bytes and mtime rather than on which spelling anyone believes is safe.
  * - degrade field by field, per repo, never block. A repo whose evidence times
  *   out or whose pins are gone still renders its counts and its age.
  * - the projection is NOT a sanitized boundary. Commit subjects, branch labels
@@ -74,7 +76,14 @@ const read = (repoDir: string, args: string[]): Promise<string> =>
  * Stopping the parse at the cap would have made `total` the capped number while
  * the header promised an exact count — a repo with 6,000 changed files would
  * have reported 5,000. */
-export function parseNumstat(out: string): { files: GitLocalFileChange[]; total: number } {
+export interface NumstatReading {
+  /** Names retained, capped at {@link MAX_FILES}. */
+  files: GitLocalFileChange[];
+  /** Every changed file, counted whether or not its name was retained. */
+  total: number;
+}
+
+export function parseNumstat(out: string): NumstatReading {
   const files: GitLocalFileChange[] = [];
   let total = 0;
   for (const line of out.split("\n")) {

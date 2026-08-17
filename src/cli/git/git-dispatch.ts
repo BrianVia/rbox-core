@@ -9,6 +9,7 @@
  */
 import { withWorkspaceSyncMutex } from "../sync-mutex.js";
 import { workspaceRelativeRepo } from "../workspace-relative.js";
+import type { GitResolveBatchOptions } from "./resolve-batch.js";
 
 export interface GitDispatchInput {
   positional: string[];
@@ -31,12 +32,13 @@ const isVerb = (value: string): value is GitResolveVerbName =>
 export interface ResolveSelection {
   repo?: string;
   under?: string;
+  expectRepos?: number;
   verb: GitResolveVerbName;
 }
 
 const RESOLVE_USAGE = [
   "usage: rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming] [--dry-run]",
-  "   or: rbox git resolve --under <folder> [show-me|keep-mine] [--group <story>] [--dry-run] [--yes]",
+  "   or: rbox git resolve --under <folder> [show-me|keep-mine] [--group <story>] [--dry-run] [--yes --expect-repos <n>]",
 ].join("\n");
 
 /**
@@ -60,7 +62,29 @@ export function parseResolveArgs(positional: string[], flags: Record<string, str
   if (!wellFormed || !isVerb(verb)) throw new GitUsageError(RESOLVE_USAGE);
   const parsed: ResolveSelection = { verb };
   if (repo !== undefined) parsed.repo = repo;
-  if (under !== undefined) parsed.under = under;
+  if (under === undefined) {
+    if (flags["expect-repos"] !== undefined) {
+      throw new GitUsageError("--expect-repos only means something with --under: a single repo is always one repo.");
+    }
+    return parsed;
+  }
+  parsed.under = under;
+  // Silently ignoring a flag is how a script believes it asked for something it
+  // did not get. Batch has no per-repo token to confirm and composes its own
+  // report, so neither of these has a batch meaning.
+  if (flags.confirm !== undefined) {
+    throw new GitUsageError("--confirm names one repo's snapshot; it cannot be used with --under. Batch re-checks each repo for you.");
+  }
+  if (flags.json !== undefined) {
+    throw new GitUsageError("--json is not available with --under yet; run the repos individually for machine output.");
+  }
+  if (flags["expect-repos"] !== undefined) {
+    const expected = Number(flags["expect-repos"]);
+    if (!Number.isInteger(expected) || expected < 0) {
+      throw new GitUsageError("--expect-repos takes a whole number of repos, e.g. --expect-repos 12.");
+    }
+    parsed.expectRepos = expected;
+  }
   return parsed;
 }
 
@@ -84,24 +108,22 @@ export async function dispatchGitCommand(input: GitDispatchInput): Promise<numbe
       gitRepublishCmd(root, target, syncMutex, { json: jsonMode }, { now: input.now }));
   }
   if (sub !== "resolve") throw new GitUsageError(RESOLVE_USAGE);
-  const { repo, under, verb } = parseResolveArgs(positional, flags);
+  const { repo, under, expectRepos, verb } = parseResolveArgs(positional, flags);
   if (under !== undefined) {
     const root = await resolveRoot(undefined);
     const { readGitPauseRows } = await import("./deferrals-command.js");
     const { gitResolveBatchCmd } = await import("./resolve-batch.js");
     const reading = await readGitPauseRows(root);
-    const options = {
+    const options: GitResolveBatchOptions = {
       under: workspaceRelativeRepo(root, under),
       verb,
       dryRun: flags["dry-run"] === "true",
       yes: flags.yes === "true",
       forceDiscardIncoming: flags["force-discard-incoming"] === "true",
     };
-    return gitResolveBatchCmd(
-      root,
-      flags.group === undefined ? options : { ...options, group: flags.group },
-      { rows: reading.repos, records: reading.records },
-    );
+    if (flags.group !== undefined) options.group = flags.group;
+    if (expectRepos !== undefined) options.expectRepos = expectRepos;
+    return gitResolveBatchCmd(root, options, { rows: reading.repos, records: reading.records });
   }
   const root = await resolveRoot(repo);
   const { gitResolveCmd } = await import("./resolve-command.js");
