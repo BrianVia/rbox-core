@@ -41,7 +41,8 @@ import {
 /** The apply deferral lane, exactly as the held plane needs it. A skip performs
  * no follow, so it must leave the standing refusal standing — including the
  * ownership holds it once retired (design 273 P2). The lane can therefore only
- * re-stand a record; it has no clear operation to misuse. */
+ * re-stand a record; it has no clear operation to misuse, and `restandApply` is
+ * reached only when NO record stands, so a skip writes at most once per hold. */
 export interface HeldDeferralLane {
   standingApply(relPath: string): GitDeferral | undefined;
   restandApply(relPath: string, standing: Pick<GitDeferral, "reason" | "subjectKey" | "checkout">): void;
@@ -161,14 +162,17 @@ export function createHeldDecisionPlane(env: HeldDecisionEnv): HeldDecisionPlane
       // had just restored one pull later, and whose clear/set cycle reset
       // `deferredSince` — leaving a multi-day hold permanently young enough to
       // count as a quiet transient, and therefore permanently invisible. It now
-      // re-stands the record instead, preserving the age.
+      // leaves the standing record exactly as it is, preserving the age.
       const retain = (priorAttempt: GitHeldAttempt): boolean => {
         if (!heldBlockersAllowSkip(priorAttempt.blockers)) return false;
-        const standingApply = env.deferrals.standingApply(relPath);
-        const ownershipHold = gitOwnershipNoEscalateEnabled()
-          && ownershipBlockersArePerRefOnly(priorAttempt.blockers);
-        if (!standingApply && !ownershipHold) return false;
-        env.deferrals.restandApply(relPath, standingApply ?? { reason: "worktree-ownership" });
+        // A record that already stands needs NOTHING written. Re-stamping its
+        // `lastSeen` on every skipping pull made the packet semantically newer
+        // (sync-published-intent's deferralSemantic), so a fleet held on 51
+        // repos paid 51 durable record writes per pull to say what the record
+        // already said. Only the repo whose hold has no record yet writes one.
+        if (env.deferrals.standingApply(relPath)) return true;
+        if (!gitOwnershipNoEscalateEnabled() || !ownershipBlockersArePerRefOnly(priorAttempt.blockers)) return false;
+        env.deferrals.restandApply(relPath, { reason: "worktree-ownership" });
         return true;
       };
 

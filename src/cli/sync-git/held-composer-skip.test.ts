@@ -450,6 +450,7 @@ test("an ownership hold across N skipping pulls keeps ONE record with a monotoni
   };
 
   const ages: number[] = [];
+  let writes = 0;
   for (let pull = 0; pull < 6; pull++) {
     const nowMs = firstSeen + pull * 3600_000;
     const plane = createHeldDecisionPlane({
@@ -459,7 +460,10 @@ test("an ownership hold across N skipping pulls keeps ONE record with a monotoni
       now: () => Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
       deferrals: {
         standingApply: () => stored,
-        restandApply: (_rel, standing) => restand(standing, new Date(nowMs).toISOString()),
+        restandApply: (_rel, standing) => {
+          writes++;
+          restand(standing, new Date(nowMs).toISOString());
+        },
       },
     });
     const repo = plane.repo({ relPath: ".", incoming: sectionFor(tip), storedAttempt: attempt, traced: false, timings: undefined });
@@ -472,6 +476,10 @@ test("an ownership hold across N skipping pulls keeps ONE record with a monotoni
   // ONE record: `deferredSince` never moved, so the age grew with every pull.
   expect(ages).toEqual([0, 3600_000, 2 * 3600_000, 3 * 3600_000, 4 * 3600_000, 5 * 3600_000]);
   expect(stored!.deferredSince).toBe(new Date(firstSeen).toISOString());
+  // And ONE write. A skip that re-stamps an already-standing record makes the
+  // state packet semantically newer every pull, so a fleet held on 51 repos
+  // paid 51 durable record writes per pull to restate what already stood.
+  expect(writes).toBe(1);
 });
 
 test("the no-escalate kill switch still refuses the skip when no record stands", async () => {
