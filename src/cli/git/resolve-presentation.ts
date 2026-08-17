@@ -1,9 +1,20 @@
+/**
+ * Everything `rbox git resolve` puts on a terminal.
+ *
+ * One exit — {@link emit} — takes a decided {@link ResolveOutput} and produces
+ * either the `--json` document or the human report. Both go through
+ * `safeResolveOutput` first, so workspace paths, credentials and terminal
+ * control sequences are stripped at a single boundary that a future verb cannot
+ * route around. The individual writers below are internal to that boundary.
+ */
+import os from "node:os";
 import path from "node:path";
 import { type GitDeferralReason } from "../config.js";
 import { gitDeferralReasonPresentation } from "../status-view/git-projection.js";
 import { sanitizeTerminalText } from "../status-view/text.js";
 import { shQuote } from "../shell-quote.js";
 import type { ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
+import type { GitResolveDeps, GitResolveVerb, ResolveRefusalCode } from "./resolve-contract.js";
 
 export interface GitResolveShow {
   status: "show-me";
@@ -41,17 +52,17 @@ function humanResolveCommand(show: GitResolveShow, verb: "keep-mine" | "take-the
 
 /** This computer, named when the hostname is readable. Never enters `--json`
  *  or the shareable `--brief`: it is a human aid on this terminal only. */
-export function thisComputer(machine?: string): string {
+function thisComputer(machine?: string): string {
   return machine ? `this computer (${machine})` : "this computer";
 }
 
 /** "this computer's version (Brians-Desktop)" — the possessive form, kept
  *  separate so the machine name never lands inside an awkward genitive. */
-export function thisComputersVersion(machine?: string): string {
+function thisComputersVersion(machine?: string): string {
   return machine ? `this computer's version (${machine})` : "this computer's version";
 }
 
-export function printShow(show: GitResolveShow, write: (line: string) => void, machine?: string): void {
+function printShow(show: GitResolveShow, write: (line: string) => void, machine?: string): void {
   const checkout = show.incomingCheckout.kind === "branch" ? `branch ${show.incomingCheckout.label}` : "detached checkout";
   write(`What happened: rbox paused Git sync for ${show.repo} because ${thisComputer(machine)} and your other computer both changed Git state; the ${checkout} from your other computer is waiting.`);
   write("What is safe: Your repository is healthy; rbox has not changed your local Git state.");
@@ -99,13 +110,13 @@ function laneLabel(lane: string): string {
   return FIXED_LANE_LABELS.get(lane) ?? lane;
 }
 
-export function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
+function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
   write("What your other computer's waiting version has that this computer doesn't (final check happens at publish):");
   for (const lane of report.lanes) write(`  ${laneLabel(lane.lane)}: ${lane.disposition === "subsumed" ? "nothing would be lost" : lane.disposition === "not-subsumed" ? "would be discarded" : "couldn't be checked"} — ${lane.detail}`);
   if (report.forceRequired) write("  Some of your other computer's waiting version would be discarded — confirming requires --force-discard-incoming. (This computer's files, branches, and history are untouched either way.)");
 }
 
-export function keepMineConfirmCommand(repo: string, snapshot: string, force: boolean): string {
+function keepMineConfirmCommand(repo: string, snapshot: string, force: boolean): string {
   const repoArg = repo.startsWith("-") ? `./${repo}` : repo;
   return [
     "rbox", "git", "resolve", repoArg, "keep-mine", "--confirm", snapshot,
@@ -122,7 +133,7 @@ export function safeResolveText(value: string, root: string): string {
   return out.replace(/\s+/g, " ").trim();
 }
 
-export function safeResolveOutput<T>(value: T, root: string): T {
+function safeResolveOutput<T>(value: T, root: string): T {
   if (typeof value === "string") return safeResolveText(value, root) as T;
   if (Array.isArray(value)) return value.map((entry) => safeResolveOutput(entry, root)) as T;
   if (value && typeof value === "object") {
@@ -154,4 +165,75 @@ export function refusalMessage(reason: GitDeferralReason): string {
     other: "the confirmed checkout could not be published safely",
   } satisfies Record<GitDeferralReason, string>;
   return messages[reason];
+}
+
+export type ResolveOutput =
+  | GitResolveShow
+  | { status: "resolved"; verb: "take-theirs"; repo: string; snapshot: string; quarantine: string }
+  | {
+      status: "preview";
+      verb: "keep-mine";
+      repo: string;
+      message: string;
+      current: GitResolveShow;
+      discardReport: ResolutionDiscardReport;
+      confirm: { snapshot: string; forceDiscardIncoming: boolean };
+    }
+  | { status: "snapshot-mismatch"; verb: "take-theirs" | "keep-mine"; repo: string; message: string; current: GitResolveShow; discardReport?: ResolutionDiscardReport }
+  | { status: "refused"; verb: GitResolveVerb; repo: string; code: ResolveRefusalCode; message: string; current?: GitResolveShow }
+  | { status: "published"; verb: "keep-mine"; repo: string; sequence: number }
+  | { status: "ack-uncertain"; verb: "keep-mine"; repo: string; message: string };
+
+export function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: string): void {
+  const out = deps.stdout ?? console.log;
+  const err = deps.stderr ?? console.error;
+  const safe = safeResolveOutput(output, root);
+  if (json) {
+    out(JSON.stringify(safe, (key, value) => typeof value === "string" && key !== "snapshot"
+      ? value.replace(/\b[0-9a-f]{40}\b/gi, "[commit]")
+      : value));
+    return;
+  }
+  // Every human-readable field can ultimately contain local repository, ref,
+  // worktree, subject, or error text. Sanitize once at the output boundary so
+  // future verbs cannot accidentally introduce a terminal-control sink.
+  const safeOut = (line: string): void => out(sanitizeTerminalText(line));
+  const safeErr = (line: string): void => err(sanitizeTerminalText(line));
+  const machine = localMachine(deps);
+  if (safe.status === "show-me") { printShow(safe, safeOut, machine); return; }
+  if (safe.status === "resolved") {
+    safeOut(`${safe.repo}: now follows your other computer's checkout; ${thisComputer(machine)}'s Git state was set aside at ${safe.quarantine}`);
+    return;
+  }
+  if (safe.status === "published") {
+    safeOut(`${safe.repo}: published; ${thisComputersVersion(machine)} is the synced truth now (sequence ${safe.sequence}).`);
+    return;
+  }
+  if (safe.status === "ack-uncertain") {
+    safeErr(`${safe.repo}: ${safe.message}`);
+    return;
+  }
+  if (safe.status === "preview") {
+    printShow(safe.current, safeOut, machine);
+    printDiscardReport(safe.discardReport, safeOut);
+    safeOut(safe.message);
+    safeOut(`Confirm exactly this preview with: ${keepMineConfirmCommand(safe.repo, safe.confirm.snapshot, safe.confirm.forceDiscardIncoming)}`);
+    return;
+  }
+  safeErr(`${safe.repo}: ${safe.message}`);
+  if (safe.status === "snapshot-mismatch" && safe.discardReport) printDiscardReport(safe.discardReport, safeErr);
+  if (safe.current) printShow(safe.current, safeErr, machine);
+}
+
+/** Empty when the hostname is unreadable or useless, so the copy falls back to
+ *  the direction-only sentences instead of naming a placeholder machine. */
+function localMachine(deps: GitResolveDeps): string | undefined {
+  let raw: string;
+  try {
+    raw = (deps.hostname ?? os.hostname)();
+  } catch {
+    return undefined;
+  }
+  const name = sanitizeTerminalText(raw.replace(/[\r\n\p{Cc}]+/gu, " ")).trim();
+  return name && name !== "localhost" ? name : undefined;
 }

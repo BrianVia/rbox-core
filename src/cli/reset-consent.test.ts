@@ -214,7 +214,12 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     "daemon/daemon.ts": 1,
     // Eight direct reloads (including keep-mine's synchronous confirm reload)
     // in the resolve workflow, plus gitDeferralsCmd's dependency-injectable call.
-    "git/resolve-command.ts": 8,
+    // Design 273 PR-A split the workflow into its verb transactions; the same
+    // eight reloads moved with the code that performs them. Total unchanged.
+    "git/resolve-artifacts.ts": 3,
+    "git/resolve-command.ts": 1,
+    "git/resolve-keep-mine.ts": 2,
+    "git/resolve-take-theirs.ts": 2,
     "git/deferrals-command.ts": 1,
   };
   const cli = path.dirname(new URL(import.meta.url).pathname);
