@@ -48,7 +48,7 @@ export const daemonIdleCpu: Scenario = {
     const rec = createRecorder(ctx);
 
     try {
-      await provisionPair(ctx, rec, { seedShape: "tiny", seedNum: 1 });
+      await provisionPair(ctx, rec, { corpus: "tiny", seedNum: 1 });
       await startDaemons(ctx, rec);
 
       // Idle soak: no file activity for SOAK_MS; the P1 sampler keeps writing stats.

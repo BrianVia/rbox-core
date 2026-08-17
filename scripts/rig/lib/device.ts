@@ -233,9 +233,10 @@ export class Device {
 
   /** `rbox start` in `workDir` — spawns the detached background-sync daemon
    *  (design 45). Throws on nonzero exit (a daemon that won't start is a hard
-   *  scenario failure). */
-  async daemonStart(workDir: string, env?: Record<string, string>): Promise<RunResult> {
-    return this.rbox(["start"], { cwd: workDir, env });
+   *  scenario failure). `args` passes start flags through (design 272 §7:
+   *  `--pull-only` is the only way to exercise the FM shape in CI). */
+  async daemonStart(workDir: string, env?: Record<string, string>, args: readonly string[] = []): Promise<RunResult> {
+    return this.rbox(["start", ...args], { cwd: workDir, env });
   }
 
   /** `rbox stop` in `workDir` — SIGTERMs the daemon (graceful; never SIGKILL).
@@ -372,8 +373,8 @@ export class Device {
    * (shape, seed) → byte-identical tree; the shape deliberately includes empty and
    * duplicate-content files (design 56 §9 regression shapes).
    */
-  async seedCorpus(dir: string, shape: string, seed: number): Promise<void> {
+  async seedCorpus(dir: string, corpusName: string, seed: number): Promise<void> {
     await this.mkdirp(dir);
-    await this.exec(["bun", GUEST.corpusEntry, dir, shape, String(seed)]);
+    await this.exec(["bun", GUEST.corpusEntry, dir, corpusName, String(seed)]);
   }
 }

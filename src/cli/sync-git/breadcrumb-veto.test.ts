@@ -8,6 +8,7 @@ import {
   resetBreadcrumbVetoLogForTests,
   type BreadcrumbVetoGate,
 } from "./breadcrumb-veto.js";
+import { GIT_DEFERRAL_REASONS, type GitDeferralReason } from "../sync-state-model.js";
 
 const VERBATIM = [
   "held-refs", "tombstone-pruned-this-cycle", "in-progress-present",
@@ -29,23 +30,32 @@ describe("BreadcrumbVetoGate", () => {
   });
 
   test("maps every deferral member without a free-form fallback", () => {
-    expect([
-      breadcrumbGateForReason("local-edits"), breadcrumbGateForReason("local-index"),
-      breadcrumbGateForReason("local-operation"), breadcrumbGateForReason("local-commits"),
-      breadcrumbGateForReason("local-stash"), breadcrumbGateForReason("deletion-pending"),
-      breadcrumbGateForReason("worktree-ownership"),
-      breadcrumbGateForReason("git-busy"), breadcrumbGateForReason("ref-read-unreadable"), breadcrumbGateForReason("unreadable"),
-      breadcrumbGateForReason("artifact"), breadcrumbGateForReason("containment"),
-      breadcrumbGateForReason("unsupported"), breadcrumbGateForReason("conflict"),
-      breadcrumbGateForReason("ignored-target"), breadcrumbGateForReason("config"),
-      breadcrumbGateForReason("other"),
-    ]).toEqual([
-      "reason-local-edits", "reason-local-index", "reason-local-operation", "reason-local-commits",
-      "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership", "reason-git-busy",
-      "reason-ref-read-unreadable", "reason-unreadable",
-      "reason-artifact", "reason-containment", "reason-unsupported", "reason-other",
-      "reason-other", "reason-other", "reason-other",
-    ]);
+    // `assertNever` is the runtime gate; `Record<GitDeferralReason, …>` is the
+    // compile-time one — a new reason cannot be omitted here the way the earlier
+    // hand-written list silently omitted `stale-unattributed` and `conflict-copies`.
+    const expected = {
+      "local-edits": "reason-local-edits",
+      "local-index": "reason-local-index",
+      "local-operation": "reason-local-operation",
+      "local-commits": "reason-local-commits",
+      "local-stash": "reason-local-stash",
+      "deletion-pending": "reason-deletion-pending",
+      "worktree-ownership": "reason-worktree-ownership",
+      "git-busy": "reason-git-busy",
+      "stale-unattributed": "reason-git-busy",
+      "ref-read-unreadable": "reason-ref-read-unreadable",
+      unreadable: "reason-unreadable",
+      artifact: "reason-artifact",
+      containment: "reason-containment",
+      unsupported: "reason-unsupported",
+      conflict: "reason-other",
+      "conflict-copies": "reason-other",
+      "ignored-target": "reason-other",
+      config: "reason-other",
+      other: "reason-other",
+    } satisfies Record<GitDeferralReason, BreadcrumbVetoGate>;
+    expect(Object.fromEntries(GIT_DEFERRAL_REASONS.map((reason) => [reason, breadcrumbGateForReason(reason)])))
+      .toEqual(expected);
   });
 
   test("logs once per workspace, repository, and gate", () => {

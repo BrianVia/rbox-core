@@ -127,9 +127,12 @@ export interface ConfigStoreIdentity {
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
+/** Order is load-bearing for `gitReasonOf` (doctor-cmd.ts:213): a member that is
+ *  a SUPERSTRING of another must be declared before it, or the shorter one
+ *  shadows it. Pinned by the invariant test; do not sort this list. */
 export const GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "ref-read-unreadable", "unreadable",
+  "deletion-pending", "conflict-copies", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "ref-read-unreadable", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ] as const;
 
@@ -147,7 +150,7 @@ export type GitDeferralReason = (typeof GIT_DEFERRAL_REASONS)[number];
  * a new reason must be ranked on purpose, never inherit a rank by accident.
  */
 export const GIT_DEFERRAL_REASON_PRECEDENCE = [
-  "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "deletion-pending", "conflict",
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "deletion-pending", "conflict", "conflict-copies",
   "worktree-ownership", "git-busy", "stale-unattributed", "ref-read-unreadable", "unreadable", "artifact", "config",
   "ignored-target", "containment", "unsupported", "other",
 ] as const satisfies readonly GitDeferralReason[];

@@ -220,6 +220,9 @@ export interface StatusDetailProjection extends StatusProjectionCommon {
    * Deliberately top-level rather than inside `counts`, which is entangled with
    * `counts.source`. */
   strandedIgnored?: number;
+  /** Design 272 §4: rbox-minted conflict copies on this device. Top-level for the
+   *  same reason `strandedIgnored` is — `counts` is entangled with `counts.source`. */
+  conflictCopies?: number;
   localChanges: number;
   health: "halt" | "outofstorage" | "active" | "pending" | "ok";
   populate?: PopulateStatusV1;

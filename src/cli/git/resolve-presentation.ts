@@ -83,11 +83,19 @@ export function printShow(show: GitResolveShow, write: (line: string) => void, m
   write(`  Confirmation token: ${show.snapshot}`);
 }
 
+const FIXED_LANE_LABELS = new Map([
+  ["stash", "stash"],
+  ["head", "checked-out branch"],
+  ["refscope", "sync scope"],
+  ["index", "staging area"],
+  ["opstate", "in-progress operation state"],
+  ["config", "repo settings"],
+]);
+
 function laneLabel(lane: string): string {
   if (lane.startsWith("branch:")) return `branch ${lane.slice("branch:".length).replace(/^refs\/heads\//, "")}`;
   if (lane.startsWith("tag:")) return `tag ${lane.slice("tag:".length).replace(/^refs\/tags\//, "")}`;
-  const names: Record<string, string> = { stash: "stash", head: "checked-out branch", refscope: "sync scope", index: "staging area", opstate: "in-progress operation state", config: "repo settings" };
-  return names[lane] ?? lane;
+  return FIXED_LANE_LABELS.get(lane) ?? lane;
 }
 
 export function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
@@ -123,13 +131,14 @@ export function safeResolveOutput<T>(value: T, root: string): T {
 }
 
 export function refusalMessage(reason: GitDeferralReason): string {
-  const messages: Record<GitDeferralReason, string> = {
+  const messages = {
     "local-edits": "local edits prevent the confirmed checkout from being published safely",
     "local-index": "local index changes prevent the confirmed checkout from being published safely",
     "local-operation": "a local Git operation prevents the confirmed checkout from being published safely",
     "local-commits": "local commits changed while the checkout was being confirmed",
     "local-stash": "the local stash changed while the checkout was being confirmed",
     "deletion-pending": "rbox is still finishing a branch deletion before the confirmed checkout can be published safely",
+    "conflict-copies": "rbox-made conflict copies are the only files left to compare in this repository",
     conflict: "the confirmed checkout still conflicts with local Git state",
     artifact: "incoming Git artifacts could not be fetched and verified",
     "ref-read-unreadable": "Git refs could not be read completely, so rbox refused ref authority",
@@ -142,6 +151,6 @@ export function refusalMessage(reason: GitDeferralReason): string {
     "ignored-target": "the confirmed checkout targets an ignored repository",
     config: "Git configuration could not be published safely",
     other: "the confirmed checkout could not be published safely",
-  };
+  } satisfies Record<GitDeferralReason, string>;
   return messages[reason];
 }

@@ -74,6 +74,7 @@ export function breadcrumbGateForReason(reason: GitDeferralReason): BreadcrumbVe
     case "containment": return "reason-containment";
     case "unsupported": return "reason-unsupported";
     case "conflict":
+    case "conflict-copies":
     case "ignored-target":
     case "config":
     case "other": return "reason-other";

@@ -23,6 +23,7 @@ import { applyPulledManifest } from "../sync.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections } from "./apply.js";
 import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
+import { CONFLICT_COPY_POPULATION_WHY } from "../../engine/apply-receipt.js";
 import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { opStateDetailToken } from "./follow-classify.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
@@ -3234,3 +3235,21 @@ for (const [label, hidden] of [
     expect(prior.base).toBeDefined();
   });
 }
+
+const indeterminateOracle = (why: string): AppliedManifestOracle => ({
+  proveRepo: async () => ({ kind: "indeterminate", why }),
+  reproveRepo: async () => ({ kind: "indeterminate", why }),
+  receiptHash: () => undefined,
+});
+
+test("disposition: a grammar-emptied oracle defers conflict-copies, not unreadable", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const { outcome } = await applyIncoming(state, incoming, indeterminateOracle(CONFLICT_COPY_POPULATION_WHY));
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("conflict-copies");
+});
+
+test("disposition: any other indeterminate why still defers unreadable", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const { outcome } = await applyIncoming(state, incoming, indeterminateOracle("repo entry is unreadable"));
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+});

@@ -10,6 +10,7 @@
 import path from "node:path";
 import { enumerateStashReflogOids, partitionOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
 import { type RepoCtx } from "./git-state.js";
+import { CONFLICT_COPY_POPULATION_WHY } from "../../engine/apply-receipt.js";
 import { OP_STATE_CLASSIFICATION } from "../../engine/manifest-validate.js";
 import { addTimedMs } from "./chain-timings.js";
 import type { GitDeferralReason, GitPartialApply, TypedBlocker } from "../config.js";
@@ -136,7 +137,10 @@ export async function classifyCheckout(args: {
     const sample = oracle.sample.length > 0 ? ` (differs at ${oracle.sample.join(", ")})` : "";
     details.push(`working tree differs from applied manifest${sample}`);
   }
-  else if (oracle.kind === "indeterminate") { reasons.add("unreadable"); details.push(oracle.why); }
+  else if (oracle.kind === "indeterminate") {
+    reasons.add(oracle.why === CONFLICT_COPY_POPULATION_WHY ? "conflict-copies" : "unreadable");
+    details.push(oracle.why);
+  }
 
   const live = args.live;
   if (!live) {
@@ -223,7 +227,9 @@ export async function classifyCheckout(args: {
   const reason = firstReason(reasons);
   const provenance = args.boundary ? "boundary" as const : "checkout" as const;
   const blockers = [...reasons].map((item) => blockerForReason(item, provenance, details.join("; ")));
-  return reason
-    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
-    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
+  const classified: CheckoutClassification = reason
+    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false }
+    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived };
+  if (breadcrumbVetoGate) classified.breadcrumbVetoGate = breadcrumbVetoGate;
+  return classified;
 }

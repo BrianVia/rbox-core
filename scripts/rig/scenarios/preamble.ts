@@ -23,8 +23,8 @@ import { parsePairToken } from "./types.js";
 export const CONCURRENCY = "16";
 
 export interface ProvisionOpts {
-  /** Seed a deterministic corpus on A before init (shape name, e.g. "tiny"). */
-  seedShape?: string;
+  /** Seed a deterministic corpus on A before init (generator name, e.g. "tiny"). */
+  corpus?: string;
   /** Corpus seed (content varies, shape fixed). Default 1. */
   seedNum?: number;
   /** Extra per-device seeding on A after the corpus, before init (e.g. a symlink). */
@@ -152,9 +152,9 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
 
   // 2. A: seed corpus (optional) + any scenario-specific extra (symlink, …). The
   //    workspace dir must exist before init even when nothing is seeded.
-  if (opts.seedShape) {
+  if (opts.corpus) {
     await rec.step("[A] seed corpus", async () => {
-      await ctx.a.seedCorpus(GUEST.workDir, opts.seedShape!, opts.seedNum ?? 1);
+      await ctx.a.seedCorpus(GUEST.workDir, opts.corpus!, opts.seedNum ?? 1);
       if (opts.afterSeedA) await opts.afterSeedA(ctx.a);
     });
   } else {
@@ -230,12 +230,13 @@ function hasHeartbeat(contents: string | undefined): boolean {
  * Records a `[X] daemon heartbeat` step per device that FAILS if no heartbeat lands
  * within {@link DAEMON_READY_TIMEOUT_MS}.
  */
-export async function startDaemons(ctx: RigCtx, rec: Recorder, env?: Record<string, string>): Promise<DaemonModes> {
-  await rec.step("[A] rbox start (daemon)", async () => {
-    await ctx.a.daemonStart(GUEST.workDir, env);
+export async function startDaemons(ctx: RigCtx, rec: Recorder, env?: Record<string, string>, pullOnly: { a?: boolean; b?: boolean } = {}): Promise<DaemonModes> {
+  const startArgs = (only: boolean | undefined): readonly string[] => (only ? ["--pull-only"] : []);
+  await rec.step(`[A] rbox start (daemon${pullOnly.a ? ", pull-only" : ""})`, async () => {
+    await ctx.a.daemonStart(GUEST.workDir, env, startArgs(pullOnly.a));
   });
-  await rec.step("[B] rbox start (daemon)", async () => {
-    await ctx.b.daemonStart(GUEST.workDir, env);
+  await rec.step(`[B] rbox start (daemon${pullOnly.b ? ", pull-only" : ""})`, async () => {
+    await ctx.b.daemonStart(GUEST.workDir, env, startArgs(pullOnly.b));
   });
 
   const waitHeartbeat = async (label: "A" | "B", device: Device): Promise<void> => {

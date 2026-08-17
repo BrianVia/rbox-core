@@ -6,6 +6,27 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `rbox status` now counts the conflict copies rbox saved for you and still
+  sitting in the workspace, so they are visible without hunting for
+  `*.conflict*` files by hand. The count is also in `rbox status --json` as
+  `conflictCopies`. A moved-aside folder counts as one thing to deal with,
+  however many files it holds.
+- New "conflict copies" hold reason for folders whose sync is paused. When the
+  only thing left to compare in a folder is copies rbox saved during an earlier
+  conflict, sync says so in plain language — "only conflict-copies remain here,
+  so the comparison was skipped" — instead of an unexplained pause.
+
+### Fixed
+- Conflict copies rbox saved no longer make a folder look permanently
+  out-of-sync. Previously a saved copy could keep a folder's comparison from
+  ever settling, so it stayed stuck even after everything else had synced.
+- Deleting the last conflict copy in a folder now clears the hold on the same
+  sync cycle. Previously that pull could pause for a cycle and tell you to
+  delete files it had just removed.
+- An ignore rule that happens to match conflict-copy names (e.g. `*.conflict*`)
+  no longer pauses every folder it applies to.
+
 ## [2.0.0-beta.4] - 2026-08-16
 
 ### Fixed

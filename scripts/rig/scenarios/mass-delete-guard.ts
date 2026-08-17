@@ -26,7 +26,7 @@ export const massDeleteGuard: Scenario = {
 
     try {
       // Converged baseline: 100-file `tiny` corpus on both devices.
-      await provisionPair(ctx, rec, { seedShape: "tiny", seedNum: 1 });
+      await provisionPair(ctx, rec, { corpus: "tiny", seedNum: 1 });
 
       const baselineB = await rec.step("[B] fingerprint baseline", async () => fingerprintTree(ctx.b, GUEST.workDir));
       rec.assert("B baseline has the corpus", baselineB.fileCount >= 100, `${baselineB.fileCount} files`);
