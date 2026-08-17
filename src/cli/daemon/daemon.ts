@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   buildIgnoreMatcher,
+  countConflictCopies,
   discoverGitRepos,
   discoverGitReposUnder,
   diffManifests,
@@ -2265,6 +2266,7 @@ export class RboxDaemon {
       stream: base.stream,
       baseSequence: base.lastSyncedSequence,
       trackedFiles: this.local.manifest.files.length,
+      conflictCopies: countConflictCopies(this.local.manifest.files),
       added: manifestDiff.added.length,
       changed: manifestDiff.changed.length,
       deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,

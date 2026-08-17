@@ -14,6 +14,7 @@ import {
   renderBriefStatus,
   renderGitDeferralCompanion,
   renderGitDeferralLine,
+  conflictCopiesLine,
   strandedIgnoredLine,
   trashLine,
   watcherTrustLine,
@@ -148,6 +149,7 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
     // Design 224 §2.3: deliberately OUTSIDE the `local` block, which is emitted
     // only for a daemon snapshot — the count exists on both branches.
     ...(projection.strandedIgnored === undefined ? {} : { strandedIgnored: projection.strandedIgnored }),
+    conflictCopies: projection.conflictCopies,
     ...(counts.source === "daemon"
       ? {
         local: {
@@ -272,6 +274,8 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
   }
   const strandedLine = strandedIgnoredLine(projection.strandedIgnored);
   if (strandedLine) lines.push(`  ${strandedLine}`);
+  const copiesLine = conflictCopiesLine(projection.conflictCopies);
+  if (copiesLine) lines.push(`  ${copiesLine}`);
   if (gitDetail) {
     for (const deferral of git.humanProjectedRepos) {
       lines.push(`  ${renderGitDeferralLine({
@@ -317,6 +321,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     activity,
     pathWarnings: projection.pathWarnings,
     strandedIgnored: projection.strandedIgnored,
+    conflictCopies: projection.conflictCopies,
     populate: populate
       ? {
         phase: populate.operation.phase,

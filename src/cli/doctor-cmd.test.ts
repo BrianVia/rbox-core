@@ -17,7 +17,9 @@ import {
   type DoctorChecks,
   type DoctorContext,
 } from "./doctor-cmd.js";
+import { CONFLICT_COPY_POPULATION_WHY } from "../engine/apply-receipt.js";
 import { git } from "../engine/git-spawn.js";
+import { gitDeferralReasonPresentation } from "./status-view.js";
 import { gitIdentity, gitIdentityKey } from "./sync-git/identity.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { saveDevice } from "./e2ee-keystore.js";
@@ -879,4 +881,16 @@ test("non-TTY --report without --yes refuses before writing a preview file", asy
   Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
   await expect(presentDiagnosticsPreview(sampleBundle(), { yes: false })).rejects.toThrow(/--yes/);
   await expect(fs.readdir(path.join(home, ".rbox"))).rejects.toThrow();
+});
+
+test("a conflict-copies hold buckets correctly through both doctor channels", () => {
+  // The `why` half: asserted over the exported constant, never a literal — a
+  // literal stays green if the constant drifts back to the singular.
+  expect(redactGitLogLines(`git-sync deferred r: ${CONFLICT_COPY_POPULATION_WHY}`))
+    .toBe("git-sync deferred reason=conflict-copies age=-");
+  // The label half, read from its own seam for the same reason: the daemon's
+  // `git deferred` line carries the rendered LABEL, not the why.
+  const label = gitDeferralReasonPresentation("conflict-copies").label;
+  expect(redactGitLogLines(`git deferred 1h: ${label} on branch main (r)`))
+    .toBe("git-sync deferred reason=conflict-copies age=1h");
 });

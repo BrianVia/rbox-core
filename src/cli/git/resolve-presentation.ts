@@ -130,6 +130,7 @@ export function refusalMessage(reason: GitDeferralReason): string {
     "local-commits": "local commits changed while the checkout was being confirmed",
     "local-stash": "the local stash changed while the checkout was being confirmed",
     "deletion-pending": "rbox is still finishing a branch deletion before the confirmed checkout can be published safely",
+    "conflict-copies": "rbox-made conflict copies are the only files left to compare in this repository",
     conflict: "the confirmed checkout still conflicts with local Git state",
     artifact: "incoming Git artifacts could not be fetched and verified",
     "ref-read-unreadable": "Git refs could not be read completely, so rbox refused ref authority",

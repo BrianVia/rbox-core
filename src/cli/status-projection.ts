@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
+import { countConflictCopies, diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
 import {
@@ -292,6 +292,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   let counts: StatusLocalCounts;
   let cacheHint: StatusCacheHint | undefined;
   let strandedIgnored: number | undefined;
+  let conflictCopies: number | undefined;
   if (trusted) {
     const matcher = port.buildMatcher(root, {
       respectGitignore: false,
@@ -300,6 +301,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     const repoHints = cfg.syncGit ? await port.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
     const gitStatus = await evaluateGit(undefined, repoHints, false);
     strandedIgnored = trusted.local.strandedIgnored;
+    conflictCopies = trusted.local.conflictCopies;
     counts = {
       added: trusted.local.added,
       changed: trusted.local.changed,
@@ -360,6 +362,8 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     const projected = projectLocalManifest(rawLocalManifest, scopedBaseManifest, matcher);
     const localManifest = projected.manifest;
     strandedIgnored = projected.strandedIgnored;
+    // `rawLocalManifest`, never the post-carry manifest: only the raw scan is this disk.
+    conflictCopies = countConflictCopies(rawLocalManifest.files);
     // A full status scan owns current read-only disk truth for this invocation.
     // It never mutates the durable sidecar; the passive loop remains its writer.
     pathWarnings = buildPathWarnings(projected.caseCollisions);
@@ -454,5 +458,6 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
         : { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials), update: await probes.readUpdateState() },
   };
   if (strandedIgnored !== undefined) detail.strandedIgnored = strandedIgnored;
+  if (conflictCopies !== undefined) detail.conflictCopies = conflictCopies;
   return detail as WorkspaceStatusProjection<M>;
 }

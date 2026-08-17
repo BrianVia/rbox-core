@@ -75,6 +75,9 @@ export interface DaemonActivity {
      *  this daemon's last projection. Optional — an older daemon, or one that has
      *  not pushed since start, omits it; `sourceVersion` stays 1. */
     strandedIgnored?: number;
+    /** Design 272 §4: locally observed entries carrying an rbox conflict-copy
+     *  path component. Optional — an older daemon omits it; `sourceVersion` stays 1. */
+    conflictCopies?: number;
     sourceVersion: 1;
   };
   /** Workspace-DO WebSocket currency evidence. `at` is refreshed only by WS-layer
@@ -150,6 +153,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       uint(local.deleted) &&
       flag(local.settled) &&
       (local.strandedIgnored === undefined || uint(local.strandedIgnored)) &&
+      (local.conflictCopies === undefined || uint(local.conflictCopies)) &&
       local.sourceVersion === 1
     ) {
       const decoded: NonNullable<DaemonActivity["local"]> = {
@@ -164,6 +168,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         sourceVersion: 1,
       };
       if (local.strandedIgnored !== undefined) decoded.strandedIgnored = local.strandedIgnored;
+      if (local.conflictCopies !== undefined) decoded.conflictCopies = local.conflictCopies;
       a.local = decoded;
     }
     const ws = raw.ws;

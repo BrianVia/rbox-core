@@ -635,3 +635,19 @@ Cost: ~25 minutes and three full 145s gate runs to identify a one-line import
 fix, including a wrong "cross-shard contention flake" hypothesis (each shard
 passed alone). Fixed here: a failing shard now keeps its raw last-40 lines;
 green shards keep the terse counts.
+
+## 2026-08-16 — finding and clearing rbox conflict copies (design 272 §4)
+`rbox status` now reports `conflictCopies` — rbox-minted `.conflict` backups
+still on this device. rbox never deletes them; deletion is the user's. List
+them with the grammar the oracle uses:
+
+```sh
+find <workspace-root> -regextype posix-extended \
+  -regex '.*\.[^/.]+\.[0-9]{14}\.conflict.*'
+```
+
+Inspect each against its original (same path, without the
+`.<device>.<timestamp>.conflict` infix), keep what you still need, then `rm`
+the rest. A repo whose ONLY remaining comparable content is conflict copies
+defers with reason `conflict-copies` until you clear them — that hold is
+deliberate, not a permissions problem.

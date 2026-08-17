@@ -230,12 +230,13 @@ function hasHeartbeat(contents: string | undefined): boolean {
  * Records a `[X] daemon heartbeat` step per device that FAILS if no heartbeat lands
  * within {@link DAEMON_READY_TIMEOUT_MS}.
  */
-export async function startDaemons(ctx: RigCtx, rec: Recorder, env?: Record<string, string>): Promise<DaemonModes> {
-  await rec.step("[A] rbox start (daemon)", async () => {
-    await ctx.a.daemonStart(GUEST.workDir, env);
+export async function startDaemons(ctx: RigCtx, rec: Recorder, env?: Record<string, string>, pullOnly: { a?: boolean; b?: boolean } = {}): Promise<DaemonModes> {
+  const startArgs = (only: boolean | undefined): readonly string[] => (only ? ["--pull-only"] : []);
+  await rec.step(`[A] rbox start (daemon${pullOnly.a ? ", pull-only" : ""})`, async () => {
+    await ctx.a.daemonStart(GUEST.workDir, env, startArgs(pullOnly.a));
   });
-  await rec.step("[B] rbox start (daemon)", async () => {
-    await ctx.b.daemonStart(GUEST.workDir, env);
+  await rec.step(`[B] rbox start (daemon${pullOnly.b ? ", pull-only" : ""})`, async () => {
+    await ctx.b.daemonStart(GUEST.workDir, env, startArgs(pullOnly.b));
   });
 
   const waitHeartbeat = async (label: "A" | "B", device: Device): Promise<void> => {

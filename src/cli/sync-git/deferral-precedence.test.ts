@@ -49,3 +49,17 @@ test("the shipped precedence of the original reasons is unchanged", () => {
     for (let j = i + 1; j < legacy.length; j++) expect(winner([legacy[j]!, legacy[i]!])).toBe(legacy[i]!);
   }
 });
+
+test("a superstring reason is declared before the member it would otherwise shadow", () => {
+  // `gitReasonOf` (doctor-cmd.ts:213) returns the FIRST declared member the
+  // normalized detail `includes()`, so a shorter member declared earlier
+  // permanently shadows every longer member containing it.
+  for (const a of GIT_DEFERRAL_REASONS) {
+    for (const b of GIT_DEFERRAL_REASONS) {
+      if (a === b || !a.includes(b)) continue;
+      expect([a, b, GIT_DEFERRAL_REASONS.indexOf(a) < GIT_DEFERRAL_REASONS.indexOf(b)]).toEqual([a, b, true]);
+    }
+  }
+  expect(GIT_DEFERRAL_REASONS.filter((a) => GIT_DEFERRAL_REASONS.some((b) => a !== b && a.includes(b))))
+    .toEqual(["conflict-copies", "ref-read-unreadable"]);
+});

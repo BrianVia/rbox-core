@@ -6,3 +6,8 @@ const RBOX_CONFLICT_ARTIFACT =
 export function isRboxConflictArtifact(component: string): boolean {
   return RBOX_CONFLICT_ARTIFACT.test(component);
 }
+
+/** The `rbox status` count: locally observed entries carrying a conflict-copy component. */
+export function countConflictCopies(files: ReadonlyArray<{ path: string }>): number {
+  return files.filter((file) => file.path.split("/").some(isRboxConflictArtifact)).length;
+}

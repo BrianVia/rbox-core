@@ -49,6 +49,8 @@ export interface StatusSnapshot {
   /** Design 224 §2.3: already-synced entries that match the ignore rules and are
    *  carried forward rather than deleted. Advisory; `rbox ignore --purge` clears it. */
   strandedIgnored?: number;
+  /** Design 272 §4: rbox-minted conflict copies on this device; the user owns deletion. */
+  conflictCopies?: number;
   populate?: {
     phase: TransferPhase;
     filesDone: number;
@@ -293,6 +295,7 @@ const DEFERRAL_REASON_PRESENTATION = {
   "local-commits": { label: "local commits", text: "Local commits changed here.", repair: "Stop Git mutation, then let normal sync retry.", transient: true },
   "local-stash": { label: "local stash", text: "The local stash changed here.", repair: "Stop stash mutation, then let normal sync retry.", transient: true },
   "deletion-pending": { label: "finishing a branch deletion", text: "rbox is finishing a branch you deleted here.", repair: "rbox retries this on its own. If it stays, run `rbox doctor`.", transient: true },
+  "conflict-copies": { label: "conflict copies", text: "Backup copies rbox made of conflicting files are the only thing left to compare here.", repair: "Remove the conflict-copy files (or resolve them), then let sync retry.", transient: false },
   conflict: { label: "conflict", text: "Incoming and local Git state conflict.", repair: "Repair the conflicting repository state, then let sync retry.", transient: false },
   "git-busy": { label: "git busy", text: "Another Git process is using this repository.", repair: "Let the other Git process finish, then let sync retry.", transient: false },
   "stale-unattributed": { label: "stale Git locks", text: "A stable lock cohort remains without a known live owner.", repair: "Run `rbox doctor`, confirm no Git process owns the reported locks, then remove only the stale lock files and let sync retry.", transient: false },
@@ -925,6 +928,8 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   }
   const stranded = strandedIgnoredLine(s.strandedIgnored);
   if (stranded) lines.push(stranded);
+  const copies = conflictCopiesLine(s.conflictCopies);
+  if (copies) lines.push(copies);
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {
     lines.push(`${style.yellow("git deferral:")} oldest ${ageBucket(s.gitOldestDeferral.deferredSince, s.now)} · ${gitDeferralReasonText(s.gitOldestDeferral.reason)}`);
   }
@@ -948,6 +953,16 @@ export function strandedIgnoredLine(count: number | undefined): string | undefin
     ? "1 file matches your ignore rules but is still synced"
     : `${n(count)} files match your ignore rules but are still synced`;
   return `${style.yellow(`⚠ ${body}`)} · ${style.dim("rbox ignore --purge")}`;
+}
+
+/** Design 272 §4: rbox-minted conflict copies still on this device. Deliberately NOT
+ *  `counts.conflictSnapshots`, which is the `refs/rbox-conflict/` git-ref namespace. */
+export function conflictCopiesLine(count: number | undefined): string | undefined {
+  if (!count || count <= 0) return undefined;
+  const body = count === 1
+    ? "1 conflict copy rbox saved is still here"
+    : `${n(count)} conflict copies rbox saved are still here`;
+  return `${style.yellow(`⚠ ${body}`)} · ${style.dim("inspect, then delete the ones you do not need")}`;
 }
 
 /** The `rbox status` trash line (design 50 §2), or undefined when trash is empty — the
