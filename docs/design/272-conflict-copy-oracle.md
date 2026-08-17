@@ -1,12 +1,18 @@
 # 272 — rbox-minted conflict copies must not gate the git-plane oracle
 
-Status: **DRAFT r6** (folds the r5 delta-confirm: blockers B-r5-1 — §2.5's
-snippet must show the dir arm converting too — and B-r5-2 — the
-scope-projection claim restated to what the four callers actually do; plus
-corrections 1–6 and four nits. The headline product decision this round: a
-guard-armed hold gets its OWN deferral reason, `conflict-copies`, instead of
-riding `unreadable` (§2.7). r4's B-r4-1…B-r4-5, r3's D1/D2, r2's
-B1/R1–R5/m1–m3 and r1's C1/C2/M3–M7/m8–m10 all held).
+Status: **DRAFT r7** (folds the r6 delta-confirm. One blocker, B-r6-1: the
+scoped predicate must test components **strictly below** the projection root,
+not "at or below" — the repo's own name component is the caller's addressing
+exactly as an ancestor's is, so a root-named repo is now addressable and BOTH
+B1 pin arms assert `mismatch` (§2.3, §2.4, §6, §7). Plus C-r6-1 (§4's
+scope-projection claim narrowed to the STATUS path — `pull-scope.ts:58-59`
+projects local and remote on the pull path), C-r6-2 (the generic
+proof-indeterminate resolve refusal accepted as a priced residual, with a named
+follow-up), C-r6-3 (the declaration-order invariant behind the `doctor-cmd`
+ordering fix, now pinned by its own test), and four nits. r6's own product
+decision — a guard-armed hold gets its OWN deferral reason, `conflict-copies`
+(§2.7) — and r5's B-r5-1/B-r5-2, r4's B-r4-1…B-r4-5, r3's D1/D2, r2's
+B1/R1–R5/m1–m3 and r1's C1/C2/M3–M7/m8–m10 all held.)
 Every file:line below re-verified against `main` on 2026-08-16.
 
 Evidence: GH #659 (re-scoped 2026-08-16) — FM wedged 103 repos for 20+ hours
@@ -16,7 +22,7 @@ true hole. Parents: design 224 (ignore-plane ruling: silent un-syncing is
 worse than over-syncing), 236 (litter classes get reclassified at the gate,
 not instrumented), 244 (echo-publish + conflict-retry containment).
 
-## 0. Concept ledger (m2, corrected in r4 and r6)
+## 0. Concept ledger (m2, corrected in r4, r6, r7)
 
 **ONE new concept** ("rbox conflict artifact"), carried by **two exported
 symbols** — one predicate and one string constant:
@@ -36,7 +42,7 @@ exported and neither pinned by a direct call in a test:
 
 | Mechanism | Why it exists | Deletion condition |
 |---|---|---|
-| `comparableFor(root, eq, armed)` — a factory returning the per-prove bound closure `comparable(rel, kind): boolean`, the oracle's single "is this path compared at all?" answer | *replaces* five hand-copied exclusion expressions, and gives the guard one place to arm from | never, while the oracle has two sides |
+| `comparableFor(root, eq, armed)` — a factory returning the per-prove bound closure `comparable(rel, kind): boolean`, the oracle's single "is this path compared at all?" answer; the grammar arm tests components **strictly below** `root` (§2.3) | *replaces* five hand-copied exclusion expressions, and gives the guard one place to arm from | never, while the oracle has two sides |
 | the per-prove **empty-population guard** (§2.4) — the `armed` sink the closure sets when the conflict grammar (and only the conflict grammar) drops an entry | a zero-pair alignment is otherwise a vacuous `match` (D2) | the grammar stops being an exclusion reason |
 
 `comparable` is deliberately NOT exported: every consumer is inside
@@ -170,6 +176,13 @@ sides empty reaches `compareEntries` (`apply-receipt.ts:306-311`), whose
 arbitrary. That is a fail-open inversion of the entire design's goal — strictly
 worse than the wedge it replaces.
 
+**r7 note on that narrative's second half.** The `:636`/`:736` scope-leaf
+exclusion it names is exactly what the adopted predicate removes: with the test
+restricted to components strictly below `root`, the scope leaf IS `root`, so it
+can never be dropped by the grammar, on either walk. The remaining way to empty
+`scopedScan` is conflict-named content strictly *inside* the repo — §2.4's
+class, not this one.
+
 **It is reachable, not theoretical.** Two producers create conflict-named
 DIRECTORY names: `apply.ts:296-307` (trash disabled ⇒ a squatting directory is
 `moveAside`d whole under a conflict name) and `trash.ts:250-252` (restore onto
@@ -180,24 +193,37 @@ directory — `claimUnclobberedName` takes `st.isDirectory()` explicitly). And
 `prunesForGitDiscovery`/`ignores` at `:61` — so conflict-named directories are
 not ignored, a repo underneath one IS discovered and IS proved.
 
-**Adopted fix — option 1.** The closure is bound to the normalized projection
-root and tests only components **at or below** it:
+**Adopted fix — option 1, corrected in r7 (B-r6-1).** The closure is bound to
+the normalized projection root and tests only components **strictly below** it:
 
 ```ts
-/** Components strictly above `root` are the caller's addressing, not content:
- *  a repo that merely LIVES under a conflict-named directory must compare
- *  exactly as it does today. */
+/** Components AT OR ABOVE `root` are the caller's addressing, not content:
+ *  `proveRepo(rel)` addresses this repo BY that path, so neither an ancestor's
+ *  name nor the repo's OWN name component is evidence about what the repo
+ *  contains. Only components strictly below `root` are content. */
 comparableFor(root: string, eq: ReceiverEquivalence, armed: { hit: boolean }):
   (rel: string, kind: ComparableKind) => boolean
 ```
 
-For `root = "."` this is every component, as before. For `root = "a.dev_x.
-<ts>.conflict/repo"` the ancestor `a.dev_x.<ts>.conflict` is skipped and the
-repo compares normally; a conflict-named directory *inside* that repo still
-prunes its subtree. This keeps §2.3's whole point (a conflict-named directory
-is one excluded object, not N extras) and removes the ANCESTOR instance of the
-vacuous match — a repo is no longer misclassified by a name that belongs to its
-caller's addressing rather than to its content.
+For `root = "."` this is every component of every `rel`, as before — the
+workspace root is not itself a component. For `root = "a.dev_x.<ts>.conflict/
+repo"` the ancestor `a.dev_x.<ts>.conflict` is skipped and the repo compares
+normally; for `root = "a/b.dev_x.<ts>.conflict"` — the repo's OWN directory
+carrying the grammar — the same holds, because `proveRepo(rel)` addresses that
+repo BY that path and the name is not content. In both, a conflict-named
+directory *inside* the repo still prunes its subtree.
+
+**Why the root component goes with the ancestors (B-r6-1, r7).** r6 wrote the
+test as "at or below `root`", which left the repo's own name component in the
+content population — so a repo that a `moveAside` had renamed under the grammar
+emptied both populations and was misclassified by its own address. The caller
+already committed to that path when it asked for a proof of it; the repo's name
+component is the caller's addressing exactly as an ancestor's is. Testing
+strictly below `root` is the whole correction. It keeps §2.3's original point (a
+conflict-named directory is one excluded object, not N extras) and removes BOTH
+addressing instances of the vacuous match — ancestor-named and root-named — so
+neither is misclassified by a name that belongs to its caller's addressing
+rather than to its content.
 
 **`root` is bound once, not threaded.** `project()`
 (`apply-receipt.ts:460-483`) is the only caller of `normalizeRel` (`:463`) and
@@ -207,32 +233,37 @@ reaches the walks. Recorded here because the shape's cheapness depends on that
 ordering: a future caller that walks without projecting first would have no
 closure to call.
 
-**Claim, narrowed (r4).** Root-scoping is **correct addressing**, not the
-safety property. A repo whose entire comparable population sits under a single
-conflict-named directory **at or below its own root** still lands on the same
-empty-both-sides chain — same `apply.ts:307` whole-directory eviction, applied
-to the repo's one content directory. §2.4 is what makes that class safe.
+**Claim, narrowed (r4, re-stated for the r7 predicate).** Root-scoping is
+**correct addressing**, not the safety property. A repo whose entire comparable
+population sits under a single conflict-named directory **strictly below its own
+root** — i.e. inside the repo — still lands on the same empty-both-sides chain:
+same `apply.ts:307` whole-directory eviction, applied to the repo's one content
+directory. §2.4 is what makes that class safe.
 
 **But addressing here IS availability (r5).** With §2.4's guard shipping,
-dropping §2.3 does not merely mis-address such a repo: every repo living under
-a conflict-named ancestor has both populations emptied BY THE GRAMMAR, arms the
-guard, and becomes **permanently `indeterminate`** — the FM wedge in a different
-color, reached by a different door. That is an availability property, not an
-addressing nicety, and it is why §2.3 stays required even though §2.4 owns
-safety.
+dropping §2.3 does not merely mis-address such a repo: every repo whose root or
+ancestor carries the grammar has both populations emptied BY THE GRAMMAR, arms
+the guard, and becomes **permanently `indeterminate`** — the FM wedge in a
+different color, reached by a different door. That is an availability property,
+not an addressing nicety, and it is why §2.3 stays required even though §2.4
+owns safety.
 
-**Pin (§7): a repo whose root or ancestor matches the grammar, with a working
-tree diverged from the applied manifest, must return the POSITIVE verdict
-(`mismatch`/`local-edits`) — not `match`, and not `indeterminate`.** Asserting
-only "not `match`" would stay green with §2.3 deleted, because the guard's
-`indeterminate` also satisfies it (B-r4-1).
+**Pin (§7), BOTH arms: a repo whose root matches the grammar, and — separately —
+a repo whose ancestor matches it, each with a working tree diverged from the
+applied manifest, must return `verdict.kind === "mismatch"` — not `match`, and
+not `indeterminate`.** The two arms are now the same rule (both names are
+addressing), which is exactly why both must be asserted: an implementation that
+regresses to "at or below" leaves the ancestor arm green and fails only the root
+arm. Asserting merely "not `match`" would stay green with §2.3 deleted, because
+the guard's `indeterminate` also satisfies it (B-r4-1).
 
 ### 2.4 The empty-population guard (D2) — a zero-pair prove is not a match
 
 The deeper primitive behind B1: **a prove that compared zero entries because
 the conflict grammar removed them is `indeterminate`, not `match`.** Root
-scoping (§2.3) removes one instance; this removes the class — ancestor, self,
-and at-or-below alike.
+scoping (§2.3) removes the two ADDRESSING instances — an ancestor's name and the
+repo's own name, neither of which is content; this removes the class that
+remains, a population emptied by conflict-named content strictly BELOW the root.
 
 **Where the vacuous match comes from.** With both populations empty,
 `compareEntries` (`apply-receipt.ts:306-311`) calls `alignPaths` (`:274-304`),
@@ -330,7 +361,7 @@ own two inputs. Writing the rule as "the verdict being stored is `match` and the
 `compareEntries` that produced it saw zero pairs" is what makes one sentence
 cover both.
 
-`settle()` (`:413-416`) is not a third site — it records a verdict with no
+`settle()` (`:413-415`) is not a third site — it records a verdict with no
 `receiptHash` and no `tokens`. **Verified across all eleven of its call sites**
 (`:391`, `:487`, `:491`, `:497`, `:503`, `:507`, `:516`, `:532`, `:653`,
 `:662`, `:666`): every one passes an `indeterminate`, either an
@@ -421,16 +452,19 @@ Today the same exclusion logic is hand-copied five times in
 | Line | Shape today | `kind` at the call |
 |---|---|---|
 | `:469` | manifest filter: `inProjection && !hardExcluded && !matcher.ignores` | `"leaf"` |
-| `:616` | cached walk, child: `hardExcluded ⇒ continue`; dir ⇒ `prunes(dirForm) ?? ignores`; leaf ⇒ `!ignores` | `"dir"` / `"leaf"` |
+| `:616` | cached walk, child: `hardExcluded ⇒ continue`; dir ⇒ `prunes?.(dirForm) ?? ignores`; leaf ⇒ `!ignores` | `"dir"` / `"leaf"` |
 | `:636` | cached walk, scope is a leaf | `"leaf"` |
 | `:713` | fresh walk, child (same shape as `:616`) | `"dir"` / `"leaf"` |
 | `:736` | fresh walk, scope is a leaf | `"leaf"` |
 
 Five hand-copies are five chances for the two sides to drift — that drift IS
 the bug class this design fixes. `comparable` =
-`!hardExcluded(rel, eq)` and `!matchesConflictGrammarAtOrBelow(rel, root)`
-and the matcher arm the `kind` already selects (`ignores(rel)` for `"leaf"`,
-`prunes(rel + "/") ?? ignores(rel + "/")` for `"dir"`). `kind` is not a new
+`!hardExcluded(rel, eq)` and `!matchesConflictGrammarBelow(rel, root)` (§2.3:
+components strictly below `root`) and the matcher arm the `kind` already selects
+(`ignores(rel)` for `"leaf"`, `prunes?.(rel + "/") ?? ignores(rel + "/")` for
+`"dir"` — `prunes` is OPTIONAL on `IgnoreMatcher` (`src/engine/ignore.ts:302`),
+so the folded call must keep the `?.`; a non-optional call throws on a matcher
+that does not implement it). `kind` is not a new
 concept: every call site already knows it statically.
 
 **Call-site count after the change (m3): seven** — `:469`, `:636`, `:736`,
@@ -461,7 +495,7 @@ directory decision has to be made before it:
 ```ts
 // scopedScan's child loop, replacing :714-722 (after :713's hardExcluded continue):
 if (child.isDirectory()) {
-  if (!comparable(childRel, "dir")) continue;   // was: prunes(dirForm) ?? ignores(dirForm)
+  if (!comparable(childRel, "dir")) continue;   // was: prunes?.(dirForm) ?? ignores(dirForm)
   await walk(childRel);
 } else {
   const type: DirCacheChild["type"] = child.isSymbolicLink() ? "symlink" : child.isFile() ? "file" : "other";
@@ -471,9 +505,14 @@ if (child.isDirectory()) {
 ```
 
 Two things to read off it. First, the `"dir"` kind carries the `dirForm`
-(`childRel + "/"`) construction and the `prunes ?? ignores` fallback INSIDE
+(`childRel + "/"`) construction and the `prunes?. ?? ignores` fallback INSIDE
 `comparable`, which is why `:715-716`'s two lines collapse to one call — the
-`dirForm` string never appears at a call site again, and neither does the `??`.
+`dirForm` string never appears at a call site again, and neither does the
+optional call or the `??`. The optional call is not cosmetic: `prunes` is an
+optional member of `IgnoreMatcher` (`src/engine/ignore.ts:302`), and both walks
+write it as `this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm)`
+today (`:619`, `:716`) — the fold must carry the `?.` verbatim or a matcher
+without `prunes` throws where it used to fall back.
 Second, `inventory`'s directory arm (`:617-620`) converts by literal
 substitution of the same call: its `"other"` arm is already a sibling
 (`:621-622`), so it needs no restructure, only the two swaps. That is the
@@ -577,12 +616,12 @@ footprint. Every site, anchored:
 | Surface | Anchor | What the new member needs |
 |---|---|---|
 | Enum declaration | `src/cli/sync-state-model.ts:130-134` (`GIT_DEFERRAL_REASONS`) | add `"conflict-copies"` |
-| Precedence ranking | `sync-state-model.ts:149-153` (`GIT_DEFERRAL_REASON_PRECEDENCE`) | rank it **immediately after `conflict`** and before `worktree-ownership` — it is a durable structural condition the user must clear, not an environmental one. `:156-158`'s `UnrankedGitDeferralReason` alias is a compile error until it is ranked; `:165` is the runtime duplicate check |
+| Precedence ranking | `sync-state-model.ts:149-153` (`GIT_DEFERRAL_REASON_PRECEDENCE`) | rank it **immediately after `conflict`** and before `worktree-ownership` — it is a durable structural condition the user must clear, not an environmental one. `:156-158`'s `UnrankedGitDeferralReason` alias is a compile error until it is ranked; `:165-167` is the load-time check, which compares the precedence SET's size against `GIT_DEFERRAL_REASONS.length` and so also catches a member ranked but never declared |
 | Wire/telemetry restatement | `src/cli/telemetry/contract.ts:158-165` | the deliberately duplicated list (`state-plane/duplicate-declarations.test.ts:59` licenses the two sites); `:163-165`'s exhaustiveness alias fails until it is added |
 | Telemetry length pin | `src/cli/telemetry/contract.test.ts:48` (`toHaveLength(18)`) | becomes `19` |
 | Status-view copy | `status-view.ts:289-307` (`DEFERRAL_REASON_PRESENTATION`, `satisfies Record<GitDeferralReason, …>` at `:308`) | the four fields below |
 | Resolve refusal copy | `src/cli/git/resolve-presentation.ts:125-146` (`refusalMessage`'s `Record<GitDeferralReason, string>`) | one sentence; the `Record` type makes omission a compile error |
-| Coverage test | `status-view.test.ts:163-169` | iterates `GIT_DEFERRAL_REASONS` asserting non-empty label/text/repair — it covers the new member automatically, and fails if the presentation entry is missing |
+| Coverage test | `status-view.test.ts:163-169` | iterates `GIT_DEFERRAL_REASONS` asserting non-empty label/text/repair — it covers the new member automatically, and fails if the presentation entry is missing. Its second half (`:170-174`) pins the unknown-reason FALLBACK (`"future-reason"` ⇒ "unrecognized Git issue", `transient: false`) and is untouched by adding a member |
 | Precedence test | `src/cli/sync-git/deferral-precedence.test.ts:11-19` | set-equality of enum vs precedence vs rank — covers it automatically |
 | Doctor reason inference | `src/cli/doctor-cmd.ts:43`, `:213-217` (`gitReasonOf`) | **see the ordering hazard below** |
 
@@ -598,6 +637,49 @@ Declaration order is explicitly "an enumeration, not a ranking"
 ranking lives in `GIT_DEFERRAL_REASON_PRECEDENCE` and is set independently
 above. Recorded because it is the one place where enum ORDER is load-bearing,
 and nothing type-checks it.
+
+**The general invariant behind that fix (C-r6-3).** `"conflict-copies"` before
+`"conflict"` is one instance of a rule the vocabulary now has to keep:
+**any `GIT_DEFERRAL_REASONS` member that is a superstring of another member must
+precede that member in the declaration.** `gitReasonOf` returns the FIRST
+`includes()` hit while iterating `GIT_DEFERRAL_REASON_SET`
+(`doctor-cmd.ts:213-217`), and that set is built from the declaration in order
+(`:43`), so a shorter member declared earlier permanently shadows every longer
+member containing it. Today `local-edits`/`local-index`/`local-operation`/
+`local-commits`/`local-stash` share only a prefix and collide with nothing, so
+the vocabulary satisfies the rule by luck rather than by construction. §7 adds a
+unit test that pins the invariant itself — for every ordered pair `(a, b)` with
+`a !== b` and `a.includes(b)`, `index(a) < index(b)` — because nothing types it
+and the next superstring member will be added by someone who has not read this
+paragraph.
+
+**Enforcement split of the nine rows above, so the cost is not overstated.**
+One row is the declaration itself. Of the eight that follow it: **four are
+compile-time** (precedence ranking, telemetry restatement, status-view copy,
+resolve refusal copy — each fails `tsc` until the member is handled), **three
+are carried automatically by existing tests** (the telemetry length pin, which
+is a one-digit edit; the status-view coverage test; the precedence test), and
+**one — `doctor-cmd`'s `gitReasonOf` — is unenforced by anything**, which is
+precisely why decision C-r6-3 above adds a test for it. Adding a member is
+mechanical everywhere except that last row.
+
+**Priced residual: the ordinary resolve refusal keeps its generic copy
+(C-r6-2).** `refusalMessage`'s new sentence reaches the user only on the
+locked-boundary refusal path (`resolve-command.ts:1070`, which emits
+`refusalMessage(follow.reason)` for the follow-up reason). The ORDINARY resolve
+refusal for a guard-downgraded repo never gets there: `proofIndeterminate` is
+set at `:269` the moment the oracle returns `indeterminate`, and the command
+short-circuits at `:686-687` (`keep-mine`) and `:892-893` with the canned
+`code: "proof-indeterminate"` text — "retry after Git state settles" — which is
+transient-flavoured copy for a hold whose `transient` is deliberately `false`.
+Accepted as a residual, not fixed here, because: the deferral surfaces
+(`rbox status`, `rbox doctor`, the deferral listing) are the primary visibility
+for this hold and they DO carry the new reason's copy; the generic refusal is
+shared across every indeterminate cause, so changing it means threading a cause
+into a message that today has none; and `resolve-command.ts` is at design 271's
+concurrent ratchet ceiling, which makes this the wrong PR to widen it in.
+**Ledgered follow-up (§6):** when `resolve-command.ts` is next split per its
+ratchet, the proof-indeterminate refusal gains reason-aware copy.
 
 **The copy, written for a non-developer** (matching the surrounding voice —
 `local-edits`'s "Working files changed here." register, not a paragraph):
@@ -626,9 +708,10 @@ repair text actively misdirects (permissions, not files), the condition is
 permanent rather than transient so the user sees it until they act, and the
 one user population that hits it — a receiver whose repo is all conflict copies
 — is precisely the population this design exists to unwedge. Trading a correct
-answer for eight enum entries, six of which the compiler demands anyway, is the
-wrong side of the primitives rule: this adds one member to an existing closed
-vocabulary, not a new mechanism.
+answer for the nine rows above — one declaration, four the compiler demands
+anyway, three existing tests carry for free, and one (`doctor-cmd`) that needs
+thought and now gets a test — is the wrong side of the primitives rule: this
+adds one member to an existing closed vocabulary, not a new mechanism.
 
 ## 3. Protected contract, and the complete consumer list (M4, R2)
 
@@ -788,12 +871,21 @@ RECORDS**, via `scope.classifyRepo(repo) === "in"` over repo keys —
 `workspace-observation.ts:86`, `sync-git/status.ts:90`/`:108`, and
 `deferral-hygiene.ts:221`. Those touch no file manifest at all.
 
-**No caller applies a scope projection to a file manifest except one, and that
-one projects the BASE.** `status-projection.ts:289-291` —
+**On the STATUS path, the only `projectFiles` call projects the BASE (C-r6-1,
+narrowed in r7).** `status-projection.ts:289-291` —
 `scopedBaseManifest = statusScope.projectFiles(state.lastSyncedManifest)` — is
 the only `projectFiles` call on the status path, and its argument is the applied
 base, never a local observation. (The same caller's other spend,
 `statusScope.probeKeys(statusRepoKeys)` at `:322`, is repo keys again.)
+
+r6 stated this workspace-wide ("no caller applies a scope projection to a file
+manifest except one"), which is false off the status path: `scopedPull`
+(`src/cli/scope/pull-scope.ts:58-59`) projects the LOCAL and REMOTE manifests as
+well as the base. That is the pull path, which builds `reconcileBase`/`local`/
+`remote` for the reconciler and never feeds this count. The conclusion is
+unchanged and is what §4 actually needs: **nothing on the status path
+scope-projects a local manifest**, so neither branch's `conflictCopies` source is
+scope-projected.
 
 So neither branch's LOCAL manifest is
 scope-projected; both are the device's own disk observation, and the `deleted`
@@ -924,14 +1016,36 @@ been observed in the field yet. The
 measured benefit today is 14 single-entry extras removed; the measured
 false-positive cost today is zero.
 
-## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4, r5, r6)
+## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4, r5, r6, r7)
 
-Four groups, in the order they were decided: **two r6 entries**, then **the
-three r5 entries** (which resolved r4's blockers B-r4-3/4/5), then **the three
-standing entries** carried since r3 (the §2.3 demotion, D1's literal
-substitution, and decision 6's export), then the one standing rejection of mint
-relocation. r5's header said "then r4's three" and mislabeled that third group —
-those entries predate r4.
+Five groups, in the order they were decided: **two r7 entries**, then **two r6
+entries**, then **the three r5 entries** (which resolved r4's blockers
+B-r4-3/4/5), then **the three standing entries** carried since r3 (the §2.3
+demotion, D1's literal substitution, and decision 6's export), then the one
+standing rejection of mint relocation. r5's header said "then r4's three" and
+mislabeled that third group — those entries predate r4.
+
+**r7:**
+
+- **Testing components "at or below" the projection root — REJECTED (B-r6-1).**
+  It was r6's written rule and it leaves the repo's OWN name component in the
+  content population, so a repo that a `moveAside` renamed under the grammar
+  empties both populations and is misclassified by its own address —
+  `indeterminate` once §2.4 ships, `match` without it. Superseded by strictly
+  below the root (§2.3): `proveRepo(rel)` addresses the repo BY that path, so
+  its name is the caller's addressing exactly as an ancestor's is. Both B1 pin
+  arms now assert `mismatch`.
+- **Threading the `conflict-copies` cause into `resolve-command`'s
+  proof-indeterminate refusal — DEFERRED, ledgered (C-r6-2).** The ordinary
+  resolve refusal short-circuits at `resolve-command.ts:269` and emits the
+  generic "retry after Git state settles" copy at `:686-687`/`:892-893` —
+  transient-flavoured for a hold that is `transient: false`. Accepted as a
+  priced residual: the deferral surfaces are this hold's primary visibility and
+  they carry the correct copy, the generic refusal is shared across all
+  indeterminate causes, and `resolve-command.ts` sits at design 271's concurrent
+  ratchet ceiling. **Follow-up condition:** when `resolve-command.ts` is next
+  split per that ratchet, the proof-indeterminate refusal gains reason-aware
+  copy. Reasoning in §2.7.
 
 **r6:**
 
@@ -941,9 +1055,10 @@ those entries predate r4.
   check repository permissions for a condition whose fix is deleting a file rbox
   minted; the hold is permanent, not transient, so the wrong instruction is what
   the user stares at until they guess. §2.7's new reason costs one member of an
-  existing closed vocabulary — six of its eight surfaces are compiler-demanded —
-  and it needs no new branch in `projectGitDeferralRepos`. Full reasoning and
-  the surface list are in §2.7.
+  existing closed vocabulary — four of its eight follow-on surfaces are
+  compiler-demanded and three are carried by existing tests (§2.7's enforcement
+  split) — and it needs no new branch in `projectGitDeferralRepos`. Full
+  reasoning and the surface list are in §2.7.
 - **A prove-scoped `armed` flag as an instance field on the oracle — REJECTED
   (correction 6).** Smaller to write, and wrong: `serial()`
   (`apply-receipt.ts:405-412`) de-duplicates in-flight proofs per `rel` but does
@@ -975,13 +1090,16 @@ those entries predate r4.
 **Standing since r3:**
 
 - **Root-scoping (§2.3) as the safety property — DEMOTED, not removed.** r3
-  claimed it made "the vacuous-match shape unreachable". It removes the ancestor
-  instance only; the at-or-below instance survives it. Kept, and r5 restates why
-  in stronger terms: with the guard shipping, dropping §2.3 makes every repo
-  under a conflict-named ancestor **permanently `indeterminate`** — an
-  availability regression, not an addressing nicety (§2.3). The safety claim
-  belongs to §2.4's guard; the availability claim is §2.3's own. Deletion
-  condition unchanged: it goes when conflict copies stop being minted.
+  claimed it made "the vacuous-match shape unreachable". It removes the two
+  ADDRESSING instances — a conflict-named ancestor AND the repo's own
+  conflict-named root component (r7/B-r6-1: both are the caller's addressing,
+  neither is content) — while the BELOW-root instance, conflict-named content
+  inside the repo, survives it. Kept, and r5 restates why in stronger terms:
+  with the guard shipping, dropping §2.3 makes every repo whose root or ancestor
+  carries the grammar **permanently `indeterminate`** — an availability
+  regression, not an addressing nicety (§2.3). The safety claim belongs to
+  §2.4's guard; the availability claim is §2.3's own. Deletion condition
+  unchanged: it goes when conflict copies stop being minted.
 - **Literal substitution of `comparable()` at `scopedScan:718` — REJECTED
   (D1).** It reads as the smallest possible change and is a fail-closed →
   fail-open flip for grammar-matching special files. §2.5's restructure is the
@@ -1017,10 +1135,16 @@ comparison.
   non-producer `~` tails and the "`ext` swallows the tail" case.
 - Symmetric-drop twin of the disproven-title pin: a matching path drops from
   BOTH the manifest side and the walk side.
-- Ancestor: a conflict-named directory **inside** a repo prunes its subtree.
-- **B1 pin (blocking, restated in r5 correction 5):** a repo whose ROOT — and,
-  separately, a repo whose ANCESTOR — matches the grammar, with a working tree
-  diverged from the applied manifest, must return the POSITIVE verdict.
+- Below-root (the fixture r6 labelled "ancestor"): a conflict-named directory
+  **inside** a repo prunes its subtree. Kept exactly as written — it is the one
+  position the predicate still tests, and the r7 correction narrows only what
+  lies at or above the root.
+- **B1 pin (blocking, restated in r5 correction 5, both arms now positive per
+  B-r6-1):** a repo whose ROOT — and, separately, a repo whose ANCESTOR —
+  matches the grammar, with a working tree diverged from the applied manifest,
+  must return the POSITIVE verdict. Under the r7 predicate both arms are the
+  same rule, and both are asserted: a regression to "at or below" leaves the
+  ancestor arm green and fails only the root arm.
   **The assertion is made at the ORACLE layer and is
   `expect(verdict.kind).toBe("mismatch")`** — the diverged-tree verdict —
   on both `pullOracle(...).proveRepo(...)` and
@@ -1064,7 +1188,14 @@ comparison.
   2. `gitReasonOf` (`doctor-cmd.ts:213`) over a detail containing
      "conflict-copies" returns `conflict-copies`, not `conflict`. This is the
      enum-ORDER dependency §2.7 names, and it is the one site no type checks.
-  3. the existing vocabulary tests carry the rest automatically —
+  3. **the ORDER INVARIANT itself, not just this instance (C-r6-3):** over
+     `GIT_DEFERRAL_REASONS`, for every pair `(a, b)` with `a !== b` and
+     `a.includes(b)`, assert `indexOf(a) < indexOf(b)`. Today
+     `("conflict-copies", "conflict")` is the only such pair; the test is worth
+     having because the declaration order is documented as "an enumeration, not
+     a ranking" (`sync-state-model.ts:145-147`) and nothing else stops the next
+     superstring member from being appended after the member it shadows.
+  4. the existing vocabulary tests carry the rest automatically —
      `status-view.test.ts:163-169` (non-empty label/text/repair) and
      `deferral-precedence.test.ts:11-19` (enum ≡ precedence ≡ rank).
      `telemetry/contract.test.ts:48`'s `toHaveLength(18)` becomes `19`; it is a
