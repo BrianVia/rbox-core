@@ -7,6 +7,8 @@ import {
   ResetOrphanArtifactHalt,
 } from "./classifier.js";
 import { sqliteResetFacade } from "./index.js";
+import { sqliteResetPaths } from "./artifacts.js";
+import { createStateStore, openStateStore } from "../store/open.js";
 
 const recoverSqliteReset = sqliteResetFacade.recover;
 
@@ -70,6 +72,37 @@ test("no-journal active WAL is W1 while orphan candidate WAL is W3", async () =>
   await fs.writeFile(path.join(candidates, `${"3".repeat(32)}.db-shm`), "");
   expect((await classifySqliteResetPredecode(second.root)).kind).toBe("W3");
   await expect(recoverSqliteReset(second.root, "old")).rejects.toBeInstanceOf(ResetOrphanArtifactHalt);
+});
+
+/**
+ * Design 276 F2.2. A daemon that holds its own store open publishes exactly the
+ * `SW` signature a crashed writer leaves behind, so an lstat-only classifier
+ * calls the daemon's own liveness a WAL crash (#765). The registry consult is
+ * the ownership input that separates them, and the second half of this test is
+ * the soundness control: a crashed-and-restarted process has an EMPTY registry,
+ * so a genuine crash is never masked.
+ */
+test("a live in-process writer proves SW is a live store, and an empty registry still reads W1", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-u2-live-store-"));
+  roots.push(root);
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  await fs.writeFile(sqliteResetPaths.authorityMarker(root), `RBOX-SQLITE-AUTHORITY-v1\n${ID}\n`);
+  const active = sqliteResetPaths.active(root);
+  createStateStore(active, {
+    authorityId: ID, lineageId: "b".repeat(32), stream: "old",
+    createdBy: "classifier-test", stateNonce: "1".repeat(32), stateRevision: 1,
+  }).close();
+
+  const writer = openStateStore(active);
+  try {
+    await fs.writeFile(`${active}-wal`, "");
+    expect((await classifySqliteResetPredecode(root)).kind).toBe("steady");
+  } finally {
+    writer.close();
+  }
+
+  await fs.writeFile(`${active}-wal`, "");
+  expect((await classifySqliteResetPredecode(root)).kind).toBe("W1");
 });
 
 test("W2 sidecar precedence wins over legacy-other", async () => {
