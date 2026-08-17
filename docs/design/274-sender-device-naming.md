@@ -1,7 +1,8 @@
 # 274 — Sender device naming: "take via-desktop's version"
 
-Status: r2 (r1 adversarial review: REVISE, 9-point delta folded here; the
-identity-exclusion and carry claims survived adversarial checking)
+Status: ALIGNED r3 (r1 review REVISE → r2 fold → delta-confirm ALIGNED →
+r3 founder rulings: trust-the-fleet producer, id restored as fallback
+rung, generic copy demoted to unstamped-only)
 Origin: split from design 273 P4 (final serial review, r3.1); founder
 directive 2026-08-17: "Use the real device name like via-desktop." Root
 user report: Max — "keep-mine / take-theirs meant nothing."
@@ -13,13 +14,13 @@ this design needs NO breaking change — the field is additive everywhere.
 Every surface that today says "another computer" / "the other computer" /
 "your other computer(s)" names the actual computer when rbox knows it:
 "Waiting from via-desktop (branch main, 4 commits newer than yours)".
-Degrade chain, in order: server label → today's copy ("another
-computer"). The raw device id NEVER occupies the subject/possessive slot
-("take dev_a1b2c3d4's version" is a second meaningless token, worse than
-the generic copy for the non-technical users this serves); it does not
-appear on human surfaces at all — `--json` already carries `deviceId` for
-diagnostics (the parenthetical variant was cut on delta-confirm as the
-last fragment of the deleted rung). There is NO revoked rung: the
+Degrade chain (FOUNDER RULING 2026-08-17, supersedes review finding 3):
+server label (usually the hostname — labels default to os.hostname at
+login) → device id → today's generic copy ONLY when the section carries
+no stamp at all (pre-274 data; ages out as repos re-capture). The
+founder's bar: "show the real name as almost as always as you can; don't
+bother with 'another computer'". With login-time priming the id rung is
+rare and the generic rung temporary. `--json` carries `deviceId` always. There is NO revoked rung: the
 device-list endpoint filters revoked rows out (apps/api/src/auth/
 devices.ts:19), so "revoked" is indistinguishable from "enrolled since
 last refresh" — rendering a status claim off absence violates the
@@ -39,17 +40,18 @@ MacBook Pro") so copy never renders "…Pro's's version".
   recon gap 1). Value: `cfg.deviceId` (workspace-config.ts:26). Optional so
   non-sync-git `captureGitState` callers are untouched.
 - Wire-additive, verified by recon + review:
-  - Validation is PRODUCER-OMIT + READER-TOLERATE (r1's strict reader
-    regex was a BLOCKER: real device ids include env-credential "env" and
-    client-supplied API-key ids `^[A-Za-z0-9_-]{8,96}$` without the dev_
-    prefix, and `validateGitSection` runs fail-closed inside the state
-    codecs — encodeGitSection/encodeRepoRecord — so a strict gate would
-    have made a CI/agent workspace author sections its own state plane
-    refuses to persist). Producer: stamp only when the local id matches
-    `^[A-Za-z0-9_-]{1,96}$`, else omit. Reader: an invalid/oversized
-    deviceId is treated as ABSENT and degrades to today's copy — same
-    rule as refScope (design 93 v12, manifest-validate.ts:428-433:
-    reader-side invalidity must never make the section/manifest fatal).
+  - Validation is TRUST-THE-FLEET + READER-TOLERATE (FOUNDER RULING
+    2026-08-17: pairing is rigorous — no producer shape policing).
+    Producer: stamp cfg.deviceId whenever non-empty, with only a
+    generous length cap (<=200 chars, manifest hygiene, not trust).
+    Reader: an absent/empty/oversized deviceId is treated as ABSENT and
+    the section still validates — same rule as refScope (design 93 v12,
+    manifest-validate.ts:428-433: reader-side invalidity must never make
+    the section/manifest fatal). Context kept for the record: r1's strict
+    reader regex was a BLOCKER (real ids include env-credential "env" and
+    API-key ids without the dev_ prefix, and validateGitSection runs
+    fail-closed inside encodeGitSection/encodeRepoRecord — a strict gate
+    could stop sync for those workspaces).
   - state codecs round-trip unknown fields (`canonicalJson` preserves;
     decode returns parsed object) — no schema change, no migration.
   - the server never sees sections (E2EE manifests; apps/api has no
@@ -121,8 +123,8 @@ MacBook Pro") so copy never renders "…Pro's's version".
   fire-and-forget, failure-absorbing), plus `rbox device list`. CLI
   render paths only READ — never fetch.
 - Render helper (one owner): `deviceDisplayName(deviceId, cache)` →
-  label → undefined (undefined = keep today's copy; the raw id is
-  NOT a rung — see Product bar). Labels are USER TEXT from the server:
+  label → the id itself (founder ruling — see Product bar); undefined
+  only when no stamp exists. Labels are USER TEXT from the server:
   through the existing `sanitizeTerminalText` + bound (~40 chars) at the
   established sanitization boundary (git-evidence-render.ts:11), not a
   new one. `isSelf` comes from the server response (devices.ts:22,
@@ -147,7 +149,7 @@ resolve-batch.ts (:110,:158,:159,:164,:170,:183 — the multi-repo surface
 most exposed to mixed senders; the mixed/unknown-sender rule below binds
 it explicitly).
 
-With a name (label only) the copy becomes:
+With a name (label, or id when no label is cached) the copy becomes:
 - evidence header: `Waiting from via-desktop (branch main, 4 commits newer than yours):`
 - overlap: `3 also changed on via-desktop ⚠`
 - listing action: `or take via-desktop's version: …`
@@ -176,7 +178,8 @@ With a name (label only) the copy becomes:
   recon: old validators accept unknown keys).
 - renderGitDeferralLine log grammar + redaction classifier byte-stable
   (the daemon LOG line does not gain names).
-- Resolve sanitization contract: labels bounded + sanitized at render;
+- Resolve sanitization contract: labels AND ids bounded + sanitized at
+  render;
   the projection is not a sanitized boundary.
 - Story vocabulary discipline (273): noun stays "computer"; names replace
   "another computer"/"the other computer" only, never the story grammar.
@@ -201,7 +204,8 @@ With a name (label only) the copy becomes:
   ABSENT and the section still validates; the surface degrades to today's
   copy. Hostile LABEL from the server renders sanitized and bounded.
 - Cache: malformed file → undefined (tolerant parse); TTL respected;
-  missing cache/unknown id → generic copy (no id rung, no revoked rung).
+  missing cache/unknown id → the id renders (founder ruling); generic
+  copy only for unstamped sections (no revoked rung).
 - Degrade: unstamped section (every pre-274 pause) renders today's copy
   verbatim — zero regression on existing fleet state (replay the 273
   field fixtures unchanged).
