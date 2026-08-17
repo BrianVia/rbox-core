@@ -22,6 +22,7 @@ import { formatGitApplyMetrics } from "./apply-metrics.js";
 import { checkoutJournalBinding } from "./follow.js";
 import { gitIncomingKey } from "./shared.js";
 import { GIT_FINGERPRINT_VERSION, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import type { GitDivergenceCacheEntry } from "./divergence-cache.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -711,3 +712,69 @@ test("203.12: integration pull converges with both gates on and with either gate
     expect(saved.gitPendingRemote, row.name).toBeUndefined();
   }
 });
+
+/** Design 274 D1's receiver-side churn ledger. The stamp is invisible to every
+ * identity key, but two receiver fast paths compare whole sections with
+ * `isDeepStrictEqual`, so the FIRST delta that carries a stamp the stored base
+ * lacks costs one bypass miss per repo. This pins that it is exactly one, that
+ * an unstamped section beside it (the mixed-version window against an older
+ * publisher) costs nothing at all, and that the stamp is durable afterwards. */
+async function primeDivergenceCache(sections: Record<string, GitSection>): Promise<void> {
+  const repos: Record<string, GitDivergenceCacheEntry> = {};
+  for (const [rel, section] of Object.entries(sections)) {
+    const fingerprint = await gitFingerprint(gitFingerprintRun("per-decision"), root, rel);
+    const identityKey = gitIdentityKey(section);
+    repos[rel] = {
+      fingerprint: fingerprint.hash,
+      writtenAtMs: Date.now() + 10_000,
+      identityKey,
+      kind: "dir",
+      probe: { busy: false, preflightOk: true, preflightKind: "dir", identityKey },
+    };
+  }
+  await fs.writeFile(
+    path.join(root, ".rbox", "state", "git-divergence.json"),
+    JSON.stringify({ version: GIT_FINGERPRINT_VERSION, repos }),
+  );
+}
+
+test("274: a first-seen author stamp misses the steady bypass once per repo, then self-heals", async () => {
+  await initRepo("stamped");
+  await initRepo("legacy");
+  const stored = { stamped: await capture("stamped"), legacy: await capture("legacy") };
+  // "legacy" keeps publishing without a stamp — an older binary in the fleet.
+  const remote = { ...stored, stamped: { ...stored.stamped, deviceId: "dev_desktop" } };
+
+  await primeDivergenceCache(stored);
+  const firstQueued: string[] = [];
+  const firstRun = await observe(() => applyGitSections(
+    root, cfg(), stateWith(stored), manifest(remote), store,
+    buildIgnoreMatcher(root), () => {}, {
+      disableConfigLane: true, collectMetrics: true, onApplyQueued: (rel) => firstQueued.push(rel),
+    },
+  ));
+  const first = firstRun.value;
+  // The whole measured cost of the stamp: one repo leaves the pre-admission bypass
+  // and goes through the pooled apply decision instead. Not one git process runs —
+  // the per-repo lazy gates behind the bypass reach the same "nothing to do" —
+  // and the unstamped neighbour never leaves the bypass at all.
+  expect(firstQueued).toEqual(["stamped"]);
+  expect(firstRun.commands).toEqual([]);
+  expect(first.gitApplyMetrics?.repos).toBe(2);
+  expect(first.gitRepos?.stamped?.deviceId).toBe("dev_desktop");
+  expect(first.gitRepos?.legacy).toEqual(stored.legacy);
+
+  await primeDivergenceCache(first.gitRepos!);
+  const secondQueued: string[] = [];
+  const secondRun = await observe(() => applyGitSections(
+    root, cfg(), stateWith(first.gitRepos!), manifest(remote), store,
+    buildIgnoreMatcher(root), () => {}, {
+      disableConfigLane: true, collectMetrics: true, onApplyQueued: (rel) => secondQueued.push(rel),
+    },
+  ));
+  const second = secondRun.value;
+  expect(secondQueued).toEqual([]);
+  expect(secondRun.commands).toEqual([]);
+  expect(second.gitApplyMetrics?.results.unchanged).toBe(2);
+  expect(second.gitRepos).toEqual(first.gitRepos!);
+}, 60_000);

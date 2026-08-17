@@ -1,0 +1,190 @@
+/**
+ * Design 274 PR-A: the author stamp `GitSection.deviceId`.
+ *
+ * The stamp is user-visibly inert here — it exists so PR-B's copy can name the
+ * computer a paused change came from. What this suite pins is everything that
+ * must NOT move because of it: the identity/fingerprint allowlists that drive
+ * held-skip and carry, the fail-closed state codecs, the publish-side change
+ * decision, and the reader's tolerance of a hostile stamp.
+ */
+import { expect, test } from "bun:test";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { LocalBlobStore, gitSectionDeviceId, validateGitSection, type GitSection } from "../../engine/index.js";
+import { captureGitState } from "./capture.js";
+import { gitIdentityKey } from "./identity.js";
+import { heldClassifierInputKey } from "./held-skip.js";
+import { gitIncomingKey } from "./shared.js";
+import { normalizeOutgoingGitSections } from "./publisher-tombstones.js";
+import { GitPlanAccumulator } from "./plan-accumulator.js";
+import { decodeGitSection, encodeGitSection } from "../state-plane/codecs/git-section.js";
+import { encodeRepoRecord } from "../state-plane/codecs/repo-record.js";
+import { recordWouldNotChange } from "../sync-state-elision.js";
+import type { SyncState } from "../config.js";
+
+const exec = promisify(execFile);
+const KEK = Buffer.alloc(32, 74);
+const sha = (n: number): string => n.toString(16).padStart(64, "0");
+const oid = (n: number): string => n.toString(16).padStart(40, "0");
+
+const section = (extra: Partial<GitSection> = {}): GitSection => ({
+  bundleSha: sha(1),
+  bundleEncSha: sha(2),
+  bundleCipherSize: 1,
+  head: "ref: refs/heads/main",
+  refs: { "refs/heads/main": oid(7) },
+  refScope: "all",
+  refTombstones: {},
+  refTombstoneGeneration: 0,
+  generatedAt: "2026-08-17T00:00:00.000Z",
+  ...extra,
+});
+
+const stateWith = (bases: Record<string, GitSection>): SyncState => ({
+  stream: "test",
+  stateNonce: "a".repeat(32),
+  lastSyncedSequence: 1,
+  lastSyncedManifest: { generatedAt: "remote", files: [], manifestSchema: 2, gitRepos: bases },
+  repoRecords: Object.fromEntries(Object.entries(bases).map(([rel, base]) => [rel, { repoGen: 1, sourceSeq: 1, base }])),
+});
+
+async function repoWithSection(deviceId?: string): Promise<GitSection | undefined> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-274-"));
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "rbox test",
+    GIT_AUTHOR_EMAIL: "rbox-test@local",
+    GIT_COMMITTER_NAME: "rbox test",
+    GIT_COMMITTER_EMAIL: "rbox-test@local",
+  };
+  const git = (...args: string[]) => exec("git", ["-C", tmp, ...args], { env });
+  try {
+    await git("init", "-q", "-b", "main");
+    await fs.writeFile(path.join(tmp, "tracked.txt"), "x\n");
+    await git("add", "tracked.txt");
+    await git("commit", "-qm", "initial");
+    const store = new LocalBlobStore(path.join(tmp, ".store"));
+    return await captureGitState(tmp, store, KEK, deviceId === undefined ? {} : { deviceId });
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+test("identity, fingerprint, and held-classifier keys exclude the author stamp", () => {
+  const base = section();
+  const a = { ...base, deviceId: "a" };
+  const b = { ...base, deviceId: "b" };
+  expect(gitIncomingKey(a)).toBe(gitIncomingKey(b));
+  expect(gitIncomingKey(a)).toBe(gitIncomingKey(base));
+  expect(gitIdentityKey(a)).toBe(gitIdentityKey(b));
+  expect(gitIdentityKey(a)).toBe(gitIdentityKey(base));
+  expect(heldClassifierInputKey(a)).toBe(heldClassifierInputKey(b));
+  expect(heldClassifierInputKey(a)).toBe(heldClassifierInputKey(base));
+});
+
+test("capture stamps the local device id and omits only an empty or unbounded one", async () => {
+  // Enrollment is trusted, so the producer does not police the id's shape — the
+  // environment-credential literal and client-supplied API keys are real ids.
+  for (const id of ["dev_aaaa33728fad066416272ae9ffa2b2b8", "env", "A-b_9", "x".repeat(200)]) {
+    expect((await repoWithSection(id))?.deviceId).toBe(id);
+  }
+  for (const id of ["", "x".repeat(201)]) {
+    expect((await repoWithSection(id))?.deviceId).toBeUndefined();
+  }
+  expect((await repoWithSection())?.deviceId).toBeUndefined();
+}, 60_000);
+
+test("an unusable stamp is read as absent and no stamp ever makes the section invalid", () => {
+  for (const deviceId of ["", "x".repeat(201)]) {
+    const s = section({ deviceId });
+    expect(validateGitSection(s).ok).toBe(true);
+    expect(gitSectionDeviceId(s.deviceId)).toBeUndefined();
+  }
+  expect(gitSectionDeviceId(undefined)).toBeUndefined();
+  expect(gitSectionDeviceId("dev_1")).toBe("dev_1");
+  // Hostile CONTENT is carried, not refused: enrollment is trusted, a section is
+  // never fatal over its stamp, and sanitizing what gets DISPLAYED is the render
+  // boundary's job (PR-B), not the wire's.
+  for (const deviceId of ["dev id", "\u001b[31mdev", "dev\u0000id", "d\u00e9v", "x".repeat(200)]) {
+    expect(validateGitSection(section({ deviceId })).ok).toBe(true);
+    expect(gitSectionDeviceId(deviceId)).toBe(deviceId);
+  }
+  // Wire values that are not strings at all still read as absent.
+  for (const wire of [5, null, true, ["dev"], { nested: "dev" }]) {
+    const onWire = JSON.parse(JSON.stringify({ ...section(), deviceId: wire }));
+    expect(validateGitSection(onWire).ok).toBe(true);
+    expect(gitSectionDeviceId(onWire.deviceId)).toBeUndefined();
+  }
+});
+
+test("state codecs admit stamped sections and round-trip the stamp", () => {
+  const stamped = section({ deviceId: "dev_aaaa33728fad066416272ae9ffa2b2b8" });
+  const encoded = encodeGitSection(".", stamped);
+  expect(encoded.canonical).toContain('"deviceId":"dev_aaaa33728fad066416272ae9ffa2b2b8"');
+  const decoded = decodeGitSection(".", encoded.canonical);
+  expect(decoded).toEqual(stamped);
+  // Re-encoding the decoded section reproduces the same canonical bytes.
+  expect(encodeGitSection(".", decoded).canonical).toBe(encoded.canonical);
+  // Both id families the fleet actually issues, plus hostile ones, stay admissible.
+  for (const deviceId of ["env", "A1b2C3d4E5f6G7h8", "dev id", "x".repeat(201)]) {
+    expect(() => encodeGitSection("repo", section({ deviceId }))).not.toThrow();
+    expect(() => encodeRepoRecord("repo", {
+      repoGen: 1, sourceSeq: 2, base: section({ deviceId }), pending: section({ deviceId }),
+    })).not.toThrow();
+  }
+});
+
+test("carry passes the author stamp through untouched, by reference", () => {
+  const authored = section({ deviceId: "dev_author" });
+  const accumulator = new GitPlanAccumulator("/ws", stateWith({ ".": authored }), { onGitLog: () => {} });
+  accumulator.carry(".", accumulator.base["."]!);
+  // Carry itself is pass-through by object reference; publication then re-normalizes
+  // tombstones into an equal section, and the author survives both.
+  expect(accumulator.out["."]).toBe(authored);
+  expect(accumulator.plan().gitRepos?.["."]).toEqual(authored);
+});
+
+test("pending substitution installs the pending author's stamp, as intended", () => {
+  const recaptured = section({ deviceId: "dev_local", generatedAt: "2026-08-17T00:00:09.000Z" });
+  const pending = section({ deviceId: "dev_pending" });
+  const { sections } = normalizeOutgoingGitSections(
+    { ".": recaptured }, { ".": pending }, { ".": undefined }, "2026-08-17T00:00:00.000Z",
+  );
+  expect(gitIncomingKey(recaptured)).toBe(gitIncomingKey(pending));
+  expect(sections["."]).toBe(pending);
+  expect(sections["."]?.deviceId).toBe("dev_pending");
+});
+
+test("the stamp adds no publish churn: carried repos still plan changed=false", () => {
+  for (const base of [section(), section({ deviceId: "dev_author" })]) {
+    const accumulator = new GitPlanAccumulator("/ws", stateWith({ ".": base }), { onGitLog: () => {} });
+    accumulator.carry(".", accumulator.base["."]!);
+    expect(accumulator.plan().changed).toBe(false);
+  }
+});
+
+test("a re-captured section differs by generatedAt, with or without the stamp", () => {
+  const base = section();
+  const recaptured = section({ deviceId: "dev_author", generatedAt: "2026-08-17T00:00:01.000Z" });
+  const withoutStamp = { ...recaptured };
+  delete withoutStamp.deviceId;
+  const plan = (outgoing: GitSection) => {
+    const accumulator = new GitPlanAccumulator("/ws", stateWith({ ".": base }), { onGitLog: () => {} });
+    accumulator.capture(".", outgoing);
+    return accumulator.plan().changed;
+  };
+  expect(plan(recaptured)).toBe(true);
+  expect(plan(withoutStamp)).toBe(true);
+});
+
+test("write elision misses once on the first stamped record, then holds", () => {
+  const unstamped = { repoGen: 1, sourceSeq: 2, base: section() };
+  const stamped = { repoGen: 1, sourceSeq: 2, base: section({ deviceId: "dev_author" }) };
+  expect(recordWouldNotChange(unstamped, stamped)).toBe(false);
+  expect(recordWouldNotChange(stamped, stamped)).toBe(true);
+});

@@ -102,6 +102,7 @@ export {
   type EncryptAddressCacheEntry,
 } from "./encrypt-address-cache.js";
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
+export { gitSectionDeviceId } from "./git-device-stamp.js";
 export {
   validateManifest,
   validateGitRepos,

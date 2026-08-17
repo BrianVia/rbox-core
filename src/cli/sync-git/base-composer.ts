@@ -28,6 +28,7 @@ const GIT_SECTION_FIELD_COVERAGE = {
   config: true,
   refScope: true,
   generatedAt: true,
+  deviceId: true,
 } as const satisfies Record<keyof GitSection, true>;
 void GIT_SECTION_FIELD_COVERAGE;
 

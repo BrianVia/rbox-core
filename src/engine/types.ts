@@ -115,6 +115,11 @@ export interface GitSection {
    *  deletion and identity projection (§7). */
   refScope: GitRefScope;
   generatedAt: string;
+  /** The device that CAPTURED this section (design 274 D1). Absent means the author
+   *  is unknown — an old writer or a carried pre-274 section — and every reader
+   *  degrades to unnamed copy. Never an identity input: it is excluded from every
+   *  key/fingerprint by construction. */
+  deviceId?: string;
 }
 
 /** A point-in-time snapshot of a tree's syncable files, sorted by `path`. */

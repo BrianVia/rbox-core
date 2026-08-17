@@ -295,6 +295,7 @@ export async function capturePlannedGitSection(
     const uploads: GitCaptureUploadCollector | undefined = retainDir === undefined ? undefined : { retainDir, pending: [] };
     const section = await captureGitState(repoDir, api.blobStore(), kek, {
       workspaceRoot: root,
+      deviceId: cfg.deviceId,
       uploadsDir,
       uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
       backoff,

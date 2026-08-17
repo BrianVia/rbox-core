@@ -631,6 +631,8 @@ test("one-commit owned-config planner surface matches the pre-refactor golden", 
           indexTree: "oid-6",
           refScope: "all",
           generatedAt: "<time>",
+          // design 274 D1: the planner's captured section names its author.
+          deviceId: "dev_test",
           config: {
             "remote.origin.fetch": ["+refs/heads/*:refs/remotes/origin/*"],
             "remote.origin.url": ["git@example.com:golden.git"],
