@@ -23,7 +23,7 @@ export function normalizeRel(rel: string): string | undefined {
   return rel;
 }
 
-export function equivalentPart(value: string, eq: ReceiverEquivalence): string {
+function equivalentPart(value: string, eq: ReceiverEquivalence): string {
   let result = value;
   if (eq.unicodeAliases) result = result.normalize("NFC");
   if (eq.caseAliases) result = result.toLowerCase();

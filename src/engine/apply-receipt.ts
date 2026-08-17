@@ -180,7 +180,10 @@ function canonicalReceipt(kind: "pull" | "state", rel: string, expected: FileEnt
   return hashBytes(Buffer.from(JSON.stringify({ version: 1, kind, rel, expected: sort(expected), observed: sort(observed) })));
 }
 
-export const CONFLICT_COPY_POPULATION_WHY = "repo population emptied by conflict-copies exclusion";
+/** Reaches users verbatim through the git-deferral detail companion, so it is
+ *  plain language. `conflict-copies` inside it is load-bearing: `gitReasonOf`
+ *  (doctor-cmd.ts) normalizes this string and buckets on that token. */
+export const CONFLICT_COPY_POPULATION_WHY = "only conflict-copies remain here, so the comparison was skipped.";
 
 function downgradeIfEmptied(verdict: OracleVerdict, armed: ConflictGrammarSink, pairs: number): OracleVerdict {
   return verdict.kind === "match" && pairs === 0 && armed.hit ? indeterminate(CONFLICT_COPY_POPULATION_WHY) : verdict;
@@ -227,7 +230,7 @@ const SCAN_FAILURE_WHY = {
 type ScanFailure = keyof typeof SCAN_FAILURE_WHY;
 
 class ScanFailed extends Error {
-  constructor(readonly failure: ScanFailure) {
+  constructor(failure: ScanFailure) {
     super(SCAN_FAILURE_WHY[failure]);
   }
 }
@@ -389,18 +392,29 @@ class ManifestOracle implements AppliedManifestOracle {
   /** Components AT OR ABOVE `root` are the caller's addressing, not content:
    *  `proveRepo(rel)` addresses this repo BY that path, so neither an ancestor's
    *  name nor the repo's OWN name component is evidence about what the repo
-   *  contains. Only components strictly below `root` are content. */
-  private comparableFor(root: string, eq: ReceiverEquivalence, armed: ConflictGrammarSink): Comparable {
+   *  contains. Only components strictly below `root` are content.
+   *
+   *  The grammar arm is LAST on purpose: an entry the hard exclusions or the
+   *  ignore matcher already removed was never going to be compared, so its name
+   *  is not why the population emptied. Arming on it would make an ignore rule
+   *  such as `*.conflict*` a permanent indeterminate for every repo it covers.
+   *
+   *  `armed` is passed only for COMPARISON populations. Omit it for the stat/hash
+   *  fast-path population (`preScan`, §2.5): filtering it must not decide whether
+   *  the comparison itself was emptied by conflict copies. */
+  private comparableFor(root: string, eq: ReceiverEquivalence, armed?: ConflictGrammarSink): Comparable {
     return (rel, kind) => {
       if (hardExcluded(rel, eq)) return false;
-      if (matchesConflictGrammarBelow(rel, root)) {
-        armed.hit = true;
-        return false;
-      }
-      if (kind === "leaf") return !this.matcher.ignores(rel);
-      const dirForm = `${rel}/`;
-      return !(this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm));
+      if (kind === "leaf" ? this.matcher.ignores(rel) : this.prunedDir(rel)) return false;
+      if (!matchesConflictGrammarBelow(rel, root)) return true;
+      if (armed) armed.hit = true;
+      return false;
     };
+  }
+
+  private prunedDir(rel: string): boolean {
+    const dirForm = `${rel}/`;
+    return this.matcher.prunes?.(dirForm) ?? this.matcher.ignores(dirForm);
   }
 
   private project(rel: string, eq: ReceiverEquivalence): Projected | OracleVerdict {
@@ -413,12 +427,16 @@ class ManifestOracle implements AppliedManifestOracle {
     }
     const armed: ConflictGrammarSink = { hit: false };
     const comparable = this.comparableFor(normalized, eq, armed);
+    const unarmedComparable = this.comparableFor(normalized, eq);
     // `inProjection` stays leftmost: this walks the WHOLE manifest, and only the short-circuit stops foreign entries arming `armed`.
-    const filter = (map: Map<string, FileEntry>): FileEntry[] => [...map.values()].filter((entry) =>
-      inProjection(entry.path, normalized, eq) && comparable(entry.path, "leaf"));
-    const expected = filter(prepared.expectedMap);
-    const oracle = filter(prepared.oracleMap);
-    const preScan = filter(prepared.preMap);
+    const filter = (map: Map<string, FileEntry>, keep: Comparable): FileEntry[] => [...map.values()].filter((entry) =>
+      inProjection(entry.path, normalized, eq) && keep(entry.path, "leaf"));
+    const expected = filter(prepared.expectedMap, comparable);
+    const oracle = filter(prepared.oracleMap, comparable);
+    // `preScan` is a stat/hash fast-path source, never a comparison population:
+    // it must not arm the sink, or a pull that deletes the last conflict copy
+    // holds for a cycle telling the user to delete files that no longer exist.
+    const preScan = filter(prepared.preMap, unarmedComparable);
     return {
       expected,
       oracle,

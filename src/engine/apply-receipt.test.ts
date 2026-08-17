@@ -513,6 +513,35 @@ test("a genuinely empty repo still matches — the guard is the grammar, never a
   expect((await stateOracle(root, manifest([])).proveRepo("repo")).kind).toBe("match");
 });
 
+test("an entry the matcher already ignores never arms the guard, whatever it is named", async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, `repo/only.dev_x.${CTS}.conflict.log`), "minted");
+  // A user rule as ordinary as `*.conflict*` covers rbox's own mint grammar. If
+  // the grammar arm ran first, that rule would make every repo it empties
+  // permanently indeterminate — the entry was never comparable to begin with.
+  const matcher = buildIgnoreMatcher(root, ["*.conflict*"]);
+  const fixture = await scanFixture(root, matcher);
+  expect(fixture.preScan.files).toEqual([]);
+
+  expect(await pullOracle(root, fixture, [], manifest([])).proveRepo("repo")).toEqual({ kind: "match" });
+  expect(await oracleFromState({ base: manifest([]), matcher, root }).proveRepo("repo")).toEqual({ kind: "match" });
+});
+
+test("the pull that deletes the LAST conflict copy settles in that same cycle", async () => {
+  const root = await tmp();
+  const copyRel = `repo/only.dev_x.${CTS}.conflict.txt`;
+  await fs.writeFile(path.join(root, copyRel), "minted");
+  const fixture = await scanFixture(root);
+  const copy = fixture.preScan.files.find((entry) => entry.path === copyRel)!;
+  await fs.rm(path.join(root, copyRel));
+
+  // `preScan` is the stat/hash fast-path source, not a comparison population:
+  // arming on it would hold the repo for a cycle, telling the user to delete
+  // files this very pull already removed.
+  const actions: Action[] = [{ kind: "delete", path: copyRel, expectedLocal: copy }];
+  expect(await pullOracle(root, fixture, actions, manifest([])).proveRepo("repo")).toEqual({ kind: "match" });
+});
+
 test("a downgraded prove mints no receipt credential and its hold survives the next boundary", async () => {
   const root = await tmp();
   await fs.mkdir(path.join(root, `repo/only.dev_x.${CTS}.conflict`), { recursive: true });

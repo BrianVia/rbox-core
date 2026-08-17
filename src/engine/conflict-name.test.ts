@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isRboxConflictArtifact } from "./conflict-name.js";
+import { countConflictCopies, isRboxConflictArtifact } from "./conflict-name.js";
 
 const TS = "20260816041610";
 
@@ -28,4 +28,31 @@ test("the conflict-artifact grammar claims every producer's mint and nothing els
   expect(positives.length + negatives.length).toBe(17);
   for (const component of positives) expect([component, isRboxConflictArtifact(component)]).toEqual([component, true]);
   for (const component of negatives) expect([component, isRboxConflictArtifact(component)]).toEqual([component, false]);
+});
+
+test("the count is minted OBJECTS, not the files that happen to sit under them", () => {
+  const dir = `node_modules.dev_x.${TS}.conflict`;
+  const dirBlast = [`${dir}/a.js`, `${dir}/nested/b.js`, `${dir}/nested/c.js`].map((path) => ({ path }));
+  // One directory rbox moved aside is one thing the user inspects and deletes.
+  expect(countConflictCopies(dirBlast)).toBe(1);
+
+  // A whole repo living under a conflict-named ANCESTOR contributes that ancestor
+  // once — the shallowest matching component names the mint.
+  const anc = `anc.dev_x.${TS}.conflict`;
+  expect(countConflictCopies([
+    { path: `${anc}/repo/src/index.ts` },
+    { path: `${anc}/repo/README.md` },
+    { path: `${anc}/repo/deep.dev_y.${TS}.conflict.ts` },
+  ])).toBe(1);
+
+  // Individually minted files each count, and untouched files never do.
+  expect(countConflictCopies([
+    { path: "src/index.ts" },
+    { path: `src/index.dev_x.${TS}.conflict.ts` },
+    { path: `src/other.dev_x.${TS}.conflict.ts` },
+    { path: `pkg/${dir}/a.js` },
+  ])).toBe(3);
+
+  expect(countConflictCopies([])).toBe(0);
+  expect(countConflictCopies([{ path: "my.conflict.ts" }])).toBe(0);
 });
