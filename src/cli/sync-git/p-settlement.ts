@@ -23,7 +23,11 @@ export type ExactPSettlementResult =
   | { status: "absent" }
   | { status: "settled"; state: SyncState; ref: string }
   | { status: "moved"; reason: "live" | "reflog" | "base-shape" }
-  | { status: "hold"; reason: string };
+  | { status: "hold"; reason: string; code?: ExactPSettlementHoldCode };
+
+/** `base-absent`: nothing is serialized to settle against, which licenses a
+ * first-BASE landing instead of a refusal. */
+export type ExactPSettlementHoldCode = "base-absent";
 
 class PSettlementMovementError extends Error {
   constructor(readonly movement: Extract<ExactPSettlementResult, { status: "moved" }>["reason"], message: string) {
@@ -71,7 +75,12 @@ export async function settleExactPresentArtifact(input: {
 }): Promise<ExactPSettlementResult> {
   const payload = input.p.payload;
   const currentRecord = repoRecordsForState(input.state)[input.relPath];
-  const currentBase = currentRecord?.base?.refs[payload.ref] ?? null;
+  // A repository the lineage no longer projects has no BASE to settle against
+  // either, and the landing composition treats both shapes identically.
+  if (!currentRecord?.base) {
+    return { status: "hold", reason: "P settlement BASE absent", code: "base-absent" };
+  }
+  const currentBase = currentRecord.base.refs[payload.ref] ?? null;
   if (currentBase !== payload.priorOid && currentBase !== payload.nextOid) return { status: "moved", reason: "base-shape" };
   let lease: MutationLease | undefined;
   try {

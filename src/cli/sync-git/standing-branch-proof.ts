@@ -66,6 +66,13 @@ export type StandingBranchProofResult =
       readonly protocol: FollowerBranchProtocol;
       readonly disposition: SettlementDisposition;
     }
+  /** Nothing is serialized to settle the standing P against, so the transition
+   * stops settling and licenses the caller to land a FIRST BASE instead. */
+  | {
+      readonly kind: "landing";
+      readonly carry: StandingProofCarry;
+      readonly protocol: FollowerBranchProtocol;
+    }
   | { readonly kind: "held"; readonly carry: StandingProofCarry; readonly hold: GitTransitionHold }
   | { readonly kind: "retry-exhausted"; readonly carry: StandingProofCarry; readonly lastProof: ProofFailureReceipt };
 
@@ -168,7 +175,11 @@ export async function settleStandingBranchProof(
     passes = pass + 1;
     const p = protocol.presentArtifacts[0]!;
     const exact = await effects.settleExactArtifact({ state, binding: protocol.binding, p });
-    if (exact.status === "hold") return held(exact.reason);
+    if (exact.status === "hold") {
+      return exact.code === "base-absent"
+        ? { kind: "landing", carry: carry(), protocol }
+        : held(exact.reason);
+    }
     if (exact.status === "moved") {
       const disposition = protocol.artifacts[p.payload.ref];
       const binding = protocol.binding;

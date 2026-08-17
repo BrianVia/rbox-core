@@ -1204,6 +1204,22 @@ describe("design 130 reset A/P lifecycle", () => {
     expect((await archivedOldState()).repoRecords?.repo?.base?.refs[branch]).toBe(fixture.prior);
   });
 
+  /** Design 271 §2.1: reset stays a refusal for a BASE-less record, and its
+   *  message names the typed code so the field can tell the shapes apart. */
+  test("a standing P over a record with NO serialized BASE refuses, naming base-absent", async () => {
+    const fixture = await protocolRepo();
+    await installP(fixture, "f".repeat(32));
+    await saveStateUnsafeLegacyOrTest(root, {
+      ...oldState(),
+      lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: { repo: section(fixture.prior) } },
+      repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
+    });
+
+    await expect(resetSyncState(root, resetDestination, undefined, resetConsent()))
+      .rejects.toThrow("unpreservable P for repo (base-absent)");
+    expect((await loadState(root, "old-stream", () => {})).stream).toBe("old-stream");
+  });
+
   test("malformed K and unpreservable moved-P reflog refuse without cutting over", async () => {
     const malformed = await protocolRepo();
     const malformedP = await installP(malformed, "d".repeat(32));

@@ -9,7 +9,7 @@ import { prepareBasePresentArtifact, readBasePresentArtifact } from "./base-arti
 import { repoCtxFromDisk } from "./git-state.js";
 import { gitRaw } from "../../engine/git-spawn.js";
 import { MutationGateClosedError, ShutdownMutationGate, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { loadRawState, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
+import { loadRawState, saveStateUnsafeLegacyOrTest, type GitHeldAttempt, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";
 import { settleCommittedBranchArtifacts } from "./received-git-transition-commit.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -86,6 +86,101 @@ async function exactSettlementFixture() {
   if (!current) throw new Error("fixture state unavailable");
   return { prior, next, state, ctx, binding, p: p.artifact, current };
 }
+
+const heldAttempt: GitHeldAttempt = {
+  incomingKey: "incoming-1",
+  effectiveBaseIndexProjection: null,
+  effectiveIncomingIndexProjection: null,
+  incomingIndexArtifactDescriptor: "absent",
+  localFingerprint: "f".repeat(64),
+  fingerprintVersion: "v1",
+  reflogs: [],
+  blockers: [],
+  repoIdentity: "i".repeat(64),
+  stateNonce: "1".repeat(32),
+  baseOriginsHash: "0".repeat(64),
+  partialDisposition: "none",
+  at: "2026-08-16T00:00:00.000Z",
+};
+
+test("a record with no serialized BASE holds base-absent without opening the transaction", async () => {
+  const { next, state, ctx, binding, p, current } = await exactSettlementFixture();
+  const baseless: SyncState = { ...current, repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } } };
+
+  const result = await settleExactPresentArtifact({
+    root, stream: state.stream, state: baseless, relPath: "repo", ctx, binding, p,
+  });
+
+  expect(result).toEqual({ status: "hold", reason: "P settlement BASE absent", code: "base-absent" });
+  expect((await readBasePresentArtifact(repo, binding, ref)).status).toBe("valid");
+  expect(await git("rev-parse", ref)).toBe(next);
+  expect((await fs.readdir(ctx.commonDir, { recursive: true })).filter((entry) => entry.toString().endsWith(".lock"))).toEqual([]);
+});
+
+test("a repository the lineage no longer projects takes the same base-absent hold", async () => {
+  const { state, ctx, binding, p, current } = await exactSettlementFixture();
+  // A record-less state must also drop the legacy manifest projection, which
+  // would otherwise rebuild the record (and its BASE) from gitRepos.
+  const projectionless: SyncState = {
+    ...current,
+    repoRecords: {},
+    lastSyncedManifest: { ...current.lastSyncedManifest, gitRepos: {} },
+  };
+
+  const result = await settleExactPresentArtifact({
+    root, stream: state.stream, state: projectionless, relPath: "repo", ctx, binding, p,
+  });
+
+  expect(result).toEqual({ status: "hold", reason: "P settlement BASE absent", code: "base-absent" });
+  expect((await readBasePresentArtifact(repo, binding, ref)).status).toBe("valid");
+});
+
+test("a post-CAS settlement refusal defers the repository and skips its held-attempt rebind", async () => {
+  const { prior, next, state, binding, p } = await exactSettlementFixture();
+  const section = state.lastSyncedManifest.gitRepos!.repo!;
+  await saveStateUnsafeLegacyOrTest(root, {
+    ...state,
+    repoRecords: { repo: { repoGen: 1, sourceSeq: 1, pending: section, attempt: heldAttempt } },
+  } as SyncState);
+  const current = await loadRawState(root);
+  if (!current) throw new Error("fixture state unavailable");
+  const witness = {
+    kind: "present" as const,
+    ref,
+    priorOid: prior,
+    nextOid: next,
+    lineageHash: binding.lineageHash,
+    repositoryIdentityHash: binding.repositoryIdentityHash,
+    artifactRef: p.ref,
+    artifactOid: p.targetOid,
+    episode,
+  };
+  const outcome = {
+    attempt: { repo: heldAttempt },
+    repoProofs: { repo: {
+      authority: {
+        kind: "pull-ref-transaction" as const,
+        lineageHash: binding.lineageHash,
+        repositoryIdentityHash: binding.repositoryIdentityHash,
+        incomingKey: `p:${episode}`,
+        branchWitnesses: { [ref]: witness },
+        safeRefWitnesses: {},
+      },
+      lockedProof: {} as never,
+    } },
+  } satisfies GitPullOutcome;
+
+  const settled = await settleCommittedBranchArtifacts(root, current, outcome);
+
+  const record = settled.repoRecords?.repo;
+  expect(record?.deferrals?.apply?.reason).toBe("artifact");
+  expect(record?.deferrals?.apply?.detail).toBe("the standing present-artifact could not be settled after its BASE was committed");
+  // The refused repository never reached a post-settlement state, so its
+  // attempt must stay exactly as it was rather than be rebound.
+  expect(record?.attempt).toEqual(heldAttempt);
+  expect(record?.base).toBeUndefined();
+  expect((await readBasePresentArtifact(repo, binding, ref)).status).toBe("valid");
+});
 
 test("prepared-ref rejection is a typed live-movement outcome", async () => {
   const { prior, state, ctx, binding, p, current } = await exactSettlementFixture();

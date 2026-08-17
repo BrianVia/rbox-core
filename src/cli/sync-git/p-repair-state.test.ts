@@ -97,3 +97,32 @@ test("§130 state port advances BASE through composer and mutates only the P-bou
   expect(saved.partial?.pRepaired).toBeUndefined();
   expect(saved.partial?.appliedRefs["refs/tags/keep"]).toEqual({ kind: "direct", oid: PRIOR });
 });
+
+/** Design 271 §2.1: the P-repair state port stays 2-valued. A record with no
+ * serialized BASE is `rejected` here — the landing is the follow path's job. */
+test("a record with no serialized BASE is still a plain CAS rejection, not a typed hold", async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-p-repair-state-baseless-"));
+  await fs.mkdir(path.join(root, ".rbox"));
+  const state: SyncState = {
+    stream: "stream", lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "", files: [] },
+    stateNonce: "nonce", stateRevision: 0,
+    repoRecords: { repo: { repoGen: 0, sourceSeq: 1 } },
+  };
+  await fs.writeFile(statePath(root), JSON.stringify(state));
+  const port = createPRepairStatePort({ root, stream: "stream", relPath: "repo", repoKind: "dir", effectiveRefScope: "all", p });
+  const before = await port.read();
+  const only = receipt("2026-07-16T12:00:00.000Z");
+
+  expect(await port.cas({
+    expected: before,
+    nextBaseOid: NEXT,
+    receipt: only,
+    lockedObservation: {
+      liveOid: only.q.value.observed.liveOid,
+      reflogSha256: only.reflog.sha256,
+      artifactsValidated: true,
+      keepRefsVerified: true,
+    },
+  })).toBe("rejected");
+  expect((await loadRawState(root))!.repoRecords!.repo!.base).toBeUndefined();
+});
