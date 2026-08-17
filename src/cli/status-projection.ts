@@ -10,7 +10,7 @@ import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import { attributeDaemonForStatus, type StatusRemoteHead } from "./status-view.js";
-import { projectGitDeferralRepos, type GitDeferralDisplayEntry } from "./status-view/git-projection.js";
+import { projectGitDeferralRepos } from "./status-view/git-projection.js";
 import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import { RBOX_VERSION } from "./version.js";
