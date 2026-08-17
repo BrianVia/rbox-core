@@ -24,11 +24,10 @@ import type { WireCandidate } from "./manifest-validate.js";
 
 const MAX_DEVICE_ID_LENGTH = 200;
 
-/** True only for a primitive string: every other wire value differs from its own
- *  string spelling (`5 !== "5"`, `["a"] !== "a"`), so this narrows a value the
- *  declared type claims is a string without a runtime type interrogation. */
-const isWireString = (value: WireCandidate<string | undefined>): value is string => value === `${value}`;
-
-/** The section's author, or `undefined` when it has none this reader can use. */
+/** The section's author, or `undefined` when it has none this reader can use.
+ *  This IS the wire decoder for the field, so the typeof here is the boundary
+ *  parse the anti-slop rule asks for (same idiom as manifest-validate.ts). */
 export const gitSectionDeviceId = (deviceId: WireCandidate<string | undefined>): string | undefined =>
-  isWireString(deviceId) && deviceId.length > 0 && deviceId.length <= MAX_DEVICE_ID_LENGTH ? deviceId : undefined;
+  typeof deviceId === "string" && deviceId.length > 0 && deviceId.length <= MAX_DEVICE_ID_LENGTH
+    ? deviceId
+    : undefined;

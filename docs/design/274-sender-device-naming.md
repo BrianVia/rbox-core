@@ -200,9 +200,15 @@ With a name (label, or id when no label is cached) the copy becomes:
   name on C (fixture-level; the pass-through reference test).
 - Pending-substitution: normalizeOutgoingGitSections keeps the pending
   author's stamp (site test).
-- Hostile wire: over-long/miscased/ANSI-bearing deviceId is treated as
-  ABSENT and the section still validates; the surface degrades to today's
-  copy. Hostile LABEL from the server renders sanitized and bounded.
+- Hostile wire: an over-long or non-string deviceId is treated as ABSENT
+  by the one reader gate (gitSectionDeviceId) and the section still
+  validates; anything within bounds is carried verbatim (trust-the-fleet)
+  and sanitized at render. Hostile LABEL from the server renders
+  sanitized and bounded. NAMED TRADE: sanitizeGitSectionForPersistence
+  does NOT strip an unusable inbound stamp (unlike config) — stripping
+  would make the stored base differ from the raw wire section and
+  permanently miss apply's steady-skip deep-equality bypass; an unusable
+  stamp persists verbatim and simply renders as absent.
 - Cache: malformed file → undefined (tolerant parse); TTL respected;
   missing cache/unknown id → the id renders (founder ruling); generic
   copy only for unstamped sections (no revoked rung).
@@ -223,9 +229,13 @@ With a name (label, or id when no label is cached) the copy becomes:
 
 ## Sequencing (two PRs — review-corrected)
 
-1. **PR-A (sync-plane, user-visibly inert):** the stamp + producer-omit
-   shape gate + reader tolerance + both coverage-map rows + identity
-   regression locks + the two one-time-miss measurements. Bakes on the
+1. **PR-A (sync-plane, user-visibly inert):** the stamp (non-empty +
+   length-cap only, per r3 — no shape gate) + reader tolerance + both
+   coverage-map rows + identity regression locks + the two one-time-miss
+   measurements. PR-B acceptance criterion (review): reads go through
+   gitSectionDeviceId — a render test for 201-char and non-string wire
+   values, and a grep-gate that `deviceId` is never dereferenced outside
+   git-device-stamp.ts and capture.ts. Bakes on the
    fleet so the field exists on receivers before any copy promises it.
 2. **PR-B (pure Adapter):** label cache + priming + deviceDisplayName +
    the ~15 copy sites + possessive rule + mixed-sender rule. Revertible
