@@ -217,8 +217,12 @@ test("the shared Git line is suppressed in brief and added by Git detail", () =>
   const git = renderStatusBrief(detail("git", withDeferral()));
 
   // Design 273 S2: `--git` appends the grouped story listing under the same
-  // brief surface. Full repo paths, no daemon log grammar.
-  expect(git.slice(0, brief.length)).toEqual(brief);
+  // brief surface. Full repo paths, no daemon log grammar. The one line brief
+  // has that `--git` does not is the pointer AT the listing being printed.
+  const pointer = "  See them:  rbox status --git";
+  expect(brief).toContain(pointer);
+  expect(git).not.toContain(pointer);
+  expect(git.slice(0, brief.length - 1)).toEqual(brief.filter((line) => line !== pointer));
   expect(git.length).toBeGreaterThan(brief.length);
   expect(git.join("\n")).toContain("repos/alpha");
   expect(git.join("\n")).not.toContain("git deferred ");

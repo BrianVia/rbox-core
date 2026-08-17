@@ -1581,9 +1581,14 @@ for (const location of ["inside", "outside"] as const) {
       capabilityProbe: async () => { capabilityCalls++; return true; },
     });
     expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
-    // The skip RE-STANDS the record rather than clearing it, so the repo does
-    // not disappear from every surface one pull after the follow restored it.
-    expect(skipped.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+    // The skip LEAVES the standing record alone rather than clearing it, so the
+    // repo does not disappear from every surface one pull after the follow
+    // restored it — and writes nothing, because nothing about it changed.
+    expect(skipped.outcome.deferrals?.repo?.apply).toBeUndefined();
+    const afterSkip = repoRecordsForState(await landOutcome(saved, skipped.outcome, 3)).repo;
+    expect(afterSkip?.deferrals?.apply?.reason).toBe("worktree-ownership");
+    expect(afterSkip?.deferrals?.apply?.deferredSince)
+      .toBe(repoRecordsForState(saved).repo?.deferrals?.apply?.deferredSince);
     expect(capabilityCalls).toBe(0);
 
     await git(receiver, "worktree", "remove", "--force", sibling);
@@ -1695,7 +1700,9 @@ test("design 200 P2 kill switches independently restore legacy ownership behavio
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
   expect(reenabled.outcome.gitApplyMetrics?.results.skipped).toBe(1);
-  expect(reenabled.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+  // Nothing written: the legacy escalation above already left a standing record.
+  expect(reenabled.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(repoRecordsForState(legacyState!).repo?.deferrals?.apply?.reason).toBe("worktree-ownership");
   expect(capabilityCalls).toBe(0);
 });
 

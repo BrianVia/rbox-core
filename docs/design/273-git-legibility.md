@@ -107,9 +107,22 @@ resolve command and NO attention/blocked severity anywhere.
 
 Telemetry ledger line: sync-state telemetry (`deferralReasons`,
 telemetry/sync-state.ts:12-20,77-81) will show a one-time step change
-(~+51 `worktree-ownership` rows on the founder fleet). The class is
-reported but excluded from any deferral-count alerting; the PR-B body
-names the expected step so health checks don't read it as a regression.
+(~+51 `worktree-ownership` rows on the founder fleet). The PR-B body names
+the expected step so health checks don't read it as a regression.
+
+CORRECTION (PR-B r4): the r2 sentence "the class is excluded from any
+deferral-count alerting" was never true and nothing implemented it.
+`reposDeferred` is the projected repo count, ownership holds included, and
+the fleet alert keys on that column (`apps/api/src/fleet-alerts.ts:290`).
+Splitting it is NOT the free additive wire field the review assumed:
+`validateSyncState` rejects unknown keys outright
+(`apps/api/src/telemetry-ingest.ts:377-395`, `hasOnlyKeys`), so a client that
+sends `reposDeferredNeedsYou` before the API is promoted has its whole
+sync-state packet dropped, and the alert can only key on a column that
+exists, i.e. a D1 migration. Challenged requirement, decision needed:
+[cost] server validator + migration + alert predicate + a CLI-after-API
+promotion order; [benefit] the ownership step stops paging. Until that
+decision, PR-B ships the honest comment and the PR-body step note.
 
 Differential tests: `hasGitResolutionIncoming` (status-view.ts:370-372),
 deferral hygiene, daemon `attentionReason` (ambient-status.ts:211-221 —
