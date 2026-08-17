@@ -10,6 +10,7 @@ import { isStandaloneBinary } from "./runtime.js";
 import { currentWorkspaceId, isDaemonProcess, parseDaemonPid, startDaemon, stopDaemon } from "./daemon-control.js";
 import { readAmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
 import { readDesiredDaemonRows, resumeDesiredDaemon, type DesiredStateRow } from "./autostart-cmd.js";
+import { requireFolderAdmission } from "./autostart/folder-admission-gate.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { verifyAndParseManifest } from "./release-verify.js";
@@ -156,33 +157,56 @@ interface DaemonCycle {
   readonly log: (line: string) => void;
 }
 
-/** One workspace's stop → desired-state check → restart. State conversion is
- * explicit-command-only; upgrade preserves daemon lifecycle and mode. */
+/** One workspace's admission → stop → desired-state check → restart. State
+ * conversion is explicit-command-only; upgrade preserves daemon lifecycle and
+ * mode.
+ *
+ * Admission runs BEFORE the stop and only for a workspace we intend to restart:
+ * a folder configuration this binary would refuse must never cost the user a
+ * working daemon (design 276 F1.2). The admitted token is then handed to the
+ * restart, so the check and the start share one catalog generation. A refusal is
+ * this workspace's alone — every other workspace still upgrades. */
 async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle): Promise<boolean> {
+  // Undefined means this workspace is not being restarted at all: its desired
+  // state is stopped, so stopping it needs no admission.
+  let admission: Awaited<ReturnType<typeof requireFolderAdmission>> | undefined;
+  if (row.desired.state !== "stopped") {
+    try {
+      admission = await requireFolderAdmission(root);
+    } catch (error) {
+      log(`daemon ${key}: left running, not restarted on ${RBOX_VERSION} — ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
   try {
     await stop(root);
   } catch {
     log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
     return false;
   }
-  if (row.desired.state === "stopped") {
+  if (admission === undefined) {
     log(`daemon ${key}: stopped (desired state is stopped)`);
     return true;
   }
-  return await restartDesiredDaemon({ root, key, row, stop, start, log });
+  return await restartDesiredDaemon({ root, key, row, stop, start, log }, admission);
 }
 
-async function restartDesiredDaemon({ key, row, start, log }: DaemonCycle): Promise<boolean> {
+async function restartDesiredDaemon(
+  { key, row, start, log }: DaemonCycle,
+  admission: Awaited<ReturnType<typeof requireFolderAdmission>>,
+): Promise<boolean> {
   try {
     const resumeMode = row.desired.pendingModeIntent ?? (row.desired.pullOnly === true ? "pull-only" : "read-write");
-    if (!await resumeDesiredDaemon(row.desired, { startDaemon: start })) {
+    if (!await resumeDesiredDaemon(row.desired, { startDaemon: start, trustedFolderAdmission: admission })) {
       log(`daemon ${key}: not restarted (desired state changed)`);
       return true;
     }
     log(`daemon ${key}: restarted${resumeMode === "pull-only" ? " (pull-only)" : ""}`);
     return true;
-  } catch {
-    log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
+  } catch (error) {
+    // The real reason, not a remedy that re-fails: `rbox stop && rbox start`
+    // runs the same admission this restart just failed (design 276 F1.1).
+    log(`daemon ${key}: restart failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }
