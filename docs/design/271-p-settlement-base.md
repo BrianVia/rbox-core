@@ -1,6 +1,6 @@
 # 271 — First BASE for BASE-less records, typed settlement refusals, resolve legibility
 
-Status: DRAFT r4, folding the r3 confirm (R1-R5, m1-m8) onto the r3 mechanism,
+Status: r5 — ALIGNED (delta confirm 2026-08-17; editorial folds m1-m5 + two §4 clauses applied), folding the r3 confirm (R1-R5, m1-m8) onto the r3 mechanism,
 which the confirm left standing. Every anchor was re-read on `main @ b9bb83d5d`;
 §6 records where a review's suggested shape did not survive that reading.
 
@@ -175,7 +175,7 @@ already equals incoming) on a branch that is not otherwise classified. With
 `base === undefined` the only reason `:160` fires today is the vacuous
 `null !== newOid`. Genuine divergence with no BASE presents as
 `oldOid !== newOid`, which never reaches `:106` at all — it takes the apply
-path, or the `:95` `hold = "local-commits"` when no branch protocol stands. So
+path, or the `:97` `hold = "local-commits"` when no branch protocol stands. So
 the condition cannot mask a real divergence: it is confined to the branch where
 disk and incoming AGREE, where there are by definition no local-only commits on
 that ref. Records that DO have a BASE keep `:160-161` exactly as it is, which is
@@ -252,7 +252,7 @@ committed.
      emit-and-return a `refused` line directly.
    - `:931` (`manual lineage proof unavailable`) and `:1001`
      (`manual BASE proof is incomplete`) are BOTH inside `makeIntended`
-     (`:929-1018`), a callback the follow executor invokes. They cannot emit
+     (`:930-1018`), a callback the follow executor invokes. They cannot emit
      and return; each throws a typed error CLASS that the `:1082` catch
      classifies into its code and curated message.
 2. At `:1078` the curated text REPLACES `pSettled.error`: that string is a raw
@@ -270,7 +270,7 @@ committed.
    else. Raw `Error.message` is never printed.
 5. Persisted deferral detail: `GitDeferral` (`sync-state-model.ts:169-180`)
    gains an OPTIONAL `detail?: string` plus its `GIT_DEFERRAL_FIELD_COVERAGE`
-   entry (`codecs/coverage.ts:123-133`); old records decode with `undefined`.
+   entry (`state-plane/codecs/coverage.ts:123-133`); old records decode with `undefined`.
    This is a state-shape change and is named as one.
    - **One author.** `detail` is curated at the DEFERRAL-WRITING site only —
      `nextDeferral` callers in the apply/settlement path pass an already-curated
@@ -427,9 +427,30 @@ Mac steady git-apply 4.4s → ~0.8s; #752 closes whole; the false
   1,024 pass cap. Reset stays a refusal and unwedges via the pull.
 - **R1 anchor `:159-160`**: the fallthrough is `:160-161`.
 - **m7 (r3), only `:931`**: `:1001` is inside the SAME `makeIntended` callback
-  (`:929-1018`), so it needs the identical error-class treatment. Two sites,
+  (`:930-1018`), so it needs the identical error-class treatment. Two sites,
   not one.
 - **m8 (r3), "the daemon's next scheduled pull settles the P"**: does not hold
   as stated. `apply.ts:774`'s `routeThroughFollow` requires a reason to follow;
   a quiescent repository is never re-followed, so the P persists harmlessly
   instead. §4 states the residual rather than claiming the schedule closes it.
+
+
+## 7. ALIGNED-round editorial folds (delta confirm, applied)
+
+- §2.4 rejection argument extended: the appliedRefs alternative is rejected
+  on coverage too, not only cost — dropping a ref from heldRefs also drops
+  it from the ref-plane-boundary ownership (:154) and published-ref
+  stability (:172) loops; §2.5's CAS-time re-read restores that proof when
+  the landing authority composes, and a section pending for another reason
+  carries no claim to prove.
+- §4 rig green side, exact phrasing: if an apply deferral survives the
+  landing pull, some governed ref's DISK value (git for-each-ref on B)
+  must differ from record.pending.refs[ref] (GitDeferral carries no ref
+  field — the assertion reads those two sources). Scoped to dir/all
+  repositories (a pointer/scoped repo's scope-refused pending is §3's
+  named row and would falsify the universal form).
+- §4 residual, two exact clauses: a permanently standing P costs exactly
+  one redone follow on the pull that retires it (apply.ts:836
+  standingPInvalidatedAttempt clears the attempt once); and "writes
+  nothing" is state-exact — the P's K keep-ref pins its artifact object
+  until retirement.
