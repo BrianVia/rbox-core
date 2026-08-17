@@ -18,7 +18,7 @@ import { type CheckoutCapabilityProbe } from "./checkout-txn.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "./config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "./config-txn.js";
 import { addTimedMs } from "./chain-timings.js";
-import { readAllRefs } from "./refs.js";
+import { readAllRefs, readAllRefsStrict } from "./refs.js";
 import { readHead, warnOnce } from "./git-state.js";
 import { git } from "../../engine/git-spawn.js";
 import { expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
@@ -31,7 +31,7 @@ import { configReceiver } from "./config-lane.js";
 import { createReceivedGitConfig } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { settleStandingBranchProof, type StandingProofPort, type StandingRepairAttempt } from "./standing-branch-proof.js";
-import { composeFollowAuthority, composeFollowRepoTransition, followHeldDeferralReason, mergeFollowDeferralLanes, type FollowRepoTransition, type FollowTransitionIdentity, type StandingBranchProofReceipt } from "./follow-repo-transition.js";
+import { composeFollowAuthority, composeFollowRepoTransition, followHeldDeferralReason, mergeFollowDeferralLanes, type FollowCommitInput, type FollowRepoTransition, type FollowTransitionIdentity, type StandingBranchProofReceipt } from "./follow-repo-transition.js";
 import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -884,11 +884,14 @@ opts: {
       state = settlement.carry.state;
       if (settlement.carry.recoveredRecord) installRecoveredRecord(rel, settlement.carry.recoveredRecord);
       baseSec = baseRepos[rel];
-      if (settlement.kind !== "settled") {
+      if (settlement.kind === "held" || settlement.kind === "retry-exhausted") {
         const refusal = settlement.kind === "held" ? settlement.hold : settlement.lastProof;
         await defer(refusal.reason, refusal.deferralReason);
         return { result: "deferred", commonDirGroup };
       }
+      // A `landing` leaves the standing P standing: nothing settled it, and the
+      // follow may serialize a FIRST BASE from what it is observed to land.
+      let landingObservation: Readonly<Record<string, string>> | undefined;
       const settledProtocol = settlement.protocol;
       // Everything downstream composes against this exact pair: the repository
       // and wire section the follow is bound to, and the lineage the settled
@@ -921,14 +924,17 @@ opts: {
       clearAttempt(rel);
       /** The pair every downstream composition binds: the prior authoritative
        * anchor and the incoming section this follow is bound to. */
-      const followComposition = () => ({
-        identity: followIdentity,
-        incoming: remoteSec,
-        baseComposition: {
-          prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-          candidate: { base: remoteSec },
-        },
-      });
+      const followComposition = (): FollowCommitInput => {
+        const bound: FollowCommitInput = {
+          identity: followIdentity,
+          incoming: remoteSec,
+          baseComposition: {
+            prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+            candidate: { base: remoteSec },
+          },
+        };
+        return landingObservation ? { ...bound, landingObservation } : bound;
+      };
       const intendedFor = async (progress: FollowProgress): Promise<FollowIntended> => {
         const authority = composeFollowAuthority(followComposition(), followProof, progress, true);
         const effectiveDeferrals = mergeFollowDeferralLanes(records[rel]?.deferrals, deferrals[rel]);
@@ -1037,6 +1043,14 @@ opts: {
           });
         },
       }));
+      // Read AFTER the follow published its refs and BEFORE either transition
+      // composes: the intended journal record and the held-attempt binding above
+      // deliberately compose without it. A record with NO serialized BASE can
+      // never earn one from per-ref witnesses alone, whether or not a P stands.
+      if (baseSec === undefined) {
+        const observed = await readAllRefsStrict(repoDir);
+        if (observed.status !== "unreadable") landingObservation = observed.refs;
+      }
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") {
         clearAttempt(rel);

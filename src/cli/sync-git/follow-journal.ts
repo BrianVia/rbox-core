@@ -56,9 +56,12 @@ export async function recoverAndLandFollowJournal(
     ? recovery.intended
     : {
         ...recovery.intended,
+        // NAMED ROW (design 271 §3): this asserts dir/all regardless of the real
+        // repository. Pre-existing; changing it changes journal recovery.
         baseProof: observedLandingRepoBaseProof(
           recovery.observedRefs,
           recordOriginLineage(recovery.intended.record.branchBaseOrigins) ?? "legacy-untrusted",
+          { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true },
         ),
       };
   const published = await savePublishedRepoIntent(workspaceRoot, state, relPath, intended);
