@@ -104,7 +104,6 @@ function readPort<M extends StatusMode>(mode: M = "json" as M, activity?: Daemon
       readActivity: async () => activity,
     }),
     inspectResetJournal: async () => ({ status: "none" as const }),
-    readResetHaltHealth: async () => undefined,
     readState: async () => state(),
     readPathWarnings: async () => undefined,
     readTrashStats: async () => undefined,
