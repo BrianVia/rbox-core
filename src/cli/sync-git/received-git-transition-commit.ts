@@ -295,7 +295,11 @@ export async function settleCommittedBranchArtifacts(
   initialState: SyncState,
   outcome: GitPullOutcome,
   mutationBoundary?: MutationBoundary,
+  /** Forensic git-sync sink. The deferral's curated detail is path-free by
+   * contract, so the RAW hold reason survives only here. */
+  log?: (line: string) => void,
 ): Promise<SyncState> {
+  const glog = log ?? ((line: string) => console.error(line));
   let state = initialState;
   const attemptsToRebind: Array<{ relPath: string; attempt: GitHeldAttempt }> = [];
   const settlementProofs = {
@@ -344,6 +348,7 @@ export async function settleCommittedBranchArtifacts(
         if (settled.status === "settled") state = settled.state;
         else if (settled.status === "absent" || settled.status === "moved") continue;
         else {
+          glog(`git-sync post-CAS settlement refused ${rel}:${ref} — ${settled.reason}`);
           state = await deferPostCasSettlementRefusal({ root, state, relPath: rel });
           refused = true;
           break;
