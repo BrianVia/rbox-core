@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
+import { attributeDaemonForStatus } from "./status-view.js";
 import {
   aggregatePlanQuotaAttention,
-  attributeDaemonForStatus,
   briefAge,
   briefBehindRemote,
   briefIdentityLine,
@@ -12,7 +12,7 @@ import {
   translateBriefProgressLabel,
   type BriefAccountSummary,
   type BriefStatusSnapshot,
-} from "./status-view.js";
+} from "./status-view/brief.js";
 
 const NOW = Date.parse("2026-07-17T12:00:00Z");
 const ago = (milliseconds: number) => new Date(NOW - milliseconds).toISOString();

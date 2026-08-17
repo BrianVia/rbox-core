@@ -16,7 +16,7 @@ import {
   renderStatusVerbose,
   renderWorkspaceStatusSurface,
 } from "./status-render.js";
-import type { GitDeferralRepoProjection } from "./status-view.js";
+import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
 
 const ROOT = "/tmp/rbox-status-render";
 const NOW = Date.parse("2026-07-08T12:00:00Z");

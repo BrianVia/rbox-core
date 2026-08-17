@@ -19,7 +19,7 @@ import {
 import {
   repoRecordsForState,
 } from "./sync-state-records.js";
-import { projectGitDeferralRepos } from "./status-view.js";
+import { projectGitDeferralRepos } from "./status-view/git-projection.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { RBOX_DIR } from "./workspace-config.js";
 import { jsonText, type JsonValue } from "../json.js";

@@ -21,7 +21,7 @@ import { beginReport, logDebugSummary } from "./metrics.js";
 import { resolveInitPlan, resolveWorkspaceDeviceId, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
-import { progressLabel } from "./status-view.js";
+import { progressLabel } from "./status-view/progress.js";
 import { promptSelect, promptInput, promptPath } from "./prompt.js";
 import { promptConfirm } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";

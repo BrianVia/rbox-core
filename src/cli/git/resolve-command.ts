@@ -50,7 +50,8 @@ import { branchBaseOriginMatches, composeRepoBase, type ManualBranchDecision, ty
 import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "../sync-git/follower-protocol.js";
 import { settleExactPresentArtifact } from "../sync-git/p-settlement.js";
 import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "../sync-git/p-repair-state.js";
-import { hasGitResolutionIncoming, sanitizeTerminalText } from "../status-view.js";
+import { hasGitResolutionIncoming } from "../status-view/git-projection.js";
+import { sanitizeTerminalText } from "../status-view/text.js";
 import { preliminaryResolutionReport, resolutionBindingIdentity, type ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
 import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, thisComputer, thisComputersVersion, type GitResolveShow } from "./resolve-presentation.js";
 import { assertCommandAllowedOnScopedBinding, ScopedBindingRefusal, type ScopeHaltCondition } from "../scope/binding-scope.js";

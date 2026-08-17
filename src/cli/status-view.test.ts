@@ -2,20 +2,17 @@ import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import {
-  ageBucket,
   attributeDaemonForStatus,
   healthDetailLines,
   healthLine,
   lastSyncLines,
-  projectGitDeferralRepos,
-  gitDeferralReasonPresentation,
-  progressLabel,
-  relTime,
-  renderGitDeferralCompanion,
-  renderGitDeferralLine,
   strandedIgnoredLine,
   type StatusSnapshot,
 } from "./status-view.js";
+import { gitDeferralReasonPresentation, projectGitDeferralRepos } from "./status-view/git-projection.js";
+import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
+import { progressLabel } from "./status-view/progress.js";
+import { ageBucket, relTime } from "./status-view/text.js";
 
 // Assertions match plain substrings so they hold with or without ANSI styling
 // (style auto-disables off a TTY, which is how bun test runs).

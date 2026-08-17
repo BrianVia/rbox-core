@@ -17,7 +17,7 @@ import type { ScanGenerationPlan, ScanObservationReceipt } from "./local-workspa
 import type { LocalObservationCommitIntent, LocalObservationCommitReceipt, UnsettledDirective } from "./local-observation-transition.js";
 import { gitReposMatcherKey, gitTopologyChanged } from "./manifest-update.js";
 import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js";
-import { watcherTrustLine } from "../status-view.js";
+import { watcherTrustLine } from "../status-view/brief.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";

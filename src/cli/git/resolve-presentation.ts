@@ -1,6 +1,7 @@
 import path from "node:path";
 import { type GitDeferralReason } from "../config.js";
-import { gitDeferralReasonPresentation, sanitizeTerminalText } from "../status-view.js";
+import { gitDeferralReasonPresentation } from "../status-view/git-projection.js";
+import { sanitizeTerminalText } from "../status-view/text.js";
 import { shQuote } from "../shell-quote.js";
 import type { ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
 
