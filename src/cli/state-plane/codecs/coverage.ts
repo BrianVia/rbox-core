@@ -105,6 +105,7 @@ export const GIT_SECTION_FIELD_COVERAGE = {
   config: true,
   refScope: true,
   generatedAt: true,
+  deviceId: true,
 } as const satisfies Record<keyof GitSection, true>;
 
 export const CONFIG_STORE_IDENTITY_FIELD_COVERAGE = {

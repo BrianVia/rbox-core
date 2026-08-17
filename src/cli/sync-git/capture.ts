@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { BlobStore, ByteProgressCallback } from "../../engine/blobstore.js";
-import { validateGitSection } from "../../engine/manifest-validate.js";
+import { gitSectionDeviceId, validateGitSection } from "../../engine/manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../../engine/types.js";
 import { clearIndexResolveUndo, encryptGitArtifact, exists, headBranchOf, listWorktrees, putGitArtifact, readHead, type PendingGitUpload, type RepoCtx, repoCtx } from "./git-state.js";
 import { git, gitOk } from "../../engine/git-spawn.js";
@@ -107,6 +107,11 @@ export interface GitCaptureOptions {
   /** Synchronous keep-mine hardening: pin the recorded snapshot and prove the
    * live repository still equals it before returning a publish candidate. */
   resolution?: boolean;
+  /** design 274 D1: this machine's device id, stamped as the section's author.
+   * Producer-omit: a value outside the wire shape is left off entirely rather
+   * than published, so a receiver never has to interpret one. Absent for the
+   * direct engine callers, which author nothing a receiver attributes. */
+  deviceId?: string;
   /** Deterministic capture-race seams. Production never supplies these. */
   testHooks?: {
     afterStagedArtifacts?: () => void | Promise<void>;
@@ -394,6 +399,8 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       section.indexCipherSize = index.cipherSize;
     }
     if (Object.keys(opState).length > 0) section.opState = opState;
+    const deviceId = gitSectionDeviceId(opts.deviceId);
+    if (deviceId !== undefined) section.deviceId = deviceId;
     // Engine self-check (scrutiny M4): a capture race (branch deleted between the HEAD and
     // refs reads by a concurrent git/sibling worktree, or an exotic symbolic-ref outside
     // refs/heads) can assemble a section apply-side validation refuses. Defer this repo
