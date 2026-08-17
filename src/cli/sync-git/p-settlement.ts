@@ -75,12 +75,16 @@ export async function settleExactPresentArtifact(input: {
 }): Promise<ExactPSettlementResult> {
   const payload = input.p.payload;
   const currentRecord = repoRecordsForState(input.state)[input.relPath];
-  // A repository the lineage no longer projects has no BASE to settle against
-  // either, and the landing composition treats both shapes identically.
-  if (!currentRecord?.base) {
+  // Only the CREATE-shaped P is wedged by an absent BASE: it is the shape whose
+  // `priorOid === null` passes the base-shape test below and then throws inside
+  // the transaction. A repository the lineage no longer projects has no BASE to
+  // settle against either, and the landing composition treats both shapes
+  // identically. Every other shape keeps its `moved`/`base-shape` classification
+  // so bounded P-repair — and reset — still complete.
+  if (!currentRecord?.base && payload.priorOid === null) {
     return { status: "hold", reason: "P settlement BASE absent", code: "base-absent" };
   }
-  const currentBase = currentRecord.base.refs[payload.ref] ?? null;
+  const currentBase = currentRecord?.base?.refs[payload.ref] ?? null;
   if (currentBase !== payload.priorOid && currentBase !== payload.nextOid) return { status: "moved", reason: "base-shape" };
   let lease: MutationLease | undefined;
   try {
