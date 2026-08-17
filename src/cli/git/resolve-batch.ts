@@ -70,9 +70,6 @@ export function selectBatchRepos(
 
 const repos = (n: number): string => `${n} repo${n === 1 ? "" : "s"}`;
 
-/** Runs one single-repo invocation with `--json` captured, whatever the caller's
- * own output mode is. The batch needs the machine answer to classify outcomes;
- * the human summary is composed here from those answers. */
 /**
  * One single-repo invocation, with its TYPED outcome observed rather than its
  * stdout parsed. The output is suppressed: batch composes its own summary from
@@ -113,7 +110,7 @@ function evidenceCell(evidence: GitRepoEvidence | undefined): string {
   return evidence.overlap > 0 ? `${evidence.overlap} also changed on another computer ⚠` : "none changed elsewhere";
 }
 
-interface PreviewRow {
+export interface PreviewRow {
   repo: string;
   evidence: GitRepoEvidence | undefined;
   why: string;
@@ -129,6 +126,10 @@ const previewRows = (
   .sort((a, b) => evidenceRisk(b.evidence) - evidenceRisk(a.evidence) || a.repo.localeCompare(b.repo));
 
 const HEADERS = ["repo", "your files", "also changed elsewhere", "why it's paused"] as const;
+
+/** Test seam: the table is pure, and its honesty about partial reads is worth
+ * pinning without standing up a workspace to produce one. */
+export const previewTableForTest = (entries: readonly PreviewRow[]): string[] => previewTable(entries);
 
 /** A four-column table sized from its own contents, headers included — padding to
  * a guessed constant misaligned the moment a count reached three digits. */
@@ -147,7 +148,13 @@ function previewTable(entries: readonly PreviewRow[]): string[] {
   const fileTotal = entries.reduce((total, entry) => total + (entry.evidence?.local?.total ?? 0), 0);
   const bothTotal = entries.reduce((total, entry) => total + (entry.evidence?.overlap ?? 0), 0);
   const uncompared = entries.filter((entry) => entry.evidence?.overlap === undefined).length;
-  lines.push(`Total: ${repos(entries.length)} · ${fileTotal} files you changed here get published`);
+  // A repo rbox could not read contributes 0 to the sum, and an unqualified
+  // total presents that as a fact. Same defect as the dry run's "nothing to
+  // save": the number is only as good as the reads behind it, so it says how
+  // many it had.
+  const unread = entries.filter((entry) => entry.evidence?.local === undefined).length;
+  const across = unread === 0 ? "" : ` across the ${entries.length - unread} of them rbox could read`;
+  lines.push(`Total: ${repos(entries.length)} · ${fileTotal} files you changed here get published${across}`);
   if (bothTotal > 0) lines.push(`       ${bothTotal} of those files also changed on another computer ⚠`);
   if (uncompared > 0) lines.push(`       ${repos(uncompared)} rbox could not compare with the other computer`);
   return lines;
@@ -238,21 +245,33 @@ export async function gitResolveBatchCmd(
     for (const line of previewTable(previewRows(selected, await evidenceFor(selected)))) write(line);
     write("");
     write("rbox re-checks each repo when you run it for real, and asks separately");
-    write("about any repo whose incoming work cannot be kept alongside yours.");
+    write("about any repo whose incoming work cannot be kept alongside yours, so the");
+    write("number it finally acts on can be smaller than the list above.");
     write("To actually do it, run the same command without --dry-run.");
-    if (options.yes === true) write(`For a script, pass: --yes --expect-repos ${selected.length}`);
+    // Deliberately no number: `--expect-repos` is compared against the count
+    // rbox will actually act on, and this preview cannot know that count without
+    // staging every repo — which is exactly what a preview must not do. Printing
+    // the selected count here would advise a value the gate then rejects.
+    if (options.yes === true) {
+      write("For a script, add --expect-repos <n> — run it once without --yes to see the number.");
+    }
     return 0;
   }
 
   const frozen: Frozen[] = [];
   const needsForce: string[] = [];
+  const refused: string[] = [];
   for (const row of selected) {
     // The unconfirmed keep-mine preview is read-only and already answers both
     // questions batch has: the confirmation token, and whether publishing here
     // would DISCARD incoming work.
     const preview = await runOne(root, row.repo, "keep-mine", {}, deps);
-    if (preview?.status !== "preview") continue;
-    if (preview.confirm.forceDiscardIncoming) needsForce.push(row.repo);
+    // A repo whose preview refuses — busy, mid-operation, a moved snapshot —
+    // used to be dropped here and appear NOWHERE: not in the table, not in the
+    // count, not in the report. A repo silently missing from a batch is
+    // indistinguishable from one rbox handled.
+    if (preview?.status !== "preview") refused.push(row.repo);
+    else if (preview.confirm.forceDiscardIncoming) needsForce.push(row.repo);
     else frozen.push({ repo: row.repo, snapshot: preview.confirm.snapshot });
   }
   const frozenRows = selected.filter((row) => frozen.some((entry) => entry.repo === row.repo));
@@ -262,6 +281,12 @@ export async function gitResolveBatchCmd(
     write("");
     for (const line of FORCE_FOREWARNING) write(line);
     for (const repo of needsForce) write(`   rbox git resolve ${sanitizeTerminalText(repo)} keep-mine`);
+  }
+  if (refused.length > 0) {
+    write("");
+    write(`rbox cannot keep this computer's work in ${repos(refused.length)} right now — run`);
+    write("each one on its own to see why:");
+    for (const repo of refused) write(`   rbox git resolve ${sanitizeTerminalText(repo)} keep-mine`);
   }
   if (frozen.length === 0) return 0;
   // Consent is bound to the count that will actually be acted on, which is the

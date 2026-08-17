@@ -1593,6 +1593,9 @@ test("batch --dry-run performs ZERO writes — it never stages a repo to preview
     stderr: () => {},
   }))).toBe(0);
   expect(fingerprintDiff(before, await workspaceFingerprint(root))).toEqual([]);
+  // Positive control: the evidence read DOES spawn git, so an observer that saw
+  // nothing at all would mean the assertion below never had anything to check.
+  expect(spawns.length).toBeGreaterThan(0);
   // The frozen-token loop stages every repo — network fetch and pack import. A
   // preview that reached it would be changing what it describes.
   expect(spawns.some((args) => args.includes("fetch") || args.includes("index-pack") || args.includes("unbundle"))).toBe(false);
@@ -1784,6 +1787,22 @@ test("keep-mine dry-run reports an unknown overlap as unknown", async () => {
   expect(unknown).toContain("could not check whether the two computers changed the same files");
 });
 
+test("a repo whose preview refuses is COUNTED and NAMED, never silently dropped", async () => {
+  await fixture();
+  const { gitResolveBatchCmd } = await import("./git/resolve-batch.js");
+  const reading = await batchReading();
+  const lines: string[] = [];
+  // The bare fixture's keep-mine preview refuses (both computers changed the
+  // branch), which is exactly the case that used to vanish: absent from the
+  // table, absent from the count, absent from the report.
+  await gitResolveBatchCmd(root, { under: ".", verb: "keep-mine" }, reading, deps(lines, {
+    stdout: (line: string) => lines.push(line), stderr: () => {},
+  }));
+  const text = lines.join("\n");
+  expect(text).toContain("rbox cannot keep this computer's work in 1 repo right now");
+  expect(text).toContain("rbox git resolve repo keep-mine");
+});
+
 test("a non-interactive run without --yes refuses and names the exact scriptable form", async () => {
   const { incoming } = await fixture();
   const incomingTip = incoming.refs["refs/heads/main"]!;
@@ -1801,4 +1820,23 @@ test("a non-interactive run without --yes refuses and names the exact scriptable
   const text = lines.join("\n");
   expect(text).toContain("Add --yes --expect-repos 1 to run this without a terminal.");
   expect(text).toContain("Nothing changed.");
+});
+
+test("the batch total never presents an unread repo's zero as a fact", async () => {
+  const { previewTableForTest } = await import("./git/resolve-batch.js");
+  const read = { repo: "a", tier: "pinned" as const, local: { files: [], total: 4, commits: 1, untracked: 0 }, overlap: 0 };
+  const bothRead = previewTableForTest([
+    { repo: "a", evidence: read, why: "you changed files here" },
+    { repo: "b", evidence: { ...read, repo: "b" }, why: "you changed files here" },
+  ]).join("\n");
+  expect(bothRead).toContain("Total: 2 repos · 8 files you changed here get published");
+  expect(bothRead).not.toContain("rbox could read");
+
+  const oneUnread = previewTableForTest([
+    { repo: "a", evidence: read, why: "you changed files here" },
+    { repo: "b", evidence: undefined, why: "you changed files here" },
+  ]).join("\n");
+  // The unread repo contributes 0; presenting that sum unqualified is the same
+  // defect as the dry run's "nothing to save".
+  expect(oneUnread).toContain("Total: 2 repos · 4 files you changed here get published across the 1 of them rbox could read");
 });

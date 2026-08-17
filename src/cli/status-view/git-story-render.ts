@@ -22,8 +22,6 @@ import { evidenceRowSuffix } from "./git-evidence-render.js";
 import { storyHeadline } from "./git-stories.js";
 import { boundedCuratedDetail, pausedFor, sanitizeTerminalText, truncateDetail } from "./text.js";
 
-export { pausedFor } from "./text.js";
-
 /** The evidence reading for one row, when the caller computed any. Absent for
  * every surface that must stay git-free, and for repos whose evidence degraded. */
 export type EvidenceLookup = (row: GitDeferralRepoProjection) => GitRepoEvidence | undefined;
@@ -47,7 +45,6 @@ export function gitPauseCounts(rows: readonly GitDeferralRepoProjection[]): GitP
 const repos = (count: number): string => `${count} repo${count === 1 ? "" : "s"}`;
 
 const DAY_MS = 86_400_000;
-
 
 /**
  * S1: the two-number split every glance surface shows. `undefined` when nothing

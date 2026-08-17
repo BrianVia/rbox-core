@@ -3,10 +3,11 @@
  *
  * It exists as its own leaf so a renderer on the daemon path can name the
  * evidence it may be handed WITHOUT importing `git-evidence.ts`, which spawns
- * git. That is not a style preference: the import-cycle gate proved the
- * alternative wired the ambient status renderer to the git-spawning module, and
- * the zero-spawn discipline this design promises is only as good as the
- * dependency direction underneath it.
+ * git. That is not a style preference: naming the type from the reader wired the
+ * ambient status renderer to the git-spawning module, and the zero-spawn
+ * discipline this design promises is only as good as the dependency direction
+ * underneath it. The runtime guarantee is gated by the `setGitSpawnObserver`
+ * test over `project()` and every surface it feeds (git-evidence.test.ts).
  *
  * Nothing here imports anything.
  */

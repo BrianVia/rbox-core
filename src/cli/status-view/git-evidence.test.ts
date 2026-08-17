@@ -266,7 +266,7 @@ test("the local count stays EXACT past the name cap — total is not files.lengt
   expect(parsed.files).toHaveLength(MAX_FILES);
 });
 
-test("a truncated local set refuses to report an overlap number", async () => {
+test("the row suffix refuses an overlap clause once the reading is not exact", async () => {
   const { root, base, theirs } = await pausedRepo();
   const incoming = section({ "refs/heads/main": theirs }, "ref: refs/heads/main");
   await writePendingPins(root, ".", (await import("../sync-git/shared.js")).gitIncomingKey(incoming), incoming);

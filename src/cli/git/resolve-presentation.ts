@@ -20,7 +20,6 @@ import type { GitResolveDeps, GitResolveShow, ResolveOutput } from "./resolve-co
 // the definitions now live in the contract, which owns the command's vocabulary.
 export type { GitResolveShow, ResolveOutput } from "./resolve-contract.js";
 
-
 const HUMAN_LOCAL_ONLY_CAP = 50;
 
 function humanRefLabel(label: string): string {
@@ -158,7 +157,6 @@ export function refusalMessage(reason: GitDeferralReason): string {
   } satisfies Record<GitDeferralReason, string>;
   return messages[reason];
 }
-
 
 export function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: string): void {
   const out = deps.stdout ?? console.log;
