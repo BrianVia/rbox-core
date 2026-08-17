@@ -14,14 +14,15 @@ export function buildSyncStateSummary(
     Object.values(record.deferrals ?? {}).filter((value): value is NonNullable<typeof value> => value !== undefined)
       .map((deferral) => ({ repo, deferral, record })),
   );
-  // Design 273 P2 expects a ONE-TIME step change here: ownership-only holds
-  // used to delete their record, so they were never reported. They now stand,
-  // which raises `reposDeferred` and adds `worktree-ownership` rows (~+51 on the
-  // founder fleet). That is restored visibility, not a regression — and the
-  // ownership holds ARE counted in `reposDeferred`, which is what the deferral
-  // alert keys on. Nothing here excludes them; the PR body names the expected
-  // step so the alert is read as the restoration it is. Splitting the count by
-  // actionability is a wire+ingest+alert change, tracked separately.
+  // Design 273 P2 expects a step change here: ownership-only holds used to
+  // delete their record, so they were never reported. They now stand, adding
+  // `worktree-ownership` rows and raising `reposDeferred`. The SIZE is not
+  // predicted: the captured fleet state (fixtures/field-states) carries zero
+  // ownership deferrals, so it predicts a near-zero step; the real step is
+  // whatever ownership holds stand at merge, measured on the fleet after the
+  // dev build lands. Ownership holds ARE counted in `reposDeferred`, which is
+  // what the deferral alert keys on — nothing here excludes them. Splitting the
+  // count by actionability is a wire+ingest+alert change, tracked separately.
   const projected = projectGitDeferralRepos(entries, now);
   const deferredRepos = new Set(projected.map((repo) => repo.repo));
   const reasons = new Set<GitDeferralReason>(

@@ -699,6 +699,49 @@ test("full and --git status add one actionable companion while JSON and the shar
   }]);
 });
 
+test("--verbose offers an ownership hold its repair, never a resolve verb", async () => {
+  const at = new Date(NOW - 5 * 86400_000).toISOString();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: at, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 1,
+        sourceSeq: 7,
+        // `pending` is what makes this the trap: the incoming-state test passes,
+        // so a surface reading canResolve/canKeepMine raw offers both verbs.
+        pending: {
+          bundleSha: "1".repeat(64),
+          bundleEncSha: "2".repeat(64),
+          bundleCipherSize: 1,
+          head: "ref: refs/heads/main\n",
+          refs: { "refs/heads/main": "3".repeat(40) },
+          refScope: "all" as const,
+        },
+        deferrals: {
+          apply: {
+            lane: "apply",
+            reason: "worktree-ownership",
+            deferredSince: at,
+            reasonSince: at,
+            lastSeen: at,
+            checkout: { kind: "branch", label: "main" },
+          },
+        },
+      },
+    },
+  });
+
+  // Design 273 P2: an ownership hold emits NO resolve command ANYWHERE. The
+  // verbose companion was the fourth surface deciding that for itself.
+  const verbose = await captureStatus({ verbose: true });
+  expect(verbose).toContain("git deferred 1d: worktree ownership on branch main (repo)");
+  expect(verbose).toContain("Repair the worktree ownership conflict, then let sync retry.");
+  expect(verbose).not.toContain("keep-mine");
+  expect(verbose).not.toContain("take-theirs");
+});
+
 test("degraded legacy deferral reload retains status reason and age", async () => {
   const deferredSince = new Date(NOW - 15 * 86400_000).toISOString();
   await saveStateUnsafeLegacyOrTest(root, {

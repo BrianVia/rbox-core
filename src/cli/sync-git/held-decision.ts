@@ -45,7 +45,7 @@ import {
  * reached only when NO record stands, so a skip writes at most once per hold. */
 export interface HeldDeferralLane {
   standingApply(relPath: string): GitDeferral | undefined;
-  restandApply(relPath: string, standing: Pick<GitDeferral, "reason" | "subjectKey" | "checkout">): void;
+  restandApply(relPath: string, standing: Pick<GitDeferral, "reason">): void;
 }
 
 export interface HeldDecisionEnv {

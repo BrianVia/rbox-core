@@ -30,8 +30,13 @@ noun), "overlap" (unexplained), raw reason codes.
    status-view.ts:520-533) — the one identifier the user needs.
 2. Headline count (103) ≠ listing count (52). Two mechanisms, both fixed:
    (a) ownership-only holds actively CLEAR their deferral record
-   (follow-repo-transition.ts:349-357) making 51 repos invisible to every
-   surface; (b) the CLI listing applies a 10-minute transient quiet filter
+   (follow-repo-transition.ts:349-357), so any repo held that way is invisible
+   to every surface. (The "51 repos" attributed here in r1-r3 was inferred from
+   the 103/52 gap; the captured fleet state shows that gap was the stale
+   pre-restart projection and carries no ownership deferrals at all. The DEFECT
+   is real and structural — a record deleted is a repo nobody can see — but its
+   population size is unmeasured until the dev build lands.)
+   (b) the CLI listing applies a 10-minute transient quiet filter
    (status-projection.ts:60-70) while the ambient/daemon count and doctor
    do not (daemon/ambient-status.ts:271-274, workspace-observation.ts:85-94).
 3. Reason labels are jargon; several user-work reasons render raw detail.
@@ -102,13 +107,18 @@ BEFORE `canResolve`/`canKeepMine` — ownership holds have
 `record.pending`, so `canKeepMine` is true (status-view.ts:406) and
 doctor-triage.ts:98-118 would otherwise print `keep-mine` for a repo
 whose story says "no command needed", and its age-only severity rule
-would mark ~51 multi-day holds `blocked`. `ownership-hold` emits NO
+would mark every multi-day hold `blocked`. `ownership-hold` emits NO
 resolve command and NO attention/blocked severity anywhere.
 
 Telemetry ledger line: sync-state telemetry (`deferralReasons`,
-telemetry/sync-state.ts:12-20,77-81) will show a one-time step change
-(~+51 `worktree-ownership` rows on the founder fleet). The PR-B body names
-the expected step so health checks don't read it as a regression.
+telemetry/sync-state.ts:12-20,77-81) will show a step change —
+`worktree-ownership` rows appear and `reposDeferred` rises. The r2 estimate
+of "~+51" is RETIRED (PR-B r4): the captured fleet state
+(src/cli/fixtures/field-states/2026-08-17-flat-meadow.jsonl) carries ZERO
+ownership deferrals, so it predicts a near-zero step. The honest statement is
+that the real step is whatever ownership holds stand at merge — measure it on
+FM after the dev build lands. The PR-B body says exactly that so health checks
+read the step as restoration rather than regression.
 
 CORRECTION (PR-B r4): the r2 sentence "the class is excluded from any
 deferral-count alerting" was never true and nothing implemented it.
@@ -331,7 +341,14 @@ syncing a repo rather than overwrite work you did on this computer.
    If any are still here tomorrow: rbox doctor
 ```
 
-Display precedence (PR-B r4): `local-operation` outranks `local-index` — a
+Display precedence (PR-B r4): needs-you OVERRIDES precedence. Among a repo's
+lanes, the display lane is the first lane whose story needs a person, and only
+when no lane does does plain precedence pick. That flips one legacy tie on
+purpose: a repo carrying both `deletion-pending` (self-healing, precedence 5)
+and `conflict` (needs you, precedence 7) now renders as the conflict —
+telling the reader "a sync stopped partway through" about a repo that also
+needs a decision is how a repo needing one leaves every attention surface.
+`local-operation` outranks `local-index` — a
 half-finished rebase always dirties the index too, so index-first meant the
 unfinished-operation story could never fire on the repo it was written for.
 Precedence also picks among the lanes that NEED A PERSON first: a repo whose

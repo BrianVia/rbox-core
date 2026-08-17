@@ -79,20 +79,27 @@ export function gitPauseHeadline(
   ];
 }
 
-const groupKey = (row: GitDeferralRepoProjection): string => `${row.story.code}|${row.story.needsYou ? "you" : "rbox"}`;
+// Resolvability is part of the key because a group prints only commands EVERY
+// repo in it supports (design 273 S2). Keying without it made one unresolvable
+// row silence the commands for the whole group; keying with it SPLITS the
+// group, and the half that can act keeps its instructions.
+const groupKey = (row: GitDeferralRepoProjection): string =>
+  `${row.story.code}|${row.story.needsYou ? "you" : "rbox"}|${row.resolvable ? "can" : "cannot"}`;
 
 interface StoryGroup {
   rows: GitDeferralRepoProjection[];
   story: GitDeferralRepoProjection["story"];
+  resolvable: boolean;
 }
 
-/** Groups by (story, actionability), each sorted oldest first with unknown ages
- * last. Overlap-count sorting arrives with the evidence reader in PR-C. */
+/** Groups by (story, actionability, resolvability), each sorted oldest first
+ * with unknown ages last. Overlap-count sorting arrives with the evidence
+ * reader in PR-C. */
 export function groupByStory(rows: readonly GitDeferralRepoProjection[], now: number): StoryGroup[] {
   const groups = new Map<string, StoryGroup>();
   for (const row of rows) {
     const key = groupKey(row);
-    const group = groups.get(key) ?? { rows: [], story: row.story };
+    const group = groups.get(key) ?? { rows: [], story: row.story, resolvable: row.resolvable };
     group.rows.push(row);
     groups.set(key, group);
   }
@@ -102,7 +109,8 @@ export function groupByStory(rows: readonly GitDeferralRepoProjection[], now: nu
   return [...groups.values()].sort((a, b) =>
     Number(a.story.needsYou ? 0 : 1) - Number(b.story.needsYou ? 0 : 1)
     || b.rows.length - a.rows.length
-    || a.story.code.localeCompare(b.story.code));
+    || a.story.code.localeCompare(b.story.code)
+    || Number(a.resolvable ? 0 : 1) - Number(b.resolvable ? 0 : 1));
 }
 
 function pausedAt(row: GitDeferralRepoProjection, now: number): number {
@@ -119,9 +127,9 @@ const commandLine = (label: string, command: string): string =>
   `   ${label}`.padEnd(COMMAND_COLUMN, " ") + command;
 
 function resolveLines(group: StoryGroup): string[] {
-  // Only commands EVERY repo in the group supports; a mixed group says nothing
-  // rather than printing a command that refuses for half its rows.
-  if (!group.rows.every((row) => row.resolvable)) return [];
+  // The group key already split the unresolvable rows out; that half has no
+  // command that would not refuse, so it prints its rows and says nothing.
+  if (!group.resolvable) return [];
   const lines = [commandLine("To fix one, first see what's waiting:", "rbox git resolve <repo> show-me")];
   if (group.rows.every((row) => row.canKeepMine)) {
     lines.push(commandLine("then keep this computer's work:", "rbox git resolve <repo> keep-mine"));

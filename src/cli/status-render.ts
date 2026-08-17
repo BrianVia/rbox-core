@@ -273,7 +273,7 @@ export function renderStatusBrief(
     daemonVersionSkew: daemon.versionSkew,
     locking: projection.locking,
     ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
-    ...(loudGitRepos.length > 0 ? { git: { ...gitPauseCounts(loudGitRepos), listed: gitDetail } } : {}),
+    git: loudGitRepos.length > 0 ? { ...gitPauseCounts(loudGitRepos), listed: gitDetail } : undefined,
     ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
     ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
     now,
@@ -292,11 +292,8 @@ export function renderStatusBrief(
   // LOG line, whose redaction classifier is byte-frozen against it.
   if (gitDetail) {
     lines.push("");
-    lines.push(...renderGitPauseListing(git.projectedRepos, {
-      now,
-      all: options.all === true,
-      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane),
-    }));
+    lines.push(...renderGitPauseListing(git.projectedRepos, { now, all: options.all === true,
+      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane) }));
   }
   return lines;
 }
@@ -389,8 +386,10 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
       })}`);
       lines.push(`      ${renderGitDeferralCompanion({
         reason: deferral.displayReason,
-        canResolve: deferral.canResolve,
-        canKeepMine: deferral.canKeepMine,
+        // The projection's predicate, here too: raw canResolve/canKeepMine made
+        // this companion a fourth offer-decider and handed keep-mine to holds.
+        canResolve: deferral.resolvable,
+        canKeepMine: deferral.resolvable && deferral.canKeepMine,
         staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
         detail: deferral.detail,
       })}`);

@@ -115,16 +115,17 @@ function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: num
     : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
   const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
   const instruction = storyInstruction(repo.story);
-  const advice = instruction ? ` What to do: ${instruction}.` : "";
+  // A repair-text story has no command by design; its repair sentence IS the remedy.
+  const remedy = instruction ? `${instruction}.` : repo.story.action.kind === "repair-text" ? repo.repairText : "";
+  const advice = remedy ? ` What to do: ${remedy}` : "";
   const finding: TriageFinding = {
     id: `git-paused:${repo.repo}`,
     severity,
     problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)}: ${repo.story.headline}.`.replace("  ", " "),
     safety: `${safety}${quietNote}${advice}`,
   };
-  // No command rather than a wrong one, and `resolvable` is the PROJECTION's
-  // predicate (design 273 P2) — doctor and the status listing diverged the
-  // moment each kept its own copy of the rule.
+  // No command rather than a wrong one. `resolvable` is the PROJECTION's
+  // predicate (273 P2): every offer-deciding surface reads that one, or diverges.
   if (repo.resolvable) finding.command = command;
   return finding;
 }
@@ -493,9 +494,8 @@ export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
 
 const isGitPaused = (finding: TriageFinding): boolean => finding.id.startsWith("git-paused:");
 
-/** The count must be the count of THINGS PRINTED: the human render collapses
- * every paused repo into ONE git block, so counting 48 repo findings above a
- * single block taught the reader that rbox cannot count. */
+/** The count must be the count of THINGS PRINTED: the render collapses every
+ * paused repo into ONE git block, so counting 48 above one block cannot add up. */
 function headline(triage: WorkspaceTriage, gitCollapsedItems: number): string {
   const actionable = triage.findings
     .filter((finding) => finding.severity !== "info" && !isGitPaused(finding)).length

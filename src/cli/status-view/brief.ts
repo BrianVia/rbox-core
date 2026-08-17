@@ -15,7 +15,7 @@ import type { AmbientWatcherTrust } from "../daemon/ambient-status.js";
 import type { LockingHealth } from "../sync-mutex.js";
 import type { StatusRemoteHead } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
-import { gitPauseHeadline } from "./git-story-render.js";
+import { gitPauseHeadline, type GitPauseCounts } from "./git-story-render.js";
 import { progressLabel } from "./progress.js";
 import { humanBytes, n, sanitizeTerminalText } from "./text.js";
 
@@ -46,11 +46,11 @@ export type BriefHaltReason =
   | { kind: "body-too-large" }
   | { kind: "unknown" };
 
-/** Design 273 S1: the split every glance surface shows, both numbers from the
- * one projection. Quiet rows are already excluded by the caller. */
-export interface BriefGitAttention {
-  needsYou: number;
-  selfHealing: number;
+/** Design 273 S1: the split every glance surface shows — literally the
+ * projection's own counts, so the snapshot cannot declare a different set of
+ * numbers than the one that was computed. Quiet rows are already excluded by
+ * the caller. */
+export interface BriefGitAttention extends GitPauseCounts {
   /** The grouped listing follows this headline, so the pointer to it is noise. */
   listed?: boolean;
 }

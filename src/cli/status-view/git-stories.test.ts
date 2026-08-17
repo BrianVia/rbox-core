@@ -145,7 +145,7 @@ test("full repo paths are sanitized, never length-truncated", () => {
   expect(listing).not.toContain("");
 });
 
-test("a group prints only commands EVERY repo in it supports", () => {
+test("a mixed group SPLITS: the half that can act keeps its commands, the other says nothing", () => {
   const resolvable = projectGitDeferralRepos([row({ repo: "a", ageMs: 86_400_000, reason: "conflict" })], NOW);
   expect(renderGitPauseListing(resolvable, { now: NOW }).join("\n")).toContain("rbox git resolve <repo> keep-mine");
 
@@ -153,9 +153,17 @@ test("a group prints only commands EVERY repo in it supports", () => {
     row({ repo: "a", ageMs: 86_400_000, reason: "conflict" }),
     { ...row({ repo: "b", ageMs: 86_400_000, reason: "conflict" }), record: undefined },
   ], NOW);
-  const listing = renderGitPauseListing(mixed, { now: NOW }).join("\n");
-  expect(listing).toContain("b   paused 1 day");
-  expect(listing).not.toContain("rbox git resolve");
+  expect(mixed.map((r) => r.resolvable)).toEqual([true, false]);
+  const lines = renderGitPauseListing(mixed, { now: NOW });
+  // Two groups, one story: the design's "mixed groups split" (S2). Silencing
+  // the whole group instead would deny "a" the commands it genuinely supports.
+  expect(lines.filter((line) => line.startsWith("1 repo — this repo changed on two computers at once"))).toHaveLength(2);
+  const text = lines.join("\n");
+  const [canAct, cannot] = text.split("1 repo — this repo changed on two computers at once").slice(1);
+  expect(canAct).toContain("   a   paused 1 day");
+  expect(canAct).toContain("rbox git resolve <repo> keep-mine");
+  expect(cannot).toContain("   b   paused 1 day");
+  expect(cannot).not.toContain("rbox git resolve");
 });
 
 test("--all drops the per-group cap", () => {

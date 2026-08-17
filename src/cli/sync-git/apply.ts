@@ -282,7 +282,7 @@ opts: {
     now: opts.heldNow,
     deferrals: {
       standingApply: (rel) => currentDeferral(rel, "apply"),
-      restandApply: (rel, standing) => setDeferral(rel, "apply", standing.reason, standing.subjectKey, standing.checkout),
+      restandApply: (rel, standing) => setDeferral(rel, "apply", standing.reason),
     },
   });
   const markCheckpointReproof = (rel: string): void => {

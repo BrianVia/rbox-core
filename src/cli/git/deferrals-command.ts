@@ -70,9 +70,6 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
   return lines;
 }
 
-/** Design 273 P2: `remediationClass` is consulted BEFORE `canResolve`. An
- * ownership hold carries `pending` and so passes the incoming-state test, but
- * its story says no command is needed — offering one is the defect. */
 /** Design 273 P5: this surface renders the FULL population and LABELS the quiet
  * rows rather than hiding them — a repo whose pause keeps flapping never ages
  * past the quiet window, and support has to be able to see it. */
