@@ -256,3 +256,29 @@ test("field replay: held ownership rows stay visible once P2 keeps their record"
   }
   expect(gitPauseCounts(loudRows(rows))).toEqual({ needsYou: 0, selfHealing: 3, total: 3 });
 });
+
+test("a self-healing group never also asks the reader to choose a side", () => {
+  const healing = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 86_400_000, reason: "artifact" }),
+    row({ repo: "b", ageMs: 86_400_000, reason: "git-busy" }),
+  ], NOW);
+  // Both rows CAN resolve (the record carries `pending`), but their stories say
+  // rbox is handling it — offering keep-mine beside "nothing here changed" is
+  // exactly the contradiction that made the old surface unreadable.
+  expect(healing.every((r) => r.canResolve)).toBe(true);
+  const listing = renderGitPauseListing(healing, { now: NOW }).join("\n");
+  expect(listing).not.toContain("rbox git resolve");
+  expect(listing).toContain("rbox is handling these on its own — nothing to do");
+  expect(listing).toContain("If any are still here tomorrow: rbox doctor");
+});
+
+test("the unreadable story carries its per-reason repair text", () => {
+  const rows = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 86_400_000, reason: "unreadable" }),
+    row({ repo: "b", ageMs: 86_400_000, reason: "containment" }),
+  ], NOW);
+  const listing = renderGitPauseListing(rows, { now: NOW }).join("\n");
+  expect(listing).toContain("rbox can't read or manage this repo right now");
+  expect(listing).toContain("Restore repository readability and permissions");
+  expect(listing).toContain("so it stays within the workspace");
+});
