@@ -208,5 +208,7 @@ test("negative control: the at-rest assertion detects a planted sidecar", async 
   const before = treeDigest(root);
   await fsp.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
   expect(treeDigest(root)).not.toEqual(before);
-  expect((await inspectResetJournal(root, stream(root))).status).toBe("halt");
+  // Design 276 F2.1: the fabricated signature is now its own typed row rather
+  // than a halt. It is still emphatically not `none` — the control's whole job.
+  expect((await inspectResetJournal(root, stream(root))).status).toBe("w1");
 });

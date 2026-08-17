@@ -8,6 +8,7 @@ import {
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
+import { unhandledResetInspection } from "./reset-halt-inspection.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import { attributeDaemonForStatus, type StatusRemoteHead } from "./status-view.js";
 import { projectGitDeferralRepos } from "./status-view/git-projection.js";
@@ -175,17 +176,25 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     bookkeeping: { promoteDaemonModeIntent: running },
   };
 
-  // Design 138 F2b: this branch precedes every state read. The classifier and
-  // health reader are both read-only, so a direct status invocation can explain
-  // an unsafe standing transaction without helping the daemon mutate its side-file.
-  const [resetInspection, resetHealth] = await Promise.all([
-    port.inspectResetJournal(root, syncStreamId(cfg)),
-    port.readResetHaltHealth(root),
-  ]);
-  if (resetInspection.status === "halt" || resetHealth !== undefined) {
+  // Design 138 F2b: this branch precedes every state read, and the classifier is
+  // read-only, so a direct status invocation can explain an unsafe standing
+  // transaction without helping the daemon mutate anything. Design 276 F2.1
+  // routes `w1` through it too: not a halt, but it must never fall through to
+  // `readState`, whose recovery would take the workspace sync mutex and attempt
+  // a rival writer takeover against the live daemon.
+  //
+  // Design 276 F2.4: the second halt source is the live daemon's own lifecycle
+  // over its ambient heartbeat, not the health-halt.json side-file this surface
+  // no longer reads at all. A heartbeat cannot outlive the condition, and a dead
+  // daemon needs no file because status already reports `daemon.running`.
+  const resetInspection = await port.inspectResetJournal(root, syncStreamId(cfg));
+  const halted = resetInspection.status === "halt"
+    || observedDaemon.trustedAmbient?.resetLifecycle === "halted";
+  if (halted || resetInspection.status === "w1") {
     const halt: StatusHaltProjection & { probes: StatusHaltProbes } = {
       kind: "reset-halt",
       ...common,
+      halted,
       reason: resetInspection.status === "halt" ? resetInspection.reason : "recovering",
       probes: probes.mode === "brief" || probes.mode === "git"
         ? { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials) }
@@ -193,6 +202,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     };
     return halt as WorkspaceStatusProjection<M>;
   }
+  if (resetInspection.status !== "none" && resetInspection.status !== "recoverable") throw unhandledResetInspection(resetInspection);
 
   const rawActivityP = workspaceObservation.readActivity();
 

@@ -130,7 +130,6 @@ function readPort<M extends StatusMode>(
       note("readWorkspaceActivity", async () => undefined),
     )),
     inspectResetJournal: note("inspectResetJournal", async () => ({ status: "none" as const })),
-    readResetHaltHealth: note("readResetHaltHealth", async () => undefined),
     readState: note("readState", async () => current),
     readPathWarnings: note("readPathWarnings", async () => undefined),
     readTrashStats: note("readTrashStats", async () => undefined),
