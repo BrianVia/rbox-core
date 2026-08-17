@@ -1,6 +1,21 @@
 # 272 — rbox-minted conflict copies must not gate the git-plane oracle
 
-Status: **DRAFT r7** (folds the r6 delta-confirm. One blocker, B-r6-1: the
+Status: **DRAFT r8** (folds the r7 delta-confirm — a small, surgical round. One
+blocker, B-r7-1: **the `why` string carries the reason token**, so
+`CONFLICT_COPY_POPULATION_WHY` must read `"repo population emptied by
+conflict-copies exclusion"` (PLURAL). `follow-classify.ts:139` pushes
+`oracle.why` verbatim and the reason id never enters the deferral log line, so
+`doctor-cmd.ts:214`'s normalization is fed the `why` alone — a singular
+"conflict-copy" normalizes to a string that does not contain `conflict-copies`
+and buckets as `conflict` regardless of declaration order (§0, §2.4, §2.7, §7).
+Plus C-r7-1 (the superstring-order invariant is NOT new and NOT held by luck:
+`("ref-read-unreadable","unreadable")` is already such a pair at indices 11/12
+with the superstring first — §2.7, §7), a narrowing of C-r6-2's pricing to the
+doctor support-bundle bucket, and five nits (`project()` anchors corrected to
+`:460-479`/`:473-478`, §2.3 retitled, `matchesConflictGrammarBelow` added to §0,
+§2.5's rejected unbound form labelled, and a one-line order comment specced at
+`sync-state-model.ts:130`). r7's own fold — everything below — held unchanged.
+r7 folded the r6 delta-confirm. One blocker, B-r6-1: the
 scoped predicate must test components **strictly below** the projection root,
 not "at or below" — the repo's own name component is the caller's addressing
 exactly as an ancestor's is, so a root-named repo is now addressable and BOTH
@@ -30,19 +45,20 @@ symbols** — one predicate and one string constant:
 | Symbol | Home | Deletion condition |
 |---|---|---|
 | `isRboxConflictArtifact(component: string): boolean` — the name grammar, on ONE path component | `src/engine/conflict-name.ts` (new; sits with `conflictName`'s grammar, re-exported from `reconcile.ts`) | conflict copies stop being minted into the workspace |
-| `CONFLICT_COPY_POPULATION_WHY` — the exact `why` string the §2.4 guard emits, so the git plane can discriminate it from every other `indeterminate` (§2.7) | `src/engine/apply-receipt.ts`, beside `whyFromScanError`'s vocabulary (`:266-272`) | the `conflict-copies` deferral reason goes away |
+| `CONFLICT_COPY_POPULATION_WHY = "repo population emptied by conflict-copies exclusion"` — the exact `why` string the §2.4 guard emits, so the git plane can discriminate it from every other `indeterminate` (§2.7). The plural **`conflict-copies`** inside it is load-bearing, not prose: see §2.7's trace | `src/engine/apply-receipt.ts`, beside `whyFromScanError`'s vocabulary (`:266-272`) | the `conflict-copies` deferral reason goes away |
 
 The constant is a shared *literal*, not a mechanism: it exists only because
 `OracleVerdict`'s `indeterminate` carries a free-form `why` and
 `follow-classify.ts:139` needs one exact-match test rather than a substring
 sniff. Concept count is unchanged.
 
-Two **module-private** mechanisms inside `src/engine/apply-receipt.ts`, neither
-exported and neither pinned by a direct call in a test:
+Three **module-private** mechanisms inside `src/engine/apply-receipt.ts`, none
+exported and none pinned by a direct call in a test:
 
 | Mechanism | Why it exists | Deletion condition |
 |---|---|---|
 | `comparableFor(root, eq, armed)` — a factory returning the per-prove bound closure `comparable(rel, kind): boolean`, the oracle's single "is this path compared at all?" answer; the grammar arm tests components **strictly below** `root` (§2.3) | *replaces* five hand-copied exclusion expressions, and gives the guard one place to arm from | never, while the oracle has two sides |
+| `matchesConflictGrammarBelow(rel, root)` — the grammar arm of `comparable`, and the only spend of `isRboxConflictArtifact` on the oracle side: true iff some component of `rel` strictly below `root` satisfies the predicate (§2.3, §2.5) | it names the "strictly below" rule once, so the addressing correction (B-r6-1) lives in one expression instead of at every call site | same as `comparableFor` |
 | the per-prove **empty-population guard** (§2.4) — the `armed` sink the closure sets when the conflict grammar (and only the conflict grammar) drops an entry | a zero-pair alignment is otherwise a vacuous `match` (D2) | the grammar stops being an exclusion reason |
 
 `comparable` is deliberately NOT exported: every consumer is inside
@@ -51,7 +67,8 @@ than by calling it. Same for the `armed` sink.
 
 **All four spends of `isRboxConflictArtifact`** — and nowhere else:
 
-1. inside the bound `comparable()` (§2.5), the only oracle-side consumer;
+1. inside `matchesConflictGrammarBelow`, i.e. the grammar arm of the bound
+   `comparable()` (§2.5) — the only oracle-side consumer;
 2. `conflictCopies` in `rbox status` (§4), over the local manifest;
 3. the papercut-documented recovery recipe (§4) — user-facing, no code;
 4. its own unit fixtures (§7).
@@ -157,7 +174,7 @@ preceded by exactly one dot-free token. Unlikely; not impossible.
 reserves `*.<token>.<14 digits>.conflict*` in every synced tree. It is not
 unforgeable and this design does not pretend otherwise; §3 and §5 price it.
 
-### 2.3 Ancestor matching, SCOPED to the projection root (B1) — correct addressing
+### 2.3 Addressing-scoped matching, SCOPED to the projection root (B1) — correct addressing
 
 r2 identified an inversion in r1's unscoped ancestor rule, confirmed here.
 r3's delta-confirm then showed this scoping kills one *instance* of the
@@ -226,7 +243,7 @@ neither is misclassified by a name that belongs to its caller's addressing
 rather than to its content.
 
 **`root` is bound once, not threaded.** `project()`
-(`apply-receipt.ts:460-483`) is the only caller of `normalizeRel` (`:463`) and
+(`apply-receipt.ts:460-479`) is the only caller of `normalizeRel` (`:463`) and
 always runs before either walk, so it is the natural — and only — place the
 closure can be built. §2.4 spells out the binding site and how the closure
 reaches the walks. Recorded here because the shape's cheapness depends on that
@@ -295,7 +312,7 @@ So the sink is born there and rides the projection:
   `const comparable = comparableFor(normalized, eq, armed)` immediately after
   `normalizeRel` (`:463`) and before the `filter` at `:468-469`. Both live on
   the returned `Projected` struct alongside `expected`/`oracle`/`preScan`/
-  `touchedKeys` (`:473-482`).
+  `touchedKeys` (the returned object literal, `:473-478`).
 - `inventory` (called at `:500`) and `scopedScan` (called at `:659`) take the
   bound closure as a parameter. Both call sites are inside scopes that already
   hold `projected`, so nothing new is plumbed through the class.
@@ -341,7 +358,7 @@ defer it permanently. The rule therefore attaches to the **final verdict**:
 
 | Final verdict | Compared pairs | Guard boolean | Result |
 |---|---|---|---|
-| `match` | zero | **set** | `indeterminate(CONFLICT_COPY_POPULATION_WHY)` — "repo population emptied by conflict-copy exclusion" |
+| `match` | zero | **set** | `indeterminate(CONFLICT_COPY_POPULATION_WHY)` — `"repo population emptied by conflict-copies exclusion"` (plural, per B-r7-1 — §2.7 traces why) |
 | `match` | zero | unset | `match` — exactly today's behavior, unchanged |
 | `match` | ≥ one | either | `match`, unchanged |
 | anything else | either | either | unchanged |
@@ -478,7 +495,10 @@ SIBLING of the leaf arm (`:621`), so swapping `:619`/`:623` for `comparable()`
 leaves `:622` genuinely untouched. `scopedScan` (`:711-722`) NESTS its
 `"other"` throw *inside* the leaf guard — `:718` is the guard, `:719` computes
 the type, `:720` throws. Replace `:718` with `comparable(childRel, "leaf",
-root, eq)` as written and a conflict-grammar FIFO fails the guard and is
+root, eq)` — the **rejected unbound form**, four arguments, kept here verbatim
+because it is what a literal substitution would write; the ADOPTED closure is
+the two-argument bound `comparable(rel, kind)` of §0 and §2.4, which already
+carries `root` and `eq` — and a conflict-grammar FIFO fails the guard and is
 **silently skipped**: `:720` is never reached. The line above — "the `"other"`
 arms deliberately do NOT call it" — is true textually and false behaviorally:
 the routing decision for `:720` is made one level up at `:718`.
@@ -615,7 +635,7 @@ footprint. Every site, anchored:
 
 | Surface | Anchor | What the new member needs |
 |---|---|---|
-| Enum declaration | `src/cli/sync-state-model.ts:130-134` (`GIT_DEFERRAL_REASONS`) | add `"conflict-copies"` |
+| Enum declaration | `src/cli/sync-state-model.ts:130-134` (`GIT_DEFERRAL_REASONS`) | add `"conflict-copies"` **immediately before `"conflict"`**, plus the one-line order comment specced below |
 | Precedence ranking | `sync-state-model.ts:149-153` (`GIT_DEFERRAL_REASON_PRECEDENCE`) | rank it **immediately after `conflict`** and before `worktree-ownership` — it is a durable structural condition the user must clear, not an environmental one. `:156-158`'s `UnrankedGitDeferralReason` alias is a compile error until it is ranked; `:165-167` is the load-time check, which compares the precedence SET's size against `GIT_DEFERRAL_REASONS.length` and so also catches a member ranked but never declared |
 | Wire/telemetry restatement | `src/cli/telemetry/contract.ts:158-165` | the deliberately duplicated list (`state-plane/duplicate-declarations.test.ts:59` licenses the two sites); `:163-165`'s exhaustiveness alias fails until it is added |
 | Telemetry length pin | `src/cli/telemetry/contract.test.ts:48` (`toHaveLength(18)`) | becomes `19` |
@@ -632,6 +652,32 @@ It infers a reason from a free-text detail by iterating
 precedes any appended member — so a detail containing "conflict-copies" would
 be classified `conflict`, silently. Fix: place `"conflict-copies"` **before**
 `"conflict"` in the `GIT_DEFERRAL_REASONS` declaration (`sync-state-model.ts:130`).
+
+**The trace that makes the `why` string load-bearing (B-r7-1).** The reason id
+NEVER reaches `gitReasonOf`; only the `why` does, and the whole path is
+verifiable in three hops:
+
+1. `follow-classify.ts:139` pushes `oracle.why` **verbatim** into `details` —
+   the reason id it `add`s alongside is a separate channel that never enters the
+   deferral log line.
+2. The log line is what `gitReasonOf`'s callers parse: `doctor-cmd.ts:246`
+   (`git deferred <age>: <detail> on …`), `:249` (`git-sync deferred <repo>:
+   <detail>`), and `:255` (`git-sync WARNING <repo>: <detail>`) each hand it the
+   captured **detail fragment**, i.e. the `why`.
+3. `gitReasonOf` normalizes with `detail.toLowerCase().replace(/[ _]+/g, "-")`
+   (`doctor-cmd.ts:214`), which folds spaces and underscores to hyphens but
+   leaves existing hyphens alone.
+
+So the ONLY way the doctor's support-bundle bucket can land on
+`conflict-copies` is for the normalized `why` to literally contain the substring
+`conflict-copies`. A singular `"…conflict-copy exclusion"` normalizes to
+`conflict-copy`, which does not contain `conflict-copies`, falls through to the
+`"conflict"` member, and buckets as `conflict` no matter how the declaration is
+ordered. Hence the constant's plural: `CONFLICT_COPY_POPULATION_WHY =
+"repo population emptied by conflict-copies exclusion"` (§0). The
+declaration-order fix above and the plural wording are **both** required — order
+alone cannot rescue a `why` that never matches, and the plural alone loses to
+`"conflict"` if `"conflict-copies"` is declared after it.
 Declaration order is explicitly "an enumeration, not a ranking"
 (`sync-state-model.ts:145-147`), so moving a member within it is free — the
 ranking lives in `GIT_DEFERRAL_REASON_PRECEDENCE` and is set independently
@@ -645,13 +691,38 @@ precede that member in the declaration.** `gitReasonOf` returns the FIRST
 `includes()` hit while iterating `GIT_DEFERRAL_REASON_SET`
 (`doctor-cmd.ts:213-217`), and that set is built from the declaration in order
 (`:43`), so a shorter member declared earlier permanently shadows every longer
-member containing it. Today `local-edits`/`local-index`/`local-operation`/
-`local-commits`/`local-stash` share only a prefix and collide with nothing, so
-the vocabulary satisfies the rule by luck rather than by construction. §7 adds a
-unit test that pins the invariant itself — for every ordered pair `(a, b)` with
-`a !== b` and `a.includes(b)`, `index(a) < index(b)` — because nothing types it
-and the next superstring member will be added by someone who has not read this
-paragraph.
+member containing it.
+
+**The invariant is already load-bearing in shipped code (C-r7-1).** The
+vocabulary does NOT satisfy it vacuously today: `"ref-read-unreadable"` and
+`"unreadable"` are exactly such a pair, and the declaration
+(`sync-state-model.ts:130-134`) already puts the superstring first — indices
+**11** and **12**. That ordering is load-bearing right now: swap the two and
+every `refs could not be read` detail buckets as plain `unreadable`. (The
+`local-edits`/`local-index`/`local-operation`/`local-commits`/`local-stash`
+family shares only a PREFIX, so it is not an instance of the rule either way.)
+`conflict-copies` therefore adds the **second** pair to a rule the code has been
+keeping by hand, unwritten and untested, since `ref-read-unreadable` was added.
+§7 adds a unit test that pins the invariant itself — for every ordered pair
+`(a, b)` with `a !== b` and `a.includes(b)`, `index(a) < index(b)` — because
+nothing types it and the next superstring member will be added by someone who
+has not read this paragraph.
+
+**Plus one comment line, at the declaration (`sync-state-model.ts:130`).** This
+is the file-size/comment rule's inexpressible-constraint case: the order
+constraint cannot be stated in the type system, and a reader looking at the
+array has no way to see that the list is not freely sortable. One line, above
+`GIT_DEFERRAL_REASONS`, in the register of the ranking comment already at
+`:138-148`:
+
+```ts
+/** Order is load-bearing for `gitReasonOf` (doctor-cmd.ts:213): a member that is
+ *  a SUPERSTRING of another must be declared before it, or the shorter one
+ *  shadows it. Pinned by the invariant test; do not sort this list. */
+```
+
+That is the whole comment budget for this change — the test says WHAT, this
+says why it cannot be expressed anywhere else.
 
 **Enforcement split of the nine rows above, so the cost is not overstated.**
 One row is the declaration itself. Of the eight that follow it: **four are
@@ -672,9 +743,13 @@ set at `:269` the moment the oracle returns `indeterminate`, and the command
 short-circuits at `:686-687` (`keep-mine`) and `:892-893` with the canned
 `code: "proof-indeterminate"` text — "retry after Git state settles" — which is
 transient-flavoured copy for a hold whose `transient` is deliberately `false`.
-Accepted as a residual, not fixed here, because: the deferral surfaces
-(`rbox status`, `rbox doctor`, the deferral listing) are the primary visibility
-for this hold and they DO carry the new reason's copy; the generic refusal is
+Accepted as a residual, not fixed here, because: the deferral surfaces are the
+primary visibility for this hold and they DO carry the new reason's copy —
+`rbox status` and the deferral listing read `deferral.reason` **from state**, so
+they render §2.7's copy directly and need nothing from the `why` string at all;
+`rbox doctor`'s log-derived support-bundle BUCKET is the one surface that
+re-infers the reason from the detail text, and it is exactly what the
+declaration-order fix plus the plural constant above correct. The generic refusal is
 shared across every indeterminate cause, so changing it means threading a cause
 into a message that today has none; and `resolve-command.ts` is at design 271's
 concurrent ratchet ceiling, which makes this the wrong PR to widen it in.
@@ -1018,12 +1093,31 @@ false-positive cost today is zero.
 
 ## 6. Alternatives recorded, REJECTED or DEMOTED (m10, r4, r5, r6, r7)
 
-Five groups, in the order they were decided: **two r7 entries**, then **two r6
+Six groups, in the order they were decided: **two r8 entries**, then **two r7
+entries**, then **two r6
 entries**, then **the three r5 entries** (which resolved r4's blockers
 B-r4-3/4/5), then **the three standing entries** carried since r3 (the §2.3
 demotion, D1's literal substitution, and decision 6's export), then the one
 standing rejection of mint relocation. r5's header said "then r4's three" and
 mislabeled that third group — those entries predate r4.
+
+**r8:**
+
+- **A singular `why` — `"repo population emptied by conflict-copy exclusion"` —
+  REJECTED (B-r7-1).** It reads better and it silently breaks the one surface
+  that re-infers the reason from text. `gitReasonOf` normalizes with
+  `toLowerCase().replace(/[ _]+/g, "-")` (`doctor-cmd.ts:214`) and tests
+  `includes()` per member: `conflict-copy` does not contain `conflict-copies`,
+  so the detail falls through to `"conflict"` and the doctor support-bundle
+  bucket is wrong no matter where `"conflict-copies"` sits in the declaration.
+  The plural is not cosmetic — it is the join between the two vocabularies.
+  Adopted wording in §0; trace in §2.7.
+- **Pinning `gitReasonOf` with a hand-authored literal detail string —
+  REJECTED (B-r7-1).** A test written as
+  `gitReasonOf("… conflict-copies …")` passes on a build whose constant has
+  drifted back to the singular, i.e. it is green in exactly the failure this
+  round exists to catch. §7 asserts over the **exported constant** instead:
+  `expect(gitReasonOf(CONFLICT_COPY_POPULATION_WHY)).toBe("conflict-copies")`.
 
 **r7:**
 
@@ -1185,17 +1279,29 @@ comparison.
      NOT `unreadable` (`follow-classify.ts:139`); and an oracle
      `indeterminate` with any other `why` still adds `unreadable` — the
      negative half, without which an over-broad match test passes.
-  2. `gitReasonOf` (`doctor-cmd.ts:213`) over a detail containing
-     "conflict-copies" returns `conflict-copies`, not `conflict`. This is the
-     enum-ORDER dependency §2.7 names, and it is the one site no type checks.
-  3. **the ORDER INVARIANT itself, not just this instance (C-r6-3):** over
-     `GIT_DEFERRAL_REASONS`, for every pair `(a, b)` with `a !== b` and
-     `a.includes(b)`, assert `indexOf(a) < indexOf(b)`. Today
-     `("conflict-copies", "conflict")` is the only such pair; the test is worth
-     having because the declaration order is documented as "an enumeration, not
-     a ranking" (`sync-state-model.ts:145-147`) and nothing else stops the next
-     superstring member from being appended after the member it shadows.
-  4. the existing vocabulary tests carry the rest automatically —
+  2. `gitReasonOf` (`doctor-cmd.ts:213`) over **the exported constant itself**:
+     `expect(gitReasonOf(CONFLICT_COPY_POPULATION_WHY)).toBe("conflict-copies")`.
+     Asserting over a hand-authored literal ("…conflict-copies…") is barred: it
+     would stay green if the constant's wording drifted back to the singular,
+     which is precisely the B-r7-1 defect — the test must consume the same
+     string the guard emits. It covers BOTH halves at once (the plural wording
+     and the enum-ORDER dependency §2.7 names), and it is the one site no type
+     checks.
+  3. **the ORDER INVARIANT itself, not just this instance (C-r6-3, corrected by
+     C-r7-1):** over `GIT_DEFERRAL_REASONS`, for every pair `(a, b)` with
+     `a !== b` and `a.includes(b)`, assert `indexOf(a) < indexOf(b)`. This is
+     **not** a rule invented for `conflict-copies`: `("ref-read-unreadable",
+     "unreadable")` is already such a pair at indices 11/12 with the superstring
+     first, so the test goes GREEN on today's `main` and stays green through the
+     addition — it pins shipped behavior rather than only the new member. The
+     test is worth having because the declaration order is documented as "an
+     enumeration, not a ranking" (`sync-state-model.ts:145-147`) and nothing
+     else stops the next superstring member from being appended after the member
+     it shadows. Red state: reorder either pair and it fails.
+  4. the one-line comment specced at `sync-state-model.ts:130` (§2.7) is the
+     inexpressible-constraint half of item 3 — the test says WHAT, the comment
+     says why a reader must not re-sort the declaration alphabetically.
+  5. the existing vocabulary tests carry the rest automatically —
      `status-view.test.ts:163-169` (non-empty label/text/repair) and
      `deferral-precedence.test.ts:11-19` (enum ≡ precedence ≡ rank).
      `telemetry/contract.test.ts:48`'s `toHaveLength(18)` becomes `19`; it is a
