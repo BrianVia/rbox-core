@@ -69,3 +69,42 @@ promoteFilesIntoPlane/state-plane territory; 270's held-skip surfaces
 beyond reading; pending-supersession (#702's territory); the resolve
 mutex structure; conflict-copy/oracle code (272's in-flight branch —
 expect sequenced merges, 272 first).
+
+## Review-round dispositions
+
+Two parallel reviews of the six implementation commits produced ten folds
+(F1-F10). What was knowingly NOT closed, and why:
+
+- **§4's two-cycle bullet (deviation 6) is deferred.** `base-absent` is
+  asserted per-caller and the landing is asserted at the composition and
+  `applyGitSections` levels, but "reachable for at most the one pull before the
+  landing composition runs" is proven only by composition-level tests plus the
+  rig's two post-rebuild cycles — not by a single automated two-cycle fixture.
+- **The standing-P rig assertion follows §4's RESIDUAL clause, not its
+  headline.** §4 says the second pull retires the P; §6/m8 says nothing
+  schedules a follow for a quiescent repository. The scenario asserts the
+  weaker form (the P may stand; it costs one redone follow when it retires),
+  resolving the design's self-contradiction toward §2.2.
+- **Resolve preflight raw-reason emissions are pre-existing and in contract.**
+  `resolve-command.ts:675` emits `preflight.reason` under `code: "artifact"`.
+  §2.1's table leaves that caller unchanged, and §2.7 curates only the five
+  mutex-body sites. Queued as a follow-up, not fixed here.
+- **P3: the `makeIntended` → `:1139` rethrow path is traced-correct but pinned
+  only by build-seam fixtures.** The two error classes are asserted by throwing
+  them from `deps.build`, which exercises the SAME outer catch and
+  classification; no fixture drives them out of `makeIntended` itself.
+- **`forceMutexBodyRefusal` is a test seam with a deletion condition.** The
+  `incomplete-checkout` and `journal-recovery` sites are reachable in production
+  only through a crash or concurrent-writer window inside the follow, which no
+  available deps seam opens. It mirrors the shipped `forceProofIndeterminate`
+  seam and is deleted the day either window becomes drivable from a fixture.
+  The `artifact` site — the only one of the three with a raw reason to replace —
+  is induced genuinely, by planting a foreign artifact inside the protocol
+  namespace during the follow.
+- **§2.3's read point is narrowed to the FOLLOWED transition.** The design
+  places the observation "before the two `commitFollowTransition` calls"; it is
+  now taken before the followed one only. The deferred call composes
+  `checkoutComplete:false`, which `composeRepoBase:592` makes `pending`
+  unconditionally, so that path provably cannot land a first BASE — and it no
+  longer pays for `readAllRefsStrict`. Its proof authority returns to exactly
+  what it was before this cycle.

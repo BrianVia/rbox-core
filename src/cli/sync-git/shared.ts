@@ -166,7 +166,7 @@ export function nextDeferral(
   /** Curated at this call site or omitted; never carried over from `current`. */
   detail?: string,
 ): GitDeferral {
-  return {
+  const deferral: GitDeferral = {
     lane,
     deferredSince: current?.deferredSince ?? now,
     reasonSince: current?.reason === reason ? current.reasonSince : now,
@@ -176,8 +176,10 @@ export function nextDeferral(
     ...(checkout === undefined ? {} : { checkout }),
     ...(current?.bytesChanged === undefined ? {} : { bytesChanged: current.bytesChanged }),
     ...(current?.reproof === undefined || current.subjectKey !== subjectKey ? {} : { reproof: current.reproof }),
-    ...(detail === undefined ? {} : { detail }),
   };
+  // Assigned last, which is also its position in the durable field order.
+  if (detail !== undefined) deferral.detail = detail;
+  return deferral;
 }
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
   if (cfg.git?.incremental === false || !baseSec || forced) return undefined;

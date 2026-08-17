@@ -1071,14 +1071,11 @@ opts: {
       }
 
       // Read AFTER the follow published its refs and BEFORE the transition
-      // composes: the intended journal record and the held-attempt binding above
-      // deliberately compose without it. The arming authority is the RECORD's own
-      // BASE, not the manifest projection — a removed or structurally-absent
-      // repository is hidden from that projection (sync-state-records.ts:144-145)
-      // while keeping a durable BASE that must never be replaced by a landing.
-      // The legacy and deferred paths returned above: neither can land a first
-      // BASE (a deferred outcome composes checkoutComplete:false ⇒ pending), so
-      // they never pay for this read.
+      // composes; the journal intent and held-attempt binding above deliberately
+      // compose without it. Armed off the RECORD's BASE, never the manifest
+      // projection, which HIDES a durable BASE for a removed or structurally
+      // absent repository (sync-state-records.ts:144-145). The legacy and
+      // deferred paths returned above and can never land a first BASE.
       if (records[rel]?.base === undefined && baseSec === undefined) {
         const observed = await readAllRefsStrict(repoDir);
         if (observed.status !== "unreadable") landingObservation = observed.refs;

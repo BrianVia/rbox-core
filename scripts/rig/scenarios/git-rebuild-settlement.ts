@@ -108,6 +108,10 @@ ${body}`.replace(/git /g, `git ${IDENT} `);
 interface CycleObservation {
   exitCode: number;
   baseRefs: Record<string, string> | undefined;
+  /** What A published, read from A's own governed refs. Unlike `incomingRefs`
+   *  this survives the landing — a section that landed is no longer pending —
+   *  so the coverage assertion keeps ONE meaning on the red and green paths. */
+  publishedRefs: Record<string, string>;
   incomingRefs: Record<string, string>;
   diskRefs: Record<string, string>;
   standingP: number;
@@ -171,6 +175,7 @@ async function observeCycle(ctx: RigCtx, cycle: number): Promise<CycleObservatio
   const observation: CycleObservation = {
     exitCode: pull.exitCode,
     baseRefs: record?.base?.refs,
+    publishedRefs: await diskRefs(ctx.a),
     incomingRefs: record?.pending?.refs ?? {},
     diskRefs: await diskRefs(ctx.b),
     standingP: standing.length,
@@ -242,12 +247,16 @@ mv '${GUEST.workDir}/.rbox' '${GUEST.workDir}/.rbox.pre-rebuild'`]);
       // pull earns the FIRST BASE, and it must cover every incoming ref.
       rec.assert("[271] the landing pull exits 0",
         landing?.exitCode === 0, `exit=${landing?.exitCode}`);
-      const uncovered = Object.keys(landing?.incomingRefs ?? {}).length > 0
-        ? Object.keys(landing!.incomingRefs).filter((ref) => landing!.baseRefs?.[ref] !== landing!.incomingRefs[ref])
-        : Object.keys(landing?.diskRefs ?? {}).filter((ref) => landing?.baseRefs?.[ref] === undefined);
+      // Judged against what A PUBLISHED, never against B's disk: a local-only
+      // branch on B is outside §4's claim, and a disk-wide fallback would both
+      // false-fail on it and change the assertion's meaning between the red path
+      // (section still pending) and the green one (section landed into BASE).
+      const uncovered = Object.entries(landing?.publishedRefs ?? {})
+        .filter(([ref, oid]) => landing?.baseRefs?.[ref] !== oid)
+        .map(([ref]) => ref);
       rec.assert("[271] the landing pull serializes a BASE covering every incoming ref",
-        landing?.baseRefs !== undefined && uncovered.length === 0,
-        `BASE=${landing?.baseRefs ? Object.keys(landing.baseRefs).join(",") : "absent"} uncovered=${uncovered.join(",") || "none"}`);
+        landing?.baseRefs !== undefined && Object.keys(landing.publishedRefs).length > 0 && uncovered.length === 0,
+        `BASE=${landing?.baseRefs ? Object.keys(landing.baseRefs).join(",") : "absent"} published=${Object.keys(landing?.publishedRefs ?? {}).join(",") || "none"} uncovered=${uncovered.join(",") || "none"}`);
       // FIX_FLIPS[1], §4 exact phrasing: a surviving deferral must name a ref
       // whose DISK value differs from what the pending section asks for.
       rec.assert("[271] any deferral surviving the landing pull names a genuinely diverged ref",
