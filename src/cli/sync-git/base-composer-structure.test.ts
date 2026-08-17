@@ -188,6 +188,11 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     "src/cli/sync-git/checkout-txn.ts": 1,
     "src/cli/sync-git/keep-pins.ts": 2,
     "src/cli/sync-git/pins.ts": 1,
+    // Design 273 P3: the ONE ref mutation for `refs/rbox-pending/*`, batched
+    // through a single `update-ref --stdin` for both the write and the sweep.
+    // Deliberately not routed through pins.ts, whose refs are capture-scoped and
+    // age-pruned at one hour — the opposite lifetime this namespace needs.
+    "src/cli/sync-git/pending-pins.ts": 1,
     "src/cli/sync-git/quarantine.ts": 3,
     "src/cli/sync-git/rollback.ts": 4,
     "src/cli/sync-git/v1724-journal-fixture.test-helper.ts": 1,

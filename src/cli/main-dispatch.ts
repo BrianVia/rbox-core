@@ -101,6 +101,17 @@ function startWorkspaceRequiredError(): Error {
   return new Error("Not inside a synced folder. Run `rbox` to get started, or pass the folder: rbox start <path>");
 }
 
+/** A repo argument as the workspace names it. Anything outside the workspace
+ * throws, so a mistyped path refuses instead of reporting on nothing. */
+function workspaceRelativeRepo(root: string, arg: string): string {
+  const rel = path.relative(root, path.resolve(arg)).split(path.sep).join("/");
+  if (rel === "") return ".";
+  if (rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) {
+    throw new Error(`${arg} is not inside this synced folder`);
+  }
+  return rel;
+}
+
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
   if (!root) throw workspaceRequiredError();
@@ -478,13 +489,22 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       }
       const root = statusRoot;
       const { statusCmd } = await import("./status-cmd.js");
-      await statusCmd(root, {
+      type StatusCmdOptions = Parameters<typeof statusCmd>[1] & object;
+      // Design 273 S2: with `--git`, a path argument names the ONE repo to
+      // detail rather than a workspace to report on — `--git` already scoped the
+      // command to this workspace's paused repos, and there is no second
+      // workspace a repo could belong to.
+      const statusOptions: StatusCmdOptions = {
         json: jsonMode,
         verbose: flags.verbose === "true",
         git: flags.git === "true",
         all: flags.all === "true",
         now: deps.now?.(),
-      });
+      };
+      if (flags.git === "true" && positional[0] !== undefined) {
+        statusOptions.gitRepo = workspaceRelativeRepo(root, positional[0]);
+      }
+      await statusCmd(root, statusOptions);
       break;
     }
     case "migrate": {

@@ -17,8 +17,14 @@
  * `git-render.ts`, whose head-truncation is part of a frozen redaction contract.
  */
 import type { GitDeferralRepoProjection } from "./git-projection.js";
+import { evidenceRisk, type GitRepoEvidence } from "./git-evidence.js";
+import { evidenceRowSuffix } from "./git-evidence-render.js";
 import { storyHeadline } from "./git-stories.js";
 import { boundedCuratedDetail, sanitizeTerminalText, truncateDetail } from "./text.js";
+
+/** The evidence reading for one row, when the caller computed any. Absent for
+ * every surface that must stay git-free, and for repos whose evidence degraded. */
+export type EvidenceLookup = (row: GitDeferralRepoProjection) => GitRepoEvidence | undefined;
 
 /** Rows a human surface shows: the quiet transients are still real, just not
  * worth interrupting anyone over (design 273 P5). */
@@ -92,10 +98,15 @@ interface StoryGroup {
   resolvable: boolean;
 }
 
-/** Groups by (story, actionability, resolvability), each sorted oldest first
- * with unknown ages last. Overlap-count sorting arrives with the evidence
- * reader in PR-C. */
-export function groupByStory(rows: readonly GitDeferralRepoProjection[], now: number): StoryGroup[] {
+/** Groups by (story, actionability, resolvability). Within a group the repos
+ * where BOTH computers touched the same files lead — that is the number a person
+ * is actually deciding on — and age breaks the tie, which is the whole order for
+ * a group whose repos carry no reading. */
+export function groupByStory(
+  rows: readonly GitDeferralRepoProjection[],
+  now: number,
+  evidence?: EvidenceLookup,
+): StoryGroup[] {
   const groups = new Map<string, StoryGroup>();
   for (const row of rows) {
     const key = groupKey(row);
@@ -104,7 +115,10 @@ export function groupByStory(rows: readonly GitDeferralRepoProjection[], now: nu
     groups.set(key, group);
   }
   for (const group of groups.values()) {
-    group.rows.sort((a, b) => pausedAt(a, now) - pausedAt(b, now) || a.repo.localeCompare(b.repo));
+    group.rows.sort((a, b) =>
+      evidenceRisk(evidence?.(b)) - evidenceRisk(evidence?.(a))
+      || pausedAt(a, now) - pausedAt(b, now)
+      || a.repo.localeCompare(b.repo));
   }
   return [...groups.values()].sort((a, b) =>
     Number(a.story.needsYou ? 0 : 1) - Number(b.story.needsYou ? 0 : 1)
@@ -198,6 +212,9 @@ export interface GitPauseListingOptions {
   /** Stale-lock evidence for the busy story. The hygiene sidecar it comes from
    * is read outside this pure module, so the caller lends the lookup. */
   staleLocks?: (row: GitDeferralRepoProjection) => { lockCount: number; oldestAgeMs: number; samplePath: string } | undefined;
+  /** Two-sided evidence, when the caller is a manual command that may spawn git.
+   * Rows without a reading keep the age-only form. */
+  evidence?: EvidenceLookup;
 }
 
 /** S2: the summary-first grouped listing behind `rbox status --git`. */
@@ -216,15 +233,22 @@ export function renderGitPauseListing(
     `rbox paused git sync in ${repos(visible.length)}. Your files are safe — rbox stops`,
     "syncing a repo rather than overwrite work you did on this computer.",
   ];
-  for (const group of groupByStory(visible, options.now)) {
+  for (const group of groupByStory(visible, options.now, options.evidence)) {
     lines.push("");
     lines.push(`${repos(group.rows.length)} — ${storyHeadline(group.story, group.rows.length)}`);
     const shown = options.all ? group.rows : group.rows.slice(0, REPOS_PER_GROUP);
     // One age column per group: unaligned ages read as noise beside paths whose
     // lengths differ by 40 characters.
     const width = Math.max(...shown.map((row) => sanitizeTerminalText(row.repo).length));
+    // The evidence column exists only when some row in the group has a reading;
+    // an all-tier-2 group keeps PR-B's two-column shape rather than padding
+    // every row around a column that is empty everywhere.
+    const suffixes = new Map(shown.map((row) => [row.repo, evidenceRowSuffix(options.evidence?.(row))] as const));
+    const evidenceWidth = Math.max(0, ...[...suffixes.values()].map((suffix) => suffix?.length ?? 0));
     for (const row of shown) {
-      lines.push(`   ${sanitizeTerminalText(row.repo).padEnd(width, " ")}   ${pausedFor(row.oldestDeferredSince, options.now)}`);
+      const suffix = suffixes.get(row.repo);
+      const evidenceColumn = evidenceWidth === 0 ? "" : `${(suffix ?? "").padEnd(evidenceWidth, " ")}   `;
+      lines.push(`   ${sanitizeTerminalText(row.repo).padEnd(width, " ")}   ${evidenceColumn}${pausedFor(row.oldestDeferredSince, options.now)}`);
       const detail = rowDetailLine(row, options);
       if (detail) lines.push(detail);
     }

@@ -5,6 +5,7 @@ import type { TrashStats } from "../engine/trash.js";
 import type { DaemonActivity } from "./activity.js";
 import type { AccountSummary } from "./account-cmd.js";
 import type { GitDeferral, SyncState, WorkspaceConfig } from "./config.js";
+import type { RepoRecordsByPath } from "./sync-state-model.js";
 import type { CredentialLoadResult, Credentials } from "./credentials.js";
 import type { DaemonMode, AmbientWatcherTrust } from "./daemon/ambient-status.js";
 import type { AmbientWorkspaceObservation } from "./workspace-observation.js";
@@ -167,6 +168,10 @@ export interface StatusGitProjection {
    * Human surfaces filter with `loudRows`; doctor and JSON render it whole. */
   projectedRepos: GitDeferralRepoProjection[];
   localRepoProjections: GitDeferralRepoProjection[];
+  /** The records those rows were projected from, kept beside them so the manual
+   * `evidence()` read (design 273 P1) does not reload state the projection
+   * already holds. Nothing renders from this directly. */
+  records: RepoRecordsByPath;
   deferredRepos: number;
   bytesChangedDeferrals: number;
   capability?: CheckoutTransactionCapability;
