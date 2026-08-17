@@ -1,5 +1,51 @@
 # rbox status — living state snapshot
 
+## 2026-08-17 (day) — design 273 SHIPPED end-to-end: git-lane legibility (#764)
+
+- **Design 273 ran the full cycle in one day** (founder-driven copy session →
+  doc r1→r3.1 ALIGNED across 4 review rounds → three PRs, each with parallel
+  review wave + fix round + final serial review): PR #766 (PR-A: status-view
+  6-way + resolve-command 7-way decompositions, both ratchet pins DELETED,
+  move-fidelity audit PASS byte-exact), PR #767 (PR-B: 13-story plain-English
+  vocabulary with founder-set "you have uncommitted work here", ownership
+  holds keep their record at all THREE clear sites, one population + per-row
+  quiet flag, one `resolvable` predicate across four surfaces, held-skip
+  write amplification eliminated 6→1 with zero-writes proof), PR #768 (PR-C:
+  refs/rbox-pending pins with convergent per-pull sweep, two-sided evidence()
+  via git plumbing reads, single-repo view, --dry-run with honest
+  unknown-vs-zero copy, batch keep-mine via --under with frozen-count consent
+  + --expect-repos; batch take-theirs refuses until design 275). Fleet live
+  on 9707d31 (all 3 hosts); field acceptance verified on FM's real 52-repo
+  state (headline==listing, evidence clauses, single-repo file lists) and a
+  real Mac dry-run (honest 2-saved/19-not-copied counts).
+- **Splits queued from review discipline:** design 274 (sender device naming
+  — Max's ask, copy says "another computer" until then), design 275
+  (restore-backup; batch take-theirs gates on it). Also queued:
+  doctor-triage.ts decomposition (~7 bytes ratchet headroom), telemetry
+  needs-you count split (challenged requirement in 273 — needs founder
+  product call: server validator + D1 migration + alert predicate,
+  API-before-CLI), batch --json shape, single-state-reader consolidation for
+  resolve (whole-state bound 53→56 comes back down), mechanical lint-debt
+  pass on status-render/resolve JSON builders (named trade in all 3 PRs).
+- **GH #765 filed (operator-induced incident, 3 product defects):** read-only
+  sqlite opens on FM/desktop live state.db left WAL sidecars → W1 halt;
+  1-hour retry for a self-clearing condition; health-halt.json poison pill
+  (status says halted while doctor reset-journal says none); boot heal races
+  its own bootstrap. FM lost ~19min, desktop ~15min; both healed. RULE
+  (memoried): never open a live fleet state.db — copy state.db* aside and
+  query the copy.
+- **Field-state fixtures shipped** (src/cli/fixtures/field-states/): real FM
+  52-record + Mac 3-record captures drive the PR-B replay suite; the night's
+  "103 vs 52" headline mystery resolved as transient/stale (post-restart the
+  same population renders 52; noted on #764).
+- **Papercuts:** resolve --dry-run loses the sync mutex race on busy
+  pull-only hosts (FM, 2 attempts) — bounded-wait idea logged.
+- **Fleet:** all hosts 2.0.0-beta.4-dev+9707d31, syncing normally; FM
+  pull-only, 46 needs-you + 6 self-healing standing (untouched by founder
+  choice); Mac 3; desktop clean. Conflict-copy litter from worktree doc
+  syncing (*.conflict.ts/md in src/ + docs/) present on all hosts —
+  cleanup candidate, do NOT commit them.
+
 ## 2026-08-17 (night 2) — 271+272 SHIPPED: P-settlement landing + conflict-copy oracle
 
 - **Merged to main and live on all 3 hosts (812202e):** PR #760 (design 271,
