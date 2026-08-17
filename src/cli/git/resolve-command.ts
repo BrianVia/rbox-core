@@ -82,6 +82,10 @@ interface GitResolveDeps {
   mutexOptions?: SyncMutexOptions;
   /** Test seam for the closed proof-refusal mapping after a real snapshot. */
   forceProofIndeterminate?: boolean;
+  /** Test seam for the two mutex-body refusals whose real trigger is a crash or
+   *  concurrent-writer window inside the follow. Names the site; the emission,
+   *  curated text, code and exit status are the production ones. */
+  forceMutexBodyRefusal?: "incomplete-checkout" | "journal-recovery";
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */
   beforeSecondProof?: () => Promise<void>;
   /** Test seam: runs immediately before keep-mine reloads every confirmed input. */
@@ -1109,13 +1113,13 @@ export async function gitResolveCmd(
       }
       return 1;
     }
-    if (Object.keys(follow.heldRefs).length || !intended) {
+    if (deps.forceMutexBodyRefusal === "incomplete-checkout" || Object.keys(follow.heldRefs).length || !intended) {
       emit({ status: "refused", verb, repo: rel, code: "incomplete-checkout", message: RESOLVE_TYPED_REFUSAL["incomplete-checkout"] }, json, deps, root);
       return 1;
     }
     step("landing the published checkout");
     const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
-    if (landed.recovery.status !== "keep") {
+    if (deps.forceMutexBodyRefusal === "journal-recovery" || landed.recovery.status !== "keep") {
       emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
       return 1;
     }

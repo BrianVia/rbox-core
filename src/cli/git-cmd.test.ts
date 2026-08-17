@@ -1395,3 +1395,73 @@ test("take-theirs and keep-mine report their steps on stderr, never on stdout", 
   // Every stdout line stays parseable JSON under --json.
   for (const line of out) expect(() => JSON.parse(line)).not.toThrow();
 });
+
+/**
+ * Design 271 §2.7: the three refusals in the resolve mutex body emit their own
+ * code and curated, path-free text instead of collapsing into the catch-all.
+ * `artifact` is the one whose raw hold reason exists at all — it is REPLACED,
+ * never appended, because it stringifies arbitrary errors and may name paths.
+ */
+test("the standing-artifact refusal replaces its raw hold reason with curated text", async () => {
+  const { incoming } = await fixture();
+  const current = await show([]);
+  const lines: string[] = [];
+
+  const code = await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines, {
+    // A foreign artifact planted inside the protocol namespace during the
+    // follow: the post-landing settlement scan refuses it.
+    beforeSecondProof: async () => {
+      await git(receiver, "update-ref",
+        `refs/rbox-local/base-present/v2/${"a".repeat(64)}/${"b".repeat(64)}`,
+        incoming.refs["refs/heads/main"]!);
+    },
+  }));
+
+  expect(code).toBe(1);
+  const output = lines.at(-1)!;
+  expect(JSON.parse(output)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "artifact",
+    message: "the standing present-artifact could not be settled; nothing was resolved — retry after Git state settles",
+  });
+  // The raw hold reason names the namespace it refused; none of it may leak.
+  expect(output).not.toContain("rbox-local/base-present");
+  expect(output).not.toContain(root);
+  expect(output).not.toMatch(/[\r\n\u001b]/);
+});
+
+test("the incomplete-checkout refusal emits its own code and curated text on both surfaces", async () => {
+  await fixture();
+  const message = "the incoming checkout could not be published for every ref; nothing was resolved — retry after Git state settles";
+  const json: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: (await show([])).snapshot },
+    deps(json, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
+  expect(JSON.parse(json.at(-1)!)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "incomplete-checkout", message,
+  });
+  expect(json.at(-1)).not.toContain(root);
+  expect(json.at(-1)).not.toMatch(/[\r\n\u001b]/);
+
+});
+
+test("the incomplete-checkout refusal renders the same curated text for a human", async () => {
+  await fixture();
+  const human: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { confirm: (await show([])).snapshot },
+    deps(human, { forceMutexBodyRefusal: "incomplete-checkout" }))).toBe(1);
+  expect(human.filter((line) => !line.startsWith("take-theirs: ")).join("\n"))
+    .toContain("the incoming checkout could not be published for every ref");
+  expect(human.join("\n")).not.toContain(root);
+});
+
+test("the journal-recovery refusal emits its own code and curated text", async () => {
+  await fixture();
+  const json: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: (await show([])).snapshot },
+    deps(json, { forceMutexBodyRefusal: "journal-recovery" }))).toBe(1);
+  expect(JSON.parse(json.at(-1)!)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "journal-recovery",
+    message: "the published checkout journal could not be recovered; retry after Git state settles, or inspect the local recovery copy",
+  });
+  expect(json.at(-1)).not.toContain(root);
+  expect(json.at(-1)).not.toMatch(/[\r\n\u001b]/);
+});
