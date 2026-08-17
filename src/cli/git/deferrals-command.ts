@@ -7,6 +7,7 @@ import {
   syncStreamId,
 } from "../config.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "../status-view/git-projection.js";
+import type { GitDeferral, RepoRecord, RepoRecordsByPath } from "../sync-state-model.js";
 import { storyInstruction } from "../status-view/git-stories.js";
 import { ageBucket } from "../status-view/text.js";
 import { serializeGitDeferralLanes } from "../sync-git/git-deferral-json.js";
@@ -85,6 +86,34 @@ function resolveCommand(root: string, repo: string, token?: string, verb?: "take
   return `cd ${shQuote(root)} && ${argv.map(shQuote).join(" ")}`;
 }
 
+export interface GitPauseReading {
+  laneEntries: Array<{ repo: string; deferral: GitDeferral; record: RepoRecord }>;
+  repos: GitDeferralRepoProjection[];
+  records: RepoRecordsByPath;
+  now: Date;
+}
+
+/**
+ * THE whole-state read behind every paused-repo surface in this family.
+ *
+ * `rbox git deferrals` and `rbox git resolve --under` need exactly the same
+ * reading, and design 163's ratchet says the whole-state adapter's production
+ * reach may only shrink — so the batch borrows this one rather than opening a
+ * second `loadState` site for the same rows.
+ */
+export async function readGitPauseRows(root: string, deps: GitDeferralsCmdDeps = {}): Promise<GitPauseReading> {
+  const cfg = await (deps.loadConfig ?? loadConfig)(root);
+  const state = await (deps.loadState ?? loadState)(root, syncStreamId(cfg));
+  const records = repoRecordsForState(state);
+  const laneEntries = Object.entries(records).flatMap(([repo, record]) =>
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])
+  ).sort((a, b) => Date.parse(a.deferral.deferredSince) - Date.parse(b.deferral.deferredSince)
+    || a.repo.localeCompare(b.repo)
+    || DEFERRAL_LANES.indexOf(a.deferral.lane) - DEFERRAL_LANES.indexOf(b.deferral.lane));
+  const now = (deps.now ?? (() => new Date()))();
+  return { laneEntries, repos: projectGitDeferralRepos(laneEntries, now.getTime()), records, now };
+}
+
 /** Render the repo-level deferral list, complete fix brief, or raw lane JSON. */
 export async function gitDeferralsCmd(
   root: string,
@@ -94,16 +123,7 @@ export async function gitDeferralsCmd(
   const write = deps.stdout ?? console.log;
   const writeError = deps.stderr ?? console.error;
   try {
-    const cfg = await (deps.loadConfig ?? loadConfig)(root);
-    const state = await (deps.loadState ?? loadState)(root, syncStreamId(cfg));
-    const records = repoRecordsForState(state);
-    const laneEntries = Object.entries(records).flatMap(([repo, record]) =>
-      Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])
-    ).sort((a, b) => Date.parse(a.deferral.deferredSince) - Date.parse(b.deferral.deferredSince)
-      || a.repo.localeCompare(b.repo)
-      || DEFERRAL_LANES.indexOf(a.deferral.lane) - DEFERRAL_LANES.indexOf(b.deferral.lane));
-    const now = (deps.now ?? (() => new Date()))();
-    const repos = projectGitDeferralRepos(laneEntries, now.getTime());
+    const { laneEntries, repos, now } = await readGitPauseRows(root, deps);
     if (options.json) {
       // Additive only: `deferrals` keeps its exact shape, and `reason` stays the
       // machine contract inside `repos`. `story` is a render-side label.

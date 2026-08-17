@@ -87,7 +87,9 @@ export async function dispatchGitCommand(input: GitDispatchInput): Promise<numbe
   const { repo, under, verb } = parseResolveArgs(positional, flags);
   if (under !== undefined) {
     const root = await resolveRoot(undefined);
-    const { runGitResolveBatch } = await import("./resolve-batch-command.js");
+    const { readGitPauseRows } = await import("./deferrals-command.js");
+    const { gitResolveBatchCmd } = await import("./resolve-batch.js");
+    const reading = await readGitPauseRows(root);
     const options = {
       under: workspaceRelativeRepo(root, under),
       verb,
@@ -95,7 +97,11 @@ export async function dispatchGitCommand(input: GitDispatchInput): Promise<numbe
       yes: flags.yes === "true",
       forceDiscardIncoming: flags["force-discard-incoming"] === "true",
     };
-    return runGitResolveBatch(root, flags.group === undefined ? options : { ...options, group: flags.group });
+    return gitResolveBatchCmd(
+      root,
+      flags.group === undefined ? options : { ...options, group: flags.group },
+      { rows: reading.repos, records: reading.records },
+    );
   }
   const root = await resolveRoot(repo);
   const { gitResolveCmd } = await import("./resolve-command.js");
