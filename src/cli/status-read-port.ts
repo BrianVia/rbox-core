@@ -18,7 +18,7 @@ import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
 import { fetchWithDeadline } from "./remote/resilient.js";
-import type { BriefAccountSummary, BriefIdentitySource } from "./status-view.js";
+import type { BriefAccountSummary, BriefIdentitySource } from "./status-view/brief.js";
 import type { StatusAccountJson, StatusMode, StatusProbePort, StatusReadPort } from "./status-contract.js";
 import { conflictSnapshotStatus, gitDivergenceCount, gitDivergenceFastRepoSource, gitDivergenceStatus, type GitDivergenceRepoHint } from "./sync-git.js";
 import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";

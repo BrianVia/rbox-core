@@ -12,7 +12,7 @@ import {
   isKnownGitDeferralReason,
   projectGitDeferralRepos,
   type GitDeferralRemediationClass,
-} from "../status-view.js";
+} from "../status-view/git-projection.js";
 import { parseSemver } from "../semver.js";
 import { RBOX_VERSION } from "../version.js";
 import {

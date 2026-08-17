@@ -24,7 +24,7 @@ import { currentWorkspaceId } from "./daemon/runtime-state.js";
 import { readMergedDaemonLogTail } from "./daemon-control.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { scopeProjectionFor } from "./scope/projection.js";
-import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
+import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view/git-projection.js";
 
 const PROCESS_PROBE_TTL_MS = 1_000;
 

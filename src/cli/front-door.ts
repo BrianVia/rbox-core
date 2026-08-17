@@ -15,7 +15,7 @@ import { promptSelect } from "./prompt.js";
 import type { WorkspaceKind } from "./setup-cmd.js";
 import { runSyncCommand } from "./sync-cmd.js";
 import { statusCmd, statusCmdWithBriefIdentity } from "./status-cmd.js";
-import type { BriefIdentitySource } from "./status-view.js";
+import type { BriefIdentitySource } from "./status-view/brief.js";
 import { stderrStyle as e } from "./style.js";
 
 export type FrontDoorAction = "login" | "sync" | "start" | "stop" | "setup" | "pair" | "usage" | "logs" | "exit";

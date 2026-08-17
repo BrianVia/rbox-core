@@ -6,7 +6,8 @@ import {
   repoRecordsForState,
   syncStreamId,
 } from "../config.js";
-import { ageBucket, projectGitDeferralRepos, type GitDeferralRepoProjection } from "../status-view.js";
+import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "../status-view/git-projection.js";
+import { ageBucket } from "../status-view/text.js";
 import { serializeGitDeferralLanes } from "../sync-git/git-deferral-json.js";
 import { shQuote } from "../shell-quote.js";
 import { RBOX_VERSION } from "../version.js";

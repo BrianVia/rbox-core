@@ -8,7 +8,7 @@ import { findRoot, RBOX_DIR, saveConfig, type WorkspaceConfig } from "./config.j
 import { requireCredentials, type Credentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { accountHex16, defaultKitTargetDir, displayPath, localYmd } from "./recovery-kit.js";
-import { progressLabel } from "./status-view.js";
+import { progressLabel } from "./status-view/progress.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { spinner } from "./spinner.js";

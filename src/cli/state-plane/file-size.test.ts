@@ -64,7 +64,6 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/e2ee-client.ts", "pending split — 765 nonblank lines and 51.9 KiB when the gate landed"],
   ["src/cli/e2ee-remote.ts", "pending split — 987 nonblank lines and 54.0 KiB when the gate landed"],
   ["src/cli/genesis-durable.ts", "pending split — 707 nonblank lines and 51.9 KiB when the gate landed"],
-  ["src/cli/git/resolve-command.ts", "pending split — 1048 nonblank lines and 52.5 KiB when the gate landed"],
   ["src/cli/help-registry.ts", "pending split — 797 nonblank lines and 35.9 KiB when the gate landed"],
   ["src/cli/init-cmd.ts", "pending split — 680 nonblank lines and 35.0 KiB when the gate landed"],
   ["src/cli/login-attempt-journal.ts", "pending split — 686 nonblank lines and 26.0 KiB when the gate landed"],
@@ -79,7 +78,6 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/setup-cmd.ts", "pending split — 873 nonblank lines and 44.8 KiB when the gate landed"],
   ["src/cli/state-plane/reset/recovery.ts", "pending split — 455 nonblank lines when the gate landed"],
   ["src/cli/status-projection.ts", "pending split — 434 nonblank lines when the gate landed"],
-  ["src/cli/status-view.ts", "pending split — 862 nonblank lines and 45.1 KiB when the gate landed"],
   ["src/cli/sync-git/apply.ts", "pending split — 1470 nonblank lines and 77.7 KiB when the gate landed"],
   ["src/cli/sync-git/base-composer.ts", "pending split — 611 nonblank lines and 28.0 KiB when the gate landed"],
   ["src/cli/sync-git/deferral-hygiene.ts", "pending split — 507 nonblank lines when the gate landed"],
@@ -139,7 +137,6 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/e2ee-client.ts", { nonblank: 765, bytes: 53107 }],
   ["src/cli/e2ee-remote.ts", { nonblank: 987, bytes: 55332 }],
   ["src/cli/genesis-durable.ts", { nonblank: 707, bytes: 53107 }],
-  ["src/cli/git/resolve-command.ts", { nonblank: 1048, bytes: 53741 }],
   ["src/cli/help-registry.ts", { nonblank: 919, bytes: 43383 }],
   ["src/cli/init-cmd.ts", { nonblank: 680, bytes: 35799 }],
   ["src/cli/login-attempt-journal.ts", { nonblank: 686, bytes: 26643 }],
@@ -154,7 +151,6 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/setup-cmd.ts", { nonblank: 873, bytes: 45858 }],
   ["src/cli/state-plane/reset/recovery.ts", { nonblank: 453, bytes: 20958 }],
   ["src/cli/status-projection.ts", { nonblank: 424, bytes: 18693 }],
-  ["src/cli/status-view.ts", { nonblank: 875, bytes: 47095 }],
   // Re-pinned 2026-08-14 to the measured size after the held-decision and
   // apply-metrics decomposition retired the earlier 1559 bridge pin. The
   // #696/#573 growth it excused is gone: the held-skip decision plane moved to

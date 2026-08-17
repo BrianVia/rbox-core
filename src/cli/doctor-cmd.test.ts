@@ -19,7 +19,7 @@ import {
 } from "./doctor-cmd.js";
 import { CONFLICT_COPY_POPULATION_WHY } from "../engine/apply-receipt.js";
 import { git } from "../engine/git-spawn.js";
-import { gitDeferralReasonPresentation } from "./status-view.js";
+import { gitDeferralReasonPresentation } from "./status-view/git-projection.js";
 import { gitIdentity, gitIdentityKey } from "./sync-git/identity.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { saveDevice } from "./e2ee-keystore.js";

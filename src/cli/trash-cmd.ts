@@ -7,7 +7,7 @@
  * Presentation only; all trash mechanics live in the engine's frozen trash module.
  */
 import { listTrash, pruneTrash, restoreFromTrash } from "../engine/trash.js";
-import { humanBytes } from "./status-view.js";
+import { humanBytes } from "./status-view/text.js";
 import { emitJson } from "./json.js";
 import { fail, style } from "./style.js";
 

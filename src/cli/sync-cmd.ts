@@ -2,7 +2,7 @@ import { type Action } from "../engine/index.js";
 import { LocalRuntime } from "./local-runtime.js";
 import { logDebugSummary } from "./metrics.js";
 import { spinner, type Spinner } from "./spinner.js";
-import { progressLabel } from "./status-view.js";
+import { progressLabel } from "./status-view/progress.js";
 import { style, stderrStyle } from "./style.js";
 import type { WorkspaceConfig } from "./workspace-config.js";
 

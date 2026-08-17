@@ -1,5 +1,5 @@
 import { emitJson } from "./json.js";
-import type { BriefIdentitySource } from "./status-view.js";
+import type { BriefIdentitySource } from "./status-view/brief.js";
 import { refreshStatusDeferralAssertions } from "./status-maintenance.js";
 import { projectWorkspaceStatusDetail } from "./status-projection.js";
 import { renderWorkspaceStatusSurface, type StatusSurfaceRender } from "./status-render.js";

@@ -4,23 +4,24 @@ import { RBOX_VERSION } from "./version.js";
 import { formatAccountSummary } from "./account-cmd.js";
 import type { CredentialLoadResult } from "./credentials.js";
 import {
+  conflictCopiesLine,
+  healthDetailLines,
+  healthLine,
+  lastSyncLines,
+  strandedIgnoredLine,
+  trashLine,
+} from "./status-view.js";
+import {
   aggregatePlanQuotaAttention,
   briefBehindRemote,
   briefWorkspaceLabel,
   freshBriefActive,
-  healthDetailLines,
-  healthLine,
-  lastSyncLines,
   renderBriefStatus,
-  renderGitDeferralCompanion,
-  renderGitDeferralLine,
-  conflictCopiesLine,
-  strandedIgnoredLine,
-  trashLine,
   watcherTrustLine,
   type BriefHaltReason,
   type BriefStatusSnapshot,
-} from "./status-view.js";
+} from "./status-view/brief.js";
+import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";

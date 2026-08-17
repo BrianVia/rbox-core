@@ -11,7 +11,8 @@ import { RboxDaemon, type DaemonTimerHandle, type ScanCadenceClock } from "../da
 import { daemonRuntimeDir, daemonStatusPath, readDaemonPidRecord } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
-import { healthLine, progressLabel } from "../status-view.js";
+import { healthLine } from "../status-view.js";
+import { progressLabel } from "../status-view/progress.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";

@@ -90,7 +90,9 @@ import {
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "../version.js";
 import { daemonBindingMatches } from "../sync-state.js";
-import { ageBucket, projectGitDeferralRepos, renderGitDeferralLine } from "../status-view.js";
+import { projectGitDeferralRepos } from "../status-view/git-projection.js";
+import { renderGitDeferralLine } from "../status-view/git-render.js";
+import { ageBucket } from "../status-view/text.js";
 import {
   acquireWorkspaceSyncMutex,
   releaseWorkspaceSyncMutex,

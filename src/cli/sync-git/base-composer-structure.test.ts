@@ -200,7 +200,13 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
   expect(counts(sites)).toEqual({
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
-    "src/cli/git/resolve-command.ts": 9,
+    // Design 273 PR-A split resolve-command.ts into its verb transactions; the
+    // same nine sites moved with the code that owned them (six in take-theirs,
+    // which composes the followed BASE). Total unchanged.
+    "src/cli/git/resolve-artifacts.ts": 1,
+    "src/cli/git/resolve-evidence.ts": 1,
+    "src/cli/git/resolve-keep-mine.ts": 1,
+    "src/cli/git/resolve-take-theirs.ts": 6,
     // U1a's unwired SQLite codec exhaustively maps the existing RepoRecord
     // shape; it has no authority-write call site.
     "src/cli/state-plane/codecs/coverage.ts": 2,

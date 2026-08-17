@@ -5,7 +5,7 @@ import path from "node:path";
 import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { resetSyncState } from "./config.js";
 import type { SyncState } from "./config.js";
-import { ageBucket } from "./status-view.js";
+import { ageBucket } from "./status-view/text.js";
 
 let root: string;
 beforeEach(async () => {

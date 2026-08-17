@@ -82,7 +82,7 @@ mock.module("./metrics.js", () => ({
 mock.module("./scope/projection.js", () => ({
   scopeProjectionFor: async () => { throw new Error("scope must not load without state"); },
 }));
-mock.module("./status-view.js", () => ({
+mock.module("./status-view/git-projection.js", () => ({
   projectGitDeferralRepos: () => { throw new Error("deferrals must not project without state"); },
 }));
 
