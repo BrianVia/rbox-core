@@ -14,6 +14,7 @@ import { inventoryAdoptionSource } from "./adopt-inventory.js";
 import { abortAdoption, continueAdoption, pinAdoptionFolderPolicy, refreshAdoptionContinuation, startAdoption } from "./adopt-lifecycle.js";
 import { adoptDisplacedDir, adoptJournalPath, findAdoptRoot, inspectAdoptFence, loadAdoptJournal, saveAdoptJournal } from "./adopt-journal.js";
 import { saveConfig, syncStreamId } from "./config.js";
+import { bindingRegistryPath } from "./rbox-paths.js";
 import {
   acquireWorkspaceSyncMutex,
   acquireWorkspaceSyncMutexForAdopt,
@@ -283,7 +284,7 @@ describe("design 166 consent and lifecycle", () => {
     await releaseWorkspaceSyncMutex(mutex);
   });
 
-  test("resume with an existing binding refuses an absent catalog before authenticated sync", async () => {
+  test("resume with an unreproducible absent catalog refuses before authenticated sync", async () => {
     const root = await sourceRoot();
     const priorHome = process.env.RBOX_HOME;
     const rboxHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-adopt-authority-"));
@@ -306,6 +307,19 @@ describe("design 166 consent and lifecycle", () => {
     await saveConfig(root, cfg);
     await saveAdoptJournal(root, journal);
     await releaseWorkspaceSyncMutex(mutex);
+    // A binding whose folder is gone is the row generation would have to drop,
+    // so the absent catalog cannot be initialized silently (design 276 F1.3) —
+    // and folder authority still speaks before any authenticated work.
+    await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
+    await fs.writeFile(bindingRegistryPath(), JSON.stringify({
+      schemaVersion: 1,
+      entries: [{
+        root: path.join(rboxHome, "gone"),
+        workspaceId: "ws_gone",
+        boundAt: "2026-08-11T00:00:00.000Z",
+        lastSeenAt: "2026-08-11T00:00:00.000Z",
+      }],
+    }));
     try {
       await expect(adoptCmd("resume", root)).rejects.toThrow("rbox config regenerate");
     } finally {
