@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { BlobStore, ByteProgressCallback } from "../../engine/blobstore.js";
-import { gitSectionDeviceId, validateGitSection } from "../../engine/manifest-validate.js";
+import { validateGitSection } from "../../engine/manifest-validate.js";
+import { gitSectionDeviceId } from "../../engine/git-device-stamp.js";
 import type { GitArtifactRef, GitSection } from "../../engine/types.js";
 import { clearIndexResolveUndo, encryptGitArtifact, exists, headBranchOf, listWorktrees, putGitArtifact, readHead, type PendingGitUpload, type RepoCtx, repoCtx } from "./git-state.js";
 import { git, gitOk } from "../../engine/git-spawn.js";
