@@ -14,6 +14,11 @@ export function buildSyncStateSummary(
     Object.values(record.deferrals ?? {}).filter((value): value is NonNullable<typeof value> => value !== undefined)
       .map((deferral) => ({ repo, deferral, record })),
   );
+  // Design 273 P2 expects a ONE-TIME step change here: ownership-only holds
+  // used to delete their record, so they were never reported. They now stand,
+  // which raises `reposDeferred` and adds `worktree-ownership` rows (~+51 on the
+  // founder fleet). That is restored visibility, not a regression, and the
+  // `ownership-hold` class is excluded from deferral-count alerting.
   const projected = projectGitDeferralRepos(entries, now);
   const deferredRepos = new Set(projected.map((repo) => repo.repo));
   const reasons = new Set<GitDeferralReason>(

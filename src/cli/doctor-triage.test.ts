@@ -124,7 +124,7 @@ const ACCOUNT_LEVEL = /^(rbox login|rbox upgrade|rbox key |rbox subscribe |rbox 
 
 function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): TriageInputs["deferrals"][number] {
   return {
-    repo: "savvy-core",
+    repo: String(over.repo ?? "savvy-core"),
     oldestDeferredSince: new Date(NOW - 20 * 3600_000).toISOString(),
     displayReason: "local-commits",
     displayLane: "apply",
@@ -956,4 +956,60 @@ test("doctor --json emits the same findings machine-readably, and refuses --repo
     expect(finding.safety.length).toBeGreaterThan(0);
   }
   await expect(doctorCmd(root, { report: true, yes: true, json: true })).rejects.toThrow("--json prints the findings only");
+});
+
+// ------------------------------------------ design 273: stories at doctor altitude
+
+test("an ownership hold is never escalated and never handed a resolve command", () => {
+  const hold = deferral({
+    displayReason: "worktree-ownership",
+    reasonLabel: "worktree ownership",
+    remediationClass: "ownership-hold",
+    story: gitStoryFor("worktree-ownership"),
+    // The record carries `pending`, so canKeepMine is TRUE — which is exactly
+    // why the class must be consulted before it (design 273 P2).
+    canResolve: true,
+    canKeepMine: true,
+    oldestDeferredSince: new Date(NOW - 5 * 86400_000).toISOString(),
+  });
+  const finding = findingById(triageWorkspace(inputs({ deferrals: [hold] })).findings, "git-paused:savvy-core");
+  expect(finding?.severity).toBe("info");
+  expect(finding?.command).toBeUndefined();
+  expect(finding?.problem).toContain("another copy of this repo (a git worktree) is using the branch");
+  expect(finding?.safety).toContain("switch that other worktree to a different branch");
+  expect(JSON.stringify(finding)).not.toContain("keep-mine");
+  expect(JSON.stringify(finding)).not.toContain("take-theirs");
+});
+
+test("a quiet transient stays reportable in doctor, labelled rather than escalated", () => {
+  const flapping = deferral({
+    displayReason: "local-edits",
+    reasonLabel: "local edits",
+    remediationClass: "transient",
+    story: gitStoryFor("local-edits"),
+    quiet: true,
+    oldestDeferredSince: new Date(NOW - 30_000).toISOString(),
+  });
+  const triage = triageWorkspace(inputs({ deferrals: [flapping] }));
+  const finding = findingById(triage.findings, "git-paused:savvy-core");
+  expect(finding?.severity).toBe("info");
+  expect(finding?.safety).toContain("paused only recently");
+  // Still in the machine population: support must be able to see a repo whose
+  // pause keeps resetting and therefore never ages out of the quiet window.
+  expect(triage.findings.some((f) => f.id === "git-paused:savvy-core")).toBe(true);
+});
+
+test("doctor SAYS the git population at summary altitude, and keeps every row in --json", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => deferral({
+    repo: `repos/app-${i}`,
+    oldestDeferredSince: new Date(NOW - (i + 1) * 86400_000).toISOString(),
+  }));
+  const triage = triageWorkspace(inputs({ deferrals: rows }));
+  expect(triage.findings.filter((f) => f.id.startsWith("git-paused:"))).toHaveLength(12);
+  const rendered = renderWorkspaceTriage(triage, rows, NOW).join("\n");
+  expect(rendered).toContain("git · 12 repos paused");
+  expect(rendered).toContain("12 waiting on you — this computer has commits your other computers never got");
+  expect(rendered).toContain("full detail: rbox status --git");
+  // Twelve near-identical paragraphs is not a diagnosis a person can read.
+  expect(rendered.split("repos/app-").length - 1).toBe(0);
 });

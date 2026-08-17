@@ -326,20 +326,21 @@ export function pausedAmbientDaemonStatus(
   now = Date.now(),
   previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "watcherTrust" | "deferredRepos" | "deferredNeedsYou" | "deferredSelfHealing" | "oldestDeferralAgeSeconds" | "deferrals">,
 ): AmbientDaemonStatusV1 {
-  return {
+  const paused: AmbientDaemonStatusV1 = {
     schemaVersion: 1,
     daemonVersion: RBOX_VERSION,
     state: "paused",
     heartbeatAt: new Date(now).toISOString(),
     sequence: previous?.sequence ?? null,
     lastSyncedAt: previous?.lastSyncedAt ?? null,
-    ...(previous?.watcherTrust === undefined ? {} : { watcherTrust: previous.watcherTrust }),
-    ...(previous?.deferredRepos === undefined ? {} : { deferredRepos: previous.deferredRepos }),
-    ...(previous?.deferredNeedsYou === undefined ? {} : { deferredNeedsYou: previous.deferredNeedsYou }),
-    ...(previous?.deferredSelfHealing === undefined ? {} : { deferredSelfHealing: previous.deferredSelfHealing }),
-    ...(previous?.oldestDeferralAgeSeconds === undefined ? {} : { oldestDeferralAgeSeconds: previous.oldestDeferralAgeSeconds }),
-    ...(previous?.deferrals === undefined ? {} : { deferrals: previous.deferrals.slice(0, 5) }),
   };
+  if (previous?.watcherTrust !== undefined) paused.watcherTrust = previous.watcherTrust;
+  if (previous?.deferredRepos !== undefined) paused.deferredRepos = previous.deferredRepos;
+  if (previous?.deferredNeedsYou !== undefined) paused.deferredNeedsYou = previous.deferredNeedsYou;
+  if (previous?.deferredSelfHealing !== undefined) paused.deferredSelfHealing = previous.deferredSelfHealing;
+  if (previous?.oldestDeferralAgeSeconds !== undefined) paused.oldestDeferralAgeSeconds = previous.oldestDeferralAgeSeconds;
+  if (previous?.deferrals !== undefined) paused.deferrals = previous.deferrals.slice(0, 5);
+  return paused;
 }
 
 export function findWorkspaceRootSync(start: string): string | undefined {

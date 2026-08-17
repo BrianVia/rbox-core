@@ -51,7 +51,7 @@ export interface WorkspaceTriage {
 
 const SAFE_LOCAL_FILES = "Your files on this machine are untouched.";
 const SAFE_NOTHING_LOST = "Nothing is lost — changes are just waiting instead of syncing.";
-const SEVERITY_RANK: Record<TriageSeverity, number> = { blocked: 0, attention: 1, info: 2 };
+const SEVERITY_RANK = { blocked: 0, attention: 1, info: 2 } satisfies Record<TriageSeverity, number>;
 
 /** Deferral reasons where rbox has PROVEN the repository itself is fine and only
  * its own bookkeeping is paused. Anything outside this set failed to read or
@@ -77,18 +77,19 @@ function scoped(root: string, command: string): string {
 
 /** The shared age buckets read as clipped exact times ("1h" for a 20-hour wait).
  * Say the bucket's real meaning instead: it is a floor, not a measurement. */
-const PLAIN_AGE: Record<string, string> = {
+const PLAIN_AGE = {
   "1h": "for over an hour",
   "1d": "for over a day",
   "7d": "for over a week",
   "14d": "for over two weeks",
   "30d": "for over a month",
   unknown: "",
-};
+} satisfies Record<string, string>;
+
+const isBucketedAge = (bucket: string): bucket is keyof typeof PLAIN_AGE => Object.hasOwn(PLAIN_AGE, bucket);
 
 function plainAge(bucket: string): string {
-  const known = PLAIN_AGE[bucket];
-  if (known !== undefined) return known;
+  if (isBucketedAge(bucket)) return PLAIN_AGE[bucket];
   const minutes = Number(bucket.replace("m", ""));
   return minutes <= 1 ? "for a minute" : `for ${minutes} minutes`;
 }
@@ -124,15 +125,16 @@ function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: num
     : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
   const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
   const advice = repo.story.action ? ` What to do: ${repo.story.action}.` : "";
-  return {
+  const finding: TriageFinding = {
     id: `git-paused:${repo.repo}`,
     severity,
     problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)}: ${repo.story.headline}.`.replace("  ", " "),
     safety: `${safety}${quietNote}${advice}`,
-    // No command rather than a wrong one: `command` is a promise that the line
-    // below it will run against the very state that produced this finding.
-    ...(resolvable ? { command } : {}),
   };
+  // No command rather than a wrong one: `command` is a promise that the line
+  // below it will run against the very state that produced this finding.
+  if (resolvable) finding.command = command;
+  return finding;
 }
 
 function massDeleteCounts(reason: string): { deletes: number; tracked: number } | undefined {

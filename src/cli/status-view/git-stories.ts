@@ -124,12 +124,15 @@ const GIT_STORIES = {
   other: OTHER,
 } satisfies Record<GitDeferralReason, GitStory | ((detail?: string) => GitStory)>;
 
+const isStoriedReason = (reason: string): reason is keyof typeof GIT_STORIES =>
+  Object.hasOwn(GIT_STORIES, reason);
+
 /** The story for a reason code. Unknown reasons — a record written by a newer
  * rbox — read as `other` rather than leaking the code to a human surface. */
 export function gitStoryFor(reason: string, detail?: string): GitStory {
-  const entry = (GIT_STORIES as Record<string, GitStory | ((detail?: string) => GitStory) | undefined>)[reason];
-  if (entry === undefined) return OTHER;
-  return typeof entry === "function" ? entry(detail) : entry;
+  if (!isStoriedReason(reason)) return OTHER;
+  const entry = GIT_STORIES[reason];
+  return entry instanceof Function ? entry(detail) : entry;
 }
 
 /** Words that must never reach a human Git surface (design 273 product bar).

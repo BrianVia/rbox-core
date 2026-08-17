@@ -74,10 +74,9 @@ function verboseWorkspaceHeading(workspace: DetailProjection<StatusMode>["worksp
   return `${style.bold("workspace")} ${label} ${style.dim(`· rbox ${RBOX_VERSION}`)}`;
 }
 
-/** Presentation-only options. They never reach the projection: `--all` changes
- * how many rows are printed, not which repos are paused. */
+/** Presentation-only options: `--all` changes how many rows print, not which
+ * repos are paused, so it never reaches the projection. */
 export interface StatusRenderOptions {
-  /** `rbox status --git --all`: the one-line form for every repo. */
   all?: boolean;
 }
 
@@ -180,11 +179,8 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
     git: {
       ...(git.capability ? { capability: git.capability } : {}),
       deferrals: serializeGitDeferralLanes(git.deferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
-      // Design 273 S5: EVERY repo in the population, quiet rows included and
-      // flagged — a machine consumer must not have to rediscover the rows the
-      // human surfaces chose not to interrupt anyone with. `displayReason` stays
-      // the machine contract; `story` is an ADDITIVE render-side label and must
-      // never be switched on in place of the reason.
+      // Design 273 S5: EVERY repo, quiet rows included and flagged.
+      // `displayReason` stays the machine contract; `story` is additive.
       deferredRepos: git.localRepoProjections.map((repo) => ({
         repo: repo.repo,
         oldestDeferredSince: repo.oldestDeferredSince,
@@ -291,12 +287,12 @@ export function renderStatusBrief(
   if (strandedLine) lines.push(`  ${strandedLine}`);
   const copiesLine = conflictCopiesLine(projection.conflictCopies);
   if (copiesLine) lines.push(`  ${copiesLine}`);
-  // Design 273 S2: the grouped, full-path listing replaces the per-repo
-  // record/companion pair. The record grammar itself is untouched — it remains
-  // the daemon LOG line, whose redaction classifier is byte-frozen against it.
+  // Design 273 S2: the grouped full-path listing replaces the per-repo
+  // record/companion pair. That record grammar is untouched — it is the daemon
+  // LOG line, whose redaction classifier is byte-frozen against it.
   if (gitDetail) {
     lines.push("");
-    lines.push(...renderGitPauseListing(git.projectedRepos, { now, ...(options.all ? { all: true } : {}) }));
+    lines.push(...renderGitPauseListing(git.projectedRepos, { now, all: options.all === true }));
   }
   return lines;
 }
