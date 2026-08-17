@@ -620,3 +620,9 @@ own file is NOT mechanical — the guard shares the file's fixture
 machinery. Follow-up owed, now blocking every branch's final gate on this
 host: redesign the guard (per-connection-cost-aware baseline or a
 dedicated-process runner), not a threshold bump.
+
+## issue-501 journal persist batching — overlay write amplification (shard 5)
+- First seen: 2026-08-17, PR #763 CI (run 31991680267, attempt 1), unrelated diff (272 conflict-copy oracle — journal subsystem untouched).
+- Signature: fails at exactly ~15055ms (15s cap) on the shard runner; green on rerun of the same SHA; passes locally.
+- Class: timing-sensitive perf pin on loaded runners. Suspect the #501 amplification measurement needs a load-tolerant bound, not a wall-clock cap.
+- Status: green-on-rerun eligible; if it recurs on an untouched-subsystem diff twice more, split the measurement out of the CI wall-clock budget.
