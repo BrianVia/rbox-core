@@ -96,8 +96,7 @@ async function earlyPull(input: {
     now: () => input.nowMs ?? Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
     deferrals: {
       standingApply: () => deferral,
-      restandApply: (_rel, standing) => { deferral = { ...standing, lastSeen: "restood" }; },
-      clearApply: () => { deferral = undefined; },
+      restandApply: (_rel, standing) => { deferral = { ...deferral, ...standing, lastSeen: "restood" } as GitDeferral; },
     },
   });
   const repo = plane.repo({
@@ -417,4 +416,83 @@ test("a matching attempt spends exactly two artifact-plane reads — the bracket
     setGitSpawnObserver(undefined);
   }
   expect(planeReads).toBe(2);
+});
+
+
+/**
+ * Design 273 P2 differential. This path runs on EVERY skipping pull, and it
+ * used to CLEAR the record for ownership-only holds. Two things broke: the
+ * record the follow site had just restored was re-deleted one pull later, and
+ * the clear/set cycle reset `deferredSince` — so a multi-day hold stayed
+ * permanently young enough to read as a quiet transient and was invisible on
+ * every surface. The invariant is ONE deferral whose age only grows.
+ */
+const ownershipHold: TypedBlocker = {
+  provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/main",
+};
+
+test("an ownership hold across N skipping pulls keeps ONE record with a monotonically growing age", async () => {
+  const { root, tip } = await repoWithCommit();
+  const attempt = createHeldAttempt(await observe(root, tip), [ownershipHold]);
+  const firstSeen = Date.parse("2026-08-10T00:00:00.000Z");
+
+  // The store mirrors apply.ts's setDeferral: a re-stand of the SAME reason
+  // preserves `deferredSince`, which is the whole point of not clearing.
+  let stored: GitDeferral | undefined;
+  const restand = (standing: Pick<GitDeferral, "reason">, nowIso: string): void => {
+    stored = {
+      lane: "apply",
+      reason: standing.reason,
+      deferredSince: stored?.deferredSince ?? nowIso,
+      reasonSince: stored?.reason === standing.reason ? stored.reasonSince : nowIso,
+      lastSeen: nowIso,
+    };
+  };
+
+  const ages: number[] = [];
+  let writes = 0;
+  for (let pull = 0; pull < 6; pull++) {
+    const nowMs = firstSeen + pull * 3600_000;
+    const plane = createHeldDecisionPlane({
+      root,
+      log: () => {},
+      attempts: {},
+      now: () => Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 1_000,
+      deferrals: {
+        standingApply: () => stored,
+        restandApply: (_rel, standing) => {
+          writes++;
+          restand(standing, new Date(nowMs).toISOString());
+        },
+      },
+    });
+    const repo = plane.repo({ relPath: ".", incoming: sectionFor(tip), storedAttempt: attempt, traced: false, timings: undefined });
+    expect(await repo.earlySkip({ pending: true, attempt })).toBe(true);
+    expect(stored).toBeDefined();
+    expect(stored!.reason).toBe("worktree-ownership");
+    ages.push(nowMs - Date.parse(stored!.deferredSince));
+  }
+
+  // ONE record: `deferredSince` never moved, so the age grew with every pull.
+  expect(ages).toEqual([0, 3600_000, 2 * 3600_000, 3 * 3600_000, 4 * 3600_000, 5 * 3600_000]);
+  expect(stored!.deferredSince).toBe(new Date(firstSeen).toISOString());
+  // And ONE write. A skip that re-stamps an already-standing record makes the
+  // state packet semantically newer every pull, so a fleet held on 51 repos
+  // paid 51 durable record writes per pull to restate what already stood.
+  expect(writes).toBe(1);
+});
+
+test("the no-escalate kill switch still refuses the skip when no record stands", async () => {
+  const { root, tip } = await repoWithCommit();
+  const attempt = createHeldAttempt(await observe(root, tip), [ownershipHold]);
+  const saved = process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE;
+  try {
+    process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE = "0";
+    const off = await earlyPull({ root, tip, attempt });
+    expect(off.skipped).toBe(false);
+    expect(off.restood).toBeUndefined();
+  } finally {
+    if (saved === undefined) delete process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE;
+    else process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE = saved;
+  }
 });

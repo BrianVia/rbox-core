@@ -138,10 +138,10 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "synced-folder + background-sync state",
     usage: "rbox status [path] [--all] [--json | --verbose | --git]",
     flags: [
-      { flag: "--all", desc: "show every locally known synced folder (cannot be combined with a path)" },
+      { flag: "--all", desc: "show every locally known synced folder (cannot be combined with a path); with --git, list every paused repo instead of the first few per group" },
       { flag: "--json", desc: "print JSON" },
       { flag: "--verbose", desc: "print the complete legacy status detail" },
-      { flag: "--git", desc: "show per-repository Git deferral detail" },
+      { flag: "--git", desc: "explain every repo where rbox paused Git sync, and what to do about it" },
     ],
   },
   {

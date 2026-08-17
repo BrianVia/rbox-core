@@ -30,8 +30,13 @@ noun), "overlap" (unexplained), raw reason codes.
    status-view.ts:520-533) — the one identifier the user needs.
 2. Headline count (103) ≠ listing count (52). Two mechanisms, both fixed:
    (a) ownership-only holds actively CLEAR their deferral record
-   (follow-repo-transition.ts:349-357) making 51 repos invisible to every
-   surface; (b) the CLI listing applies a 10-minute transient quiet filter
+   (follow-repo-transition.ts:349-357), so any repo held that way is invisible
+   to every surface. (The "51 repos" attributed here in r1-r3 was inferred from
+   the 103/52 gap; the captured fleet state shows that gap was the stale
+   pre-restart projection and carries no ownership deferrals at all. The DEFECT
+   is real and structural — a record deleted is a repo nobody can see — but its
+   population size is unmeasured until the dev build lands.)
+   (b) the CLI listing applies a 10-minute transient quiet filter
    (status-projection.ts:60-70) while the ambient/daemon count and doctor
    do not (daemon/ambient-status.ts:271-274, workspace-observation.ts:85-94).
 3. Reason labels are jargon; several user-work reasons render raw detail.
@@ -102,14 +107,32 @@ BEFORE `canResolve`/`canKeepMine` — ownership holds have
 `record.pending`, so `canKeepMine` is true (status-view.ts:406) and
 doctor-triage.ts:98-118 would otherwise print `keep-mine` for a repo
 whose story says "no command needed", and its age-only severity rule
-would mark ~51 multi-day holds `blocked`. `ownership-hold` emits NO
+would mark every multi-day hold `blocked`. `ownership-hold` emits NO
 resolve command and NO attention/blocked severity anywhere.
 
 Telemetry ledger line: sync-state telemetry (`deferralReasons`,
-telemetry/sync-state.ts:12-20,77-81) will show a one-time step change
-(~+51 `worktree-ownership` rows on the founder fleet). The class is
-reported but excluded from any deferral-count alerting; the PR-B body
-names the expected step so health checks don't read it as a regression.
+telemetry/sync-state.ts:12-20,77-81) will show a step change —
+`worktree-ownership` rows appear and `reposDeferred` rises. The r2 estimate
+of "~+51" is RETIRED (PR-B r4): the captured fleet state
+(src/cli/fixtures/field-states/2026-08-17-flat-meadow.jsonl) carries ZERO
+ownership deferrals, so it predicts a near-zero step. The honest statement is
+that the real step is whatever ownership holds stand at merge — measure it on
+FM after the dev build lands. The PR-B body says exactly that so health checks
+read the step as restoration rather than regression.
+
+CORRECTION (PR-B r4): the r2 sentence "the class is excluded from any
+deferral-count alerting" was never true and nothing implemented it.
+`reposDeferred` is the projected repo count, ownership holds included, and
+the fleet alert keys on that column (`apps/api/src/fleet-alerts.ts:290`).
+Splitting it is NOT the free additive wire field the review assumed:
+`validateSyncState` rejects unknown keys outright
+(`apps/api/src/telemetry-ingest.ts:377-395`, `hasOnlyKeys`), so a client that
+sends `reposDeferredNeedsYou` before the API is promoted has its whole
+sync-state packet dropped, and the alert can only key on a column that
+exists, i.e. a D1 migration. Challenged requirement, decision needed:
+[cost] server validator + migration + alert predicate + a CLI-after-API
+promotion order; [benefit] the ownership step stops paging. Until that
+decision, PR-B ships the honest comment and the PR-body step note.
 
 Differential tests: `hasGitResolutionIncoming` (status-view.ts:370-372),
 deferral hygiene, daemon `attentionReason` (ambient-status.ts:211-221 —
@@ -240,22 +263,35 @@ asserts the "was saved first" sentence never renders without a quarantine
 path on disk. Story codes are code symbols + optional `--json` fields;
 `reason` remains the machine contract; NO wire/persisted renames.
 
-| story | maps from | human copy (group header) |
-|---|---|---|
-| `local-edits` | local-edits | "you changed files here that were never synced" |
-| `local-staged` | local-index | "you have work staged for a commit here" |
-| `local-commits` | local-commits (+ held local-commits) | "this computer has commits your other computers never got" |
-| `local-stash` | local-stash (+ held local-stash) | "you have stashed work here (git stash)" |
-| `unfinished-git-operation` | local-operation | "a git operation (like a rebase or merge) was left half-finished here" |
-| `branch-in-use-elsewhere` | worktree-ownership, held ownership | "another copy of this repo (a git worktree) is using the branch rbox needs to update, so rbox left it alone" — action: "switch that other worktree to a different branch and rbox finishes on its own; no command needed" |
-| `both-changed` | conflict | "this repo changed on two computers at once" |
-| `conflict-copies` | conflict-copies | "the only files left here are the backup copies rbox made when two computers changed the same file — there is nothing left to compare" — action: "open or delete those conflict files, then rbox retries by itself" |
-| `sync-interrupted` | deletion-pending, journal/checkout recovery detail families | "a sync stopped partway through — rbox retries this on its own" |
-| `sync-download-failed` | artifact (fetch/verify failure — nothing applied, NO backup exists) | "rbox couldn't finish downloading the other computer's version — nothing here changed" |
-| `settle-failed` | artifact (post-apply settle failure) | "the last sync got most of the way and then stopped — your earlier state was saved first" |
-| `repo-unreadable` | unreadable, ref-read-unreadable, config, containment, ignored-target, unsupported | "rbox can't read or manage this repo right now" + repairText |
-| `busy` | git-busy, stale-unattributed | "git was busy here — rbox retries on its own" |
-| `other` | (compiler-forced explicit choice for future reasons) | bounded curated detail passthrough |
+Each row also carries an **action policy** — story-table DATA, not a renderer
+branch (PR-B r4). The five policies are `resolve` (the keep-mine/take-theirs
+block, printed only when EVERY repo in the group is `resolvable`),
+`repair-text` (the row's own curated repair sentence; never a resolve verb),
+`self-healing` (one handling line, escalating past a day), `support`
+("Send this to support: rbox doctor --report"), and `instruction` (one literal
+sentence). `resolvable` is ONE exported predicate on the projection
+(remediationClass first, then incoming state) consumed by the listing, doctor
+and `git deferrals` — three divergent copies of that rule were the r4 defect.
+
+| story | maps from | action | human copy (group header; plural form) |
+|---|---|---|---|
+| `local-edits` | local-edits | resolve | "you changed files here that were never synced" |
+| `local-staged` | local-index | resolve | "you have uncommitted work here" (FOUNDER-SET 2026-08-17, replaces "you have work staged for a commit here": the same pause fires for a half-finished rebase, and "staged" names a git concept the reader may not hold) |
+| `local-commits` | local-commits (+ held local-commits) | resolve | "this computer has commits your other computers never got" |
+| `local-stash` | local-stash (+ held local-stash) | resolve | "you have stashed work here (git stash)" |
+| `unfinished-git-operation` | local-operation | resolve | "a git operation (like a rebase or merge) was left half-finished here"; plural "git operations … were left half-finished here" |
+| `branch-in-use-elsewhere` | worktree-ownership, held ownership | instruction | "another copy of this repo (a git worktree) is using the branch rbox needs to update, so rbox left it alone"; plural "other copies of these repos (git worktrees) are using the branches rbox needs to update, so rbox left them alone" — action: "switch that other worktree to a different branch and rbox finishes on its own; no command needed" |
+| `both-changed` | conflict | resolve | "this repo changed on two computers at once"; plural "each of these changed on two computers at once" |
+| `conflict-copies` | conflict-copies | instruction | "the only files left here are the backup copies rbox made when two computers changed the same file — there is nothing left to compare" — action: "open or delete those conflict files, then rbox retries by itself" |
+| `sync-interrupted` | deletion-pending, journal/checkout recovery detail families | self-healing | "a sync stopped partway through"; plural "syncs stopped partway through" (the "rbox retries this on its own" clause moved to the group's one handling line — printing both said it twice) |
+| `sync-download-failed` | artifact (fetch/verify failure — nothing applied, NO backup exists) | self-healing | "rbox couldn't finish downloading the other computer's version — nothing here changed" |
+| `settle-failed` | artifact (post-apply settle failure) | self-healing | "the last sync got most of the way and then stopped — your earlier state was saved first" |
+| `repo-unreadable` | unreadable, ref-read-unreadable, config, containment, ignored-target, unsupported | repair-text | "rbox can't read or manage this repo right now"; plural "rbox can't read or manage them right now" + repairText on its own indented line |
+| `busy` | git-busy, stale-unattributed | self-healing | "git was busy here" (retry clause moved to the handling line, as above) |
+| `other` | (compiler-forced explicit choice for future reasons) | support | "rbox stopped syncing this repo for an unusual reason"; plural "rbox stopped syncing these for an unusual reason" + bounded curated detail passthrough |
+
+Every group header must agree in number at one repo and at many; a story
+supplies a plural headline whenever its singular form cannot.
 
 The two `artifact` stories are distinguished by the typed refusal/detail
 already written at the deferral site (271's `detail` discipline); the
@@ -305,6 +341,26 @@ syncing a repo rather than overwrite work you did on this computer.
    If any are still here tomorrow: rbox doctor
 ```
 
+Display precedence (PR-B r4): needs-you OVERRIDES precedence. Among a repo's
+lanes, the display lane is the first lane whose story needs a person, and only
+when no lane does does plain precedence pick. That flips one legacy tie on
+purpose: a repo carrying both `deletion-pending` (self-healing, precedence 5)
+and `conflict` (needs you, precedence 7) now renders as the conflict —
+telling the reader "a sync stopped partway through" about a repo that also
+needs a decision is how a repo needing one leaves every attention surface.
+`local-operation` outranks `local-index` — a
+half-finished rebase always dirties the index too, so index-first meant the
+unfinished-operation story could never fire on the repo it was written for.
+Precedence also picks among the lanes that NEED A PERSON first: a repo whose
+oldest lane is a quiet ownership hold and whose second lane is unreadable must
+render the unreadable story, and `ownership-hold` is claimed only when EVERY
+lane is `worktree-ownership`.
+
+Each repo row may carry ONE compact indented second line, printed only when it
+is load-bearing: stale-lock evidence (busy story), the curated per-reason
+repair or detail, a detached-checkout marker, and "working files changed here
+since the pause". Rows stay one line when none of that exists.
+
 - `--all` prints the one-line form for every repo — no invocation emits
   the expanded form at fleet scale; machines use `--json`.
 - Group action lines print only commands EVERY repo in the group supports
@@ -334,8 +390,9 @@ reaches the terminal raw.)
 
 Summary altitude over the same project() output; doctor's user-facing git
 findings are already typed (doctor-triage.ts:98-118) and move onto
-stories. `classifyGitLogMessage`/`gitReasonOf` (doctor-cmd.ts:237-276) is
-NOT deleted — it parses historical daemon log text for redaction and is
+stories. The log-redaction classifier (doctor-cmd.ts:218-276; landed as
+`classifyGitLogLineForRedaction`/`logRedactionReasonOf`, formerly
+`classifyGitLogMessage`/`gitReasonOf`) is NOT deleted — it parses historical daemon log text for redaction and is
 byte-frozen against `renderGitDeferralLine`'s emitted grammar
 (status-view.ts:455-462); it is renamed to say it is a log-redaction
 classifier. Rule: that emitted log grammar stays byte-stable, or the
@@ -471,7 +528,7 @@ optional.
   Scoping: S2's "full paths, never truncated" applies to the STATUS
   renderer only; the emitted LOG line keeps `truncateDetail`
   (status-view.ts:520-533) so the redaction regex and its privacy bound
-  hold. Renaming `gitReasonOf` updates the reason-declaration-order
+  hold. The `logRedactionReasonOf` rename updates the reason-declaration-order
   comment at sync-state-model.ts:129-131 (anchor there already stale).
 - New surface registration: `--dry-run`/`--under`/`--expect-repos` get
   help-registry entries (help-registry.test.ts), zsh completions

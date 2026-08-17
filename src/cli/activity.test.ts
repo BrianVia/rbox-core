@@ -227,12 +227,33 @@ test("shell.deferrals is stable, encoded, precedence-collapsed, oldest-first, an
 test("saveShellDeferrals deletes the sidecar when no deferrals remain", async () => {
   const file = path.join(root, ".rbox", "state", "shell.deferrals");
   const now = Date.parse("2026-07-13T12:00:00Z");
+  const since = new Date(now - 3600_000).toISOString();
   await saveShellDeferrals(root, deferralState({ repo: { repoGen: 1, sourceSeq: 1, deferrals: {
-    apply: { lane: "apply", reason: "local-edits", deferredSince: new Date(now).toISOString(), reasonSince: new Date(now).toISOString(), lastSeen: new Date(now).toISOString() },
+    apply: { lane: "apply", reason: "local-edits", deferredSince: since, reasonSince: since, lastSeen: since },
   } } }), now, ageBucket);
-  expect(await fs.readFile(file, "utf8")).toContain("repo\tlocal-edits\t0m\t0");
+  expect(await fs.readFile(file, "utf8")).toContain("repo\tlocal-edits\t1h\t0");
   await saveShellDeferrals(root, deferralState({}), now, ageBucket);
   await expect(fs.access(file)).rejects.toThrow();
+});
+
+// Design 273 P5: the prompt sidecar carries only rows worth interrupting a shell
+// for. A quiet transient self-heals within minutes, and an ownership hold has no
+// command to offer — after P2 restored those records, including them would put a
+// git warning in EVERY directory of the workspace.
+test("the prompt sidecar omits quiet transients and ownership holds", () => {
+  const now = Date.parse("2026-07-13T12:00:00Z");
+  const lane = (reason: "local-edits" | "worktree-ownership" | "conflict", ageMs: number) => {
+    const since = new Date(now - ageMs).toISOString();
+    return { lane: "apply" as const, reason, deferredSince: since, reasonSince: since, lastSeen: since };
+  };
+  const rendered = renderShellDeferrals(deferralState({
+    "young-transient": { repoGen: 1, sourceSeq: 1, deferrals: { apply: lane("local-edits", 60_000) } },
+    "old-transient": { repoGen: 1, sourceSeq: 1, deferrals: { apply: lane("local-edits", 3600_000) } },
+    "branch-in-use": { repoGen: 1, sourceSeq: 1, deferrals: { apply: lane("worktree-ownership", 5 * 86_400_000) } },
+    "both-changed": { repoGen: 1, sourceSeq: 1, deferrals: { apply: lane("conflict", 3600_000) } },
+  }), now, ageBucket)!;
+  const repos = rendered.trimEnd().split("\n").slice(1).map((row) => decodeURIComponent(row.split("\t")[0]!));
+  expect(repos.sort()).toEqual(["both-changed", "old-transient"]);
 });
 
 // --- design 46: the pure prompt-sidecar renderer ---------------------------

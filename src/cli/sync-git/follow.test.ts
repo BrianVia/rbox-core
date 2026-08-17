@@ -1561,7 +1561,8 @@ for (const location of ["inside", "outside"] as const) {
     await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
 
     const first = await applyIncoming(stateWith(base), incoming, matchingOracle, { collectMetrics: true });
-    expect(first.outcome.deferrals?.repo?.apply).toBeUndefined();
+    // Design 273 P2: the hold keeps a visible record instead of deleting one.
+    expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
     expect(first.outcome.gitPendingRemote?.repo).toEqual(incoming);
     expect(first.outcome.partial?.repo?.heldRefs["refs/heads/side"]).toBe("ownership");
     expect(first.outcome.partial?.repo?.appliedRefs["refs/heads/main"]).toBeDefined();
@@ -1580,7 +1581,14 @@ for (const location of ["inside", "outside"] as const) {
       capabilityProbe: async () => { capabilityCalls++; return true; },
     });
     expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+    // The skip LEAVES the standing record alone rather than clearing it, so the
+    // repo does not disappear from every surface one pull after the follow
+    // restored it — and writes nothing, because nothing about it changed.
     expect(skipped.outcome.deferrals?.repo?.apply).toBeUndefined();
+    const afterSkip = repoRecordsForState(await landOutcome(saved, skipped.outcome, 3)).repo;
+    expect(afterSkip?.deferrals?.apply?.reason).toBe("worktree-ownership");
+    expect(afterSkip?.deferrals?.apply?.deferredSince)
+      .toBe(repoRecordsForState(saved).repo?.deferrals?.apply?.deferredSince);
     expect(capabilityCalls).toBe(0);
 
     await git(receiver, "worktree", "remove", "--force", sibling);
@@ -1635,6 +1643,11 @@ test("design 200 P2: a sibling branch switch during classification records no st
   expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingTip);
 });
 
+// Design 273 P2: RBOX_GIT_OWNERSHIP_NO_ESCALATE now CLASSES the record rather
+// than deleting it, so both settings record `worktree-ownership`. What the flag
+// still controls is escalation, which the projection's `ownership-hold` class
+// owns. RBOX_GIT_OWNERSHIP_HELD_SKIP is unchanged: it re-follows instead of
+// skipping.
 test("design 200 P2 kill switches independently restore legacy ownership behavior", async () => {
   await commit("one\n", "p2-switch-c1");
   const baseTip = await commit("two\n", "p2-switch-c2");
@@ -1663,7 +1676,7 @@ test("design 200 P2 kill switches independently restore legacy ownership behavio
     expect(fullFollow.outcome.attempt?.repo?.blockers).toEqual([{
       provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/side",
     }]);
-    expect(fullFollow.outcome.deferrals?.repo?.apply).toBeUndefined();
+    expect(fullFollow.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
     expect(capabilityCalls).toBeGreaterThan(0);
     followedState = await landOutcome(saved, fullFollow.outcome, 3);
   } finally {
@@ -1687,7 +1700,9 @@ test("design 200 P2 kill switches independently restore legacy ownership behavio
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
   expect(reenabled.outcome.gitApplyMetrics?.results.skipped).toBe(1);
-  expect(reenabled.outcome.deferrals?.repo?.apply == null).toBe(true);
+  // Nothing written: the legacy escalation above already left a standing record.
+  expect(reenabled.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(repoRecordsForState(legacyState!).repo?.deferrals?.apply?.reason).toBe("worktree-ownership");
   expect(capabilityCalls).toBe(0);
 });
 

@@ -83,10 +83,11 @@ test("founder target shape is headline, one attention item, then identity", () =
   expect(lines(full({
     pendingChanges: 1,
     active: { phase: "upload", done: 1, total: 2 },
-    git: { count: 3, oldestDeferredSince: ago(86400_000), allLocalEditDeferrals: true },
+    git: { needsYou: 3, selfHealing: 0 },
   }))).toEqual([
     "Development · syncing normally — 1 change uploading now",
-    "⚠ 3 git repos waiting on uncommitted changes (oldest: 1 day) · rbox status --git",
+    "⚠ 3 repos are waiting on you — rbox paused git sync there so nothing you did gets overwritten.",
+    "  See them:  rbox status --git",
     "Signed in as owner@example.com · pro",
   ]);
 });
@@ -171,10 +172,10 @@ test("locking, version, git, trash, and update keep rows use exact copy", () => 
   ] as const;
   for (const [locking, copy] of lockCases) expect(lines(full({ locking }))).toContain(copy);
   expect(lines(full({ daemonVersion: "1.7.17", daemonVersionSkew: true }))).toContain("⚠ daemon is running v1.7.17 but this CLI is v1.7.18 — restart to finish the upgrade: rbox stop && rbox start");
-  expect(lines(full({ git: { count: 1, oldestDeferredSince: ago(86400_000), allLocalEditDeferrals: true } })))
-    .toContain("⚠ 1 git repo waiting on uncommitted changes (oldest: 1 day) · rbox status --git");
-  expect(lines(full({ git: { count: 2, oldestDeferredSince: ago(2 * 3600_000), allLocalEditDeferrals: false } })))
-    .toContain("⚠ 2 git repos need attention (oldest: 2 hours) · rbox status --git");
+  expect(lines(full({ git: { needsYou: 1, selfHealing: 0 } })))
+    .toContain("⚠ 1 repo is waiting on you — rbox paused git sync there so nothing you did gets overwritten.");
+  expect(lines(full({ git: { needsYou: 2, selfHealing: 1 } })))
+    .toContain("⚠ 2 repos are waiting on you — rbox paused git sync there so nothing you did gets overwritten. 1 more is sorting itself out.");
   expect(lines(full({ trash: { files: 1, bytes: 12_300 } }))).toContain("⚠ 1 trashed file (12.3 KB) · rbox trash list");
   expect(lines(full({ update: { current: "1.0.0", next: "1.1.0" } }))).toContain("⚠ update available: 1.0.0 → 1.1.0 · rbox upgrade");
 });
@@ -248,7 +249,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
   const nonBlockers: Partial<Full>[] = [
     { daemonRunning: false }, { daemonStale: true }, { populate: { filesDone: 1, filesTotal: 2 } },
     { active: { phase: "download", done: 1, total: 2 } }, { pendingChanges: 1 }, { behindRemote: true },
-    { git: { count: 1, oldestDeferredSince: ago(1000), allLocalEditDeferrals: true } },
+    { git: { needsYou: 1, selfHealing: 0 } },
     { trash: { files: 1, bytes: 1 } }, { update: { current: "1", next: "2" } },
   ];
   for (const nonBlocker of nonBlockers) expect(headlineBlocked(full(nonBlocker))).toBe(false);
@@ -267,7 +268,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     daemonVersionSkew: true,
     locking: { status: "starved", reason: "fence" },
     behindRemote: true,
-    git: { count: 2, oldestDeferredSince: ago(8 * 86400_000), allLocalEditDeferrals: false },
+    git: { needsYou: 2, selfHealing: 0 },
     trash: { files: 2, bytes: 1000 },
     update: { current: "1.0.0", next: "2.0.0" },
   }));
@@ -279,7 +280,8 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     "⚠ daemon is running v1.7.17 but this CLI is v1.7.18 — restart to finish the upgrade: rbox stop && rbox start",
     "⚠ workspace recovery is holding the sync lock · rbox doctor",
     "⚠ remote changes waiting to download · rbox pull",
-    "⚠ 2 git repos need attention (oldest: 7 days) · rbox status --git",
+    "⚠ 2 repos are waiting on you — rbox paused git sync there so nothing you did gets overwritten.",
+    "  See them:  rbox status --git",
     "⚠ 2 trashed files (1.0 KB) · rbox trash list",
     "⚠ update available: 1.0.0 → 2.0.0 · rbox upgrade",
     "Signed in as owner@example.com · pro",

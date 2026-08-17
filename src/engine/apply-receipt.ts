@@ -180,8 +180,9 @@ function canonicalReceipt(kind: "pull" | "state", rel: string, expected: FileEnt
   return hashBytes(Buffer.from(JSON.stringify({ version: 1, kind, rel, expected: sort(expected), observed: sort(observed) })));
 }
 
-/** Reaches users verbatim through the git-deferral detail companion, so it is
- *  plain language. `conflict-copies` inside it is load-bearing: `gitReasonOf`
+/** Reaches users verbatim: `rbox status --git` prints it under the repo row, and
+ *  `--verbose` prints it in the deferral companion. So it is plain language, and
+ *  `conflict-copies` inside it is load-bearing: `logRedactionReasonOf`
  *  (doctor-cmd.ts) normalizes this string and buckets on that token. */
 export const CONFLICT_COPY_POPULATION_WHY = "only conflict-copies remain here, so the comparison was skipped.";
 

@@ -191,10 +191,14 @@ test("untrack of a stale nested root never walks up and destroys the parent's bi
   expect((await readPersistedEntries()).map((entry) => entry.root)).toEqual([parent]);
 });
 
-test("--all rejects the single-workspace detail flags rather than ignoring them", async () => {
+test("--all rejects --verbose rather than ignoring it, and means 'every repo' with --git", async () => {
   await trackOnlyWorkspace("papers");
+  // --verbose has no aggregate meaning, so silently ignoring it would report the
+  // wrong thing with a success exit code.
   await expect(run("status", "--all", "--verbose")).rejects.toThrow(/--all is the aggregate view/);
-  await expect(run("status", "--all", "--git")).rejects.toThrow(/--all is the aggregate view/);
+  // Design 273 S2: `--git --all` is the escape hatch from the 5-per-group
+  // summary — every paused repo, one line each — not the machine-wide aggregate.
+  await run("status", "--all", "--git");
   await expect(run("doctor", "--all", "--residue-bytes")).rejects.toThrow(/workspace-scoped/);
 });
 

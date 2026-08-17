@@ -1405,7 +1405,11 @@ test("repo dir GONE ENTIRELY → pusher drops the section (§9); receiver drops 
 
 // ── (c) design §13.5 pending tests ────────────────────────────────────────────────
 
-test("design 200 P2: linked-worktree partial apply stays pending without repo deferral, then completes after removal", async () => {
+// Design 273 P2 amended the "without repo deferral" half: the hold now KEEPS a
+// `worktree-ownership` record so every local surface can see it. It is still
+// never escalated and never handed a resolve command (the `ownership-hold`
+// class owns that), and it still clears the moment the apply completes.
+test("design 200 P2: linked-worktree partial apply stays pending with a visible ownership hold, then completes after removal", async () => {
   const a = path.join(rootA, "r");
   await initRepo(a);
   await commitFile(a, "base.txt", "base", "base");
@@ -1448,7 +1452,8 @@ test("design 200 P2: linked-worktree partial apply stays pending without repo de
     heldRefs: { "refs/heads/side": "ownership" },
     configApplied: true,
   });
-  expect(record.deferrals?.apply).toBeUndefined();
+  expect(record.deferrals?.apply?.reason).toBe("worktree-ownership");
+  const holdSince = record.deferrals!.apply!.deferredSince;
   expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 
   // A newer wire section may arrive after the v2 partial. The proof is against persisted
@@ -1464,7 +1469,9 @@ test("design 200 P2: linked-worktree partial apply stays pending without repo de
   expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
   record = repoRecordsForState(state).r!;
   expect(record.partial?.incomingKey).toBe(gitIncomingKey(state.gitPendingRemote!["r"]!));
-  expect(record.deferrals?.apply).toBeUndefined();
+  // ONE record across pulls: the age is the hold's real age, not a fresh stamp.
+  expect(record.deferrals?.apply?.reason).toBe("worktree-ownership");
+  expect(record.deferrals?.apply?.deferredSince).toBe(holdSince);
   expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
   expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 

@@ -22,6 +22,7 @@ import {
   type BriefStatusSnapshot,
 } from "./status-view/brief.js";
 import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
+import { gitPauseCounts, loudRows, renderGitPauseListing } from "./status-view/git-story-render.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
@@ -73,9 +74,16 @@ function verboseWorkspaceHeading(workspace: DetailProjection<StatusMode>["worksp
   return `${style.bold("workspace")} ${label} ${style.dim(`· rbox ${RBOX_VERSION}`)}`;
 }
 
+/** Presentation-only options: `--all` changes how many rows print, not which
+ * repos are paused, so it never reaches the projection. */
+export interface StatusRenderOptions {
+  all?: boolean;
+}
+
 /** Selects the one surface a projection's mode admits. */
 export function renderWorkspaceStatusSurface<M extends StatusMode>(
   projection: WorkspaceStatusProjection<M>,
+  options: StatusRenderOptions = {},
 ): StatusSurfaceRender {
   if (projection.kind === "reset-halt") return renderResetHalt(projection);
   const daemonRunning = projection.daemon.running;
@@ -85,7 +93,7 @@ export function renderWorkspaceStatusSurface<M extends StatusMode>(
   if (projection.probes.mode === "verbose") {
     return { surface: "lines", lines: renderStatusVerbose(projection as DetailProjection<"verbose">), daemonRunning };
   }
-  return { surface: "lines", lines: renderStatusBrief(projection as DetailProjection<"brief" | "git">), daemonRunning };
+  return { surface: "lines", lines: renderStatusBrief(projection as DetailProjection<"brief" | "git">, options), daemonRunning };
 }
 
 export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender {
@@ -171,10 +179,16 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
     git: {
       ...(git.capability ? { capability: git.capability } : {}),
       deferrals: serializeGitDeferralLanes(git.deferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
+      // Design 273 S5: EVERY repo, quiet rows included and flagged.
+      // `displayReason` stays the machine contract; `story` is additive.
       deferredRepos: git.localRepoProjections.map((repo) => ({
         repo: repo.repo,
         oldestDeferredSince: repo.oldestDeferredSince,
         displayReason: repo.displayReason,
+        story: repo.story.code,
+        needsYou: repo.story.needsYou,
+        quiet: repo.quiet,
+        remediationClass: repo.remediationClass,
         ageSeconds: Number.isFinite(Date.parse(repo.oldestDeferredSince)) && Date.parse(repo.oldestDeferredSince) <= now
           ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
           : null,
@@ -201,10 +215,14 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
   };
 }
 
-export function renderStatusBrief(projection: DetailProjection<"brief" | "git">): string[] {
+export function renderStatusBrief(
+  projection: DetailProjection<"brief" | "git">,
+  options: StatusRenderOptions = {},
+): string[] {
   const { workspace, daemon, counts, git, activity, populate } = projection;
   const gitDetail = projection.probes.mode === "git";
   const now = projection.now;
+  const loudGitRepos = loudRows(git.projectedRepos);
   const account = projection.probes.account;
   const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
   const typedHalt = activity?.halt?.typedReason;
@@ -255,15 +273,7 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
     daemonVersionSkew: daemon.versionSkew,
     locking: projection.locking,
     ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
-    ...(git.humanProjectedRepos.length > 0
-      ? {
-        git: {
-          count: git.humanProjectedRepos.length,
-          oldestDeferredSince: git.humanProjectedRepos[0]!.oldestDeferredSince,
-          allLocalEditDeferrals: git.humanProjectedRepos.every((repo) => repo.displayReason === "local-edits"),
-        },
-      }
-      : {}),
+    git: loudGitRepos.length > 0 ? { ...gitPauseCounts(loudGitRepos), listed: gitDetail } : undefined,
     ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
     ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
     now,
@@ -277,25 +287,13 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
   if (strandedLine) lines.push(`  ${strandedLine}`);
   const copiesLine = conflictCopiesLine(projection.conflictCopies);
   if (copiesLine) lines.push(`  ${copiesLine}`);
+  // Design 273 S2: the grouped full-path listing replaces the per-repo
+  // record/companion pair. That record grammar is untouched — it is the daemon
+  // LOG line, whose redaction classifier is byte-frozen against it.
   if (gitDetail) {
-    for (const deferral of git.humanProjectedRepos) {
-      lines.push(`  ${renderGitDeferralLine({
-        relPath: deferral.repo,
-        reason: deferral.displayReason,
-        deferredSince: deferral.oldestDeferredSince,
-        checkout: deferral.checkout,
-        bytesChanged: deferral.bytesChanged,
-        now,
-        capability: deferral.displayReason === "unsupported" ? git.capability : undefined,
-      })}`);
-      lines.push(`    ${renderGitDeferralCompanion({
-        reason: deferral.displayReason,
-        canResolve: deferral.canResolve,
-        canKeepMine: deferral.canKeepMine,
-        staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
-        detail: deferral.detail,
-      })}`);
-    }
+    lines.push("");
+    lines.push(...renderGitPauseListing(git.projectedRepos, { now, all: options.all === true,
+      staleLocks: (row) => statusStaleLockDetail(workspace.root, projection.hygieneDetails, row.repo, row.displayLane) }));
   }
   return lines;
 }
@@ -303,6 +301,7 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
 export function renderStatusVerbose(projection: DetailProjection<"verbose">): string[] {
   const { workspace, daemon, counts, git, activity, populate, locking, crypto } = projection;
   const now = projection.now;
+  const loudGitRepos = loudRows(git.projectedRepos);
   const lines = [verboseWorkspaceHeading(workspace)];
   if (projection.genesisPending) lines.push(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
   const statusSnapshot = {
@@ -310,10 +309,10 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     changed: counts.changed,
     deleted: counts.deleted,
     gitChanged: counts.gitChanged,
-    gitDeferrals: git.humanProjectedRepos.length,
-    gitBytesChangedDeferrals: git.humanProjectedRepos.filter((repo) => repo.bytesChanged).length,
-    gitOldestDeferral: git.humanProjectedRepos[0]
-      ? { deferredSince: git.humanProjectedRepos[0].oldestDeferredSince, reason: git.humanProjectedRepos[0].displayReason }
+    gitDeferrals: loudGitRepos.length,
+    gitBytesChangedDeferrals: loudGitRepos.filter((repo) => repo.bytesChanged).length,
+    gitOldestDeferral: loudGitRepos[0]
+      ? { deferredSince: loudGitRepos[0].oldestDeferredSince, reason: loudGitRepos[0].displayReason }
       : undefined,
     trackedFiles: counts.trackedFiles,
     daemonRunning: daemon.running,
@@ -363,7 +362,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     }
     if (projection.state.pendingRepos) parts.push(style.yellow(`${projection.state.pendingRepos} pending`));
     if (projection.state.conflictRepos) parts.push(style.yellow(`${projection.state.conflictRepos} conflict${projection.state.conflictRepos === 1 ? "" : "s"}`));
-    if (git.humanProjectedRepos.length) parts.push(style.yellow(`${git.humanProjectedRepos.length} deferred`));
+    if (loudGitRepos.length) parts.push(style.yellow(`${loudGitRepos.length} deferred`));
     if (counts.gitConfigChecking?.length) {
       const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
       parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
@@ -375,7 +374,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     if (counts.conflictSnapshots.prunable > 0) {
       lines.push(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
     }
-    for (const deferral of git.humanLocalRepoProjections) {
+    for (const deferral of loudRows(git.localRepoProjections)) {
       lines.push(`    ${renderGitDeferralLine({
         relPath: deferral.repo,
         reason: deferral.displayReason,
@@ -387,8 +386,10 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
       })}`);
       lines.push(`      ${renderGitDeferralCompanion({
         reason: deferral.displayReason,
-        canResolve: deferral.canResolve,
-        canKeepMine: deferral.canKeepMine,
+        // The projection's predicate, here too: raw canResolve/canKeepMine made
+        // this companion a fourth offer-decider and handed keep-mine to holds.
+        canResolve: deferral.resolvable,
+        canKeepMine: deferral.resolvable && deferral.canKeepMine,
         staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
         detail: deferral.detail,
       })}`);

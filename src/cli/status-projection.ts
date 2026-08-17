@@ -10,7 +10,7 @@ import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import { attributeDaemonForStatus, type StatusRemoteHead } from "./status-view.js";
-import { projectGitDeferralRepos, type GitDeferralDisplayEntry } from "./status-view/git-projection.js";
+import { projectGitDeferralRepos } from "./status-view/git-projection.js";
 import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import { RBOX_VERSION } from "./version.js";
@@ -35,7 +35,6 @@ import type {
 } from "./status-contract.js";
 
 const LOCAL_TRUST_MS = 60_000;
-const TRANSIENT_DEFERRAL_QUIET_MS = 10 * 60_000;
 
 function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
   const out: LocalGitDeferral[] = [];
@@ -52,20 +51,6 @@ function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
 
 const laneDeferrals = (state: SyncState): GitDivergenceStatus["deferrals"] =>
   localGitDeferrals(state).map(({ repo, ...deferral }) => ({ relPath: repo, ...deferral }));
-
-function humanGitDeferralEntries<T extends GitDeferralDisplayEntry>(entries: T[], now: number): T[] {
-  return entries.filter((entry) => {
-    const projected = projectGitDeferralRepos([entry], now)[0];
-    if (projected?.remediationClass !== "transient") return true;
-    const deferredAt = Date.parse(entry.deferral.deferredSince);
-    // Peer echoes on an actively committed repo arrive seconds behind local
-    // state and self-supersede on the next push. Showing those brief holds as
-    // attention trains users to ignore the banner or reach for take-theirs.
-    return !Number.isFinite(deferredAt)
-      || deferredAt > now
-      || now - deferredAt >= TRANSIENT_DEFERRAL_QUIET_MS;
-  });
-}
 
 function trustedLocalSnapshot(input: {
   activity: DaemonActivity | undefined;
@@ -394,16 +379,16 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     deferral,
     record: statusRecords[deferral.repo],
   }));
+  // Design 273 P5: ONE population. Every row carries its own `quiet` flag, and
+  // each surface decides whether to omit or label those rows — no surface
+  // re-derives the rule, so the headline and the listing cannot disagree.
   const projectedRepos = projectGitDeferralRepos(projectedGitEntries, now);
-  const humanProjectedRepos = projectGitDeferralRepos(humanGitDeferralEntries(projectedGitEntries, now), now);
   const active = activity?.active;
   const live = active && Date.now() - Date.parse(active.at) < 60_000 ? active : undefined;
   const git: StatusGitProjection = {
     deferrals: gitDeferrals,
     projectedRepos,
     localRepoProjections: projectGitDeferralRepos(localGitEntries, now),
-    humanProjectedRepos,
-    humanLocalRepoProjections: projectGitDeferralRepos(humanGitDeferralEntries(localGitEntries, now), now),
     deferredRepos: projectedRepos.length,
     bytesChangedDeferrals: projectedRepos.filter((repo) => repo.bytesChanged).length,
   };

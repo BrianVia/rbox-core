@@ -18,6 +18,8 @@ export interface StatusCmdOptions {
   json?: boolean;
   verbose?: boolean;
   git?: boolean;
+  /** With `--git`: print the one-line form for every paused repo. */
+  all?: boolean;
   now?: Date;
 }
 
@@ -93,7 +95,10 @@ export async function statusCmdWithDeps(
 ): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
   const mode: StatusMode = opts.json ? "json" : opts.verbose ? "verbose" : opts.git === true ? "git" : "brief";
-  return emitStatusSurface(renderWorkspaceStatusSurface(await projectOnce(root, mode, deps)));
+  return emitStatusSurface(renderWorkspaceStatusSurface(
+    await projectOnce(root, mode, deps),
+    opts.all === true ? { all: true } : {},
+  ));
 }
 
 function emitStatusSurface(rendered: StatusSurfaceRender): StatusCmdResult {

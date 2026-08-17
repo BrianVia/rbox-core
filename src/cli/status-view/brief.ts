@@ -15,6 +15,7 @@ import type { AmbientWatcherTrust } from "../daemon/ambient-status.js";
 import type { LockingHealth } from "../sync-mutex.js";
 import type { StatusRemoteHead } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
+import { gitPauseHeadline, type GitPauseCounts } from "./git-story-render.js";
 import { progressLabel } from "./progress.js";
 import { humanBytes, n, sanitizeTerminalText } from "./text.js";
 
@@ -45,10 +46,13 @@ export type BriefHaltReason =
   | { kind: "body-too-large" }
   | { kind: "unknown" };
 
-export interface BriefGitAttention {
-  count: number;
-  oldestDeferredSince: string;
-  allLocalEditDeferrals: boolean;
+/** Design 273 S1: the split every glance surface shows — literally the
+ * projection's own counts, so the snapshot cannot declare a different set of
+ * numbers than the one that was computed. Quiet rows are already excluded by
+ * the caller. */
+export interface BriefGitAttention extends GitPauseCounts {
+  /** The grouped listing follows this headline, so the pointer to it is noise. */
+  listed?: boolean;
 }
 
 export interface BriefPopulateProgress {
@@ -308,13 +312,7 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
     const paths = snapshot.pathWarnings!.pathCount;
     lines.push(`⚠ skipped ${n(paths)} case-conflicting path${paths === 1 ? "" : "s"} in ${n(groups)} group${groups === 1 ? "" : "s"} · rename or remove one; background sync will pick it up`);
   }
-  if (snapshot.git && snapshot.git.count > 0) {
-    const repos = `${n(snapshot.git.count)} git repo${snapshot.git.count === 1 ? "" : "s"}`;
-    const condition = snapshot.git.allLocalEditDeferrals
-      ? "waiting on uncommitted changes"
-      : snapshot.git.count === 1 ? "needs attention" : "need attention";
-    lines.push(`⚠ ${repos} ${condition} (oldest: ${briefAge(snapshot.git.oldestDeferredSince, snapshot.now)}) · rbox status --git`);
-  }
+  if (snapshot.git) lines.push(...gitPauseHeadline(snapshot.git));
   if (snapshot.trash && snapshot.trash.files > 0) {
     const files = `${n(snapshot.trash.files)} trashed file${snapshot.trash.files === 1 ? "" : "s"}`;
     lines.push(`⚠ ${files} (${humanBytes(snapshot.trash.bytes)}) · rbox trash list`);

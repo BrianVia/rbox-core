@@ -15,6 +15,7 @@ import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks 
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
+import { gitStoryFor } from "./status-view/git-stories.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -122,8 +123,8 @@ const findingById = (findings: TriageFinding[], id: string): TriageFinding | und
 const ACCOUNT_LEVEL = /^(rbox login|rbox upgrade|rbox key |rbox subscribe |rbox track |brew )/;
 
 function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): TriageInputs["deferrals"][number] {
-  return {
-    repo: "savvy-core",
+  const row = {
+    repo: String(over.repo ?? "savvy-core"),
     oldestDeferredSince: new Date(NOW - 20 * 3600_000).toISOString(),
     displayReason: "local-commits",
     displayLane: "apply",
@@ -132,11 +133,22 @@ function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): Triage
     reasonText: "Local commits changed here.",
     repairText: "Stop Git mutation, then let normal sync retry.",
     remediationClass: "apply-resolvable",
+    story: gitStoryFor(String(over.displayReason ?? "local-commits")),
+    quiet: false,
     canResolve: true,
     canKeepMine: true,
     bytesChanged: false,
     ...over,
   } as TriageInputs["deferrals"][number];
+  // Derived exactly as the projection derives it, so a fixture cannot hand
+  // doctor a row the projection could never produce.
+  return {
+    ...row,
+    resolvable: row.remediationClass !== "ownership-hold"
+      && row.remediationClass !== "capture"
+      && row.remediationClass !== "config"
+      && row.canResolve,
+  };
 }
 
 async function writeActivity(body: DaemonActivity): Promise<void> {
@@ -889,7 +901,9 @@ test("only proven-healthy deferral classes claim the repository is healthy", () 
     );
     expect(risky?.safety).not.toContain("repository is healthy");
     expect(risky?.safety).toContain("could not read or reconcile");
-    expect(risky?.command).toBe(`cd ${root} && rbox git deferrals --brief`);
+    // Design 273: a repo with no resolvable incoming state gets NO command
+    // rather than a command that cannot act on the state that produced it.
+    expect(risky?.command).toBeUndefined();
   }
 });
 
@@ -951,4 +965,94 @@ test("doctor --json emits the same findings machine-readably, and refuses --repo
     expect(finding.safety.length).toBeGreaterThan(0);
   }
   await expect(doctorCmd(root, { report: true, yes: true, json: true })).rejects.toThrow("--json prints the findings only");
+});
+
+// ------------------------------------------ design 273: stories at doctor altitude
+
+test("an ownership hold is never escalated and never handed a resolve command", () => {
+  const hold = deferral({
+    displayReason: "worktree-ownership",
+    reasonLabel: "worktree ownership",
+    remediationClass: "ownership-hold",
+    story: gitStoryFor("worktree-ownership"),
+    // The record carries `pending`, so canKeepMine is TRUE — which is exactly
+    // why the class must be consulted before it (design 273 P2).
+    canResolve: true,
+    canKeepMine: true,
+    oldestDeferredSince: new Date(NOW - 5 * 86400_000).toISOString(),
+  });
+  const finding = findingById(triageWorkspace(inputs({ deferrals: [hold] })).findings, "git-paused:savvy-core");
+  expect(finding?.severity).toBe("info");
+  expect(finding?.command).toBeUndefined();
+  expect(finding?.problem).toContain("another copy of this repo (a git worktree) is using the branch");
+  expect(finding?.safety).toContain("switch that other worktree to a different branch");
+  expect(JSON.stringify(finding)).not.toContain("keep-mine");
+  expect(JSON.stringify(finding)).not.toContain("take-theirs");
+});
+
+test("a quiet transient stays reportable in doctor, labelled rather than escalated", () => {
+  const flapping = deferral({
+    displayReason: "local-edits",
+    reasonLabel: "local edits",
+    remediationClass: "transient",
+    story: gitStoryFor("local-edits"),
+    quiet: true,
+    oldestDeferredSince: new Date(NOW - 30_000).toISOString(),
+  });
+  const triage = triageWorkspace(inputs({ deferrals: [flapping] }));
+  const finding = findingById(triage.findings, "git-paused:savvy-core");
+  expect(finding?.severity).toBe("info");
+  expect(finding?.safety).toContain("paused only recently");
+  // Still in the machine population: support must be able to see a repo whose
+  // pause keeps resetting and therefore never ages out of the quiet window.
+  expect(triage.findings.some((f) => f.id === "git-paused:savvy-core")).toBe(true);
+});
+
+test("doctor SAYS the git population at summary altitude, and keeps every row in --json", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => deferral({
+    repo: `repos/app-${i}`,
+    oldestDeferredSince: new Date(NOW - (i + 1) * 86400_000).toISOString(),
+  }));
+  const triage = triageWorkspace(inputs({ deferrals: rows }));
+  expect(triage.findings.filter((f) => f.id.startsWith("git-paused:"))).toHaveLength(12);
+  const rendered = renderWorkspaceTriage(triage, rows, NOW).join("\n");
+  expect(rendered).toContain("git · 12 repos paused");
+  expect(rendered).toContain("12 waiting on you — this computer has commits your other computers never got");
+  expect(rendered).toContain("full detail: rbox status --git");
+  // Twelve near-identical paragraphs is not a diagnosis a person can read.
+  expect(rendered.split("repos/app-").length - 1).toBe(0);
+});
+
+test("every number doctor prints is derivable from the others", () => {
+  const checks = healthyChecks();
+  checks.enrollment = { ok: false, label: "encryption", message: "device key is missing" };
+  const rows = Array.from({ length: 48 }, (_, i) => deferral({
+    repo: `repos/app-${i}`,
+    oldestDeferredSince: new Date(NOW - (i + 1) * 3600_000).toISOString(),
+  }));
+  const triage = triageWorkspace(inputs({ checks, daemon: STOPPED, deferrals: rows }));
+  const rendered = renderWorkspaceTriage(triage, rows, NOW);
+  const text = rendered.join("\n");
+
+  // The collapsed git block is ONE thing to deal with; the other two are the
+  // numbered items. "48 things need your attention" over a single git block and
+  // two numbered items was the defect.
+  expect(text).toContain("3 things need your attention.");
+  const numbered = rendered.filter((line) => /^\d+\. /.test(line));
+  expect(numbered).toHaveLength(2);
+  expect(text).toContain("git · 48 repos paused");
+  expect(text).toContain("48 waiting on you");
+});
+
+test("a git population that only sorts itself out is not counted as needing attention", () => {
+  const rows = [deferral({
+    repo: "repos/healing",
+    displayReason: "git-busy",
+    remediationClass: "transient",
+    story: gitStoryFor("git-busy"),
+  })];
+  const triage = triageWorkspace(inputs({ deferrals: rows, daemon: STOPPED }));
+  const text = renderWorkspaceTriage(triage, rows, NOW).join("\n");
+  expect(text).toContain("1 thing needs your attention.");
+  expect(text).toContain("1 sorting itself out");
 });

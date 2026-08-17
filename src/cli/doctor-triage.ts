@@ -17,6 +17,8 @@ import type { AdoptFenceInspection } from "./adopt-journal.js";
 import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
+import { storyInstruction } from "./status-view/git-stories.js";
+import { loudRows, renderGitPauseSummary } from "./status-view/git-story-render.js";
 import { ageBucket } from "./status-view/text.js";
 import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
@@ -50,7 +52,7 @@ export interface WorkspaceTriage {
 
 const SAFE_LOCAL_FILES = "Your files on this machine are untouched.";
 const SAFE_NOTHING_LOST = "Nothing is lost — changes are just waiting instead of syncing.";
-const SEVERITY_RANK: Record<TriageSeverity, number> = { blocked: 0, attention: 1, info: 2 };
+const SEVERITY_RANK = { blocked: 0, attention: 1, info: 2 } satisfies Record<TriageSeverity, number>;
 
 /** Deferral reasons where rbox has PROVEN the repository itself is fine and only
  * its own bookkeeping is paused. Anything outside this set failed to read or
@@ -76,18 +78,19 @@ function scoped(root: string, command: string): string {
 
 /** The shared age buckets read as clipped exact times ("1h" for a 20-hour wait).
  * Say the bucket's real meaning instead: it is a floor, not a measurement. */
-const PLAIN_AGE: Record<string, string> = {
+const PLAIN_AGE = {
   "1h": "for over an hour",
   "1d": "for over a day",
   "7d": "for over a week",
   "14d": "for over two weeks",
   "30d": "for over a month",
   unknown: "",
-};
+} satisfies Record<string, string>;
+
+const isBucketedAge = (bucket: string): bucket is keyof typeof PLAIN_AGE => Object.hasOwn(PLAIN_AGE, bucket);
 
 function plainAge(bucket: string): string {
-  const known = PLAIN_AGE[bucket];
-  if (known !== undefined) return known;
+  if (isBucketedAge(bucket)) return PLAIN_AGE[bucket];
   const minutes = Number(bucket.replace("m", ""));
   return minutes <= 1 ? "for a minute" : `for ${minutes} minutes`;
 }
@@ -100,22 +103,31 @@ function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: num
   const age = ageBucket(repo.oldestDeferredSince, now);
   const command = repo.canKeepMine
     ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`)
-    : repo.canResolve
-      ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`)
-      : scoped(root, "rbox git deferrals --brief");
-  const waiting = repo.canResolve
-    ? "rbox has paused publishing its history until you say which side wins"
-    : `rbox has paused publishing its history (${repo.reasonLabel})`;
+    : scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`);
   const safety = REPOSITORY_PROVEN_HEALTHY.has(repo.displayReason)
     ? `Your repository is healthy; only rbox's bookkeeping is paused. ${SAFE_LOCAL_FILES}`
     : `rbox could not read or reconcile part of this repository (${repo.reasonLabel}). It has changed nothing there — look at the repository itself before changing anything.`;
-  return {
+  // Design 273 P2/P5: an ownership hold and a young transient are never
+  // escalated. The age-only rule below would otherwise call ~51 multi-day
+  // ownership holds "blocked" the moment P2 made them visible again.
+  const severity: TriageSeverity = !repo.story.needsYou || repo.quiet
+    ? "info"
+    : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
+  const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
+  const instruction = storyInstruction(repo.story);
+  // A repair-text story has no command by design; its repair sentence IS the remedy.
+  const remedy = instruction ? `${instruction}.` : repo.story.action.kind === "repair-text" ? repo.repairText : "";
+  const advice = remedy ? ` What to do: ${remedy}` : "";
+  const finding: TriageFinding = {
     id: `git-paused:${repo.repo}`,
-    severity: age === "unknown" || age.endsWith("m") ? "attention" : "blocked",
-    problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)} to publish: ${waiting}.`.replace("  ", " "),
-    safety,
-    command,
+    severity,
+    problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)}: ${repo.story.headline}.`.replace("  ", " "),
+    safety: `${safety}${quietNote}${advice}`,
   };
+  // No command rather than a wrong one. `resolvable` is the PROJECTION's
+  // predicate (273 P2): every offer-deciding surface reads that one, or diverges.
+  if (repo.resolvable) finding.command = command;
+  return finding;
 }
 
 function massDeleteCounts(reason: string): { deletes: number; tracked: number } | undefined {
@@ -480,16 +492,39 @@ export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
   };
 }
 
-function headline(triage: WorkspaceTriage): string {
-  const actionable = triage.findings.filter((finding) => finding.severity !== "info").length;
+const isGitPaused = (finding: TriageFinding): boolean => finding.id.startsWith("git-paused:");
+
+/** The count must be the count of THINGS PRINTED: the render collapses every
+ * paused repo into ONE git block, so counting 48 above one block cannot add up. */
+function headline(triage: WorkspaceTriage, gitCollapsedItems: number): string {
+  const actionable = triage.findings
+    .filter((finding) => finding.severity !== "info" && !isGitPaused(finding)).length
+    + gitCollapsedItems;
   if (actionable === 0) return "Everything is syncing normally.";
   return actionable === 1 ? "1 thing needs your attention." : `${actionable} things need your attention.`;
 }
 
-export function renderWorkspaceTriage(triage: WorkspaceTriage): string[] {
+/**
+ * Design 273 S3: the git findings are SAID at summary altitude. Every paused
+ * repo keeps its own `git-paused:<repo>` row in `--json` — that is the machine
+ * contract and the support flow's full population — but a hundred near-identical
+ * paragraphs is not a diagnosis a person can read, so the human render collapses
+ * them into the story summary and points at `rbox status --git` for the list.
+ */
+export function renderWorkspaceTriage(
+  triage: WorkspaceTriage,
+  gitRows: readonly GitDeferralRepoProjection[] = [],
+  now = Date.now(),
+): string[] {
   const lines = [`${style.bold("rbox doctor")} — ${triage.workspace} ${style.dim(`(${triage.root})`)}`, ""];
-  lines.push(headline(triage));
-  triage.findings.forEach((finding, index) => {
+  // The git block is one item, and only when it says someone must act.
+  const gitCollapsedItems = gitRows.length > 0 && loudRows(gitRows).some((row) => row.story.needsYou) ? 1 : 0;
+  lines.push(headline(triage, gitCollapsedItems));
+  if (gitRows.length > 0) {
+    lines.push("");
+    for (const line of renderGitPauseSummary(gitRows, now)) lines.push(line);
+  }
+  triage.findings.filter((finding) => !isGitPaused(finding)).forEach((finding, index) => {
     lines.push("");
     const marker = finding.severity === "info" ? style.dim("note") : `${index + 1}.`;
     lines.push(`${marker} ${finding.problem}`);

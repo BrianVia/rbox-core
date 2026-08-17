@@ -282,8 +282,7 @@ opts: {
     now: opts.heldNow,
     deferrals: {
       standingApply: (rel) => currentDeferral(rel, "apply"),
-      restandApply: (rel, standing) => setDeferral(rel, "apply", standing.reason, standing.subjectKey, standing.checkout),
-      clearApply: (rel) => clearDeferral(rel, "apply"),
+      restandApply: (rel, standing) => setDeferral(rel, "apply", standing.reason),
     },
   });
   const markCheckpointReproof = (rel: string): void => {
@@ -938,8 +937,14 @@ opts: {
       const intendedFor = async (progress: FollowProgress): Promise<FollowIntended> => {
         const authority = composeFollowAuthority(followComposition(), followProof, progress, true);
         const effectiveDeferrals = mergeFollowDeferralLanes(records[rel]?.deferrals, deferrals[rel]);
-        if (authority.held && !(gitOwnershipNoEscalateEnabled() && authority.ownershipOnly)) {
-          const heldReason = followHeldDeferralReason(progress);
+        // Design 273 P2 mirror of the follow-transition site: every held repo
+        // keeps a record. An ownership-only hold records `worktree-ownership`,
+        // which the projection classes `ownership-hold` — visible everywhere,
+        // escalated nowhere.
+        if (authority.held) {
+          const heldReason = gitOwnershipNoEscalateEnabled() && authority.ownershipOnly
+            ? "worktree-ownership" as const
+            : followHeldDeferralReason(progress);
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
         } else delete effectiveDeferrals.apply;

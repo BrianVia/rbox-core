@@ -51,7 +51,7 @@ test("the shipped precedence of the original reasons is unchanged", () => {
 });
 
 test("a superstring reason is declared before the member it would otherwise shadow", () => {
-  // `gitReasonOf` (doctor-cmd.ts:213) returns the FIRST declared member the
+  // `logRedactionReasonOf` (doctor-cmd.ts) returns the FIRST declared member the
   // normalized detail `includes()`, so a shorter member declared earlier
   // permanently shadows every longer member containing it.
   for (const a of GIT_DEFERRAL_REASONS) {

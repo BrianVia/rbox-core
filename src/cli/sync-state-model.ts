@@ -127,9 +127,10 @@ export interface ConfigStoreIdentity {
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
-/** Order is load-bearing for `gitReasonOf` (doctor-cmd.ts:213): a member that is
- *  a SUPERSTRING of another must be declared before it, or the shorter one
- *  shadows it. Pinned by the invariant test; do not sort this list. */
+/** Order is load-bearing for `logRedactionReasonOf` (doctor-cmd.ts, the daemon
+ *  log-redaction classifier): a member that is a SUPERSTRING of another must be
+ *  declared before it, or the shorter one shadows it. Pinned by the invariant
+ *  test; do not sort this list. */
 export const GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
   "deletion-pending", "conflict-copies", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "ref-read-unreadable", "unreadable",

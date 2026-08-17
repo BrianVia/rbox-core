@@ -17,6 +17,7 @@ import {
   renderWorkspaceStatusSurface,
 } from "./status-render.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
+import { gitStoryFor } from "./status-view/git-stories.js";
 
 const ROOT = "/tmp/rbox-status-render";
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -49,6 +50,8 @@ function deferredRepo(): GitDeferralRepoProjection {
     reasonText: "uncommitted changes",
     repairText: "commit or stash",
     remediationClass: "user-action",
+    story: gitStoryFor("local-edits"),
+    quiet: false,
     canResolve: false,
     canKeepMine: false,
     bytesChanged: true,
@@ -82,8 +85,6 @@ function base(): Omit<StatusDetailProjection, "probes"> {
       deferrals: [],
       projectedRepos: [],
       localRepoProjections: [],
-      humanProjectedRepos: [],
-      humanLocalRepoProjections: [],
       deferredRepos: 0,
       bytesChangedDeferrals: 0,
     },
@@ -120,7 +121,7 @@ function halt<M extends StatusMode>(mode: M): Extract<WorkspaceStatusProjection<
 }
 
 const withDeferral = () => ({
-  git: { ...base().git, humanProjectedRepos: [deferredRepo()], humanLocalRepoProjections: [deferredRepo()] },
+  git: { ...base().git, projectedRepos: [deferredRepo()], localRepoProjections: [deferredRepo()] },
 }) as Partial<StatusDetailProjection>;
 
 test("every renderer is a pure function of its projection: no writer or reader is reachable", async () => {
@@ -215,9 +216,16 @@ test("the shared Git line is suppressed in brief and added by Git detail", () =>
   const brief = renderStatusBrief(detail("brief", withDeferral()));
   const git = renderStatusBrief(detail("git", withDeferral()));
 
-  expect(git.slice(0, brief.length)).toEqual(brief);
-  expect(git.length).toBe(brief.length + 2);
-  expect(git[brief.length]).toContain("repos/alpha");
+  // Design 273 S2: `--git` appends the grouped story listing under the same
+  // brief surface. Full repo paths, no daemon log grammar. The one line brief
+  // has that `--git` does not is the pointer AT the listing being printed.
+  const pointer = "  See them:  rbox status --git";
+  expect(brief).toContain(pointer);
+  expect(git).not.toContain(pointer);
+  expect(git.slice(0, brief.length - 1)).toEqual(brief.filter((line) => line !== pointer));
+  expect(git.length).toBeGreaterThan(brief.length);
+  expect(git.join("\n")).toContain("repos/alpha");
+  expect(git.join("\n")).not.toContain("git deferred ");
 });
 
 test("verbose renders its own surface, never the brief one", () => {

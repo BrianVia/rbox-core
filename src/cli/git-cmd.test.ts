@@ -455,7 +455,7 @@ test("git deferrals renders empty human and JSON forms", async () => {
   expect(human).toEqual(["no deferred repos"]);
   const json: string[] = [];
   expect(await gitDeferralsCmd(root, { json: true }, { loadConfig: async () => cfg, loadState: async () => state, stdout: (line) => json.push(line) })).toBe(0);
-  expect(JSON.parse(json[0]!)).toEqual({ schemaVersion: 1, deferrals: [] });
+  expect(JSON.parse(json[0]!)).toEqual({ schemaVersion: 1, deferrals: [], repos: [] });
 });
 
 test("git deferrals brief is deterministic, actionable, anchored, quoted, and host-free", async () => {

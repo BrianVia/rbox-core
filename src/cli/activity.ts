@@ -434,7 +434,12 @@ export function renderShellDeferrals(
   const entries = Object.entries(repoRecords).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
   );
-  const projections = projectGitDeferralRepos(entries);
+  // Design 273 P5: the prompt sidecar carries only rows worth interrupting a
+  // shell for. Quiet transients self-heal within minutes, and an ownership hold
+  // has no command to offer — after P2 restored those records, including them
+  // would put a git warning in EVERY directory of the workspace.
+  const projections = projectGitDeferralRepos(entries, now)
+    .filter((repo) => !repo.quiet && repo.remediationClass !== "ownership-hold");
   const rows = projections.map((repo) => ({
     projection: repo,
     line: `${encodeURIComponent(repo.repo)}\t${repo.displayReason}\t${ageBucket(repo.oldestDeferredSince, now)}\t${repo.bytesChanged ? 1 : 0}`,

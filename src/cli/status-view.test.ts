@@ -128,7 +128,11 @@ test("deletion-pending gets its deliberate display slot without changing legacy 
       { repo: "repo", deferral: { lane: "apply", reason: "deletion-pending", deferredSince: iso(60), reasonSince: iso(60) } },
     ], NOW)[0]!;
   expect(project("local-commits")).toMatchObject({ displayReason: "local-commits" });
-  expect(project("conflict")).toMatchObject({ displayReason: "deletion-pending", reasonLabel: "finishing a branch deletion" });
+  // Design 273 S2 (needs-you overrides precedence): a durable conflict outranks
+  // the self-healing slot. Telling the reader "a sync stopped partway through"
+  // about a repo that also needs a decision is how a repo needing one
+  // disappears from every attention surface.
+  expect(project("conflict")).toMatchObject({ displayReason: "conflict", reasonLabel: "conflict" });
   expect(project("worktree-ownership")).toMatchObject({ displayReason: "deletion-pending", reasonLabel: "finishing a branch deletion" });
 });
 
