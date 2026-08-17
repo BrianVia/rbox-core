@@ -32,6 +32,30 @@ async function catalogAbsent(): Promise<boolean> {
   }
 }
 
+/** A 1.x-shaped bound folder: a `.rbox/` binding and nothing else. */
+async function boundFolder(name: string, policy: { syncGit?: boolean } = {}): Promise<string> {
+  const root = path.join(home, name);
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_bound",
+    projectId: "root",
+    deviceId: "dev_1",
+    rootPath: root,
+    remoteUrl: "https://api.test",
+    token: "",
+    ...policy,
+  }));
+  return root;
+}
+
+async function writeBindingRegistry(...entries: { root: string; workspaceId: string }[]): Promise<void> {
+  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
+  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
+    schemaVersion: 1,
+    entries: entries.map((entry) => ({ ...entry, boundAt: "2026-08-11T00:00:00.000Z", lastSeenAt: "2026-08-11T00:00:00.000Z" })),
+  }));
+}
+
 test("a genuinely fresh machine silently initializes an empty authoritative catalog", async () => {
   const state = await ensureFolderAuthority();
   expect(state.kind).toBe("authoritative");
@@ -46,36 +70,29 @@ test("a corrupt binding registry blocks silent initialization instead of publish
 });
 
 /**
- * The refusal the daemon depends on.
+ * The 1.x upgrade case (design 276 F1.3).
  *
- * A host whose catalog was lost still has its bindings, so the inventory is not
- * empty and regeneration would "succeed" — publishing a catalog stripped of
- * labels, ordering, global defaults, inheritance, and overrides that nothing can
- * reconstruct. The daemon never created the binding it is running, so it has no
- * standing to make that call; it asks for ordinary authority and refuses.
+ * A 1.11.4 home has discoverable bindings and no catalog. Generation reproduces
+ * every one of them from its own pre-catalog policy, so there is nothing to lose
+ * and nothing to consent to: initializing is what un-bricks the upgrade. Only a
+ * row generation would DROP (the skipped case below) still refuses.
  */
-test("a lost catalog on a root the caller did not just bind refuses instead of regenerating", async () => {
-  const root = path.join(home, "bound-folder");
-  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
-  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
-    remoteWorkspaceId: "ws_bound",
-    projectId: "root",
-    deviceId: "dev_1",
-    rootPath: root,
-    remoteUrl: "https://api.test",
-    token: "",
-    syncGit: true,
-  }));
-  await fs.mkdir(path.dirname(bindingRegistryPath()), { recursive: true });
-  await fs.writeFile(bindingRegistryPath(), JSON.stringify({
-    schemaVersion: 1,
-    entries: [{
-      root,
-      workspaceId: "ws_bound",
-      boundAt: "2026-08-11T00:00:00.000Z",
-      lastSeenAt: "2026-08-11T00:00:00.000Z",
-    }],
-  }));
+test("an absent catalog with only discoverable bindings initializes instead of demanding regenerate", async () => {
+  const root = await boundFolder("bound-folder", { syncGit: true });
+  await writeBindingRegistry({ root, workspaceId: "ws_bound" });
+
+  const state = await ensureFolderAuthority({ currentRoot: root });
+  expect(state.snapshot.folders.map((folder) => folder.normalizedPath)).toEqual([root]);
+  expect(state.snapshot.folders[0]?.policy.syncGit).toBe(true);
+  expect(await catalogAbsent()).toBe(false);
+});
+
+test("an absent catalog with a binding whose evidence would be dropped still refuses", async () => {
+  const root = await boundFolder("bound-folder");
+  await writeBindingRegistry(
+    { root, workspaceId: "ws_bound" },
+    { root: path.join(home, "gone"), workspaceId: "ws_gone" },
+  );
 
   await expect(ensureFolderAuthority({ currentRoot: root })).rejects.toThrow(/regenerate/);
   expect(await catalogAbsent()).toBe(true);

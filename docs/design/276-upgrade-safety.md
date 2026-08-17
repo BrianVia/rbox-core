@@ -64,16 +64,20 @@ anyway because :957 samples lifecycle before the pump at :958.
    workspaces' daemons), and reuses the `trustedFolderAdmission` token
    pattern `bootResume` already demonstrates (boot-resume.ts:45 →
    daemon-state.ts:73 honors it and skips the re-check) — check and
-   restart become atomic in the sense that matters; residual TOCTOU is
-   bounded by the token's generation and by leaving the daemon running
-   on refusal. An upgrade must never trade a working 1.x daemon for a
+   restart become atomic in the sense that matters. The residual TOCTOU
+   is NOT bounded by the token's generation (nothing compares it): the
+   real backstop is the daemon's own construction-time re-check
+   (`installInitialFolderPolicy` → `runtimeRefusal`), plus leaving the
+   daemon running on refusal, so a catalog edit landing between the check
+   and the spawn is caught by the daemon rather than by the token. An upgrade must never trade a working 1.x daemon for a
    stopped 2.0 one. ("Old daemon + new binary on disk" is already a
    supported state: DEPLOYMENTS.md's binary-swap installer transits it on
    every fleet upgrade, and compat-matrix.test.ts:264-273 pins the
    dual-binary scenario — cited as evidence, not asserted.)
 3. **Auto-init on the ABSENT case (review-corrected — the "lossless
    regeneration" concept is DELETED):** the #688 machine has NO catalog,
-   and the absent case has nothing to lose BY CONSTRUCTION — the
+   and the absent case has nothing to lose BY CONSTRUCTION (qualified
+   below: only while bindings stay complete policy snapshots) — the
    regeneration/consent machinery exists to REPLACE an existing catalog
    and its "loss description" is a constant string (never empty;
    folder-catalog-generate.ts:149-155 — r1's predicate was not
@@ -85,12 +89,20 @@ anyway because :957 samples lifecycle before the pump at :958.
    (folder-catalog-generate.ts:131-147). The fix is a GUARD WIDENING at
    folder-authority.ts:26: auto-initialize when zero SKIPPED and zero
    evidenceUnavailable bindings (not only zero bindings). Semantics are
-   proven round-trip-safe: generated catalogs snapshot per-folder policy
-   via `snapshotPreCatalogPolicy`, the exact inverse of
-   `folderPolicyFields` (pinned by folder-catalog-generate.test.ts:93);
-   labels/ordering are derived, which is loss only relative to a catalog
-   that existed. `damaged` (bytes exist, loss real) keeps the consent
-   gate verbatim; both message producers (folder-catalog-publish.ts:179
+   round-trip-safe ONLY while every binding stays a COMPLETE pre-catalog
+   snapshot: generated catalogs snapshot per-folder policy via
+   `snapshotPreCatalogPolicy`, the exact inverse of `folderPolicyFields`.
+   Review falsified the unqualified claim — `rbox ignore
+   --respect-gitignore` (ignore-cmd.ts) wrote the CATALOG only, so a lost
+   catalog silently REVERTED the user's ignore policy. That command now
+   persists the resolved policy into the binding too, pinned end to end by
+   "a respect-gitignore edit survives losing and reinitializing the folder
+   catalog" (ignore-cmd.test.ts) — the round-trip proof this design rests
+   on. Labels/ordering are derived, which is loss only relative to a
+   catalog that existed. This also RETIRES design 266's fold-R4 amendment
+   (266 §7.1) early and deliberately reverses its forbidden-call-site
+   ruling for the daemon; 266 carries the amendment block.
+   `damaged` (bytes exist, loss real) keeps the consent gate verbatim; both message producers (folder-catalog-publish.ts:179
    AND folder-inventory.ts:99) stay accurate.
    FOUNDER SUPERSESSION NOTE: the 2026-08-13 #688 comment de-scoped
    in-place upgrades to "up-front guard only". Today's #1-blocker
@@ -195,7 +207,10 @@ anyway because :957 samples lifecycle before the pump at :958.
   running, and prints the `rbox config regenerate` remedy, (e) a
   `damaged` catalog still refuses and keeps its consent gate.
   Upgrade-restart admission test added to upgrade-daemons.test.ts
-  (recon: no such test exists).
+  (recon: no such test exists). Scope note, pinned by its own test:
+  folder ADMISSION is decided per workspace, but catalog INITIALIZATION
+  reads ONE home-global inventory, so a single unreproducible row refuses
+  every workspace at once.
 - #765 red-first: (a) foreign-sidecar fixture — today halts an hour, fix
   recovers within one boundary pass; WITH the reader still attached, the
   assertion is "refused on short bounded backoff without a one-hour
@@ -225,8 +240,13 @@ anyway because :957 samples lifecycle before the pump at :958.
 |---|---|---|
 | per-workspace admission check in cycleOneDaemon (trustedFolderAdmission token) | upgrade-cmd | 2.0 stable ubiquitous; 1.x support window ends |
 | absent-case auto-init guard widening | folder-authority (heals upgrade AND bootResume) | folder catalog v2 makes 1.x configs unrepresentable |
+| RULE: every catalog-only policy editor must also persist `folderPolicyFields` into the binding, or auto-init reverts the edit | the editing command (today only ignore-cmd's `setRespectGitignore`) | catalog publication becomes the sole policy record and bindings stop carrying policy |
+| RESIDUAL (accepted, bounded): a catalog-only entry with no binding (`rbox config add` on an unbound folder) is not reproduced by auto-init and vanishes with a lost catalog; recovery is re-running `rbox config add` | folder-authority | same as above |
+| RESIDUAL (open product question): a leftover daemon runtime dir with no user config vetoes initialization exactly like a real registry row — should it? | founder | ruling recorded |
 | typed classifier row through ResetSafetyInspection | reset-journal adapter | reset plane v2 |
 | liveStores consult in classifySqliteResetPredecode | state-plane classifier | classifier gains cross-process ownership input |
+| short W1 re-inspection backoff (bounded, N attempts, then hourly) | daemon reset-retry policy (split from the log-gate constant) | classifier gains cross-process ownership input |
+| resetLifecycle in AmbientDaemonStatusV1 (replaces status's health-file read) | daemon heartbeat writer | reset plane v2 unified halt surface |
 
 The consult's one standing risk: a WRITER handle leaked by a save would keep
 answering "live store" and mask a real W1 the daemon should recover. That is
@@ -236,8 +256,6 @@ path (":771 the save closes the writer it opened", plus the lineage/genesis
 cases), and the consult admits owned writers only, so a reader handle never
 suppresses the row (`classifier.test.ts` negative control).
 
-| short W1 re-inspection backoff (bounded, N attempts, then hourly) | daemon reset-retry policy (split from the log-gate constant) | classifier gains cross-process ownership input |
-| resetLifecycle in AmbientDaemonStatusV1 (replaces status's health-file read) | daemon heartbeat writer | reset plane v2 unified halt surface |
 
 ## Non-goals
 

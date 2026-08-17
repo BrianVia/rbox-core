@@ -10,6 +10,7 @@ import { findRoot, loadConfig, loadState, saveConfig, syncStreamId } from "./con
 import { daemonRuntimeDir } from "./daemon-control.js";
 import { desiredStatePath } from "./autostart-cmd.js";
 import { folderCatalogPath } from "./rbox-paths.js";
+import { ensureFolderAuthority } from "./folder-authority.js";
 
 let dir: string;
 let home: string;
@@ -106,10 +107,16 @@ test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async (
   expect(await findRoot(root)).toBeUndefined();
 });
 
-test("re-tracking a bound root with a lost folder catalog refuses instead of regenerating it", async () => {
+// Design 276 F1.3: a lost catalog whose every folder is still a discoverable
+// binding is reproduced exactly, so activation rebuilds it. Only a catalog
+// generation would have to DROP a row refuses toward `rbox config regenerate`
+// (folder-authority.test.ts).
+test("re-tracking a bound root rebuilds a lost folder catalog it can fully reproduce", async () => {
   const { root } = await track(dir, { workspace: "ws_abc123" }, "https://api.test");
   await fs.rm(folderCatalogPath(), { force: true });
-  await expect(track(dir, { workspace: "ws_abc123" }, "https://api.test")).rejects.toThrow(/regenerate/);
+  await track(dir, { workspace: "ws_abc123" }, "https://api.test");
+  const state = await ensureFolderAuthority();
+  expect(state.snapshot.folders.map((folder) => folder.normalizedPath)).toEqual([root]);
 });
 
 test("track is bind-only: it persists config and Q but performs no first sync", async () => {

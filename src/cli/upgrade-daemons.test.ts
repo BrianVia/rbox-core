@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { restartDaemonsAfterUpgrade, restartStaleDaemonsIfAny } from "./upgrade-cmd.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
-import { recordFolder } from "./folder-config.js";
-import { workspaceKey } from "./rbox-paths.js";
+import { forgetFolder, recordFolder } from "./folder-config.js";
+import { folderCatalogPath, workspaceKey } from "./rbox-paths.js";
 import type { DesiredStateRow } from "./autostart-cmd.js";
 import { RBOX_VERSION } from "./version.js";
 
@@ -26,8 +26,9 @@ afterEach(async () => {
   await fs.rm(home, { recursive: true, force: true });
 });
 
-async function runtime(name: string, pid: number, options: { state?: "running" | "stopped"; pullOnly?: boolean; pendingModeIntent?: "pull-only" | "read-write"; desired?: boolean } = {}): Promise<{ root: string; key: string }> {
-  if (rows.length === 0) await ensureFolderAuthority();
+async function runtime(name: string, pid: number, options: { state?: "running" | "stopped"; pullOnly?: boolean; pendingModeIntent?: "pull-only" | "read-write"; desired?: boolean; catalog?: boolean } = {}): Promise<{ root: string; key: string }> {
+  const catalog = options.catalog !== false;
+  if (catalog && rows.length === 0) await ensureFolderAuthority();
   const root = path.join(home, name);
   await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
   await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
@@ -39,7 +40,7 @@ async function runtime(name: string, pid: number, options: { state?: "running" |
     remoteUrl: "https://api.test",
     token: "",
   }));
-  await recordFolder(root);
+  if (catalog) await recordFolder(root);
   const key = workspaceKey(root);
   const dir = path.join(home, ".rbox", "daemons", key);
   await fs.mkdir(dir, { recursive: true });
@@ -157,7 +158,7 @@ test("stale-only restart failure prints the stale summary first and preserves th
     log: (line) => logs.push(line),
   })).rejects.toThrow("upgrade installed, but one or more live daemons could not be restarted");
   expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
-  expect(logs[1]).toContain("restart failed; run rbox stop && rbox start");
+  expect(logs[1]).toContain("restart failed: private failure");
   expect(logs.join("\n")).not.toContain("already up to date");
 });
 
@@ -287,6 +288,134 @@ test("managed upgrade reports malformed runtime discovery and continues", async 
   })).rejects.toThrow("could not be restarted");
   expect(actions).toContain(`stop:${valid.key}`);
   expect(logs.join("\n")).toContain("bad-runtime: not restarted (runtime record unreadable)");
+});
+
+/** A dangling desired row for a folder that is gone: generation would have to drop
+ *  it, so the absent catalog cannot be initialized silently (design 276 F1.3). */
+async function ghostDesiredRow(): Promise<void> {
+  const dir = path.join(home, ".rbox", "daemons", "ghost-00000000");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "daemon.pid"), "v2 999 boot-999\n");
+  await fs.writeFile(path.join(dir, "desired.json"), `${JSON.stringify({
+    rootPath: path.join(home, "ghost"),
+    state: "running",
+    accountId: "acct",
+    workspaceId: "ws-ghost",
+    at: "2026-07-15T00:00:00.000Z",
+  }, null, 2)}\n`);
+}
+
+test("an upgrade on a 1.x-shaped home initializes the folder catalog and restarts the daemon", async () => {
+  const target = await runtime("legacy-home", 501, { catalog: false });
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-legacy-home",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(actions).toEqual(["stop", "start"]);
+  expect(logs.join("\n")).toContain(`daemon ${target.key}: restarted`);
+});
+
+test("an upgrade refused by folder admission leaves the daemon running and names the remedy", async () => {
+  const target = await runtime("legacy-skipped", 502, { catalog: false });
+  await ghostDesiredRow();
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: (pid) => pid === 502,
+    currentWorkspaceId: () => "ws-legacy-skipped",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(actions).toEqual([]);
+  expect(logs.join("\n")).toContain(`daemon ${target.key}: left running`);
+  expect(logs.join("\n")).toContain("rbox config regenerate");
+  expect(logs.join("\n")).not.toContain("run rbox stop && rbox start");
+});
+
+test("a damaged folder catalog keeps its consent gate and never stops a live daemon", async () => {
+  const target = await runtime("damaged-catalog", 503);
+  await fs.writeFile(folderCatalogPath(), "{");
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-damaged-catalog",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(actions).toEqual([]);
+  expect(logs.join("\n")).toContain(`daemon ${target.key}: left running`);
+  expect(logs.join("\n")).toContain("is damaged");
+  expect(logs.join("\n")).toContain("rbox config regenerate");
+});
+
+test("one refused workspace leaves its daemon running while every other workspace upgrades", async () => {
+  const detached = await runtime("detached", 504);
+  const healthy = await runtime("healthy", 505);
+  await forgetFolder(detached.root);
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: (root) => `ws-${path.basename(root)}`,
+    stopDaemon: async (root) => void actions.push(`stop:${workspaceKey(root)}`),
+    startDaemon: async (root) => { actions.push(`start:${workspaceKey(root)}`); return "started"; },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(actions).toEqual([`stop:${healthy.key}`, `start:${healthy.key}`]);
+  expect(logs.join("\n")).toContain(`daemon ${detached.key}: left running`);
+  expect(logs.join("\n")).toContain("rbox config add");
+});
+
+/** The scope of the per-workspace claim: FOLDER ADMISSION is decided per
+ *  workspace, but catalog INITIALIZATION reads one home-global inventory, so a
+ *  single unreproducible row refuses every workspace at once. Pinned so nobody
+ *  reads the per-workspace refusal as a per-workspace initialization. */
+test("one ghost desired row refuses every workspace, healthy ones included", async () => {
+  const healthy = await runtime("home-global-healthy", 601, { catalog: false });
+  const second = await runtime("home-global-second", 602, { catalog: false });
+  await ghostDesiredRow();
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: (pid) => pid === 601 || pid === 602,
+    currentWorkspaceId: (root) => `ws-${path.basename(root)}`,
+    stopDaemon: async (root) => void actions.push(`stop:${workspaceKey(root)}`),
+    startDaemon: async (root) => { actions.push(`start:${workspaceKey(root)}`); return "started"; },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(actions).toEqual([]);
+  for (const target of [healthy, second]) {
+    expect(logs.join("\n")).toContain(`daemon ${target.key}: left running`);
+  }
+  expect(logs.join("\n")).toContain("rbox config regenerate");
+});
+
+test("a genuine restart failure reports the underlying reason, not just a re-runnable remedy", async () => {
+  const target = await runtime("restart-fails", 506);
+  const logs: string[] = [];
+  await expect(restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-restart-fails",
+    stopDaemon: async () => {},
+    startDaemon: async () => { throw new Error("spawn rbox EACCES"); },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("could not be restarted");
+  expect(logs.join("\n")).toContain(`daemon ${target.key}: restart failed`);
+  expect(logs.join("\n")).toContain("spawn rbox EACCES");
 });
 
 test("the curl installer remains binary-swap-only", async () => {

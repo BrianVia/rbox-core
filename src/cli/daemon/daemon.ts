@@ -2920,10 +2920,6 @@ export class RboxDaemon {
           return;
         }
       }
-      // The daemon never created this binding, so a missing catalog here is a
-      // LOST catalog, not an un-published one. Regenerating it would discard
-      // labels, ordering, and overrides that regeneration cannot reconstruct, so
-      // ordinary authority activation refuses and the operator repairs.
       const state = await ensureFolderAuthority({ currentRoot: this.root });
       const admission = await observeFolderAdmission(this.root, state);
       if (admission.kind !== "admitted") {

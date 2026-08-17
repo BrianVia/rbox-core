@@ -179,14 +179,8 @@ export async function track(
   // write, so a missing catalog with existing bindings demanded regeneration
   // while nothing had been written yet. Design 266 moved it after admission:
   // a lock refusal must precede every catalog, registry, and source effect.
-  //
-  // `rbox track` also re-tracks an already-bound root, so whether THIS
-  // invocation created the binding is the only thing that licenses regenerating
-  // an absent catalog. On a re-track an absent catalog is a LOST one.
-  let createdTheBinding = false;
   const cfg = await withScopeTransitionLock(root, () => withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
     const prev = await loadConfig(root).catch(() => undefined);
-    createdTheBinding = prev === undefined;
     const currentState = await loadRawState(root);
     const currentStream = currentState?.stream ?? (prev ? syncStreamId(prev) : undefined);
     if (currentStream && currentStream !== nextStream) {
@@ -231,7 +225,7 @@ export async function track(
     requireSelected(admission);
     return next;
   }), deps.scopeDeps?.lockWaitMs);
-  const folderAuthority = await ensureFolderAuthority({ currentRoot: root, admittedFirstBinding: createdTheBinding });
+  const folderAuthority = await ensureFolderAuthority({ currentRoot: root });
   const folderAlreadyListed = folderAuthority.snapshot.folders.some((folder) => folder.normalizedPath === root);
   // Design 211: this machine's durable record of the binding, so `rbox status
   // --all` can find a tracked folder that never started background sync.
