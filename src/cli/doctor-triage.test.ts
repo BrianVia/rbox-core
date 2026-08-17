@@ -15,6 +15,7 @@ import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks 
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
+import { gitStoryFor } from "./status-view/git-stories.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -132,6 +133,8 @@ function deferral(over: Partial<TriageInputs["deferrals"][number]> = {}): Triage
     reasonText: "Local commits changed here.",
     repairText: "Stop Git mutation, then let normal sync retry.",
     remediationClass: "apply-resolvable",
+    story: gitStoryFor(String(over.displayReason ?? "local-commits")),
+    quiet: false,
     canResolve: true,
     canKeepMine: true,
     bytesChanged: false,
@@ -889,7 +892,9 @@ test("only proven-healthy deferral classes claim the repository is healthy", () 
     );
     expect(risky?.safety).not.toContain("repository is healthy");
     expect(risky?.safety).toContain("could not read or reconcile");
-    expect(risky?.command).toBe(`cd ${root} && rbox git deferrals --brief`);
+    // Design 273: a repo with no resolvable incoming state gets NO command
+    // rather than a command that cannot act on the state that produced it.
+    expect(risky?.command).toBeUndefined();
   }
 });
 

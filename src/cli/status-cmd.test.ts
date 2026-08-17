@@ -591,14 +591,21 @@ test("status renders durable lanes oldest-first with reason precedence and safe 
 test("status --git aggregate and detail use one consistent repo projection", async () => {
   await saveDeferralState();
   const out = await captureStatus({ git: true });
-  expect(out).toContain("⚠ 3 git repos need attention (oldest: 14 days) · rbox status --git");
-  const details = out.split("\n").filter((line) => line.includes("git deferred "));
-  expect(details).toHaveLength(3);
-  expect(details[0]).toContain("local commits on detached checkout (zeta)");
-  expect(details[1]).toContain("local edits on branch release/0.9 (alpha)");
-  expect(details[2]).toContain("git busy on checkout unavailable (beta)");
-  expect(out).toContain("Stop Git mutation, then let normal sync retry.");
+  // Design 273 S1/S2: one split headline, then the grouped listing over the very
+  // same rows. Full repo paths, never the frozen log grammar.
+  expect(out).toContain("⚠ 2 repos are waiting on you");
+  expect(out).toContain("1 more is sorting itself out.");
+  expect(out).toContain("rbox paused git sync in 3 repos.");
+  expect(out).toContain("1 repo — this computer has commits your other computers never got");
+  expect(out).toContain("1 repo — you changed files here that were never synced");
+  expect(out).toContain("1 repo — git was busy here — rbox retries on its own");
+  expect(out).toContain("   zeta   paused 15 days");
+  expect(out).toContain("   alpha   paused 2 days");
+  expect(out).toContain("   beta   paused 2 days");
+  // The daemon LOG grammar is not a status surface (design 273 §Protected).
+  expect(out).not.toContain("git deferred ");
   expect(out).not.toContain("0123456789abcdef");
+  for (const banned of ["deferral", "quarantine", "dry run"]) expect(out.toLowerCase()).not.toContain(banned);
 });
 
 test("full and --git status add one actionable companion while JSON and the shared line stay frozen", async () => {
@@ -636,12 +643,19 @@ test("full and --git status add one actionable companion while JSON and the shar
 
   const frozen = "git deferred 1h: local commits on branch main (repo)";
   const guidance = "To keep this computer's version and publish it, run `rbox git resolve <repo> keep-mine`; `take-theirs` uses the version from your other computer and sets aside this computer's Git changes.";
-  for (const options of [{ verbose: true }, { git: true }]) {
-    const human = await captureStatus(options);
-    expect(human.split("\n").filter((line) => line.trim() === frozen)).toHaveLength(1);
-    expect(human.split(guidance)).toHaveLength(2);
-    expect(human.match(/Your repository is healthy; only rbox's bookkeeping is paused/g)).toHaveLength(1);
-  }
+  // The record/companion pair is the VERBOSE surface and the daemon log grammar.
+  // `--git` moved to the design-273 story listing, so the frozen line must not
+  // appear there — that scoping is what keeps the redaction classifier honest.
+  const verbose = await captureStatus({ verbose: true });
+  expect(verbose.split("\n").filter((line) => line.trim() === frozen)).toHaveLength(1);
+  expect(verbose.split(guidance)).toHaveLength(2);
+  expect(verbose.match(/Your repository is healthy; only rbox's bookkeeping is paused/g)).toHaveLength(1);
+  const gitSurface = await captureStatus({ git: true });
+  expect(gitSurface).not.toContain(frozen);
+  expect(gitSurface).toContain("1 repo — this computer has commits your other computers never got");
+  expect(gitSurface).toContain("rbox git resolve <repo> show-me");
+  expect(gitSurface).toContain("rbox git resolve <repo> keep-mine");
+  expect(gitSurface).toContain("rbox git resolve <repo> take-theirs --confirm <token from show-me>");
 
   const jsonText = await captureStatus({ json: true });
   expect(jsonText).not.toContain("bookkeeping");
@@ -728,11 +742,17 @@ test("status --json exposes only the stable local deferral projection and cannot
       bytesChanged: false,
     },
   ]);
+  // Design 273 S5: `reason`/`displayReason` stay the machine contract; `story`,
+  // `needsYou`, `quiet` and `remediationClass` are ADDITIVE render-side labels.
   expect(parsed.git.deferredRepos).toEqual([
     {
       repo: "zeta",
       oldestDeferredSince: new Date(NOW - 15 * 86400_000).toISOString(),
       displayReason: "local-commits",
+      story: "local-commits",
+      needsYou: true,
+      quiet: false,
+      remediationClass: "transient",
       ageSeconds: 15 * 86400,
       bytesChanged: false,
       checkout: { kind: "detached" },
@@ -741,6 +761,10 @@ test("status --json exposes only the stable local deferral projection and cannot
       repo: "alpha",
       oldestDeferredSince: new Date(NOW - 2 * 86400_000).toISOString(),
       displayReason: "local-edits",
+      story: "local-edits",
+      needsYou: true,
+      quiet: false,
+      remediationClass: "transient",
       ageSeconds: 2 * 86400,
       bytesChanged: true,
       checkout: { kind: "branch", label: "release/0.9" },
@@ -749,6 +773,10 @@ test("status --json exposes only the stable local deferral projection and cannot
       repo: "beta",
       oldestDeferredSince: new Date(NOW - 2 * 86400_000).toISOString(),
       displayReason: "git-busy",
+      story: "busy",
+      needsYou: false,
+      quiet: false,
+      remediationClass: "config",
       ageSeconds: 2 * 86400,
       bytesChanged: false,
     },
@@ -834,11 +862,13 @@ test("human status quiets only transient deferrals younger than ten minutes whil
   });
 
   const human = await captureStatus({ git: true });
-  expect(human).toContain("⚠ 3 git repos need attention");
-  expect(human).not.toContain("(young-transient)");
-  expect(human).toContain("(boundary-transient)");
-  expect(human).toContain("(young-durable)");
-  expect(human).toContain("(mixed)");
+  // Design 273 P5: ONE population, one quiet rule, computed once on the row. The
+  // young transient is omitted from every human surface; everything else shows.
+  expect(human).toContain("rbox paused git sync in 3 repos.");
+  expect(human).not.toContain("young-transient");
+  expect(human).toContain("boundary-transient");
+  expect(human).toContain("young-durable");
+  expect(human).toContain("mixed");
 
   const json = JSON.parse(await captureStatus({ json: true }));
   expect(json.git.deferrals.map((lane: { repo: string }) => lane.repo)).toEqual([
@@ -1023,7 +1053,7 @@ test("review M6: status hygiene failures retain deferrals through both call site
   const out = await captureStatusWithDeps({}, d);
 
   expect(calls).toBe(2);
-  expect(out).toContain("1 git repo needs attention");
+  expect(out).toContain("1 repo is sorting itself out.");
   expect(repoRecordsForState(await loadState(root, stream)).repo?.deferrals?.capture?.reason).toBe("git-busy");
 });
 

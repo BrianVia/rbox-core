@@ -350,8 +350,14 @@ export function composeFollowRepoTransition(
       ...settled,
       pending: input.incoming,
       partial: { kind: "from-progress", checkoutPending: false },
+      // Design 273 P2: an ownership-only hold KEEPS its record. "Don't nag about
+      // ownership holds" used to be implemented by deleting the record, which
+      // made the repo invisible to every local surface — the headline counted a
+      // population the listing could not show. The flag now classes the record
+      // (`ownership-hold`, which emits no command and no attention severity)
+      // instead of erasing it.
       deferral: gitOwnershipNoEscalateEnabled() && authority.ownershipOnly
-        ? { kind: "clear" }
+        ? { kind: "set", reason: "worktree-ownership" }
         : { kind: "set", reason: heldRefCount ? followHeldDeferralReason(progress) : "artifact" },
       heldAttempt: "retain",
     };

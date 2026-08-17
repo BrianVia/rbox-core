@@ -181,7 +181,7 @@ function canonicalReceipt(kind: "pull" | "state", rel: string, expected: FileEnt
 }
 
 /** Reaches users verbatim through the git-deferral detail companion, so it is
- *  plain language. `conflict-copies` inside it is load-bearing: `gitReasonOf`
+ *  plain language. `conflict-copies` inside it is load-bearing: `logRedactionReasonOf`
  *  (doctor-cmd.ts) normalizes this string and buckets on that token. */
 export const CONFLICT_COPY_POPULATION_WHY = "only conflict-copies remain here, so the comparison was skipped.";
 

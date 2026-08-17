@@ -39,12 +39,12 @@ import {
  */
 
 /** The apply deferral lane, exactly as the held plane needs it. A skip performs
- * no follow, so it must leave the standing refusal untouched — or retire it
- * when the only blockers are per-ref ownership under no-escalate. */
+ * no follow, so it must leave the standing refusal standing — including the
+ * ownership holds it once retired (design 273 P2). The lane can therefore only
+ * re-stand a record; it has no clear operation to misuse. */
 export interface HeldDeferralLane {
   standingApply(relPath: string): GitDeferral | undefined;
-  restandApply(relPath: string, standing: GitDeferral): void;
-  clearApply(relPath: string): void;
+  restandApply(relPath: string, standing: Pick<GitDeferral, "reason" | "subjectKey" | "checkout">): void;
 }
 
 export interface HeldDecisionEnv {
@@ -156,16 +156,19 @@ export function createHeldDecisionPlane(env: HeldDecisionEnv): HeldDecisionPlane
 
       /** Preserve the exact sidecar transition shared by the early optimization
        * and the authoritative post-protocol held check. */
+      // Design 273 P2: this runs on EVERY skipping pull. It used to CLEAR the
+      // record for ownership-only holds, which re-deleted what the follow site
+      // had just restored one pull later, and whose clear/set cycle reset
+      // `deferredSince` — leaving a multi-day hold permanently young enough to
+      // count as a quiet transient, and therefore permanently invisible. It now
+      // re-stands the record instead, preserving the age.
       const retain = (priorAttempt: GitHeldAttempt): boolean => {
         if (!heldBlockersAllowSkip(priorAttempt.blockers)) return false;
         const standingApply = env.deferrals.standingApply(relPath);
-        const priorOwnershipOnly = ownershipBlockersArePerRefOnly(priorAttempt.blockers);
-        if (!standingApply && !(gitOwnershipNoEscalateEnabled() && priorOwnershipOnly)) return false;
-        if (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly) {
-          env.deferrals.clearApply(relPath);
-        } else if (standingApply) {
-          env.deferrals.restandApply(relPath, standingApply);
-        }
+        const ownershipHold = gitOwnershipNoEscalateEnabled()
+          && ownershipBlockersArePerRefOnly(priorAttempt.blockers);
+        if (!standingApply && !ownershipHold) return false;
+        env.deferrals.restandApply(relPath, standingApply ?? { reason: "worktree-ownership" });
         return true;
       };
 

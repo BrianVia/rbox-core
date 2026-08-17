@@ -418,7 +418,11 @@ describe("followed transition", () => {
     expect(transition.baseAdvance?.appliedSection?.refs).toEqual({ "refs/heads/main": OLD_OID });
   });
 
-  test("ownership-only holds clear the apply lane while the no-escalate rule stands", () => {
+  // Design 273 P2: the no-escalate flag CLASSES the record instead of deleting
+  // it. Either way an ownership-only hold records `worktree-ownership`; the
+  // difference now lives in the projection's `ownership-hold` class, not in
+  // whether the repo is visible at all.
+  test("ownership-only holds keep a worktree-ownership record under both no-escalate settings", () => {
     const advance = provenBranchAdvance();
     const ownership = progress({
       ...advance.progress,
@@ -429,7 +433,7 @@ describe("followed transition", () => {
     try {
       delete process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE;
       expect(composeFollowRepoTransition(advance.input, receipt({ progress: ownership }), proofReceipt()).deferral)
-        .toEqual({ kind: "clear" });
+        .toEqual({ kind: "set", reason: "worktree-ownership" });
       process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE = "0";
       expect(composeFollowRepoTransition(advance.input, receipt({ progress: ownership }), proofReceipt()).deferral)
         .toEqual({ kind: "set", reason: "worktree-ownership" });

@@ -457,13 +457,15 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         break;
       }
       assertAllWithoutPath("status", flags.all === "true", positional[0]);
-      if (flags.all === "true") {
-        // --verbose and --git are single-workspace detail views; silently
-        // ignoring them would report the wrong thing with a success exit code.
-        if (flags.verbose === "true" || flags.git === "true") {
+      // Design 273 S2: `--git --all` means "every paused repo, one line each" —
+      // the escape hatch from the 5-per-group summary. Bare `--all` remains the
+      // machine-wide aggregate; --verbose still has no aggregate meaning, and
+      // silently ignoring it would report the wrong thing with a success exit.
+      if (flags.all === "true" && flags.git !== "true") {
+        if (flags.verbose === "true") {
           throw new Error(workspaceCopy(
-            "--all is the aggregate view; --verbose and --git report one synced folder. Use `rbox status --all [--json]`.",
-            "--all is the aggregate view; --verbose and --git report one workspace. Use `rbox status --all [--json]`.",
+            "--all is the aggregate view; --verbose reports one synced folder. Use `rbox status --all [--json]`.",
+            "--all is the aggregate view; --verbose reports one workspace. Use `rbox status --all [--json]`.",
           ));
         }
         await runMachineTriage(jsonMode, "status");
@@ -480,6 +482,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         json: jsonMode,
         verbose: flags.verbose === "true",
         git: flags.git === "true",
+        all: flags.all === "true",
         now: deps.now?.(),
       });
       break;

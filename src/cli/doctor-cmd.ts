@@ -210,7 +210,12 @@ function keepLastUtf8(s: string, maxBytes: number): string {
   return bytes.subarray(bytes.byteLength - maxBytes).toString("utf8");
 }
 
-function gitReasonOf(detail: string, fallback = "other"): string {
+/** LOG-REDACTION classifier — not a status surface. It parses historical daemon
+ * log TEXT back into a closed reason enum so diagnostics can be shipped without
+ * local Git forensics, and is byte-frozen against `renderGitDeferralLine`'s
+ * emitted grammar (status-view/git-render.ts). Nothing a user reads comes from
+ * here; the human vocabulary lives in status-view/git-stories.ts. */
+function logRedactionReasonOf(detail: string, fallback = "other"): string {
   const normalized = detail.toLowerCase().replace(/[ _]+/g, "-");
   for (const reason of GIT_DEFERRAL_REASON_SET) {
     if (normalized.includes(reason)) return reason;
@@ -234,7 +239,10 @@ function gitReasonOf(detail: string, fallback = "other"): string {
   return fallback;
 }
 
-function classifyGitLogMessage(message: string): { text: string; key: string } | undefined {
+/** Recognize one historical daemon log line and reduce it to its redacted key.
+ * Fail-closed: an unrecognized line is omitted from diagnostics entirely, so the
+ * emitted grammar must stay byte-stable or be updated here in the same PR. */
+function classifyGitLogLineForRedaction(message: string): { text: string; key: string } | undefined {
   let klass: string;
   let reason = "other";
   let age = "-";
@@ -243,22 +251,22 @@ function classifyGitLogMessage(message: string): { text: string; key: string } |
   if ((match = /^git deferred (\d+m|1h|1d|7d|14d|30d):\s+(.+?) on (?:branch .+|detached checkout|checkout unavailable) \(.+\)(?: \(working files changed since\))?$/.exec(message))) {
     klass = "deferred";
     age = match[1]!;
-    reason = gitReasonOf(match[2]!);
+    reason = logRedactionReasonOf(match[2]!);
   } else if ((match = /^git-sync deferred\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
     klass = "deferred";
-    reason = gitReasonOf(match[1]!);
+    reason = logRedactionReasonOf(match[1]!);
   } else if ((match = /^git-sync CONFLICT\s+(.+)$/.exec(message))) {
     klass = "conflict";
     reason = "conflict";
   } else if ((match = /^git-sync WARNING\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
     klass = "warning";
-    reason = gitReasonOf(match[1]!);
+    reason = logRedactionReasonOf(match[1]!);
   } else if ((match = /^git-sync config skipped\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
     klass = "config-skipped";
     reason = "config";
   } else if ((match = /^git-sync applied\s+(.+)$/.exec(message))) {
     klass = "applied";
-    reason = /\(held refs:/.test(match[1]!) ? gitReasonOf(match[1]!, "local-commits") : "other";
+    reason = /\(held refs:/.test(match[1]!) ? logRedactionReasonOf(match[1]!, "local-commits") : "other";
   } else if ((match = /^git-sync removed\s+(.+)$/.exec(message))) {
     klass = "removed";
     reason = "other";
@@ -301,7 +309,7 @@ export function redactGitLogLines(tail: string): string {
       }
       continue;
     }
-    const classified = classifyGitLogMessage(message);
+    const classified = classifyGitLogLineForRedaction(message);
     if (classified) rows.push(classified);
   }
 
@@ -1020,7 +1028,7 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
     if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;
     return;
   }
-  for (const line of renderWorkspaceTriage(triage)) console.log(line);
+  for (const line of renderWorkspaceTriage(triage, observation.deferrals, observation.observedAt)) console.log(line);
   console.log("");
   console.log(renderDoctor(ctx.checks, ctx.localOnly));
   if (opts.report) {

@@ -163,10 +163,10 @@ export interface StatusStateProjection {
 
 export interface StatusGitProjection {
   deferrals: LocalGitDeferral[];
+  /** The FULL population, quiet rows included and flagged (design 273 P5).
+   * Human surfaces filter with `loudRows`; doctor and JSON render it whole. */
   projectedRepos: GitDeferralRepoProjection[];
   localRepoProjections: GitDeferralRepoProjection[];
-  humanProjectedRepos: GitDeferralRepoProjection[];
-  humanLocalRepoProjections: GitDeferralRepoProjection[];
   deferredRepos: number;
   bytesChangedDeferrals: number;
   capability?: CheckoutTransactionCapability;

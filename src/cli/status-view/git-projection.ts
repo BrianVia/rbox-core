@@ -11,6 +11,17 @@
  * it. The render module imports this one; this one imports no renderer.
  */
 import type { GitDeferral, GitDeferralReason, RepoRecord } from "../sync-state-model.js";
+import { gitStoryFor, type GitStory } from "./git-stories.js";
+
+/**
+ * Design 273 P5: a transient pause younger than this is real but not worth
+ * interrupting anyone over. Peer echoes on an actively committed repo arrive
+ * seconds behind local state and self-supersede on the next push; showing those
+ * brief holds as attention trains users to ignore the banner or reach for
+ * take-theirs. Computed ONCE here as a per-row flag so the headline, the
+ * listing, the daemon count and the prompt sidecar cannot disagree.
+ */
+export const TRANSIENT_DEFERRAL_QUIET_MS = 10 * 60_000;
 
 export interface GitDeferralReasonPresentation {
   label: string;
@@ -82,8 +93,24 @@ export interface GitDeferralDisplayEntry {
   record?: RepoRecord;
 }
 
-/** One authoritative display row per repo, shared by every local visibility surface. */
-export type GitDeferralRemediationClass = "transient" | "capture" | "config" | "apply-resolvable" | "apply-unavailable";
+/** One authoritative display row per repo, shared by every local visibility surface.
+ *
+ * `ownership-hold` (design 273 P2) is the class for a repo rbox left alone
+ * because another worktree owns the branch. It is consulted BEFORE
+ * `canResolve`/`canKeepMine` on every command-emitting or severity-assigning
+ * surface: the record carries `pending`, so `canKeepMine` is true and a naive
+ * surface would print a resolve command for a repo whose story says "no command
+ * needed", and an age-only severity rule would mark a multi-day hold blocked.
+ * An `ownership-hold` emits NO resolve command and NO attention/blocked severity
+ * anywhere. Owner: the hold/skip sites. Deletion condition: the 2.0 unified
+ * pause record. */
+export type GitDeferralRemediationClass =
+  | "transient"
+  | "capture"
+  | "config"
+  | "apply-resolvable"
+  | "apply-unavailable"
+  | "ownership-hold";
 
 export interface GitDeferralRepoProjection {
   repo: string;
@@ -95,6 +122,14 @@ export interface GitDeferralRepoProjection {
   reasonText: string;
   repairText: string;
   remediationClass: GitDeferralRemediationClass;
+  /** What a human is told happened here, and whether they must decide anything.
+   * Render-side only; `displayReason` stays the machine contract. */
+  story: GitStory;
+  /** Design 273 P5: a young transient pause that self-heals. Headline, listing,
+   * ambient count and prompt sidecar OMIT these rows; doctor and
+   * `git deferrals --json` render them LABELLED, so a flapping repo whose
+   * `deferredSince` keeps resetting stays visible to the support flow. */
+  quiet: boolean;
   canResolve: boolean;
   canKeepMine: boolean;
   alsoDeferred?: string;
@@ -147,6 +182,8 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
     const canKeepMine = knownReason && Boolean(record?.pending);
     const remediationClass: GitDeferralRemediationClass = !knownReason
       ? "apply-unavailable"
+      : display.reason === "worktree-ownership"
+      ? "ownership-hold"
       : presentation.transient
       ? "transient"
       : display.lane === "capture"
@@ -154,6 +191,14 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
         : display.lane === "config"
           ? "config"
           : canResolve ? "apply-resolvable" : "apply-unavailable";
+    // A repo is quiet only when EVERY standing lane is a young transient. One
+    // durable lane (a conflict beside a busy capture) makes the whole repo loud,
+    // whichever lane display precedence happens to name.
+    const quiet = lanes.every((lane) => {
+      if (!gitDeferralReasonPresentation(lane.reason).transient) return false;
+      const at = parsedDeferralTime(lane.deferredSince, now);
+      return Number.isFinite(at) && now - at < TRANSIENT_DEFERRAL_QUIET_MS;
+    });
     const additional = ordered.slice(1).map((lane) => `${lane.lane} — ${gitDeferralReasonPresentation(lane.reason).label}`);
     const row: GitDeferralRepoProjection = {
       repo,
@@ -165,6 +210,8 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       reasonText: presentation.text,
       repairText: presentation.repair,
       remediationClass,
+      story: gitStoryFor(display.reason, display.detail),
+      quiet,
       canResolve,
       canKeepMine,
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),

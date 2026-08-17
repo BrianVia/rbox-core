@@ -17,6 +17,7 @@ import type { AdoptFenceInspection } from "./adopt-journal.js";
 import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
+import { renderGitPauseSummary } from "./status-view/git-story-render.js";
 import { ageBucket } from "./status-view/text.js";
 import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
@@ -96,25 +97,41 @@ function repoArg(repo: string): string {
   return repo.startsWith("-") ? `./${repo}` : repo;
 }
 
+/** A repo whose class AND incoming state both admit a resolve command. Design
+ * 273 P2: `remediationClass` is consulted FIRST. An ownership hold carries
+ * `pending`, so `canKeepMine` alone would hand a `keep-mine` command to a repo
+ * whose own story says no command is needed. */
+const offersResolve = (repo: GitDeferralRepoProjection): boolean =>
+  repo.remediationClass !== "ownership-hold"
+  && repo.remediationClass !== "capture"
+  && repo.remediationClass !== "config"
+  && (repo.canResolve || repo.canKeepMine);
+
 function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: number): TriageFinding {
   const age = ageBucket(repo.oldestDeferredSince, now);
+  const resolvable = offersResolve(repo);
   const command = repo.canKeepMine
     ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`)
-    : repo.canResolve
-      ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`)
-      : scoped(root, "rbox git deferrals --brief");
-  const waiting = repo.canResolve
-    ? "rbox has paused publishing its history until you say which side wins"
-    : `rbox has paused publishing its history (${repo.reasonLabel})`;
+    : scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`);
   const safety = REPOSITORY_PROVEN_HEALTHY.has(repo.displayReason)
     ? `Your repository is healthy; only rbox's bookkeeping is paused. ${SAFE_LOCAL_FILES}`
     : `rbox could not read or reconcile part of this repository (${repo.reasonLabel}). It has changed nothing there — look at the repository itself before changing anything.`;
+  // Design 273 P2/P5: an ownership hold and a young transient are never
+  // escalated. The age-only rule below would otherwise call ~51 multi-day
+  // ownership holds "blocked" the moment P2 made them visible again.
+  const severity: TriageSeverity = !repo.story.needsYou || repo.quiet
+    ? "info"
+    : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
+  const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
+  const advice = repo.story.action ? ` What to do: ${repo.story.action}.` : "";
   return {
     id: `git-paused:${repo.repo}`,
-    severity: age === "unknown" || age.endsWith("m") ? "attention" : "blocked",
-    problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)} to publish: ${waiting}.`.replace("  ", " "),
-    safety,
-    command,
+    severity,
+    problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)}: ${repo.story.headline}.`.replace("  ", " "),
+    safety: `${safety}${quietNote}${advice}`,
+    // No command rather than a wrong one: `command` is a promise that the line
+    // below it will run against the very state that produced this finding.
+    ...(resolvable ? { command } : {}),
   };
 }
 
@@ -486,10 +503,25 @@ function headline(triage: WorkspaceTriage): string {
   return actionable === 1 ? "1 thing needs your attention." : `${actionable} things need your attention.`;
 }
 
-export function renderWorkspaceTriage(triage: WorkspaceTriage): string[] {
+/**
+ * Design 273 S3: the git findings are SAID at summary altitude. Every paused
+ * repo keeps its own `git-paused:<repo>` row in `--json` — that is the machine
+ * contract and the support flow's full population — but a hundred near-identical
+ * paragraphs is not a diagnosis a person can read, so the human render collapses
+ * them into the story summary and points at `rbox status --git` for the list.
+ */
+export function renderWorkspaceTriage(
+  triage: WorkspaceTriage,
+  gitRows: readonly GitDeferralRepoProjection[] = [],
+  now = Date.now(),
+): string[] {
   const lines = [`${style.bold("rbox doctor")} — ${triage.workspace} ${style.dim(`(${triage.root})`)}`, ""];
   lines.push(headline(triage));
-  triage.findings.forEach((finding, index) => {
+  if (gitRows.length > 0) {
+    lines.push("");
+    for (const line of renderGitPauseSummary(gitRows, now)) lines.push(line);
+  }
+  triage.findings.filter((finding) => !finding.id.startsWith("git-paused:")).forEach((finding, index) => {
     lines.push("");
     const marker = finding.severity === "info" ? style.dim("note") : `${index + 1}.`;
     lines.push(`${marker} ${finding.problem}`);

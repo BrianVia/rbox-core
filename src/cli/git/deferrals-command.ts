@@ -48,7 +48,9 @@ function checkoutBrief(checkout: GitDeferralRepoProjection["checkout"]): string 
 
 function remediationLines(repo: GitDeferralRepoProjection): string[] {
   const lines = [`Diagnosis: ${briefField(repo.reasonText)}`, `Repair: ${briefField(repo.repairText)}`];
-  if (repo.remediationClass === "transient") {
+  if (repo.remediationClass === "ownership-hold") {
+    lines.push(briefField(repo.story.action ?? repo.story.headline));
+  } else if (repo.remediationClass === "transient") {
     lines.push("Let normal sync retry while the repository is quiet. If both ages keep growing, inspect `rbox status` and the daemon logs.");
   } else if (repo.remediationClass === "capture") {
     lines.push("Make the repository quiet and readable so normal push capture can retry. Persistent failures require Git/version/repository-shape repair; resolver commands do not apply.");
@@ -67,9 +69,18 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
   return lines;
 }
 
+/** Design 273 P2: `remediationClass` is consulted BEFORE `canResolve`. An
+ * ownership hold carries `pending` and so passes the incoming-state test, but
+ * its story says no command is needed — offering one is the defect. */
 function shouldOfferResolve(repo: GitDeferralRepoProjection): boolean {
+  if (repo.remediationClass === "ownership-hold") return false;
   return repo.canResolve && (repo.displayLane === "apply" || repo.remediationClass === "transient");
 }
+
+/** Design 273 P5: this surface renders the FULL population and LABELS the quiet
+ * rows rather than hiding them — a repo whose pause keeps flapping never ages
+ * past the quiet window, and support has to be able to see it. */
+const QUIET_LABEL = "recently paused, usually self-heals";
 
 function resolveCommand(root: string, repo: string, token?: string, verb?: "take-theirs" | "keep-mine"): string {
   const repoArg = repo.startsWith("-") ? `./${repo}` : repo;
@@ -99,18 +110,33 @@ export async function gitDeferralsCmd(
       || a.repo.localeCompare(b.repo)
       || DEFERRAL_LANES.indexOf(a.deferral.lane) - DEFERRAL_LANES.indexOf(b.deferral.lane));
     const now = (deps.now ?? (() => new Date()))();
+    const repos = projectGitDeferralRepos(laneEntries, now.getTime());
     if (options.json) {
+      // Additive only: `deferrals` keeps its exact shape, and `reason` stays the
+      // machine contract inside `repos`. `story` is a render-side label.
       write(JSON.stringify({
         schemaVersion: 1,
         deferrals: serializeGitDeferralLanes(laneEntries, now.getTime()),
+        repos: repos.map((repo) => ({
+          repo: repo.repo,
+          reason: repo.displayReason,
+          lane: repo.displayLane,
+          story: repo.story.code,
+          needsYou: repo.story.needsYou,
+          quiet: repo.quiet,
+          remediationClass: repo.remediationClass,
+          oldestDeferredSince: repo.oldestDeferredSince,
+          reasonSince: repo.reasonSince,
+          bytesChanged: repo.bytesChanged,
+        })),
       }));
       return 0;
     }
-    const repos = projectGitDeferralRepos(laneEntries, now.getTime());
     if (!options.brief) {
       if (!repos.length) write("no deferred repos");
       for (const repo of repos) {
-        write(`${displayField(repo.repo)} — ${displayField(repo.reasonLabel)} · deferred ${ageBucket(repo.oldestDeferredSince, now.getTime())} · reason ${ageBucket(repo.reasonSince, now.getTime())}`);
+        const quiet = repo.quiet ? ` · ${QUIET_LABEL}` : "";
+        write(`${displayField(repo.repo)} — ${displayField(repo.reasonLabel)} · deferred ${ageBucket(repo.oldestDeferredSince, now.getTime())} · reason ${ageBucket(repo.reasonSince, now.getTime())}${quiet}`);
       }
       return 0;
     }
@@ -125,7 +151,7 @@ export async function gitDeferralsCmd(
     for (const repo of repos) {
       write("");
       write(`## ${briefField(repo.repo)}`);
-      write(`Deferred for ${ageBucket(repo.oldestDeferredSince, now.getTime())} · current reason ${briefField(repo.reasonLabel)} since ${ageBucket(repo.reasonSince, now.getTime())}`);
+      write(`Deferred for ${ageBucket(repo.oldestDeferredSince, now.getTime())} · current reason ${briefField(repo.reasonLabel)} since ${ageBucket(repo.reasonSince, now.getTime())}${repo.quiet ? ` · ${QUIET_LABEL}` : ""}`);
       write(`Checkout: ${checkoutBrief(repo.checkout)}`);
       if (repo.alsoDeferred) write(briefField(repo.alsoDeferred));
       for (const line of remediationLines(repo)) write(line);

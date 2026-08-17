@@ -13,6 +13,7 @@ import {
   projectGitDeferralRepos,
   type GitDeferralRemediationClass,
 } from "../status-view/git-projection.js";
+import { gitPauseCounts, loudRows } from "../status-view/git-story-render.js";
 import { parseSemver } from "../semver.js";
 import { RBOX_VERSION } from "../version.js";
 import {
@@ -65,7 +66,12 @@ export interface AmbientDaemonStatusV1 {
   attentionReason?: AmbientAttentionReason;
   /** Visibility-only watcher trust. Absence is unknown/old-writer, not trusted. */
   watcherTrust?: AmbientWatcherTrust;
+  /** The rows a human is shown: quiet transients excluded (design 273 P5), so
+   * this count and `rbox status --git` cannot disagree. */
   deferredRepos?: number;
+  /** Design 273 S1: the same count split by actionability. */
+  deferredNeedsYou?: number;
+  deferredSelfHealing?: number;
   oldestDeferralAgeSeconds?: number | null;
   deferrals?: AmbientGitDeferral[];
   /** Boot-bound graceful-stop proof consumed by `rbox stop`. */
@@ -268,9 +274,10 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
           currentPath: cleanLocalPath(input.currentPath),
         })
       : undefined;
-  const projectedDeferrals = projectGitDeferralRepos(Object.entries(input.repoRecords ?? {}).flatMap(([repo, record]) =>
+  const projectedDeferrals = loudRows(projectGitDeferralRepos(Object.entries(input.repoRecords ?? {}).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])
-  ), input.now);
+  ), input.now));
+  const split = gitPauseCounts(projectedDeferrals);
   const deferredRepos = projectedDeferrals.length;
   const oldestDeferredSince = Date.parse(projectedDeferrals[0]?.oldestDeferredSince ?? "");
   const oldestDeferralAgeSeconds = deferredRepos === 0
@@ -290,6 +297,8 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
     attentionReason: state === "attention" ? reason ?? "unknown-error" : undefined,
     watcherTrust: input.trustState === "suspect" || input.trustState === "fused" ? input.trustState : undefined,
     deferredRepos,
+    deferredNeedsYou: split.needsYou,
+    deferredSelfHealing: split.selfHealing,
     oldestDeferralAgeSeconds,
     deferrals: projectedDeferrals.flatMap((deferral) => {
       const repo = boundedAmbientText(deferral.repo, 1_024);
@@ -315,7 +324,7 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
 
 export function pausedAmbientDaemonStatus(
   now = Date.now(),
-  previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "watcherTrust" | "deferredRepos" | "oldestDeferralAgeSeconds" | "deferrals">,
+  previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "watcherTrust" | "deferredRepos" | "deferredNeedsYou" | "deferredSelfHealing" | "oldestDeferralAgeSeconds" | "deferrals">,
 ): AmbientDaemonStatusV1 {
   return {
     schemaVersion: 1,
@@ -326,6 +335,8 @@ export function pausedAmbientDaemonStatus(
     lastSyncedAt: previous?.lastSyncedAt ?? null,
     ...(previous?.watcherTrust === undefined ? {} : { watcherTrust: previous.watcherTrust }),
     ...(previous?.deferredRepos === undefined ? {} : { deferredRepos: previous.deferredRepos }),
+    ...(previous?.deferredNeedsYou === undefined ? {} : { deferredNeedsYou: previous.deferredNeedsYou }),
+    ...(previous?.deferredSelfHealing === undefined ? {} : { deferredSelfHealing: previous.deferredSelfHealing }),
     ...(previous?.oldestDeferralAgeSeconds === undefined ? {} : { oldestDeferralAgeSeconds: previous.oldestDeferralAgeSeconds }),
     ...(previous?.deferrals === undefined ? {} : { deferrals: previous.deferrals.slice(0, 5) }),
   };
@@ -367,6 +378,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
     if (j.watcherTrust !== undefined && !WATCHER_TRUST.has(j.watcherTrust as AmbientWatcherTrust)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
+    if (j.deferredNeedsYou !== undefined && !uint(j.deferredNeedsYou)) return undefined;
+    if (j.deferredSelfHealing !== undefined && !uint(j.deferredSelfHealing)) return undefined;
     if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
     const out: AmbientDaemonStatusV1 = {
       schemaVersion: 1,
@@ -381,6 +394,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
     if (j.watcherTrust !== undefined) out.watcherTrust = j.watcherTrust as AmbientWatcherTrust;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
+    if (j.deferredNeedsYou !== undefined) out.deferredNeedsYou = j.deferredNeedsYou;
+    if (j.deferredSelfHealing !== undefined) out.deferredSelfHealing = j.deferredSelfHealing;
     if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
     if (j.deferrals !== undefined) {
       const items = Array.isArray(j.deferrals) ? j.deferrals : [];
