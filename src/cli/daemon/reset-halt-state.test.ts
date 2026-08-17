@@ -308,9 +308,6 @@ test("the ready line reports the lifecycle the first pump left behind", async ()
     const halted = await startWith("halted");
     expect(halted).toContain("rbox daemon live but sync halted pending reset-journal recovery");
     expect(halted.some((line) => line.startsWith("rbox daemon ready"))).toBe(false);
-    // A first pump that lands in the W1 backoff is RECOVERING. Calling that
-    // "halted pending reset-journal recovery" sends the user to a doctor
-    // command for a condition that clears itself in seconds.
     const recovering = await startWith("recovering");
     expect(recovering).toContain("rbox daemon live; sync starts once state recovery finishes");
     expect(recovering.some((line) => line.includes("halted"))).toBe(false);

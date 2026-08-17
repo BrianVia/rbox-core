@@ -961,12 +961,9 @@ export class RboxDaemon {
     this.remoteWakeup.activate();
     this.startUpdateChecks();
 
-    // Design 276 F2.5: the pump runs its own reset boundary, so the lifecycle
-    // sampled before it cannot be trusted to describe the daemon afterwards —
-    // that pre-sampling is how "rbox daemon ready" printed for a daemon that had
-    // just halted. Re-read it here and say what is true. (The `setReady` call
-    // above samples early on purpose: it is self-correcting through
-    // `enterResetHalt`, which sets readiness false itself.)
+    // Design 276 F2.5: the pump runs its own reset boundary, so a lifecycle
+    // sampled before it cannot describe the daemon afterwards. (`setReady`
+    // above samples early on purpose: `enterResetHalt` corrects it itself.)
     if (this.resetLifecycle === "ready") await this.pump();
     this.log(this.readyLine());
   }
@@ -1335,7 +1332,6 @@ export class RboxDaemon {
     // into the same loadState-driven recovery — which owns the writer takeover —
     // instead of the halt the adapter used to demote it to.
     const walCrash = inspection.status === "w1";
-    if (inspection.status === "recoverable" || walCrash) this.resetLifecycle = "recovering";
     if (inspection.status === "recoverable" || walCrash || this.resetLifecycle !== "ready" || persisted) {
       this.resetLifecycle = "recovering";
       let state: SyncState;
@@ -1350,12 +1346,10 @@ export class RboxDaemon {
       const after = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
       if (after.status !== "none") {
         if (after.status === "halt") await this.enterResetHalt(after.reason, after.journalIdentityHash);
-        else if (after.status === "w1") {
-          if (await this.retryWalCrashRecovery()) return false;
-          await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
-        }
         else if (after.status === "recoverable") await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
-        else throw unhandledResetInspection(after);
+        else if (after.status === "w1") {
+          if (!await this.retryWalCrashRecovery()) await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
+        } else throw unhandledResetInspection(after);
         return false;
       }
       if (!await this.bootstrapAgreement(state)) return false;

@@ -287,8 +287,8 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
         ]
         : [
           `${snapshot.workspaceLabel} · recovering state`,
-          // Nothing replays while no daemon runs, and the line below this one
-          // says "background sync: stopped". Name the actual next step.
+          // Nothing replays while no daemon runs, so name the step that starts
+          // the recovery instead of claiming one is under way.
           snapshot.daemonRunning
             ? "↻ replaying write-ahead state after an unclean shutdown"
             : "↻ recovering on the next daemon start · rbox start",

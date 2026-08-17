@@ -270,8 +270,6 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     "↻ replaying write-ahead state after an unclean shutdown",
     "Signed in as owner@example.com · pro",
   ]);
-  // Nothing replays while the daemon is stopped, so the copy names the step
-  // that starts the recovery instead of claiming one is under way.
   expect(lines(reset(false, false))).toEqual([
     "Development · recovering state",
     "↻ recovering on the next daemon start · rbox start",

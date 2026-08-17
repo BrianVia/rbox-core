@@ -17,7 +17,7 @@ export const RESET_WAL_CRASH_RETRY_ATTEMPTS = 6;
 
 /** The halt log gate's own interval. Split from RESET_RECOVERY_RETRY_MS (design
  * 276 F2.3) so a shorter retry deadline can never shorten log suppression. */
-export const RESET_HALT_LOG_INTERVAL_MS = 60 * 60 * 1000;
+const RESET_HALT_LOG_INTERVAL_MS = 60 * 60 * 1000;
 
 const DEFAULT_LRU_CAPACITY = 64;
 
