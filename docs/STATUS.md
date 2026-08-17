@@ -1,5 +1,47 @@
 # rbox status — living state snapshot
 
+## 2026-08-17 (evening) — must-ship arc: 274 PR-A + 276 both halves SHIPPED
+
+- **Design 276 (upgrade safety) shipped both halves same-day** (doc r1→r2.1
+  ALIGNED, adversarial review + REVISE folds + diff-scoped /simplify passes
+  per the founder's discipline reminder): PR #774 (F1/#688 CLOSED — 1.x→2.0
+  upgrades no longer take sync down; admission checked per-workspace BEFORE
+  the stop, real remedy surfaced, absent-catalog auto-init at one owner
+  healing upgrade+bootResume+track+adopt+init; design 266 R4 retired via
+  dated amendment; respectGitignore round-trip hole closed at the mutation;
+  initializeFolderCatalogAfterFirstBinding deleted as a proven strict
+  subset) and PR #773 (F2/#765 CLOSED — W1 is a typed variant not a halt,
+  classifier consults the in-process owned-writer registry, 6×5s bounded
+  backoff before the fail-closed hour, status halts from classifier ∪
+  live-ambient resetLifecycle with the health-halt.json poison-pill read
+  DELETED, three-way ready line). **Field-proven on FM**: the exact
+  sqlite3-ro replay of the morning incident → syncing normally in 90s
+  (morning cost: 19min outage).
+- **Design 274 PR-A merged (#771)**: GitSection.deviceId stamped at capture,
+  identity-excluded by construction with regression locks, churn refuted by
+  measurement; baking on the fleet. PR-B (the visible "take via-desktop's
+  version" copy + label cache) dispatches after bake; founder rulings r3:
+  trust-the-fleet stamping, label→id→generic-only-for-unstamped ladder.
+- **Fleet**: all three hosts on 2.0.0-beta.4-dev+505738e, syncing normally.
+- **Issues**: #688 #765 closed; filed #769 (file-size gate unreliable under
+  full runs), #770 (manifest-validate zero headroom), #772 (ambient-status
+  34B headroom + status-render at exactly 400); #757 got a fresh evidence
+  pair. Papercuts: CLI suite leaks tmpfs fixture dirs (~17G/54k dirs — brick
+  class), dry-run mutex contention on busy pull-only hosts.
+- **Open founder decisions**: F1's product question (should a leftover
+  daemon runtime dir veto catalog initialization like real user config?);
+  telemetry needs-you split (273 challenged requirement); #667 fossil
+  disposal at tag time.
+- **Process learnings memoried**: cwd resets cross-contaminate worktrees
+  (absolute paths only in multi-worktree briefs; 3 incidents); never open a
+  live fleet state.db even read-only (db-copy pattern); one full suite at a
+  time per host (tmpfs); diff-scoped /simplify as an explicit pre-merge
+  gate.
+- **Queue**: #517 recovery-phrase fix (next slot), #535 echo data-safety
+  design (heavyweight), #661 sender lane, 274 PR-B, design 275
+  restore-backup, /antislop + /improve-codebase-architecture sweeps in the
+  next soak window.
+
 ## 2026-08-17 (day) — design 273 SHIPPED end-to-end: git-lane legibility (#764)
 
 - **Design 273 ran the full cycle in one day** (founder-driven copy session →
