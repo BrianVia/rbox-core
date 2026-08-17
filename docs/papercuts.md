@@ -663,3 +663,11 @@ git.deferrals is right, but nothing tells a human it exists or that headline ≠
 listing); (4) no `rbox git resolve --dry-run` / batch mode — per-repo verb
 only, so a 52-repo sweep means 52 hand-typed commands. A user without an agent
 cannot make this decision from our surfaces.
+
+## 2026-08-17 — resolve --dry-run can't get a word in on a busy pull-only host
+On FM (pulls ~50s, cycling every 1-3 min) `rbox git resolve <repo> take-theirs
+--dry-run` lost the workspace sync mutex race twice in a row ("daemon/CLI is
+syncing; retry, or run `rbox stop` first"). The message is honest but the
+experience is "the preview command doesn't work on the busiest machine".
+Ideas: bounded mutex wait for read-only resolve modes, or a hint naming the
+expected wait ("a sync pass is finishing, usually under a minute").
