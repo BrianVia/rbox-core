@@ -157,7 +157,12 @@ export async function publishObservedRefPlane(state: RefPlaneObservation): Promi
               checkoutRefDetail = `manual absent branch proof failed for ${ref}: ${boundedRefFailure(error)}`;
             }
           }
-        } else if (baseOid !== (newOid ?? null)) {
+        } else if (baseOid !== (newOid ?? null) && opts.base !== undefined) {
+          // With NO serialized base this arm is exhausted by the vacuous
+          // `null !== newOid`: reaching :106 requires disk to already EQUAL
+          // incoming, and genuine divergence (oldOid !== newOid) never gets
+          // here. So a BASE-less record at this point is the landing shape, not
+          // local divergence. Records that HAVE a base keep the stale-BASE hold.
           heldRefs[ref] = "local-commits";
         }
       } else if (baseOid !== (newOid ?? null)) {

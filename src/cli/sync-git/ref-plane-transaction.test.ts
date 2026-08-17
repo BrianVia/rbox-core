@@ -251,6 +251,63 @@ test("checkout uses the ref candidate captured before the initial classifier awa
   expect(await git("rev-parse", "HEAD")).toBe(candidateA);
 });
 
+/**
+ * Design 271 §2.4: with no serialized BASE, a branch already AT the incoming
+ * value is the first-BASE landing shape, not local divergence.
+ */
+test("a BASE-less record mints no local-commits hold for a branch already at the incoming value", async () => {
+  const tip = await git("rev-parse", "HEAD");
+  await git("update-ref", "refs/heads/topic", tip);
+  const { live, opts } = await transactionOptions();
+  opts.incoming.refs["refs/heads/topic"] = tip;
+  const transaction = new RefPlaneTransaction(
+    opts, live, Object.values(live.refs), await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming), live.currentRef,
+  );
+
+  const progress = await transaction.publishIndependentRefs(staged(path.join(repo, ".git", "index")), live.indexProjection);
+
+  expect(opts.base).toBeUndefined();
+  expect(progress.heldRefs["refs/heads/topic"]).toBeUndefined();
+});
+
+test("a record that HAS a BASE keeps the stale-BASE hold for the same shape", async () => {
+  const tip = await git("rev-parse", "HEAD");
+  await git("update-ref", "refs/heads/topic", tip);
+  const { live, opts } = await transactionOptions();
+  opts.incoming.refs["refs/heads/topic"] = tip;
+  // A serialized BASE that does not name topic: the stale-BASE protection this
+  // arm actually provides is unchanged for every record that has one.
+  opts.base = { ...opts.incoming, refs: { ...live.refs } };
+  delete opts.base.refs["refs/heads/topic"];
+  const transaction = new RefPlaneTransaction(
+    opts, live, Object.values(live.refs), await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming), live.currentRef,
+  );
+
+  const progress = await transaction.publishIndependentRefs(staged(path.join(repo, ".git", "index")), live.indexProjection);
+
+  expect(progress.heldRefs["refs/heads/topic"]).toBe("local-commits");
+});
+
+test("a genuinely diverged branch is still held with no serialized BASE", async () => {
+  const tip = await git("rev-parse", "HEAD");
+  const tree = await git("rev-parse", "HEAD^{tree}");
+  const localOnly = await git("commit-tree", tree, "-p", tip, "-m", "local only");
+  await git("update-ref", "refs/heads/topic", localOnly);
+  const { live, opts } = await transactionOptions();
+  opts.incoming.refs["refs/heads/topic"] = tip;
+  const transaction = new RefPlaneTransaction(
+    opts, live, Object.values(live.refs), await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming), live.currentRef,
+  );
+
+  const progress = await transaction.publishIndependentRefs(staged(path.join(repo, ".git", "index")), live.indexProjection);
+
+  expect(opts.base).toBeUndefined();
+  expect(progress.heldRefs["refs/heads/topic"]).toBe("local-commits");
+});
+
 test("makeIntended cannot remove a held ref from the checkout boundary proof", async () => {
   const base = await git("rev-parse", "HEAD");
   const tree = await git("rev-parse", "HEAD^{tree}");
