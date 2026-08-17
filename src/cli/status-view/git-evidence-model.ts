@@ -28,8 +28,13 @@ export interface GitIncomingFacts {
   commitsAhead?: number;
   newest?: { subject: string; date: string };
   oldest?: { subject: string; date: string };
-  /** Paths the incoming work touches. Bounded by {@link MAX_FILES}. */
+  /** Paths the incoming work touches. PRESENT ONLY when the comparison actually
+   * ran: an empty array must mean "they changed nothing", never "rbox could not
+   * ask". Absent is the honest answer for an unrelated history, an exhausted
+   * budget, or a failed read. */
   files?: string[];
+  /** The name list was capped; `files.length` is not the count. */
+  filesTruncated?: boolean;
 }
 
 /**
@@ -42,8 +47,13 @@ export interface GitIncomingFacts {
 export type GitEvidenceTier = "pinned" | "record" | "none";
 
 export interface GitLocalWork {
+  /** The changed files this reading RETAINED names for; capped. */
   files: GitLocalFileChange[];
+  /** The true count, which stays exact even when the name list is capped. */
   total: number;
+  /** `files` is shorter than `total`. Any set operation over `files` is a
+   * lower bound, so consumers must degrade rather than report a number. */
+  truncated?: boolean;
   /** Commits on this computer the last sync never carried away. */
   commits: number;
   /** Files git does not track. The take-theirs backup CANNOT contain these, and
@@ -64,7 +74,16 @@ export interface GitRepoEvidence {
   timedOut?: boolean;
 }
 
-/** Sort key for every two-sided surface: the repos where both computers touched
- * the same files are the ones a person must look at first, and among equals the
- * oldest pause leads (design 273 S2, replacing PR-B's age-only order). */
-export const evidenceRisk = (evidence: GitRepoEvidence | undefined): number => evidence?.overlap ?? -1;
+/**
+ * Sort key for every two-sided surface: the repos where both computers touched
+ * the same files lead, and among equals the oldest pause does (design 273 S2,
+ * replacing PR-B's age-only order).
+ *
+ * UNKNOWN outranks KNOWN-ZERO. A repo rbox could not compare might be the worst
+ * one in the list, and sorting it below repos it has PROVEN safe would bury the
+ * only rows a reader still has to check by hand.
+ */
+export const evidenceRisk = (evidence: GitRepoEvidence | undefined): number => {
+  if (!evidence) return -1;
+  return evidence.overlap ?? 0.5;
+};

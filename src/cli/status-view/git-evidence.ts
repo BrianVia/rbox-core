@@ -39,7 +39,7 @@ export type { GitEvidenceTier, GitIncomingFacts, GitLocalFileChange, GitLocalWor
 /** How much of the other computer's work a single read will enumerate. Beyond
  * this the counts stay exact and the NAMES stop — a repo with 40k changed files
  * must not turn a status command into an unbounded allocation. */
-const MAX_FILES = 5_000;
+export const MAX_FILES = 5_000;
 /** Per-repo wall-clock budget. A repo on a stalled network filesystem degrades
  * to its counts instead of hanging the whole listing behind it. */
 export const EVIDENCE_REPO_TIMEOUT_MS = 3_000;
@@ -70,17 +70,24 @@ class Budget {
 const read = (repoDir: string, args: string[]): Promise<string> =>
   git(repoDir, ["--no-optional-locks", ...args]);
 
-function parseNumstat(out: string): GitLocalFileChange[] {
+/** Counts EVERY changed file and retains names for the first {@link MAX_FILES}.
+ * Stopping the parse at the cap would have made `total` the capped number while
+ * the header promised an exact count — a repo with 6,000 changed files would
+ * have reported 5,000. */
+export function parseNumstat(out: string): { files: GitLocalFileChange[]; total: number } {
   const files: GitLocalFileChange[] = [];
+  let total = 0;
   for (const line of out.split("\n")) {
     const [added, removed, ...rest] = line.split("\t");
     const file = rest.join("\t");
     if (!file || added === undefined || removed === undefined) continue;
+    total++;
     // "-" is git's marker for a binary file; it changed, it just has no lines.
-    files.push({ path: file, added: Number.parseInt(added, 10) || 0, removed: Number.parseInt(removed, 10) || 0 });
-    if (files.length >= MAX_FILES) break;
+    if (files.length < MAX_FILES) {
+      files.push({ path: file, added: Number.parseInt(added, 10) || 0, removed: Number.parseInt(removed, 10) || 0 });
+    }
   }
-  return files;
+  return { files, total };
 }
 
 function parseSubject(out: string): { subject: string; date: string } | undefined {
@@ -124,7 +131,7 @@ async function localSide(repoDir: string, base: GitSection | undefined, budget: 
   const branch = (await budget.run(() => read(repoDir, ["symbolic-ref", "--quiet", "--short", "HEAD"]), "")).trim();
   const anchor = baseAnchor(base, branch || undefined) ?? "HEAD";
   const numstat = await budget.run(() => read(repoDir, ["diff-index", "--numstat", anchor]), "");
-  const files = parseNumstat(numstat);
+  const { files, total } = parseNumstat(numstat);
   // mtimes answer "when did I last touch this" on the single-repo view. A repo
   // with thousands of changed files never shows thousands of rows, so only the
   // head of the list pays for a stat.
@@ -136,9 +143,9 @@ async function localSide(repoDir: string, base: GitSection | undefined, budget: 
     (await budget.run(() => read(repoDir, ["rev-list", "--count", `${anchor}..HEAD`]), "")).trim(), 10);
   const untracked = (await budget.run(() => read(repoDir, ["ls-files", "--others", "--exclude-standard"]), ""))
     .split("\n").filter(Boolean).length;
-  const side: LocalSide = {
-    local: { files, total: files.length, commits: Number.isFinite(commits) ? commits : 0, untracked },
-  };
+  const local: GitLocalWork = { files, total, commits: Number.isFinite(commits) ? commits : 0, untracked };
+  if (files.length < total) local.truncated = true;
+  const side: LocalSide = { local };
   if (branch) side.localBranch = branch;
   return side;
 }
@@ -162,17 +169,31 @@ async function incomingSide(
   const oldest = parseSubject(
     (await budget.run(() => read(repoDir, ["log", "--reverse", "--format=%s%x00%aI", range]), "")).split("\n")[0] ?? "",
   );
-  // Tree-to-tree from the fork point, so the file list is what the other computer
-  // ADDED rather than everything the two histories differ by. Plumbing again: the
-  // porcelain three-dot spelling reads the worktree index on the way past.
-  const forkPoint = (await budget.run(() => read(repoDir, ["merge-base", "HEAD", oid]), "")).trim();
-  const names = forkPoint
-    ? await budget.run(() => read(repoDir, ["diff-tree", "-r", "--name-only", "--no-commit-id", forkPoint, oid]), "")
-    : "";
-  const facts: GitIncomingFacts = { ...offline, files: names.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, MAX_FILES) };
+  const facts: GitIncomingFacts = { ...offline };
   if (Number.isFinite(ahead)) facts.commitsAhead = ahead;
   if (newest) facts.newest = newest;
   if (oldest) facts.oldest = oldest;
+  // Tree-to-tree from the fork point, so the file list is what the other computer
+  // ADDED rather than everything the two histories differ by. Plumbing again: the
+  // porcelain three-dot spelling reads the worktree index on the way past.
+  //
+  // `files` is set ONLY when this comparison ran. `merge-base` exits non-zero on
+  // unrelated histories and the budget can expire between the pin read and here;
+  // either way the fallback is an empty string, and treating that as an empty
+  // FILE LIST printed "none changed elsewhere" next to "1 commit newer" — an
+  // unknown rendered as a reassurance.
+  const forkPoint = (await budget.run(() => read(repoDir, ["merge-base", "HEAD", oid]), "")).trim();
+  if (HEX40.test(forkPoint)) {
+    const names = await budget.run(
+      () => read(repoDir, ["diff-tree", "-r", "--name-only", "--no-commit-id", forkPoint, oid]).then((out) => ({ out })),
+      undefined,
+    );
+    if (names !== undefined) {
+      const all = names.out.split("\n").map((line) => line.trim()).filter(Boolean);
+      facts.files = all.slice(0, MAX_FILES);
+      if (all.length > MAX_FILES) facts.filesTruncated = true;
+    }
+  }
   return { tier: "pinned", incoming: facts };
 }
 
@@ -201,8 +222,14 @@ export async function gitDeferralEvidence(request: GitEvidenceRequest): Promise<
     if (local) evidence.local = local;
     if (side) evidence.incoming = side.incoming;
     if (budget.timedOut) evidence.timedOut = true;
-    if (side?.tier === "pinned" && local && side.incoming.files) {
-      const theirs = new Set(side.incoming.files);
+    // Overlap is the lead risk NUMBER on every two-sided surface, so it is only
+    // ever set when it is exact. A truncated set on either side, or a budget that
+    // expired mid-read, makes it a lower bound — and a lower bound printed as a
+    // number is the same lie as the false zero above.
+    const theirFiles = side?.incoming.files;
+    if (side?.tier === "pinned" && local && theirFiles
+      && !budget.timedOut && local.truncated !== true && side.incoming.filesTruncated !== true) {
+      const theirs = new Set(theirFiles);
       evidence.overlap = local.files.filter((file) => theirs.has(file.path)).length;
     }
     out.set(repo, evidence);

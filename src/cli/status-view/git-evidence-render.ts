@@ -56,12 +56,16 @@ const shortDateOf = (iso: string | undefined): string | undefined =>
  * The listing's per-repo risk clause: "12 files changed here, 3 also changed on
  * another computer ⚠". `undefined` when this repo has no reading, which is how a
  * pre-273 pause keeps the age-only row PR-B shipped.
+ *
+ * "none changed elsewhere" is a CLAIM, and it is made only when the comparison
+ * actually ran. Everything else says rbox could not compare, because a reader who
+ * is told "none" stops looking.
  */
 export function evidenceRowSuffix(evidence: GitRepoEvidence | undefined): string | undefined {
   const local = evidence?.local;
   if (!local || local.total === 0) return undefined;
   const here = `${files(local.total)} changed here`;
-  if (evidence.tier !== "pinned" || evidence.overlap === undefined) return here;
+  if (evidence.overlap === undefined) return `${here}, can't compare with the other computer`;
   return evidence.overlap > 0
     ? `${here}, ${evidence.overlap} also changed on another computer ⚠`
     : `${here}, none changed elsewhere`;
@@ -97,16 +101,23 @@ function incomingLines(evidence: GitRepoEvidence): string[] {
     const when = shortDateOf(incoming.oldest.date);
     lines.push(`    oldest waiting: "${safeSubject(incoming.oldest.subject)}"${when ? `  (${when})` : ""}`);
   }
-  if (incoming.files) {
-    const overlap = evidence.overlap ?? 0;
+  const overlap = evidence.overlap;
+  if (incoming.files && overlap !== undefined) {
     lines.push(overlap > 0
       ? `    changes ${files(incoming.files.length)} — ${overlap} of them ${overlap === 1 ? "is a file" : "are files"} you also changed here ⚠`
       : `    changes ${files(incoming.files.length)} — none of them are files you changed here`);
+  } else if (incoming.files) {
+    // The list is real but the comparison is not exact (a capped list, or a
+    // budget that ran out). Give the count and refuse the number.
+    lines.push(`    changes ${files(incoming.files.length)} — rbox could not finish checking which of them you also changed here`);
   } else {
-    // Tier 2: the objects are gone, so the honest offering is the date it was
-    // made and the command that fetches the rest on demand.
+    // Tier 2: the objects are gone. Say WHY in the reader's terms rather than
+    // reporting an internal absence.
     const captured = shortDateOf(incoming.generatedAt);
-    lines.push(`    rbox no longer has a local copy of this to compare${captured ? ` (it was made ${captured})` : ""}`);
+    lines.push(captured
+      ? `    The other computer published this on ${captured}. rbox doesn't keep a copy of it`
+      : "    rbox doesn't keep a copy of the other computer's version");
+    lines.push("    here once a pause gets old, so it can't compare the two sides right now.");
   }
   return lines;
 }

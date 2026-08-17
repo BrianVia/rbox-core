@@ -1515,7 +1515,8 @@ test("take-theirs --dry-run changes nothing on disk and points at the real backu
   expect(lines[0]).toBe("This is a preview — nothing on this computer changed.");
   expect(text).toContain(`${backupDirFor("repo")}/`);
   expect(text).toContain("NOT copy:");
-  expect(text).toContain("you never added to git, and ignored files");
+  expect(text).toContain("you never added to git, and ignored");
+  expect(text).toContain("files — those stay where they are on disk, untouched");
   expect(text).toContain("To actually do it, run the same command without --dry-run.");
   expect(text).toContain("keep it until you're sure");
   // Design 275 owns the restore command; printing one that does not exist is
@@ -1629,4 +1630,40 @@ test("batch selection reads the projection's own resolvable predicate and the --
     .toEqual(["acme/admin", "acme/checkout", "other/app"]);
   expect(selectBatchRepos(rows, { under: ".", group: "local-edits" }).map((row) => row.repo).sort())
     .toEqual(["acme/checkout", "other/app"]);
+});
+
+test("a dry-run over an unreadable repo says UNKNOWN, never 'nothing to save'", async () => {
+  const { renderResolveDryRun, backupDirFor } = await import("./git/resolve-dry-run.js");
+  const unreadable = renderResolveDryRun("repo", "take-theirs", undefined).join("\n");
+  // The inverted danger: a reader decides a destructive command is free exactly
+  // when rbox is least able to say so.
+  expect(unreadable).not.toContain("there is nothing of yours here to save");
+  expect(unreadable).toContain("rbox could not read this repo, so it cannot tell you");
+  expect(unreadable).toContain("the backup is still made");
+  // The pointer SURVIVES an unknown — that is when it matters most.
+  expect(unreadable).toContain(`Your backup would be saved at ${backupDirFor("repo")}/`);
+
+  const timedOut = renderResolveDryRun("repo", "take-theirs", {
+    repo: "repo", tier: "pinned", timedOut: true,
+    local: { files: [], total: 0, commits: 0, untracked: 0 },
+  }).join("\n");
+  expect(timedOut).toContain("ran out of time reading this repo");
+  expect(timedOut).toContain("the backup is still made");
+
+  // Only a SUCCESSFUL empty read drops the pointer.
+  const provenEmpty = renderResolveDryRun("repo", "take-theirs", {
+    repo: "repo", tier: "pinned",
+    local: { files: [], total: 0, commits: 0, untracked: 0 },
+  }).join("\n");
+  expect(provenEmpty).not.toContain("Your backup would be saved at");
+  expect(provenEmpty).toContain("(0 files, 0 commits)");
+});
+
+test("keep-mine dry-run reports an unknown overlap as unknown", async () => {
+  const { renderResolveDryRun } = await import("./git/resolve-dry-run.js");
+  const unknown = renderResolveDryRun("repo", "keep-mine", {
+    repo: "repo", tier: "pinned",
+    local: { files: [], total: 3, commits: 1, untracked: 0 },
+  }).join("\n");
+  expect(unknown).toContain("could not check whether the two computers changed the same files");
 });

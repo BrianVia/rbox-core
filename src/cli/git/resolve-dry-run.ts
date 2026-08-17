@@ -32,37 +32,65 @@ export function backupDirFor(rel: string): string {
 
 const count = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
 
-function savedClause(evidence: GitRepoEvidence | undefined): string {
+/**
+ * A SUCCESSFUL read proving there is nothing of yours here. Absent, partial and
+ * timed-out readings are not proof of emptiness — this is the one question where
+ * "rbox does not know" and "there is nothing" have opposite consequences.
+ */
+const provesNothingLocal = (evidence: GitRepoEvidence | undefined): boolean => {
   const local = evidence?.local;
-  if (!local || (local.total === 0 && local.commits === 0)) return "(there is nothing of yours here to save)";
-  return `(${count(local.total, "file")}, ${count(local.commits, "commit")})`;
+  return local !== undefined && evidence?.timedOut !== true && local.total === 0 && local.commits === 0;
+};
+
+function savedLines(evidence: GitRepoEvidence | undefined): string[] {
+  const local = evidence?.local;
+  const lead = "  - first save a copy of your committed and work-in-progress changes to";
+  if (local === undefined || evidence?.timedOut === true) {
+    // Reporting an unknown as "nothing to save" inverts the danger: the reader
+    // decides a destructive command is free precisely when rbox is least able to
+    // say so. The backup is still made either way, and the copy says that.
+    return [
+      lead,
+      "    files git tracks (rbox could not read this repo, so it cannot tell you",
+      "    how much that is — the backup is still made) here:",
+    ];
+  }
+  return [lead, `    files git tracks (${count(local.total, "file")}, ${count(local.commits, "commit")}) here:`];
 }
 
-function notCopiedLine(evidence: GitRepoEvidence | undefined): string {
-  const untracked = evidence?.local?.untracked ?? 0;
-  const newFiles = untracked > 0
-    ? `${count(untracked, "brand-new file")} you never added to git, and ignored files`
-    : "brand-new files you never added to git, and ignored files";
-  return `  - NOT copy: ${newFiles} — those stay where they are on disk, untouched`;
+function notCopiedLines(evidence: GitRepoEvidence | undefined): string[] {
+  const untracked = evidence?.local?.untracked;
+  const newFiles = untracked !== undefined && untracked > 0
+    ? `${count(untracked, "brand-new file")} you never added to git, and ignored`
+    : "brand-new files you never added to git, and ignored";
+  return [
+    `  - NOT copy: ${newFiles}`,
+    "    files — those stay where they are on disk, untouched",
+  ];
 }
 
 function takeTheirsLines(rel: string, evidence: GitRepoEvidence | undefined): string[] {
   const ahead = evidence?.incoming?.commitsAhead;
   const newer = ahead === undefined ? "" : ` (${count(ahead, "commit")} newer)`;
   const backup = backupDirFor(rel);
-  return [
-    `Taking the other computer's version would:`,
+  const lines = [
+    "Taking the other computer's version would:",
     `  - switch this repo to their version${newer}`,
-    `  - first save a copy of your committed and work-in-progress changes to`,
-    `    files git tracks ${savedClause(evidence)} here:`,
+    ...savedLines(evidence),
     `      ${backup}/  (rbox calls this the git quarantine)`,
-    notCopiedLine(evidence),
-    `To actually do it, run the same command without --dry-run.`,
-    // Deliberately a DIRECTORY, not a command: `rbox git restore-backup` ships
-    // with design 275, and printing a command that does not exist is worse than
-    // printing none.
-    `Your backup would be saved at ${backup}/ — keep it until you're sure.`,
+    ...notCopiedLines(evidence),
+    "To actually do it, run the same command without --dry-run.",
   ];
+  // The closing pointer is dropped ONLY when a successful read proved there is
+  // nothing of yours to back up. An unreadable repo keeps it — that is exactly
+  // the case where the reader most needs to know where to look afterwards.
+  // Deliberately a DIRECTORY, not a command: `rbox git restore-backup` ships
+  // with design 275, and printing a command that does not exist is worse than
+  // printing none.
+  if (!provesNothingLocal(evidence)) {
+    lines.push(`Your backup would be saved at ${backup}/ — keep it until you're sure.`);
+  }
+  return lines;
 }
 
 function keepMineLines(evidence: GitRepoEvidence | undefined): string[] {
@@ -70,17 +98,20 @@ function keepMineLines(evidence: GitRepoEvidence | undefined): string[] {
   const waiting = ahead === undefined
     ? "  - leave the other computer's waiting work unapplied here"
     : `  - leave the other computer's waiting work unapplied here (${count(ahead, "commit")})`;
-  const overlap = evidence?.overlap ?? 0;
-  return [
-    `Keeping this computer's work would:`,
-    `  - publish this computer's version, so your other computers follow it`,
-    waiting,
-    ...(overlap > 0
+  const overlap = evidence?.overlap;
+  const both = overlap === undefined
+    ? ["  - rbox could not check whether the two computers changed the same files here"]
+    : overlap > 0
       ? [`  - ⚠ ${count(overlap, "file")} changed on BOTH computers; the other computer keeps its own copy either way`]
-      : []),
-    `The other computer's work is not deleted — it stays there, and rbox stops`,
-    `trying to bring it here.`,
-    `To actually do it, run the same command without --dry-run.`,
+      : [];
+  return [
+    "Keeping this computer's work would:",
+    "  - publish this computer's version, so your other computers follow it",
+    waiting,
+    ...both,
+    "The other computer's work is not deleted — it stays there, and rbox stops",
+    "trying to bring it here.",
+    "To actually do it, run the same command without --dry-run.",
   ];
 }
 
@@ -94,6 +125,9 @@ export function renderResolveDryRun(
   evidence: GitRepoEvidence | undefined,
 ): string[] {
   const lines = ["This is a preview — nothing on this computer changed."];
+  if (evidence?.timedOut === true) {
+    lines.push("(rbox ran out of time reading this repo, so some numbers below are missing.)");
+  }
   if (verb === "take-theirs") lines.push(...takeTheirsLines(rel, evidence));
   else if (verb === "keep-mine") lines.push(...keepMineLines(evidence));
   else lines.push("`show-me` only reads; it never changes anything here, with or without --dry-run.");

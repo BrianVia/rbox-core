@@ -9,8 +9,9 @@ import { hashBytes } from "../../engine/hash.js";
 import type { GitSection } from "../../engine/types.js";
 import { writePendingPins } from "../sync-git/pending-pins.js";
 import type { RepoRecord } from "../sync-state-model.js";
-import { gitDeferralEvidence } from "./git-evidence.js";
-import { renderGitRepoDetail } from "./git-evidence-render.js";
+import { gitDeferralEvidence, MAX_FILES, parseNumstat } from "./git-evidence.js";
+import { evidenceRisk } from "./git-evidence-model.js";
+import { evidenceRowSuffix, renderGitRepoDetail } from "./git-evidence-render.js";
 import { projectGitDeferralRepos } from "./git-projection.js";
 import { gitPauseCounts, gitPauseHeadline, renderGitPauseListing, renderGitPauseSummary } from "./git-story-render.js";
 
@@ -216,4 +217,73 @@ test("a commit subject carrying terminal escapes renders inert and bounded", () 
   // Bounded, not merely stripped: an unbounded peer string is its own defect.
   expect(lines.split("\n").every((line) => line.length < 300)).toBe(true);
   expect(lines).toContain("1 of them is a file you also changed here ⚠");
+});
+
+// ── unknown must never render as zero ────────────────────────────────────────
+
+test("unrelated histories yield NO overlap number, not a false zero", async () => {
+  const { root, base } = await pausedRepo();
+  // A second root commit: `git merge-base HEAD <oid>` exits non-zero, which is
+  // the read whose empty fallback used to become an empty FILE LIST — printing
+  // "none changed elsewhere" beside "1 commit newer".
+  const orphan = (await exec("git", ["-C", root, "commit-tree", "-m", "unrelated",
+    (await exec("git", ["-C", root, "write-tree"])).stdout.trim()])).stdout.trim();
+  const incoming = section({ "refs/heads/main": orphan }, "ref: refs/heads/main");
+  await writePendingPins(root, ".", (await import("../sync-git/shared.js")).gitIncomingKey(incoming), incoming);
+  await fs.writeFile(path.join(root, "shared.ts"), "mine\n");
+
+  const evidence = (await gitDeferralEvidence({
+    root,
+    records: new Map([[".", record({ base: section({ "refs/heads/main": base }, "ref: refs/heads/main"), pending: incoming })]]),
+  })).get(".")!;
+  expect(evidence.tier).toBe("pinned");
+  expect(evidence.incoming?.files).toBeUndefined();
+  expect(evidence.overlap).toBeUndefined();
+  expect(evidenceRowSuffix(evidence)).toBe("1 file changed here, can't compare with the other computer");
+});
+
+test("a timed-out reading never reports an overlap number", async () => {
+  const { root, base, theirs } = await pausedRepo();
+  const incoming = section({ "refs/heads/main": theirs }, "ref: refs/heads/main");
+  await writePendingPins(root, ".", (await import("../sync-git/shared.js")).gitIncomingKey(incoming), incoming);
+  await fs.writeFile(path.join(root, "shared.ts"), "mine\n");
+  const evidence = (await gitDeferralEvidence({
+    root,
+    timeoutMs: 0,
+    records: new Map([[".", record({ base: section({ "refs/heads/main": base }, "ref: refs/heads/main"), pending: incoming })]]),
+  })).get(".")!;
+  expect(evidence.timedOut).toBe(true);
+  expect(evidence.overlap).toBeUndefined();
+});
+
+test("the local count stays EXACT past the name cap — total is not files.length", () => {
+  const overflow = MAX_FILES + 17;
+  const numstat = Array.from({ length: overflow }, (_, i) => `1\t0\tsrc/file-${i}.ts`).join("\n");
+  const parsed = parseNumstat(numstat);
+  // The whole point: stopping the parse at the cap silently reported 5,000
+  // changed files for a repo that had 5,017.
+  expect(parsed.total).toBe(overflow);
+  expect(parsed.files).toHaveLength(MAX_FILES);
+});
+
+test("a truncated local set refuses to report an overlap number", async () => {
+  const { root, base, theirs } = await pausedRepo();
+  const incoming = section({ "refs/heads/main": theirs }, "ref: refs/heads/main");
+  await writePendingPins(root, ".", (await import("../sync-git/shared.js")).gitIncomingKey(incoming), incoming);
+  await fs.writeFile(path.join(root, "shared.ts"), "mine\n");
+  const evidence = (await gitDeferralEvidence({
+    root,
+    records: new Map([[".", record({ base: section({ "refs/heads/main": base }, "ref: refs/heads/main"), pending: incoming })]]),
+  })).get(".")!;
+  // Control: an untruncated reading DOES report the number.
+  expect(evidence.overlap).toBe(1);
+  expect(evidenceRowSuffix({ ...evidence, local: { ...evidence.local!, truncated: true }, overlap: undefined }))
+    .toBe("1 file changed here, can't compare with the other computer");
+});
+
+test("an unknown reading outranks a proven-safe one in the risk order", () => {
+  const known = { repo: "a", tier: "pinned", overlap: 0 } as const;
+  const unknown = { repo: "b", tier: "pinned" } as const;
+  expect(evidenceRisk(unknown)).toBeGreaterThan(evidenceRisk(known));
+  expect(evidenceRisk(undefined)).toBeLessThan(evidenceRisk(known));
 });
