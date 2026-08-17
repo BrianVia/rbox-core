@@ -76,6 +76,9 @@ export interface BriefTransferProgress {
 export type BriefStatusSnapshot =
   | {
       kind: "reset-halt";
+      /** Design 276 F2.1: false is the non-halt `w1` recovery, which stops sync
+       * for one boundary pass rather than until an operator intervenes. */
+      halted: boolean;
       workspaceLabel: string;
       daemonRunning: boolean;
       account: BriefAccountSummary;
@@ -199,7 +202,9 @@ export function briefIdentityLine(account: BriefAccountSummary): string {
 
 /** The intentionally closed design-153 headline blocker predicate. */
 export function headlineBlocked(snapshot: BriefStatusSnapshot): boolean {
-  if (snapshot.kind === "reset-halt") return true;
+  // Design 276 F2.1: a `w1` recovery blocks nothing — it clears itself on the
+  // next boundary pass and needs no operator.
+  if (snapshot.kind === "reset-halt") return snapshot.halted;
   return snapshot.halt !== undefined
     || snapshot.planQuota.kind !== "none"
     || snapshot.watcherTrust === "fused"
@@ -274,11 +279,21 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   if (snapshot.kind === "reset-halt") {
     return {
       daemonRunning: snapshot.daemonRunning,
-      lines: [
-        `${snapshot.workspaceLabel} · sync needs attention`,
-        "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
-        briefIdentityLine(snapshot.account),
-      ],
+      lines: snapshot.halted
+        ? [
+          `${snapshot.workspaceLabel} · sync needs attention`,
+          "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
+          briefIdentityLine(snapshot.account),
+        ]
+        : [
+          `${snapshot.workspaceLabel} · recovering state`,
+          // Nothing replays while no daemon runs, so name the step that starts
+          // the recovery instead of claiming one is under way.
+          snapshot.daemonRunning
+            ? "↻ replaying write-ahead state after an unclean shutdown"
+            : "↻ recovering on the next daemon start · rbox start",
+          briefIdentityLine(snapshot.account),
+        ],
     };
   }
 

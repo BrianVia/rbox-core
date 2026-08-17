@@ -111,6 +111,7 @@ function halt<M extends StatusMode>(mode: M): Extract<WorkspaceStatusProjection<
   const { workspace, daemon, credentials, bookkeeping } = base();
   return {
     kind: "reset-halt",
+    halted: true,
     reason: "unreadable-journal",
     workspace,
     daemon,

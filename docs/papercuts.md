@@ -671,3 +671,10 @@ syncing; retry, or run `rbox stop` first"). The message is honest but the
 experience is "the preview command doesn't work on the busiest machine".
 Ideas: bounded mutex wait for read-only resolve modes, or a hint naming the
 expected wait ("a sync pass is finishing, usually under a minute").
+
+## 2026-08-17 — the CLI test suite leaks mkdtemp dirs until /tmp bricks the host
+Two reviewer agents independently hit it today: ~54k leftover rbox-* fixture
+dirs (~17G) on the /tmp tmpfs, then inode exhaustion (1048558/1048576) turning
+a full `bun test src/cli` into 204 phantom "unable to open database file"
+failures. Fixtures should clean up in afterEach/afterAll or the harness needs
+a startup sweep of stale rbox-* dirs older than N minutes.

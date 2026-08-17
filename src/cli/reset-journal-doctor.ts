@@ -25,6 +25,11 @@ import {
 } from "./reset-quarantine.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
+/** Design 276 F2.1: W1 has no journal to quarantine and no halt to report — the
+ * daemon replays the write-ahead log in place at its next recovery boundary. */
+const WAL_CRASH_REPORT =
+  "the SQLite authority has an ordinary WAL crash the daemon recovers in place";
+
 export interface ResetJournalDoctorOptions {
   quarantine?: boolean;
   restore?: string;
@@ -148,10 +153,11 @@ async function quarantineStandingJournal(root: string): Promise<void> {
     }
     throw new Error("no reset journal is standing");
   }
+  if (before.status === "w1") throw new Error(WAL_CRASH_REPORT);
   const preRequests = requestsFromJournal(before.journal);
   await withResetJournalDoctorFence(root, preRequests, async () => {
     const inspection = await inspectResetJournalSafety(root, syncStreamId(await loadConfig(root)));
-    if (inspection.status === "none") throw new Error("reset journal disappeared before quarantine");
+    if (inspection.status === "none" || inspection.status === "w1") throw new Error("reset journal disappeared before quarantine");
     if (before.journalIdentityHash && inspection.journalIdentityHash !== before.journalIdentityHash) throw new Error("reset journal changed before quarantine; retry the command");
     if (!await boundedHash(resetJournalPath(root), RESET_STREAM_BYTE_LIMIT)) throw new Error("reset journal disappeared before quarantine");
     const journal = inspection.journal;
@@ -215,6 +221,10 @@ export async function resetJournalDoctorCmd(root: string, opts: ResetJournalDoct
   }
   if (inspection.status === "recoverable") {
     console.log("reset journal: recoverable; the daemon will complete forward recovery");
+    return;
+  }
+  if (inspection.status === "w1") {
+    console.log(`reset journal: none; ${WAL_CRASH_REPORT}`);
     return;
   }
   console.log(`reset journal: sync halted (${inspection.reason})`);

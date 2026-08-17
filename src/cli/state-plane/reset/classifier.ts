@@ -7,6 +7,7 @@ import {
 } from "../../reset-namespace-inventory.js";
 import { readSqliteAuthorityId } from "./lifecycle.js";
 import { sqliteResetPaths } from "./artifacts.js";
+import { ownedStateStoreWriterForReset } from "../store/open.js";
 
 export type SqliteResetPredecodeRow =
   | { kind: "W2"; inventory: ResetNamespaceInventory }
@@ -76,7 +77,16 @@ export async function classifySqliteResetPredecode(root: string): Promise<Sqlite
   if (inventory.active.main !== "regular") {
     return { kind: "halt", code: "RESET_ACTIVE_ARTIFACT_INVALID", inventory };
   }
-  if (inventory.active.sidecarVector === "SW") return { kind: "W1", inventory };
+  if (inventory.active.sidecarVector === "SW") {
+    // The sidecar vector alone cannot tell a crashed writer from a live one: an
+    // open owned writer publishes exactly `SW` (#765). The in-process registry
+    // is the ownership input that separates them. It is sound in both
+    // directions: a crashed-and-restarted process holds an EMPTY registry, so a
+    // genuine crash is never masked, and a worker thread or a second daemon has
+    // its own module instance and falls back to the lstat-only verdict.
+    if (ownedStateStoreWriterForReset(sqliteResetPaths.active(root))) return { kind: "steady", inventory };
+    return { kind: "W1", inventory };
+  }
   if (inventory.active.sidecarVector !== "S0") {
     return { kind: "halt", code: "RESET_ACTIVE_ARTIFACT_INVALID", inventory };
   }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { loadConfig, loadState, repoRecordsForState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
@@ -17,6 +18,8 @@ import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-dura
 import { flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
 import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
+import { sqliteResetPaths } from "./state-plane/paths.js";
+import { createStateStore } from "./state-plane/store/open.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -236,6 +239,35 @@ async function saveDeferralState(): Promise<void> {
   });
 }
 
+/** Replaces the legacy-JSON fixture state with a real SQLite authority. */
+async function sqliteAuthorityWorkspace(): Promise<void> {
+  const authorityId = "9".repeat(32);
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId,
+    lineageId: "8".repeat(32),
+    stream: syncStreamId(cfg),
+    createdBy: "status-cmd-test",
+    stateNonce: "7".repeat(32),
+    stateRevision: 1,
+  }).close();
+  await fs.writeFile(sqliteResetPaths.authorityMarker(root), `RBOX-SQLITE-AUTHORITY-v1\n${authorityId}\n`);
+}
+
+/** Every byte under `.rbox`, sidecars and lock files included. */
+async function rboxTreeDigest(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  const walk = async (dir: string, prefix: string): Promise<void> => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full, `${prefix}${entry.name}/`);
+      else out[`${prefix}${entry.name}`] = createHash("sha256").update(await fs.readFile(full)).digest("hex");
+    }
+  };
+  await walk(path.join(root, ".rbox"), "");
+  return out;
+}
+
 async function captureStatus(opts: { json?: boolean; verbose?: boolean; git?: boolean }): Promise<string> {
   return captureStatusWithDeps(opts, cleanScanDeps());
 }
@@ -362,15 +394,80 @@ test("reset-journal halt renders text and JSON without dereferencing state", asy
   expect(json.remote).toBeUndefined();
 });
 
-test("stale daemon halt record with no journal renders recovering and remains read-only", async () => {
+/**
+ * Design 276 F2.1 validation (c). A SQLite authority whose active database
+ * carries an ordinary WAL crash is RECOVERING, not halted — and status must
+ * reach that verdict without touching a byte. Falling through to `readState`
+ * would take the workspace sync mutex and attempt a writer takeover against the
+ * live daemon, which is exactly what design 138 F2b makes status read-only for.
+ */
+test("an ordinary WAL crash renders recovering and mutates nothing", async () => {
+  await sqliteAuthorityWorkspace();
+  await fs.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
+  const before = await rboxTreeDigest();
+
+  const json = JSON.parse(await captureStatus({ json: true }));
+  expect(json).toMatchObject({ halted: false, reason: "recovering" });
+  // No daemon runs in this fixture, so nothing is replaying anything: the copy
+  // has to name the step that actually starts the recovery.
+  const brief = await captureStatus({});
+  expect(brief).toContain("recovering on the next daemon start · rbox start");
+  expect(brief).not.toContain("sync halted");
+  const text = await captureStatus({ verbose: true });
+  expect(text).toContain("it recovers on the next daemon start");
+  expect(text).not.toContain("rbox doctor reset-journal");
+
+  // With a live daemon the same store IS being replayed, and the user has
+  // nothing to do.
+  const live = cleanScanDeps();
+  live.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ bootId: "boot_status" }));
+  const liveBrief = await captureStatusWithDeps({}, live);
+  expect(liveBrief).toContain("replaying write-ahead state after an unclean shutdown");
+  const liveText = await captureStatusWithDeps({ verbose: true }, live);
+  expect(liveText).toContain("the daemon replays in place");
+  expect(liveText).toContain("no action needed");
+
+  expect(await rboxTreeDigest()).toEqual(before);
+});
+
+/**
+ * Design 276 F2.4 validation (e). health-halt.json is no longer a status input,
+ * so a record the daemon never cleared cannot keep a healthy workspace pinned to
+ * a halt projection. Its one remaining reader is the daemon's own re-recovery
+ * trigger, and this test proves status left it alone.
+ */
+test("a stale halt record no longer halts status while the classifier is clean", async () => {
   await writeResetHaltHealth(root, {
     reason: "old halt",
     journalIdentity: "a".repeat(64),
     haltedAt: "2026-07-17T12:00:00.000Z",
   });
-  const json = JSON.parse(await captureStatus({ json: true }));
-  expect(json).toMatchObject({ halted: true, reason: "recovering" });
+  const deps = cleanScanDeps();
+  deps.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ state: "synced" }));
+  const json = JSON.parse(await captureStatusWithDeps({ json: true }, deps));
+  expect(json.halted).toBeUndefined();
+  expect(json.health).toBe("ok");
   expect(await fs.lstat(path.join(root, ".rbox", "state", "health-halt.json"))).toBeDefined();
+});
+
+/**
+ * Design 276 F2.4 validation (d). Three enterResetHalt reasons — the
+ * bootstrapAgreement disagreement among them — have no classifier signature.
+ * The ambient lifecycle projection is what keeps them visible in `rbox status`
+ * now that the health file is not read here (design 138 visibility).
+ */
+test("a daemon-side halt with no classifier signature stays visible through ambient", async () => {
+  const deps = cleanScanDeps();
+  deps.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+    bootId: "boot_status",
+    state: "attention",
+    attentionReason: "halt",
+    resetLifecycle: "halted",
+  }));
+  const json = JSON.parse(await captureStatusWithDeps({ json: true }, deps));
+  expect(json).toMatchObject({ halted: true, reason: "recovering" });
+  const brief = await captureStatusWithDeps({}, deps);
+  expect(brief).toContain("sync halted to protect recovery state");
 });
 
 test("status text and JSON expose only closed locking health", async () => {

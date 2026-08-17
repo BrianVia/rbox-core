@@ -199,9 +199,7 @@ export async function inspectResetJournal(root: string, callerStream?: string): 
     const { sqliteResetFacade } = await import("./state-plane/reset/index.js");
     const sqlite = await sqliteResetFacade.inspect(root, callerStream);
     if (sqlite.status === "steady" || sqlite.status === "none") return { status: "none" };
-    if (sqlite.status === "w1") {
-      return { status: "halt", reason: "SQLite authority has an ordinary WAL crash requiring writer takeover" };
-    }
+    if (sqlite.status === "w1") return { status: "w1" };
     if (sqlite.status === "halt") {
       return {
         status: "halt",
@@ -395,6 +393,7 @@ export async function recoverResetJournalUnderHeldFence(
   let inspection = await inspectResetJournal(root, callerStream);
   if (inspection.status === "none") return "none";
   if (inspection.status === "halt") throw new ResetRecoveryHaltError(inspection);
+  if (inspection.status !== "recoverable") throw corruption("SQLite WAL crash has no legacy reset journal to recover");
   if ("stateFormat" in inspection.journal) {
     throw corruption("state format changed before legacy reset recovery");
   }

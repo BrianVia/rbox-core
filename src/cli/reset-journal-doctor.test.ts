@@ -137,3 +137,33 @@ test("doctor reports no standing reset through a real selected SQLite authority"
 
   expect(await capture(() => resetJournalDoctorCmd(root))).toBe("reset journal: none");
 });
+
+/**
+ * Design 276 F2.1. `rbox doctor reset-journal` is the command a user reaches
+ * during exactly this incident, so both of its W1 answers are pinned: the report
+ * must not call an ordinary WAL crash a halt, and the quarantine must refuse
+ * rather than fail obscurely on a journal that does not exist.
+ */
+test("doctor reports a W1 WAL crash as recoverable in place and refuses to quarantine it", async () => {
+  const authorityId = "d".repeat(32);
+  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId,
+    lineageId: "e".repeat(32),
+    stream: syncStreamId(cfg),
+    createdBy: "test",
+    stateNonce: "f".repeat(32),
+    stateRevision: 0,
+  }).close();
+  await fs.writeFile(statePath(root), authorityMarkerBytes(authorityId));
+  await fs.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
+
+  const report = await capture(() => resetJournalDoctorCmd(root));
+  expect(report).toBe("reset journal: none; the SQLite authority has an ordinary WAL crash the daemon recovers in place");
+  expect(report).not.toContain("sync halted");
+
+  await expect(resetJournalDoctorCmd(root, { quarantine: true }))
+    .rejects.toThrow(/ordinary WAL crash the daemon recovers in place/);
+  // The refusal is inert: the sidecar the daemon still has to replay is intact.
+  expect(await fs.lstat(`${sqliteResetPaths.active(root)}-wal`)).toBeDefined();
+});

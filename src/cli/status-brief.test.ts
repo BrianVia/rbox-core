@@ -228,13 +228,13 @@ test("workspace label fallbacks and active-upload freshness are decided before r
 
 test("reset-halt snapshot has typed absence of state-backed fields", () => {
   const reset: Extract<BriefStatusSnapshot, { kind: "reset-halt" }> = {
-    kind: "reset-halt", workspaceLabel: "Development", daemonRunning: false, account: account(),
+    kind: "reset-halt", halted: true, workspaceLabel: "Development", daemonRunning: false, account: account(),
   };
   // @ts-expect-error reset-halt cannot carry full-snapshot local evidence
   void reset.pendingChanges;
   // @ts-expect-error reset-halt cannot carry full-snapshot locking evidence
   void reset.locking;
-  expect(Object.keys(reset).sort()).toEqual(["account", "daemonRunning", "kind", "workspaceLabel"]);
+  expect(Object.keys(reset).sort()).toEqual(["account", "daemonRunning", "halted", "kind", "workspaceLabel"]);
 });
 
 test("headline blocker predicate is closed and attention ordering is total", () => {
@@ -253,9 +253,26 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     { trash: { files: 1, bytes: 1 } }, { update: { current: "1", next: "2" } },
   ];
   for (const nonBlocker of nonBlockers) expect(headlineBlocked(full(nonBlocker))).toBe(false);
-  expect(lines({ kind: "reset-halt", workspaceLabel: "Development", daemonRunning: false, account: account() })).toEqual([
+  const reset = (halted: boolean, daemonRunning: boolean) =>
+    ({ kind: "reset-halt", halted, daemonRunning, workspaceLabel: "Development", account: account() }) as const;
+  // Design 276 F2.1: only a real halt blocks the headline. A `w1` recovery
+  // clears itself on the next boundary pass and needs no operator.
+  expect(headlineBlocked(reset(true, false))).toBe(true);
+  expect(headlineBlocked(reset(false, true))).toBe(false);
+  expect(headlineBlocked(reset(false, false))).toBe(false);
+  expect(lines(reset(true, false))).toEqual([
     "Development · sync needs attention",
     "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
+    "Signed in as owner@example.com · pro",
+  ]);
+  expect(lines(reset(false, true))).toEqual([
+    "Development · recovering state",
+    "↻ replaying write-ahead state after an unclean shutdown",
+    "Signed in as owner@example.com · pro",
+  ]);
+  expect(lines(reset(false, false))).toEqual([
+    "Development · recovering state",
+    "↻ recovering on the next daemon start · rbox start",
     "Signed in as owner@example.com · pro",
   ]);
 
