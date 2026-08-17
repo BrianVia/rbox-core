@@ -202,7 +202,9 @@ export function briefIdentityLine(account: BriefAccountSummary): string {
 
 /** The intentionally closed design-153 headline blocker predicate. */
 export function headlineBlocked(snapshot: BriefStatusSnapshot): boolean {
-  if (snapshot.kind === "reset-halt") return true;
+  // Design 276 F2.1: a `w1` recovery blocks nothing — it clears itself on the
+  // next boundary pass and needs no operator.
+  if (snapshot.kind === "reset-halt") return snapshot.halted;
   return snapshot.halt !== undefined
     || snapshot.planQuota.kind !== "none"
     || snapshot.watcherTrust === "fused"
@@ -285,7 +287,11 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
         ]
         : [
           `${snapshot.workspaceLabel} · recovering state`,
-          "↻ replaying write-ahead state after an unclean shutdown",
+          // Nothing replays while no daemon runs, and the line below this one
+          // says "background sync: stopped". Name the actual next step.
+          snapshot.daemonRunning
+            ? "↻ replaying write-ahead state after an unclean shutdown"
+            : "↻ recovering on the next daemon start · rbox start",
           briefIdentityLine(snapshot.account),
         ],
     };

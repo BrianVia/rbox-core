@@ -130,7 +130,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
     const diagnostic = credentialStatusJson(credentials);
     lines.push(`  ${style.yellow(`credential-degraded: ${String(diagnostic.reason)} (${String(diagnostic.variable ?? diagnostic.path)})`)}`);
   }
-  const recovering = "sync recovering: an unclean shutdown left write-ahead state the daemon replays in place. Files on disk are untouched; no action needed.";
+  const recovering = `sync recovering: an unclean shutdown left write-ahead state${daemon.running ? " the daemon replays in place. Files on disk are untouched; no action needed." : " to replay. Files on disk are untouched; it recovers on the next daemon start — run \`rbox start\`."}`;
   lines.push(`  ${projection.halted ? style.yellow(`sync halted: a state-recovery record can't be processed (${projection.reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`) : style.cyan(recovering)}`);
   lines.push(`  ${style.dim("background sync:")} ${daemon.stale
     ? style.yellow(`running but bound to a previous workspace (pid ${daemon.pid})`)

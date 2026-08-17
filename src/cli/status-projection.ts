@@ -8,6 +8,7 @@ import {
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
+import { unhandledResetInspection } from "./reset-halt-inspection.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import { attributeDaemonForStatus, type StatusRemoteHead } from "./status-view.js";
 import { projectGitDeferralRepos } from "./status-view/git-projection.js";
@@ -203,6 +204,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     };
     return halt as WorkspaceStatusProjection<M>;
   }
+  if (resetInspection.status !== "none" && resetInspection.status !== "recoverable") throw unhandledResetInspection(resetInspection);
 
   const rawActivityP = workspaceObservation.readActivity();
 

@@ -151,7 +151,7 @@ import { telemetryEnabled } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { formatPushResiduals, formatPushSpan } from "../sync/format.js";
-import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
+import { inspectResetJournalSafety, unhandledResetInspection } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
 import {
@@ -968,9 +968,16 @@ export class RboxDaemon {
     // above samples early on purpose: it is self-correcting through
     // `enterResetHalt`, which sets readiness false itself.)
     if (this.resetLifecycle === "ready") await this.pump();
-    this.log(this.resetLifecycle === "ready"
-      ? this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)"
-      : "rbox daemon live but sync halted pending reset-journal recovery");
+    this.log(this.readyLine());
+  }
+
+  /** Three outcomes, not two: a first pump that lands in the W1 backoff is
+   * RECOVERING, and calling that "halted pending reset-journal recovery" sends
+   * the user to a doctor command for a condition that clears itself. */
+  private readyLine(): string {
+    if (this.resetLifecycle === "halted") return "rbox daemon live but sync halted pending reset-journal recovery";
+    if (this.resetLifecycle !== "ready") return "rbox daemon live; sync starts once state recovery finishes";
+    return this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)";
   }
 
   /**
@@ -1290,8 +1297,12 @@ export class RboxDaemon {
    */
   private async retryWalCrashRecovery(): Promise<boolean> {
     if (this.walCrashRetries >= RESET_WAL_CRASH_RETRY_ATTEMPTS) return false;
-    this.walCrashRetries++;
     const reinspected = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
+    // A re-inspection that now reads a terminal row is not a lost race. Fail
+    // closed immediately rather than spending attempts on a condition that
+    // needs an operator.
+    if (reinspected.status === "halt") return false;
+    this.walCrashRetries++;
     this.resetLifecycle = "recovering";
     this.nextResetRetryAt = this.now() + (reinspected.status === "none" ? 0 : RESET_WAL_CRASH_RETRY_MS);
     this.scheduleResetRetry();
@@ -1343,7 +1354,8 @@ export class RboxDaemon {
           if (await this.retryWalCrashRecovery()) return false;
           await this.enterResetHalt("SQLite writer takeover did not reach a steady store");
         }
-        else await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
+        else if (after.status === "recoverable") await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
+        else throw unhandledResetInspection(after);
         return false;
       }
       if (!await this.bootstrapAgreement(state)) return false;

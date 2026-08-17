@@ -227,6 +227,15 @@ anyway because :957 samples lifecycle before the pump at :958.
 | absent-case auto-init guard widening | folder-authority (heals upgrade AND bootResume) | folder catalog v2 makes 1.x configs unrepresentable |
 | typed classifier row through ResetSafetyInspection | reset-journal adapter | reset plane v2 |
 | liveStores consult in classifySqliteResetPredecode | state-plane classifier | classifier gains cross-process ownership input |
+
+The consult's one standing risk: a WRITER handle leaked by a save would keep
+answering "live store" and mask a real W1 the daemon should recover. That is
+already a pinned invariant rather than a new one — `whole-state-compat.test.ts`
+asserts `ownedStateStoreWriterForReset(active)` is undefined after every save
+path (":771 the save closes the writer it opened", plus the lineage/genesis
+cases), and the consult admits owned writers only, so a reader handle never
+suppresses the row (`classifier.test.ts` negative control).
+
 | short W1 re-inspection backoff (bounded, N attempts, then hourly) | daemon reset-retry policy (split from the log-gate constant) | classifier gains cross-process ownership input |
 | resetLifecycle in AmbientDaemonStatusV1 (replaces status's health-file read) | daemon heartbeat writer | reset plane v2 unified halt surface |
 

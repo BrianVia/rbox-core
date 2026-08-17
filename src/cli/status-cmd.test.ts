@@ -408,12 +408,24 @@ test("an ordinary WAL crash renders recovering and mutates nothing", async () =>
 
   const json = JSON.parse(await captureStatus({ json: true }));
   expect(json).toMatchObject({ halted: false, reason: "recovering" });
+  // No daemon runs in this fixture, so nothing is replaying anything: the copy
+  // has to name the step that actually starts the recovery.
   const brief = await captureStatus({});
-  expect(brief).toContain("replaying write-ahead state after an unclean shutdown");
+  expect(brief).toContain("recovering on the next daemon start · rbox start");
   expect(brief).not.toContain("sync halted");
   const text = await captureStatus({ verbose: true });
-  expect(text).toContain("sync recovering");
+  expect(text).toContain("it recovers on the next daemon start");
   expect(text).not.toContain("rbox doctor reset-journal");
+
+  // With a live daemon the same store IS being replayed, and the user has
+  // nothing to do.
+  const live = cleanScanDeps();
+  live.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ bootId: "boot_status" }));
+  const liveBrief = await captureStatusWithDeps({}, live);
+  expect(liveBrief).toContain("replaying write-ahead state after an unclean shutdown");
+  const liveText = await captureStatusWithDeps({ verbose: true }, live);
+  expect(liveText).toContain("the daemon replays in place");
+  expect(liveText).toContain("no action needed");
 
   expect(await rboxTreeDigest()).toEqual(before);
 });

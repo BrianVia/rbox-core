@@ -101,6 +101,17 @@ test("a live in-process writer proves SW is a live store, and an empty registry 
     writer.close();
   }
 
+  // Negative control: the consult admits an owned WRITER only. A reader handle
+  // proves nothing about who owns the write-ahead log, so the same sidecar with
+  // only a reader open still classifies as a crash.
+  const reader = openStateStore(active, { readonly: true });
+  try {
+    await fs.writeFile(`${active}-wal`, "");
+    expect((await classifySqliteResetPredecode(root)).kind).toBe("W1");
+  } finally {
+    reader.close();
+  }
+
   await fs.writeFile(`${active}-wal`, "");
   expect((await classifySqliteResetPredecode(root)).kind).toBe("W1");
 });

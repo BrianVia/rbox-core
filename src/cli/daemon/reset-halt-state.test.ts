@@ -115,8 +115,12 @@ test("a still-attached foreign reader is refused on a short backoff before any h
       expect(await d.resetOperationBoundary()).toBe(false);
       expect(d.resetLifecycle).toBe("recovering");
       expect(await readResetHaltHealth(root)).toBeUndefined();
-      expect(d.nextResetRetryAt).toBeLessThanOrEqual(NOW + RESET_WAL_CRASH_RETRY_MS);
+      // Exact, not a bound: NOW+0 would be a busy loop and NEGATIVE_INFINITY an
+      // ungated retry, and both satisfy "at most one interval away".
+      expect(d.nextResetRetryAt).toBe(NOW + RESET_WAL_CRASH_RETRY_MS);
+      expect(d.resetRetryTimer).toBeDefined();
     }
+    const shortTimer = d.resetRetryTimer;
     expect(await d.resetOperationBoundary()).toBe(false);
     expect(d.resetLifecycle).toBe("halted");
     // Either observable shape of "a foreign reader is still attached": the
@@ -124,6 +128,11 @@ test("a still-attached foreign reader is refused on a short backoff before any h
     // the reader's sidecars.
     expect((await readResetHaltHealth(root))?.reason).toMatch(/busy|at-rest S0/);
     expect(d.nextResetRetryAt).toBe(NOW + RESET_RECOVERY_RETRY_MS);
+    // The escalation owns the hour it just claimed: enterResetHalt cleared the
+    // pending five-second timer and re-armed, so the short one cannot survive
+    // and fire inside that hour.
+    expect(d.resetRetryTimer).toBeDefined();
+    expect(d.resetRetryTimer).not.toBe(shortTimer);
   } finally {
     foreign.exec("ROLLBACK");
     foreign.close();
@@ -284,19 +293,29 @@ test("the ready line reports the lifecycle the first pump left behind", async ()
   process.env.RBOX_DAEMON_WS_DISABLED = "1";
   process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = "1";
   process.env.RBOX_HOME = path.join(root, "ready-line-runtime");
-  const logs: string[] = [];
-  const d = new RboxDaemon(root, cfg, {} as never, {
-    pullOnly: true,
-    log: (line) => void logs.push(line),
-    acquireSyncMutex: async () => ({ status: "contended", holderKey: "test-holder", blockerKind: "live" }),
-  }) as HaltInternals;
-  d.pump = async () => { d.resetLifecycle = "halted"; };
+  const startWith = async (pumpLands: HaltInternals["resetLifecycle"]): Promise<string[]> => {
+    const logs: string[] = [];
+    const d = new RboxDaemon(root, cfg, {} as never, {
+      pullOnly: true,
+      log: (line) => void logs.push(line),
+      acquireSyncMutex: async () => ({ status: "contended", holderKey: "test-holder", blockerKind: "live" }),
+    }) as HaltInternals;
+    d.pump = async () => { d.resetLifecycle = pumpLands; };
+    try { await d.start(); } finally { await d.stop(); }
+    return logs;
+  };
   try {
-    await d.start();
-    expect(logs).toContain("rbox daemon live but sync halted pending reset-journal recovery");
-    expect(logs.some((line) => line.startsWith("rbox daemon ready"))).toBe(false);
+    const halted = await startWith("halted");
+    expect(halted).toContain("rbox daemon live but sync halted pending reset-journal recovery");
+    expect(halted.some((line) => line.startsWith("rbox daemon ready"))).toBe(false);
+    // A first pump that lands in the W1 backoff is RECOVERING. Calling that
+    // "halted pending reset-journal recovery" sends the user to a doctor
+    // command for a condition that clears itself in seconds.
+    const recovering = await startWith("recovering");
+    expect(recovering).toContain("rbox daemon live; sync starts once state recovery finishes");
+    expect(recovering.some((line) => line.includes("halted"))).toBe(false);
+    expect(recovering.some((line) => line.startsWith("rbox daemon ready"))).toBe(false);
   } finally {
-    await d.stop();
     if (previousWs === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED; else process.env.RBOX_DAEMON_WS_DISABLED = previousWs;
     if (previousReliability === undefined) delete process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED; else process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = previousReliability;
     if (previousHome === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = previousHome;
