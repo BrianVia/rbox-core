@@ -26,6 +26,16 @@ All notable changes to rbox are recorded here. The format follows
   delete files it had just removed.
 - An ignore rule that happens to match conflict-copy names (e.g. `*.conflict*`)
   no longer pauses every folder it applies to.
+- Upgrading from a 1.x install no longer leaves background sync switched off. A
+  1.x machine has folders but no folder configuration file, which the new
+  binary refused to start without; rbox now writes that file from the folders
+  it can already see. Autostart at login was stuck the same way and is fixed by
+  the same change.
+- If rbox genuinely cannot work out your folder configuration during an upgrade,
+  it now leaves the running sync alone instead of stopping it, and prints the
+  command that actually fixes it (`rbox config regenerate`) rather than
+  `rbox stop && rbox start`, which failed the same way. Each workspace is
+  decided on its own, so one unhappy folder no longer holds up the rest.
 
 ## [2.0.0-beta.4] - 2026-08-16
 

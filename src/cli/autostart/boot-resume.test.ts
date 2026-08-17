@@ -12,7 +12,7 @@ import {
 } from "../autostart-cmd.js";
 import { ensureFolderAuthority } from "../folder-authority.js";
 import { forgetFolder, recordFolder } from "../folder-config.js";
-import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
+import { daemonPidPath, daemonStatusPath, folderCatalogPath } from "../rbox-paths.js";
 import {
   absent,
   afterEachAutostartTest,
@@ -75,6 +75,27 @@ test("__boot-resume pins authority once and logs one skip for each non-admitted 
   expect(logs.some((line) => line.includes(missing) && line.includes("(missing:"))).toBe(true);
   expect(logs.some((line) => line.includes(detached) && line.includes("(detached:") && line.includes("config add"))).toBe(true);
   expect(logs.some((line) => line.includes(unbound) && line.includes("(unbound:"))).toBe(true);
+});
+
+/** The second entry point #688 bricked: login-item/systemd autostart calls
+ *  ensureFolderAuthority before the loop, so a 1.x-shaped home (bindings, no
+ *  catalog) used to skip every workspace silently (design 276 F1.4). */
+test("__boot-resume heals a 1.x-shaped home with no folder catalog and starts its running roots", async () => {
+  const running = await workspace("ws_boot_precatalog");
+  await recordDesired(running, "running", "acct_boot");
+  await fs.rm(folderCatalogPath());
+
+  const started: string[] = [];
+  const logs: string[] = [];
+  await bootResume({
+    loadCredentials: creds("acct_boot"),
+    startDaemon: async (root) => { started.push(root); return "started"; },
+    log: (line) => logs.push(line),
+  });
+
+  expect(started).toEqual([running]);
+  expect(logs).toEqual([]);
+  expect((await ensureFolderAuthority()).snapshot.folders.map((folder) => folder.normalizedPath)).toEqual([running]);
 });
 
 test("a detached desired row keeps its prior mode and resumes after re-add", async () => {
