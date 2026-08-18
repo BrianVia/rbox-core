@@ -149,8 +149,12 @@ onto the stored blocker. Additive shape change, v2-beta window.
 - Design 273 P2 retention: the skip re-stands the existing deferral
   (`restandApply` only), never clears, never re-stamps `lastSeen`.
 - Copy fix in the same PR (r3-retargeted): the "over a day" line STAYS
-  (it keys off deferredSince age — still true — and its doctor
-  escalation is the safety valve for a stale verdict). The genuinely
+  (it keys off deferredSince age — still true). Final-review correction:
+  that line is NOT an escalation valve — doctor forces severity "info"
+  for any needsYou:false story (doctor-triage.ts:113), so a
+  connectivity repo broken for weeks never escalates past info. Real
+  escalation is #781's job; the copy stays because it is honest, not
+  because it escalates. The genuinely
   wrong copy is the `artifact` story (git-stories.ts:151-155,
   SYNC_DOWNLOAD_FAILED: "rbox couldn't finish downloading…") — false
   for this class, where the download SUCCEEDS and the local object
