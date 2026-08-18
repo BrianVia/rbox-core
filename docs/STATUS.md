@@ -1,5 +1,43 @@
 # rbox status — living state snapshot
 
+## 2026-08-18 (day) — 277 soaked + design 278 SHIPPED same-day (FM pulls 44→20.5s)
+
+- **277 soaked numbers (overnight, n=733/547/158/116)**: desktop push
+  median **1.5s** (was 7.4), Mac **2.7s** (was 6.6), desktop pull 2.0s,
+  FM pull 44.3s. #661 CLOSED at target-met. Fleet re-rolled onto the
+  post-deletion build; desktop watcher re-armed clean on restart
+  (first arm raced a codex worktree teardown — papercut logged).
+- **Design 278 (connectivity-defer skip, #782 MERGED, field-proven
+  same-day)**: the #775 recon convicted a fetch-before-defer livelock —
+  5 FM repos (AutoGPT, bird, savvy-demo, savvy-core-v1,
+  claude-containers) re-fetched+decrypted bundles (12.5–17.3s + 1–5s×4)
+  every pull, failed the same connectivity proof, deferred, forever.
+  Fix extends design 270's held-skip: typed `connectivity-unproven`
+  code at the one proof site (regex deleted), gated attempt store at
+  the checkout-defer exit, one allowlist disjunct
+  (provenance+code), kill switch RBOX_GIT_CONNECTIVITY_SKIP=0. NO new
+  durable state — r1's objectDbDigest dropped after coverage review
+  proved a stale skip is ≤1h slow, never unsafe (full input-coverage
+  table + no-consumer proof in the design doc). 4 review rounds, all
+  opus (codex quota out — flagged in PR; optional codex confirm pass
+  owed). **Field acceptance exact**: skippedHeld 43→48, deferred 9→4,
+  git-apply 28.3→4.0s, fetchDecrypt max 98ms, zero proof-failure lines
+  post-roll, FM pull **44.3 → 20.5–21.0s**. Fleet on d29e5e7.
+- **FM's remaining poles, ranked**: cas acquire 11.3s/pull (#749
+  residual — now the biggest), unreadable-journal repos pegasus +
+  savvy-core (#775 stays open), #781 (structural escalation for
+  >32h-broken repos; artifact stories are needsYou:false so doctor
+  never escalates past info today — known, deliberate).
+- Flake sighting recorded: daemon-trusted-pull.test.ts:620 ("deep-scan
+  audit opened after the pre-pull drain") failed CI shard 5 on #782,
+  attempt-1 evidence preserved in the run log (run 32144245570), 9
+  consecutive local passes, diff-unrelated; rerun-proven green.
+- e2e picture vs the ≤10s target: sender 1.5–2.7s everywhere;
+  desktop→Mac in range; desktop→FM needs the #749 lock slice next.
+- Queue: #749 residual (recommended next), unreadable-journal class,
+  274 PR-B (stamp baking since last night), design 262 §2, codex
+  confirm pass on #782.
+
 ## 2026-08-18 (overnight) — perf cycle 277 SHIPPED + architecture loop COMPLETE (12/12, map deleted)
 
 - **Design 277 shipped both slices** (ALIGNED r4 after 2 parallel reviews +
