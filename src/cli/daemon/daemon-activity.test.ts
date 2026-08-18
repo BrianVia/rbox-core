@@ -90,7 +90,6 @@ interface DaemonInternals {
   cache: HashCache;
   local: { head: Manifest };
   pendingEvents: WatchEvent[];
-  pendingEventsOverflow: boolean;
   activity: DaemonActivity;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -931,12 +930,11 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const clock = new FakeScanCadenceClock();
     const remote = new MiniRemote();
     const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
-    // Design 277 B1: a pull-only boot now starts the live watcher, and the BOOT scan is
-    // pruned under a trusted watcher — so no absence proof exists by the time this test
-    // samples one. Deep scans stay unpruned and remain a proof source either way
-    // (`doDeepScan`, mode "unpruned"); the healthy-watcher path has its own test below.
-    // This one pins the DEGRADED world, so the watcher factory rejects exactly as
-    // production does when it cannot arm.
+    // Design 277 B1: a pull-only boot now starts the live watcher. The boot scan still
+    // mints an absence proof — it runs BEFORE the watcher exists, so it is unpruned —
+    // and this fixture keeps pinning the DEGRADED world, where the watcher factory
+    // rejects exactly as production does when it cannot arm. The healthy-watcher path
+    // has its own test below.
     daemon.startWatcherFn = () => Promise.reject(new Error("forced watcher-init failure (pr8 fixture)"));
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
@@ -2323,9 +2321,11 @@ test("design 277 B1: a pull-only host WITH a live watcher still clears a ghost d
     await daemon.start();
     expect(daemon.watcher).toBeDefined();
 
-    // Deep scans are unpruned and mint the absence proof; the FIRST one under a live
-    // watcher establishes it, the SECOND clears the ghost. Ghost-clear latency on a
-    // pull-only host therefore roughly doubles (30m → 60m) — a named trade.
+    // Clearing a gone repo needs TWO qualifying observations under DIFFERENT discovery
+    // epochs at least 30s apart (sync-git/deferral-hygiene.ts): the first deep tick
+    // records the gone observation, the second clears it. Nothing here is about
+    // pruning — deep scans are always unpruned. Ghost-clear latency on a pull-only
+    // host therefore spans two deep ticks (30m → 60m) — a named trade.
     now += 30_000;
     await clock.fireDeep();
     await Promise.resolve();
