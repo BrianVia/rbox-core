@@ -29,10 +29,11 @@ inside `scripts/rig/` because the deliverable is explicitly limited to that tree
   not reset guests or call `scenario.run`.
 - `up` permits per-device selection because it does not execute a scenario.
 - Scenario capability is explicit and closed by default:
-  `supportsDualBinary?: true`. No existing scenario is opted in. Git-entanglement
+  `supportsDualBinary?: true`. Dual-binary-state is the sole opted-in scenario;
+  it proves released JSON preservation, released-reader fail-closed behavior over
+  candidate genesis Q, and released-JSON/candidate-Q convergence. Git-entanglement
   parses legacy `.rbox/state.json`, which is not present after 2.0 migration.
-  Two-device-live never explicitly migrates its 2.0 side, so it would only prove
-  mixed executables in legacy-state mode, not design 163's mixed-authority case.
+  Other scenarios remain closed because they do not prove this authority boundary.
 
 ## Structure
 

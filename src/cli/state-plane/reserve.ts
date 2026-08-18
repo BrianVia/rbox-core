@@ -1,21 +1,12 @@
-/**
- * The generic 1 MiB reserve (design 163, unit B0, contents item 3).
- *
- * A future migration needs guaranteed disk runway at the moment it is least able
- * to acquire any, so the barrier release allocates it long before any migration
- * exists. The file is fixed-path and generic — whichever migration eventually
- * runs claims it — which is exactly why it carries provenance: a fixed-path
- * allocation artifact must never adopt, truncate, claim, or delete a file it did
- * not create, and that has to be a property of the bytes rather than a promise.
- */
+/** Provenance-bound 1 MiB reserve maintained by live legacy JSON publication. */
 import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fsyncDirectory, moveNoClobber, RBOX_TMP_PREFIX } from "../../../engine/fsutil.js";
-import { parseSemver } from "../../semver.js";
-import { RBOX_VERSION } from "../../version.js";
-import { RBOX_DIR } from "../../workspace-config.js";
+import { fsyncDirectory, moveNoClobber, RBOX_TMP_PREFIX } from "../../engine/fsutil.js";
+import { parseSemver } from "../semver.js";
+import { RBOX_VERSION } from "../version.js";
+import { RBOX_DIR } from "../workspace-config.js";
 
 export const RESERVE_MAGIC = "RBOX-STATE-RESERVE-v1";
 export const RESERVE_HEADER_BYTES = 128;
@@ -48,8 +39,7 @@ export type ReserveOutcome =
    * never adopted, claimed, truncated, or deleted — only reported. */
   | { status: "reserve-foreign"; detail: ReserveForeignDetail }
   /** The reserve could not be established for an ordinary environmental reason.
-   * Never fatal to the CLI: a workspace without a reserve is one a migration
-   * must create it in. */
+   * Never fatal to the CLI: a later publication can try again. */
   | { status: "unavailable"; detail: string };
 
 export type ReserveForeignDetail =

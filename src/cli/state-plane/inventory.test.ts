@@ -80,23 +80,9 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // Design 277: the O(1) lineage identity read routes through the same
   // selection and ownership-proving open as the whole-state loads.
   { file: "src/cli/state-plane/adapters/lineage-reads.ts", symbol: "loadRawStateIdentity", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
-  // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
-  // legacy document, so the repositories it covers are the same set in either
-  // format. It used to classify and refuse instead, which made every lock bundle
-  // unobtainable on a workspace rbox had just migrated.
-  //
-  // It classifies FIRST and only then reads, because the `M5 + Q` row requires the
-  // database to be at rest and an open here would deposit the sidecars that row
-  // reads as corruption. The classify is the extra access site.
-  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
   // Lock-unsupported handling must distinguish a fresh root from established
   // JSON before choosing ephemeral refusal versus the preserved degraded row.
   { file: "src/cli/sync-mutex.ts", symbol: "acquireWorkspaceSyncMutexInternal", kind: "read", sites: 2, guards: ["classifyStateFormat"] },
-  { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
-  // The migration classifier's sole reader of the document. It must handle the
-  // marker rather than refuse it, so its guard is the classifier that decides
-  // the format, not the barrier that throws on it.
-  { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
   // FLAKE-009: the reset fence fingerprints the document on every ordinary load,
   // unlocked, so a writer's atomic republish can land inside it. The guard is the
   // retry that re-runs the whole identity tuple rather than reporting corruption.
@@ -147,13 +133,6 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/genesis.ts", symbol: "resume", kind: "read", sites: 2, guards: ["classifyStateFormat", "holdsMarkerFor"] },
   { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["assertHealthyOwnedSyncMutex", "isOwner", "classifyStateFormat", "fsp.rename"] },
 
-  // Design 163's authority flip (M-6): the one rename in the product that
-  // replaces a live legacy document with `Q`. Its barrier is deliberately not
-  // `assertStatePublishable` — that guards a binary about to write legacy JSON,
-  // and this is the writer publishing the marker that barrier exists to protect.
-  // Its obligations instead are the sibling fence, the exact-sibling image, and
-  // the re-read of the live body digest as the LAST thing before the rename.
-  { file: "src/cli/state-plane/migration/authority-flip.ts", symbol: "flipAuthority", kind: "write", sites: 0, guards: ["requireSibling", "observeQSibling", "revalidateBackups", "revalidateActive", "cleanupCursor", "renameSync"] },
 ];
 
 /** Access sites that neither read nor replace the document's contents. Each
@@ -165,8 +144,7 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 1, reason: "names the active path for classified physical comparison; the exact live document is read by its selected guarded caller under the same lock" }],
   ["src/cli/reset-journal-inspection.ts::assertResetProtocolFence", { sites: 2, reason: "names the state path only as the protocol lock identity and never reads or writes the document" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
-  ["src/cli/state-plane/locks.ts::runLockAttempt", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the injected guarded inventory reader owns any document read" }],
-  ["src/cli/state-plane/migration/authority-flip.ts::completeFlip", { sites: 2, reason: "names `.rbox` only as the parent to fsync after the flip's rename; the document itself is replaced by flipAuthority, which is inventoried above" }],
+  ["src/cli/state-plane/locks.ts::runLockAttempt", { sites: 2, reason: "uses statePath only as the repository fence's identity; genesis does not read the authority document" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
 ]);

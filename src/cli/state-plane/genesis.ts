@@ -16,7 +16,7 @@ import { AUTHORITY_MARKER_BYTES, authorityMarkerBytes, classifyStateFormat } fro
 import { StateAuthorityCorruptError } from "./errors.js";
 import { readGenesisIntent, type FencedEvidence, type GenesisIntent } from "./genesis-intent.js";
 import type { HeldStatePlaneLocks } from "./locks.js";
-import { genesisPaths, migrationPaths, stateIncarnationPath, statePath, sqliteResetPaths } from "./paths.js";
+import { genesisPaths, stateIncarnationPath, statePath, sqliteResetPaths } from "./paths.js";
 import { installGenesisLineage } from "./schema/application.js";
 import { SQLITE_SIDECARS as SIDECARS } from "./store/artifact-proof.js";
 import {
@@ -51,8 +51,8 @@ export interface GenesisFaults { afterQPrepared?: () => Promise<void> }
 const CREATED_BY = "genesis-v1";
 const REBUILD = Symbol("genesis-rebuild");
 
-/** Does this workspace belong to genesis? Read-only; the caller owns the
- * migration control's absence. */
+/** Does this workspace belong to genesis? Read-only; active database presence
+ * excludes a new claim when no resumable intent exists. */
 export async function inspect(root: string, locks: HeldStatePlaneLocks): Promise<GenesisInspection> {
   const intent = readGenesisIntent(root);
   if (intent) return { claims: true, intent };
@@ -89,11 +89,8 @@ async function eligibility(root: string): Promise<{ refusal: GenesisRefusal } | 
   const legacy = await classifyStateFormat(statePath(root));
   if (legacy === "json") return { refusal: "legacy-present" };
   if (legacy !== "absent") return { refusal: "artifact-present" };
-  // One expression, no body: genesis names the control only to stat it, and
-  // `control.test.ts` pins this exact statement. Wave 2B's coordinator (§1.3)
-  // already decides genesis-vs-migration on the control, so when it lands this
-  // observation moves there and the sole-writer gate goes back to unconditional.
-  if ([sqliteResetPaths.active(root), migrationPaths.control(root)].some(inodeOf)) {
+  // A database without a resumable intent is owned state, never genesis runway.
+  if (inodeOf(sqliteResetPaths.active(root))) {
     return { refusal: "artifact-present" };
   }
   const evidence = await liveEvidence(root);

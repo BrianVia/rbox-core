@@ -332,10 +332,7 @@ function environmentFindings(input: TriageInputs): TriageFinding[] {
   }
   const locking = lockingFinding(root, checks.locking);
   if (locking) out.push(locking);
-  // The migration check carries its own finding (see `DoctorCheck.finding`):
-  // U3's halt copy has one home, and triage reports it rather than re-deriving a
-  // second wording from a status string.
-  if (checks.migration?.ok === false && checks.migration.finding) out.push(checks.migration.finding);
+  if (checks.genesis?.ok === false && checks.genesis.finding) out.push(checks.genesis.finding);
   if (checks.reserve && !checks.reserve.ok && checks.reserve.inconclusive !== true) {
     out.push({
       id: "state-reserve-foreign",

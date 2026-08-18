@@ -87,7 +87,7 @@ export const dualBinaryState: Scenario = {
       });
       const remoteId = workspaceId(await ctx.a.readFile(`${LEGACY_ROOT}/.rbox/workspace.json`));
 
-      await rec.step("candidate reads exact released JSON bytes before explicit migration", async () => {
+      await rec.step("candidate reads exact released JSON bytes under legacy authority", async () => {
         const oldBytes = await ctx.a.readFile(`${LEGACY_ROOT}/.rbox/state.json`);
         await copyTree(ctx.a, GUEST.rboxHome, ctx.b, TAKEOVER_RBOX_HOME);
         await copyTree(ctx.a, LEGACY_ROOT, ctx.b, LEGACY_ROOT);
@@ -106,25 +106,6 @@ export const dualBinaryState: Scenario = {
         rec.assert("candidate ordinary sync retains JSON authority", authority.format === "json", JSON.stringify(authority));
       });
 
-      await rec.step("candidate explicitly migrates the stopped released root", async () => {
-        await ctx.b.rbox(["migrate", LEGACY_ROOT], { cwd: LEGACY_ROOT, env: TAKEOVER_ENV });
-        const authority = await readDeviceStateAuthority(ctx.b, LEGACY_ROOT, TAKEOVER_ENV);
-        rec.assert("takeover publishes migration Q", authority.format === "authority-marker" && authority.originKind === "migration", JSON.stringify(authority));
-      });
-
-      await rec.step("isolated 1.11.4 Q probes refuse without mutation", async () => {
-        for (const command of RELEASED_NEGATIVE_PROBES) {
-          const snapshot = `/work/old-negative-${command}`;
-          await copyTree(ctx.b, LEGACY_ROOT, ctx.a, snapshot);
-          const before = await rboxTreeDigest(ctx.a, snapshot);
-          const result = await ctx.a.rbox([command], { cwd: snapshot, allowFail: true });
-          const after = await rboxTreeDigest(ctx.a, snapshot);
-          const output = `${result.stdout}\n${result.stderr}`;
-          rec.assert(`1.11.4 ${command} refuses Q`, result.exitCode !== 0 && /newer version|format.{0,12}new|too new/i.test(output), `exit=${result.exitCode} ${output.trim().slice(-300)}`);
-          rec.assert(`1.11.4 ${command} leaves Q snapshot byte-identical`, before === after, `before=${before.length} after=${after.length}`);
-        }
-      });
-
       const mixedRemoteId = await rec.step("[A/1.11.4] create separate JSON interoperability root", async () => {
         await ctx.a.mkdirp(MIXED_JSON_ROOT);
         await ctx.a.writeFile(`${MIXED_JSON_ROOT}/from-old.txt`, "released JSON peer\n");
@@ -136,13 +117,29 @@ export const dualBinaryState: Scenario = {
       });
 
       await connectRigDeviceB(ctx, rec);
-      await rec.step("released JSON and candidate Q roots converge through one remote", async () => {
+      await rec.step("candidate creates a genesis Q peer for the released JSON root", async () => {
         await ctx.b.mkdirp(Q_ROOT);
         await ctx.b.rbox([
           "track", Q_ROOT, "--workspace", mixedRemoteId, "--remote", ctx.apiUrl, "--git", "false",
         ], { cwd: Q_ROOT });
         const q = await readDeviceStateAuthority(ctx.b, Q_ROOT);
         rec.assert("candidate peer is genesis Q", q.format === "authority-marker" && q.originKind === "genesis", JSON.stringify(q));
+      });
+
+      await rec.step("isolated 1.11.4 genesis Q probes refuse without mutation", async () => {
+        for (const command of RELEASED_NEGATIVE_PROBES) {
+          const snapshot = `/work/old-negative-${command}`;
+          await copyTree(ctx.b, Q_ROOT, ctx.a, snapshot);
+          const before = await rboxTreeDigest(ctx.a, snapshot);
+          const result = await ctx.a.rbox([command], { cwd: snapshot, allowFail: true });
+          const after = await rboxTreeDigest(ctx.a, snapshot);
+          const output = `${result.stdout}\n${result.stderr}`;
+          rec.assert(`1.11.4 ${command} refuses Q`, result.exitCode !== 0 && /newer version|format.{0,12}new|too new/i.test(output), `exit=${result.exitCode} ${output.trim().slice(-300)}`);
+          rec.assert(`1.11.4 ${command} leaves Q snapshot byte-identical`, before === after, `before=${before.length} after=${after.length}`);
+        }
+      });
+
+      await rec.step("released JSON and candidate Q roots converge through one remote", async () => {
         await ctx.b.rbox(["sync"], { cwd: Q_ROOT });
         const [oldTree, candidateTree] = await Promise.all([
           fingerprintTree(ctx.a, MIXED_JSON_ROOT),

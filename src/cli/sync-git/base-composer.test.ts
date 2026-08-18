@@ -7,7 +7,7 @@ import {
   type RepoBaseLockedProof,
   type SafeRefWitness,
 } from "./base-composer.js";
-import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
+import { migrationRepoBaseProof } from "../state-plane/base-proof.js";
 
 const L = "1".repeat(40);
 const N = "2".repeat(40);
@@ -61,16 +61,18 @@ const pull = (branchWitnesses: Record<string, BranchTransitionWitness> = {}, saf
   kind: "pull-ref-transaction", lineageHash: LIN, repositoryIdentityHash: REPO, incomingKey: "incoming",
   branchWitnesses, safeRefWitnesses,
 });
-const lockedBranch = (witness: BranchTransitionWitness) => ({
-  liveOid: witness.kind === "present" ? witness.nextOid : null,
-  witness,
-  ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
-  artifactsClear: true,
-  ownershipStable: true,
-  reflogStable: true,
-  currentRef: false,
-  siblingOwned: false,
-});
+const lockedBranch = (witness: BranchTransitionWitness) => {
+  const locked = {
+    liveOid: witness.kind === "present" ? witness.nextOid : null,
+    witness,
+    artifactsClear: true,
+    ownershipStable: true,
+    reflogStable: true,
+    currentRef: false,
+    siblingOwned: false,
+  };
+  return witness.kind === "present" ? { ...locked, reflogEpisode: witness.episode } : locked;
+};
 
 describe("design 130 mandatory BASE composer", () => {
   test("closed authority union has exactly all eight members", () => {
@@ -122,8 +124,11 @@ describe("design 130 mandatory BASE composer", () => {
       undefined,
       { v: 1 as const, oid: N, lineageHash: LIN, kind: "manual" as const, episode: "8".repeat(32) },
     ]) {
+      const previous = origin === undefined
+        ? { base: section({ [ref]: L }) }
+        : { base: section({ [ref]: L }), branchBaseOrigins: { [ref]: origin } };
       const result = composeRepoBase(
-        { base: section({ [ref]: L }), ...(origin ? { branchBaseOrigins: { [ref]: origin } } : {}) },
+        previous,
         { base: section({ [ref]: L }, "same") },
         { kind: "pull-carry", lineageHash: LIN },
         locked(),
@@ -170,17 +175,16 @@ describe("design 130 mandatory BASE composer", () => {
     const TD = "8".repeat(40);
     const previous = section({ [topic]: L, [v1]: T0, [oldTag]: TD, [stash]: S0 }, "mixed-old");
     const incoming = section({ [topic]: N, [v1]: T1, [v2]: T2, [stash]: S1 }, "mixed-next");
-    const safeRefWitnesses: Record<string, SafeRefWitness> = {
+    const safeRefWitnesses = {
       [v1]: { kind: "safe-ref", proof: "locked-terminal-observation", afterOid: T1 },
       [v2]: { kind: "safe-ref", proof: "locked-terminal-observation", afterOid: T2 },
       [oldTag]: { kind: "safe-ref", proof: "locked-terminal-observation", afterOid: null },
       [stash]: { kind: "safe-ref", proof: "locked-terminal-observation", afterOid: S1 },
-    };
-    const safeRefs = Object.fromEntries(Object.entries(safeRefWitnesses).map(([ref, witness]) => [ref, {
-      liveOid: witness.afterOid,
-      witness,
-      ...(ref === stash ? { stashReflogReady: true } : {}),
-    }]));
+    } satisfies Record<string, SafeRefWitness>;
+    const safeRefs = Object.fromEntries(Object.entries(safeRefWitnesses).map(([ref, witness]) => {
+      const locked = { liveOid: witness.afterOid, witness };
+      return [ref, ref === stash ? { ...locked, stashReflogReady: true } : locked];
+    }));
 
     // Safe refs have committed and the process crashed before partial/state
     // persistence. Locked-terminal recovery proves them, but the already-live
@@ -243,8 +247,11 @@ describe("design 130 mandatory BASE composer", () => {
         const witness: SafeRefWitness = { kind: "safe-ref", proof: "expected-old-transaction", beforeOid: physicalBefore, afterOid: after };
         const beforeRefs = logicalBefore ? { [ref]: logicalBefore } : {};
         const afterRefs = after ? { [ref]: after } : {};
+        const lockedSafeRef = ref === "refs/stash" && after
+          ? { liveOid: after, witness, stashReflogReady: true }
+          : { liveOid: after, witness };
         const result = composeRepoBase({ base: section(beforeRefs) }, { base: section(afterRefs, "next") }, pull({}, { [ref]: witness }), locked({
-          safeRefs: { [ref]: { liveOid: after, witness, ...(ref === "refs/stash" && after ? { stashReflogReady: true } : {}) } },
+          safeRefs: { [ref]: lockedSafeRef },
         }));
         expect(result.disposition, `${ref}:${logicalBefore}->${after}`).toBe("terminal");
         expect(result.base?.refs[ref] ?? null).toBe(after);

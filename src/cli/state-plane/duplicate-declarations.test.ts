@@ -15,8 +15,7 @@
  * from the owner, or a deliberate coincidence that belongs in ALLOWED with a
  * reason a reviewer can check.
  *
- * Scope is `src/` — the same scope as the sole-writer gate in
- * `migration/control.test.ts`. `src/` is what links into the one CLI binary, so
+ * Scope is `src/`, which links into the one CLI binary, so
  * a name declared twice here is two live declarations in one program. `apps/`
  * builds separately deployed surfaces with their own tsconfigs (a name shared
  * between the worker and the CLI is not a collision), and `scripts/` is one-shot
@@ -53,7 +52,6 @@ interface Declaration {
  * the very defect this gate exists to catch, and a bare name would wave it
  * through. */
 const ALLOWED: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
-  ["AdmissionProof", { sites: 2, reason: "unrelated domains: an e2ee roster admission signature bundle vs. design 163's migration byte budget" }],
   ["DeferralDiscoveryAuthority", { sites: 2, reason: "REAL DUPLICATE, pending removal — the same two fields in daemon/git-discovery-continuity.ts and sync-git/deferral-hygiene.ts, differing only in `readonly`. Pick an owner, import it, delete this entry" }],
   ["HeadPin", { sites: 2, reason: "REAL DUPLICATE, pending removal — byte-identical interface in e2ee-keystore.ts and e2ee-remote-types.ts. Pick an owner, import it, delete this entry" }],
   ["GIT_DEFERRAL_REASONS", { sites: 2, reason: "telemetry/contract.ts deliberately restates the wire list; its `satisfies` plus exhaustiveness assert make any drift from sync-state-model.ts a type error" }],
@@ -140,18 +138,16 @@ function offenders(): string[] {
 /**
  * Durable filenames under `.rbox`. A module cannot write a record it cannot
  * name, so re-typing one of these names is how a second writer of a
- * single-writer record gets created — the same defect the sole-writer gate in
- * `migration/control.test.ts` pins for the migration control, generalized to
- * every durable record `paths.ts` owns.
+ * single-writer record gets created.
  *
  * `state.db` is deliberately absent: it is a stem rather than a filename
- * (`state.db.migrate.<id>`, `state.db.genesis.<id>`), so the sites that name it
+ * (`state.db.genesis.<id>`), so the sites that name it
  * are not the single-writer shape this gate is about.
  */
 const OWNER = "src/cli/state-plane/paths.ts";
 const DURABLE_FILENAMES: readonly string[] = [
-  "state.json", "state-incarnation.json", "reset-v1.json", "migration-v1.json",
-  "genesis-v1.json", "reserve-1mib.bin", "pre-163-latest.json.bak",
+  "state.json", "state-incarnation.json", "reset-v1.json",
+  "genesis-v1.json",
 ];
 
 /** Files that may still spell a durable name themselves. Each needs a reason. */
@@ -161,7 +157,6 @@ const LITERAL_ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/reset-journal-doctor.ts", "diagnoses the pre-163 layout directly, by design"],
   ["src/cli/reset-quarantine.ts", "chooses between the legacy and SQLite layouts before either path policy applies"],
   ["src/cli/state-plane/errors.ts", "StreamMismatchError renders the stable legacy paths in user-facing copy; it never reads or writes them (already exempt in inventory.test.ts)"],
-  ["src/cli/state-plane/migration/reserve.ts", "pre-dates paths.migrationPaths.reserve; collapsing it is a separate change"],
   ["src/cli/state-plane/reset/crash-rig-child.ts", "a spawned crash-rig fixture that must name the on-disk layout literally to be a faithful witness"],
 ]);
 

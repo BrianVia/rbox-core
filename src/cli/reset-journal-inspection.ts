@@ -161,13 +161,13 @@ async function artifactIdentity(root: string, file: string): Promise<readonly un
       // The cap must be the artifact's legal size bound, not a hash budget: a
       // real workspace's state.json is tens of MiB, and boundedStream REFUSES
       // oversized files rather than prefix-hashing them. 512 KiB here made
-      // every fence observation — and therefore `rbox migrate` — refuse any
-      // legitimately large legacy state (field: 73 MiB desktop state.json).
-      const controlHash = hashed ? await boundedHash(file, RESET_MATERIALIZED_BYTE_LIMIT) : undefined;
+      // every fence observation refuse any legitimately large legacy state
+      // (field: 73 MiB desktop state.json).
+      const artifactHash = hashed ? await boundedHash(file, RESET_MATERIALIZED_BYTE_LIMIT) : undefined;
       if (hashed) await assertUnmovedSince(file, s);
       return [
         s.isFile(), s.isSymbolicLink(), s.size.toString(), s.mtimeNs.toString(),
-        s.dev.toString(), s.ino.toString(), controlHash,
+        s.dev.toString(), s.ino.toString(), artifactHash,
       ];
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return ["absent"];

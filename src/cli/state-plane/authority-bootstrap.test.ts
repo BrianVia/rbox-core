@@ -19,14 +19,9 @@ import { assertAuthorityWritable } from "./state-write-fence.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis.js";
-import {
-  MIGRATION_PHASES, encodeMigrationControl,
-  type ArtifactItem, type HaltResource, type MigrationControl,
-  type MigrationPhase, type MigrationWitness,
-} from "./migration/control-codec.js";
-import { genesisPaths, migrationPaths, sqliteResetPaths, statePath } from "./paths.js";
+import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { createStateStore, openStateStore, stateStoreDatabase } from "./store/open.js";
-import { rboxResiduePaths } from "./migration/fault-rig.js";
+import { rboxResiduePaths } from "./fault-rig.js";
 
 async function workspace(): Promise<string> {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-u3-2d-bootstrap-"));
@@ -37,60 +32,6 @@ async function workspace(): Promise<string> {
   await saveConfig(root, config);
   await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
   return root;
-}
-
-// --- control fixtures (shape mirrors `migration/control.test.ts`) ------------
-
-const HASH = "a".repeat(64);
-const source = { path: "/w/.rbox/state.json", dev: 1, ino: 2, bytes: 10, sha256: HASH, mtimeNs: "123" };
-const artifact = { path: "/w/x", dev: 1, ino: 3, bytes: 4, sha256: HASH };
-const proof = { sha256: HASH, bytes: 9, semanticDigest: HASH, entryCount: 1, repoCount: 0, proofVersion: 1 };
-const item = (role: ArtifactItem["role"], ino: number): ArtifactItem =>
-  ({ role, path: `/w/${role}`, parent: "/w", dev: 1, ino, sha256: null });
-
-type WitnessLayer = Partial<Omit<Extract<MigrationWitness, { phase: "M7" }>, "phase">>;
-
-const LAYERS: readonly WitnessLayer[] = [
-  {},
-  { admission: { sourceBytes: 10, requiredBytes: 520, budgetBytes: 4096 } },
-  { history: artifact, fixedBackup: artifact, stagingMain: { state: "present", dev: 1, ino: 30 } },
-  {
-    completion: {
-      migrationId: "m1", importerVersion: "2.0.0", authorityId: "a1", sourceJsonSha256: HASH,
-      sourceSemanticDigest: HASH, sourceBytes: 10, entryCount: 1, repoCount: 0,
-      perTableCounts: { files: 1 }, completedAt: 5,
-    },
-  },
-  { staging: proof },
-  {
-    active: proof,
-    qSibling: { path: "/w/.rbox/state.json.migrate.m1.q", bytes: 58, sha256: HASH, disposition: { state: "absent" } },
-  },
-  { cleanup: { items: [item("reserve", 7)], durablePrefix: 1, currentIntent: null }, futureControls: null },
-  { terminalSibling: { ...artifact, disposition: "exact-or-absent-terminal" } },
-];
-
-const available: HaltResource = { disposition: "available", dev: 1, ino: 20, bytes: 1_048_576, sha256: HASH };
-
-function resourcesFor(phase: MigrationPhase): MigrationControl["haltResources"] {
-  if (phase === "M0") return { reserve: { disposition: "not-created" }, emergency: { disposition: "not-created" } };
-  if (phase === "M7") return { reserve: { disposition: "retired" }, emergency: { disposition: "retired" } };
-  if (phase === "M6") return { reserve: { disposition: "cleanup-absent" }, emergency: { disposition: "cleanup-intent" } };
-  return { reserve: available, emergency: available };
-}
-
-function controlFor(phase: MigrationPhase): MigrationControl {
-  return {
-    version: 1, controlRevision: 1, migrationId: "m1", authorityId: "a1",
-    source, stagingPath: "/w/.rbox/state/state.db.migrate.m1",
-    witness: Object.assign({ phase }, ...LAYERS.slice(0, MIGRATION_PHASES.indexOf(phase) + 1)) as MigrationWitness,
-    haltResources: resourcesFor(phase),
-    halt: null, retirement: null,
-  };
-}
-
-function plantControl(root: string, phase: MigrationPhase): void {
-  fs.writeFileSync(migrationPaths.control(root), encodeMigrationControl(controlFor(phase)));
 }
 
 async function plantLegacyState(root: string): Promise<void> {
@@ -117,27 +58,8 @@ function snapshot(dir: string) {
 
 // --- the write fence --------------------------------------------------------
 
-test("the fence admits a workspace with no control and no intent", async () => {
+test("the fence admits a workspace with no genesis intent", async () => {
   const root = await workspace();
-  expect(() => assertAuthorityWritable(root)).not.toThrow();
-});
-
-test("the fence refuses while a control blocks writes, with one reason", async () => {
-  const root = await workspace();
-  plantControl(root, "M0");
-  try {
-    assertAuthorityWritable(root);
-    throw new Error("expected a refusal");
-  } catch (error) {
-    expect(error).toBeInstanceOf(StateWriteRefusedError);
-    expect((error as StateWriteRefusedError).reason).toBe("authority-recovery-pending");
-    expect((error as StateWriteRefusedError).file).toBe(statePath(root));
-  }
-});
-
-test("the fence admits a control past the flip", async () => {
-  const root = await workspace();
-  plantControl(root, "M7");
   expect(() => assertAuthorityWritable(root)).not.toThrow();
 });
 
@@ -162,12 +84,6 @@ test("the fence refuses an unretired genesis intent under the same reason", asyn
   }));
   expect(() => assertAuthorityWritable(root)).toThrow(StateWriteRefusedError);
   expect(() => assertAuthorityWritable(root)).toThrow(/authority recovery|mid-recovery/);
-});
-
-test("the fence fails closed on an undecodable control", async () => {
-  const root = await workspace();
-  await fsp.writeFile(migrationPaths.control(root), "{not json");
-  expect(() => assertAuthorityWritable(root)).toThrow();
 });
 
 /** A workspace whose active database is real, so an open would have something
@@ -251,14 +167,10 @@ test("163 v13 complete control: the fence works where no open can, however place
 
 // --- both fence reads are bounded: no hang, no follow, no unbounded load ----
 
-test("a FIFO at either fence path refuses instead of hanging the save", async () => {
-  for (const at of ["control", "intent"] as const) {
-    const root = await workspace();
-    const file = at === "control" ? migrationPaths.control(root) : genesisPaths.intent(root);
-    execFileSync("mkfifo", [file]);
-    // Without O_NONBLOCK this never returns — while holding the state lock.
-    expect(() => assertAuthorityWritable(root), at).toThrow();
-  }
+test("a FIFO at the genesis-intent fence refuses instead of hanging the save", async () => {
+  const root = await workspace();
+  execFileSync("mkfifo", [genesisPaths.intent(root)]);
+  expect(() => assertAuthorityWritable(root)).toThrow();
 });
 
 test("a symlink or an oversized file at the intent path refuses", async () => {
@@ -409,16 +321,6 @@ test("ordinary admission has no migration dispatch vocabulary", () => {
 
 // --- the boundary the fence's home depends on (§7.9) ------------------------
 
-const SRC = path.resolve(import.meta.dir, "../../..", "src");
-
-function sources(dir: string): string[] {
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    const file = path.join(dir, entry.name);
-    if (entry.isDirectory()) return sources(file);
-    return entry.isFile() && file.endsWith(".ts") && !file.endsWith(".test.ts") ? [file] : [];
-  });
-}
-
 /** Every specifier a module can reach at RUNTIME: `from "…"` and dynamic
  * `import("…")`, minus type-only lines, which are erased. */
 function valueSpecifiers(text: string): string[] {
@@ -429,31 +331,6 @@ function valueSpecifiers(text: string): string[] {
   }
   return out;
 }
-
-/** `state-plane/index.ts` re-exports `migration/`, so importing it reaches
- * migration without naming it. */
-const STATE_PLANE_INDEX = /\/state-plane\/index\.js"?$/;
-const importsGenesis = (text: string): boolean =>
-  valueSpecifiers(text).some((spec) => /\/genesis\.js$/.test(spec));
-const importsMigration = (text: string): boolean =>
-  valueSpecifiers(text).some((spec) => /(^|\/)migration\/[^/]+\.js$/.test(spec) || STATE_PLANE_INDEX.test(spec));
-
-test("genesis and migration never import each other or share a dispatch import boundary", () => {
-  const both: string[] = [];
-  for (const file of sources(SRC)) {
-    const text = fs.readFileSync(file, "utf8");
-    const genesisSide = importsGenesis(text);
-    const migrationSide = importsMigration(text);
-    if (file.endsWith(`${path.sep}genesis.ts`)) {
-      expect(migrationSide, "genesis.ts must import nothing from migration/").toBe(false);
-    }
-    if (file.includes(`${path.sep}state-plane${path.sep}migration${path.sep}`)) {
-      expect(genesisSide, `${file} must import nothing from genesis.ts`).toBe(false);
-    }
-    if (genesisSide && migrationSide) both.push(path.relative(SRC, file));
-  }
-  expect(both).toEqual([]);
-});
 
 // --- the fence cannot reach SQLite, however anyone rewrites it --------------
 
@@ -531,9 +408,9 @@ test("settled selection's static coordinator closure is SQLite/genesis/lock free
   expect(names).not.toContain("bun:sqlite");
 });
 
-test("the fence calls only its two bounded readers and its own refusal", () => {
+test("the fence calls only its bounded genesis reader and its own refusal", () => {
   expect(fenceCallees(fs.readFileSync(FENCE, "utf8")).sort())
-    .toEqual(["blocksSqliteWrites", "readCanonicalControl", "readGenesisIntent", "refuse"]);
+    .toEqual(["readGenesisIntent", "refuse"]);
 });
 
 test("no SQLite is reachable from anything the fence calls", () => {
@@ -545,7 +422,7 @@ test("no SQLite is reachable from anything the fence calls", () => {
     expect(imported, `${callee} must be imported or local`).not.toBeNull();
     seeds.push(resolveSpecifier(FENCE, imported![1]!));
   }
-  expect(seeds.length).toBeGreaterThan(1);
+  expect(seeds).toHaveLength(1);
 
   const reachable = reachableFrom(seeds);
   expect([...reachable].filter((entry) => /sqlite/i.test(entry) && !entry.endsWith(".ts")))

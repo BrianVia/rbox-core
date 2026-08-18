@@ -17,12 +17,11 @@ import os from "node:os";
 import path from "node:path";
 import type { GitSection } from "../../../engine/index.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
-import { migrationRepoBaseProof } from "../migration/base-proof.js";
-import { beginMigrationImportStage } from "../migration/import-stage.js";
+import { migrationRepoBaseProof } from "../base-proof.js";
 import type { RepoRecordInput } from "../../sync-state-model.js";
 import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
-import { MigrationImporterCapabilityError, ProoflessBaseError, StageChangedError } from "../errors.js";
+import { ProoflessBaseError, StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
 import { createStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
@@ -43,7 +42,7 @@ afterEach(() => {
 
 const hex = (width: number, value: number): string => value.toString(16).padStart(width, "0");
 
-function workspace(prefix: string): { stages: string; handle: StateStoreHandle } {
+function workspace(prefix: string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   roots.push(root);
   const handle = createStateStore(path.join(root, "state.db"), {
@@ -73,20 +72,17 @@ function sealOne(
   stages: string,
   token: LineageSnapshot,
   row: { relPath: string; expectedRepoGen: number; newRecord: RepoRecordInput; baseProof?: ReturnType<typeof carryRepoBaseProof> },
-  options: { importer?: "engine" | "migration" } = {},
 ): SealedRepoTransitionRef {
-  // A migration-tagged stage is only creatable through migration territory's
-  // bound entry point; `beginRepoTransitionStage` cannot be talked into the tag.
-  const builder = options.importer === "migration"
-    ? beginMigrationImportStage(stages, token, [])
-    : beginRepoTransitionStage(stages, token, []);
-  builder.putTransition({
+  const builder = beginRepoTransitionStage(stages, token, []);
+  const transition = {
     relPath: row.relPath,
     expectedRepoGen: row.expectedRepoGen,
     newRecord: row.newRecord,
-    ...(row.baseProof ? { baseProof: row.baseProof } : {}),
     evidenceBindings: { sourceStages: [] },
-  });
+  };
+  builder.putTransition(row.baseProof === undefined
+    ? transition
+    : { ...transition, baseProof: row.baseProof });
   return builder.finishRepoTransitionStage();
 }
 
@@ -126,7 +122,7 @@ test("the transition builder refuses a BASE introduction that carries no proof",
   handle.close();
 });
 
-test("blanket migration authority is reserved for the tagged migration importer", () => {
+test("retired migration authority is refused by live transition stages", () => {
   const { stages, handle } = workspace("rbox-proofless-migration-");
   const token = openReadSnapshot(handle).token;
   expect(() => sealOne(stages, token, {
@@ -135,61 +131,7 @@ test("blanket migration authority is reserved for the tagged migration importer"
     baseProof: migrationRepoBaseProof("lineage"),
   })).toThrow(ProoflessBaseError);
 
-  // The same proof IS admissible from the tagged importer, so the refusal above is
-  // about provenance rather than about the proof being malformed. The tag is
-  // minted through the capability, never asked for by name.
-  const tagged = sealOne(stages, token, {
-    relPath: "repo", expectedRepoGen: 0,
-    newRecord: { sourceSeq: 1, base: section(10) },
-    baseProof: migrationRepoBaseProof("lineage"),
-  }, { importer: "migration" });
-  expect(applyOne(stages, handle, tagged).status).toBe("accepted");
-  expect(loadRawStateFromStore(handle).repoRecords!["repo"]!.base).toBeDefined();
   handle.close();
-});
-
-test("the migration importer tag cannot be claimed without the capability", () => {
-  const { stages, handle } = workspace("rbox-proofless-capability-");
-  const token = openReadSnapshot(handle).token;
-
-  // The tag is what makes blanket authority admissible on re-admission, and
-  // canonical JSON erases every in-memory distinction — so a caller who could
-  // simply ASK for the tag would inherit the whole reserved lane. Refused at
-  // stage creation, before any bytes exist. The check is `===` against a
-  // module-private object, so a look-alike is just a different object.
-  for (const forged of [undefined, {}, { kind: "state-plane-migration-importer/v1" }, Object.freeze({})]) {
-    expect(() => beginRepoTransitionStage(stages, token, [], {
-      importer: "migration",
-      ...(forged === undefined ? {} : { capability: forged as never }),
-    })).toThrow(MigrationImporterCapabilityError);
-  }
-
-  // The refusal is about the tag alone: the same call with no tag is fine.
-  const engine = beginRepoTransitionStage(stages, token, []);
-  engine.discard();
-  handle.close();
-});
-
-test("the admission seam offers no way to obtain or register the capability", async () => {
-  const admission = await import("./transition-admission.js");
-
-  // Regression pin for the exploited round-2 shape: an exported registrar took
-  // any object into a trusted WeakSet, so a forged literal was admitted. There
-  // must be no registrar, and no export may hand a capability back.
-  expect(Object.keys(admission).sort()).toEqual([
-    "assertBaseProof", "assertDeclaredBindings", "assertEvidence", "assertMigrationImporter",
-    "canonicalEvidenceOf", "withMigrationImporter",
-  ].sort());
-  for (const name of Object.keys(admission)) expect(name).not.toMatch(/register|mint|create/i);
-
-  // The one entry point yields the capability only INSIDE its callback, and the
-  // gate accepts nothing else — including a value smuggled out of that callback's
-  // sibling scope, since there is only ever one object and it is not exported.
-  const inside = admission.withMigrationImporter((capability) => {
-    expect(() => admission.assertMigrationImporter(capability)).not.toThrow();
-    return capability;
-  });
-  expect(() => admission.assertMigrationImporter({ ...(inside as object) })).toThrow(MigrationImporterCapabilityError);
 });
 
 test("the CAS refuses a proofless row that would move an existing BASE", () => {

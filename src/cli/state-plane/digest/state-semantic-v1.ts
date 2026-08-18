@@ -4,12 +4,8 @@
  * exactly the failure this digest exists to catch, and that divergence is
  * invisible when the two walks sit in two modules.
  *
- * They are deliberately two literal walks. A helper parameterized over "where
- * the rows come from" would make them agree by construction, which is precisely
- * the agreement the import-fidelity gate must not assume.
- *
- * The row plan the JSON walk reads is built in `legacy-state-plan.ts`; the same
- * plan is what `migration/import-install.ts` writes.
+ * They are deliberately two literal walks so their agreement is measured rather
+ * than obtained from a shared traversal.
  */
 import type { Database } from "bun:sqlite";
 import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";

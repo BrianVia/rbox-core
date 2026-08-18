@@ -15,6 +15,7 @@
  * a directory must refuse rather than block or load.
  */
 import fs, { constants } from "node:fs";
+import { jsonObject, type JsonValue } from "../../json.js";
 import { checkRecord, type Fields, type Refuse, type Spec } from "./closed-record.js";
 import { StateAuthorityCorruptError } from "./errors.js";
 import { genesisPaths } from "./paths.js";
@@ -77,7 +78,7 @@ const INODE: Fields = { dev: "int", ino: "int" };
 
 /** The shape on disk selects which closed spec must accept `incarnation`;
  * neither admits the other, so nothing is coerced into `"absent"`. */
-const intentSpec = (incarnation: unknown): Spec => ({ fields: {
+const intentSpec = (incarnation: JsonValue | undefined): Spec => ({ fields: {
   version: { const: 1 }, authorityId: "hex32", lineageId: "hex32",
   evidence: { fields: { root: "string", stream: "string",
     incarnation: incarnation === "absent" ? { const: "absent" } : { fields: { ...INODE, sha256: "hex" } } } },
@@ -87,11 +88,13 @@ const intentSpec = (incarnation: unknown): Spec => ({ fields: {
 /** Strict decode of a closed record: a future version halts, never reads. */
 export function decodeIntent(file: string, text: string): GenesisIntent {
   const bad: Refuse = (at, why) => { throw new StateAuthorityCorruptError(file, `${at} ${why}`); };
-  let record: unknown;
+  let record: JsonValue;
   try { record = JSON.parse(text); } catch { return bad("the genesis intent", "is not JSON"); }
-  const incarnation = (record as { evidence?: { incarnation?: unknown } } | null)?.evidence?.incarnation;
-  checkRecord(record, intentSpec(incarnation), "the genesis intent", bad);
-  return record as GenesisIntent;
+  const object = jsonObject(record) ? record : undefined;
+  const evidence = object && jsonObject(object.evidence) ? object.evidence : undefined;
+  const incarnation = evidence?.incarnation;
+  checkRecord<GenesisIntent>(record, intentSpec(incarnation), "the genesis intent", bad);
+  return record;
 }
 
 function corrupt(file: string, why: string): StateAuthorityCorruptError {

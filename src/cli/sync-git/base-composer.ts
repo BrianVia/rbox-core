@@ -165,7 +165,7 @@ declare const migrationBaseAuthorityBrand: unique symbol;
  * witness. The brand is a NON-EXPORTED `unique symbol`, so `{ kind: "migration",
  * lineageHash }` written anywhere else no longer satisfies this type — minting
  * one takes a deliberate cast, and the only module that performs it is
- * `state-plane/migration/base-proof.ts` (the `state-plane/reset/owner.ts`
+ * `state-plane/base-proof.ts` (the `state-plane/reset/owner.ts`
  * lexical-capability idiom). The brand is erased at runtime, so it never reaches
  * a canonical-JSON digest; the live CAS refuses this kind outright instead
  * (base-proof-selection.ts), which catches a forged structural variant too.
@@ -212,8 +212,9 @@ export interface RepoBaseProof {
  * candidates agreeing here compose identically under any authority kind — the
  * fact the prooflessness rule in base-proof-selection.ts rests on.
  */
-export function authorityGovernedRefs(base: GitSection | undefined): Record<string, string> {
-  const governed: Record<string, string> = {};
+type GovernedRefs = Record<string, string>;
+export function authorityGovernedRefs(base: GitSection | undefined): GovernedRefs {
+  const governed: GovernedRefs = {};
   for (const [ref, oid] of Object.entries(base?.refs ?? {})) {
     if (isBranch(ref) || isSafeRef(ref)) governed[ref] = oid;
   }
@@ -608,16 +609,18 @@ export function composeRepoBase(
   if (!pending && authority.kind === "migration") {
     for (const [ref, value] of Object.entries(previousRefs)) if (candidateRefs[ref] === undefined) refs[ref] = value;
   }
-  return {
+  const result = {
     base: { ...family, refs },
-    ...(Object.keys(origins).length ? { branchBaseOrigins: origins } : {}),
     disposition: pending ? "pending" : "terminal",
     holds,
-  };
+  } satisfies ComposeRepoBaseResult;
+  return Object.keys(origins).length === 0
+    ? result
+    : { ...result, branchBaseOrigins: origins };
 }
 
 /** Blanket `migration` authority is deliberately not constructible here; it
- * lives in `state-plane/migration/base-proof.ts` so no ordinary write path can
+ * lives in `state-plane/base-proof.ts` so no ordinary write path can
  * default to it. Prooflessly changed BASE is refused by requireRepoBaseProof(). */
 export function carryRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
   return {

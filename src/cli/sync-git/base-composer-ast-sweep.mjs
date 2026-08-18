@@ -86,15 +86,6 @@ const STATE_ORDER_OWNERS = new Map([
     "settleStandingResetUnderHeldFence",
   ])],
   ["src/cli/state-plane/genesis.ts", new Set(["finishWithQ"])],
-  // Design 163's authority flip. It reaches `.rbox/state.json` through a local
-  // binding rather than a `statePath(...)` argument, so without this entry its
-  // ordering — the sibling fence, the exact-sibling image, the revalidations,
-  // and the live-body re-read last — would be invisible to the inventory.
-  ["src/cli/state-plane/migration/authority-flip.ts", new Set(["flipAuthority"])],
-  // The lock bundle's read-only inventory (wave 5B). It reaches the document
-  // only through the selecting seam now — no `statePath(...)` argument — so
-  // without this entry the obligation the fence rests on would be invisible.
-  ["src/cli/state-plane/locks.ts", new Set(["inspectInventory"])],
 ]);
 const STATE_ORDER_CALLEES = new Set([
   "acquireLock",

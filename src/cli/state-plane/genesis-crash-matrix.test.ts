@@ -8,24 +8,9 @@
  * the transitions named — with a comment — as unreachable from inside genesis,
  * and each of those still uses bytes a real crashed run produced.
  *
- * TWO RIG FINDINGS, recorded here because they shape everything below. Both
- * were fixed in this same PR; the history is kept because it explains the file.
- * 1. `migration/fault-rig.ts` originally patched only the `node:fs` DEFAULT
- *    EXPORT. Genesis performs 28 of its 36 workspace-touching calls through
- *    `node:fs/promises` — including the intent publication, BOTH renames and
- *    BOTH parent fsyncs, i.e. every kill point §7.2 names for genesis — so the
- *    rig could not reach a single one. The rig now takes a `surface`.
- *    `patchPromise` below is NOT that gap surviving: it remains because its
- *    predicates match on NON-STRING arguments (`typeof args[1] === "number"`,
- *    to catch one `open` overload and not another), which the rig's
- *    regex-over-joined-string-arguments deliberately cannot express. Where a
- *    path regex suffices, use the rig.
- * 2. `migration/fault-rig-child.ts` had a `genesis` command that minted
- *    `randomUUID()` ids while `installGenesisLineage` requires `^[0-9a-f]{32}$`,
- *    so it threw at step 4 on every invocation and could never reach steps 5–7.
- *    That command is now deleted rather than fixed: §7.9 forbids `migration/**`
- *    from importing `genesis.ts`, and a harness is not exempt from a structural
- *    rule it can silently break. The child below is genesis's own.
+ * `patchPromise` remains local because its predicates match non-string
+ * arguments, which the path-oriented residue helper deliberately does not model.
+ * The child below is genesis's own crash driver.
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -34,14 +19,14 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { checkStateMigration } from "../doctor-state-plane.js";
+import { checkStateGenesis } from "../doctor-state-plane.js";
 import { saveConfig, type WorkspaceConfig } from "../workspace-config.js";
 import { observeStateAuthority } from "./authority-bootstrap.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { establish, readGenesisIntent, type GenesisIds } from "./genesis.js";
-import { rboxResidue, rboxResiduePaths } from "./migration/fault-rig.js";
-import { inodeOf as inodeKey, replaceUnderNewInode } from "./migration/inode-fixtures.js";
+import { rboxResidue, rboxResiduePaths } from "./fault-rig.js";
+import { inodeOf as inodeKey, replaceUnderNewInode } from "./inode-fixtures.js";
 import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { assertAuthorityWritable } from "./state-write-fence.js";
 import { openStateStore, stateStoreDatabase } from "./store/open.js";
@@ -489,7 +474,7 @@ test("G6: foreign-id strands and a foreign-evidence intent are never adopted and
   // FINDING against §7.1's G6 row ("reported by doctor as an inert artifact"):
   // `doctor-state-plane.ts` reads only the control and the intent and never
   // classifies artifacts, so an inert strand is invisible. Asserted as it is.
-  expect(checkStateMigration(root)).toMatchObject({ ok: true, message: "no conversion in progress" });
+  expect(checkStateGenesis(root)).toMatchObject({ ok: true, message: "no setup in progress" });
 
   // (b) A well-formed Q sibling scoped to a different authority id. Produced by
   // a real kill after step 6's sibling fsync in a donor workspace, then carried
@@ -519,7 +504,7 @@ test("G6: foreign-id strands and a foreign-evidence intent are never adopted and
   await expect(establish(copied, () => freshIds(), publicationLocks(copied))).rejects.toThrow(StateAuthorityCorruptError);
   expect(rboxResidue(copied)).toEqual(untouched); // zero writes, nothing deleted
   expect(fs.existsSync(statePath(copied))).toBe(false);
-  expect(checkStateMigration(copied)).toMatchObject({ ok: false, status: "state-genesis/unfinished" });
+  expect(checkStateGenesis(copied)).toMatchObject({ ok: false, status: "state-genesis/unfinished" });
 }, 40_000);
 
 test("ENOSPC at the intent write leaves an unowned zero-byte staged file and nothing else", async () => {

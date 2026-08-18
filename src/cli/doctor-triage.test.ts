@@ -163,16 +163,19 @@ async function writeDaemonRecords(opts: {
 }): Promise<void> {
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
   await fs.writeFile(daemonPidPath(root), `v2 ${LIVE_PID} ${opts.pidBootId ?? BOOT}\n`);
-  await fs.writeFile(daemonStatusPath(root), JSON.stringify({
+  const status = {
     schemaVersion: 1,
     state: "synced",
     heartbeatAt: new Date(NOW - 1_000).toISOString(),
     sequence: 1,
     lastSyncedAt: null,
-    ...(opts.statusBootId === undefined ? {} : { bootId: opts.statusBootId }),
     ...opts.status,
-  }));
+  } satisfies Partial<AmbientDaemonStatusV1>;
+  if (opts.statusBootId !== undefined) status.bootId = opts.statusBootId;
+  await fs.writeFile(daemonStatusPath(root), JSON.stringify(status));
 }
+
+const requestUrl = (input: string | URL | Request): string => new Request(input).url;
 
 beforeEach(async () => {
   savedHomeEnv = Object.fromEntries(["HOME", "RBOX_HOME"].map((key) => [key, process.env[key]]));
@@ -228,7 +231,7 @@ test("a VALID token during a network outage reports 'couldn't check', never sign
 test("a genuinely REJECTED token still reports signed-out, and not the offline finding", async () => {
   await saveCredentials({ token: "tok_stale", deviceId: "dev_1", remoteUrl: "https://api.rbox.to", accountId: "acct_1111111111111111" });
   globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    const url = requestUrl(input);
     if (url.includes("/v1/account/status")) return new Response("no", { status: 401 });
     return new Response("ok", { status: 200 });
   }) as typeof fetch;
@@ -247,7 +250,7 @@ test("a genuinely REJECTED token still reports signed-out, and not the offline f
 test("a 5xx on the account check is inconclusive, not a rejected token", async () => {
   await saveCredentials({ token: "tok_valid", deviceId: "dev_1", remoteUrl: "https://api.rbox.to", accountId: "acct_1111111111111111" });
   globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    const url = requestUrl(input);
     if (url.includes("/v1/account/status")) return new Response("boom", { status: 503 });
     return new Response("ok", { status: 200 });
   }) as typeof fetch;
@@ -263,7 +266,7 @@ test("a 5xx on the account check is inconclusive, not a rejected token", async (
 test("a REJECTED token still reports signed-out even when the version lookup was inconclusive", async () => {
   await saveCredentials({ token: "tok_stale", deviceId: "dev_1", remoteUrl: "https://api.rbox.to", accountId: "acct_1111111111111111" });
   globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    const url = requestUrl(input);
     if (url.includes("/v1/account/status")) return new Response("no", { status: 401 });
     // The release manifest is what fails to answer here.
     if (url.endsWith("/version") || url.endsWith("/version.sig")) throw new Error("connection reset");
@@ -769,15 +772,14 @@ test("a marker with no records behind it is contradictory authority, not a too-n
   expect(whole).not.toMatch(/restore/i);
 });
 
-/** A healthy migrated workspace is the case this must never regress into: the
+/** A healthy workspace is the case this must never regress into: the
  * `state` check reports it as healthy, and no finding is produced at all. The
- * store-backed positive is proved by the snapshot-replay harness against real
- * data; what is pinned here is that "migrated" alone is not a fault. */
+ * SQLite-backed positive is pinned in the compatibility matrix. */
 test("a healthy legacy workspace still reports a healthy state check", async () => {
   const ctx = await collectDoctorContext(root);
   expect(ctx.checks.state.ok).toBe(true);
-  expect(ctx.checks.migration?.ok).toBe(true);
-  expect(ctx.checks.migration?.message).toBe("no conversion in progress");
+  expect(ctx.checks.genesis?.ok).toBe(true);
+  expect(ctx.checks.genesis?.message).toBe("no setup in progress");
 });
 
 test("a foreign occupant of the upgrade reserve is reported without threatening it", () => {

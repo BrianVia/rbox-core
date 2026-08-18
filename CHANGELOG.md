@@ -6,6 +6,13 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Removed
+- The retired `rbox migrate` command and the
+  `rbox doctor --retry-state-migration` /
+  `--abort-state-migration` options have been removed. New 2.0 workspaces
+  already use the current sync-record format, so there is no conversion job to
+  start, retry, or abandon.
+
 ### Added
 - `rbox status` now counts the conflict copies rbox saved for you and still
   sitting in the workspace, so they are visible without hunting for

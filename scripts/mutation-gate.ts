@@ -56,69 +56,6 @@ export interface MutationGuard {
  */
 export const MUTATION_GUARDS: readonly MutationGuard[] = [
   {
-    id: "control-cas-identity",
-    file: "cli/state-plane/migration/control-publication.ts",
-    anchor: "current.migrationId !== expect.migrationId || current.controlRevision !== expect.revision",
-    removed: "false",
-    test: "cli/state-plane/migration/control.test.ts",
-    reason:
-      "The compare-and-swap on (migrationId, controlRevision) is the only thing preventing a stale observation from publishing over a revision it never saw; without it two admitted migrations interleave silently.",
-  },
-  {
-    id: "cleanup-enospc-predicate",
-    file: "cli/state-plane/migration/cleanup.ts",
-    anchor: 'return code === "ENOSPC" || code === "EDQUOT";',
-    removed: "return false;",
-    test: "cli/state-plane/migration/cleanup.test.ts",
-    reason:
-      "A full disk during cleanup must publish cleanup-deferred against the exact cursor; misclassifying ENOSPC as an ordinary error turns a resumable halt into an unhandled throw after Q is already live.",
-  },
-  {
-    id: "runway-enospc-predicate",
-    file: "cli/state-plane/migration/control-publication.ts",
-    anchor: 'return code === "ENOSPC" || code === "EDQUOT";',
-    removed: "return false;",
-    test: "cli/state-plane/migration/guard-coverage.test.ts",
-    reason:
-      "ENOSPC and EDQUOT are the two conditions the prebuilt runway exists for; if neither is recognised the runway is never consumed and a disk-full halt cannot be published at all.",
-  },
-  {
-    id: "phase-receipt-phase-match",
-    file: "cli/state-plane/migration/phase-io.ts",
-    anchor: "if (receipt.phase !== expected) {",
-    removed: "if (false) {",
-    test: "cli/state-plane/migration/guard-coverage.test.ts",
-    reason:
-      "A phase body may only run on a receipt for the phase it follows; without this a misrouted receipt lets M4's proof run against M2's witness and the phase table stops being a sequence.",
-  },
-  {
-    id: "source-rebracket",
-    file: "cli/state-plane/migration/phase-io.ts",
-    anchor: 'halt("verification", false, "the legacy document is no longer the one this migration recorded");',
-    removed: "void 0;",
-    test: "cli/state-plane/migration/guard-coverage.test.ts",
-    reason:
-      "Every mutator re-brackets the recorded source before acting; deleting the check lets a legacy document that changed mid-migration be imported as if it were the one the control recorded, which is the whole source-changed disposition.",
-  },
-  {
-    id: "flip-last-instant-reverify",
-    file: "cli/state-plane/migration/authority-flip.ts",
-    anchor: "if (final.sha256 !== witness.completion.sourceJsonSha256) {",
-    removed: "if (false) {",
-    test: "cli/state-plane/migration/guard-coverage.test.ts",
-    reason:
-      "222 §5.2's M6 row calls this the last operation before the rename with nothing between, and §6.2's legacy-write-detected disposition is reachable only here; without it an older rbox's write inside the check-to-rename microwindow is flipped over and silently lost.",
-  },
-  {
-    id: "cleanup-m6-receipt",
-    file: "cli/state-plane/migration/cleanup.ts",
-    anchor: 'if (control.witness.phase !== "M6") return corruptCleanup(',
-    removed: "if (false) return corruptCleanup(",
-    test: "cli/state-plane/migration/guard-coverage.test.ts",
-    reason:
-      "The direct analogue of phase-receipt-phase-match, one phase later: it survived all six 5C matrices and all fourteen behavioural state-plane suites, including its own owning cleanup.test.ts, so the cleanup cursor could be driven from a non-M6 witness with nothing noticing.",
-  },
-  {
     id: "daemon-folder-policy-runtime-fields",
     file: "cli/daemon/daemon.ts",
     anchor: "this.cfg = { ...this.cfg,",
@@ -176,9 +113,7 @@ function prepareSandbox(): string {
  * exact failure mode it exists to catch. Bun prints `(fail)` only for a test
  * that ran and failed, so its presence is the proof that a test did the killing.
  */
-function runTest(sandboxSrc: string, testFile: string): {
-  ok: boolean; assertionsFailed: boolean; output: string;
-} {
+function runTest(sandboxSrc: string, testFile: string) {
   const proc = Bun.spawnSync(
     [process.execPath, "test", path.join(sandboxSrc, testFile), "--bail"],
     { cwd: REPO, stdout: "pipe", stderr: "pipe", env: { ...process.env, RBOX_MUTATION_GATE: "1" } },

@@ -21,7 +21,7 @@ import { pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
-import { checkState, checkStateMigration, checkStateReserve } from "./doctor-state-plane.js";
+import { checkState, checkStateGenesis, checkStateReserve } from "./doctor-state-plane.js";
 import type { TriageFinding } from "./doctor-triage.js";
 import { describeCheck, type DoctorCheckDescriptor, type DoctorCheckRunInput } from "./doctor-check.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
@@ -61,17 +61,13 @@ export interface DoctorCheck {
    * A check that already speaks triage's vocabulary carries its own finding.
    *
    * Every other check has its `status` translated into a `TriageFinding` inside
-   * `doctor-triage.ts`. The state-plane checks cannot: their words come from
-   * `state-plane-copy.ts`, whose exhaustive `satisfies` clauses are the merge
-   * gate for U3's halt taxonomy, and re-deriving them from a status string would
-   * be a second copy of the table that could disagree with what `rbox migrate`
-   * printed about the same halt.
+   * `doctor-triage.ts`. Genesis admission owns its user-facing copy centrally.
    */
   finding?: TriageFinding;
 }
 
 export type DoctorChecks = Record<CheckName, DoctorCheck>
-  & { chain?: DoctorCheck; reserve?: DoctorCheck; migration?: DoctorCheck };
+  & { chain?: DoctorCheck; reserve?: DoctorCheck; genesis?: DoctorCheck };
 
 export interface WorkspaceSize {
   fileCount: number;
@@ -82,6 +78,11 @@ type ExcludedSection = typeof STALE_EXCLUDED;
 type DaemonLogSection = string | ExcludedSection;
 type MetricsSection = Partial<SyncMetrics> & { truncated?: boolean; originalBytes?: number } | ExcludedSection;
 type ActivitySection = Partial<DaemonActivity> & { truncated?: boolean; originalBytes?: number } | ExcludedSection;
+interface DiagnosticsSidecars {
+  daemonLogTail: DaemonLogSection;
+  metrics: MetricsSection;
+  activity: ActivitySection;
+}
 
 export interface DiagnosticsBundle {
   version: string;
@@ -91,7 +92,7 @@ export interface DiagnosticsBundle {
   daemonLogTail: DaemonLogSection;
   metrics: MetricsSection;
   activity: ActivitySection;
-  workspaceShape: WorkspaceSize;
+  "workspaceShape": WorkspaceSize;
   leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
   repoResidue: DiagnosticsRepoResidueSection;
 }
@@ -386,17 +387,20 @@ export async function checkDeviceIdentity(creds: Credentials | undefined, cfg: W
 
 function checkDaemon(daemon: DaemonObservation): DoctorCheck {
   if (daemon.stale) {
-    return {
+    const check: DoctorCheck = {
       ok: false,
       label: "background sync",
       message: `running but bound to a different workspace${daemon.pid ? ` (pid ${daemon.pid})` : ""}`,
       hint: "run `rbox start` to rebind",
       status: "stale",
-      ...(daemon.pid ? { pid: daemon.pid } : {}),
     };
+    if (daemon.pid !== undefined) check.pid = daemon.pid;
+    return check;
   }
   if (daemon.running) {
-    return { ok: true, label: "background sync", message: `running (pid ${daemon.pid})`, status: "running", ...(daemon.pid ? { pid: daemon.pid } : {}) };
+    const check: DoctorCheck = { ok: true, label: "background sync", message: `running (pid ${daemon.pid})`, status: "running" };
+    if (daemon.pid !== undefined) check.pid = daemon.pid;
+    return check;
   }
   return { ok: false, label: "background sync", message: "stopped", hint: "run `rbox start`", status: "stopped" };
 }
@@ -472,16 +476,23 @@ async function checkGitCapability(root: string): Promise<DoctorCheck> {
   const current = capability.version;
   switch (capability.status) {
     case "supported":
-      return { ok: true, label: "git", message: `transactional symref-update supported${current ? ` (${current})` : ""}`, status: capability.status, ...(current ? { current } : {}) };
+      return gitCapabilityCheck(true, `transactional symref-update supported${current ? ` (${current})` : ""}`, capability.status, current);
     case "git-missing":
       return { ok: false, label: "git", message: "Git is not installed", hint: "install Git >= 2.46", status: capability.status };
     case "version-unavailable":
       return { ok: false, label: "git", message: "Git version is unavailable", hint: "repair or upgrade Git to >= 2.46", status: capability.status };
     case "probe-failed":
-      return { ok: false, label: "git", message: "transactional symref-update probe failed", hint: "retry after Git state settles", status: capability.status, ...(current ? { current } : {}) };
+      return gitCapabilityCheck(false, "transactional symref-update probe failed", capability.status, current, "retry after Git state settles");
     case "unsupported":
-      return { ok: false, label: "git", message: `needs Git >= 2.46 transactional symref-update${current ? `; found ${current}` : ""}`, hint: "upgrade Git to >= 2.46", status: capability.status, ...(current ? { current } : {}) };
+      return gitCapabilityCheck(false, `needs Git >= 2.46 transactional symref-update${current ? `; found ${current}` : ""}`, capability.status, current, "upgrade Git to >= 2.46");
   }
+}
+
+function gitCapabilityCheck(ok: boolean, message: string, status: string, current?: string, hint?: string): DoctorCheck {
+  const check: DoctorCheck = { ok, label: "git", message, status };
+  if (current !== undefined) check.current = current;
+  if (hint !== undefined) check.hint = hint;
+  return check;
 }
 
 async function measureWorkspaceSize(root: string, cfg: WorkspaceConfig): Promise<WorkspaceSize> {
@@ -524,13 +535,14 @@ export async function collectLeftoverWorktrees(
       if (entryReal === self) continue;
       const key = `${absolutePath}\0${entry.branch ?? ""}\0${entry.prunable ? "1" : "0"}`;
       const previous = byEntry.get(key);
-      byEntry.set(key, {
-        ...(entry.branch ? { branch: entry.branch } : {}),
+      const worktree: LocalOnlyLeftoverWorktreeEntry = {
         path: absolutePath,
         prunable: entry.prunable,
         holdsSyncedRef: previous?.holdsSyncedRef === true
           || (entry.branch !== undefined && syncedRefs.has(entry.branch)),
-      });
+      };
+      if (entry.branch !== undefined) worktree.branch = entry.branch;
+      byEntry.set(key, worktree);
     }
   }
   const entries = [...byEntry.values()].sort((a, b) =>
@@ -539,11 +551,11 @@ export async function collectLeftoverWorktrees(
     localOnly: { count: entries.length, entries },
     diagnostics: {
       count: entries.length,
-      entries: entries.map(({ branch, prunable, holdsSyncedRef }) => ({
-        ...(branch ? { branch } : {}),
-        prunable,
-        holdsSyncedRef,
-      })),
+      entries: entries.map(({ branch, prunable, holdsSyncedRef }) => {
+        const entry: DiagnosticsLeftoverWorktreeEntry = { prunable, holdsSyncedRef };
+        if (branch !== undefined) entry.branch = branch;
+        return entry;
+      }),
     },
   };
 }
@@ -559,7 +571,7 @@ async function allocatedBytes(abs: string): Promise<number> {
   } catch {
     return 0;
   }
-  const self = typeof stat.blocks === "number" ? stat.blocks * 512 : stat.size;
+  const self = stat.blocks === undefined ? stat.size : stat.blocks * 512;
   if (!stat.isDirectory() || stat.isSymbolicLink()) return self;
   let entries: string[];
   try {
@@ -625,11 +637,12 @@ export async function collectRepoResidue(
     // Keep the workspace line even when absent; per-repo lines are useful only
     // when an artifact directory actually exists.
     if (!present && candidate.label !== "workspace .rbox/git-quarantine") continue;
-    quarantine.push({
+    const entry: LocalOnlyQuarantineEntry = {
       ...candidate,
       present,
-      ...(present && options.residueBytes ? { bytes: await allocatedBytes(candidate.path) } : {}),
-    });
+    };
+    if (present && options.residueBytes) entry.bytes = await allocatedBytes(candidate.path);
+    quarantine.push(entry);
   }
 
   const identity: DiagnosticsRepoResidueSection["identity"] = { match: 0, mismatch: 0, unknown: 0 };
@@ -731,22 +744,20 @@ const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
   describeCheck("locking", ({ root }) => checkLocking(root)),
   describeCheck("git", ({ root }) => checkGitCapability(root)),
   describeCheck("reserve", ({ root, cfg }) => checkStateReserve(root, cfg)),
-  describeCheck("migration", ({ root }) => checkStateMigration(root)),
+  describeCheck("genesis", ({ root }) => checkStateGenesis(root)),
   // The rejection reason is a caught exception: `unknown` by language rule, and
   // this handler IS its decoder into the check's message line.
   describeCheck("chain", ({ root, loaded }) => buildAuthedRemote(root, Date.now, undefined, loaded)
     .then((built) => checkManifestChain(built.remote))
-    .catch((error: unknown) => ({ ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) }))),
+    .catch((error: Error) => ({ ok: false, label: "manifest chain", message: error.message }))),
 ];
 
 export async function collectDoctorContext(
   root: string,
   options: { residueBytes?: boolean; now?: number } = {},
 ): Promise<DoctorContext> {
-  const observation = await observeWorkspace(root, {
-    depth: "local",
-    ...(options.now === undefined ? {} : { now: options.now }),
-  });
+  const observation = await observeWorkspace(root,
+    options.now === undefined ? { depth: "local" } : { depth: "local", now: options.now });
   const rawCfg = observation.config;
   const loaded = await loadCredentials();
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
@@ -805,7 +816,7 @@ function pickMetrics(m: SyncMetrics): MetricsSection {
     fileConflicts: Number.isFinite(m.fileConflicts) ? Math.max(0, Math.trunc(m.fileConflicts)) : 0,
     lockStarved: Number.isFinite(m.lockStarved) ? Math.max(0, Math.trunc(m.lockStarved)) : 0,
   };
-  if (typeof m.lastConflictAt === "string") {
+  if (m.lastConflictAt !== undefined) {
     const capped = capString(m.lastConflictAt);
     out.lastConflictAt = capped.value;
     if (capped.truncated) return { ...out, truncated: true, originalBytes: capped.originalBytes };
@@ -847,14 +858,19 @@ function machineChecks(checks: DoctorChecks): DoctorChecks {
 
 export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<DiagnosticsBundle> {
   const observedSidecars = await ctx.observation.readDaemonSidecars();
-  const sidecars = observedSidecars === undefined
-    ? { daemonLogTail: STALE_EXCLUDED, metrics: STALE_EXCLUDED, activity: STALE_EXCLUDED }
-    : {
-        daemonLogTail: redactGitLogLines(observedSidecars.daemonLogTail),
-        metrics: pickMetrics(observedSidecars.metrics),
-        activity: pickActivity(observedSidecars.activity),
-      };
-  return fitBundle({
+  let daemonLogForCap: string | undefined;
+  let sidecars: DiagnosticsSidecars;
+  if (observedSidecars === undefined) {
+    sidecars = { daemonLogTail: STALE_EXCLUDED, metrics: STALE_EXCLUDED, activity: STALE_EXCLUDED };
+  } else {
+    daemonLogForCap = redactGitLogLines(observedSidecars.daemonLogTail);
+    sidecars = {
+      daemonLogTail: daemonLogForCap,
+      metrics: pickMetrics(observedSidecars.metrics),
+      activity: pickActivity(observedSidecars.activity),
+    };
+  }
+  const bundle: DiagnosticsBundle = {
     version: RBOX_VERSION,
     platform: { os: process.platform, arch: process.arch },
     bunVersion: bunVersion(),
@@ -862,7 +878,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     daemonLogTail: sidecars.daemonLogTail,
     metrics: sidecars.metrics,
     activity: sidecars.activity,
-    workspaceShape: ctx.workspaceSize,
+    "workspaceShape": ctx.workspaceSize,
     leftoverWorktrees: ctx.diagnostics.leftoverWorktrees,
     repoResidue: ctx.diagnostics.repoResidue ?? {
       count: 0,
@@ -871,17 +887,18 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
       identity: { match: 0, mismatch: 0, unknown: 0 },
       quarantinePresent: 0,
     },
-  });
+  };
+  return fitBundle(bundle, daemonLogForCap);
 }
 
-function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
+function fitBundle(bundle: DiagnosticsBundle, daemonLogTail: string | undefined): DiagnosticsBundle {
   let raw = JSON.stringify(bundle, null, 2);
   if (byteLen(raw) <= REPORT_CAP_BYTES) return bundle;
-  if (typeof bundle.daemonLogTail !== "string") return bundle;
+  if (daemonLogTail === undefined) return bundle;
   const over = byteLen(raw) - REPORT_CAP_BYTES;
   const marker = "[rbox: daemon log tail truncated to fit diagnostics bundle]\n";
-  const keepBytes = Math.max(0, byteLen(bundle.daemonLogTail) - over - byteLen(marker) - 1024);
-  const next = { ...bundle, daemonLogTail: marker + keepLastUtf8(bundle.daemonLogTail, keepBytes) };
+  const keepBytes = Math.max(0, byteLen(daemonLogTail) - over - byteLen(marker) - 1024);
+  const next = { ...bundle, daemonLogTail: marker + keepLastUtf8(daemonLogTail, keepBytes) };
   raw = JSON.stringify(next, null, 2);
   if (byteLen(raw) <= REPORT_CAP_BYTES) return next;
   return { ...next, daemonLogTail: marker };
@@ -1004,19 +1021,17 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   if (opts.json === true && opts.report) {
     throw new Error("--json prints the findings only — drop --report, or drop --json to build the support report");
   }
-  const ctx = await collectDoctorContext(
-    root,
-    { ...(opts.residueBytes ? { residueBytes: true } : {}), ...(opts.now === undefined ? {} : { now: opts.now }) },
-  );
+  const ctx = await collectDoctorContext(root, {
+    residueBytes: opts.residueBytes === true,
+    now: opts.now,
+  });
   const { renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
   // The checks above take seconds against the network, and triage recommends
   // destructive recovery (`rbox pull --allow-mass-delete`). Re-observe locally
   // so no finding — and no recommendation — describes a workspace this folder
   // was re-bound away from while doctor was running.
-  const observation = await observeWorkspace(root, {
-    depth: "local",
-    ...(opts.now === undefined ? {} : { now: opts.now }),
-  });
+  const observation = await observeWorkspace(root,
+    opts.now === undefined ? { depth: "local" } : { depth: "local", now: opts.now });
   if (observation.config.remoteWorkspaceId !== ctx.cfg.remoteWorkspaceId) {
     console.log("this folder was re-bound to a different workspace while rbox doctor was running — nothing here describes it. Re-run: rbox doctor");
     process.exitCode = 1;

@@ -1,11 +1,5 @@
 /**
- * The legacy JSON document as the ROW PLAN the importer writes (design 222
- * §M-5).
- *
- * Not a second projection of the source: `state-semantic-v1.ts` walks this plan
- * to produce the JSON-side digest, and `migration/import-install.ts` writes it
- * to SQLite. One plan, two consumers — so what is hashed and what is stored
- * cannot drift apart without the digest saying so.
+ * The normalized row view used by the legacy JSON semantic digest.
  */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import {

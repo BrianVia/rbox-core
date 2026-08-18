@@ -1,3 +1,5 @@
+SP-4 executed 2026-08-18: the completed JSON→SQLite migration tree and operator surfaces were retired after founder support-window sign-off.
+
 # 262 — Retire the JSON→SQLite migration tree; SQLite becomes the only state plane
 
 Status: RESCOPED v2 — parent plan for the "finish the state plane" loop

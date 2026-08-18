@@ -3,16 +3,20 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HashCache } from "../../engine/index.js";
-import { saveConfig, saveStateUnsafeLegacyOrTest, stateLockPath, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { saveConfig, saveStateUnsafeLegacyOrTest, stateLockPath, statePath, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { beginResetJournal, resetJournalPath } from "../reset-journal.js";
 import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
 import { acquireLock } from "../../engine/lockfile.js";
 import { Database } from "bun:sqlite";
-import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../state-plane/locks.js";
-import { runMigration } from "../state-plane/migration/authority.js";
+import { admitGenesisAuthority } from "../state-plane/authority-bootstrap.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { sqliteResetPaths } from "../state-plane/paths.js";
+import {
+  applyStateSavePacket,
+  loadRawState,
+} from "../state-plane/adapters/whole-state-compat.js";
 import {
   RESET_RECOVERY_RETRY_MS,
   RESET_WAL_CRASH_RETRY_ATTEMPTS,
@@ -69,13 +73,28 @@ function daemon(logs: string[] = []): HaltInternals {
 
 const NOW = Date.parse("2026-07-17T12:00:00.000Z");
 
-/** Machine-produced SQLite authority: the real migration, never a planted DB. */
-async function migrateToSqliteAuthority(): Promise<void> {
-  await fs.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
-  const outcome = await withStatePlaneLocks(root, (locks: HeldStatePlaneLocks) =>
-    runMigration(root, { entry: "foreground-migrate", locks } as EntryProof));
-  if (!outcome.held || outcome.value.kind !== "migrated") {
-    throw new Error(`fixture did not migrate: ${JSON.stringify(outcome)}`);
+/** Replace the per-test legacy fixture with machine-produced SQLite genesis. */
+async function establishSqliteAuthority(): Promise<void> {
+  await fs.rm(statePath(root));
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    const outcome = await admitGenesisAuthority(root, mutex);
+    if (outcome.kind !== "selected" || outcome.authority.kind !== "sqlite-store") {
+      throw new Error(`fixture did not establish SQLite authority: ${JSON.stringify(outcome)}`);
+    }
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+  const current = await loadRawState(root);
+  const saved = await applyStateSavePacket(root, {
+    expectedStream: syncStreamId(cfg),
+    expectedNonce: current?.stateNonce ?? "legacy",
+    sourceGlobalSeq: state.lastSyncedSequence,
+    global: { manifest: state.lastSyncedManifest },
+    repos: [],
+  });
+  if (saved.status !== "accepted") {
+    throw new Error(`fixture did not populate SQLite authority: ${JSON.stringify(saved)}`);
   }
 }
 
@@ -86,7 +105,7 @@ async function migrateToSqliteAuthority(): Promise<void> {
  * one boundary pass.
  */
 test("a foreign sidecar recovers within one boundary pass instead of halting for an hour", async () => {
-  await migrateToSqliteAuthority();
+  await establishSqliteAuthority();
   await fs.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
   const d = daemon();
   d.cache = new HashCache();
@@ -104,7 +123,7 @@ test("a foreign sidecar recovers within one boundary pass instead of halting for
  * hourly fail-closed halt only after the attempts are spent.
  */
 test("a still-attached foreign reader is refused on a short backoff before any hourly halt", async () => {
-  await migrateToSqliteAuthority();
+  await establishSqliteAuthority();
   const foreign = new Database(sqliteResetPaths.active(root));
   foreign.exec("BEGIN");
   foreign.query("SELECT count(*) AS n FROM store_meta").get();
