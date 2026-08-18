@@ -1,10 +1,26 @@
 # 278 — Connectivity-deferred repos join the held-skip fast path
 
-Status: DRAFT r2 · 2026-08-18 · Addresses the connectivity class of #775
+Status: ALIGNED r3 · 2026-08-18 · Addresses the connectivity class of #775
 (#775 stays open for the unreadable-journal class + cas acquire).
 r1 → r2: folded opus review B (REVISE) + 208-pull per-repo field evidence;
 objectDbDigest DROPPED (liveness-only mechanism — see M2); typed defer
 status replaces the /connectivity/ regex; scope and estimate made honest.
+r2 → r3: folded opus coverage review — digest-drop UPHELD as safe (full
+input-coverage table verified; every uncovered change is
+verdict-conservative in both the connectivity proof AND the ref-plane
+ownership proofs; `record.attempt` has zero readers outside sync-git/ and
+resolve-evidence re-stages live, so no consumer can act on a stale
+verdict); ONE BLOCKER folded: M1 is GATED ON THE TYPED CODE, never on
+bare defer status — an unscoped store would memoize transient
+boundary-race defers (chooseFailure mints allowlisted reasons like
+local-commits from boundary provenance; reflogs are unfingerprinted, so
+the bracket would hold) and stall a clean apply up to the 1h floor;
+r1-residue digest validation items deleted; copy fix retargeted to the
+`artifact` story (SYNC_DOWNLOAD_FAILED is false for this class — the
+download succeeds, the local object graph is incomplete); the "over a
+day" line stays (keys off deferredSince, remains true, doctor escalation
+is the safety valve); store-success assertions added (the M1 bracket can
+refuse silently on breadcrumb-waived repos — degrade documented).
 Baseline: FM pulls median 44.3s post-277, git-apply median 28.3s dominated
 by deferred repos re-fetching bundles (fetchDecryptMs 12.5–17.3s for one
 repo, 1–5s for four more, EVERY zero-change pull; queueMs p95 22–28s from
@@ -70,10 +86,11 @@ deferred unchanged >32h.
 ### M1. The connectivity-defer exit records a bracketed classification
 
 `follow.ts` gains a third `afterHeldClassification` invocation for the
-`checkout.status === "defer"` exit (`:199`), recording a completed,
-fingerprint-bracketed classification with a new narrow attempt code
-`connectivity-unproven` (blocker `provenance:"boundary"`). Constraints
-honored:
+checkout-defer exit (`:199`), **gated on the M0 typed code — invoked
+ONLY when `checkout.code === "connectivity-unproven"`** (r3 blocker: an
+unscoped store memoizes boundary-race defers whose reasons are already
+reason-allowlisted). The `CheckoutDeferCode` rides
+`CheckoutCommitReceipt` for this gate. Constraints honored:
 - Runs inside the same stable-fingerprint bracket as the two existing
   sites (design 176 §4 v6): the observation is only stored when the
   fingerprint at classification start equals the fingerprint at store
@@ -131,13 +148,16 @@ onto the stored blocker. Additive shape change, v2-beta window.
   now the SOLE liveness bound and is named as such.
 - Design 273 P2 retention: the skip re-stands the existing deferral
   (`restandApply` only), never clears, never re-stamps `lastSeen`.
-- Copy fix in the same PR (review-B finding 7): the 273 story line
-  "rbox has been retrying these for over a day" becomes untrue under
-  hourly re-proves — reword to state rbox re-checks hourly; the
-  legibility surfaces otherwise render identically (P2 keeps ages
-  honest). Named trade: the per-pull `git-sync deferred <rel>` log line
-  goes quiet between floors; `skippedHeld` counts cover the operator
-  view.
+- Copy fix in the same PR (r3-retargeted): the "over a day" line STAYS
+  (it keys off deferredSince age — still true — and its doctor
+  escalation is the safety valve for a stale verdict). The genuinely
+  wrong copy is the `artifact` story (git-stories.ts:151-155,
+  SYNC_DOWNLOAD_FAILED: "rbox couldn't finish downloading…") — false
+  for this class, where the download SUCCEEDS and the local object
+  graph is incomplete; reworded to be honest for both subclasses under
+  the 273 copy bar. Named trade: the per-pull `git-sync deferred <rel>`
+  log line goes quiet between floors; `skippedHeld` counts cover the
+  operator view.
 
 ### Effect (honest, review-B-corrected)
 
@@ -206,7 +226,14 @@ triggers (§2).
   fingerprint-bracket store rules (176 §4 v6); 273 P2 retention; the
   `clearAttempt` rule at `apply.ts:940-943`; design 241's local-edits
   exclusion; chain-timing leaf-sum invariant (`chain-timings.ts:78-82`);
-  apply-stats golden strings updated deliberately.
+  apply-stats golden strings updated deliberately. r3 additions: the
+  Layer-A gate does not compare reflog digests (pre-existing, shared
+  with every fast-path class, conservative here — reflogs can change
+  the blocker CLASSIFICATION, so this is named rather than rediscovered);
+  the ref-plane ownership proofs (`tipOwnedByIncoming`) also read the
+  object DB — both flip directions under a skip are conservative
+  (suppressed publish = delay; suppressed hold = no-op, a skip publishes
+  nothing).
 
 ## 4. Validation
 
@@ -236,6 +263,17 @@ triggers (§2).
 - Digest-drop liveness test: repair the broken repo (add the missing
   objects via git fetch) mid-soak ⇒ the repo follows successfully at
   the next hourly floor, not sooner — pinning the accepted ≤1h lag.
+  (r3: the r2 "digest sensitivity" gc/repack/fetch-refusal tests are
+  DELETED as r1 residue — no digest exists and those mutations move
+  nothing observable by design.)
+- Store-success assertions: the fixpoint test asserts the attempt is
+  durably stored after cycle 1; negative: a breadcrumb-waived repo
+  (preserveOrigHead writes ORIG_HEAD inside the bracket) refuses the
+  store and full-follows both cycles — the silent-degrade mode is
+  documented, not discovered in the field.
+- Boundary-race negative (r3 blocker pin): a non-connectivity
+  commitCheckout defer (boundary provenance, reason local-commits)
+  stores NO attempt and is re-attempted next pull.
 - Field acceptance: FM overnight — deferral ages keep growing (273 P2),
   `skippedHeld` rises by exactly the five connectivity repos,
   fetchDecryptMs for AutoGPT appears at most once per hour, pull median
