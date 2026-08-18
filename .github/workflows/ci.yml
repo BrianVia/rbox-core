@@ -24,6 +24,7 @@ jobs:
   changes:
     name: "changes · CI scope"
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       run_ci: ${{ steps.scope.outputs.run_ci }}
       run_rboxbar: ${{ steps.scope.outputs.run_rboxbar }}
@@ -80,6 +81,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_rboxbar == 'true'
     runs-on: macos-14
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Same image + default Xcode as release.yml's rboxbar job: the floor is
@@ -97,6 +99,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -112,6 +115,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: changes
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -238,6 +242,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -257,6 +262,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
