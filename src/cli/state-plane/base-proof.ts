@@ -13,7 +13,7 @@ import {
  * inline `{ kind: "migration", … }` elsewhere no longer type-checks as one.
  */
 export function migrationRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
-  const authority = Object.freeze({ kind: "migration", lineageHash }) as unknown as MigrationBaseAuthority;
+  const authority: MigrationBaseAuthority = Object.freeze({ kind: "migration", lineageHash }) as MigrationBaseAuthority;
   return {
     authority,
     lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
@@ -28,8 +28,10 @@ export function adoptLegacyManifestRepoBase(candidate: GitSection | undefined): 
   const proof = migrationRepoBaseProof();
   const composed = composeRepoBase({}, candidate === undefined ? {} : { base: candidate },
     proof.authority, proof.lockedProof);
-  return {
-    ...(composed.base === undefined ? {} : { base: composed.base }),
-    ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
-  };
+  // Each member stays ABSENT rather than present-and-undefined: this value is
+  // serialized, and an explicit `undefined` would surface as a written member.
+  const adopted: RepoBaseValue = {};
+  if (composed.base !== undefined) adopted.base = composed.base;
+  if (composed.branchBaseOrigins !== undefined) adopted.branchBaseOrigins = composed.branchBaseOrigins;
+  return adopted;
 }

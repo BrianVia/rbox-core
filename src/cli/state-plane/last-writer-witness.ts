@@ -4,6 +4,7 @@ import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
+import { jsonObject, jsonText, type JsonValue } from "../../json.js";
 import type { OwnedLock } from "../../engine/lockfile.js";
 import { semverGt } from "../semver.js";
 import { RBOX_VERSION } from "../version.js";
@@ -55,31 +56,27 @@ export type WitnessVerdict =
         | "writer-version-below-floor";
     };
 
-const isSafeInt = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value);
+/** Signed on purpose: `stateMtimeMs` and the two identity numbers are whatever
+ * the filesystem reported, not counters, so the bound is safe-integer alone. */
+const isSafeInt = (value: JsonValue | undefined): value is number => Number.isSafeInteger(value);
 
 /** Parse the closed schema. Any unknown member, missing member, or wrong type is
  * a foreign witness, not a witness with extras. */
 export function parseLastWriterWitness(text: string): LastWriterWitness | undefined {
-  let raw: unknown;
+  let raw: JsonValue;
   try {
     raw = JSON.parse(text);
   } catch {
     return undefined;
   }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  if (!jsonObject(raw)) return undefined;
   const keys = Object.keys(raw).sort().join("\0");
   if (keys !== [...WITNESS_KEYS].sort().join("\0")) return undefined;
-  const version: unknown = Reflect.get(raw, "version");
-  const writerVersion: unknown = Reflect.get(raw, "writerVersion");
-  const stateBodySha256: unknown = Reflect.get(raw, "stateBodySha256");
-  const writtenAtMs: unknown = Reflect.get(raw, "writtenAtMs");
-  const stateSizeBytes: unknown = Reflect.get(raw, "stateSizeBytes");
-  const stateMtimeMs: unknown = Reflect.get(raw, "stateMtimeMs");
-  const stateDev: unknown = Reflect.get(raw, "stateDev");
-  const stateIno: unknown = Reflect.get(raw, "stateIno");
+  const { version, writerVersion, stateBodySha256 } = raw;
+  const { writtenAtMs, stateSizeBytes, stateMtimeMs, stateDev, stateIno } = raw;
   if (version !== 1) return undefined;
-  if (typeof writerVersion !== "string" || writerVersion.length > 40) return undefined;
-  if (typeof stateBodySha256 !== "string" || !/^[0-9a-f]{64}$/.test(stateBodySha256)) return undefined;
+  if (!jsonText(writerVersion) || writerVersion.length > 40) return undefined;
+  if (!jsonText(stateBodySha256) || !/^[0-9a-f]{64}$/.test(stateBodySha256)) return undefined;
   if (!isSafeInt(writtenAtMs) || !isSafeInt(stateSizeBytes) || !isSafeInt(stateMtimeMs)
     || !isSafeInt(stateDev) || !isSafeInt(stateIno)) return undefined;
   return { version, writerVersion, writtenAtMs, stateBodySha256, stateSizeBytes, stateMtimeMs, stateDev, stateIno };
@@ -116,7 +113,8 @@ export async function recordLastWriterWitness(
     if (heldLock && path.resolve(heldLock.path) !== path.resolve(stateLockPath(root))) {
       throw new StateWriteRefusedError("state-lock-unavailable", statePath, "held lock has the wrong canonical path");
     }
-    const body = typeof publishedBytes === "string" ? Buffer.from(publishedBytes, "utf8") : Buffer.from(publishedBytes);
+    // `Buffer.from` already decodes a string as utf8 and copies a Uint8Array.
+    const body = Buffer.from(publishedBytes);
     const sample = await sampleStateFile(statePath);
     if (!sample) return undefined;
     const { stat } = sample;
