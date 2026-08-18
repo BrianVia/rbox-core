@@ -56,12 +56,16 @@ export async function publishWholeState(file: string, body: string, lock: OwnedL
 export async function afterStatePublication(
   root: string,
   file: string,
-  stream: string,
+  // `SyncState.stream` is declared required, but a legacy document decoded from
+  // disk can lack it entirely, and a streamless state is pinned behaviour
+  // (telemetry/sync-state.test.ts T14). The reserve is stream-scoped, so such a
+  // state simply has none.
+  stream: string | undefined,
   body: string,
   heldLock?: OwnedLock,
 ): Promise<void> {
   await recordLastWriterWitness(root, file, body, Date.now, heldLock);
-  if (stream.length > 0) {
+  if (stream !== undefined && stream.length > 0) {
     await ensureStateReserve(root, stream).catch(() => undefined);
   }
 }
