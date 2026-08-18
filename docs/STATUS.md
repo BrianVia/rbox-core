@@ -1,13 +1,54 @@
 # rbox status — living state snapshot
 
-## 2026-08-18 — state migration executor retired
+## 2026-08-18 (overnight) — perf cycle 277 SHIPPED + architecture loop COMPLETE (12/12, map deleted)
 
-- Design 262 SP-4 executed after the founder support-window sign-off: the
-  completed JSON→SQLite migration tree, `rbox migrate`, its two doctor mutation
-  flags, the upgrade stub, snapshot automation, the migration-only rig leg, and transient
-  importer/lock modes are gone. Legacy JSON authority remains live pending its
-  separate refusal slice; fresh genesis, SQLite/reset safety, reserve, witness,
-  and BASE-adoption behavior remain covered.
+- **Design 277 shipped both slices** (ALIGNED r4 after 2 parallel reviews +
+  final serial per slice, plus a founder-ordered /step-out-a-layer pass that
+  replaced three invented mechanisms with existing primitives — both
+  implementation-review blockers dissolved instead of patched):
+  - **PR #776 (Slice B, #477 CLOSED)**: pull-only daemons start the live
+    watcher; "pull-only" collapsed to publish-suppression only (design-178
+    fullScan-drop + hygiene-tick split deleted); watch-queue overflow = a
+    synthetic transient drop episode through watcherTrust (no latch
+    protocol); pull-side event drain moved above the P-chain (latent
+    read-write inversion fixed). FM's FIRST-EVER trusted pulls at 03:14Z.
+  - **PR #778 (Slice A, #661 build half)**: memoized `loadState` at the one
+    adapter choke point (state-memo.ts, 82 lines, zero call-site changes) —
+    the steady push cycle did FIVE full O(N) state materializations (the
+    design counted 4; a boundary binding-fence load was the fifth), now 1
+    cold / 0 warm. Four-column freshness probe {authority, lineage, nonce,
+    revision, telemetry_binding_id}; aliasing precondition proven by a true
+    recursive deep-freeze over the full suite (RBOX_STATE_FREEZE=1 guard
+    ships); per-column stale-token witnesses; allowlisted mutator audit;
+    RBOX_STATE_LOAD_CACHE=0 kill switch (deletion: two clean fleet weeks).
+- **First fleet numbers (fleet on 9fb37fb, ~15min samples; overnight soak
+  running)**: desktop zero-change push **7.4s → 1.6s**; Mac **6.6 → 2.6-3.4s**
+  (git-plan 2.2-2.9s is now the whole push); FM pull **51-63s → 38-48s**
+  with the 10-17s scan leg at 0.0 (`local=trusted`). Content push 17→12.2s
+  (commit 4.6s = next lever). Remaining FM poles filed as **#775**
+  (deferred-repo bundle refetch 12-17s/pull + 11-12s cas acquire).
+- **Architecture loop DONE 12/12**: founder signed off #42 + map deletion
+  ("we're trying to make our code so simple it doesn't need a map").
+  **PR #779**: migration tree retired — 56 files, **−19,108 lines**, 3 CLI
+  commands gone (`rbox migrate`, doctor retry/abort), 5 live modules rehomed
+  (move-fidelity audited), anti-slop 1,777→1,585. Doctor's `migration`
+  check renamed `genesis` (v2-beta window). Legacy JSON authority KEPT
+  (design 262 §2 refusal gate = queued separate slice). **PR #780**:
+  docs/CODEMAP.md DELETED — 346 entries judged: 168 constraints moved into
+  their modules as `Never:` headers, 158 navigation lines died, 20 already
+  present; AGENTS.md law inverted (constraint lives in the module).
+  Gates caught 3 real defects en route (streamless-legacy crash from an
+  anti-slop typeof removal — fixed by honest typing; Bun exit-0-on-fail
+  quirk re-confirmed; #778 mutator-audit staleness across branches).
+- **Fleet**: all 3 hosts on 2.0.0-beta.4-dev+9fb37fb, all 3 with LIVE
+  watchers (desktop needed a second restart — its first watcher arm raced a
+  codex worktree teardown and degraded wholesale on ENOENT; papercut filed
+  32c0c34c9). FM overnight soak running; morning owes: soaked perf
+  differential (both lanes, 3 hosts), fleet re-roll onto the post-deletion
+  build, #661 close decision (target: push op 4-5s — met at 1.6-3.4s).
+- Open next: #775 (FM refetch, biggest remaining e2e pole), design 262 §2,
+  Mac git-plan slimming (measured decision), 274 PR-B (visible device
+  names) once the stamp bakes.
 
 ## 2026-08-17 (evening) — must-ship arc: 274 PR-A + 276 both halves SHIPPED
 
