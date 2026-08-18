@@ -1,9 +1,23 @@
 # 277 — One state load per operation (+cross-cycle reuse) and the pull-only watcher
 
-Status: ALIGNED r3 (codex delta-confirm 2026-08-17; 2 parallel reviews + final serial + delta) · Closes the build half of #661; closes #477.
+Status: r4 STEP-OUT (founder-ordered simplification pass 2026-08-17, post-ALIGNED-r3, during implementation review) · Closes the build half of #661; closes #477.
 r1 → r2: folded two independent REVISE reviews (codex gpt-5.6-sol + opus).
 r2 → r3: folded final serial review (probe columns confirmed sufficient;
 receipt reshaped to evidence-carrying; enqueue-time cap; audit reshaped).
+r3 → r3.1: implementation-review amendment (safety-tick + pull-exclusive
+latch) — SUPERSEDED by r4.
+r3 → r4: step-out-a-layer. Three mechanisms replaced by stronger existing
+primitives; both implementation-review blockers dissolve (their guarded
+states stop existing) instead of being patched:
+- A: the evidence-carrying receipt + per-call-site preload threading →
+  ONE memoizing `loadState` in the shared adapter (§A1').
+- B: the overflow latch protocol → a synthetic watcher DROP EPISODE into
+  the existing trust machine (§B3').
+- B: the pull-only fullScan drop + hygiene-only tick split (design-178
+  vintage, rationale predates the watcher) → deleted; pull-only collapses
+  to publish-suppression only (§B2').
+Gated on two empirical checks (§A1' aliasing freeze-run; §B2' degraded-mode
+consequence check) — either failing reverts that slice to the r3 mechanism.
 Baseline: docs/design/data/277-baseline-2026-08-17.md (field capture, fleet on
 2.0.0-beta.4-dev+505738e). All daemon anchors are src/cli/daemon/daemon.ts.
 
@@ -59,7 +73,39 @@ transition keeps updating the same slot. `loadSyncBase`'s two side effects —
 load-bearing for design-206 P7 re-baselining) — run on every path, reuse or
 reload.
 
-### A1. Thread the boundary's state through the push operation (×4 → ×1)
+### A1'. r4 mechanism: memoize `loadState` at the adapter (supersedes A1+A2 below)
+
+The r3 receipt/threading solved "callers can't trust in-memory state" at
+every call site. r4 solves it at the source: all four loads, the pull lane,
+and CLI one-shots already pass through ONE adapter —
+`loadState` (state-plane/adapters/whole-state-compat.ts). Memoize there:
+
+- Per-root memo `{state, probeToken}`, probeToken =
+  {authority, active_lineage_id, state_nonce, state_revision,
+  telemetry_binding_id} (the r3-confirmed sufficient column set).
+- Every `loadState` call runs authority selection, genesis admission under
+  a held mutex, and `recoverStandingResetJournal` exactly as today; then a
+  one-row probe read (never `immutable=1`). Token match ⇒ return the
+  memoized state; mismatch ⇒ full materialization + memo refresh.
+- Save-through: the adapter's save path refreshes the memo from the
+  accepted state it already returns.
+- Unconditional invalidation: reset-journal recovery, authority change,
+  `stateWasStreamMismatch`. Legacy JSON authority is never memoized.
+- Kill switch `RBOX_STATE_LOAD_CACHE=0` (default-on).
+- Zero call-site changes; no PushResult/receipt types; span vocabulary
+  untouched (state-load reads ~0.0 on hits).
+- **Gate (empirical, blocks this mechanism):** returned-state aliasing —
+  deep-freeze the memoized state under the daemon+push+pull suites; any
+  in-place mutation of a loaded SyncState surfaces as a throw. A mutator
+  found ⇒ report and fall back to the r3 mechanism (a structural clone
+  would eat the win; fixing the mutator is its own decision).
+- The mutator-audit test, telemetry negative control, and the counting
+  test (4 cold → 1 per cold cycle → 0 warm) carry over unchanged in
+  intent; single-use/receipt-path tests are obsolete.
+
+The r3 §A1/§A2 text below is retained as the recorded fallback mechanism.
+
+### A1. [r3 fallback] Thread the boundary's state through the push operation (×4 → ×1)
 
 The boundary load (daemon.ts:1625, mutex held from
 daemon-operation-scheduler.ts:380 to :415) becomes the cycle's only
@@ -205,7 +251,50 @@ Collapse the mode branch at daemon.ts:950-956: every non-scoped boot runs
 daemon.ts:987-991). The ready line self-corrects (:974-978 keys off watcher
 presence). P1 becomes satisfiable; FM's 10–17s scan leg dies.
 
-### B2. Fused re-arm witness must reach fullScan — via a pumped request
+### B2'. r4 mechanism: pull-only collapses to publish-suppression (supersedes B2 + the B3 safety-tick rulings)
+
+Archaeology: the pull-only `fullScan` drop and the hygiene-only safety-tick
+routing arrived with design 178, when pull-only daemons had no watcher —
+every pull ran its own scan, so safety scans were pure duplication. That
+rationale is dead the moment B1 gives pull-only a watcher. Rather than
+tunnel exceptions through the mode filter (the r3 witness method, the r3.1
+safety-tick amendment), delete the incidental mode branches:
+
+- `request()`: pull-only drops ONLY `push`. `fullScan`/`deepScan` route
+  normally.
+- Safety tick: no mode branch — everyone requests `fullScan` (pruned and
+  cheap under a trusted watcher, exactly read-write's profile). Deferral
+  hygiene keeps running via deep-scan execution (pinned by test).
+- The supervisor's re-arm witness stays plain `request("fullScan")` — now
+  mode-independent for free, and it keeps the mutex early-reprobe.
+- Pull-only is then: `requestPush` no-op, push-halt suspension, key-release
+  opt-in, boot log. One concept: publishing is suppressed.
+- **Consequence (named trade):** DEGRADED watcherless pull-only now pays
+  read-write's unpruned safety-scan cadence — convergence with read-write's
+  degraded mode; cost measured and named in the PR body (empirical check:
+  cadence under `watcherLive=false`, and that `doFullScan`'s tail is safe
+  under `requestPush` no-op).
+- Drop-event healing bound for pull-only becomes read-write's 60s–5m
+  (r3.1's fix falls out of the collapse instead of being a special case).
+
+### B3'. r4 mechanism: overflow is a watcher drop episode (supersedes the B3 latch)
+
+"The watcher lost events" is what `watcherTrust` already models. On enqueue
+saturation (cap 65,536): clear the queue, log once, and report a synthetic
+drop episode through the trust machine's existing transient-failure path.
+Everything the latch protocol hand-built follows from existing machinery:
+suspect ⇒ P1 false ⇒ scan-backed pulls ⇒ supervisor re-arm ⇒ witnessed
+full-tree scan ⇒ re-trust. A push after a drop publishes a briefly-stale
+view — today's established watcher-drop failure class with today's healing
+(design 49 safety scans; now also on pull-only via §B2') — not a new
+invariant. This dissolves the r3 implementation-review blocker (push
+consuming the latch) because there is no latch to consume. The pull-side
+drain still moves above the P-chain (after the kill-switch gate — a
+disabled trust lane keeps its pre-202 shape, drain included).
+
+The r3 §B2/§B3 text below is retained as the recorded fallback mechanism.
+
+### B2. [r3 fallback] Fused re-arm witness must reach fullScan — via a pumped request
 
 Pull-only `request()` drops every `fullScan` (daemon.ts:1218-1227), but the
 fuse-recovery loop publishes re-trust ONLY from a witnessed full-tree scan
@@ -249,9 +338,21 @@ Fix, two parts (final review split them correctly):
   until the covering scan completes. Owner: the daemon's event intake;
   deletion condition: none (it is the overflow contract).
 
-Safety-tick ruling unchanged from r1: pull-only keeps hygiene-only ticks;
-`liveEnoughToSkipSafetyScan()` backing the hygiene cadence off toward 5m is
-accepted and named in the PR body. First pull after a large apply may skip
+[r3.1, superseded by §B2´ r4] Safety-tick ruling AMENDED at implementation review: the
+r1 "hygiene-only ticks" ruling predated B1 making the trusted view reachable
+in pull-only, and it left dropped watcher events healing only at the 30m
+deep scan (read-write hosts bound the same exposure at 60s–5m via pruned
+safety fullScans — design 49). Amended rule: a pull-only daemon whose
+watcher session is live routes its safety tick to a fullScan through the
+same mode-independent pumped seam as the B2 witness (pruned under a trusted
+watcher — same cost/healing profile as read-write); with no watcher session
+it keeps today's hygiene-only tick. Deferral hygiene keeps running via deep
+scans. `liveEnoughToSkipSafetyScan()` backing the cadence off toward 5m is
+accepted and named in the PR body. Overflow-latch consumption is
+PULL-EXCLUSIVE: the push prologue must never consume the latch — a
+read-write push that drained a saturated queue would publish a truncated
+manifest with no covering scan; on a set latch the push defers
+(retryLater) and requests the covering fullScan instead. First pull after a large apply may skip
 trusted (`p2-observation`/`p3-pending`) — self-clearing; accepted.
 
 ### B4. Scoped bindings — gate on the existing signal
