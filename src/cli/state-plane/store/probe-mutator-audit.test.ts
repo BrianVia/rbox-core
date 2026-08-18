@@ -84,22 +84,6 @@ const ALLOWLIST: ReadonlyMap<string, Mutator> = new Map([
       { file: "store/open.ts", coverage: "lineage-genesis", why: "store creation installs the lineage before anything can retain it" },
     ],
   }],
-  ["migration/import-install.ts::installLegacyState", {
-    statements: ["INSERT state_lineage", "INSERT store_meta", "INSERT plane_heads", "INSERT migration_completion"],
-    callers: [{ file: "migration/import-json.ts", coverage: "lineage-genesis", why: "the import installs a NEW lineage; nothing can read it before store_meta names it" }],
-  }],
-  ["migration/import-install.ts::installEntries", {
-    statements: ["INSERT entry_values", "INSERT plane_entries"],
-    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
-  }],
-  ["migration/import-install.ts::installRepos", {
-    statements: ["INSERT repo_records"],
-    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
-  }],
-  ["migration/import-install.ts::installManifestLayer", {
-    statements: ["INSERT global_manifest_meta", "INSERT manifest_chain", "INSERT manifest_git_sections"],
-    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
-  }],
   ["store/write-packet.ts::runTransaction", {
     statements: ["UPDATE state_lineage", "UPDATE state_lineage"],
     callers: [{ file: "<module-private>", coverage: "revision-bump", why: "the bump itself: nonce, revision and sequence move in one transaction" }],
