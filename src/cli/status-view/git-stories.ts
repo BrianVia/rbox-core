@@ -148,8 +148,12 @@ const SYNC_INTERRUPTED = story("sync-interrupted", {
   needsYou: false,
   action: SELF_HEALING,
 });
+// The artifact class has two causes and the headline must be true for both: the
+// download can fail, or it can succeed and still leave this repo unable to prove
+// its own copy is complete (design 278's connectivity class). Naming only the
+// download told the second half of the fleet something false about its own repo.
 const SYNC_DOWNLOAD_FAILED = story("sync-download-failed", {
-  headline: "rbox couldn't finish downloading the other computer's version — nothing here changed",
+  headline: "rbox couldn't put the other computer's version in place here — nothing here changed",
   needsYou: false,
   action: SELF_HEALING,
 });

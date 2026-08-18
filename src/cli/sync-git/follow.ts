@@ -197,11 +197,15 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (baseProjection !== undefined) checkoutInput.baseProjection = baseProjection;
     const checkout = await refTransaction.commitCheckout(checkoutInput);
     if (checkout.status === "defer") {
-      // Design 278 M1: a pre-commit checkout refusal published nothing, so the
-      // repository still stands at `trustedFingerprint` — the same bracket the
-      // classification-defer site uses. This is a NEW post-follow observation,
-      // never a resurrection of the attempt apply.ts shredded before the follow.
-      await opts.afterHeldClassification?.({
+      // Design 278 M1: ONLY the connectivity proof's typed code stores an
+      // attempt here. Every other checkout defer — above all a boundary race,
+      // whose `local-commits`/`worktree-ownership` reasons the held allowlist
+      // already admits on reason alone — must stay attempt-less so the next pull
+      // re-attempts it immediately instead of stalling to the hourly floor.
+      // The proof runs pre-commit and publishes nothing, so the repository still
+      // stands at `trustedFingerprint`; `observeHeldInputs` re-reads and refuses
+      // the store if anything moved, exactly like the two existing sites.
+      if (checkout.code === "connectivity-unproven") await opts.afterHeldClassification?.({
         phase: "defer",
         trustedFingerprint,
         effectiveBaseIndexProjection,

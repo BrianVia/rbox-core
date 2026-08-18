@@ -163,6 +163,31 @@ test("index-only checkout reserves unchanged symbolic HEAD with symref-verify", 
   expect(await git(repo, "write-tree")).toBe(await git(repo, "rev-parse", `${newOid}^{tree}`));
 });
 
+test("design 278: the real connectivity proof defers with the typed connectivity-unproven code", async () => {
+  // Every other case here injects `proof`, so this is the first exercise of the
+  // real `defaultConnectivityProof`. A planned root the object database does not
+  // have is exactly the field class: the proof fails before anything is
+  // published, and the ONE site that runs it mints the code the held-skip
+  // allowlist keys on.
+  const absentRoot = `${"0".repeat(39)}1`;
+  const headBefore = await git(repo, "rev-parse", "HEAD");
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    plannedGraphRoots: [newOid, absentRoot],
+  }), { capabilityProbe: supported, secondProof: proof });
+
+  expect(result).toEqual({
+    status: "defer",
+    reason: "planned graph connectivity proof failed",
+    code: "connectivity-unproven",
+  });
+  // The exact-equality above also pins the absence of `journalIntact`: this
+  // defer is pre-prepare, so no reservation exists for a journal to protect.
+  // Nothing moved — no ref, no HEAD, and the live index is byte-identical.
+  expect(await git(repo, "rev-parse", "HEAD")).toBe(headBefore);
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
+});
+
 test("design 116 checkout transaction commits detached HEAD", async () => {
   await git(repo, "checkout", "-q", "--detach", oldOid);
   const detachedIndex = await fs.readFile(path.join(ctx.gitDir, "index"));

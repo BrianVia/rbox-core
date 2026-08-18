@@ -24,6 +24,11 @@ export const gitOwnershipNoEscalateEnabled = (env: NodeJS.ProcessEnv = process.e
 export const gitHeldSkipComposerEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.RBOX_GIT_HELD_SKIP_COMPOSER !== "0";
 
+/** Design 278: gates the connectivity disjunct below. Owner: design 278.
+ * Deletion condition: two clean fleet weeks. */
+export const gitConnectivitySkipEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.RBOX_GIT_CONNECTIVITY_SKIP !== "0";
+
 export function sortedTypedBlockers(blockers: readonly TypedBlocker[]): TypedBlocker[] {
   const byKey = new Map<string, TypedBlocker>();
   for (const blocker of blockers) byKey.set(canonicalString(blocker), blocker);
@@ -51,6 +56,23 @@ export function composerHoldAllowsSkip(blocker: TypedBlocker): boolean {
     && (blocker.code === "missing-branch-proof" || blocker.code === "missing-safe-ref-proof");
 }
 
+/**
+ * "The checkout transaction's planned-graph connectivity proof failed" — a
+ * verdict about the LOCAL object database that re-running the follow reproduces
+ * exactly, after paying for the same bundle fetch, decrypt, and import. Nothing
+ * the receiver can do between two pulls of the SAME sequence changes it, so a
+ * repository in this state re-follows forever (design 278 §0).
+ *
+ * The match is by typed code, never by the human reason string: the two other
+ * producers of `reason:"artifact"` at this exit — the staging fetch/import
+ * failure and the follower-branch hold — mint no code and refuse here by
+ * construction. `HELD_SKIP_SAFETY_FLOOR_MS` is the sole liveness bound: a
+ * repaired object database is re-proved within the hour.
+ */
+export function connectivityHoldAllowsSkip(blocker: TypedBlocker): boolean {
+  return blocker.provenance === "boundary" && blocker.code === "connectivity-unproven";
+}
+
 export function heldBlockersAllowSkip(
   blockers: readonly TypedBlocker[],
   env: NodeJS.ProcessEnv = process.env,
@@ -62,7 +84,8 @@ export function heldBlockersAllowSkip(
       || blocker.reason === "local-operation"
       || blocker.reason === "deletion-pending"
       || (blocker.reason === "worktree-ownership" && gitOwnershipHeldSkipEnabled(env))
-      || (composerHoldAllowsSkip(blocker) && gitHeldSkipComposerEnabled(env)));
+      || (composerHoldAllowsSkip(blocker) && gitHeldSkipComposerEnabled(env))
+      || (connectivityHoldAllowsSkip(blocker) && gitConnectivitySkipEnabled(env)));
 }
 
 export function ownershipBlockersArePerRefOnly(blockers: readonly TypedBlocker[]): boolean {

@@ -1,7 +1,7 @@
 /** Never: construct branch inverses, classify checkout safety, recover journals, compose BASE, or persist sync state. */
 import crypto from "node:crypto";
 import path from "node:path";
-import { ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";
+import { ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutDeferCode, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";
 import { basePresentKeepRef } from "./base-artifacts.js";
 import { clearCheckoutJournal, markCheckoutJournalPublished, updateCheckoutJournal, writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
 import { tipOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
@@ -41,7 +41,8 @@ import { publishObservedRefPlane, type RefPlaneProgress } from "./ref-plane-publ
 import { origHeadPreservationFailureLine, preserveOrigHead, type OrigHeadPreservation } from "./orig-head.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
 
-export type CheckoutCommitReceipt = { status: "defer"; result: FollowResult }
+export type CheckoutCommitReceipt =
+  | { status: "defer"; result: FollowResult; code?: CheckoutDeferCode }
   | { status: "committed"; progress: FollowProgress; origHeadPreservation?: OrigHeadPreservation };
 
 export interface CheckoutCommitInput {
@@ -359,6 +360,10 @@ export class RefPlaneTransaction {
       }
       // The typed code is the ONLY carrier of the connectivity verdict; the
       // human reason stays a log string (design 278 M0).
+      // A boundary failure authors its own blockers, so the code is minted only
+      // when this site authors the blocker that would carry it. The receipt
+      // reports exactly the code that reached a blocker and nothing else.
+      const mintedCode = result.status === "defer" && !boundaryFailure ? result.code : undefined;
       const deferCode = result.status === "defer" ? result.code : undefined;
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
@@ -368,7 +373,7 @@ export class RefPlaneTransaction {
       const detail = result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
         ? "operation state differs at ORIG_HEAD"
         : boundaryFailure?.detail ?? result.reason;
-      return {
+      const receipt: CheckoutCommitReceipt = {
         status: "defer",
         result: {
           status: "defer",
@@ -377,10 +382,12 @@ export class RefPlaneTransaction {
           ...progress,
           blockers: [
             ...progress.blockers,
-            ...(boundaryFailure?.blockers ?? [blockerForReason(reason, "boundary", result.reason, deferCode)]),
+            ...(boundaryFailure?.blockers ?? [blockerForReason(reason, "boundary", result.reason, mintedCode)]),
           ],
         },
       };
+      if (mintedCode) receipt.code = mintedCode;
+      return receipt;
     }
     if (this.checkoutBranchPlan) {
       if (!checkoutBranchLockedProof) throw new Error("checkout branch committed without locked proof receipt");
