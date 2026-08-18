@@ -25,7 +25,7 @@ interface MemoEntry { token: StateFreshnessToken; state: SyncState }
 
 const MEMO = new Map<string, MemoEntry>();
 
-export const stateMemoEnabled = (): boolean => process.env.RBOX_STATE_LOAD_CACHE !== "0";
+const stateMemoEnabled = (): boolean => process.env.RBOX_STATE_LOAD_CACHE !== "0";
 
 function sameToken(left: StateFreshnessToken, right: StateFreshnessToken): boolean {
   return left.authorityId === right.authorityId
