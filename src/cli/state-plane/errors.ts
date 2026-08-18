@@ -1,5 +1,4 @@
 import path from "node:path";
-import type { MigrationHalt } from "./migration/health.js";
 
 /** A caller selected a different manifest stream than the durable baseline. */
 export class StreamMismatchError extends Error {
@@ -46,8 +45,7 @@ export type StateWriteRefusalReason =
   | "state-lock-lease-lost"
   /** Unlockable filesystem, and the target is not recognizable legacy JSON. */
   | "state-unlocked-foreign-target"
-  /** A migration control blocks writes, or an unretired genesis intent survives:
-   * authority recovery has not finished. One policy, one reason (design 222 §1.3). */
+  /** An unretired genesis intent survives, so authority recovery has not finished. */
   | "authority-recovery-pending";
 
 /** A state publication was refused rather than attempted unlocked or blind.
@@ -61,23 +59,21 @@ export class StateWriteRefusedError extends Error {
   }
 }
 
-const REFUSAL_MESSAGES: Record<StateWriteRefusalReason, string> = {
+const REFUSAL_MESSAGES = {
   "authority-uninitialized": "this folder has no sync-record authority yet; refusing to create legacy state outside genesis admission",
   "state-lock-unavailable": "another rbox process is saving this folder's sync records; refusing to save over it",
   "state-lock-error": "this folder's sync-record lock could not be checked; refusing to save without it",
   "state-lock-lease-lost": "this folder's sync-record lock was lost mid-save; refusing to publish",
   "state-unlocked-foreign-target": "this folder's sync records are not in a format this rbox wrote; refusing to replace them",
   "authority-recovery-pending": "this folder's sync records are mid-recovery onto the new format; refusing to write until it finishes",
-};
+} satisfies Record<StateWriteRefusalReason, string>;
 
 /**
  * `.rbox/state.json` says SQLite is authority, but the database that claim
  * names is absent, incomplete, foreign, or carries a different authority id.
  *
- * Deliberately not a `MigrationHaltCode`: a halt is a suspended protocol that
- * doctor may retry, and this is contradictory durable state that rbox will not
- * repair automatically at all. Zero repair writes, never retryable; the remedy
- * is re-adoption (design 163 M0 matrix, design 222 §6.4).
+ * This is contradictory durable state that rbox will not repair automatically.
+ * Zero repair writes, never retryable; the remedy is re-adoption.
  */
 export class StateAuthorityCorruptError extends Error {
   readonly name = "StateAuthorityCorruptError";
@@ -86,50 +82,6 @@ export class StateAuthorityCorruptError extends Error {
       `${file} says this workspace uses the new state format, but its state database is missing or does not match (${detail}). ` +
       "rbox has changed nothing and will not try to repair this automatically.",
     );
-  }
-}
-
-export type MigrationControlErrorReason =
-  /** Unknown, extra, missing, mistyped, or noncanonical member bytes. */
-  | "schema"
-  /** A control path holds something rbox did not write: a symlink, a directory,
-   * an unreadable or over-cap file, or a sibling that is not this exact record. */
-  | "foreign"
-  /** The canonical control was not the exact record the publisher expected. */
-  | "cas"
-  /** A prepared sibling is not the exact inode/length/hash/bytes it recorded. */
-  | "prepared-foreign"
-  /** The published record did not read back as the exact bytes just renamed. */
-  | "reread";
-
-/** The durable migration control could not be read, trusted, or replaced. Every
- * reason is a zero-write refusal: the caller classifies it as corruption, never
- * as something to repair forward. */
-export class MigrationControlError extends Error {
-  readonly name = "MigrationControlError";
-  constructor(readonly reason: MigrationControlErrorReason, detail: string) {
-    super(`migration control ${reason}: ${detail}`);
-  }
-}
-
-/**
- * A phase body refuses, carrying the exact halt the driver must publish.
- *
- * The halt taxonomy is closed and the durable record is the driver's to write
- * (163's "a failed halt publication is the final mutation of the trace"), so a
- * phase body names its halt and raises — it never publishes one itself, and it
- * never returns a value that a caller could mistake for progress. `wrote` is
- * the one fact the driver cannot recompute: whether this refusal happened
- * before any artifact mutation, which is what the zero-write rows assert.
- */
-export class MigrationPhaseHaltError extends Error {
-  readonly name = "MigrationPhaseHaltError";
-  constructor(
-    readonly halt: MigrationHalt,
-    readonly wrote: boolean,
-    detail: string,
-  ) {
-    super(`migration halt ${halt.code}: ${detail}`);
   }
 }
 
@@ -209,20 +161,6 @@ export class TransitionRowOversizeError extends Error {
   readonly name = "TransitionRowOversizeError";
   constructor(readonly relPath: string, readonly canonicalBytes: number, readonly retainedEstimate: number) {
     super(`transition row ${relPath} exceeds transition-stage limits (${canonicalBytes} canonical, ${retainedEstimate} retained bytes)`);
-  }
-}
-
-/**
- * A stage tried to tag itself as the migration importer without presenting the
- * state-plane migration capability. That tag is what makes blanket `migration`
- * BASE authority admissible on re-admission — after canonical-JSON round trip a
- * minted authority and a forged one are indistinguishable, so the tag, not the
- * proof shape, is the thing that has to be unforgeable.
- */
-export class MigrationImporterCapabilityError extends Error {
-  readonly name = "MigrationImporterCapabilityError";
-  constructor(readonly detail: string) {
-    super(`a migration-tagged transition stage requires the state-plane migration capability: ${detail}`);
   }
 }
 

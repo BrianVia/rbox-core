@@ -13,8 +13,8 @@ import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
 import type { OwnedLock } from "../../../engine/lockfile.js";
 import { assertStatePublishable } from "../authority-marker.js";
 import { StateWriteRefusedError } from "../errors.js";
-import { ensureStateReserve } from "../migration/reserve.js";
-import { recordLastWriterWitness } from "../migration/last-writer-witness.js";
+import { ensureStateReserve } from "../reserve.js";
+import { recordLastWriterWitness } from "../last-writer-witness.js";
 
 /**
  * Publish `body` as the whole state document at `file`. `lock` is the state lock
@@ -50,7 +50,7 @@ export async function publishWholeState(file: string, body: string, lock: OwnedL
 
 /**
  * Post-publication obligations of every barrier-era writer: record the witness
- * for the bytes just published, and make sure the migration reserve exists.
+ * for the bytes just published, and make sure the state reserve exists.
  * Neither may fail a state write that is already durable.
  */
 export async function afterStatePublication(
@@ -61,7 +61,7 @@ export async function afterStatePublication(
   heldLock?: OwnedLock,
 ): Promise<void> {
   await recordLastWriterWitness(root, file, body, Date.now, heldLock);
-  if (typeof stream === "string" && stream.length > 0) {
+  if (stream.length > 0) {
     await ensureStateReserve(root, stream).catch(() => undefined);
   }
 }

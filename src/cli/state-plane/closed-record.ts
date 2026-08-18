@@ -1,14 +1,12 @@
 /**
  * The strict reader every closed state-plane record shares.
  *
- * Design 163 and 222 specify three durable records — the migration control
- * (163:2627), its retirement union, and the genesis intent (222 §2.3) — with
- * one admission rule: unknown, extra, missing, or mistyped members REJECT.
- * That rule is the same code every time, so it is written once here and each
- * record supplies only its own shape and its own refusal error.
+ * Genesis intent uses one admission rule: unknown, extra, missing, or mistyped
+ * members REJECT. The generic shape walker keeps that rule explicit and local.
  *
  * Pure: no filesystem, no SQLite, no paths.
  */
+import { jsonCounter, jsonObject, jsonText, type JsonObject, type JsonValue } from "../../json.js";
 
 /** A record-minted identifier that is interpolated into a filesystem path
  * template. Bounded, and free of `/`, `.`, and every other character that could
@@ -21,7 +19,7 @@ export type Fields = Readonly<Record<string, Spec>>;
 export type Spec =
   | "string" | "id" | "int" | "hex" | "hex32" | "digits"
   | { readonly oneOf: readonly string[] }
-  | { readonly const: unknown }
+  | { readonly const: JsonValue }
   | { readonly opt: Spec }
   | { readonly list: Spec }
   | { readonly each: Spec }
@@ -39,19 +37,17 @@ export const tagged = (on: string, cases: Readonly<Record<string, Fields>>): Spe
   },
 });
 
-export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse): void {
-  const plain = (v: unknown, where: string): object =>
-    typeof v === "object" && v !== null && !Array.isArray(v)
-      ? v
-      : bad(where, "is not an object");
+export function checkRecord<T = JsonValue>(value: JsonValue, spec: Spec, at: string, bad: Refuse): asserts value is JsonValue & T {
+  const plain = (candidate: JsonValue, where: string): JsonObject =>
+    jsonObject(candidate) ? candidate : bad(where, "is not an object");
   const v = value;
-  if (spec === "string") { if (typeof v !== "string" || v.length === 0) bad(at, "is not a nonempty string"); return; }
-  if (spec === "id") { if (typeof v !== "string" || !RECORD_ID.test(v)) bad(at, "is not a path-safe identifier"); return; }
-  if (spec === "int") { if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) bad(at, "is not a nonnegative safe integer"); return; }
-  if (spec === "hex") { if (typeof v !== "string" || !/^[0-9a-f]{64}$/.test(v)) bad(at, "is not 64 lowercase hex characters"); return; }
-  if (spec === "hex32") { if (typeof v !== "string" || !/^[0-9a-f]{32}$/.test(v)) bad(at, "is not 32 lowercase hex characters"); return; }
-  if (spec === "digits") { if (typeof v !== "string" || !/^[0-9]+$/.test(v)) bad(at, "is not decimal digits"); return; }
-  if ("oneOf" in spec) { if (!spec.oneOf.includes(v as string)) bad(at, `is not one of ${spec.oneOf.join("|")}`); return; }
+  if (spec === "string") { if (!jsonText(v) || v.length === 0) bad(at, "is not a nonempty string"); return; }
+  if (spec === "id") { if (!jsonText(v) || !RECORD_ID.test(v)) bad(at, "is not a path-safe identifier"); return; }
+  if (spec === "int") { if (jsonCounter(v) === undefined) bad(at, "is not a nonnegative safe integer"); return; }
+  if (spec === "hex") { if (!jsonText(v) || !/^[0-9a-f]{64}$/.test(v)) bad(at, "is not 64 lowercase hex characters"); return; }
+  if (spec === "hex32") { if (!jsonText(v) || !/^[0-9a-f]{32}$/.test(v)) bad(at, "is not 32 lowercase hex characters"); return; }
+  if (spec === "digits") { if (!jsonText(v) || !/^[0-9]+$/.test(v)) bad(at, "is not decimal digits"); return; }
+  if ("oneOf" in spec) { if (!jsonText(v) || !spec.oneOf.includes(v)) bad(at, `is not one of ${spec.oneOf.join("|")}`); return; }
   if ("const" in spec) { if (v !== spec.const) bad(at, `is not ${JSON.stringify(spec.const)}`); return; }
   if ("opt" in spec) { if (v !== null) checkRecord(v, spec.opt, at, bad); return; }
   if ("list" in spec) {
@@ -64,8 +60,8 @@ export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse)
     return;
   }
   if ("union" in spec) {
-    const tag: unknown = Reflect.get(plain(v, at), spec.union.on);
-    const fields = typeof tag === "string" ? spec.union.cases[tag] : undefined;
+    const tag = plain(v, at)[spec.union.on];
+    const fields = jsonText(tag) ? spec.union.cases[tag] : undefined;
     if (!fields) bad(`${at}.${spec.union.on}`, `is not one of ${Object.keys(spec.union.cases).join("|")}`);
     return checkRecord(v, { fields: fields! }, at, bad);
   }
@@ -74,7 +70,8 @@ export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse)
   for (const key of Object.keys(o)) if (!keys.includes(key)) bad(at, `has unknown member ${JSON.stringify(key)}`);
   for (const key of keys) {
     if (!(key in o)) bad(at, `is missing ${JSON.stringify(key)}`);
-    const member: unknown = Reflect.get(o, key);
+    const member = o[key];
+    if (member === undefined) return bad(at, `is missing ${JSON.stringify(key)}`);
     checkRecord(member, spec.fields[key]!, `${at}.${key}`, bad);
   }
 }

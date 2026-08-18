@@ -73,8 +73,9 @@ constructor); admission in `base-proof-selection.ts`; persisted in
 
 Every composition names one **authority** (`ComposeRepoBaseAuthority`:
 `pull-ref-transaction`, `pull-carry`, `observed-landing`, `journal-recovery`,
-`publisher-ack`, `manual`, `p-repair`, plus a branded `migration` kind mintable
-only in `state-plane/migration/`). Serialized BASE is a materialized view:
+`publisher-ack`, `manual`, `p-repair`, plus a historical branded `migration`
+kind whose only mint remains in `state-plane/base-proof.ts`; live transition
+stages reject that retired authority. Serialized BASE is a materialized view:
 readers first overlay valid base-absent artifacts under
 `refs/rbox-local/base-absent/` (`src/cli/sync-git/base-artifacts.ts`), and a valid
 one beats stale serialized presence. A bad ref yields a `RepoBaseHardHold` →
@@ -271,7 +272,7 @@ Other admission points, each separately owned: E2EE roster admission grants
 (client-owned; the server stores the material verbatim and never parses it),
 `/v1/keys/admit` version monotonicity, pairing-token material, **folder
 admission** (`admitted | unbound | missing | detached | damaged | ambiguous`),
-state-plane migration admission, reset memory admission, transition/stage
+state-plane genesis admission, reset memory admission, transition/stage
 admission, and watcher admission (native prune globs — the one best-effort,
 non-fencing use).
 

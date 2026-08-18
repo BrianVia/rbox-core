@@ -1,30 +1,17 @@
-/**
- * The durable last-writer witness (design 163, unit B0, closure 1b).
- *
- * `SyncState` has no version member and must not grow one: a new member is
- * silently dropped by older binaries and by the degraded composer, so it could
- * never prove anything about the writer that wrote last. The witness therefore
- * lives beside the state, in a closed-schema sidecar, and records the body hash
- * of the exact bytes that were published.
- *
- * It is never authority and is never read by the sync engine. Its sole consumer
- * is a future migration's admission check, which must be able to prove that the
- * document on disk right now was published by a barrier-capable binary.
- */
+/** Durable proof of the exact legacy JSON bytes and barrier-capable writer last published. */
 import crypto from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
-import type { OwnedLock } from "../../../engine/lockfile.js";
-import { semverGt } from "../../semver.js";
-import { RBOX_VERSION } from "../../version.js";
-import { RBOX_DIR } from "../../workspace-config.js";
-import { StateWriteRefusedError } from "../errors.js";
-import { stateLockPath } from "../paths.js";
+import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
+import type { OwnedLock } from "../../engine/lockfile.js";
+import { semverGt } from "../semver.js";
+import { RBOX_VERSION } from "../version.js";
+import { RBOX_DIR } from "../workspace-config.js";
+import { StateWriteRefusedError } from "./errors.js";
+import { stateLockPath } from "./paths.js";
 
-/** The ratified downgrade floor: the first release whose writers maintain this
- * witness. A workspace whose most recent writer predates it is not migratable. */
+/** The first release whose legacy JSON writers maintain this witness. */
 export const BARRIER_DOWNGRADE_FLOOR = "1.11.0";
 const WITNESS_MAX_BYTES = 4 * 1024;
 /** Matches the reset materialization bound the state readers already apply. */

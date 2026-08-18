@@ -1,6 +1,5 @@
 /** File-level state-authority observation, ordinary SQLite genesis admission,
- * and the state-plane write fence. Explicit migration has its own command owner;
- * this module never dispatches between genesis and migration. */
+ * and the state-plane write fence. */
 import { randomBytes } from "node:crypto";
 import type { LockUnsupportedReason } from "../../engine/lockfile.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";

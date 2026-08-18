@@ -6,7 +6,7 @@
  *
  *   1. `state` — the live sync records, in EITHER format (163 §C4).
  *   2. `upgrade reserve` — the reserved 1 MiB of runway.
- *   3. `migration` — a conversion that is suspended, interrupted, or unfinished.
+ *   3. `genesis` — fresh SQLite setup that did not finish.
  *
  * The words all three speak come from `state-plane-copy.ts`, whose exhaustive
  * `satisfies` clauses are the merge gate; `state-plane-report.ts` turns a typed
@@ -22,10 +22,7 @@ import { classifyStateFormat } from "./state-plane/authority-marker.js";
 // binary that is already current — the one thing a doctor must never do.
 import { loadRawState } from "./state-plane/adapters/whole-state-compat.js";
 import { readGenesisIntent } from "./state-plane/genesis-intent.js";
-import { readCanonicalControl } from "./state-plane/migration/control-publication.js";
 import { statePath } from "./state-plane/paths.js";
-import { MIGRATION_STEP_COPY } from "./state-plane-copy.js";
-import { describeMigrationHalt } from "./state-plane-report.js";
 import {
   inspectStateReserve, StateAuthorityCorruptError, StateFormatTooNewError,
 } from "./state-plane/index.js";
@@ -101,83 +98,30 @@ export async function checkStateReserve(root: string, cfg: WorkspaceConfig): Pro
 }
 
 /**
- * The `migration` check: is a conversion of this workspace's sync records
- * suspended, interrupted, or unfinished?
- *
- * READ-ONLY and file-level. It reads the canonical control record and the
- * genesis intent — both plain files — and never classifies artifacts, never
- * takes a lock, and never opens a database. 163 v13's rule is that a read-only
- * SQLite open is not zero-write, and doctor is the surface a worried user runs
- * most, so it is the last place that should deposit sidecars.
- *
- * Every message comes from `state-plane-report.ts`, so what doctor prints about
- * a halt and what `rbox migrate` printed when it hit that halt are the same
- * sentences.
+ * Report an unfinished fresh-workspace SQLite setup without opening SQLite.
  */
-export function checkStateMigration(root: string): DoctorCheck {
-  const control = read(() => readCanonicalControl(root));
-  if (control?.halt) {
-    const report = describeMigrationHalt(root, control.halt, true, control);
-    return {
-      ok: report.ok,
-      label: "migration",
-      status: report.finding.id,
-      // The check LINE carries what happened plus the facts it names; the safety
-      // answer and the one command belong to the triage finding, which is the
-      // surface a non-developer actually reads. Duplicating them into a
-      // paragraph-long check line would push the other checks off the screen.
-      message: [report.finding.problem, ...report.facts].join(" "),
-      ...(report.finding.command === undefined ? {} : { hint: report.finding.command }),
-      finding: report.finding,
-    };
-  }
-  if (control) {
-    // "Interrupted" would be a LIE while a conversion is running: doctor takes no
-    // lock, so an unhalted control is equally the record of a migration in
-    // progress in another process and one a crash abandoned. Doctor cannot tell
-    // them apart without the exclusivity it deliberately does not take, so it
-    // says what it observed — a conversion is part-way — and lets the remedy be
-    // safe in both readings. `rbox migrate` on a live one refuses
-    // `migration-not-exclusive`; on an abandoned one it resumes.
-    return {
-      ok: false,
-      label: "migration",
-      status: "state-migration/in-progress",
-      // The phase name is an internal noun; `MIGRATION_STEP_COPY` is the same
-      // fact in the words the progress renderer already uses.
-      message: `converting this workspace's sync records is part-way through — ${MIGRATION_STEP_COPY[control.witness.phase]}`,
-      hint: "rbox migrate",
-      finding: {
-        id: "state-migration/in-progress",
-        severity: "attention",
-        problem: "Converting this workspace's sync records to rbox's current format is part-way through. If nothing is running it, it stopped early.",
-        safety: "Nothing was lost. The records rbox is using right now are the ones it was already using.",
-        command: "rbox migrate",
-      },
-    };
-  }
+export function checkStateGenesis(root: string): DoctorCheck {
   if (read(() => readGenesisIntent(root))) {
     return {
       ok: false,
-      label: "migration",
+      label: "genesis",
       status: "state-genesis/unfinished",
       message: "setting up this workspace's sync records didn't finish",
-      hint: "rbox migrate",
+      hint: "rbox sync",
       finding: {
         id: "state-genesis/unfinished",
         severity: "attention",
         problem: "rbox was setting up this workspace's sync records and didn't finish.",
         safety: "No files were changed. rbox will pick the setup back up where it left off.",
-        command: "rbox migrate",
+        command: "rbox sync",
       },
     };
   }
-  return { ok: true, label: "migration", message: "no conversion in progress" };
+  return { ok: true, label: "genesis", message: "no setup in progress" };
 }
 
 /** A record that cannot be read is reported by the `state` check above and by
- * the migration machine's own corruption halt; a doctor that crashed on it would
- * report neither. */
+ * the state check above; a doctor that crashed on it would report neither. */
 function read<T>(reader: () => T | undefined): T | undefined {
   try {
     return reader();

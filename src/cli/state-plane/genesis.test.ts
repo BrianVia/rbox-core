@@ -18,7 +18,7 @@ import {
   type GenesisIntent,
   type HeldStatePlaneLocks,
 } from "./genesis.js";
-import { genesisPaths, migrationPaths, sqliteResetPaths, statePath } from "./paths.js";
+import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { createStateStore, openStateStore, stateStoreDatabase, type ClaimedInode } from "./store/open.js";
 import { withGenesisAdmissionLocks } from "./locks.js";
 
@@ -105,7 +105,7 @@ test("G1: a fresh workspace reaches Q with no leftovers and no migration artifac
   }
 });
 
-test("step 1 refuses, mutating nothing: legacy JSON, an artifact, a migration control, missing evidence", async () => {
+test("step 1 refuses, mutating nothing: legacy JSON, an artifact, missing evidence", async () => {
   const legacy = await workspace();
   await fsp.writeFile(statePath(legacy), '{"lastSyncedSequence":1}');
   expect(await run(legacy)).toEqual({ kind: "refused", reason: "legacy-present" });
@@ -115,10 +115,6 @@ test("step 1 refuses, mutating nothing: legacy JSON, an artifact, a migration co
   const claimed = await workspace();
   plantStore(sqliteResetPaths.active(claimed), "other", OTHER);
   expect(await run(claimed)).toEqual({ kind: "refused", reason: "artifact-present" });
-
-  const migrating = await workspace();
-  await fsp.writeFile(migrationPaths.control(migrating), "{}");
-  expect(await run(migrating)).toEqual({ kind: "refused", reason: "artifact-present" });
 
   const unlinked = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-genesis-"));
   expect(await run(unlinked)).toEqual({ kind: "refused", reason: "evidence-missing" });

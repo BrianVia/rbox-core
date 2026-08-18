@@ -37,14 +37,13 @@ test("live recovery, doctor, and quarantine preserve one exact J0 decoder result
       limit: null,
     },
   });
-  const doctor = await inspectResetJournalSafety(root, "old") as unknown as {
-    status: string;
-    decodeError?: unknown;
-  };
-  expect(doctor).toMatchObject({ status: "halt", decodeError: (live as { decodeError: unknown }).decodeError });
-  expect(await inspectResetJournalForQuarantine(sqliteResetPaths.journal(root))).toMatchObject({
+  if (live.status !== "halt" || live.decodeError === undefined) throw new Error("fixture did not produce a decoder halt");
+  const doctor = await inspectResetJournalSafety(root, "old");
+  expect(doctor).toMatchObject({ status: "halt", decodeError: live.decodeError });
+  const quarantine = await inspectResetJournalForQuarantine(sqliteResetPaths.journal(root));
+  expect(quarantine).toMatchObject({
     ok: false,
-    error: (live as { decodeError: unknown }).decodeError,
+    error: live.decodeError,
   });
   expect(await fs.readdir(sqliteResetPaths.stateRoot(root))).toEqual(before);
 });
@@ -66,9 +65,9 @@ test("reset orchestration has two format-neutral gates and no legacy journal dec
   expect(source).not.toMatch(/readResetJournal|inspectResetJournal/);
 });
 
-test("both lock inventories use the format-neutral reset fence", async () => {
+test("genesis lock inventory uses the format-neutral reset fence", async () => {
   const source = await productionSource("../locks.ts");
-  expect(source.match(/inspectResetFenceInventory\s*\(/g)).toHaveLength(2);
+  expect(source.match(/inspectResetFenceInventory\s*\(/g)).toHaveLength(1);
   expect(source).not.toContain("readResetJournal");
 });
 

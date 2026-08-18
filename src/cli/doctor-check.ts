@@ -4,7 +4,7 @@
  * Every workspace-health probe registers as a descriptor instead of taking a
  * slot in an index-aligned `Promise.all` tuple + result object + render key
  * list. The orchestrator (`doctor-cmd.ts`) iterates descriptors, so adding a
- * check — design 163 §U3 adds ~15 migration halts — is one array entry, not four
+ * check is one array entry, not four
  * coordinated edits a reorder could silently corrupt. `renderHuman` emits the
  * workspace-health lines; `renderMachine` shapes the check's entry in the
  * `--report` diagnostics bundle.
@@ -40,9 +40,7 @@ export function renderCheckHuman(check: DoctorCheck): string[] {
   return lines;
 }
 
-/** A current check IS its own machine representation: the `DoctorCheck` is what
- * the diagnostics bundle serializes. U3's migration-halt descriptors override
- * this to emit their `MIGRATION_HALT_COPY` machine twin. */
+/** A current check IS its own machine representation in diagnostics. */
 export const passthroughMachine = (check: DoctorCheck): DoctorCheck => check;
 
 /** A descriptor wired to the default uniform human + machine renderers. */

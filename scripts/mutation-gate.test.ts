@@ -53,7 +53,7 @@ test("guard ids are unique", () => {
 test("the table is not empty", () => {
   // A gate that sweeps nothing passes forever. If the table is ever emptied,
   // that is a decision to delete the gate, and it should fail here first.
-  expect(MUTATION_GUARDS.length).toBeGreaterThan(4);
+  expect(MUTATION_GUARDS.length).toBeGreaterThan(0);
 });
 
 test("a mutant that cannot build is not reported as a covered guard", () => {

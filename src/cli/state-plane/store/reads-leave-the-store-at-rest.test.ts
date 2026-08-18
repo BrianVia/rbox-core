@@ -14,7 +14,7 @@
  * order every case asserts is the daemon's own recovery boundary, which loads
  * the state and then requires the very next inspection to be terminal.
  *
- * Every case drives a REAL migration and asserts the whole `.rbox` tree is
+ * Every case drives REAL genesis and asserts the whole `.rbox` tree is
  * byte-identical across the read. Sidecar reaping is timing-sensitive, so each
  * case runs `ROUNDS` times rather than once.
  */
@@ -26,13 +26,12 @@ import os from "node:os";
 import path from "node:path";
 import { inspectResetJournal } from "../../reset-journal.js";
 import type { StateSavePacket } from "../../sync-state-model.js";
-import { saveStateUnsafeLegacyOrTest } from "../../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../../sync-mutex.js";
+import { admitGenesisAuthority } from "../authority-bootstrap.js";
 import { materializeManifestFromStore } from "../adapters/read-only.js";
 import { applyStateSavePacket, loadRawState, loadState, replaceResetLineageStream } from "../adapters/whole-state-compat.js";
 import { StateWriteRefusedError } from "../errors.js";
-import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
-import { runMigration } from "../migration/authority.js";
 import { sqliteResetPaths } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
 import { openStateStore, stateStoreDatabase } from "./open.js";
@@ -41,35 +40,42 @@ import { openReadSnapshot } from "./read-snapshot.js";
 process.env.RBOX_HOME = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-at-rest-home-"));
 
 const ROUNDS = 8;
-const NONCE = "c".repeat(32);
-
 const configOf = (root: string): WorkspaceConfig => ({
   schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev",
   rootPath: root, remoteUrl: "https://example.invalid", token: "",
 });
 
-/** A migrated workspace, machine-produced: the real M0→M7 loop over real legacy
- * records, never a hand-planted database. */
-async function migratedWorkspace(): Promise<string> {
+/** A machine-produced SQLite workspace created through real genesis admission. */
+async function sqliteWorkspace(): Promise<string> {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-at-rest-"));
   const config = configOf(root);
   await saveConfig(root, config);
-  await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
-  await saveStateUnsafeLegacyOrTest(root, {
-    stream: syncStreamId(config), lastSyncedSequence: 0, stateNonce: NONCE, stateRevision: 0,
-    lastSyncedManifest: { generatedAt: "", files: [] },
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli");
+  try {
+    const outcome = await admitGenesisAuthority(root, mutex);
+    if (outcome.kind !== "selected" || outcome.authority.kind !== "sqlite-store") {
+      throw new Error(`fixture did not establish SQLite authority: ${JSON.stringify(outcome)}`);
+    }
+  } finally {
+    await releaseWorkspaceSyncMutex(mutex);
+  }
+  const initialized = await applyStateSavePacket(root, {
+    expectedStream: syncStreamId(config),
+    expectedNonce: "legacy",
+    sourceGlobalSeq: 0,
+    global: { manifest: { generatedAt: "", files: [] } },
+    repos: [],
   });
-  const outcome = await withStatePlaneLocks(root, (locks: HeldStatePlaneLocks) =>
-    runMigration(root, { entry: "foreground-migrate", locks } as EntryProof));
-  if (!outcome.held || outcome.value.kind !== "migrated") {
-    throw new Error(`fixture did not migrate: ${JSON.stringify(outcome)}`);
+  if (initialized.status !== "accepted") {
+    throw new Error(`fixture did not initialize SQLite state: ${JSON.stringify(initialized)}`);
   }
   return root;
 }
 
 /** Every byte under `.rbox`, sidecars included. */
-function treeDigest(root: string): Record<string, string> {
-  const out: Record<string, string> = {};
+type TreeDigest = Record<string, string>;
+function treeDigest(root: string): TreeDigest {
+  const out: TreeDigest = {};
   const walk = (dir: string, prefix: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
@@ -87,7 +93,7 @@ const stream = (root: string): string => syncStreamId(configOf(root));
  * and the workspace must still classify healthy afterwards. */
 async function readsLeaveTheWorkspaceUntouched(read: (root: string) => Promise<unknown>): Promise<void> {
   for (let round = 0; round < ROUNDS; round++) {
-    const root = await migratedWorkspace();
+    const root = await sqliteWorkspace();
     const before = treeDigest(root);
     await read(root);
     expect(treeDigest(root)).toEqual(before);
@@ -115,20 +121,15 @@ test("materializeManifest — the wire snapshot projection", async () => {
   });
 });
 
-test("explicit migration — the terminal-sqlite active-store proof", async () => {
-  await readsLeaveTheWorkspaceUntouched((root) =>
-    withStatePlaneLocks(root, (locks: HeldStatePlaneLocks) =>
-      runMigration(root, { entry: "foreground-migrate", locks } as EntryProof)));
-});
-
 /** A write is not a read, but it shares the obligation: the store it commits to
  * must be back at rest before the next observer classifies it. */
 test("applyStateSavePacket leaves the committed store at rest", async () => {
   for (let round = 0; round < ROUNDS; round++) {
-    const root = await migratedWorkspace();
+    const root = await sqliteWorkspace();
+    const current = await loadRawState(root);
     const result = await applyStateSavePacket(root, {
       expectedStream: stream(root),
-      expectedNonce: NONCE,
+      expectedNonce: current?.stateNonce ?? "legacy",
       sourceGlobalSeq: 5,
       global: { manifest: { generatedAt: "2026-07-29T00:00:00.000Z", files: [] } },
       repos: [],
@@ -141,7 +142,7 @@ test("applyStateSavePacket leaves the committed store at rest", async () => {
 });
 
 test("reset-lineage replacement closes its writer at exact S0", async () => {
-  const root = await migratedWorkspace();
+  const root = await sqliteWorkspace();
   const active = sqliteResetPaths.active(root);
   const archiveHash = (await stableDbHash(active)).sha256;
   const archive = sqliteResetPaths.archive(root, "d".repeat(32), archiveHash);
@@ -153,7 +154,7 @@ test("reset-lineage replacement closes its writer at exact S0", async () => {
   writer.close();
   const rejected = (await loadRawState(root))!;
   const applied = await replaceResetLineageStream(root, authorized, rejected, {
-    expectedStream: stream(root), expectedNonce: NONCE, sourceGlobalSeq: 5,
+    expectedStream: stream(root), expectedNonce: authorized.stateNonce, sourceGlobalSeq: 5,
     global: { manifest: { generatedAt: "2026-08-15T00:00:00.000Z", files: [] } }, repos: [],
   }, authorized, authorized);
   expect(applied.stream).toBe(stream(root));
@@ -163,9 +164,10 @@ test("reset-lineage replacement closes its writer at exact S0", async () => {
 });
 
 test("unsupported Q save opens no store and leaves the complete workspace at rest", async () => {
-  const root = await migratedWorkspace();
+  const root = await sqliteWorkspace();
   const before = treeDigest(root);
   const active = path.resolve(sqliteResetPaths.active(root));
+  const expectedNonce = (await loadRawState(root))?.stateNonce ?? "legacy";
   const originalOpen = fs.openSync;
   let storeOpens = 0;
   const open = spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
@@ -175,7 +177,7 @@ test("unsupported Q save opens no store and leaves the complete workspace at res
   try {
     const result = await applyStateSavePacket(root, {
       expectedStream: stream(root),
-      expectedNonce: NONCE,
+      expectedNonce,
       sourceGlobalSeq: 5,
       global: { manifest: { generatedAt: "2026-08-15T00:00:00.000Z", files: [] } },
       repos: [],
@@ -204,7 +206,7 @@ test("unsupported Q save opens no store and leaves the complete workspace at res
  * beside the active database — and proves both halves of the assertion notice.
  */
 test("negative control: the at-rest assertion detects a planted sidecar", async () => {
-  const root = await migratedWorkspace();
+  const root = await sqliteWorkspace();
   const before = treeDigest(root);
   await fsp.writeFile(`${sqliteResetPaths.active(root)}-wal`, "");
   expect(treeDigest(root)).not.toEqual(before);

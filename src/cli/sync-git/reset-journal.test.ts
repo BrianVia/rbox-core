@@ -18,7 +18,7 @@ import {
 import { gitRaw, setGitSpawnObserver } from "../../engine/git-spawn.js";
 import { errMsg } from "./shared.js";
 import type { RepoIdentityV1 } from "./repo-lineage.js";
-import { lastWriterWitnessPath, recordLastWriterWitness, type LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
+import { lastWriterWitnessPath, recordLastWriterWitness, type LastWriterWitness } from "../state-plane/last-writer-witness.js";
 import {
   beginResetJournal as beginResetJournalUnderLock,
   inspectResetJournal,

@@ -12,7 +12,7 @@ import {
 import {
   saveStateUnsafeLegacyOrTest,
   statePath,
-} from "../../sync-state-store.js";
+} from "../sync-state-store.js";
 
 async function workspace(prefix: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));

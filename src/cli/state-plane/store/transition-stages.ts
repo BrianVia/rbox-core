@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { RepoRecord, RepoRecordInput } from "../../sync-state-model.js";
 import type { RepoBaseProof } from "../../sync-git/base-composer.js";
-import type { JsonObject, JsonValue } from "../../../json.js";
+import { jsonCounter, jsonObject, type JsonObject, type JsonValue } from "../../../json.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 import {
@@ -13,8 +13,7 @@ import {
 } from "../digest/repo-transition-v1.js";
 import { ProoflessBaseError, StageChangedError, TransitionRowOversizeError } from "../errors.js";
 import {
-  assertBaseProof, assertDeclaredBindings, assertEvidence, assertMigrationImporter,
-  canonicalEvidenceOf, type MigrationImporterCapability,
+  assertBaseProof, assertDeclaredBindings, assertEvidence, canonicalEvidenceOf,
 } from "./transition-admission.js";
 
 export { assertBaseProof, assertEvidence, canonicalEvidenceOf } from "./transition-admission.js";
@@ -33,7 +32,7 @@ const TRANSITION_DDL = `
 CREATE TABLE transition_meta(
   stage_id TEXT PRIMARY KEY, state TEXT NOT NULL CHECK(state IN ('building','sealed')),
   snapshot_cjson TEXT NOT NULL, source_bindings_cjson TEXT NOT NULL,
-  importer TEXT NOT NULL CHECK(importer IN ('engine','migration')),
+  importer TEXT NOT NULL CHECK(importer='engine'),
   global_binding_cjson TEXT,
   digest TEXT, row_count INTEGER,
   CHECK(state='building' OR (digest IS NOT NULL AND row_count IS NOT NULL))
@@ -92,18 +91,10 @@ export function beginRepoTransitionStage(
   snapshotToken: LineageSnapshot,
   sourceStageBindings: readonly SourceStageBinding[],
   options: {
-    importer?: "engine" | "migration";
-    /** Required for `importer: "migration"`; obtainable only inside withMigrationImporter. */
-    capability?: MigrationImporterCapability;
     stageId?: string;
     globalBinding?: SourceStageBinding;
   } = {},
 ): RepoTransitionStageBuilder {
-  const importer = options.importer ?? "engine";
-  // The importer tag survives sealing and is what re-admission trusts, so it is
-  // proven HERE — before any bytes exist — rather than at re-admission, where the
-  // canonical-JSON round trip has already erased every in-memory distinction.
-  if (importer === "migration") assertMigrationImporter(options.capability);
   const globalBinding = options.globalBinding;
   if (globalBinding && !sourceStageBindings.some((binding) => sameStageBinding(binding, globalBinding))) {
     throw new TypeError("the global binding must also be declared as a source stage");
@@ -121,14 +112,14 @@ export function beginRepoTransitionStage(
     db.exec(TRANSITION_DDL);
     runStatement(db, `INSERT INTO transition_meta(stage_id,state,snapshot_cjson,source_bindings_cjson,importer,global_binding_cjson)
       VALUES (?,'building',?,?,?,?)`,
-      stageId, canonicalJson(snapshotToken), canonicalJson(bindings), importer,
+      stageId, canonicalJson(snapshotToken), canonicalJson(bindings), "engine",
       globalBinding === undefined ? null : canonicalJson(globalBinding),
     );
   } catch (error) {
     abandonBuilder(db, lock, privateDirectory);
     throw error;
   }
-  return new SqliteTransitionBuilder(directory, stageId, snapshotToken, bindings, globalBinding, importer, db, lock, privateDirectory);
+  return new SqliteTransitionBuilder(directory, stageId, snapshotToken, bindings, globalBinding, db, lock, privateDirectory);
 }
 
 class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
@@ -141,7 +132,6 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     private readonly snapshotToken: LineageSnapshot,
     private readonly bindings: SourceStageBinding[],
     private readonly globalBinding: SourceStageBinding | undefined,
-    private readonly importer: "engine" | "migration",
     private readonly db: Database,
     private readonly lock: StageLock,
     private readonly privateDirectory: PrivateStageDirectory,
@@ -155,7 +145,7 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     if (!Number.isSafeInteger(input.expectedRepoGen) || input.expectedRepoGen < 0) {
       throw new TypeError(`transition ${input.relPath} has an invalid expected generation`);
     }
-    assertBaseProof(input, this.importer);
+    assertBaseProof(input);
     assertEvidence(input.relPath, input.evidenceBindings, this.bindings, this.globalBinding);
     // Pre-materialization scan: the complete row — record plus proof plus evidence
     // — is measured and refused BEFORE anything is encoded or written, so an
@@ -165,11 +155,15 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     const canonicalEvidence = canonicalEvidenceOf(input.evidenceBindings);
     const rowCanonical = Buffer.byteLength(canonicalRecord)
       + Buffer.byteLength(canonicalProof ?? "") + Buffer.byteLength(canonicalEvidence);
-    const rowRetained = retainedEstimate({
+    const retainedInput = input.baseProof === undefined ? {
       newRecord: input.newRecord,
-      ...(input.baseProof === undefined ? {} : { baseProof: input.baseProof }),
       evidenceBindings: input.evidenceBindings,
-    });
+    } : {
+      newRecord: input.newRecord,
+      baseProof: input.baseProof,
+      evidenceBindings: input.evidenceBindings,
+    };
+    const rowRetained = retainedEstimate(retainedInput);
     if (rowCanonical > MAX_ROW_CANONICAL_BYTES || rowRetained > MAX_ROW_RETAINED_BYTES) {
       throw new TransitionRowOversizeError(input.relPath, rowCanonical, rowRetained);
     }
@@ -201,8 +195,8 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     this.lock.assertHeld();
     try {
       const digest = new RepoTransitionDigestBuilder(this.snapshotToken, this.bindings, this.globalBinding);
-      streamRows<TransitionRowShape>(this.db, TRANSITION_ROW_SELECT, [this.stageId], (row) => {
-        revalidate(row, this.bindings, this.importer, this.globalBinding);
+      streamRows<PersistedTransitionRow>(this.db, TRANSITION_ROW_SELECT, [this.stageId], (row) => {
+        revalidate(row, this.bindings, this.globalBinding);
         digest.row(digestRow(row));
       });
       const rowCount = digest.rows;
@@ -217,12 +211,14 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
       );
       this.privateDirectory.destroy();
       this.lock.release();
-      return {
+      const sealed = {
         stageId: this.stageId,
-        ...(this.globalBinding === undefined ? {} : { globalBinding: this.globalBinding }),
         logicalDigest, physicalSha256: physical.sha256, bytes: physical.bytes,
         rowCount, snapshotToken: this.snapshotToken, sourceStageBindings: this.bindings,
       };
+      return this.globalBinding === undefined
+        ? sealed
+        : { ...sealed, globalBinding: this.globalBinding };
     } catch (error) {
       this.#open = false;
       abandonBuilder(this.db, this.lock, this.privateDirectory);
@@ -237,7 +233,7 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
   }
 }
 
-interface TransitionRowShape {
+interface PersistedTransitionRow {
   rel_path: string;
   expected_repo_gen: number;
   record_cjson: string;
@@ -248,7 +244,7 @@ interface TransitionRowShape {
 const TRANSITION_ROW_SELECT = `SELECT rel_path,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson
   FROM transition_rows WHERE stage_id=? ORDER BY path_order`;
 
-const digestRow = (row: TransitionRowShape) => ({
+const digestRow = (row: PersistedTransitionRow) => ({
   relPath: row.rel_path,
   expectedRepoGen: row.expected_repo_gen,
   canonicalRecord: row.record_cjson,
@@ -266,7 +262,7 @@ const digestRow = (row: TransitionRowShape) => ({
  */
 /** The one container test every persisted-payload decode in this seam shares. */
 export const isJsonObject = (value: JsonValue | undefined): value is JsonObject =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
+  jsonObject(value);
 
 function persistedObject(field: string, text: string): JsonObject {
   const value = parseCanonicalJson(text);
@@ -277,12 +273,12 @@ function persistedObject(field: string, text: string): JsonObject {
 /** `sourceSeq` is RepoRecordInput's one required member; every other member is
  * optional and is re-established by `encodeRepoRecord` at the authority write. */
 function assertRecordInput(value: JsonObject): asserts value is JsonObject & RepoRecordInput {
-  if (typeof value.sourceSeq !== "number") throw new TypeError("transition record has no sourceSeq");
+  if (jsonCounter(value.sourceSeq) === undefined) throw new TypeError("transition record has no sourceSeq");
 }
 
 function assertBaseProofPayload(value: JsonObject): asserts value is JsonObject & RepoBaseProof {
-  // A proof's authority kind, its migration reservation, and prooflessness itself
-  // stay with assertBaseProof; only the two members that make the value a proof
+  // A proof's authority kind and prooflessness itself stay with assertBaseProof;
+  // only the two members that make the value a proof
   // at all are established here.
   if (!isJsonObject(value.authority)) throw new TypeError("transition baseProof has no authority");
   if (!isJsonObject(value.lockedProof)) throw new TypeError("transition baseProof has no lockedProof");
@@ -313,27 +309,26 @@ export function decodeTransitionEvidence(text: string): TransitionEvidenceBindin
   return value;
 }
 
-function decodeRow(row: TransitionRowShape): TransitionRow {
-  return {
+function decodeRow(row: PersistedTransitionRow): TransitionRow {
+  const decoded = {
     relPath: row.rel_path,
     expectedRepoGen: row.expected_repo_gen,
     newRecord: decodeTransitionRecord(row.record_cjson),
-    ...(row.base_proof_cjson === null
-      ? {}
-      : { baseProof: decodeTransitionBaseProof(row.base_proof_cjson) }),
     evidenceBindings: decodeTransitionEvidence(row.evidence_cjson),
   };
+  return row.base_proof_cjson === null
+    ? decoded
+    : { ...decoded, baseProof: decodeTransitionBaseProof(row.base_proof_cjson) };
 }
 
 /** The row's OWN evidence is re-admitted; nothing is substituted from the stage. */
 function revalidate(
-  row: TransitionRowShape,
+  row: PersistedTransitionRow,
   declared: SourceStageBinding[],
-  importer: "engine" | "migration",
   globalBinding?: SourceStageBinding,
 ): TransitionRow {
   const decoded = decodeRow(row);
-  assertBaseProof(decoded, importer);
+  assertBaseProof(decoded);
   assertEvidence(decoded.relPath, decoded.evidenceBindings, declared, globalBinding);
   return decoded;
 }
@@ -352,7 +347,7 @@ export function openSealedRepoTransitionStage(
   try {
     const meta = selectRow<{
       stage_id: string; state: string; snapshot_cjson: string; source_bindings_cjson: string;
-      importer: "engine" | "migration"; global_binding_cjson: string | null;
+      importer: "engine"; global_binding_cjson: string | null;
       digest: string; row_count: number;
     }>(accessor.db, `SELECT stage_id,state,snapshot_cjson,source_bindings_cjson,importer,
       global_binding_cjson,digest,row_count FROM transition_meta`);
@@ -371,8 +366,8 @@ export function openSealedRepoTransitionStage(
     }
     const sealedGlobal = ref.globalBinding;
     const digest = new RepoTransitionDigestBuilder(ref.snapshotToken, ref.sourceStageBindings, sealedGlobal);
-    streamRows<TransitionRowShape>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId], (row) => {
-      revalidate(row, ref.sourceStageBindings, meta.importer, sealedGlobal);
+    streamRows<PersistedTransitionRow>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId], (row) => {
+      revalidate(row, ref.sourceStageBindings, sealedGlobal);
       digest.row(digestRow(row));
     });
     if (digest.rows !== ref.rowCount || digest.seal() !== ref.logicalDigest || meta.digest !== ref.logicalDigest) {
@@ -388,7 +383,7 @@ export function openSealedRepoTransitionStage(
   }
   return {
     streamRows(visit): number {
-      return streamRows<TransitionRowShape>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId],
+      return streamRows<PersistedTransitionRow>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId],
         (row) => visit(decodeRow(row)));
     },
     close(): void {

@@ -15,7 +15,7 @@ import { assertAuthorityWritable } from "./state-write-fence.js";
 import { authorityMarkerBytes } from "./authority-marker.js";
 import { StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis-intent.js";
-import { rboxResiduePaths } from "./migration/fault-rig.js";
+import { rboxResiduePaths } from "./fault-rig.js";
 import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { openStateStore, stateStoreDatabase } from "./store/open.js";
 

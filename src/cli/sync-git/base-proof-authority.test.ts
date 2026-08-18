@@ -23,7 +23,7 @@ import { applyStateSavePacket, type SyncState } from "../config.js";
 import { composeStateSavePacket, type StateSource } from "../sync-state.js";
 import { savePublishedRepoIntent } from "../sync-published-intent.js";
 import { carryRepoBaseProof, composeRepoBase, observedLandingRepoBaseProof, type BranchBaseOrigin, type RepoBaseProof } from "./base-composer.js";
-import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
+import { migrationRepoBaseProof } from "../state-plane/base-proof.js";
 
 const T = "1".repeat(40);
 const U = "2".repeat(40);
@@ -271,14 +271,14 @@ test("blanket migration authority is refused by the JSON store no matter what", 
  */
 test("the mints' importers are a closed list", async () => {
   const src = path.resolve(import.meta.dir, "../..");
-  const specifier = /\bfrom\s*\(?\s*["'][^"']*migration\/(base-proof|import-stage)(\.[jt]s)?["']/;
+  const specifier = /\bfrom\s*\(?\s*["'][^"']*base-proof(\.[jt]s)?["']/;
   const importers: string[] = [];
   for (const entry of await fs.readdir(src, { recursive: true, withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
     const abs = path.join(entry.parentPath, entry.name);
     if (specifier.test(await fs.readFile(abs, "utf8"))) importers.push(path.relative(src, abs));
   }
-  expect(importers.sort(), "migration BASE authority escaped its territory").toEqual([
+  expect(importers.sort(), "legacy-import BASE authority escaped its territory").toEqual([
     // The legacy JSON manifest adoption the blanket authority exists for.
     "cli/sync-state-records.ts",
     // Composer unit test: the one place migration composition semantics are asserted.

@@ -17,7 +17,7 @@ import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { applyPulledManifest, MassDeleteGuardError, push, type SyncDeps, TrustedViewRefusalError, type TrustedLocalView } from "../sync.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "../config.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
-import type { LastWriterWitness } from "../state-plane/migration/last-writer-witness.js";
+import type { LastWriterWitness } from "../state-plane/last-writer-witness.js";
 
 const KEK = Buffer.alloc(32, 23);
 const roots: string[] = [];

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RBOX_TMP_PREFIX } from "../../../engine/fsutil.js";
+import { RBOX_TMP_PREFIX } from "../../engine/fsutil.js";
 import {
   buildReserveHeader,
   ensureStateReserve,
@@ -16,8 +16,8 @@ import {
   stateReservePath,
   streamDigest,
 } from "./reserve.js";
-import { applyStateSavePacket } from "../../sync-state-store.js";
-import { statePath } from "../paths.js";
+import { applyStateSavePacket } from "../sync-state-store.js";
+import { statePath } from "./paths.js";
 
 async function workspace(prefix: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));

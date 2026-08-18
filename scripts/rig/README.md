@@ -97,8 +97,8 @@ parse/compare, the pair-token parse, and report shaping.
 
 Every scenario in `FAST_SUITE` that uses the shared two-device preamble now reads
 state through the dual-authority state view and requires both databases to carry
-`migration_completion.origin_kind = 'genesis'`. The marker alone is not enough: a
-migrated legacy workspace also has that marker.
+`migration_completion.origin_kind = 'genesis'`. The marker alone is not enough
+to prove that the live store is the expected fresh-workspace authority.
 
 Two FAST scenarios pin the lifecycle edges:
 
@@ -287,7 +287,7 @@ bun run rig run dual-binary-state \
 ```
 
 The runner persists both canonical host paths, SHA-256 values, and observed
-versions. The SP-2.5 `sqlite-fresh-install` and `json-upgrade-path` scenarios
+versions. The SQLite `sqlite-fresh-install` and `json-upgrade-path` scenarios
 remain same-build gates.
 
 ## What's next

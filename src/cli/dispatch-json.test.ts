@@ -21,7 +21,7 @@ afterEach(async () => {
   await fs.rm(cwd, { recursive: true, force: true });
 });
 
-function run(args: string[], runCwd = cwd, envOverrides: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+function run(args: string[], runCwd = cwd, envOverrides: NodeJS.ProcessEnv = {}) {
   const env = { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", RBOX_HOME: home };
   delete env.RBOX_API;
   delete env.RBOX_API_QUIET;
@@ -79,6 +79,20 @@ test("unknown commands use the pared help screen and fail", () => {
   const res = run(["definitely-not-a-command"]);
   expect(res.status).toBe(1);
   expect(res.stdout).toBe(`${renderEssentialHelp()}\n`);
+});
+
+test("retired migration command and doctor flags are absent", () => {
+  const command = run(["migrate"]);
+  expect(command.status).toBe(1);
+  expect(command.stdout).toBe(`${renderEssentialHelp()}\n`);
+
+  for (const flag of ["--retry-state-migration", "--abort-state-migration"]) {
+    const result = run(["doctor", flag]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`unknown flag ${flag}`);
+  }
+
+  expect(renderGroupedHelp()).not.toMatch(/rbox migrate|retry-state-migration|abort-state-migration/);
 });
 
 test("RBOX_API override warning leaves JSON command stdout valid", async () => {
@@ -242,10 +256,6 @@ test("folder-first human copy preserves every legacy workspace JSON error", () =
     {
       args: ["status", "/private/tmp", "--all", "--json"],
       error: "--all covers every locally known workspace, so it cannot be combined with a path. Use `rbox status --all` or `rbox status /private/tmp`.",
-    },
-    {
-      args: ["migrate", "--json"],
-      error: "Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox migrate <path>.",
     },
     {
       args: ["doctor", "--report", "--json"],

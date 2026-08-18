@@ -58,7 +58,7 @@ const carriedFrom = (previous: RepoBaseValue): RepoBaseProof =>
 /**
  * No ordinary state write carries blanket authority — not a forged structural
  * `{ kind: "migration" }`, and not even a genuinely minted one. Legacy adoption
- * happens in `state-plane/migration/base-proof.ts` and never reaches a packet,
+ * happens in `state-plane/base-proof.ts` and never reaches a packet,
  * so refusing the kind outright is both simpler and stricter than checking a
  * token: it needs no identity that a canonical-JSON round trip would destroy,
  * and it holds against a caller that reconstructed the shape by hand.

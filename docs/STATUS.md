@@ -1,5 +1,14 @@
 # rbox status — living state snapshot
 
+## 2026-08-18 — state migration executor retired
+
+- Design 262 SP-4 executed after the founder support-window sign-off: the
+  completed JSON→SQLite migration tree, `rbox migrate`, its two doctor mutation
+  flags, the upgrade stub, snapshot automation, the migration-only rig leg, and transient
+  importer/lock modes are gone. Legacy JSON authority remains live pending its
+  separate refusal slice; fresh genesis, SQLite/reset safety, reserve, witness,
+  and BASE-adoption behavior remain covered.
+
 ## 2026-08-17 (evening) — must-ship arc: 274 PR-A + 276 both halves SHIPPED
 
 - **Design 276 (upgrade safety) shipped both halves same-day** (doc r1→r2.1

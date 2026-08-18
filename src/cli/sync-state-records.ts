@@ -10,7 +10,7 @@ import { MAX_GIT_REPOS } from "../engine/index.js";
 import { jsonCounter, type JsonValue } from "../json.js";
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
 import { carryRepoBaseProof, composeRepoBase, recordOriginLineage } from "./sync-git/base-composer.js";
-import { adoptLegacyManifestRepoBase } from "./state-plane/migration/base-proof.js";
+import { adoptLegacyManifestRepoBase } from "./state-plane/base-proof.js";
 import type { RepoRecord, RepoRecordsByPath, StateSavePacket, SyncState } from "./sync-state-model.js";
 
 export const MAX_LEGACY_GIT_SIDECAR_REPOS = MAX_GIT_REPOS;

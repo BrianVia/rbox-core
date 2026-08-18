@@ -3,59 +3,8 @@
  * the sealed reader's re-admission — without the SQLite plumbing around them. */
 import { canonicalStageBinding, sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { canonicalJson } from "../digest/codecs.js";
-import { MigrationImporterCapabilityError, ProoflessBaseError } from "../errors.js";
+import { ProoflessBaseError } from "../errors.js";
 import type { TransitionEvidenceBindings, TransitionInput } from "./transition-stages.js";
-
-declare const migrationImporterCapabilityBrand: unique symbol;
-/**
- * The right to CREATE a migration-tagged transition stage — the tag that makes
- * blanket `migration` BASE authority admissible on re-admission, and therefore
- * the thing that has to be unforgeable on the SQLite plane (a persisted proof
- * loses its brand to the canonical-JSON round trip; the tag survives sealing).
- */
-export interface MigrationImporterCapability {
-  readonly [migrationImporterCapabilityBrand]: true;
-}
-
-/**
- * The capability IS this object — not its shape, not its type, not membership in
- * a registry. It is module-private, never exported, never returned by anything,
- * and never handed to a registrar, so there is no value to forge and no mint to
- * call. Validation below is `===`, so a look-alike is simply a different object.
- *
- * The previous shape kept a `WeakSet` behind an exported `register` function.
- * That was a runtime mint: a TypeScript brand constrains ordinary structural
- * assignability but says nothing to a `as never` caller, so registering a forged
- * literal admitted it. Identity has no such surface.
- */
-const MIGRATION_IMPORTER = Object.freeze({}) as unknown as MigrationImporterCapability;
-
-/**
- * Run `work` as the state-plane migration importer.
- *
- * The capability exists only as this callback's argument. This is a scope you
- * enter, not a token you are issued: nothing here returns it, and nothing
- * accepts it for safekeeping. Entering the scope is deliberately open — the
- * bound facade in `state-plane/reset/owner.ts` is equally callable — because
- * what has to be impossible is MANUFACTURING the capability, so that the only
- * code able to tag a stage is code that came through this function.
- */
-export function withMigrationImporter<T>(run: (capability: MigrationImporterCapability) => T): T {
-  return run(MIGRATION_IMPORTER);
-}
-
-/**
- * The stage gate's check. It compares and nothing else: it cannot produce the
- * capability, cannot store one, and cannot be talked into widening what counts
- * as one. Exported only because the const stays private to this module.
- */
-export function assertMigrationImporter(value: unknown): asserts value is MigrationImporterCapability {
-  if (value !== MIGRATION_IMPORTER) {
-    throw new MigrationImporterCapabilityError(
-      value === undefined ? "no capability was presented" : "the value presented is not the migration importer",
-    );
-  }
-}
 
 /** Exact-identity dedup. A duplicate would be verified twice and, worse, consumed
  * twice — leaving post-commit cleanup to delete an artifact it already removed. */
@@ -85,15 +34,13 @@ export const canonicalEvidenceOf = (evidence: TransitionEvidenceBindings): strin
  *
  * A record that carries `base` or `branchBaseOrigins` is asserting new BASE
  * authority. That assertion is admitted only with an explicit `RepoBaseProof` whose
- * authority kind is a real one — the `migration` kind is a blanket authority
- * reserved for the tagged migration importer, which is why an implicit
- * `migrationRepoBaseProof()` default is not offered anywhere in this seam. Whatever
- * proof is supplied is then bound by the transition digest to this repository, its
+ * authority kind is purpose-bound. Blanket legacy-import authority is refused,
+ * so no implicit proof default exists in this seam. Whatever proof is supplied
+ * is then bound by the transition digest to this repository, its
  * expected generation, the source evidence, and the coherent snapshot token.
  */
 export function assertBaseProof(
   input: Pick<TransitionInput, "relPath" | "newRecord" | "baseProof">,
-  importer: "engine" | "migration",
 ): void {
   if (input.baseProof === undefined) {
     if (input.newRecord.base !== undefined) {
@@ -105,11 +52,11 @@ export function assertBaseProof(
     return;
   }
   const authority = input.baseProof.authority;
-  if (!authority || typeof authority.kind !== "string") {
+  if (!authority) {
     throw new ProoflessBaseError(input.relPath, "baseProof has no authority kind");
   }
-  if (authority.kind === "migration" && importer !== "migration") {
-    throw new ProoflessBaseError(input.relPath, "implicit migration authority is reserved for the tagged migration importer");
+  if (authority.kind === "migration") {
+    throw new ProoflessBaseError(input.relPath, "migration BASE authority is retired");
   }
   if (!input.baseProof.lockedProof) throw new ProoflessBaseError(input.relPath, "baseProof has no lockedProof");
 }

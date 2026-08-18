@@ -219,7 +219,7 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // Blanket migration authority and the legacy-manifest adoption it exists
     // for. Confined here so no ordinary write path can default to it; the
     // importer set is pinned by sync-git/base-proof-authority.test.ts.
-    "src/cli/state-plane/migration/base-proof.ts": 3,
+    "src/cli/state-plane/base-proof.ts": 3,
     // U1b's unwired CAS recomposes BASE exactly like the JSON authority: one
     // composeRepoBase call per transition, driven by that transition's own
     // explicit RepoBaseProof. Step 2 lives in exactly one module, so there is no

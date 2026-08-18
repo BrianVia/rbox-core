@@ -23,7 +23,7 @@ import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-
 import { authorityMarkerBytes, readAuthorityMarkerId } from "../authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError } from "../errors.js";
 import { readGenesisIntent } from "../genesis-intent.js";
-import { rboxResidue } from "../migration/fault-rig.js";
+import { rboxResidue } from "../fault-rig.js";
 import { genesisPaths, sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
 import { markResetLineageProvenance } from "../reset-lineage.js";

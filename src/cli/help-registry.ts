@@ -675,17 +675,6 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
-    name: "migrate",
-    group: "BILLING & MAINTENANCE",
-    summary: "convert this workspace's sync records to rbox's current format",
-    usage: "rbox migrate [path] [--json]",
-    flags: [{ flag: "--json", desc: "print the outcome as JSON (for scripts, CI, and agents)" }],
-    notes: [
-      "Nothing else may be using the workspace: run `rbox stop` first if background sync is on.",
-      "rbox does this for you during `rbox upgrade`; run it by hand only when doctor asks you to.",
-    ],
-  },
-  {
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "explain what is stuck and how to fix it, in plain English",
@@ -700,8 +689,6 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--path <dir>", desc: "compatibility alias for the [path] positional", takesValue: true },
       { flag: "--quarantine", desc: "with reset-journal, preserve and remove an unsafe standing journal" },
       { flag: "--restore <bundle>", desc: "with reset-journal, restore a committed quarantine bundle", takesValue: true },
-      { flag: "--retry-state-migration", desc: "resume a paused conversion of this workspace's sync records after fixing what stopped it" },
-      { flag: "--abort-state-migration", desc: "abandon an unfinished conversion and keep the sync records rbox is using now" },
     ],
   },
   {
