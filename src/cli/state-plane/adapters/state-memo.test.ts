@@ -101,9 +101,15 @@ test("an accepted save leaves the loads that follow it free and exact", async ()
  * wrong answer.
  */
 function mutateStoreOutsideTheAdapter(root: string, sql: string, ...bindings: string[]): void {
+  mutateStoreInOneOpen(root, [[sql, ...bindings]]);
+}
+
+/** Several statements on ONE handle: the open validation runs per open, so a
+ * change that spans two rows cannot be split across two of them. */
+function mutateStoreInOneOpen(root: string, statements: readonly (readonly string[])[]): void {
   const store = openStateStore(sqliteResetPaths.active(root), { readonly: false });
   try {
-    runStatement(stateStoreDatabase(store), sql, ...bindings);
+    for (const [sql, ...bindings] of statements) runStatement(stateStoreDatabase(store), sql!, ...bindings);
   } finally {
     store.close();
   }
@@ -152,6 +158,30 @@ test("a replaced authority and lineage force a rematerialization", async () => {
   }).close();
   await fsp.writeFile(statePath(root), authorityMarkerBytes("9".repeat(32)));
   expect(await materializationsForNextLoad(root)).toBe(1);
+});
+
+test("an authority that moves ALONE forces a rematerialization", async () => {
+  // The lineage row is left byte-identical — same lineage_id, stream, nonce,
+  // revision, binding — so this test fails if `authorityId` stops being part of
+  // the comparison. Authority and lineage usually move together; that is
+  // exactly why the column needs its own witness.
+  const root = await sqliteWorkspace("column-authority");
+  const before = await loadState(root, STREAM);
+  const successor = "9".repeat(32);
+  // The authority id is carried by the marker, store_meta, and the completion
+  // record the open validation counts against it — move all three, and nothing
+  // else, so the lineage row this comparison reads is untouched.
+  mutateStoreInOneOpen(root, [
+    ["UPDATE store_meta SET authority_id=? WHERE singleton=1", successor],
+    ["UPDATE migration_completion SET authority_id=? WHERE singleton=1", successor],
+  ]);
+  await fsp.writeFile(statePath(root), authorityMarkerBytes(successor));
+
+  expect(await materializationsForNextLoad(root)).toBe(1);
+  const after = await loadState(root, STREAM);
+  expect(after.stateNonce).toBe(before.stateNonce);
+  expect(after.stateRevision).toBe(before.stateRevision);
+  expect(await materializationsForNextLoad(root)).toBe(0); // and settles again
 });
 
 test("a foreign stream change is refused, never served from retention", async () => {
