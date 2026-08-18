@@ -16,6 +16,7 @@ import {
 import { gitIncomingKey } from "./shared.js";
 import {
   blockersAfterComposer,
+  gitConnectivitySkipEnabled,
   gitOwnershipHeldSkipEnabled,
   gitOwnershipNoEscalateEnabled,
   heldBlockersAllowSkip,
@@ -37,6 +38,10 @@ afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { re
 
 const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commits" };
 const localEdits: TypedBlocker = { provenance: "checkout", reason: "local-edits" };
+const connectivityHold: TypedBlocker = {
+  provenance: "boundary", reason: "artifact", code: "connectivity-unproven",
+  detail: "planned graph connectivity proof failed",
+};
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
 const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
@@ -88,6 +93,20 @@ test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([ownership])).toBe(true);
   expect(heldBlockersAllowSkip([ownership], { RBOX_GIT_OWNERSHIP_HELD_SKIP: "0" })).toBe(false);
   expect(heldBlockersAllowSkip([{ provenance: "checkout", reason: "worktree-ownership" }])).toBe(true);
+  // Design 278: only the typed code minted by the connectivity proof, and only
+  // on a boundary blocker. Design 241's local-edits exclusion is permanent, and
+  // it is not weakened by a connectivity blocker standing beside it.
+  expect(heldBlockersAllowSkip([connectivityHold])).toBe(true);
+  expect(heldBlockersAllowSkip([connectivityHold], { RBOX_GIT_CONNECTIVITY_SKIP: "0" })).toBe(false);
+  expect(heldBlockersAllowSkip([connectivityHold, localCommit])).toBe(true);
+  expect(heldBlockersAllowSkip([connectivityHold, localEdits])).toBe(false);
+  expect(heldBlockersAllowSkip([connectivityHold, { provenance: "boundary", reason: "artifact" }])).toBe(false);
+  expect(heldBlockersAllowSkip([connectivityHold, { provenance: "protocol", reason: "artifact", detail: "hold" }])).toBe(false);
+  // The uncoded producers of the same reason, and a code on the wrong provenance.
+  expect(heldBlockersAllowSkip([{ provenance: "checkout", reason: "artifact", code: "connectivity-unproven" }])).toBe(false);
+  expect(gitConnectivitySkipEnabled({})).toBe(true);
+  expect(gitConnectivitySkipEnabled({ RBOX_GIT_CONNECTIVITY_SKIP: "0" })).toBe(false);
+  expect(gitConnectivitySkipEnabled({ RBOX_GIT_CONNECTIVITY_SKIP: "false" })).toBe(true);
   expect(gitHeldSkipEnabled({ RBOX_GIT_HELD_SKIP: "0" })).toBe(false);
   expect(gitOwnershipHeldSkipEnabled({})).toBe(true);
   expect(gitOwnershipHeldSkipEnabled({ RBOX_GIT_OWNERSHIP_HELD_SKIP: "0" })).toBe(false);

@@ -47,6 +47,17 @@ test("the artifact row is fail-closed: 'was saved first' needs a typed post-appl
     .toBe("settle-failed");
 });
 
+test("the artifact headline is true for a failed download AND for an unusable local copy", () => {
+  // Design 278: the connectivity class downloads the bundle successfully every
+  // time and still cannot put it in place, so a headline that names downloading
+  // would tell those repos something false.
+  const headline = gitStoryFor("artifact").headline;
+  expect(headline).toBe("rbox couldn't put the other computer's version in place here — nothing here changed");
+  expect(headline).not.toContain("download");
+  expect(gitStoryFor("artifact", "planned graph connectivity proof failed").headline).toBe(headline);
+  expect(gitStoryFor("artifact", "git artifact fetch/decrypt/import failed: bundle verify failed").headline).toBe(headline);
+});
+
 test("only the settle story claims a backup was saved first", () => {
   for (const reason of GIT_DEFERRAL_REASONS) {
     const story = gitStoryFor(reason);

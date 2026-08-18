@@ -100,9 +100,14 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
   mutationBoundary?: MutationBoundary;
 }
 
+/** The machine-readable identity of a defer whose cause downstream planes are
+ * allowed to act on. `reason` stays a human string for logs and never carries
+ * semantics; only a code minted at the site that ran the proof does. */
+export type CheckoutDeferCode = "connectivity-unproven";
+
 export type CommitCheckoutResult =
   | { status: "committed" }
-  | { status: "defer"; reason: string; journalIntact?: true }
+  | { status: "defer"; reason: string; code?: CheckoutDeferCode; journalIntact?: true }
   | { status: "unsupported"; reason: string };
 
 export const ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY = "ORIG_HEAD changed at checkout boundary";
@@ -690,7 +695,9 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     const connected = await addTimedMs(opts.chainTimings, "connectivityProofMs", () => opts.connectivityProof
       ? opts.connectivityProof(ctx.repoDir, plan.plannedGraphRoots)
       : defaultConnectivityProof(ctx.repoDir, plan.plannedGraphRoots, plan.malformedOrigHeadPreserved === true));
-    if (!connected) return { status: "defer", reason: "planned graph connectivity proof failed" };
+    if (!connected) {
+      return { status: "defer", reason: "planned graph connectivity proof failed", code: "connectivity-unproven" };
+    }
     try { opts.crashAt?.("after-connectivity-proof"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
     const locksBeforePrepare = new Map<string, string>();

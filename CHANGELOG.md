@@ -25,6 +25,18 @@ All notable changes to rbox are recorded here. The format follows
   so the comparison was skipped" — instead of an unexplained pause.
 
 ### Fixed
+- A Git repo whose local copy rbox cannot verify no longer re-downloads the
+  same history on every sync. Repos in that state were downloading, unpacking,
+  and re-checking the same unchanged history every few seconds, forever, which
+  slowed down every other repo waiting behind them. rbox now recognises that
+  nothing has changed since the last check and re-checks such a repo once an
+  hour instead — and it re-checks immediately, as before, the moment you commit
+  in it or the other computer sends something new. (Set
+  `RBOX_GIT_CONNECTIVITY_SKIP=0` to restore the old behaviour.)
+- The message for a paused Git repo no longer says rbox "couldn't finish
+  downloading the other computer's version" when the download in fact
+  succeeded. It now says rbox couldn't put that version in place here, which is
+  true for both reasons that pause can happen.
 - Conflict copies rbox saved no longer make a folder look permanently
   out-of-sync. Previously a saved copy could keep a folder's comparison from
   ever settling, so it stayed stuck even after everything else had synced.

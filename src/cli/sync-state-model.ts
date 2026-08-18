@@ -210,7 +210,15 @@ export interface GitPartialApply {
 
 export type TypedBlocker =
   | { provenance: "ref-plane"; reason: "local-commits" | "local-stash" | "deletion-pending" | "worktree-ownership"; ref: string }
-  | { provenance: "checkout" | "boundary"; reason: GitDeferralReason; detail?: string }
+  | {
+      provenance: "checkout" | "boundary";
+      reason: GitDeferralReason;
+      detail?: string;
+      /** Design 278: minted only by the checkout transaction's connectivity
+       * proof, so a later pull can recognize that exact cause without reading
+       * `detail` prose. Absent on every other checkout/boundary blocker. */
+      code?: "connectivity-unproven";
+    }
   | { provenance: "indeterminate"; reason: "unreadable" | "unsupported"; detail: string }
   | { provenance: "protocol"; reason: "artifact"; detail: string }
   | {

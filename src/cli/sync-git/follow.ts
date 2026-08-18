@@ -196,7 +196,26 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (selfRootWitness) checkoutInput.selfRootWitness = selfRootWitness;
     if (baseProjection !== undefined) checkoutInput.baseProjection = baseProjection;
     const checkout = await refTransaction.commitCheckout(checkoutInput);
-    if (checkout.status === "defer") return checkout.result;
+    if (checkout.status === "defer") {
+      // Design 278 M1: ONLY the connectivity proof's typed code stores an
+      // attempt here. Every other checkout defer — above all a boundary race,
+      // whose `local-commits`/`worktree-ownership` reasons the held allowlist
+      // already admits on reason alone — must stay attempt-less so the next pull
+      // re-attempts it immediately instead of stalling to the hourly floor.
+      // The proof runs pre-commit and publishes nothing, so the repository still
+      // stands at `trustedFingerprint`; `observeHeldInputs` re-reads and refuses
+      // the store if anything moved, exactly like the two existing sites.
+      if (checkout.code === "connectivity-unproven") await opts.afterHeldClassification?.({
+        phase: "defer",
+        trustedFingerprint,
+        effectiveBaseIndexProjection,
+        effectiveIncomingIndexProjection,
+        blockers: checkout.result.blockers,
+        reflogPaths: checkout.result.consultedReflogPaths ?? [],
+        progress: checkout.result,
+      });
+      return checkout.result;
+    }
     const { progress: postProgress, origHeadPreservation } = checkout;
     if (origHeadPreservation) {
       if (origHeadPreservation.recoveryRef && origHeadPreservation.discriminator) {

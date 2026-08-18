@@ -3,7 +3,7 @@
  * classification into a typed deferral. Moved verbatim out of follow.ts. */
 import type { MutationBoundary } from "../../engine/mutation-gate.js";
 import type { AppliedManifestOracle, BlobStore, GitSection } from "../../engine/index.js";
-import type { CheckoutCapabilityProbe } from "./checkout-txn.js";
+import type { CheckoutCapabilityProbe, CheckoutDeferCode } from "./checkout-txn.js";
 import type { CheckoutJournalBinding } from "./journal.js";
 import type { GitChainTimings } from "./chain-timings.js";
 import type { RepoCtx } from "./git-state.js";
@@ -198,8 +198,12 @@ export function blockerForReason(
   reason: GitDeferralReason,
   provenance: "checkout" | "boundary",
   detail?: string,
+  code?: CheckoutDeferCode,
 ): TypedBlocker {
-  return { provenance, reason, ...(detail ? { detail } : {}) };
+  const blocker: TypedBlocker = { provenance, reason };
+  if (detail) blocker.detail = detail;
+  if (code) blocker.code = code;
+  return blocker;
 }
 
 export function progressWithBlocker(
