@@ -28,6 +28,7 @@ import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord } from "../sync-state.js";
 import { savePulledState, type PullProvenance } from "./pull-state-save.js";
+import { RELOAD_DURABLE_STATE, type DurableStateReceipt } from "./durable-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats, formatPullOracleMetrics, type PullOracleMetrics } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
@@ -86,12 +87,16 @@ export async function pullWithMetadata(
   deps: SyncDeps = {},
   trustedView?: TrustedLocalView,
   provenance: PullProvenance = "standalone",
-): Promise<{ actions: Action[]; initialRemoteSequence: number }> {
+  /** Design 277 §A1: the durable state this operation's boundary already loaded
+   *  under the held mutex. SINGLE-USE and daemon-only; every other caller loads. */
+  boundaryState?: SyncState,
+): Promise<{ actions: Action[]; initialRemoteSequence: number; durable: DurableStateReceipt }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  const state = await report.phase("state-load", async () =>
+    boundaryState ?? loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const validatedMeta = validManifestMeta(state.manifestMeta);
   // Design 204 §4.3: DEFAULT-ON. Delta writes without the evidence fast path
   // regress default receivers — the cold walk fetches the head + every chain link
@@ -115,11 +120,27 @@ export async function pullWithMetadata(
     head: { sequence, manifest: remote, manifestMeta },
   });
   surfaceResolutionReceiptReconciliation(reconciled, deps);
+  if (reconciled.status !== "none") {
+    // Receipt reconciliation applies a manifest and clears the receipt through
+    // its own writers; the state they left is not this pull's to name.
+    return { actions: reconciled.actions, initialRemoteSequence: sequence, durable: RELOAD_DURABLE_STATE };
+  }
+  // The pull's own last durable write is the state it saved; the hook fires
+  // immediately after `savePulledState` and nothing writes state after it.
+  let saved: SyncState | undefined;
+  const applyDeps: SyncDeps = {
+    ...deps,
+    onGitDeferralsSaved: (savedState) => {
+      saved = savedState;
+      deps.onGitDeferralsSaved?.(savedState);
+    },
+  };
+  const actions = await applyPulledManifest(root, cfg, applyDeps, api,
+    { sequence, manifest: remote, manifestMeta, state, provenance }, trustedView);
   return {
-    actions: reconciled.status === "none"
-      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state, provenance }, trustedView)
-      : reconciled.actions,
+    actions,
     initialRemoteSequence: sequence,
+    durable: saved ? { state: saved } : RELOAD_DURABLE_STATE,
   };
 }
 

@@ -31,13 +31,16 @@ import { RBOX_DIR } from "../workspace-config.js";
  * gate turns "recover this reset" into a hard read error on exactly the
  * workspaces this recovery exists for. Format dispatch belongs to
  * `recoverResetJournal`, which classifies the authority first.
+ *
+ * Returns whether a standing reset was settled: a recovery replaces the lineage,
+ * so it invalidates any retained sync state (design 277 §A2).
  */
 export async function recoverStandingResetJournal(
   root: string,
   stream: string,
   heldMutex?: WorkspaceSyncMutex,
-): Promise<void> {
-  if ((await inspectResetFenceInventory(root, stream)).settlement === "none") return;
+): Promise<boolean> {
+  if ((await inspectResetFenceInventory(root, stream)).settlement === "none") return false;
   let recoveryMutex = heldMutex;
   let releaseRecoveryMutex = false;
   if (!recoveryMutex) {
@@ -48,6 +51,7 @@ export async function recoverStandingResetJournal(
   if (workspaceSyncMutexDegraded(recoveryMutex)) throw new Error("reset journal recovery requires a non-degraded workspace fence");
   try {
     await settleStandingReset(root, recoveryMutex, stream);
+    return true;
   } finally {
     if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
   }

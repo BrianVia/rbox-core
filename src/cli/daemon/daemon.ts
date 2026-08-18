@@ -28,7 +28,7 @@ import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, save
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
-import { MassDeleteGuardError, PushConflictExhaustedError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
+import { MassDeleteGuardError, PushConflictExhaustedError, pull, pullWithMetadata, pushManifest, type PushManifestOptions, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
 import { ensureFolderAuthority } from "../folder-authority.js";
@@ -136,6 +136,7 @@ import { LocalAuthority } from "./local-observation-transition.js";
 import {
   classifyPublishOutcome,
   PublishLocalWorkspaceTransition,
+  type SealedPublishRequest,
 } from "./daemon-publish-transition.js";
 import {
   ApplyRemoteWorkspaceTransition,
@@ -173,6 +174,9 @@ import {
 } from "./key-delivery-fulfill.js";
 import { admitGenesisAuthority, GenesisAdmissionRefusedError, requireSelected } from "../state-plane/authority-bootstrap.js";
 import { describeGenesisAdmissionRefusal, renderOperatorReport } from "../state-plane-report.js";
+import { probeStateFreshness, stateMatchesFreshness } from "../state-plane/adapters/lineage-reads.js";
+import { stateWasStreamMismatch } from "../state-plane/reset-lineage.js";
+import { RELOAD_DURABLE_STATE, type DurableStateReceipt } from "../sync/durable-state.js";
 import {
   RemoteWakeupChannel,
   type PullWakeupReceipt,
@@ -390,6 +394,16 @@ export class RboxDaemon {
   private matcherGeneration = 0;
   private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
+  /** Design 277 §A2: the store lineage `syncBase` was materialized from. The
+   *  probed nonce/revision/binding are compared against `syncBase` itself, so
+   *  this is the one token the state does not carry. */
+  private baseLineage?: { authorityId: string; lineageId: string };
+  /** Whether `syncBase` is known to be the store's durable truth. Cleared when
+   *  an operation takes it as a boundary pre-load, set by a load or a receipt. */
+  private syncBaseIsDurable = false;
+  /** Design 277 §A1: the running pull's durable-state receipt, consumed by the
+   *  pull transition's post-base settle. */
+  private pullDurable: DurableStateReceipt = RELOAD_DURABLE_STATE;
   private resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping" = "ready";
   private resetRetryTimer?: ReturnType<typeof setTimeout>;
   private nextResetRetryAt = Number.NEGATIVE_INFINITY;
@@ -755,7 +769,7 @@ export class RboxDaemon {
       telemetry: this.telemetry,
     }, {
       log: this.log,
-      refreshDurableState: async () => { this.emitDurableGitDeferrals(await this.loadSyncBase()); },
+      refreshDurableState: async (receipt) => { this.emitDurableGitDeferrals(await this.adoptDurableState(receipt)); },
     });
     this.pullTransition = new ApplyRemoteWorkspaceTransition({
       root: this.root,
@@ -772,7 +786,9 @@ export class RboxDaemon {
         this.rulesChangedSinceDeepScan = true;
       },
       loadAndSurfacePostBase: async () => {
-        const base = await this.loadSyncBase();
+        const receipt = this.pullDurable;
+        this.pullDurable = RELOAD_DURABLE_STATE;
+        const base = await this.adoptDurableState(receipt);
         this.emitDurableGitDeferrals(base);
         return base;
       },
@@ -1230,14 +1246,62 @@ export class RboxDaemon {
     void this.pump();
   }
 
-  private async loadSyncBase(heldMutex?: WorkspaceSyncMutex): Promise<SyncState> {
-    const state = await loadState(this.root, syncStreamId(this.cfg), this.log, heldMutex);
+  /** The one seam every durable-state adoption passes through: the resident slot
+   *  and design 206 §1 matcher provenance move together, on a fresh load, a
+   *  probe-verified reuse, and an operation's accepted-state receipt alike. */
+  private installSyncBase(state: SyncState): SyncState {
     this.syncBase = state;
     // Design 206 §1: push completion, post-pull reload, failure recovery and boot all
     // land here, so a base whose `gitRepos` key set moved re-baselines P7 provenance
     // instead of latching the pull path onto scans until restart (#464).
     this.ensureMatcherProvenance(state);
+    this.syncBaseIsDurable = true;
     return state;
+  }
+
+  /**
+   * Design 277 §A2: materialize durable state only when the store says the
+   * resident base is stale. The probe is one lineage row; a mismatch, a legacy
+   * or absent authority, a recovered reset journal, or reset-lineage provenance
+   * all fall through to the full load. `RBOX_STATE_LOAD_CACHE=0` reverts to a
+   * per-boundary materialization.
+   */
+  private async loadSyncBase(heldMutex?: WorkspaceSyncMutex): Promise<SyncState> {
+    const probe = process.env.RBOX_STATE_LOAD_CACHE === "0"
+      ? undefined
+      : await probeStateFreshness(this.root, syncStreamId(this.cfg), heldMutex);
+    const retained = this.syncBase;
+    if (probe && retained && this.baseLineage
+      && this.baseLineage.authorityId === probe.authorityId
+      && this.baseLineage.lineageId === probe.lineageId
+      && !stateWasStreamMismatch(retained)
+      && stateMatchesFreshness(retained, probe)) {
+      return this.installSyncBase(retained);
+    }
+    const state = await loadState(this.root, syncStreamId(this.cfg), this.log, heldMutex);
+    // Retain the lineage identity only when the probe describes the state this
+    // load returned: a write that raced between the two drops retention instead
+    // of blessing a state the store no longer holds.
+    this.baseLineage = probe && stateMatchesFreshness(state, probe) && !stateWasStreamMismatch(state)
+      ? { authorityId: probe.authorityId, lineageId: probe.lineageId }
+      : undefined;
+    return this.installSyncBase(state);
+  }
+
+  /** Design 277 §A1: adopt an operation's durable-state receipt, or reload. */
+  private async adoptDurableState(receipt: DurableStateReceipt): Promise<SyncState> {
+    return "state" in receipt ? this.installSyncBase(receipt.state) : this.loadSyncBase();
+  }
+
+  /**
+   * The boundary state an operation may reuse instead of loading again. Consumed:
+   * only a fresh load or an operation's own receipt re-establishes durability, so
+   * an operation that ended without evidence cannot hand a stale base to the next.
+   */
+  private takeDurableBase(): SyncState | undefined {
+    if (!this.syncBaseIsDurable) return undefined;
+    this.syncBaseIsDurable = false;
+    return this.syncBase;
   }
 
   private seedFromState(state: SyncState): void {
@@ -1888,6 +1952,15 @@ export class RboxDaemon {
     }
   }
 
+  /** The publication options one attempt is sealed with: the caller's observation
+   *  authority plus, on the first attempt of an operation, the state its boundary
+   *  already loaded. */
+  private publishOptions(request: SealedPublishRequest, boundaryState: SyncState | undefined): PushManifestOptions {
+    const options: PushManifestOptions = { localFileObservation: request.localFileObservation };
+    if (boundaryState) options.boundaryState = boundaryState;
+    return options;
+  }
+
   /** The publish composition root: prologue, the report lifecycle the push deps bag
    *  owns, and one sealed transition. Everything the outcome is allowed to change
    *  lives in {@link PublishLocalWorkspaceTransition}. */
@@ -1898,6 +1971,9 @@ export class RboxDaemon {
     const prologueMs = performance.now() - prologueT0;
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
+    // Design 277 §A1: the boundary already loaded this state under the held
+    // mutex. Single-use — every retry inside the publication loads for real.
+    const boundaryState = this.takeDurableBase();
     const receipt = await this.publishTransition.publish(provenance, {
       appliedBase: this.syncBase?.lastSyncedManifest,
       execute: (request) => classifyPublishOutcome(request, () => pushManifest(this.root, this.cfg, request.manifest, {
@@ -1920,7 +1996,7 @@ export class RboxDaemon {
         mutationBoundary: this.mutationGate,
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
         onStrandedIgnoredObserved: (count) => { this.strandedIgnored = count; },
-      }, { localFileObservation: request.localFileObservation })),
+      }, this.publishOptions(request, boundaryState))),
       settleReport: (publishTransitionMs) => {
         if (report) {
           report.appendDetails("state-save", { publish_transition_ms: publishTransitionMs }, formatPushSpan("publish_transition_ms", publishTransitionMs));
@@ -2098,9 +2174,17 @@ export class RboxDaemon {
   /** Chain repair mutates disk across historical sequences and its post-repair re-pull
    *  must see that disk — both always scan (F4 also forces the post-pull scan), so only
    *  the view passed in here can ever be trusted. */
-  private async runPull(deps: SyncDeps, view: TrustedLocalView | undefined, noteChainRepair: () => void): Promise<Action[]> {
+  private async runPull(
+    deps: SyncDeps,
+    view: TrustedLocalView | undefined,
+    noteChainRepair: () => void,
+    boundaryState: SyncState | undefined,
+  ): Promise<Action[]> {
+    this.pullDurable = RELOAD_DURABLE_STATE;
     try {
-      return await pull(this.root, this.cfg, deps, view);
+      const pulled = await pullWithMetadata(this.root, this.cfg, deps, view, "standalone", boundaryState);
+      this.pullDurable = pulled.durable;
+      return pulled.actions;
     } catch (error) {
       if (!(error instanceof ManifestChainError)) throw error;
       // Chain repair applies a historical manifest to disk and then PUBLISHES the
@@ -2143,12 +2227,16 @@ export class RboxDaemon {
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     let chainRepaired = false;
+    // Single-use: taken at seal, handed to the first pull attempt only. A scan
+    // fallback re-executes and loads for real.
+    let boundaryState: SyncState | undefined;
     await this.pullTransition.apply({
       seal: async () => {
         // Design 202. P4 is captured HERE, at op start, and re-checked immediately
         // before the post-pull install; the pre-op base is F2's "before" side.
         const watcherErrorGeneration = this.watcherTrust.captureOperation().errorGeneration;
-        const preBase = this.syncBase ?? await this.loadSyncBase();
+        boundaryState = this.takeDurableBase();
+        const preBase = boundaryState ?? this.syncBase ?? await this.loadSyncBase();
         return {
           preBase,
           watcherErrorGeneration,
@@ -2186,7 +2274,11 @@ export class RboxDaemon {
         return {
           execute: (request) => classifyPullOutcome(
             request,
-            (view) => this.runPull(pullDeps, view, () => { chainRepaired = true; }),
+            (view) => {
+              const boundary = boundaryState;
+              boundaryState = undefined;
+              return this.runPull(pullDeps, view, () => { chainRepaired = true; }, boundary);
+            },
             () => chainRepaired,
           ),
           settleReport: () => {

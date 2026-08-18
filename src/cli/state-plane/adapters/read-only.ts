@@ -11,7 +11,8 @@ import type {
   LineageSnapshot, MaterializeManifestRequest, Plane, ReadSnapshot,
 } from "../ports.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
-import type { StateStoreHandle } from "../store/open.js";
+import { stateStoreDatabase, type StateStoreHandle } from "../store/open.js";
+import { selectRow } from "../store/statements.js";
 
 function collectGit(snapshot: ReadSnapshot, role: "meta-wire" | "manifest-projection"): GlobalManifestMeta["gitRepos"] {
   const result: GlobalManifestMeta["gitRepos"] = {};
@@ -111,6 +112,50 @@ export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
   // proves that every nested short projection belonged to this token.
   guard.finishProjection();
   return result;
+}
+
+/** The four lineage tokens design 277 §A2 probes plus the stream they belong to.
+ * Every accepted CAS bumps `stateRevision`, a reset replaces `lineageId`, and the
+ * one deliberately non-CAS writer (`ensureStoreTelemetryBindingId`) moves
+ * `telemetryBindingId` — so a state whose tokens still match the store is the
+ * state the store holds. */
+export interface StateFreshnessToken {
+  readonly authorityId: string;
+  readonly lineageId: string;
+  readonly stream: string;
+  readonly stateNonce?: string;
+  readonly stateRevision?: number;
+  readonly telemetryBindingId?: string;
+}
+
+/** The probe's own assembly view of its readonly result. */
+type MutableFreshnessToken = { -readonly [K in keyof StateFreshnessToken]: StateFreshnessToken[K] };
+
+interface FreshnessRow {
+  authority_id: string;
+  lineage_id: string;
+  stream: string;
+  state_nonce: string | null;
+  state_revision: number | null;
+  telemetry_binding_id: string | null;
+}
+
+/** One row, no cursor: the freshness probe is O(1) where a materialization is
+ * O(files + repos). */
+export function readStateFreshnessFromStore(store: StateStoreHandle): StateFreshnessToken {
+  const row = selectRow<FreshnessRow>(stateStoreDatabase(store),
+    `SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,l.telemetry_binding_id
+     FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id WHERE m.singleton=1`);
+  if (!row) throw new Error("state store singleton disappeared");
+  const token: MutableFreshnessToken = {
+    authorityId: row.authority_id, lineageId: row.lineage_id, stream: row.stream,
+  };
+  // Absent tokens stay absent rather than present-and-undefined: the comparison
+  // against a held state is an equality, and `undefined` is one of its values.
+  if (row.state_nonce !== null) token.stateNonce = row.state_nonce;
+  if (row.state_revision !== null) token.stateRevision = row.state_revision;
+  if (row.telemetry_binding_id !== null) token.telemetryBindingId = row.telemetry_binding_id;
+  return token;
 }
 
 export function materializeManifestFromStore(

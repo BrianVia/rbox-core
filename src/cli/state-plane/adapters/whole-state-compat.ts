@@ -2,13 +2,15 @@
  * The whole-state compatibility adapter — one selector between every whole-state
  * caller and the two backends, keeping every caller signature and translating
  * the store's raw `CasResult` into the `StateSaveResult` the JSON CAS has always
- * returned. The store is reached through a DYNAMIC import: the CLI's eager
- * static graph must stay free of `bun:sqlite` (`schema/inventory.test.ts`).
+ * returned. Reaching the selected authority — routing, genesis admission, the
+ * held-lock write fence, and the ownership-proving open — belongs to
+ * `authority-open.ts`, which keeps `bun:sqlite` out of the CLI's eager static
+ * graph (`schema/inventory.test.ts`) for this adapter and the O(1) lineage
+ * reads alike.
  *
- * NOTHING HERE OPENS A DATABASE IT HAS NOT PROVEN IT OWNS (163 v13). Selection
- * and every refusal are decided from file-level facts — the marker's exact bytes
- * and the SQLite header `store/open.ts` reads before connecting — so a workspace
- * this adapter refuses is byte-identical afterwards, sidecars included.
+ * NOTHING HERE OPENS A DATABASE IT HAS NOT PROVEN IT OWNS (163 v13): every
+ * refusal is decided from file-level facts, so a workspace this adapter refuses
+ * is byte-identical afterwards, sidecars included.
  */
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
@@ -21,12 +23,12 @@ import {
   repoRecordsForState,
 } from "../../sync-state-records.js";
 import {
-  StateAuthorityCorruptError, StateStoreOpenError, StateWriteRefusedError, StreamMismatchError,
+  StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError,
 } from "../errors.js";
 import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
-import type { StateStoreHandle } from "../store/open.js";
-import { LEGACY_REJECTION_REASON, translateCasResult, type StoreFacade } from "./cas-translation.js";
+import { LEGACY_REJECTION_REASON, translateCasResult } from "./cas-translation.js";
+import { fencedAuthorityUnderHeldLock, openAuthorityStore, selectAuthority, sqliteAuthority, translateStoreOpenError } from "./authority-open.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
@@ -38,61 +40,6 @@ import {
   saveStateUnsafeLegacyOrTest,
   stateLockBusyDetail,
 } from "./legacy-json-store.js";
-
-/** `.rbox/state.json` carries `Q`, and this is the database it names. */
-interface SqliteAuthority { authorityId: string; file: string }
-
-const sqliteAuthority = (
-  root: string,
-  selection: { readonly authorityId: string },
-): SqliteAuthority => ({ authorityId: selection.authorityId, file: sqliteResetPaths.active(root) });
-
-function translateStoreOpenError<T>(file: string, read: () => T): T {
-  try { return read(); } catch (error) {
-    if (error instanceof StateStoreOpenError) throw new StateAuthorityCorruptError(file, `${error.reason}: ${error.message}`);
-    throw error;
-  }
-}
-
-async function selectAuthority(root: string, heldMutex?: WorkspaceSyncMutex) {
-  const coordinator = await import("../authority-bootstrap.js");
-  if (!heldMutex) return coordinator.observeStateAuthority(root);
-  return coordinator.requireSelected(await coordinator.admitGenesisAuthority(root, heldMutex));
-}
-
-/**
- * Everything a writer must do after it takes `<state>.lock` and before it opens
- * anything: clear the write fence, then re-read the marker UNDER the lock. The
- * pre-lock selection only routed, and the authority may have flipped while this
- * call waited. One function, so the three held-lock writers cannot drift.
- */
-async function fencedAuthorityUnderHeldLock(root: string): Promise<SqliteAuthority> {
-  const [coordinator, fence] = await Promise.all([
-    import("../authority-bootstrap.js"),
-    import("../state-write-fence.js"),
-  ]);
-  fence.assertAuthorityWritable(root);
-  const selection = await coordinator.observeStateAuthority(root);
-  if (selection.kind !== "sqlite-store") {
-    throw new StateAuthorityCorruptError(statePath(root), "the authority marker disappeared under the held state lock");
-  }
-  return sqliteAuthority(root, selection);
-}
-
-async function openAuthorityStore(authority: SqliteAuthority, readonly: boolean): Promise<{ store: StateStoreHandle; facade: StoreFacade }> {
-  const facade = await import("../store-facade.js");
-  // Absent, foreign, malformed, or wrong-schema are all zero-write authority
-  // contradictions rather than backend-specific open failures.
-  const store = translateStoreOpenError(authority.file, () => facade.openStateStore(authority.file, { readonly }));
-  if (store.header.authority_id !== authority.authorityId) {
-    store.close();
-    throw new StateAuthorityCorruptError(
-      authority.file,
-      `the database carries authority ${store.header.authority_id}, the marker names ${authority.authorityId}`,
-    );
-  }
-  return { store, facade };
-}
 
 /** Raw reads never manufacture a baseline. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
