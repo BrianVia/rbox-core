@@ -83,7 +83,7 @@ interface SafetyInternals {
   };
   safetyDelay: number;
   pumping: boolean;
-  want: { push: boolean; fullScan: boolean };
+  want: { push: boolean; fullScan: boolean; deepScan: boolean };
   pendingEvents: WatchEvent[];
   watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
@@ -111,6 +111,11 @@ interface SafetyInternals {
   acknowledgeFolderPolicyRecycle(): Promise<boolean>;
   gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
+  request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
+  /** The exact effect object the supervisor holds — reached so the fuse-recovery
+   *  re-arm route is proven WIRED, not merely present on the daemon. */
+  watcherSessions: { effects: { requestFullScan(): void } };
+  pump(): Promise<void>;
 }
 
 /** The discovery owner's public receipt surface plus the continuity fields these
@@ -371,10 +376,45 @@ test("pull-only daemon watcher path never queues push", async () => {
     await daemon.startLiveWatch();
     deliver!([{ type: "update", path: path.join(root, "a.txt") }]);
     expect(daemon.want.push).toBe(false);
+    // Design 277 B1: the watcher path is LIVE in pull-only now, so "no push" must be
+    // the suppression proving itself, not a dead watcher — the event still lands.
+    expect(daemon.pendingEvents.length).toBe(1);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("design 277: pull-only filters PUSH only — every scan route stays open (#477)", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root, { pullOnly: true });
+  let pumps = 0;
+  daemon.pump = () => {
+    pumps++;
+    return Promise.resolve();
+  };
+
+  try {
+    // Design 178 dropped `fullScan`/`deepScan` in pull-only because a watcherless
+    // pull-only daemon scanned inside every pull anyway. B1 gives it a watcher, so that
+    // rationale is dead — and the fuse-recovery re-arm needs a witnessed full-tree scan
+    // it can only get through this route.
+    daemon.request("fullScan");
+    expect(daemon.want.fullScan).toBe(true);
+    daemon.request("deepScan");
+    expect(daemon.want.deepScan).toBe(true);
+    daemon.request("push");
+    expect(daemon.want.push).toBe(false); // publish suppression is the whole of pull-only
+
+    daemon.want.fullScan = false;
+    daemon.watcherSessions.effects.requestFullScan(); // the supervisor's re-arm witness
+    expect(daemon.want.fullScan).toBe(true);
+    expect(pumps).toBe(4);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

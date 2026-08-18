@@ -19,8 +19,8 @@ import {
   type PullAttemptInputs,
   type PullOperation,
   type PullTransitionPort,
-  type PullTrustAfterDrain,
-  type PullTrustBeforeDrain,
+  type PullTrustGate,
+  type PullTrustRecheck,
   type SealedPullRequest,
 } from "./daemon-pull-transition.js";
 import { LocalAuthority } from "./local-observation-transition.js";
@@ -37,8 +37,7 @@ function state(sequence: number, files: string[] = ["a.txt"]): SyncState {
 }
 
 const VIEW: TrustedLocalView = { manifest: manifest(["a.txt"]), deferred: new Set<string>() };
-const TRUSTED_BEFORE: PullTrustBeforeDrain = {
-  killSwitchOff: false,
+const TRUSTED_BEFORE: PullTrustGate = {
   watcherTrusted: true,
   manifestSettled: true,
   fullWorkspaceSinceSeed: true,
@@ -46,7 +45,7 @@ const TRUSTED_BEFORE: PullTrustBeforeDrain = {
   matcherMatchesBase: true,
   matcherObservationCurrent: true,
 };
-const TRUSTED_AFTER: PullTrustAfterDrain = {
+const TRUSTED_AFTER: PullTrustRecheck = {
   pendingEmpty: true,
   watcherTrusted: true,
   manifestSettled: true,
@@ -75,8 +74,8 @@ class RecordingTelemetry implements TelemetryRecorder {
 }
 
 async function harness(options: {
-  before?: PullTrustBeforeDrain;
-  after?: PullTrustAfterDrain;
+  before?: PullTrustGate;
+  after?: PullTrustRecheck;
   outcome?: (request: SealedPullRequest) => DaemonPullOutcome;
   actions?: readonly Action[];
   chainRepaired?: boolean;
@@ -85,6 +84,7 @@ async function harness(options: {
   metrics?: SyncMetrics;
   notifyPendingAt?: number;
   failAt?: "settle-report" | "refresh-matcher" | "load-post-base";
+  killSwitch?: boolean;
 } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pull-transition-"));
   const calls: string[] = [];
@@ -143,34 +143,58 @@ async function harness(options: {
     },
   };
   const attempt: PullAttemptInputs = {
-    beforeDrain: options.before ?? TRUSTED_BEFORE,
     preBase,
     watcherErrorGeneration: 4,
     notifyPendingAt: options.notifyPendingAt,
   };
   const operation: PullOperation = {
     seal: async () => { calls.push("seal"); return attempt; },
+    trustedPullEnabled: () => options.killSwitch !== true,
     drainPendingEvents: async () => { calls.push("drain"); },
-    afterDrain: () => { calls.push("after-drain"); return options.after ?? TRUSTED_AFTER; },
+    trustGate: () => { calls.push("trust-gate"); return options.before ?? TRUSTED_BEFORE; },
+    trustRecheck: () => { calls.push("trust-recheck"); return options.after ?? TRUSTED_AFTER; },
     open: () => { calls.push("open"); return port; },
   };
   return { root, calls, requests, metrics, telemetry, adopted, logs, observed, transition, port, operation };
 }
 
 describe("trusted pull admission", () => {
-  test("accepted trust drains once and seals the post-drain view", async () => {
+  test("accepted trust drains once, then gates, then seals the view", async () => {
     const calls: string[] = [];
     expect(await buildTrustedPullView(
-      TRUSTED_BEFORE,
+      () => true,
       async () => { calls.push("drain"); },
-      () => { calls.push("after"); return TRUSTED_AFTER; },
+      () => { calls.push("gate"); return TRUSTED_BEFORE; },
+      () => { calls.push("recheck"); return TRUSTED_AFTER; },
     )).toEqual({ view: VIEW });
-    expect(calls).toEqual(["drain", "after"]);
+    expect(calls).toEqual(["drain", "gate", "recheck"]);
   });
 
-  test("each pre-drain value reports its named refusal without draining", async () => {
-    const cases: [keyof PullTrustBeforeDrain, boolean, string][] = [
-      ["killSwitchOff", true, "kill-switch"],
+  test("design 277 r3.1: the kill switch precedes the drain — pre-202 lane restored whole", async () => {
+    let drained = false;
+    const result = await buildTrustedPullView(
+      () => false,
+      async () => { drained = true; },
+      () => TRUSTED_BEFORE,
+      () => TRUSTED_AFTER,
+    );
+    expect(result.skip).toBe("kill-switch");
+    expect(drained).toBe(false);
+  });
+
+  test("design 277 B3: trust is sampled after the drain, so a settling drain admits", async () => {
+    let settled = false;
+    const result = await buildTrustedPullView(
+      () => true,
+      async () => { settled = true; },
+      () => ({ ...TRUSTED_BEFORE, manifestSettled: settled }),
+      () => TRUSTED_AFTER,
+    );
+    expect(result.view).toBe(VIEW);
+  });
+
+  test("every gate value reports its named refusal AFTER the unconditional drain", async () => {
+    const cases: [keyof PullTrustGate, boolean, string][] = [
       ["watcherTrusted", false, "p1-watcher"],
       ["manifestSettled", false, "p2-observation"],
       ["fullWorkspaceSinceSeed", false, "p5-seed"],
@@ -181,51 +205,55 @@ describe("trusted pull admission", () => {
     for (const [key, value, expected] of cases) {
       let drained = false;
       const result = await buildTrustedPullView(
-        { ...TRUSTED_BEFORE, [key]: value },
+        () => true,
         async () => { drained = true; },
+        () => ({ ...TRUSTED_BEFORE, [key]: value }),
         () => TRUSTED_AFTER,
       );
       expect(result.skip, key).toBe(expected);
-      expect(drained, key).toBe(false);
+      expect(drained, key).toBe(true);
     }
   });
 
   test("post-drain P3, P1, and P2 refusals keep their exact tokens", async () => {
-    const cases: [Partial<PullTrustAfterDrain>, string][] = [
+    const cases: [Partial<PullTrustRecheck>, string][] = [
       [{ pendingEmpty: false }, "p3-pending"],
       [{ watcherTrusted: false }, "p1-watcher"],
       [{ manifestSettled: false }, "p2-observation"],
     ];
     for (const [override, expected] of cases) {
-      const result = await buildTrustedPullView(TRUSTED_BEFORE, async () => {}, () => ({ ...TRUSTED_AFTER, ...override }));
+      const result = await buildTrustedPullView(() => true, async () => {}, () => TRUSTED_BEFORE, () => ({ ...TRUSTED_AFTER, ...override }));
       expect(result.skip).toBe(expected);
     }
   });
 
   test("the trusted projection stays lazy until every post-drain clause admits", async () => {
     let projections = 0;
-    const after = (override: Partial<PullTrustAfterDrain>): PullTrustAfterDrain => ({
+    const after = (override: Partial<PullTrustRecheck>): PullTrustRecheck => ({
       ...TRUSTED_AFTER,
       ...override,
       trustedView: () => { projections++; return VIEW; },
     });
     expect((await buildTrustedPullView(
-      TRUSTED_BEFORE,
+      () => true,
       async () => {},
+      () => TRUSTED_BEFORE,
       () => after({ pendingEmpty: false }),
     )).skip).toBe("p3-pending");
     expect((await buildTrustedPullView(
-      TRUSTED_BEFORE,
+      () => true,
       async () => {},
+      () => TRUSTED_BEFORE,
       () => after({ watcherTrusted: false }),
     )).skip).toBe("p1-watcher");
     expect((await buildTrustedPullView(
-      TRUSTED_BEFORE,
+      () => true,
       async () => {},
+      () => TRUSTED_BEFORE,
       () => after({ manifestSettled: false }),
     )).skip).toBe("p2-observation");
     expect(projections).toBe(0);
-    expect((await buildTrustedPullView(TRUSTED_BEFORE, async () => {}, () => after({}))).view).toBe(VIEW);
+    expect((await buildTrustedPullView(() => true, async () => {}, () => TRUSTED_BEFORE, () => after({}))).view).toBe(VIEW);
     expect(projections).toBe(1);
   });
 });
@@ -278,7 +306,7 @@ describe("ApplyRemoteWorkspaceTransition", () => {
     const receipt = await h.transition.apply(h.operation);
     expect(receipt).toMatchObject({ local: "trusted", fallback: undefined, skip: undefined });
     expect(h.calls).toEqual([
-      "seal", "drain", "after-drain", "open", "execute:trusted", "clear-chain-repair",
+      "seal", "drain", "trust-gate", "trust-recheck", "open", "execute:trusted", "clear-chain-repair",
       "propagation", "settle-report", "load-post-base", "adopt-sequence", "install-patch", "log",
     ]);
     expect(h.adopted).toEqual([9]);
@@ -286,12 +314,14 @@ describe("ApplyRemoteWorkspaceTransition", () => {
     expect(h.logs).toEqual(["pull local=trusted"]);
   });
 
-  test("withheld trust executes scan-backed without drain, post snapshot, or patch", async () => {
+  // Design 277 B3: a withheld-trust pull still DRAINS. Leaving the drain behind P1
+  // let a fused watcher accumulate events unboundedly and hold local work unsettled.
+  test("withheld trust executes scan-backed but still drains, without post snapshot or patch", async () => {
     const h = await harness({ before: { ...TRUSTED_BEFORE, watcherTrusted: false } });
     const receipt = await h.transition.apply(h.operation);
     expect(receipt).toMatchObject({ local: "scan", skip: "p1-watcher" });
-    expect(h.calls).not.toContain("drain");
-    expect(h.calls).not.toContain("after-drain");
+    expect(h.calls.slice(0, 3)).toEqual(["seal", "drain", "trust-gate"]);
+    expect(h.calls).not.toContain("trust-recheck");
     expect(h.calls).not.toContain("install-patch");
     expect(h.calls.slice(-2)).toEqual(["scan-local", "log"]);
     expect(h.logs.at(-1)).toBe("pull local=scan skip=p1-watcher");
@@ -321,7 +351,7 @@ describe("ApplyRemoteWorkspaceTransition", () => {
   test("mismatched identity performs no settlement", async () => {
     const h = await harness({ outcome: () => ({ kind: "applied", attemptId: "other", actions: [], chainRepaired: false }) });
     await expect(h.transition.apply(h.operation)).rejects.toThrow(/attempt/);
-    expect(h.calls).toEqual(["seal", "drain", "after-drain", "open", "execute:trusted"]);
+    expect(h.calls).toEqual(["seal", "drain", "trust-gate", "trust-recheck", "open", "execute:trusted"]);
   });
 
   test("conflict metrics increment the stable loaded record and preserve siblings", async () => {

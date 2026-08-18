@@ -7,8 +7,7 @@ import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { LocalAuthority } from "./local-observation-transition.js";
 import { gitTopologyChanged, type SkipCause, type TrustedPullViewResult } from "./manifest-update.js";
 
-export interface PullTrustBeforeDrain {
-  readonly killSwitchOff: boolean;
+export interface PullTrustGate {
   readonly watcherTrusted: boolean;
   readonly manifestSettled: boolean;
   readonly fullWorkspaceSinceSeed: boolean;
@@ -17,28 +16,40 @@ export interface PullTrustBeforeDrain {
   readonly matcherObservationCurrent: boolean;
 }
 
-export interface PullTrustAfterDrain {
+export interface PullTrustRecheck {
   readonly pendingEmpty: boolean;
   readonly watcherTrusted: boolean;
   readonly manifestSettled: boolean;
   readonly trustedView: () => TrustedLocalView;
 }
 
-/** Evaluate predicate P from values, taking the only side effect at P3. */
+/**
+ * Evaluate predicate P (design 202 order, unchanged) — but drain FIRST, always.
+ * Applying watch events to the local observer is mode- and trust-independent
+ * bookkeeping, identical to the push prologue's drain; leaving it behind P1 let a
+ * fused watcher on a pull-only host accumulate events for a whole fuse interval
+ * while the non-empty queue held `externalLocalWorkSettled` false, interlocking
+ * against the very trust recovery that would clear P1 (design 277 B3).
+ * Trust is therefore sampled AFTER the drain; the pull keeps its pre-op base.
+ * The kill switch alone precedes the drain: turning design 202 off must restore the
+ * pre-202 pull lane whole, and that lane did not drain here.
+ */
 export async function buildTrustedPullView(
-  before: PullTrustBeforeDrain,
+  trustedPullEnabled: () => boolean,
   drainPendingEvents: () => Promise<void>,
-  afterDrain: () => PullTrustAfterDrain,
+  trustGate: () => PullTrustGate,
+  trustRecheck: () => PullTrustRecheck,
 ): Promise<TrustedPullViewResult> {
-  if (before.killSwitchOff) return { skip: "kill-switch" };
+  if (!trustedPullEnabled()) return { skip: "kill-switch" };
+  await drainPendingEvents();
+  const before = trustGate();
   if (!before.watcherTrusted) return { skip: "p1-watcher" };
   if (!before.manifestSettled) return { skip: "p2-observation" };
   if (!before.fullWorkspaceSinceSeed) return { skip: "p5-seed" };
   if (!before.resetReady) return { skip: "p6-reset" };
   if (!before.matcherMatchesBase) return { skip: "p7-matcher" };
   if (!before.matcherObservationCurrent) return { skip: "p7-matcher-observation" };
-  await drainPendingEvents();
-  const after = afterDrain();
+  const after = trustRecheck();
   if (!after.pendingEmpty) return { skip: "p3-pending" };
   if (!after.watcherTrusted) return { skip: "p1-watcher" };
   if (!after.manifestSettled) return { skip: "p2-observation" };
@@ -46,7 +57,6 @@ export async function buildTrustedPullView(
 }
 
 export interface PullAttemptInputs {
-  readonly beforeDrain: PullTrustBeforeDrain;
   readonly preBase: SyncState;
   readonly watcherErrorGeneration: number;
   readonly notifyPendingAt: number | undefined;
@@ -85,8 +95,10 @@ export interface DaemonPullReceipt {
 
 export interface PullOperation {
   seal(): Promise<PullAttemptInputs>;
+  trustedPullEnabled(): boolean;
   drainPendingEvents(): Promise<void>;
-  afterDrain(): PullTrustAfterDrain;
+  trustGate(preBase: SyncState): PullTrustGate;
+  trustRecheck(): PullTrustRecheck;
   open(): PullTransitionPort;
 }
 
@@ -193,9 +205,10 @@ export class ApplyRemoteWorkspaceTransition {
     const parent = `pull-${++this.attempts}`;
     const inputs = await op.seal();
     const trust = await buildTrustedPullView(
-      inputs.beforeDrain,
+      () => op.trustedPullEnabled(),
       () => op.drainPendingEvents(),
-      () => op.afterDrain(),
+      () => op.trustGate(inputs.preBase),
+      () => op.trustRecheck(),
     );
     let request = sealPullRequest(`${parent}/1`, trust, inputs.watcherErrorGeneration);
     const port = op.open();

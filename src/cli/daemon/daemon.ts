@@ -141,8 +141,8 @@ import {
   ApplyRemoteWorkspaceTransition,
   buildTrustedPullView,
   classifyPullOutcome,
-  type PullTrustAfterDrain,
-  type PullTrustBeforeDrain,
+  type PullTrustGate,
+  type PullTrustRecheck,
 } from "./daemon-pull-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
@@ -193,6 +193,10 @@ const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
 const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 export const GIT_BUSY_RETRY_DELAYS_MS = [2_000, 8_000] as const;
+/** Resident bound on undrained watch events. A drain-time bound would cap apply work
+ *  but not memory — events accumulate BETWEEN operations, and a pull-only host under a
+ *  fused watcher has no push prologue to drain them. */
+export const PENDING_EVENT_CAP = 65_536;
 
 interface ReloadStatToken { mtimeMs: number; size: number }
 
@@ -562,7 +566,7 @@ export class RboxDaemon {
     this.telemetry = new TelemetryQueue(this.api, this.log);
     this.retryQueue = new LocalRetryQueue({
       requeue: (paths) => {
-        for (const p of paths) this.pendingEvents.push({ relPath: p, kind: "change" });
+        this.enqueueWatchEvents(paths.map((relPath) => ({ relPath, kind: "change" })));
         this.request("push");
       },
       markUnsettled: (p) => this.local.markUnsettled(p),
@@ -675,7 +679,7 @@ export class RboxDaemon {
         if (this.resetLifecycle !== "ready") return;
         this.watcherTrust.observe({ kind: "watch-activity" });
         this.noteChurn();
-        this.pendingEvents.push(...events);
+        this.enqueueWatchEvents(events);
         this.request("push");
       },
       onRawEvent: (event) => {
@@ -949,7 +953,11 @@ export class RboxDaemon {
 
     if (this.stopped) return;
     this.armStandingRecovery();
-    if (this.pullOnly) {
+    // Design 277 B1/B4: pull-only is not a reason to skip the watcher — a pull-only
+    // daemon still needs P1 to make design-202 trusted pulls reachable (#477). Only a
+    // SCOPED binding keeps the periodic-scan floor: it publishes nothing and is torn
+    // down on any scope change (`this.scoped`, not the destructively-forced `pullOnly`).
+    if (this.scoped) {
       this.scheduleSafetyScan();
       this.scheduleDeepScan();
     }
@@ -1047,8 +1055,7 @@ export class RboxDaemon {
     try {
       this.advanceSafetyCadenceForTick();
       this.churnSinceSafety = false;
-      if (this.pullOnly) await this.runDeferralHygiene();
-      else this.request("fullScan");
+      this.request("fullScan");
     } finally {
       if (!this.stopped) this.scheduleSafetyScan();
     }
@@ -1217,10 +1224,7 @@ export class RboxDaemon {
 
   private request(kind: keyof Wants): void {
     if (kind === "push") this.requestPush("other");
-    else {
-      if (this.pullOnly && kind !== "pull" && kind !== "deepScan") return;
-      this.scheduler.request(kind);
-    }
+    else this.scheduler.request(kind);
     this.writeAmbientStatus();
     if (this.resetLifecycle !== "ready" && this.now() < this.nextResetRetryAt) return;
     void this.pump();
@@ -1959,6 +1963,25 @@ export class RboxDaemon {
     return visibleChanged;
   }
 
+  /**
+   * The saturating intake for watch events, and the sole writer of `pendingEvents`.
+   * Saturation is a watcher DROP, not a new failure class: the queue is cleared and the
+   * trust machine is told, exactly as a kernel overflow reports itself. Trust then owns
+   * the consequences it already owns — suspect ⇒ P1 false ⇒ scan-backed pulls, safety
+   * floor pinned, recovery through the supervised re-arm's witnessed full-tree scan.
+   */
+  private enqueueWatchEvents(events: readonly WatchEvent[]): void {
+    for (const event of events) {
+      if (this.pendingEvents.length >= PENDING_EVENT_CAP) {
+        this.pendingEvents = [];
+        this.log(`watch queue overflowed at ${PENDING_EVENT_CAP} pending events — cleared; reconciling by scan`);
+        this.watcherTrust.observe({ kind: "error", error: new Error("watch queue overflow: events were dropped") });
+        return;
+      }
+      this.pendingEvents.push(event);
+    }
+  }
+
   private async applyPendingWatchEvents(): Promise<void> {
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
@@ -2021,9 +2044,8 @@ export class RboxDaemon {
     return this.local.observationComplete && this.activeCaseCollisions.length === 0;
   }
 
-  private pullTrustBeforeDrain(base: SyncState): PullTrustBeforeDrain {
+  private pullTrustGate(base: SyncState): PullTrustGate {
     return {
-      killSwitchOff: !pullTrustWatcherEnabled(),
       watcherTrusted: this.watcherTrust.trustedForPull(),
       manifestSettled: this.manifestSettledForPull(),
       fullWorkspaceSinceSeed: this.local.fullWorkspaceSinceSeed,
@@ -2033,7 +2055,7 @@ export class RboxDaemon {
     };
   }
 
-  private pullTrustAfterDrain(): PullTrustAfterDrain {
+  private pullTrustRecheck(): PullTrustRecheck {
     return {
       pendingEmpty: this.pendingEvents.length === 0,
       watcherTrusted: this.watcherTrust.trustedForPull(),
@@ -2044,9 +2066,10 @@ export class RboxDaemon {
 
   private buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
     return buildTrustedPullView(
-      this.pullTrustBeforeDrain(base),
+      () => pullTrustWatcherEnabled(),
       () => this.applyPendingWatchEvents(),
-      () => this.pullTrustAfterDrain(),
+      () => this.pullTrustGate(base),
+      () => this.pullTrustRecheck(),
     );
   }
 
@@ -2127,14 +2150,15 @@ export class RboxDaemon {
         const watcherErrorGeneration = this.watcherTrust.captureOperation().errorGeneration;
         const preBase = this.syncBase ?? await this.loadSyncBase();
         return {
-          beforeDrain: this.pullTrustBeforeDrain(preBase),
           preBase,
           watcherErrorGeneration,
           notifyPendingAt: receipt?.notifyPendingAt,
         };
       },
+      trustedPullEnabled: () => pullTrustWatcherEnabled(),
       drainPendingEvents: () => this.applyPendingWatchEvents(),
-      afterDrain: () => this.pullTrustAfterDrain(),
+      trustGate: (preBase) => this.pullTrustGate(preBase),
+      trustRecheck: () => this.pullTrustRecheck(),
       open: () => {
         const metricsReport = beginReport("pull");
         const report = metricsReport ?? (telemetryEnabled() || this.propagationTrace ? PhaseReport.pull() : undefined);

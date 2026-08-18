@@ -6,8 +6,9 @@ import { HashCache, scanManifest, type BlobStore, type FileEntry, type GitSectio
 import { gitIdentity } from "../sync-git/identity.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
-import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon, type DaemonTimerHandle, type ScanCadenceClock } from "../daemon.js";
+import { PENDING_EVENT_CAP } from "./daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonPidRecord } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
@@ -874,7 +875,7 @@ test("design 178 C: daemon hygiene updates the next ambient heartbeat projection
   });
 });
 
-test("review H2: pull-only safety cadence clears a stale lane without a scan or status call", async () => {
+test("review H2: the pull-only safety cadence clears a stale lane, now through its own fullScan", async () => {
   await withIsolatedDaemonHome(async () => {
     const repo = path.join(root, "repo");
     await fs.mkdir(repo);
@@ -901,10 +902,21 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     };
     await saveStateUnsafeLegacyOrTest(root, seeded);
     daemon.syncBase = await loadState(root, seeded.stream);
+    // Design 277: pull-only no longer filters `fullScan`, so the safety tick takes the
+    // read-write route and deferral hygiene rides the scan tail instead of being the
+    // tick's whole body. The lane still clears, and still without a push.
+    let scans = 0;
+    const doFullScan = daemon.doFullScan.bind(daemon);
+    daemon.doFullScan = async () => {
+      scans++;
+      return doFullScan();
+    };
     daemon.scheduleSafetyScan();
     expect(daemon.safetyTimer).toBeDefined();
     await clock.fireAll();
+    await daemon.pumpRun;
 
+    expect(scans).toBe(1);
     expect(daemon.syncBase?.repoRecords?.repo?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.repo?.deferrals).toBeUndefined();
     expect(daemon.want.fullScan).toBe(false);
@@ -918,6 +930,12 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const clock = new FakeScanCadenceClock();
     const remote = new MiniRemote();
     const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
+    // Design 277 B1: a pull-only boot now starts the live watcher. The boot scan still
+    // mints an absence proof — it runs BEFORE the watcher exists, so it is unpruned —
+    // and this fixture keeps pinning the DEGRADED world, where the watcher factory
+    // rejects exactly as production does when it cannot arm. The healthy-watcher path
+    // has its own test below.
+    daemon.startWatcherFn = () => Promise.reject(new Error("forced watcher-init failure (pr8 fixture)"));
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
       ...(daemon.syncBase ?? await daemon.loadSyncBase()),
@@ -938,19 +956,69 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const firstEpoch = daemon.gitDiscovery.absenceProof?.epoch;
     expect(firstEpoch).toBeDefined();
 
+    // Design 277: pull-only no longer filters `fullScan`, so a degraded pull-only host
+    // pays read-write's safety-scan cost — and gets read-write's healing. The safety
+    // tick now reminits discovery itself instead of waiting 30m for the deep tick.
     await clock.fireSafety();
-    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch);
-    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals?.capture).toBeDefined();
+    await daemon.pumpRun;
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 1);
 
     now += 30_000;
     await clock.fireDeep();
     await Promise.resolve();
     await daemon.pumpRun;
-    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 1);
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 2);
     expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
     expect(daemon.want.push).toBe(false);
     expect(remote.head).toBe(0);
+  });
+});
+
+test("design 277 B1: an unscoped pull-only boot starts the live watcher session (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const clock = new FakeScanCadenceClock();
+    const daemon = await makeDaemon(new MiniRemote(), "pull-only-watch", { pullOnly: true, now: () => TEST_NOW, scanCadenceClock: clock });
+    let started = 0;
+    daemon.startWatcherFn = () => {
+      started++;
+      return Promise.resolve({ backend: "parcel", close: async () => {} });
+    };
+
+    await daemon.start();
+
+    expect(started).toBe(1);
+    expect(daemon.watcher).toBeDefined();
+    // The periodic floor stays armed alongside the watcher, exactly as read-write.
+    expect(clock.safetyArmed).toBe(true);
+    expect(clock.deepArmed).toBe(true);
+  });
+});
+
+test("design 277 B4: a scoped binding boots without a live watcher (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const scopedCfg = testConfig({ scope: ["sub"], scopeGeneration: 1 });
+    await saveConfig(root, scopedCfg);
+    const clock = new FakeScanCadenceClock();
+    const daemon = await makeDaemon(new MiniRemote(), "scoped-no-watch", { now: () => TEST_NOW, scanCadenceClock: clock }, { scope: ["sub"], scopeGeneration: 1 });
+    let started = 0;
+    daemon.startWatcherFn = () => {
+      started++;
+      return Promise.resolve({ backend: "parcel", close: async () => {} });
+    };
+
+    await daemon.start();
+
+    // This test cannot discriminate the gate PREDICATE by construction: a scoped
+    // binding forces `pullOnly`, so `scoped` and `pullOnly` are both true here and a
+    // `pullOnly` gate would pass it too. The discriminator is the B1 test above — an
+    // unscoped pull-only boot that DOES start the watcher.
+    expect(started).toBe(0);
+    expect(daemon.watcher).toBeUndefined();
+    // Negative control: the boot really reached the mode gate (a halted scope seal
+    // would also leave the watcher unstarted) and armed the periodic-scan floor.
+    expect(clock.safetyArmed).toBe(true);
+    expect(clock.deepArmed).toBe(true);
   });
 });
 
@@ -2227,4 +2295,50 @@ test("executeOp D4: recovery-probe ops do NOT report watcher operation completio
 
   // Recovery ops run outside the watcher-generation bracketing the observation assumes.
   expect(calls).toEqual([]);
+});
+
+test("design 277 B1: a pull-only host WITH a live watcher still clears a ghost deferral (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    let now = TEST_NOW;
+    const clock = new FakeScanCadenceClock();
+    const remote = new MiniRemote();
+    const daemon = await makeDaemon(remote, "pull-only-ghost-watch", { pullOnly: true, now: () => now, scanCadenceClock: clock });
+    daemon.startWatcherFn = () => Promise.resolve({ backend: "parcel", close: async () => {} });
+    const at = new Date(TEST_NOW - 60_000).toISOString();
+    const seeded: SyncState = {
+      ...(daemon.syncBase ?? await daemon.loadSyncBase()),
+      repoRecords: {
+        ghost: {
+          repoGen: 1,
+          sourceSeq: 0,
+          deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+        },
+      },
+    };
+    await saveStateUnsafeLegacyOrTest(root, seeded);
+    daemon.syncBase = await loadState(root, seeded.stream);
+
+    await daemon.start();
+    expect(daemon.watcher).toBeDefined();
+
+    // Clearing a gone repo needs TWO qualifying observations under DIFFERENT discovery
+    // epochs at least 30s apart (sync-git/deferral-hygiene.ts): the first deep tick
+    // records the gone observation, the second clears it. Nothing here is about
+    // pruning — deep scans are always unpruned. Ghost-clear latency on a pull-only
+    // host therefore spans two deep ticks (30m → 60m) — a named trade.
+    now += 30_000;
+    await clock.fireDeep();
+    await Promise.resolve();
+    await daemon.pumpRun;
+    now += 30_000;
+    await clock.fireDeep();
+    await Promise.resolve();
+    await daemon.pumpRun;
+
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(3);
+    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect(daemon.want.push).toBe(false);
+    expect(remote.head).toBe(0);
+  });
 });
