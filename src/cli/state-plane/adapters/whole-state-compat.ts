@@ -29,6 +29,7 @@ import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
 import { LEGACY_REJECTION_REASON, translateCasResult } from "./cas-translation.js";
 import { fencedAuthorityUnderHeldLock, openAuthorityStore, selectAuthority, sqliteAuthority, translateStoreOpenError } from "./authority-open.js";
+import { forgetState, memoizedState, rememberState } from "./state-memo.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
@@ -93,12 +94,18 @@ export async function loadState(
   if (selection.kind === "legacy-json-store") return loadLegacyJsonState(root, stream, warningSink, heldMutex);
   const authority = sqliteAuthority(root, selection);
   // Recovery cannot change the answer above: a standing reset under `Q` is
-  // recovered by the SQLite reset plane, which republishes `Q`.
-  await recoverStandingResetJournal(root, stream, heldMutex);
+  // recovered by the SQLite reset plane, which republishes `Q`. A recovery
+  // replaces the lineage, so it also invalidates any retained state
+  // unconditionally rather than relying on the token comparison alone.
+  const recovered = await recoverStandingResetJournal(root, stream, heldMutex);
+  if (recovered) forgetState(root);
   const { store, facade } = await openAuthorityStore(authority, true);
   let state: SyncState;
   try {
-    state = facade.loadRawStateFromStore(store);
+    // Design 277: the token and the projection are read through the SAME open
+    // handle, so nothing can move between deciding to skip and skipping.
+    const token = facade.readStateFreshnessFromStore(store);
+    state = memoizedState(root, token) ?? rememberState(root, token, facade.loadRawStateFromStore(store));
   } finally {
     store.close();
   }
@@ -165,7 +172,8 @@ export async function ensureTelemetryBindingId(
         casOwnerTokenFromLock(acquired.lock),
         randomBytes,
       );
-      return { state: facade.loadRawStateFromStore(store), bindingId };
+      const state = facade.loadRawStateFromStore(store);
+      return { state: rememberState(root, facade.readStateFreshnessFromStore(store), state), bindingId };
     } finally {
       store.close();
     }
@@ -228,10 +236,18 @@ async function saveThroughStore(
     const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
-      return translateCasResult(
+      const result = translateCasResult(
         await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)),
         store, facade, packet, options.acceptedProjection,
       );
+      // An accepted save already holds the exact state the store now carries;
+      // retaining it under the post-write token is what makes the loads that
+      // follow a publication free. Every other status leaves the retention
+      // alone — the next load's token comparison is the arbiter either way.
+      if (result.status === "accepted") {
+        rememberState(root, facade.readStateFreshnessFromStore(store), result.state);
+      }
+      return result;
     } finally {
       store.close();
     }
@@ -268,6 +284,9 @@ export async function replaceResetLineageStream(
     return legacyReplacement;
   }
 
+  // The replacement installs a different lineage; nothing retained under the
+  // rejected one may survive it.
+  forgetState(root);
   const acquired = await acquireLock(stateLockPath(root));
   if (acquired.status !== "acquired") {
     throw new StateWriteRefusedError("state-lock-unavailable", statePath(root), acquired.status === "held" ? stateLockBusyDetail(acquired) : String(acquired.error));

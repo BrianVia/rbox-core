@@ -22,6 +22,7 @@ import { sqliteResetPaths, statePath } from "../state-plane/paths.js";
 import * as storeFacade from "../state-plane/store-facade.js";
 import { createStateStore } from "../state-plane/store/open.js";
 import { loadRawState } from "../state-plane/adapters/whole-state-compat.js";
+import { forgetState } from "../state-plane/adapters/state-memo.js";
 import { saveStateSource } from "../sync-state.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
@@ -164,7 +165,10 @@ async function countMaterializations(run: () => Promise<void>): Promise<number> 
   return loads;
 }
 
-test("277 A1: with retention off, the clean zero-change push cycle materializes state once", async () => {
+test("277: with the memo off, the clean zero-change push cycle materializes state four times", async () => {
+  // The behavior this design set out to remove, pinned so the kill switch is a
+  // real revert: the boundary load, the receipt reconcile, the attempt, and the
+  // publish transition's refresh each materialize the whole workspace.
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   process.env.RBOX_STATE_LOAD_CACHE = "0";
@@ -173,13 +177,24 @@ test("277 A1: with retention off, the clean zero-change push cycle materializes 
       daemon.want.push = true;
       await daemon.pump();
     });
-    expect(loads).toBe(1);
+    expect(loads).toBe(4);
   } finally {
     delete process.env.RBOX_STATE_LOAD_CACHE;
   }
 });
 
-test("277 A2: the steady zero-change push cycle materializes state not at all", async () => {
+test("277: a cold clean push cycle materializes state exactly once", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  forgetState(root); // a freshly started daemon has nothing retained
+  const loads = await countMaterializations(async () => {
+    daemon.want.push = true;
+    await daemon.pump();
+  });
+  expect(loads).toBe(1);
+});
+
+test("277: the steady zero-change push cycle materializes state not at all", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   daemon.want.push = true;
@@ -193,9 +208,9 @@ test("277 A2: the steady zero-change push cycle materializes state not at all", 
 });
 
 // The pull's own accepted save projects the installed state through
-// `translateCasResult` — a write-path materialization, not a load. Slice A
-// removes every LOAD; design 267's elision owns that remaining one.
-test("277 A2: the steady zero-change pull cycle materializes state only for its own accepted save", async () => {
+// `translateCasResult` — a write-path materialization, not a load. Every LOAD
+// in the cycle is served from the retention.
+test("277: the steady zero-change pull cycle materializes state only for its own accepted save", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   daemon.want.pull = true;
@@ -208,36 +223,7 @@ test("277 A2: the steady zero-change pull cycle materializes state only for its 
   expect(loads).toBe(1);
 });
 
-test("277 A1: the settled durable state deep-equals the store after a zero-change push", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  daemon.want.push = true;
-  await daemon.pump();
-  expect(daemon.syncBase).toEqual(await loadRawState(root));
-});
-
-test("277 A1: the settled durable state deep-equals the store after a committing push", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  await fs.writeFile(path.join(root, "a.txt"), "hello\n");
-  daemon.local.head = await scanManifest(root);
-  daemon.want.push = true;
-  await daemon.pump();
-  expect(remote.head).toBe(1);
-  expect(daemon.syncBase).toEqual(await loadRawState(root));
-});
-
-test("277 A1: the settled durable state deep-equals the store after a pull that applies", async () => {
-  const remote = new MiniRemote();
-  const daemon = await makeDaemon(remote);
-  remote.injectCommit([await remote.seedEntry("remote.txt", "remote\n")]);
-  daemon.want.pull = true;
-  await daemon.pump();
-  expect(daemon.syncBase?.lastSyncedSequence).toBe(1);
-  expect(daemon.syncBase).toEqual(await loadRawState(root));
-});
-
-test("277 A2: a foreground state write between cycles fails the probe and reloads", async () => {
+test("277: a foreground state write between cycles is materialized again", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   daemon.want.push = true;
@@ -250,29 +236,42 @@ test("277 A2: a foreground state write between cycles fails the probe and reload
     observedRepos: [],
     values: {},
   });
+  forgetState(root); // as another process's write would leave this one
 
   const loads = await countMaterializations(async () => {
     daemon.want.push = true;
     await daemon.pump();
   });
-  expect(loads).toBeGreaterThanOrEqual(1);
+  expect(loads).toBe(1);
   expect(daemon.syncBase).toEqual(await loadRawState(root));
 });
 
-test("277 A2: RBOX_STATE_LOAD_CACHE=0 restores per-boundary materialization", async () => {
+test("277: the settled durable state deep-equals the store after a zero-change push", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   daemon.want.push = true;
   await daemon.pump();
-
-  process.env.RBOX_STATE_LOAD_CACHE = "0";
-  try {
-    const loads = await countMaterializations(async () => {
-      daemon.want.push = true;
-      await daemon.pump();
-    });
-    expect(loads).toBeGreaterThanOrEqual(1);
-  } finally {
-    delete process.env.RBOX_STATE_LOAD_CACHE;
-  }
+  expect(daemon.syncBase).toEqual(await loadRawState(root));
 });
+
+test("277: the settled durable state deep-equals the store after a committing push", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello\n");
+  daemon.local.head = await scanManifest(root);
+  daemon.want.push = true;
+  await daemon.pump();
+  expect(remote.head).toBe(1);
+  expect(daemon.syncBase).toEqual(await loadRawState(root));
+});
+
+test("277: the settled durable state deep-equals the store after a pull that applies", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  remote.injectCommit([await remote.seedEntry("remote.txt", "remote\n")]);
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(daemon.syncBase?.lastSyncedSequence).toBe(1);
+  expect(daemon.syncBase).toEqual(await loadRawState(root));
+});
+

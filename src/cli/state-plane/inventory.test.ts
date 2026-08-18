@@ -77,11 +77,9 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/adapters/authority-open.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
-  // Design 277 §A2: the O(1) lineage reads route through the same selection and
-  // ownership-proving open as the whole-state loads; the probe additionally
-  // recovers a standing reset journal before it answers.
+  // Design 277: the O(1) lineage identity read routes through the same
+  // selection and ownership-proving open as the whole-state loads.
   { file: "src/cli/state-plane/adapters/lineage-reads.ts", symbol: "loadRawStateIdentity", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
-  { file: "src/cli/state-plane/adapters/lineage-reads.ts", symbol: "probeStateFreshness", kind: "read", sites: 0, guards: ["selectAuthority", "recoverStandingResetJournal", "openAuthorityStore"] },
   // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
   // legacy document, so the repositories it covers are the same set in either
   // format. It used to classify and refuse instead, which made every lock bundle

@@ -1,19 +1,13 @@
 /**
- * The O(1) lineage reads (design 277). Both answer a question about the state
- * the store holds WITHOUT materializing every file and repository behind it:
- * the boundary fence compares two identity tokens, and the freshness probe asks
- * whether a state a caller already holds is still the state the store holds.
+ * The O(1) lineage identity read (design 277). It answers the daemon's
+ * boundary fence — "is this still the stream and state nonce I bound to?" —
+ * without materializing every file and repository behind that answer.
  *
- * Legacy JSON has no header to read cheaply, so identity falls back to its
- * ordinary raw read and freshness declines to answer at all — the probe is a
- * SQLite lineage row, and parity for a dying path is not worth a JSON token
- * scheme.
+ * Legacy JSON has no header to read cheaply, so it falls back to its ordinary
+ * raw read; parity for a dying path is not worth a JSON token scheme.
  */
-import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
 import type { SyncState } from "../../sync-state-model.js";
-import { recoverStandingResetJournal } from "../reset-lineage.js";
 import { openAuthorityStore, selectAuthority, sqliteAuthority } from "./authority-open.js";
-import type { StateFreshnessToken } from "./read-only.js";
 import { loadRawLegacyJsonState } from "./legacy-json-store.js";
 
 /** The lineage identity a boundary fence compares. `undefined` means no
@@ -29,38 +23,4 @@ export async function loadRawStateIdentity(root: string): Promise<Pick<SyncState
   } finally {
     store.close();
   }
-}
-
-/**
- * Design 277 §A2: read the lineage tokens a caller compares against the state it
- * already holds. `undefined` means "no reuse is admissible" — an absent or
- * legacy authority, a stream this workspace no longer carries, or a reset
- * journal this call just recovered.
- *
- * Authority selection, genesis admission under a held mutex, and reset-journal
- * recovery run exactly as they do on the full load path.
- */
-export async function probeStateFreshness(
-  root: string,
-  stream: string,
-  heldMutex?: WorkspaceSyncMutex,
-): Promise<StateFreshnessToken | undefined> {
-  const selection = await selectAuthority(root, heldMutex);
-  if (selection.kind !== "sqlite-store") return undefined;
-  if (await recoverStandingResetJournal(root, stream, heldMutex)) return undefined;
-  const { store, facade } = await openAuthorityStore(sqliteAuthority(root, selection), true);
-  try {
-    const token = facade.readStateFreshnessFromStore(store);
-    return token.stream === stream ? token : undefined;
-  } finally {
-    store.close();
-  }
-}
-
-/** Whether a held state still carries the store's probed tokens. */
-export function stateMatchesFreshness(state: SyncState, token: StateFreshnessToken): boolean {
-  return state.stream === token.stream
-    && state.stateNonce === token.stateNonce
-    && state.stateRevision === token.stateRevision
-    && state.telemetryBindingId === token.telemetryBindingId;
 }

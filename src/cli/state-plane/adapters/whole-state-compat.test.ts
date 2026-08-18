@@ -757,16 +757,16 @@ test("each selected write fences exactly once and never through a static import"
   // writer. 163 v13 is specifically about what a READ is allowed to do.
   expect(source.match(/openAuthorityStore\(authority, true\)/g) ?? []).toHaveLength(2);
   expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(3);
-  expect(lineageReads.match(/openAuthorityStore\(sqliteAuthority\(root, selection\), true\)/g) ?? []).toHaveLength(2);
+  expect(lineageReads.match(/openAuthorityStore\(sqliteAuthority\(root, selection\), true\)/g) ?? []).toHaveLength(1);
   expect(lineageReads).not.toContain("openAuthorityStore(sqliteAuthority(root, selection), false)");
   expect(authorityOpen).toContain("facade.openStateStore(authority.file, { readonly })");
   // Five closes in the whole-state adapter: its two read paths, save, telemetry,
   // and the reset-lineage replacement; the authority-id refusal closes the
-  // handle it had to open to compare ids, in `authority-open.ts`, and each O(1)
-  // lineage read closes its own.
+  // handle it had to open to compare ids, in `authority-open.ts`, and the O(1)
+  // lineage identity read closes its own.
   expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(5);
   expect(authorityOpen.match(/store\.close\(\);/g) ?? []).toHaveLength(1);
-  expect(lineageReads.match(/store\.close\(\);/g) ?? []).toHaveLength(2);
+  expect(lineageReads.match(/store\.close\(\);/g) ?? []).toHaveLength(1);
   // A static import of either the coordinator or the store would drag
   // `bun:sqlite` into the CLI's eager graph, which `schema/inventory.test.ts`
   // forbids — and would stop the adapter being inert before the flip.

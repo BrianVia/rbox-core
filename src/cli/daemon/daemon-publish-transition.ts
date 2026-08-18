@@ -4,7 +4,6 @@ import { saveMetrics, type SyncMetrics } from "../metrics.js";
 import { CommitRejectedError } from "../remote.js";
 import { deferManifest } from "../sync-recovery.js";
 import { localFileObservationForScan, type PushManifestOptions, type PushResult } from "../sync/push.js";
-import { RELOAD_DURABLE_STATE, type DurableStateReceipt } from "../sync/durable-state.js";
 import type { GitCaptureSample } from "../telemetry/contract.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { PushProvenance } from "./daemon.js";
@@ -60,9 +59,7 @@ export interface PublishTransitionState {
 /** The two genuine adjacent services that cannot be owned by the transition. */
 export interface PublishTransitionServices {
   log(line: string): void;
-  /** Design 277 §A1: settle adopts the operation's evidence-carrying receipt —
-   * the exact accepted state, or a real reload when nothing can name it. */
-  refreshDurableState(receipt: DurableStateReceipt): Promise<void>;
+  refreshDurableState(): Promise<void>;
 }
 
 export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCaptureSample | undefined {
@@ -148,8 +145,7 @@ export class PublishLocalWorkspaceTransition {
     }
     if (outcome.kind === "terminal-block") {
       this.noteTerminalBlock(outcome.fingerprint);
-      // A terminal block returns no result, so nothing here has evidence.
-      await this.services.refreshDurableState(RELOAD_DURABLE_STATE);
+      await this.services.refreshDurableState();
       return { attemptId: request.attemptId, outcome: outcome.kind };
     }
     await this.settle(outcome.result, provenance, port, publishTransitionT0);
@@ -207,7 +203,7 @@ export class PublishLocalWorkspaceTransition {
     const writeFinish = new Set(deferred.filter((path) => !retryLater.has(path)));
     if (writeFinish.size > 0) this.state.retries.scheduleWriteFinish(writeFinish);
     if (retryLater.size > 0) this.state.retries.scheduleGcFence(retryLater);
-    await this.services.refreshDurableState(result.durable ?? RELOAD_DURABLE_STATE);
+    await this.services.refreshDurableState();
     this.state.metrics.syncs += 1;
     await saveMetrics(this.state.root, this.state.metrics);
     port.settleReport(Math.max(0, performance.now() - publishTransitionT0));

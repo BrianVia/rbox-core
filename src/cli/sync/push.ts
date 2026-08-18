@@ -15,7 +15,7 @@ import {
   type Manifest,
   type CaseFoldCollisionGroup,
 } from "../../engine/index.js";
-import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type WorkspaceConfig } from "../config.js";
 import { mdeWritePolicy } from "../e2ee-remote.js";
 import {
   deferManifest,
@@ -51,7 +51,6 @@ import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } fr
 import type { LocalManifestProjectionSpans } from "../local-file-projection.js";
 import { executeManifestCommit, type ManifestCommitPort } from "./manifest-commit-executor.js";
 import { acknowledgePublishedGitTransitions, type RepoTransitionPort } from "./publisher-ack-transition.js";
-import { RELOAD_DURABLE_STATE, type DurableStateReceipt } from "./durable-state.js";
 
 const COMMIT_FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
 const COMMIT_FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(COMMIT_FILE_ENTRY_KEYS);
@@ -159,10 +158,6 @@ export async function push(
  *  the no-op and everything-deferred short-circuits, so callers can say "already in
  *  sync" instead of reporting a publish that never happened (design 44: the setup
  *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
-/** The operation-local receipt slot, carried by the retry loop so one exit point
- *  reports it and no outcome arm can forget to. */
-interface DurableStateWitness { receipt: DurableStateReceipt }
-
 export type ResolutionPushResult = { outcome: "published" | "refused" | "aborted-remote-moved" | "ack-uncertain"; reason?: string; sequence?: number };
 export type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean; repairConflict?: boolean; resolution?: ResolutionPushResult;
   /** Complete, deterministic raw collision groups observed for this candidate.
@@ -172,10 +167,7 @@ export type PushResult = { sequence: number; manifest: Manifest; deferred?: stri
   localFileObservationAuthority: "authoritative" | "preserve";
   /** Design 108 §3.1: set true only on a successful, sequence-advancing files-only
    *  genesis commit (commit 1) with git still owed — signals init to run commit 2. */
-  gitDeferred?: boolean;
-  /** Design 277 §A1: durable-state evidence for the caller's settle. Absent means
-   *  the caller must reload — the same verdict as an explicit `reload`. */
-  durable?: DurableStateReceipt };
+  gitDeferred?: boolean };
 export interface RepairPushMode { kind: "repair"; parentSequence: number }
 
 export class PushConflictExhaustedError extends Error {
@@ -252,11 +244,6 @@ export interface PushManifestOptions {
   /** §3.6.3: publish as the PIN's child, snapshot-only, short-circuits bypassed. */
   repair?: RepairPushMode;
   resolution?: GitResolutionRider;
-  /** Design 277 §A1: the durable state this operation's boundary already loaded
-   * under the held mutex. SINGLE-USE — consumed before the first attempt and
-   * never reused by a retry, which runs recovery pulls and rescans that
-   * supersede it. Daemon-only; CLI one-shots keep loading. */
-  boundaryState?: SyncState;
   /** Whether this caller owns a complete local-file observation. Preserve-mode
    * callers may supply a prior episode which this publication must not clear. */
   localFileObservation?:
@@ -320,9 +307,7 @@ async function pushManifestInner(
   // even with attempts left — the daemon probe, not this loop, owns long retry.
   let firstConflictAt: number | undefined;
   // Loop-carried attempt state, mutated by the RecoveryAction transitions below.
-  const boundaryState = options.boundaryState;
-  const reconciled = await reconcileResolutionReceipt(root, cfg, deps, undefined,
-    boundaryState ? { state: boundaryState } : undefined);
+  const reconciled = await reconcileResolutionReceipt(root, cfg, deps);
   surfaceResolutionReceiptReconciliation(reconciled, deps);
   let initialObservation = options.localFileObservation;
   if (reconciled.status !== "none") {
@@ -348,12 +333,7 @@ async function pushManifestInner(
     forceSnapshot: repair !== undefined,
     filesFirstAborted: false,
     filesFirstFallbackUsed: false,
-    durable: { receipt: RELOAD_DURABLE_STATE },
   };
-  // Receipt-path gate: a reconciliation with a status durably mutated state
-  // (applyPulledManifest, finishResolutionReceipt), so the boundary snapshot is
-  // stale and the attempt must load for real.
-  if (boundaryState && reconciled.status === "none") state.preloadedState = boundaryState;
   if (repair) state.repair = repair;
   if (resolution) state.resolution = resolution;
   let previousUnsatisfiedTotal: number | undefined;
@@ -388,13 +368,13 @@ async function pushManifestInner(
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
-      return { ...outcome.result, durable: state.durable.receipt };
+      return outcome.result;
     }
     if (outcome.action.kind === "repair-conflict") {
       // Repair conflicts deliberately escape this inner budget immediately. The
       // outer repairChain budget owns 409 races; this loop only spends retries on
       // bounded 422 reuploads and epoch refreshes while in repair mode.
-      return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true, durable: state.durable.receipt, ...resultCollisionMetadata(state) };
+      return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true, ...resultCollisionMetadata(state) };
     }
     if (outcome.action.kind === "files-first-fallback") {
       // Design 108 §3.2: a files-first attempt committed nothing (every file deferred).
@@ -468,13 +448,6 @@ interface PushAttemptState {
   filesFirstAborted: boolean;
   /** Design 108 §3.2: independent cap (=1) for the files-first-fallback RecoveryAction. */
   filesFirstFallbackUsed: boolean;
-  /** Design 277 §A1: the operation's durable-state receipt, rewritten by every
-   *  in-attempt state writer and read once at the loop's exit. */
-  durable: DurableStateWitness;
-  /** Design 277 §A1: the boundary's pre-loaded state. Consumed by the FIRST
-   *  invocation and independent of the retry counter — the files-first rerun
-   *  re-invokes without consuming a retry, and it must load for real. */
-  preloadedState?: SyncState;
   repair?: RepairPushMode;
   resolution?: GitResolutionRider;
 }
@@ -527,20 +500,8 @@ async function runPushAttempt(
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
   const report = spans.report;
-  // Single-use: consumed here, so every re-invocation (including the files-first
-  // rerun, which spends no retry) loads for real. The span still stamps.
-  const preloaded = attemptState.preloadedState;
-  delete attemptState.preloadedState;
-  let state = await spans.span("state-load", async () =>
-    preloaded ?? loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
-  // Every durable writer below either installs the exact state it accepted or
-  // leaves the receipt degraded; nothing infers durability from an outcome.
-  const witness = (accepted: SyncState): SyncState => {
-    attemptState.durable.receipt = { state: accepted };
-    return accepted;
-  };
-  attemptState.durable.receipt = { state };
-  state = witness(await spans.span("state_lineage_ms", () => ensureCapableStateLineage(root, state)));
+  let state = await spans.span("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  state = await spans.span("state_lineage_ms", () => ensureCapableStateLineage(root, state));
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
@@ -598,7 +559,7 @@ async function runPushAttempt(
           },
           changedRepos: (values) => changedSidecarRepoKeys(state, values),
           save: async (write) => {
-            state = witness(await spans.span("state-save", () => saveStateSource(root, state, {
+            state = await spans.span("state-save", () => saveStateSource(root, state, {
               expectedStream: syncStreamId(cfg),
               sourceGlobalSeq: write.acceptedSequence,
               observedRepos: write.observedRepos,
@@ -606,7 +567,7 @@ async function runPushAttempt(
               repoProofs: write.repoProofs,
             }, {
               allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-            })));
+            }));
             try {
               deps.onGitDeferralsSaved?.(state);
             } catch {
@@ -637,9 +598,7 @@ async function runPushAttempt(
           receipt.plan.publisherAckBindings?.[relPath]?.lineageHash,
         ),
       ]));
-      // The carry deliberately does not advance the attempt's own `state`, but it
-      // IS a durable write: the receipt takes the accepted state it returned.
-      witness(await spans.span("state-save", () => saveStateSource(root, state, {
+      await spans.span("state-save", () => saveStateSource(root, state, {
         expectedStream: syncStreamId(cfg),
         sourceGlobalSeq: carrySequence,
         observedRepos: changedRepos,
@@ -647,7 +606,7 @@ async function runPushAttempt(
         repoProofs,
       }, {
         allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-      })));
+      }));
     },
     logPublicationLine: ({ plan }) => {
       (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(plan), plan);
@@ -856,7 +815,7 @@ async function runPushAttempt(
         if (installed.status !== "accepted") throw new Error("keep-mine publication receipt could not be armed");
         // No failure-capable work may follow the durable arm before POST.
         // The accepted transaction already returns the exact installed state.
-        state = witness(installed.state);
+        state = installed.state;
       },
       commit: async ({ parentSequence: parent, manifest, options }) => {
         return spans.span("commit", () => api.commit(parent, cfg.deviceId, manifest, options));
@@ -864,21 +823,18 @@ async function runPushAttempt(
       reportCommitTimings: (timings) => report.recordDetails("commit", { ...timings }, formatCommitTimings(timings)),
       disarmKeepMine: async (receipt) => {
         await finishResolutionReceipt(root, state, receipt.repo, receipt, false);
-        state = witness(await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+        state = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
       },
       notifyConflict: () => { deps.onCommitConflict?.(); }, // tally 409 retry pressure (design 09 §3)
       reconcileKeepMine: async () => {
         const reconciled = await reconcileResolutionReceipt(root, cfg, deps, api);
-        // Reconciliation applies a manifest and clears the receipt through its
-        // own writers; nothing here can name the state they left.
-        if (reconciled.status !== "none") attemptState.durable.receipt = RELOAD_DURABLE_STATE;
         return reconciled.status === "none"
           ? { status: "none" }
           : { status: reconciled.status, sequence: reconciled.sequence, manifest: reconciled.manifest };
       },
       pullAndLoadAccepted: async () => {
         await pull(root, cfg, deps, undefined, "recovery");
-        const postPull = witness(await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+        const postPull = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
         return { sequence: postPull.lastSyncedSequence, manifest: postPull.lastSyncedManifest };
       },
     };
@@ -960,7 +916,7 @@ async function runPushAttempt(
       observedRepos: (values) => observedRepoKeys(state, committed.gitRepos, values),
       announce: (line) => { (deps.onGitLog ?? ((l: string) => console.error(l)))(line); },
       save: async (write) => {
-        witness(await spans.span("state-save", () => saveStateSource(root, state, {
+        await spans.span("state-save", () => saveStateSource(root, state, {
             expectedStream: syncStreamId(cfg),
             sourceGlobalSeq: write.acceptedSequence,
             globalManifest: write.globalManifest,
@@ -974,7 +930,7 @@ async function runPushAttempt(
             authoredCfgHashByRepo: write.authoredCfgHashByRepo,
           }, {
             allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-          })));
+          }));
       },
     };
     const acknowledgement = await spans.span("ack_ms", () => acknowledgePublishedGitTransitions(
@@ -988,9 +944,6 @@ async function runPushAttempt(
       transitionPort,
     ));
     if (acknowledgement.kind === "accepted-state-pending") {
-      // The acknowledgement save failed after a durable commit: nobody can name
-      // the state the store holds.
-      attemptState.durable.receipt = RELOAD_DURABLE_STATE;
       // An unarmed publication keeps the pre-seam contract: the state-save error
       // is the caller's, not a soft "landed but unrecorded" result.
       if (!acknowledgement.reason.armed) throw acknowledgement.reason.cause;
