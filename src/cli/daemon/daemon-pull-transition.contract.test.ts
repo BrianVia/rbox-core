@@ -38,7 +38,6 @@ function state(sequence: number, files: string[] = ["a.txt"]): SyncState {
 
 const VIEW: TrustedLocalView = { manifest: manifest(["a.txt"]), deferred: new Set<string>() };
 const TRUSTED_BEFORE: PullTrustGate = {
-  killSwitchOff: false,
   watcherTrusted: true,
   manifestSettled: true,
   fullWorkspaceSinceSeed: true,
@@ -85,6 +84,7 @@ async function harness(options: {
   metrics?: SyncMetrics;
   notifyPendingAt?: number;
   failAt?: "settle-report" | "refresh-matcher" | "load-post-base";
+  killSwitch?: boolean;
 } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pull-transition-"));
   const calls: string[] = [];
@@ -149,6 +149,7 @@ async function harness(options: {
   };
   const operation: PullOperation = {
     seal: async () => { calls.push("seal"); return attempt; },
+    trustedPullEnabled: () => options.killSwitch !== true,
     drainPendingEvents: async () => { calls.push("drain"); },
     trustGate: () => { calls.push("trust-gate"); return options.before ?? TRUSTED_BEFORE; },
     trustRecheck: () => { calls.push("trust-recheck"); return options.after ?? TRUSTED_AFTER; },
@@ -161,6 +162,7 @@ describe("trusted pull admission", () => {
   test("accepted trust drains once, then gates, then seals the view", async () => {
     const calls: string[] = [];
     expect(await buildTrustedPullView(
+      () => true,
       async () => { calls.push("drain"); },
       () => { calls.push("gate"); return TRUSTED_BEFORE; },
       () => { calls.push("recheck"); return TRUSTED_AFTER; },
@@ -168,9 +170,22 @@ describe("trusted pull admission", () => {
     expect(calls).toEqual(["drain", "gate", "recheck"]);
   });
 
+  test("design 277 r3.1: the kill switch precedes the drain — pre-202 lane restored whole", async () => {
+    let drained = false;
+    const result = await buildTrustedPullView(
+      () => false,
+      async () => { drained = true; },
+      () => TRUSTED_BEFORE,
+      () => TRUSTED_AFTER,
+    );
+    expect(result.skip).toBe("kill-switch");
+    expect(drained).toBe(false);
+  });
+
   test("design 277 B3: trust is sampled after the drain, so a settling drain admits", async () => {
     let settled = false;
     const result = await buildTrustedPullView(
+      () => true,
       async () => { settled = true; },
       () => ({ ...TRUSTED_BEFORE, manifestSettled: settled }),
       () => TRUSTED_AFTER,
@@ -180,7 +195,6 @@ describe("trusted pull admission", () => {
 
   test("every gate value reports its named refusal AFTER the unconditional drain", async () => {
     const cases: [keyof PullTrustGate, boolean, string][] = [
-      ["killSwitchOff", true, "kill-switch"],
       ["watcherTrusted", false, "p1-watcher"],
       ["manifestSettled", false, "p2-observation"],
       ["fullWorkspaceSinceSeed", false, "p5-seed"],
@@ -191,6 +205,7 @@ describe("trusted pull admission", () => {
     for (const [key, value, expected] of cases) {
       let drained = false;
       const result = await buildTrustedPullView(
+        () => true,
         async () => { drained = true; },
         () => ({ ...TRUSTED_BEFORE, [key]: value }),
         () => TRUSTED_AFTER,
@@ -207,7 +222,7 @@ describe("trusted pull admission", () => {
       [{ manifestSettled: false }, "p2-observation"],
     ];
     for (const [override, expected] of cases) {
-      const result = await buildTrustedPullView(async () => {}, () => TRUSTED_BEFORE, () => ({ ...TRUSTED_AFTER, ...override }));
+      const result = await buildTrustedPullView(() => true, async () => {}, () => TRUSTED_BEFORE, () => ({ ...TRUSTED_AFTER, ...override }));
       expect(result.skip).toBe(expected);
     }
   });
@@ -220,22 +235,25 @@ describe("trusted pull admission", () => {
       trustedView: () => { projections++; return VIEW; },
     });
     expect((await buildTrustedPullView(
+      () => true,
       async () => {},
       () => TRUSTED_BEFORE,
       () => after({ pendingEmpty: false }),
     )).skip).toBe("p3-pending");
     expect((await buildTrustedPullView(
+      () => true,
       async () => {},
       () => TRUSTED_BEFORE,
       () => after({ watcherTrusted: false }),
     )).skip).toBe("p1-watcher");
     expect((await buildTrustedPullView(
+      () => true,
       async () => {},
       () => TRUSTED_BEFORE,
       () => after({ manifestSettled: false }),
     )).skip).toBe("p2-observation");
     expect(projections).toBe(0);
-    expect((await buildTrustedPullView(async () => {}, () => TRUSTED_BEFORE, () => after({}))).view).toBe(VIEW);
+    expect((await buildTrustedPullView(() => true, async () => {}, () => TRUSTED_BEFORE, () => after({}))).view).toBe(VIEW);
     expect(projections).toBe(1);
   });
 });

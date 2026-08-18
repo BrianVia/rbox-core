@@ -8,6 +8,7 @@ import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon, type DaemonTimerHandle, type ScanCadenceClock } from "../daemon.js";
+import { PENDING_EVENT_CAP } from "./daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonPidRecord } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
@@ -89,6 +90,7 @@ interface DaemonInternals {
   cache: HashCache;
   local: { head: Manifest };
   pendingEvents: WatchEvent[];
+  pendingEventsOverflow: boolean;
   activity: DaemonActivity;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -901,6 +903,9 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     };
     await saveStateUnsafeLegacyOrTest(root, seeded);
     daemon.syncBase = await loadState(root, seeded.stream);
+    // No watcher session was ever started here: this pins the hygiene-only branch
+    // that design 277 B3 (r3.1) keeps for a pull-only daemon with no live watcher.
+    expect(daemon.watcher).toBeUndefined();
     daemon.scheduleSafetyScan();
     expect(daemon.safetyTimer).toBeDefined();
     await clock.fireAll();
@@ -2275,4 +2280,66 @@ test("executeOp D4: recovery-probe ops do NOT report watcher operation completio
 
   // Recovery ops run outside the watcher-generation bracketing the observation assumes.
   expect(calls).toEqual([]);
+});
+
+test("design 277 B3 (r3.1): an overflowed queue defers the push; only the covering scan releases it (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const remote = new MiniRemote();
+    const daemon = await makeDaemon(remote, "overflow-defer", { now: () => TEST_NOW, scanCadenceClock: new FakeScanCadenceClock() });
+    let deliver!: (events: WatchEvent[]) => void;
+    daemon.startWatcherFn = (_root, _matcher, cb) => {
+      deliver = cb;
+      return Promise.resolve({ backend: "parcel", close: async () => {} });
+    };
+    await daemon.startLiveWatch();
+    await fs.writeFile(path.join(root, "published.txt"), "local work the push would publish");
+
+    // Sampled at the covering scan: consuming the latch in the push prologue would
+    // publish the retained TRUNCATED manifest — `observationComplete: false` selects
+    // preserve-authority, it does not force a scan.
+    let latchAtScan: boolean | undefined;
+    let headAtScan: number | undefined;
+    const doFullScan = daemon.doFullScan.bind(daemon);
+    daemon.doFullScan = async () => {
+      latchAtScan ??= daemon.pendingEventsOverflow;
+      headAtScan ??= remote.head;
+      return doFullScan();
+    };
+
+    deliver(Array.from({ length: PENDING_EVENT_CAP + 1 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const })));
+    expect(daemon.pendingEventsOverflow).toBe(true);
+    expect(daemon.want.push).toBe(true);
+
+    await daemon.pump();
+
+    expect(headAtScan).toBe(0); // the deferred push published nothing
+    expect(latchAtScan).toBe(true); // …and left the latch for the pull/scan
+    expect(remote.head).toBe(1); // the covering scan releases the push: deferral is not permanent
+    expect(daemon.pendingEventsOverflow).toBe(false);
+  });
+});
+
+test("design 277 B3 (r3.1): a pull-only safety tick with a live watcher heals by fullScan (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const clock = new FakeScanCadenceClock();
+    const daemon = await makeDaemon(new MiniRemote(), "pull-only-safety-scan", { pullOnly: true, now: () => TEST_NOW, scanCadenceClock: clock });
+    daemon.startWatcherFn = () => Promise.resolve({ backend: "parcel", close: async () => {} });
+    let scans = 0;
+    const doFullScan = daemon.doFullScan.bind(daemon);
+    daemon.doFullScan = async () => {
+      scans++;
+      return doFullScan();
+    };
+
+    await daemon.start();
+    expect(daemon.watcher).toBeDefined();
+    scans = 0; // boot scans are not the subject
+    await clock.fireSafety();
+    await daemon.pumpRun;
+
+    // Read-write bounds dropped-event exposure at 60s–5m with pruned safety scans;
+    // before this, a pull-only host healed only at the 30m deep scan.
+    expect(scans).toBe(1);
+    expect(daemon.want.push).toBe(false); // still no push in pull-only
+  });
 });

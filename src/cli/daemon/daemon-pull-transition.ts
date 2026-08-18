@@ -8,7 +8,6 @@ import type { LocalAuthority } from "./local-observation-transition.js";
 import { gitTopologyChanged, type SkipCause, type TrustedPullViewResult } from "./manifest-update.js";
 
 export interface PullTrustGate {
-  readonly killSwitchOff: boolean;
   readonly watcherTrusted: boolean;
   readonly manifestSettled: boolean;
   readonly fullWorkspaceSinceSeed: boolean;
@@ -32,15 +31,18 @@ export interface PullTrustRecheck {
  * while the non-empty queue held `externalLocalWorkSettled` false, interlocking
  * against the very trust recovery that would clear P1 (design 277 B3).
  * Trust is therefore sampled AFTER the drain; the pull keeps its pre-op base.
+ * The kill switch alone precedes the drain: turning design 202 off must restore the
+ * pre-202 pull lane whole, and that lane did not drain here.
  */
 export async function buildTrustedPullView(
+  trustedPullEnabled: () => boolean,
   drainPendingEvents: () => Promise<void>,
   trustGate: () => PullTrustGate,
   trustRecheck: () => PullTrustRecheck,
 ): Promise<TrustedPullViewResult> {
+  if (!trustedPullEnabled()) return { skip: "kill-switch" };
   await drainPendingEvents();
   const before = trustGate();
-  if (before.killSwitchOff) return { skip: "kill-switch" };
   if (!before.watcherTrusted) return { skip: "p1-watcher" };
   if (!before.manifestSettled) return { skip: "p2-observation" };
   if (!before.fullWorkspaceSinceSeed) return { skip: "p5-seed" };
@@ -93,6 +95,7 @@ export interface DaemonPullReceipt {
 
 export interface PullOperation {
   seal(): Promise<PullAttemptInputs>;
+  trustedPullEnabled(): boolean;
   drainPendingEvents(): Promise<void>;
   trustGate(preBase: SyncState): PullTrustGate;
   trustRecheck(): PullTrustRecheck;
@@ -202,6 +205,7 @@ export class ApplyRemoteWorkspaceTransition {
     const parent = `pull-${++this.attempts}`;
     const inputs = await op.seal();
     const trust = await buildTrustedPullView(
+      () => op.trustedPullEnabled(),
       () => op.drainPendingEvents(),
       () => op.trustGate(inputs.preBase),
       () => op.trustRecheck(),
