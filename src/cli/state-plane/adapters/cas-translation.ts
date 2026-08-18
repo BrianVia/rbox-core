@@ -2,6 +2,9 @@
  * One owner for the store's raw `CasResult` → whole-state `StateSaveResult`
  * translation: the rejection vocabulary the JSON CAS has always spoken, and the
  * choice between reading the accepted state back and projecting it.
+ *
+ * Never: trusting a caller's claim, widening StateSaveResult, opening or locking anything, or
+ * deciding elision.
  */
 import { fullyElidedPacket } from "../../sync-state-elision.js";
 import type { StateSavePacket, StateSaveResult, SyncState } from "../../sync-state-model.js";

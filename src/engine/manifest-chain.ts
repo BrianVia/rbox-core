@@ -1,3 +1,4 @@
+/** Never: I/O. */
 export const MAX_MANIFEST_DELTA_CHAIN = 16;
 
 const SHA_RE = /^[0-9a-f]{64}$/;

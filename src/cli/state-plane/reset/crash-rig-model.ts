@@ -5,6 +5,8 @@
  * contents become power-safe only after fsyncFile(). A power cut therefore
  * reconstructs names from durable directory entries and bytes from durable
  * inode images, discarding every other write.
+ *
+ * Never: production filesystem behavior.
  */
 export class DurableTree {
   private nextInode = 1;

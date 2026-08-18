@@ -1,3 +1,4 @@
+/** Never: prompting, inventory, or mutation. */
 import path from "node:path";
 
 export interface AdoptConsentWitness {

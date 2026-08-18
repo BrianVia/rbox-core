@@ -1,3 +1,4 @@
+/** Never: the decision to delete (reconcile.ts). */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertWithinRoot, claimUnclobberedName, errCode, isAbsent } from "./fsutil.js";

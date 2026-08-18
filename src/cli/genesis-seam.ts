@@ -4,6 +4,8 @@
  * Design 180 owns classification, locking, durable intent/RETARGET state,
  * receipts, and cleanup. This module only binds those real interfaces to the
  * small injectable surface used by recovery-kit policy and unit tests.
+ *
+ * Never: independent genesis state, fallback production behavior, or command UX.
  */
 import { isDeepStrictEqual } from "node:util";
 import { AsyncLocalStorage } from "node:async_hooks";

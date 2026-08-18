@@ -1,3 +1,4 @@
+/** Never: filesystem traversal or scan policy. */
 import type { DircacheOutcome } from "./dircache.js";
 
 export interface ScanStats extends ScanTimingStats {

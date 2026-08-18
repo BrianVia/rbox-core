@@ -2,6 +2,8 @@
  * File-level write readiness for the selected SQLite authority.
  *
  * Refuse SQLite writes while a surviving genesis intent is unsettled.
+ *
+ * Never: protocol dispatch, lock acquisition, repair, or a SQLite open.
  */
 import { StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis-intent.js";

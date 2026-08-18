@@ -1,3 +1,4 @@
+/** Never: mutation, fetch, or caller fail-policy decisions. */
 import { graphEnv } from "./reachability.js";
 import { git } from "../../engine/git-spawn.js";
 

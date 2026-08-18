@@ -1,3 +1,4 @@
+/** Never: Git ref/checkout mutation, BASE/pending/deferral lane authority, state persistence, or push-side config capture (sync-git/config-lane.ts owns the capture model). */
 import path from "node:path";
 import type { GitSection } from "../../engine/index.js";
 import type { RepoCtx } from "./git-state.js";

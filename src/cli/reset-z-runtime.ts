@@ -1,3 +1,4 @@
+/** Never: journal parsing, artifact paths, or SQLite state mutation. */
 import path from "node:path";
 import {
   readRepoIdentityV1,

@@ -1,3 +1,4 @@
+/** Never: mutate another repo, assemble a whole plan, flush artifacts, own cross-repo pointer policy, or persist state. */
 import { type GitSection } from "../../engine/index.js";
 import { gitIdentity, gitIdentityKey } from "./identity.js";
 import { gitPreflight, isGitBusy } from "./preflight.js";

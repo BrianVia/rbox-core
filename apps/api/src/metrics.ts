@@ -1,3 +1,4 @@
+/** Never: feature/domain policy or raw identifiers in dimensions. */
 import type { Env } from "./env.js";
 
 export const DIVERGENCE_SAMPLE = 16; // design 102 §7.1

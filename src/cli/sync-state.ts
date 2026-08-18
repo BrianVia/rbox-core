@@ -1,3 +1,4 @@
+/** Never: state persistence format or elision authority; the legacy store and sync-state-elision.ts own them. */
 import type { GitSection, Manifest } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../cli/sync-git/config-txn.js";

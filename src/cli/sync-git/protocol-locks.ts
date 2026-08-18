@@ -1,3 +1,4 @@
+/** Never: mutation policy, Git transactions, or state composition. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";

@@ -1,4 +1,8 @@
-/** Public follow surface and receive/check-out orchestration. */
+/** Public follow surface and receive/check-out orchestration.
+ *
+ * Never: ref mutation mechanics, transaction/journal ownership, ORIG_HEAD/D4a recovery mechanics,
+ * or state persistence.
+ */
 import { validateGitSection } from "../../engine/index.js";
 import { checkoutTransactionSupported } from "./checkout-txn.js";
 import { incomingOwnershipRoots, ownershipProofContext } from "./reachability.js";

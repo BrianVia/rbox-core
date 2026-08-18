@@ -16,6 +16,9 @@
  *
  * Every observation read is non-mutating. In particular local depth uses raw
  * state rather than the recovering `loadState` path.
+ *
+ * Never: workspace reads, an independent daemon trust calculation, user-facing wording, remedy
+ * selection, or any write.
  */
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";

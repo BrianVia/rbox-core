@@ -6,6 +6,8 @@
  * seal-and-prove protocol as every other stage, and its own delete-on-close. Two
  * concurrent rejections therefore cannot clobber each other's view, and closing one
  * cannot empty another.
+ *
+ * Never: authority mutation, whole-state projection, or shared mutable scratch state.
  */
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";

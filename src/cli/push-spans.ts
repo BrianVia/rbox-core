@@ -1,3 +1,4 @@
+/** Never: phase/gap/rendering authority, retry policy, upload scheduling, transport selection, network I/O, or durable transitions. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { PhaseReport, type PhaseName } from "../engine/index.js";
 import { fillVersion } from "./remote/blob-batch/config.js";

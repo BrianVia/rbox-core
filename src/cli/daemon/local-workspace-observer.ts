@@ -1,3 +1,4 @@
+/** Never: advancing LOCAL authority (it seals a commit intent for local-observation-transition.ts), scan scheduling, push/pull decisions, or drift resolution. */
 import {
   applyWatchEvents,
   caseFoldCollisionGroups,

@@ -1,3 +1,4 @@
+/** Never: daemon signals/status persistence or filesystem mutation itself. */
 export type MutationPhase = "file-apply" | "git-prepare" | "git-commit" | "state-cas";
 
 export interface MutationDescriptor {

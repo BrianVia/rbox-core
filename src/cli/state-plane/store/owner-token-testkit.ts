@@ -6,6 +6,8 @@
  * exercise rejection, retry, and hostile-callback paths — mint their token here
  * instead, through the one clearly-named seam. Production code must never import
  * this module; `owner-token.test.ts` enforces that.
+ *
+ * Never: production imports.
  */
 import type { OwnedLockCasToken } from "./owner-token.js";
 

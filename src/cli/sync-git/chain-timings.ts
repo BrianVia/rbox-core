@@ -1,3 +1,4 @@
+/** Never: Git I/O or sync policy. */
 export interface GitChainTimings {
   chainLength: number;
   fetchDecryptMs: number;

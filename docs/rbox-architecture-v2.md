@@ -11,8 +11,8 @@
 > **D5** (two encryption tiers), and the `rbox.yml` half of **D11**. It also
 > predates the local `~/.rbox/config.json` folder authority (design 231), which
 > is now the sole authority for which folders a machine syncs and their
-> options. For module-level truth read `docs/CODEMAP.md`; for user-facing file
-> semantics read `docs/usage.md`.
+> options. For module-level truth read the module's `Never:` header; for
+> user-facing file semantics read `docs/usage.md`.
 
 rbox is a developer-aware, continuously-syncing "Dropbox for devs." It keeps your *working directory* mirrored across machines — including uncommitted git state — while treating dependencies, build output, and machine-local junk as regenerable local state rather than bytes to ship.
 

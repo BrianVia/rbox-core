@@ -1,3 +1,4 @@
+/** Never: candidate selection, scan/encryption/upload, BASE advancement, or state/config reads. */
 import type { Manifest } from "../../engine/index.js";
 import type { GitResolutionPublicationReceipt, GlobalManifestMeta } from "../config.js";
 import type { CommitOptions, CommitResult, CommitTimings } from "../remote.js";

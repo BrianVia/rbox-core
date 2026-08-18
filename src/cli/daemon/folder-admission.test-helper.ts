@@ -1,3 +1,4 @@
+/** Never: production admission policy, global catalog resets, or bypasses. */
 import { saveConfig, type WorkspaceConfig } from "../config.js";
 import {
   initializeFolderCatalog,

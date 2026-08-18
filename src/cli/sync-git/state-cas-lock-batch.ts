@@ -1,3 +1,4 @@
+/** Never: generic lock ownership, journal I/O, recovery policy, or non-CAS lockfile defaults. */
 import path from "node:path";
 import { fsyncDirectory } from "../../engine/fsutil.js";
 

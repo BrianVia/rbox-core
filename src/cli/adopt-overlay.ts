@@ -1,3 +1,4 @@
+/** Never: ordinary matcher/reconcile policy or Git administrative mutation. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import {

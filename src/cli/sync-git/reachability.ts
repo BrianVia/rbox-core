@@ -1,3 +1,4 @@
+/** Never: ref mutation, cache persistence, or follow policy. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection } from "../../engine/types.js";

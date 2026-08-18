@@ -1,3 +1,4 @@
+/** Never: I/O decisions. */
 import fs from "node:fs/promises";
 
 export interface ApplyStats {

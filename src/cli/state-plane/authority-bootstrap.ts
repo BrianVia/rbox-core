@@ -1,5 +1,9 @@
 /** File-level state-authority observation, ordinary SQLite genesis admission,
- * and the state-plane write fence. */
+ * and the state-plane write fence.
+ *
+ * Never: legacy-state conversion, protocol phase logic, a SQLite open of any mode, or durable
+ * refusal state.
+ */
 import { randomBytes } from "node:crypto";
 import type { LockUnsupportedReason } from "../../engine/lockfile.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
@@ -28,6 +32,7 @@ export type StateAuthorityObservation =
 /**
  * Observe the state authority without taking locks, opening SQLite, or reading
  * admission records. Only an exact authority marker selects the store.
+ *
  */
 export async function observeStateAuthority(root: string): Promise<StateAuthorityObservation> {
   const format = await classifyStateFormat(statePath(root));

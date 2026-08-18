@@ -1,3 +1,4 @@
+/** Never: mutation of repos, cache, or state. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { discoverGitRepos, poolMap, type GitSection, type IgnoreMatcher } from "../../engine/index.js";

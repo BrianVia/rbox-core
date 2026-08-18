@@ -1,3 +1,4 @@
+/** Never: safety/deep cadence, watcher trust arithmetic/classification, disk observation, or sync scheduling policy. */
 import crypto from "node:crypto";
 import type { WatchEvent, DiscoveredGitRepo } from "../../engine/index.js";
 import { gitRefSideChannelEligible } from "./git-ref-watch.js";

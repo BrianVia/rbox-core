@@ -1,3 +1,4 @@
+/** Never: own plan mutation, repo-scoped capture/config state, artifact retention state, persisted resolution authority, or apply-side mutation. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { discoverGitRepos, isPresentButUnreadableError, oracleFromState, receiverEquivalentCollisionNames, poolMap, type DiscoveredGitRepo, type GitSection, type IgnoreMatcher } from "../../engine/index.js";

@@ -1,3 +1,4 @@
+/** Never: the received-config due predicate, follower-protocol discovery, sync-state reads, caller-visible plan/receipt protocols, or durable persistence. */
 import { type GitSection } from "../../engine/index.js";
 import { assertGitTargetWithinRoot } from "./containment.js";
 import { type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type ApplyGitResult } from "./git-state-apply.js";

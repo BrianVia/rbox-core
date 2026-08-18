@@ -1,3 +1,4 @@
+/** Never: gathering Git proof facts or deciding ref mutations. */
 import type { GitDeferralReason } from "../config.js";
 
 /**

@@ -1,3 +1,4 @@
+/** Never: candidate mutation, leases, R2 deletion, scheduling, durable observations, or unrelated HTTP responses. */
 import type { Env } from "./env.js";
 import { dbFor } from "./db.js";
 import { loadSidecarRefs } from "./sidecar.js";

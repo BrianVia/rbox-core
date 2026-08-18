@@ -1,3 +1,4 @@
+/** Never: filesystem mutation (apply.ts). */
 import { conflictName } from "./conflict-name.js";
 import { sameContent } from "./diff.js";
 import { indexByPath } from "./diff.js";

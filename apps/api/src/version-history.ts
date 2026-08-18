@@ -1,3 +1,4 @@
+/** Never: garbage collection, retention mutation, or Durable Object sequencing. */
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { dbFor } from "./db.js";

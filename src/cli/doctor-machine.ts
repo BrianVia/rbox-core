@@ -13,6 +13,9 @@
  * Per-workspace facts still come from the daemon's own ambient status record,
  * behind the SAME liveness + boot-binding trust gates the in-workspace report
  * applies. Read-only: no network, no scans, no mutation.
+ *
+ * Never: changing machine JSON for catalog-only evidence, per-workspace check collection, network
+ * calls, or mutation.
  */
 import path from "node:path";
 import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";

@@ -8,6 +8,8 @@
  * Encoding conventions on the wire: binary is base64url (no padding); hashes are
  * lowercase hex. Keep these two straight — addresses/ids are hex, key/ciphertext
  * blobs are b64url.
+ *
+ * Never: node:-only APIs.
  */
 import { webcrypto } from "node:crypto";
 export { fromB64url, toB64url } from "../encoding.js";

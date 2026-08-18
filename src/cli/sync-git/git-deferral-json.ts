@@ -1,3 +1,4 @@
+/** Never: deferral policy, persistence, or rendering. */
 import type { GitDeferral } from "../config.js";
 
 export interface GitDeferralLaneJson {

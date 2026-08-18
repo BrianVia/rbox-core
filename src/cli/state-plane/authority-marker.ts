@@ -10,6 +10,8 @@
  *
  * The write side is the load-bearing half: a read-time check only protects an
  * operation that read *after* the flip.
+ *
+ * Never: persistence, unrelated artifacts, or error message ownership.
  */
 import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";

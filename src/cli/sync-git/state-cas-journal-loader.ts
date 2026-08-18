@@ -1,3 +1,4 @@
+/** Never: journal encoding/writes, recovery decisions, lock lifecycle, Git validation, or reporting. */
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";

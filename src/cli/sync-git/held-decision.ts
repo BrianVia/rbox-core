@@ -1,3 +1,4 @@
+/** Never: held-input observation or matching primitives, follow/ref mutation, BASE composition, or unrelated state persistence. */
 import { addTimedMs } from "./chain-timings.js";
 import type { GitSection } from "../../engine/index.js";
 import type { GitChainTimings } from "./chain-timings.js";

@@ -16,6 +16,8 @@
  * fd introspection, which is ptrace-equivalent and outside this design's threat
  * model. The same boundary covers the residual window between the identity check
  * and the unlink in {@link deleteSealedArtifact}.
+ *
+ * Never: stage schemas, digest grammars, or authority mutation.
  */
 import { constants, Database } from "bun:sqlite";
 import fs from "node:fs";

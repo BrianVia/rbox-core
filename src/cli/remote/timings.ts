@@ -1,3 +1,4 @@
+/** Never: I/O. */
 import type { JsonValue } from "../../json.js";
 
 /**

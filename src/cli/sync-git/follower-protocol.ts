@@ -1,3 +1,4 @@
+/** Never: ref mutation or BASE persistence. */
 import { type GitSection } from "../../engine/index.js";
 import { artifactBinding, readRepoIdentityV1, readStateLineageV1, type ArtifactBinding } from "./repo-lineage.js";
 import { readSettledAbsence, type BasePresentPayload, type PreparedProtocolRef } from "./base-artifacts.js";

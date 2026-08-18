@@ -1,3 +1,4 @@
+/** Never: state, I/O, policy. */
 import { type ApplyStats, type ScanStats } from "../../engine/index.js";
 import { type CommitTimings, type LatestTimings } from "../remote.js";
 

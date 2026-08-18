@@ -1,3 +1,4 @@
+/** Never: apply orchestration, Git/state I/O, mutation policy, or logging. */
 import type { GitChainTimings } from "./chain-timings.js";
 
 /**

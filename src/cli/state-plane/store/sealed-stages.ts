@@ -4,7 +4,10 @@
  * digest — is recomputed from the rows a consumer will actually read, so a
  * crash-resumed stage is never trusted from its `sealed` bit or its stored digest
  * column. The verified sealed header is part of the ref, which is what makes it
- * the header that later commits to authority. */
+ * the header that later commits to authority.
+ *
+ * Never: staging, authority mutation, or ref construction from caller claims.
+ */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { jsonObject, jsonText, type JsonObject, type JsonValue } from "../../../json.js";
 import {
@@ -129,6 +132,7 @@ const sealedObject = (value: JsonValue): JsonObject | undefined => (jsonObject(v
  * required members of its type is a mutated sealed stage — the same class as
  * every other verification failure here. The parsed value itself is returned, so
  * members these rules cannot see ride along exactly as they were sealed.
+ *
  */
 function isManifestHeader(value: JsonValue): value is JsonObject & ManifestHeader {
   const object = sealedObject(value);

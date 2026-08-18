@@ -1,3 +1,4 @@
+/** Never: Git/artifact/state-file I/O, follower planning, or publisher normalization. */
 import type { GitRefScope, GitSection } from "../../engine/index.js";
 import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
 

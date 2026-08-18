@@ -1,3 +1,4 @@
+/** Never: Git mutation or outcome authorship; base-composer.ts owns BASE composition. */
 import path from "node:path";
 import { readBaseAbsentArtifact, readBasePresentArtifact, settleBaseAbsentArtifact } from "./base-artifacts.js";
 import { repoCtxFromDisk } from "./git-state.js";
