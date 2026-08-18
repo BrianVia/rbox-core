@@ -97,6 +97,8 @@ interface DaemonInternals {
   pendingEventsOverflow: boolean;
   pullOnly: boolean;
   enqueueWatchEvents(events: readonly { relPath: string; kind: "change" }[]): void;
+  drainPendingForPull(): Promise<void>;
+  request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
   applyPendingWatchEvents(): Promise<void>;
   /** LOCAL authority (`CommitLocalObservation`), driven directly for fixture setup. */
   local: {
@@ -313,12 +315,14 @@ test("design 277 B3: a fused watcher's pull still drains pendingEvents before it
   expect(d.local.manifest.files.some((f) => f.path === "b.txt")).toBe(true);
 });
 
-test("design 277 B1: a pull-only daemon's steady pull takes the watcher-backed path (#477)", async () => {
+test("design 277 B1: the P-chain is mode-independent — a pull-only daemon reaches the trusted view (#477)", async () => {
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
   // Armed read-write (the fixture needs one publish), then switched to the mode that
-  // could not reach P at all before B1 — the predicate itself is mode-independent.
+  // could not reach P at all before B1. This pins the PREDICATE's mode-independence,
+  // not the boot gate — the boot gate's discriminator is the B1 test in
+  // daemon-activity.test.ts, which asserts the watcher factory is actually called.
   d.pullOnly = true;
   remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
 
@@ -367,6 +371,60 @@ test("design 277 B3: a pull consumes the overflow latch, so P2 fails until a cov
 
   await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: base.lastSyncedManifest, mode: "unpruned" });
   expect((await d.buildTrustedPullView(base)).view).toBeDefined();
+});
+
+test("design 277 B3: the saturation log fires once per episode, not per dropped event (#477)", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const flood = Array.from({ length: PENDING_EVENT_CAP + 50 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
+  const saturationLines = (): number => lines.filter((line) => line.includes("watch queue saturated")).length;
+
+  d.enqueueWatchEvents(flood);
+  d.enqueueWatchEvents(flood);
+  expect(saturationLines()).toBe(1);
+
+  d.pendingEvents.length = 0; // the applied work is not this test's subject
+  await d.drainPendingForPull(); // consumes the latch, closing the episode
+  d.enqueueWatchEvents(flood);
+  expect(saturationLines()).toBe(2);
+});
+
+test("design 277 B2: a fused pull-only watcher re-arms, witnesses its fullScan, and re-trusts (#477)", async () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  let timer: { fn: () => void; ms: number } | undefined;
+  const d = await armed(remote, "parcel", {
+    watcherRearmClock: {
+      setTimeout: (fn, ms) => {
+        timer = { fn, ms };
+        return { cancel: () => { timer = undefined; } };
+      },
+    },
+  });
+  d.startWatcherFn = async (_root, _matcher, _settle, opts) => {
+    (opts as { onArm?: () => void }).onArm?.();
+    return { backend: "parcel", close: async () => {} };
+  };
+  // Pull-only from here on: ambient `fullScan` requests are dropped, so before B2 the
+  // re-arm witness had no route to the scan re-trust is published from.
+  d.pullOnly = true;
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+  expect(d.watcherTrust.state).toBe("fused");
+
+  d.request("fullScan");
+  expect(d.want.fullScan).toBe(false); // ambient requests still drop
+
+  const fireRearm = timer!.fn;
+  timer = undefined;
+  fireRearm();
+  await d.watcherSessions.drainReplacement();
+  expect(d.watcherSessions.activeAttempt).toBeDefined();
+  await d.pumpRun;
+
+  expect(d.watcherTrust.state).toBe("trusted");
 });
 
 // ── 12. trusted-pull log line ─────────────────────────────────────────────────

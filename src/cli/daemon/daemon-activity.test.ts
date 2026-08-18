@@ -923,10 +923,12 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const clock = new FakeScanCadenceClock();
     const remote = new MiniRemote();
     const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
-    // Design 277 B1: a pull-only boot now starts the live watcher, and a trusted
-    // watcher makes every scan PRUNED — which cannot mint an absence proof. The
-    // periodic-scan floor this test pins is therefore the degraded world: force the
-    // watcher factory to reject, exactly as production does when it cannot arm.
+    // Design 277 B1: a pull-only boot now starts the live watcher, and the BOOT scan
+    // is pruned under a trusted watcher — so no absence proof exists by the time this
+    // test samples one. Deep scans stay unpruned and remain the proof source either
+    // way (daemon.ts `doDeepScan`, `mode: "unpruned"`); the healthy-watcher path has
+    // its own test below. This one keeps pinning the degraded world, so the watcher
+    // factory rejects exactly as production does when it cannot arm.
     daemon.startWatcherFn = () => Promise.reject(new Error("forced watcher-init failure (pr8 fixture)"));
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
@@ -998,6 +1000,10 @@ test("design 277 B4: a scoped binding boots without a live watcher (#477)", asyn
 
     await daemon.start();
 
+    // This test cannot discriminate the gate PREDICATE by construction: a scoped
+    // binding forces `pullOnly`, so `scoped` and `pullOnly` are both true here and a
+    // `pullOnly` gate would pass it too. The discriminator is the B1 test above — an
+    // unscoped pull-only boot that DOES start the watcher.
     expect(started).toBe(0);
     expect(daemon.watcher).toBeUndefined();
     // Negative control: the boot really reached the mode gate (a halted scope seal
@@ -2341,5 +2347,49 @@ test("design 277 B3 (r3.1): a pull-only safety tick with a live watcher heals by
     // before this, a pull-only host healed only at the 30m deep scan.
     expect(scans).toBe(1);
     expect(daemon.want.push).toBe(false); // still no push in pull-only
+  });
+});
+
+test("design 277 B1: a pull-only host WITH a live watcher still clears a ghost deferral (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    let now = TEST_NOW;
+    const clock = new FakeScanCadenceClock();
+    const remote = new MiniRemote();
+    const daemon = await makeDaemon(remote, "pull-only-ghost-watch", { pullOnly: true, now: () => now, scanCadenceClock: clock });
+    daemon.startWatcherFn = () => Promise.resolve({ backend: "parcel", close: async () => {} });
+    const at = new Date(TEST_NOW - 60_000).toISOString();
+    const seeded: SyncState = {
+      ...(daemon.syncBase ?? await daemon.loadSyncBase()),
+      repoRecords: {
+        ghost: {
+          repoGen: 1,
+          sourceSeq: 0,
+          deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+        },
+      },
+    };
+    await saveStateUnsafeLegacyOrTest(root, seeded);
+    daemon.syncBase = await loadState(root, seeded.stream);
+
+    await daemon.start();
+    expect(daemon.watcher).toBeDefined();
+
+    // Deep scans are unpruned and mint the absence proof; the FIRST one under a live
+    // watcher establishes it, the SECOND clears the ghost. Ghost-clear latency on a
+    // pull-only host therefore roughly doubles (30m → 60m) — a named trade.
+    now += 30_000;
+    await clock.fireDeep();
+    await Promise.resolve();
+    await daemon.pumpRun;
+    now += 30_000;
+    await clock.fireDeep();
+    await Promise.resolve();
+    await daemon.pumpRun;
+
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(3);
+    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect(daemon.want.push).toBe(false);
+    expect(remote.head).toBe(0);
   });
 });
