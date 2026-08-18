@@ -687,3 +687,14 @@ periodic-scan entirely. A directory that disappears between discovery and
 arm should be skipped (it no longer exists — there is nothing to miss), not
 fail the whole arm. Also: the watcher walks `.claude/worktrees` at all —
 the .rboxignore carve-out covers sync but apparently not watch scope.
+
+## 2026-08-18 — rbox file-sync races git pull on synced repo checkouts
+Fleet rollout friction, hit on BOTH Mac and FM: rbox syncs working-tree
+files (STATUS.md edits, newly rehomed modules) to the other hosts before
+their checkouts `git pull` the commits that track them — so the pull
+aborts on "untracked working tree files would be overwritten" (the
+untracked copies are byte-identical to what the merge wants to write).
+Manual fix each time: delete the blocking untracked copies, merge.
+Recurred 4 times in one night. Also: an agent wrote REVIEW-1/2.md at the
+primary repo root and rbox synced the litter fleet-wide within minutes —
+agent-output hygiene matters on a synced checkout.
