@@ -678,3 +678,12 @@ dirs (~17G) on the /tmp tmpfs, then inode exhaustion (1048558/1048576) turning
 a full `bun test src/cli` into 204 phantom "unable to open database file"
 failures. Fixtures should clean up in afterEach/afterAll or the harness needs
 a startup sweep of stale rbox-* dirs older than N minutes.
+
+## 2026-08-18 — watcher arm degrades wholesale on a vanished directory
+During the 277 fleet rollout, the desktop watcher failed to arm because
+`inotify_add_watch` hit ENOENT on `.claude/worktrees/42-codemap-retirement/.codex`
+(a codex agent's temp dir deleted mid-walk) and the daemon degraded to
+periodic-scan entirely. A directory that disappears between discovery and
+arm should be skipped (it no longer exists — there is nothing to miss), not
+fail the whole arm. Also: the watcher walks `.claude/worktrees` at all —
+the .rboxignore carve-out covers sync but apparently not watch scope.
