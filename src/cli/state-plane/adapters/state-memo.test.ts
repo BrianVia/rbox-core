@@ -15,8 +15,10 @@ import { saveStateSource } from "../../sync-state.js";
 import { authorityMarkerBytes } from "../authority-marker.js";
 import { sqliteResetPaths, statePath } from "../paths.js";
 import * as storeFacade from "../store-facade.js";
-import { createStateStore } from "../store/open.js";
+import { createStateStore, openStateStore, stateStoreDatabase } from "../store/open.js";
+import { runStatement } from "../store/statements.js";
 import { saveStateUnsafeLegacyOrTest } from "./legacy-json-store.js";
+import { stateWasStreamMismatch } from "../reset-lineage.js";
 import { ensureTelemetryBindingId, loadRawState, loadState } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_memo::root";
@@ -91,21 +93,72 @@ test("an accepted save leaves the loads that follow it free and exact", async ()
   expect(await loadState(root, STREAM)).toEqual((await loadRawState(root))!);
 });
 
-test("a foreign write moves the probed token and forces a materialization", async () => {
-  const root = await sqliteWorkspace("foreign");
-  const held = await loadState(root, STREAM);
-  // Another writer, out of band: the memo must not answer for it.
-  await save(root, held);
-  const loads = await countMaterializations(async () => {
-    // Drop the save's own retention the way a different process would: the
-    // token comparison, not the writer, is what decides.
-    process.env.RBOX_STATE_LOAD_CACHE = "0";
-    await loadState(root, STREAM);
-    delete process.env.RBOX_STATE_LOAD_CACHE;
-    const reloaded = await loadState(root, STREAM);
-    expect(reloaded).toEqual((await loadRawState(root))!);
-  });
-  expect(loads).toBeGreaterThanOrEqual(2);
+/**
+ * Mutate the live database WITHOUT going through the adapter, so the retention
+ * stays resident and stale — the multi-process case. Anything the adapter does
+ * for itself (refreshing on its own save) would prove nothing about the token
+ * comparison, which is the only thing standing between a stale memo and a
+ * wrong answer.
+ */
+function mutateStoreOutsideTheAdapter(root: string, sql: string, ...bindings: string[]): void {
+  const store = openStateStore(sqliteResetPaths.active(root), { readonly: false });
+  try {
+    runStatement(stateStoreDatabase(store), sql, ...bindings);
+  } finally {
+    store.close();
+  }
+}
+
+async function materializationsForNextLoad(root: string): Promise<number> {
+  return countMaterializations(async () => {
+    const state = await loadState(root, STREAM);
+    expect(state).toEqual((await loadRawState(root))!);
+  }) .then((loads) => loads - 1); // the loadRawState comparison read is not the load under test
+}
+
+test("a foreign state_revision bump forces exactly one rematerialization", async () => {
+  const root = await sqliteWorkspace("column-revision");
+  await loadState(root, STREAM);
+  mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET state_revision=state_revision+1");
+  expect(await materializationsForNextLoad(root)).toBe(1);
+  expect(await materializationsForNextLoad(root)).toBe(0); // and settles again
+});
+
+test("a foreign state_nonce change forces exactly one rematerialization", async () => {
+  const root = await sqliteWorkspace("column-nonce");
+  await loadState(root, STREAM);
+  mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET state_nonce=?", "f".repeat(32));
+  expect(await materializationsForNextLoad(root)).toBe(1);
+  expect((await loadState(root, STREAM)).stateNonce).toBe("f".repeat(32));
+});
+
+test("a foreign telemetry_binding_id change forces exactly one rematerialization", async () => {
+  const root = await sqliteWorkspace("column-binding");
+  await loadState(root, STREAM);
+  mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET telemetry_binding_id=?", "00112233445566ff");
+  expect(await materializationsForNextLoad(root)).toBe(1);
+  expect((await loadState(root, STREAM)).telemetryBindingId).toBe("00112233445566ff");
+});
+
+test("a replaced authority and lineage force a rematerialization", async () => {
+  const root = await sqliteWorkspace("column-lineage");
+  await loadState(root, STREAM);
+  // How authority and lineage actually move: the workspace is reset onto a new
+  // database, and the marker names it.
+  await fsp.rm(sqliteResetPaths.active(root), { force: true });
+  createStateStore(sqliteResetPaths.active(root), {
+    authorityId: "9".repeat(32), lineageId: "8".repeat(32), stream: STREAM,
+    createdBy: "test", stateNonce: NONCE, stateRevision: 0,
+  }).close();
+  await fsp.writeFile(statePath(root), authorityMarkerBytes("9".repeat(32)));
+  expect(await materializationsForNextLoad(root)).toBe(1);
+});
+
+test("a foreign stream change is refused, never served from retention", async () => {
+  const root = await sqliteWorkspace("column-stream");
+  await loadState(root, STREAM);
+  mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET stream=?", "https://api.test::moved::root");
+  await expect(loadState(root, STREAM)).rejects.toThrow(/stream/);
 });
 
 test("the non-CAS telemetry writer is covered by the probed binding column", async () => {
@@ -143,6 +196,39 @@ test("a legacy JSON authority is never memoized", async () => {
   expect(second).toEqual(first);
 });
 
+const RECEIPT = {
+  repo: "repo", attemptedGitIncomingKey: "attempted", attemptedSequence: 1,
+  confirmedReportHash: "4".repeat(64),
+};
+
+test("RBOX_STATE_FREEZE=1 freezes DEEPLY nested state, not just the top containers", async () => {
+  // The aliasing gate is only as strong as its depth: design 43/273's git
+  // machinery lives in nested members (repo records' receipts, deferrals,
+  // partial applies, git sections' refs), which is exactly where an in-place
+  // mutation would hide.
+  const root = await sqliteWorkspace("deep-freeze");
+  const before = await loadState(root, STREAM);
+  await saveStateSource(root, before, {
+    expectedStream: STREAM,
+    sourceGlobalSeq: before.lastSyncedSequence,
+    observedRepos: ["repo"],
+    values: { resolutionReceipt: { repo: RECEIPT } },
+  });
+
+  process.env.RBOX_STATE_FREEZE = "1";
+  try {
+    const state = await loadState(root, STREAM);
+    const record = state.repoRecords?.repo;
+    expect(record).toBeDefined();
+    expect(Object.isFrozen(state)).toBe(true);
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(Object.isFrozen(record!.resolutionReceipt)).toBe(true);
+    expect(() => { (record!.resolutionReceipt as { repo: string }).repo = "moved"; }).toThrow();
+  } finally {
+    delete process.env.RBOX_STATE_FREEZE;
+  }
+});
+
 test("RBOX_STATE_FREEZE=1 makes a retained state immutable for the aliasing sweep", async () => {
   // The precondition for sharing one object between callers. The design's
   // validation runs the whole CLI suite with this on; here it is pinned as the
@@ -157,4 +243,55 @@ test("RBOX_STATE_FREEZE=1 makes a retained state immutable for the aliasing swee
   } finally {
     delete process.env.RBOX_STATE_FREEZE;
   }
+});
+
+/** Reset-v1's hash-addressed old-lineage archive: the durable evidence that a
+ * seq-0 state came from a rebind/freshening rather than true genesis. */
+async function plantResetLineageArchive(root: string): Promise<string> {
+  const archive = path.join(sqliteResetPaths.stateRoot(root), "lineages", "d".repeat(32));
+  await fsp.mkdir(archive, { recursive: true });
+  await fsp.writeFile(path.join(archive, `${"e".repeat(64)}.db`), "archive");
+  return path.join(sqliteResetPaths.stateRoot(root), "lineages");
+}
+
+test("a rebind-marked state is never retained, so its provenance cannot outlive the evidence", async () => {
+  const root = await sqliteWorkspace("provenance");
+  const lineages = await plantResetLineageArchive(root);
+  const marked = await loadState(root, STREAM);
+  expect(stateWasStreamMismatch(marked)).toBe(true);
+
+  // The archive is the evidence. Once it is gone the next load must re-derive
+  // from durable facts — a retained object would carry the sticky mark forever.
+  await fsp.rm(lineages, { recursive: true, force: true });
+  const reloaded = await loadState(root, STREAM);
+  expect(stateWasStreamMismatch(reloaded)).toBe(false);
+});
+
+test("provenance is re-derived on every load, including one served from retention", async () => {
+  const root = await sqliteWorkspace("provenance-appears");
+  const clean = await loadState(root, STREAM);
+  expect(stateWasStreamMismatch(clean)).toBe(false);
+  await plantResetLineageArchive(root);
+  expect(stateWasStreamMismatch(await loadState(root, STREAM))).toBe(true);
+});
+
+test("the two-read safety argument: state_revision is strictly monotonic per lineage", async () => {
+  // The token and the projection are two reads on one handle. That is safe only
+  // because a revision never repeats within a lineage and a lineage id is never
+  // reused — a writer landing between them can make the NEXT comparison miss,
+  // never make a superseded state look current.
+  const root = await sqliteWorkspace("monotonic");
+  const revisions: number[] = [];
+  for (let round = 0; round < 4; round++) {
+    const state = await loadState(root, STREAM);
+    revisions.push(state.stateRevision!);
+    await save(root, state);
+  }
+  expect(revisions).toEqual([...revisions].sort((left, right) => left - right));
+  expect(new Set(revisions).size).toBe(revisions.length);
+
+  // And the bump is computed from the CAS-checked expectation, not from a value
+  // the caller supplied — the one line that argument rests on.
+  const writer = fs.readFileSync(path.resolve(import.meta.dir, "../store/write-packet.ts"), "utf8");
+  expect(writer).toContain("frozen.expected.stateRevision + 1");
 });

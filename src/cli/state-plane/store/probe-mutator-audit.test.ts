@@ -1,17 +1,32 @@
 /**
- * Design 277 §A2's future-proofing gate.
+ * Design 277's future-proofing gate.
  *
- * The freshness probe reads four lineage tokens and concludes that a state
- * carrying them is the state the store holds. That conclusion is only as good
- * as this claim: EVERY production mutation of a table `loadRawStateFromStore`
- * projects either bumps a probed token in the same transaction, establishes the
- * authority/lineage itself, or is the one deliberately non-CAS writer the probe
- * covers by name.
+ * The memo skips a materialization when the store's lineage token still matches
+ * the retained one. That is only sound while EVERY production mutation of a
+ * table `loadRawStateFromStore` projects either bumps a probed token in the same
+ * transaction, establishes the authority/lineage itself, or is the one
+ * deliberately non-CAS writer the probe covers by name.
  *
  * A `state_lineage` UPDATE grep would not prove that — it would miss a direct
  * `repo_records`, BASE-plane, or manifest-chain write that forgot to bump. So
- * this audit enumerates the statements instead, and a new one fails here until
- * somebody records which of those three it is.
+ * this audit enumerates the statements PER FUNCTION and pins each function's
+ * production callers, because the same helper can be safe under one caller and
+ * unsafe under another (`promoteFilesIntoPlane` is plane-parameterized: BASE
+ * from the CAS transaction, LOCAL from a transaction that bumps nothing).
+ *
+ * NAMED LIMITATIONS — this audit is a tripwire, not a proof:
+ *  - table names are matched literally; a statement built from a template
+ *    literal whose table is interpolated is invisible to it (the temp-table
+ *    helpers in `plane-promotion.ts` are the existing example, and they only
+ *    ever name temp tables);
+ *  - "the caller bumps the revision" is checked structurally (the caller is the
+ *    CAS writer, or is itself allowlisted as such), not by proving one SQLite
+ *    transaction encloses both statements;
+ *  - callers are found by identifier occurrence across the state plane, so a
+ *    dynamically dispatched call would not be seen.
+ * Each of those failure modes leaves the token comparison itself intact — a
+ * missed bump makes a load stale, which is exactly what the fleet-facing kill
+ * switch `RBOX_STATE_LOAD_CACHE=0` exists to undo.
  */
 import { expect, test } from "bun:test";
 import fs from "node:fs";
@@ -35,79 +50,120 @@ const MATERIALIZED_TABLES = new Set([
   "migration_completion",
 ]);
 
-type Category =
-  /** Runs inside a CAS transaction that bumps `state_revision` (write-packet.ts
-   *  :296/:302) — the probe sees the bump. */
+type Coverage =
+  /** Runs inside the CAS transaction that bumps `state_revision`. */
   | "revision-bump"
-  /** Establishes or replaces the authority/lineage itself, which changes
-   *  `active_lineage_id` (or creates the store). */
+  /** Establishes or replaces the authority/lineage itself. */
   | "lineage-genesis"
   /** The deliberately non-CAS telemetry writer — probed by name. */
   | "telemetry-probe"
-  /** LOCAL plane only. `SyncState` materializes the BASE plane; the local head
-   *  is `local_revision`, explicitly exempt (design 277 §A2). */
+  /** Touches LOCAL-plane rows only. `SyncState` materializes the BASE plane;
+   *  `local_revision` is explicitly exempt (design 277 §A2). */
   | "local-plane"
+  /** No production caller: reachable only as a facade export. */
+  | "unreachable"
   /** A crash rig, never linked into a shipped command path. */
   | "test-rig";
 
-interface Mutator { statement: string; category: Category; why: string }
+interface Mutator {
+  /** Statements on materialized tables, in source order, inside this function. */
+  statements: readonly string[];
+  /** Every production file that names this function, with how the probe covers
+   *  the mutation under that caller. `<module-private>` means the function is
+   *  not exported, so its only callers are inside its own module. */
+  callers: readonly { file: string; coverage: Coverage; why: string }[];
+}
 
-/** file → the mutations it performs on materialized tables. */
-const ALLOWLIST: ReadonlyMap<string, readonly Mutator[]> = new Map([
-  ["schema/application.ts", [
-    { statement: "INSERT state_lineage", category: "lineage-genesis", why: "genesis creates the lineage the probe reads" },
-    { statement: "INSERT store_meta", category: "lineage-genesis", why: "genesis names the active lineage" },
-    { statement: "INSERT plane_heads", category: "lineage-genesis", why: "genesis seeds both plane heads" },
-    { statement: "INSERT migration_completion", category: "lineage-genesis", why: "genesis records the origin shape" },
-  ]],
-  ["migration/import-install.ts", [
-    { statement: "INSERT entry_values", category: "lineage-genesis", why: "the import installs a NEW lineage; nothing may read it before store_meta names it" },
-    { statement: "INSERT plane_entries", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT repo_records", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT global_manifest_meta", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT manifest_chain", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT manifest_git_sections", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT state_lineage", category: "lineage-genesis", why: "the installed lineage id is new by construction" },
-    { statement: "INSERT store_meta", category: "lineage-genesis", why: "publishes the new active_lineage_id" },
-    { statement: "INSERT plane_heads", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-    { statement: "INSERT migration_completion", category: "lineage-genesis", why: "runs in the same new-lineage install transaction" },
-  ]],
-  ["store/write-packet.ts", [
-    { statement: "UPDATE state_lineage", category: "revision-bump", why: "the CAS bump itself: nonce, revision, and sequence move together" },
-    { statement: "UPDATE state_lineage", category: "revision-bump", why: "the elided-packet bump, still a revision move" },
-    { statement: "UPDATE state_lineage", category: "telemetry-probe", why: "ensureStoreTelemetryBindingId: non-CAS by design, which is why telemetry_binding_id is a probed column" },
-  ]],
-  ["store/cas-steps.ts", [
-    { statement: "UPDATE plane_heads", category: "revision-bump", why: "base head advance inside the CAS transaction" },
-    { statement: "UPDATE state_lineage", category: "revision-bump", why: "active_base_generation rides the revision-bumping transaction" },
-    { statement: "DELETE manifest_chain", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "DELETE global_manifest_meta", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "DELETE manifest_git_sections", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "INSERT global_manifest_meta", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "INSERT manifest_chain", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "INSERT manifest_git_sections", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "INSERT repo_records", category: "revision-bump", why: "runs inside the revision-bumping CAS transaction" },
-    { statement: "DELETE manifest_git_sections", category: "revision-bump", why: "meta git-section replacement, inside the CAS transaction" },
-    { statement: "INSERT manifest_git_sections", category: "revision-bump", why: "meta git-section replacement, inside the CAS transaction" },
-  ]],
-  ["store/plane-promotion.ts", [
-    { statement: "INSERT entry_values", category: "revision-bump", why: "promotion runs only inside a CAS generation transaction" },
-    { statement: "DELETE plane_entries", category: "revision-bump", why: "runs in the same CAS generation transaction as the bump" },
-    { statement: "INSERT plane_entries", category: "revision-bump", why: "runs in the same CAS generation transaction as the bump" },
-    { statement: "DELETE plane_entries", category: "revision-bump", why: "runs in the same CAS generation transaction as the bump" },
-    { statement: "INSERT plane_entries", category: "revision-bump", why: "runs in the same CAS generation transaction as the bump" },
-    { statement: "DELETE entry_values", category: "revision-bump", why: "unreferenced-value collection, same transaction" },
-  ]],
-  ["store/local-plane.ts", [
-    { statement: "UPDATE plane_heads", category: "local-plane", why: "the LOCAL head; SyncState materializes BASE" },
-    { statement: "UPDATE plane_heads", category: "local-plane", why: "local-plane invalidation" },
-  ]],
-  ["reset/crash-rig-child.ts", [
-    { statement: "UPDATE state_lineage", category: "test-rig", why: "the crash rig's child process, never a shipped command path" },
-  ]],
+const CAS_WRITER = "store/write-packet.ts";
+
+const ALLOWLIST: ReadonlyMap<string, Mutator> = new Map([
+  ["schema/application.ts::installGenesisLineage", {
+    statements: ["INSERT state_lineage", "INSERT store_meta", "INSERT plane_heads", "INSERT migration_completion"],
+    callers: [
+      { file: "genesis.ts", coverage: "lineage-genesis", why: "genesis creates the very lineage a token is later read from" },
+      { file: "store/open.ts", coverage: "lineage-genesis", why: "store creation installs the lineage before anything can retain it" },
+    ],
+  }],
+  ["migration/import-install.ts::installLegacyState", {
+    statements: ["INSERT state_lineage", "INSERT store_meta", "INSERT plane_heads", "INSERT migration_completion"],
+    callers: [{ file: "migration/import-json.ts", coverage: "lineage-genesis", why: "the import installs a NEW lineage; nothing can read it before store_meta names it" }],
+  }],
+  ["migration/import-install.ts::installEntries", {
+    statements: ["INSERT entry_values", "INSERT plane_entries"],
+    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
+  }],
+  ["migration/import-install.ts::installRepos", {
+    statements: ["INSERT repo_records"],
+    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
+  }],
+  ["migration/import-install.ts::installManifestLayer", {
+    statements: ["INSERT global_manifest_meta", "INSERT manifest_chain", "INSERT manifest_git_sections"],
+    callers: [{ file: "<module-private>", coverage: "lineage-genesis", why: "same new-lineage install, before store_meta publishes it" }],
+  }],
+  ["store/write-packet.ts::runTransaction", {
+    statements: ["UPDATE state_lineage", "UPDATE state_lineage"],
+    callers: [{ file: "<module-private>", coverage: "revision-bump", why: "the bump itself: nonce, revision and sequence move in one transaction" }],
+  }],
+  ["store/write-packet.ts::ensureStoreTelemetryBindingId", {
+    statements: ["UPDATE state_lineage"],
+    callers: [
+      { file: "adapters/whole-state-compat.ts", coverage: "telemetry-probe", why: "non-CAS by design, which is why telemetry_binding_id is one of the probed columns" },
+      { file: "store-facade.ts", coverage: "telemetry-probe", why: "the facade re-export of that same writer, probed by the same column" },
+    ],
+  }],
+  ["store/cas-steps.ts::applyGlobal", {
+    statements: [
+      "UPDATE plane_heads", "UPDATE state_lineage", "DELETE manifest_chain", "DELETE global_manifest_meta",
+      "DELETE manifest_git_sections", "INSERT global_manifest_meta", "INSERT manifest_chain", "INSERT manifest_git_sections",
+    ],
+    callers: [{ file: "store/write-packet.ts", coverage: "revision-bump", why: "the CAS writer's own generation step, inside its transaction" }],
+  }],
+  ["store/cas-steps.ts::applyTransitions", {
+    statements: ["INSERT repo_records"],
+    callers: [{ file: "store/write-packet.ts", coverage: "revision-bump", why: "repo-record transitions inside the CAS writer's transaction" }],
+  }],
+  ["store/cas-steps.ts::rebuildManifestProjection", {
+    statements: ["DELETE manifest_git_sections", "INSERT manifest_git_sections"],
+    callers: [{ file: "store/write-packet.ts", coverage: "revision-bump", why: "meta git-section replacement inside the CAS writer's transaction" }],
+  }],
+  ["store/plane-promotion.ts::internStagedEntryValues", {
+    statements: ["INSERT entry_values"],
+    callers: [
+      { file: "store/cas-steps.ts", coverage: "revision-bump", why: "BASE interning inside the CAS writer's transaction" },
+      { file: "store/local-plane.ts", coverage: "local-plane", why: "interning only ADDS values; a BASE projection reaches values through BASE plane_entries, which a LOCAL promotion never writes" },
+    ],
+  }],
+  ["store/plane-promotion.ts::promoteFilesIntoPlane", {
+    statements: ["DELETE plane_entries", "INSERT plane_entries"],
+    callers: [
+      { file: "store/cas-steps.ts", coverage: "revision-bump", why: "promotes the BASE plane inside the CAS writer's transaction" },
+      { file: "store/local-plane.ts", coverage: "local-plane", why: "promotes plane='local' in local-plane's OWN BEGIN IMMEDIATE with no revision bump; LOCAL rows are not part of the SyncState projection" },
+    ],
+  }],
+  ["store/plane-promotion.ts::applyDeltaOpsIntoPlane", {
+    statements: ["DELETE plane_entries", "INSERT plane_entries"],
+    callers: [{ file: "store/cas-steps.ts", coverage: "revision-bump", why: "delta application into BASE inside the CAS writer's transaction" }],
+  }],
+  ["store/plane-promotion.ts::collectUnreferencedEntryValues", {
+    statements: ["DELETE entry_values"],
+    callers: [{ file: "store-facade.ts", coverage: "unreachable", why: "no production caller — the facade re-exports it and nothing calls it. A caller must re-classify: deleting a value a BASE projection still reaches WOULD change materialization" }],
+  }],
+  ["store/local-plane.ts::promote", {
+    statements: ["UPDATE plane_heads"],
+    callers: [{ file: "<module-private>", coverage: "local-plane", why: "writes the LOCAL head, whose generation IS local_revision — explicitly exempt from the projection" }],
+  }],
+  ["store/local-plane.ts::invalidateLocalPlane", {
+    statements: ["UPDATE plane_heads"],
+    callers: [{ file: "store-facade.ts", coverage: "local-plane", why: "watcher invalidation bumps the LOCAL head only, never the BASE plane" }],
+  }],
+  ["reset/crash-rig-child.ts::zFixture", {
+    statements: ["UPDATE state_lineage"],
+    callers: [{ file: "<module-private>", coverage: "test-rig", why: "the crash rig's child process, never linked into a shipped command path" }],
+  }],
 ]);
 
 const STATEMENT = /(INSERT\s+(?:OR\s+REPLACE\s+)?INTO|UPDATE|DELETE\s+FROM)\s+([a-z_]+)/gi;
+const FUNCTION_HEAD = /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/;
 
 function productionSources(directory: string): string[] {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -118,57 +174,104 @@ function productionSources(directory: string): string[] {
   });
 }
 
-/** Every mutation of a materialized table, in source order, as `file` → list. */
+/** Statements on materialized tables, keyed `file::enclosing-function`. */
 function observedMutators(): Map<string, string[]> {
   const observed = new Map<string, string[]>();
   for (const file of productionSources(STATE_PLANE)) {
     const relative = path.relative(STATE_PLANE, file);
     if (relative === "schema/v1.ts") continue; // the DDL itself, including triggers
-    const source = fs.readFileSync(file, "utf8");
-    for (const match of source.matchAll(STATEMENT)) {
-      const table = match[2]!.toLowerCase();
-      if (!MATERIALIZED_TABLES.has(table)) continue;
-      const verb = match[1]!.toUpperCase().startsWith("INSERT") ? "INSERT"
-        : match[1]!.toUpperCase().startsWith("UPDATE") ? "UPDATE" : "DELETE";
-      const list = observed.get(relative) ?? [];
-      list.push(`${verb} ${table}`);
-      observed.set(relative, list);
+    let owner = "<module>";
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      const head = FUNCTION_HEAD.exec(line);
+      if (head) owner = head[1]!;
+      for (const match of line.matchAll(STATEMENT)) {
+        const table = match[2]!.toLowerCase();
+        if (!MATERIALIZED_TABLES.has(table)) continue;
+        const verb = match[1]!.toUpperCase().startsWith("INSERT") ? "INSERT"
+          : match[1]!.toUpperCase().startsWith("UPDATE") ? "UPDATE" : "DELETE";
+        const key = `${relative}::${owner}`;
+        observed.set(key, [...(observed.get(key) ?? []), `${verb} ${table}`]);
+      }
     }
   }
   return observed;
 }
 
-test("277 A2: every mutator of materialized state is probe-covered", () => {
+/** Comments name functions all the time; only code counts as a caller. */
+function code(file: string): string {
+  return fs.readFileSync(path.join(STATE_PLANE, file), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n").map((line) => line.replace(/\/\/.*$/, "")).join("\n");
+}
+
+/** Production files in the state plane that name this function. A function the
+ * module does not export cannot be called from outside it. */
+function callersOf(functionName: string, definedIn: string): string[] {
+  if (!new RegExp(`export\\s+(?:async\\s+)?function\\s+${functionName}\\b`).test(code(definedIn))) {
+    return ["<module-private>"];
+  }
+  const identifier = new RegExp(`\\b${functionName}\\b`);
+  return productionSources(STATE_PLANE)
+    .map((file) => path.relative(STATE_PLANE, file))
+    .filter((file) => file !== definedIn && identifier.test(code(file)))
+    .sort();
+}
+
+test("277: every mutator of materialized state is enumerated per function", () => {
   const observed = observedMutators();
-  const declared = new Map([...ALLOWLIST].map(([file, mutators]) => [file, mutators.map((entry) => entry.statement)]));
+  const declared = new Map([...ALLOWLIST].map(([key, mutator]) => [key, [...mutator.statements]]));
   expect(
     Object.fromEntries([...observed].sort()),
-    "a production statement mutates state the freshness probe claims to cover. Either bump a probed token in the same "
-    + "transaction, change the active authority/lineage, or record it here with the reason it is safe.",
+    "a production statement mutates state the memo's token comparison claims to cover. Either bump a probed token in "
+    + "the same transaction, change the active authority/lineage, or record it here with the reason it is safe.",
   ).toEqual(Object.fromEntries([...declared].sort()));
 });
 
-test("277 A2: the allowlist's revision-bump claim is backed by an actual bump", () => {
-  const bumpingFiles = new Set<string>();
-  for (const [file, mutators] of ALLOWLIST) {
-    if (mutators.some((entry) => entry.category === "revision-bump")) bumpingFiles.add(file);
-  }
-  // Every revision-bump module either performs the bump itself or is reached
-  // exclusively from the packet writer that does.
-  const writer = fs.readFileSync(path.join(STATE_PLANE, "store/write-packet.ts"), "utf8");
-  expect(writer).toContain("state_revision");
-  for (const file of bumpingFiles) {
-    const source = fs.readFileSync(path.join(STATE_PLANE, file), "utf8");
-    const bumpsItself = source.includes("state_revision");
-    const reachedFromWriter = writer.includes(path.basename(file, ".ts"));
-    expect(bumpsItself || reachedFromWriter, `${file} claims revision-bump coverage but neither bumps nor is reached from write-packet.ts`).toBe(true);
+test("277: every allowlisted function's production callers are the ones it claims", () => {
+  for (const [key, mutator] of ALLOWLIST) {
+    const [file, functionName] = key.split("::") as [string, string];
+    const declared = mutator.callers.map((caller) => caller.file).sort();
+    expect(callersOf(functionName, file), `${key}: its callers moved — re-derive how the probe covers each one`)
+      .toEqual(declared);
   }
 });
 
-test("277 A2: every allowlist entry records a reason", () => {
-  for (const [file, mutators] of ALLOWLIST) {
-    for (const entry of mutators) {
-      expect(entry.why.length, `${file}:${entry.statement} has no reason`).toBeGreaterThan(20);
+test("277: a revision-bump claim names a caller that is (or reaches) the CAS writer", () => {
+  const writer = code(CAS_WRITER);
+  // The bump the whole scheme rests on, at its one owner.
+  expect(writer).toMatch(/UPDATE state_lineage SET[^`]*state_revision/);
+  for (const [key, mutator] of ALLOWLIST) {
+    for (const caller of mutator.callers) {
+      if (caller.coverage !== "revision-bump") continue;
+      const reaches = caller.file === "<module-private>"
+        ? key.startsWith(CAS_WRITER)
+        : caller.file === CAS_WRITER || [...ALLOWLIST.keys()].some((other) => other.startsWith(`${caller.file}::`));
+      expect(reaches, `${key}: claims revision-bump coverage under ${caller.file}, which is not the CAS writer or an allowlisted step`).toBe(true);
+    }
+  }
+});
+
+const LOCAL_MODULE = "store/local-plane.ts";
+
+test("277: a local-plane claim belongs to the LOCAL module, which never names the base plane", () => {
+  // The claim is "this mutation only touches LOCAL rows". Its mechanical
+  // evidence: the mutation is defined in, or reached from, the module whose
+  // whole job is the LOCAL plane — and that module never names the other one.
+  expect(code(LOCAL_MODULE), `${LOCAL_MODULE} now names the base plane; LOCAL-plane exemptions are no longer safe`)
+    .not.toMatch(/["']base["']/);
+  for (const [key, mutator] of ALLOWLIST) {
+    for (const caller of mutator.callers) {
+      if (caller.coverage !== "local-plane") continue;
+      const local = caller.file === LOCAL_MODULE || key.startsWith(`${LOCAL_MODULE}::`);
+      expect(local, `${key}: claims LOCAL-plane coverage under ${caller.file}, which is not the LOCAL module`).toBe(true);
+    }
+  }
+});
+
+test("277: every caller claim records a reason", () => {
+  for (const [key, mutator] of ALLOWLIST) {
+    for (const caller of mutator.callers) {
+      expect(caller.why.length, `${key} (${caller.file}) has no reason`).toBeGreaterThan(30);
     }
   }
 });

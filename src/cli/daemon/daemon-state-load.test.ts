@@ -15,15 +15,16 @@ import {
   type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent,
 } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
-import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { authorityMarkerBytes } from "../state-plane/authority-marker.js";
 import { sqliteResetPaths, statePath } from "../state-plane/paths.js";
 import * as storeFacade from "../state-plane/store-facade.js";
 import { createStateStore } from "../state-plane/store/open.js";
 import { loadRawState } from "../state-plane/adapters/whole-state-compat.js";
-import { forgetState } from "../state-plane/adapters/state-memo.js";
-import { saveStateSource } from "../sync-state.js";
+import { loadState } from "../config.js";
+import { openStateStore, stateStoreDatabase } from "../state-plane/store/open.js";
+import { runStatement } from "../state-plane/store/statements.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
@@ -149,7 +150,21 @@ async function makeDaemon(remote: MiniRemote): Promise<DaemonInternals> {
   return daemon;
 }
 
-/** Count only the O(N) materializations a cycle performs, from the boundary in. */
+/** A load through the production adapter, used to observe retention. */
+async function loadRawStateThroughAdapter(): Promise<void> {
+  await loadState(root, syncStreamId(testConfig()));
+}
+
+/** Drop this root's retention the way a fresh process would start. */
+async function releaseRetainedState(): Promise<void> {
+  const memo = await import("../state-plane/adapters/state-memo.js");
+  memo.forgetState(root);
+}
+
+/** Count only the O(N) materializations a cycle performs, from the boundary in.
+ *  The spy sits on the store facade, which is how the adapter reaches the
+ *  projection; a direct `adapters/read-only.js` import would bypass it, and
+ *  `state-plane/inventory.test.ts` is what keeps every read on that route. */
 async function countMaterializations(run: () => Promise<void>): Promise<number> {
   const original = storeFacade.loadRawStateFromStore;
   let loads = 0;
@@ -186,7 +201,7 @@ test("277: with the memo off, the clean zero-change push cycle materializes stat
 test("277: a cold clean push cycle materializes state exactly once", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
-  forgetState(root); // a freshly started daemon has nothing retained
+  await releaseRetainedState(); // a freshly started daemon has nothing retained
   const loads = await countMaterializations(async () => {
     daemon.want.push = true;
     await daemon.pump();
@@ -223,20 +238,20 @@ test("277: the steady zero-change pull cycle materializes state only for its own
   expect(loads).toBe(1);
 });
 
-test("277: a foreground state write between cycles is materialized again", async () => {
+test("277: a write from ANOTHER process between cycles is materialized again", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   daemon.want.push = true;
   await daemon.pump();
 
-  const current = await loadState(root, syncStreamId(testConfig()));
-  await saveStateSource(root, current, {
-    expectedStream: syncStreamId(testConfig()),
-    sourceGlobalSeq: current.lastSyncedSequence,
-    observedRepos: [],
-    values: {},
-  });
-  forgetState(root); // as another process's write would leave this one
+  // Mutated outside this process's adapter, so the retention stays resident and
+  // stale: only the token comparison can catch it.
+  const store = openStateStore(sqliteResetPaths.active(root), { readonly: false });
+  try {
+    runStatement(stateStoreDatabase(store), "UPDATE state_lineage SET state_revision=state_revision+1");
+  } finally {
+    store.close();
+  }
 
   const loads = await countMaterializations(async () => {
     daemon.want.push = true;
@@ -275,3 +290,18 @@ test("277: the settled durable state deep-equals the store after a pull that app
   expect(daemon.syncBase).toEqual(await loadRawState(root));
 });
 
+
+test("277: a stopped daemon releases its retained state", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.stop();
+
+  // Nothing is retained across a stop, so the next load materializes: the memo
+  // is a live-daemon optimization, not a process-lifetime cache.
+  const loads = await countMaterializations(async () => {
+    await loadRawStateThroughAdapter();
+  });
+  expect(loads).toBe(1);
+});

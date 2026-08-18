@@ -11,11 +11,18 @@
  *
  * The memo therefore holds exactly one entry per workspace root and is only
  * ever consulted UNDER a token comparison read from the live database — it is a
- * skip rule for the projection, never a second source of truth. Callers share
- * the returned object; nothing in the CLI mutates a loaded `SyncState` in place
- * (proved by the freeze sweep in `state-memo.test.ts`).
+ * skip rule for the projection, never a second source of truth.
+ *
+ * Callers share the returned object, which is safe only because nothing mutates
+ * a loaded `SyncState` in place. That is a property of the CODE, not something
+ * this module can enforce: the evidence is a sweep — `RBOX_STATE_FREEZE=1`
+ * deep-freezes every state this module hands out, and the whole CLI suite is
+ * run under it (design 277 validation). `state-memo.test.ts` pins the freeze
+ * mechanism and a representative nested member; it does not, by itself, prove
+ * the fleet-wide property.
  *
  * Kill switch: `RBOX_STATE_LOAD_CACHE=0` restores a materialization per load.
+ * Deletion condition: two clean fleet weeks (docs/diagnostics.md).
  */
 import type { SyncState } from "../../sync-state-model.js";
 import { stateWasStreamMismatch } from "../reset-lineage.js";
@@ -41,13 +48,24 @@ export function memoizedState(root: string, token: StateFreshnessToken): SyncSta
   if (!stateMemoEnabled()) return undefined;
   const entry = MEMO.get(root);
   if (!entry || !sameToken(entry.token, token)) return undefined;
+  // Defence in depth: retention refuses marked states, so this can only fire if
+  // a state acquired its mark after being retained.
+  if (stateWasStreamMismatch(entry.state)) {
+    MEMO.delete(root);
+    return undefined;
+  }
+  freezeForSweep(entry.state);
   return entry.state;
 }
 
-/** Retain a state the store just returned or accepted, under its own token. A
- * rebind/freshening state is never retained: its provenance is carried by
- * object identity (`stateWasStreamMismatch`), which a later reader must
- * re-derive from durable evidence rather than inherit from a memo. */
+/**
+ * Retain a state the store just returned or accepted, under its own token.
+ *
+ * A rebind/freshening state is never retained: `stateWasStreamMismatch` marks
+ * the OBJECT, permanently, and the durable evidence behind that mark (the
+ * reset-lineage archive) can disappear. Retaining a marked object would let
+ * the mark outlive its evidence, so callers re-derive it per load instead.
+ */
 export function rememberState(root: string, token: StateFreshnessToken, state: SyncState): SyncState {
   if (!stateMemoEnabled() || stateWasStreamMismatch(state)) {
     MEMO.delete(root);
@@ -61,25 +79,25 @@ export function rememberState(root: string, token: StateFreshnessToken, state: S
 /**
  * Design 277's aliasing precondition, enforceable on demand: two callers may
  * share one loaded state only because nothing in the CLI mutates one in place.
- * `RBOX_STATE_FREEZE=1` turns every retained state immutable so a sweep of the
- * suites proves that rather than assuming it. Never on in production — freezing
- * is O(state) and the invariant it checks is a code property, not a runtime one.
+ * `RBOX_STATE_FREEZE=1` makes every retained state deeply immutable so a sweep
+ * of the suites PROVES that rather than assuming it — the mutations worth
+ * catching live in nested members (design 43/273's git sections, repo-record
+ * deferrals, partial applies, receipts), not in the top-level containers.
+ *
+ * Cycle-safe by the frozen check, and never on in production: freezing is
+ * O(state) and the property it checks is a property of the code.
  */
 function freezeForSweep(state: SyncState): void {
   if (process.env.RBOX_STATE_FREEZE !== "1") return;
-  const manifest = state.lastSyncedManifest;
-  for (const entry of manifest.files) Object.freeze(entry);
-  Object.freeze(manifest.files);
-  for (const section of Object.values(manifest.gitRepos ?? {})) Object.freeze(section);
-  Object.freeze(manifest.gitRepos);
-  Object.freeze(manifest);
-  for (const record of Object.values(state.repoRecords ?? {})) Object.freeze(record);
-  Object.freeze(state.repoRecords);
-  if (state.manifestMeta) {
-    Object.freeze(state.manifestMeta.chain);
-    Object.freeze(state.manifestMeta);
+  const pending: unknown[] = [state];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    // Buffers and typed arrays are values here, and freezing one breaks the
+    // consumers that write into it.
+    if (!(node instanceof Object) || Object.isFrozen(node) || ArrayBuffer.isView(node)) continue;
+    Object.freeze(node);
+    for (const member of Object.values(node)) pending.push(member);
   }
-  Object.freeze(state);
 }
 
 /** Drop this root's retention — used where the lineage itself is replaced. */

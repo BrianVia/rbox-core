@@ -30,6 +30,7 @@ import { stableDbHash } from "../reset/artifacts.js";
 import { LEGACY_REJECTION_REASON, translateCasResult } from "./cas-translation.js";
 import { fencedAuthorityUnderHeldLock, openAuthorityStore, selectAuthority, sqliteAuthority, translateStoreOpenError } from "./authority-open.js";
 import { forgetState, memoizedState, rememberState } from "./state-memo.js";
+import type { StateFreshnessToken } from "./read-only.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
 import { inventoryResetNamespace } from "../../reset-namespace-inventory.js";
@@ -100,17 +101,31 @@ export async function loadState(
   const recovered = await recoverStandingResetJournal(root, stream, heldMutex);
   if (recovered) forgetState(root);
   const { store, facade } = await openAuthorityStore(authority, true);
+  let token: StateFreshnessToken;
+  let retained: SyncState | undefined;
   let state: SyncState;
   try {
     // Design 277: the token and the projection are read through the SAME open
-    // handle, so nothing can move between deciding to skip and skipping.
-    const token = facade.readStateFreshnessFromStore(store);
-    state = memoizedState(root, token) ?? rememberState(root, token, facade.loadRawStateFromStore(store));
+    // handle, so nothing can move between deciding to skip and skipping. The
+    // two reads are safe as one observation because `state_revision` is
+    // strictly monotonic within a lineage and a lineage id is never reused: a
+    // writer that lands between them can only make the NEXT comparison miss,
+    // never make a superseded state look current.
+    token = facade.readStateFreshnessFromStore(store);
+    retained = memoizedState(root, token);
+    state = retained ?? facade.loadRawStateFromStore(store);
   } finally {
     store.close();
   }
   if (state.stream !== stream) throw new StreamMismatchError(root, stream, state.stream ?? "", "state");
-  return markResetLineageProvenance(root, state);
+  // Provenance is re-derived from durable evidence on EVERY load, retained or
+  // materialized, and its mark is sticky per object — so a marked state is
+  // never retained. Otherwise a rebind mark would outlive the reset archive
+  // that justifies it (design 277 fold; markResetLineageProvenance's contract).
+  const marked = await markResetLineageProvenance(root, state);
+  if (stateWasStreamMismatch(marked)) forgetState(root);
+  else if (!retained) rememberState(root, token, marked);
+  return marked;
 }
 
 /** Establish the first durable state nonce through the selected backend. */
