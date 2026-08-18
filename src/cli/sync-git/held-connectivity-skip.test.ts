@@ -368,3 +368,27 @@ test("a boundary race defers without storing an attempt, so the next pull re-att
   expect(two.counts.fetchOrImportSpawns).toBeGreaterThan(0);
   expect(two.logs).toEqual(["git-sync followed repo"]);
 });
+
+test("a repository that moves inside the observation bracket stores nothing and keeps re-proving", async () => {
+  // The store is fingerprint-bracketed (design 176 section 4 v6), so anything
+  // that writes into the git directory while the classification is being
+  // observed refuses it. That is the design's silent-degrade mode: correct, and
+  // indistinguishable from "not fixed yet" unless it is pinned here.
+  const { state, incoming } = await connectivityFixpointFixture();
+  let mutated = false;
+  const one = await pull(state, incoming, 2, {
+    afterHeldClassification: async () => {
+      if (mutated) return;
+      mutated = true;
+      await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${"0".repeat(39)}1\n`);
+    },
+  });
+  expect(mutated).toBe(true);
+  expect(one.deferral?.reason).toBe("artifact");
+  expect(one.record?.attempt).toBeUndefined();
+
+  const two = await pull(one.state, incoming, 3);
+  expect(two.counts.blobGets).toBeGreaterThan(0);
+  expect(two.counts.fetchOrImportSpawns).toBeGreaterThan(0);
+  expect(two.logs).toEqual(["git-sync deferred repo: planned graph connectivity proof failed"]);
+});
