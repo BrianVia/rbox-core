@@ -357,9 +357,12 @@ export class RefPlaneTransaction {
       if (result.status !== "defer" || !result.journalIntact) {
         await addTimedMs(opts.chainTimings, "journalMs", () => clearCheckoutJournal(opts.workspaceRoot, opts.relPath));
       }
+      // The typed code is the ONLY carrier of the connectivity verdict; the
+      // human reason stays a log string (design 278 M0).
+      const deferCode = result.status === "defer" ? result.code : undefined;
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
-        : /connectivity/.test(result.reason) ? "artifact"
+        : deferCode === "connectivity-unproven" ? "artifact"
         : result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "local-operation"
         : boundaryFailure?.reason ?? "other";
       const detail = result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
@@ -372,7 +375,10 @@ export class RefPlaneTransaction {
           reason,
           detail,
           ...progress,
-          blockers: [...progress.blockers, ...(boundaryFailure?.blockers ?? [blockerForReason(reason, "boundary", result.reason)])],
+          blockers: [
+            ...progress.blockers,
+            ...(boundaryFailure?.blockers ?? [blockerForReason(reason, "boundary", result.reason, deferCode)]),
+          ],
         },
       };
     }

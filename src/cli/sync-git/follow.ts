@@ -196,7 +196,22 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (selfRootWitness) checkoutInput.selfRootWitness = selfRootWitness;
     if (baseProjection !== undefined) checkoutInput.baseProjection = baseProjection;
     const checkout = await refTransaction.commitCheckout(checkoutInput);
-    if (checkout.status === "defer") return checkout.result;
+    if (checkout.status === "defer") {
+      // Design 278 M1: a pre-commit checkout refusal published nothing, so the
+      // repository still stands at `trustedFingerprint` — the same bracket the
+      // classification-defer site uses. This is a NEW post-follow observation,
+      // never a resurrection of the attempt apply.ts shredded before the follow.
+      await opts.afterHeldClassification?.({
+        phase: "defer",
+        trustedFingerprint,
+        effectiveBaseIndexProjection,
+        effectiveIncomingIndexProjection,
+        blockers: checkout.result.blockers,
+        reflogPaths: checkout.result.consultedReflogPaths ?? [],
+        progress: checkout.result,
+      });
+      return checkout.result;
+    }
     const { progress: postProgress, origHeadPreservation } = checkout;
     if (origHeadPreservation) {
       if (origHeadPreservation.recoveryRef && origHeadPreservation.discriminator) {
