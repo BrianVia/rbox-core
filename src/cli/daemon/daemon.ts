@@ -399,14 +399,6 @@ export class RboxDaemon {
   private walCrashRetries = 0;
   private readonly resetHaltLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
-  /** Set when {@link PENDING_EVENT_CAP} forced events to be dropped: the local view
-   *  now has an unobserved hole. Consumed by the PULL drain (which withdraws observation
-   *  completeness) or healed by a completed full-workspace scan; a push may never
-   *  consume it. */
-  private pendingEventsOverflow = false;
-  /** Identifies the current saturation episode so a covering scan clears only the
-   *  episode it started under — drops DURING a scan keep their own latch. */
-  private pendingEventsOverflowEpisode = 0;
   /** Sole owner of repository topology, absence authority, and the Linux
    * safety-cadence floor. The daemon supplies discovery effects and consumes
    * receipts; it holds none of that state itself. */
@@ -659,7 +651,6 @@ export class RboxDaemon {
       externalLocalWorkSettled: () => this.activePumpOp === undefined
         && !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan
         && this.pendingEvents.length === 0
-        && !this.pendingEventsOverflow
         && this.retryQueue.deferredPaths.size === 0,
       fuseSession: () => this.watcherSessions.fused(),
       fatalSession: () => this.watcherSessions.fatalError(),
@@ -714,7 +705,7 @@ export class RboxDaemon {
       detachRefBackend: () => this.gitDiscovery.detachRefBackend(),
       abandonRefBackend: () => this.gitDiscovery.abandonRefBackend(),
       noteRefBackendUnavailable: () => this.gitDiscovery.noteRefBackendUnavailable(),
-      requestFullScan: () => this.requestWitnessFullScan(),
+      requestFullScan: () => this.request("fullScan"),
       publishTrust: (errorGeneration) => {
         this.watcherTrust.observe({ kind: "rearmed", errorGeneration });
       },
@@ -1064,15 +1055,7 @@ export class RboxDaemon {
     try {
       this.advanceSafetyCadenceForTick();
       this.churnSinceSafety = false;
-      // Design 277 B3 (r3.1): with B1 the pull-only trusted view is reachable, so a
-      // dropped watcher event must heal on the safety cadence (60s–5m) like read-write,
-      // not at the 30m deep scan. A live session routes the tick to a fullScan through
-      // the witness seam (pruned under a trusted watcher — same cost as read-write);
-      // with no session the hygiene-only tick stays. Deferral hygiene still runs after
-      // every scan, so neither branch loses it.
-      if (!this.pullOnly) this.request("fullScan");
-      else if (this.watcher) this.requestWitnessFullScan();
-      else await this.runDeferralHygiene();
+      this.request("fullScan");
     } finally {
       if (!this.stopped) this.scheduleSafetyScan();
     }
@@ -1241,30 +1224,7 @@ export class RboxDaemon {
 
   private request(kind: keyof Wants): void {
     if (kind === "push") this.requestPush("other");
-    else {
-      if (this.pullOnly && kind !== "pull" && kind !== "deepScan") return;
-      this.scheduler.request(kind);
-    }
-    this.wake();
-  }
-
-  /**
-   * The ONLY `fullScan` route that survives pull-only mode, and it belongs to the
-   * watcher fuse-recovery witness alone: re-trust publishes only from a witnessed
-   * full-tree scan (watcher-session-supervisor `requestFullScan` → settleScan's
-   * `fullScan` gate; `deepScan` does not substitute), so a pull-only daemon whose
-   * watcher fused would otherwise re-arm forever. Ambient `fullScan` requests keep
-   * being dropped by `request()`.
-   */
-  private requestWitnessFullScan(): void {
-    // `request`, not `queue`: it also cuts a parked mutex backoff short, and the scan
-    // that re-arms a fused watcher is the one that must not wait out a 30s tier.
-    this.scheduler.request("fullScan");
-    this.wake();
-  }
-
-  /** Publish the queue and wake the pump — `scheduler.queue`/`request` only set a bit. */
-  private wake(): void {
+    else this.scheduler.request(kind);
     this.writeAmbientStatus();
     if (this.resetLifecycle !== "ready" && this.now() < this.nextResetRetryAt) return;
     void this.pump();
@@ -1602,18 +1562,12 @@ export class RboxDaemon {
       return;
     }
     let cov: ScanCoverage;
-    const overflowEpisode = this.pendingEventsOverflowEpisode;
     try {
       cov = op === "fullScan" ? await this.doFullScan() : await this.doDeepScan();
     } catch (error) {
       if (error instanceof WatcherRecoveryScanError && this.watcherSessions.scanThrew(error)) return;
       throw error;
     }
-    // A completed full-workspace scan IS the covering scan the overflow latch waits
-    // for: it re-reads every tracked path, closing the hole the drops left. Without
-    // this a read-write daemon would defer its push forever (the push is forbidden to
-    // consume the latch, and only the pull lane does).
-    if (this.pendingEventsOverflowEpisode === overflowEpisode) this.pendingEventsOverflow = false;
     await this.runDeferralHygiene();
     this.watcherTrust.observe({
       kind: "scan",
@@ -1778,7 +1732,7 @@ export class RboxDaemon {
           const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
           this.outOfStorageProbeArmed = false;
           if (this.activity.outOfStorage && !quotaProbe) {
-            await this.drainPendingForPush();
+            await this.applyPendingWatchEvents();
           } else {
             await this.doPush(syncMutex, pushProvenance!);
             pushedToRemote = true;
@@ -1940,7 +1894,7 @@ export class RboxDaemon {
   private async doPush(syncMutex: WorkspaceSyncMutex, provenance: PushProvenance): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const prologueT0 = performance.now();
-    if (!await this.drainPendingForPush()) return;
+    await this.applyPendingWatchEvents();
     const prologueMs = performance.now() - prologueT0;
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
@@ -2011,54 +1965,21 @@ export class RboxDaemon {
 
   /**
    * The saturating intake for watch events, and the sole writer of `pendingEvents`.
-   * Dropping at the cap is the overflow contract: the latch it sets keeps local work
-   * unsettled and forces the next operation onto a scan-backed path, so a dropped
-   * event can never be silently mistaken for "nothing happened here".
+   * Saturation is a watcher DROP, not a new failure class: the queue is cleared and the
+   * trust machine is told, exactly as a kernel overflow reports itself. Trust then owns
+   * the consequences it already owns — suspect ⇒ P1 false ⇒ scan-backed pulls, safety
+   * floor pinned, recovery through the supervised re-arm's witnessed full-tree scan.
    */
   private enqueueWatchEvents(events: readonly WatchEvent[]): void {
     for (const event of events) {
       if (this.pendingEvents.length >= PENDING_EVENT_CAP) {
-        if (!this.pendingEventsOverflow) {
-          this.pendingEventsOverflow = true;
-          this.pendingEventsOverflowEpisode++;
-          this.log(`watch queue saturated at ${PENDING_EVENT_CAP} events — dropping; the next operation reconciles by scan`);
-        }
+        this.pendingEvents = [];
+        this.log(`watch queue overflowed at ${PENDING_EVENT_CAP} pending events — cleared; reconciling by scan`);
+        this.watcherTrust.observe({ kind: "error", error: new Error("watch queue overflow: events were dropped") });
         return;
       }
       this.pendingEvents.push(event);
     }
-  }
-
-  /**
-   * Pull lane: drain, consuming the overflow latch atomically. Dropped events are an
-   * unobserved hole in LOCAL, so the pull withdraws observation completeness — P2 false
-   * ⇒ scan-backed pull, and re-trust cannot bless the incomplete view until the covering
-   * scan completes.
-   */
-  private async drainPendingForPull(): Promise<void> {
-    if (this.pendingEventsOverflow) {
-      this.pendingEventsOverflow = false;
-      this.local.setObservationComplete(false);
-    }
-    await this.applyPendingWatchEvents();
-  }
-
-  /**
-   * Push lane: drain, but NEVER consume the latch — consumption is pull-exclusive.
-   * `observationComplete: false` only selects preserve-authority; it does not force a
-   * scan, so a push that drained a saturated queue would publish the retained TRUNCATED
-   * manifest and omit a dropped add remotely with no covering scan. On a set latch this
-   * push defers instead and requests that scan; the scan's own `requestPush` re-queues it.
-   * Returns false when the push must not proceed.
-   */
-  private async drainPendingForPush(): Promise<boolean> {
-    if (this.pendingEventsOverflow) {
-      this.log("push deferred: watch queue overflowed — reconciling by full scan first");
-      this.requestWitnessFullScan();
-      return false;
-    }
-    await this.applyPendingWatchEvents();
-    return true;
   }
 
   private async applyPendingWatchEvents(): Promise<void> {
@@ -2146,7 +2067,7 @@ export class RboxDaemon {
   private buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
     return buildTrustedPullView(
       () => pullTrustWatcherEnabled(),
-      () => this.drainPendingForPull(),
+      () => this.applyPendingWatchEvents(),
       () => this.pullTrustGate(base),
       () => this.pullTrustRecheck(),
     );
@@ -2235,7 +2156,7 @@ export class RboxDaemon {
         };
       },
       trustedPullEnabled: () => pullTrustWatcherEnabled(),
-      drainPendingEvents: () => this.drainPendingForPull(),
+      drainPendingEvents: () => this.applyPendingWatchEvents(),
       trustGate: (preBase) => this.pullTrustGate(preBase),
       trustRecheck: () => this.pullTrustRecheck(),
       open: () => {

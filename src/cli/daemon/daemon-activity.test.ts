@@ -876,7 +876,7 @@ test("design 178 C: daemon hygiene updates the next ambient heartbeat projection
   });
 });
 
-test("review H2: pull-only safety cadence clears a stale lane without a scan or status call", async () => {
+test("review H2: the pull-only safety cadence clears a stale lane, now through its own fullScan", async () => {
   await withIsolatedDaemonHome(async () => {
     const repo = path.join(root, "repo");
     await fs.mkdir(repo);
@@ -903,13 +903,21 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     };
     await saveStateUnsafeLegacyOrTest(root, seeded);
     daemon.syncBase = await loadState(root, seeded.stream);
-    // No watcher session was ever started here: this pins the hygiene-only branch
-    // that design 277 B3 (r3.1) keeps for a pull-only daemon with no live watcher.
-    expect(daemon.watcher).toBeUndefined();
+    // Design 277: pull-only no longer filters `fullScan`, so the safety tick takes the
+    // read-write route and deferral hygiene rides the scan tail instead of being the
+    // tick's whole body. The lane still clears, and still without a push.
+    let scans = 0;
+    const doFullScan = daemon.doFullScan.bind(daemon);
+    daemon.doFullScan = async () => {
+      scans++;
+      return doFullScan();
+    };
     daemon.scheduleSafetyScan();
     expect(daemon.safetyTimer).toBeDefined();
     await clock.fireAll();
+    await daemon.pumpRun;
 
+    expect(scans).toBe(1);
     expect(daemon.syncBase?.repoRecords?.repo?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.repo?.deferrals).toBeUndefined();
     expect(daemon.want.fullScan).toBe(false);
@@ -923,12 +931,12 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const clock = new FakeScanCadenceClock();
     const remote = new MiniRemote();
     const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
-    // Design 277 B1: a pull-only boot now starts the live watcher, and the BOOT scan
-    // is pruned under a trusted watcher — so no absence proof exists by the time this
-    // test samples one. Deep scans stay unpruned and remain the proof source either
-    // way (daemon.ts `doDeepScan`, `mode: "unpruned"`); the healthy-watcher path has
-    // its own test below. This one keeps pinning the degraded world, so the watcher
-    // factory rejects exactly as production does when it cannot arm.
+    // Design 277 B1: a pull-only boot now starts the live watcher, and the BOOT scan is
+    // pruned under a trusted watcher — so no absence proof exists by the time this test
+    // samples one. Deep scans stay unpruned and remain a proof source either way
+    // (`doDeepScan`, mode "unpruned"); the healthy-watcher path has its own test below.
+    // This one pins the DEGRADED world, so the watcher factory rejects exactly as
+    // production does when it cannot arm.
     daemon.startWatcherFn = () => Promise.reject(new Error("forced watcher-init failure (pr8 fixture)"));
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
@@ -950,15 +958,18 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const firstEpoch = daemon.gitDiscovery.absenceProof?.epoch;
     expect(firstEpoch).toBeDefined();
 
+    // Design 277: pull-only no longer filters `fullScan`, so a degraded pull-only host
+    // pays read-write's safety-scan cost — and gets read-write's healing. The safety
+    // tick now reminits discovery itself instead of waiting 30m for the deep tick.
     await clock.fireSafety();
-    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch);
-    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals?.capture).toBeDefined();
+    await daemon.pumpRun;
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 1);
 
     now += 30_000;
     await clock.fireDeep();
     await Promise.resolve();
     await daemon.pumpRun;
-    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 1);
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 2);
     expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
     expect(daemon.want.push).toBe(false);
@@ -2286,68 +2297,6 @@ test("executeOp D4: recovery-probe ops do NOT report watcher operation completio
 
   // Recovery ops run outside the watcher-generation bracketing the observation assumes.
   expect(calls).toEqual([]);
-});
-
-test("design 277 B3 (r3.1): an overflowed queue defers the push; only the covering scan releases it (#477)", async () => {
-  await withIsolatedDaemonHome(async () => {
-    const remote = new MiniRemote();
-    const daemon = await makeDaemon(remote, "overflow-defer", { now: () => TEST_NOW, scanCadenceClock: new FakeScanCadenceClock() });
-    let deliver!: (events: WatchEvent[]) => void;
-    daemon.startWatcherFn = (_root, _matcher, cb) => {
-      deliver = cb;
-      return Promise.resolve({ backend: "parcel", close: async () => {} });
-    };
-    await daemon.startLiveWatch();
-    await fs.writeFile(path.join(root, "published.txt"), "local work the push would publish");
-
-    // Sampled at the covering scan: consuming the latch in the push prologue would
-    // publish the retained TRUNCATED manifest — `observationComplete: false` selects
-    // preserve-authority, it does not force a scan.
-    let latchAtScan: boolean | undefined;
-    let headAtScan: number | undefined;
-    const doFullScan = daemon.doFullScan.bind(daemon);
-    daemon.doFullScan = async () => {
-      latchAtScan ??= daemon.pendingEventsOverflow;
-      headAtScan ??= remote.head;
-      return doFullScan();
-    };
-
-    deliver(Array.from({ length: PENDING_EVENT_CAP + 1 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const })));
-    expect(daemon.pendingEventsOverflow).toBe(true);
-    expect(daemon.want.push).toBe(true);
-
-    await daemon.pump();
-
-    expect(headAtScan).toBe(0); // the deferred push published nothing
-    expect(latchAtScan).toBe(true); // …and left the latch for the pull/scan
-    expect(remote.head).toBe(1); // the covering scan releases the push: deferral is not permanent
-    expect(daemon.pendingEventsOverflow).toBe(false);
-  });
-});
-
-test("design 277 B3 (r3.1): a pull-only safety tick with a live watcher heals by fullScan (#477)", async () => {
-  await withIsolatedDaemonHome(async () => {
-    const clock = new FakeScanCadenceClock();
-    const daemon = await makeDaemon(new MiniRemote(), "pull-only-safety-scan", { pullOnly: true, now: () => TEST_NOW, scanCadenceClock: clock });
-    daemon.startWatcherFn = () => Promise.resolve({ backend: "parcel", close: async () => {} });
-    let scans = 0;
-    const doFullScan = daemon.doFullScan.bind(daemon);
-    daemon.doFullScan = async () => {
-      scans++;
-      return doFullScan();
-    };
-
-    await daemon.start();
-    expect(daemon.watcher).toBeDefined();
-    scans = 0; // boot scans are not the subject
-    await clock.fireSafety();
-    await daemon.pumpRun;
-
-    // Read-write bounds dropped-event exposure at 60s–5m with pruned safety scans;
-    // before this, a pull-only host healed only at the 30m deep scan.
-    expect(scans).toBe(1);
-    expect(daemon.want.push).toBe(false); // still no push in pull-only
-  });
 });
 
 test("design 277 B1: a pull-only host WITH a live watcher still clears a ghost deferral (#477)", async () => {

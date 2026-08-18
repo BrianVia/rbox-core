@@ -94,12 +94,9 @@ interface DaemonInternals {
   pumpRun: Promise<void>;
   retryQueue: { stop(): void; scheduleWriteFinish(paths: Set<string>): void };
   pendingEvents: { relPath: string; kind: string }[];
-  pendingEventsOverflow: boolean;
   pullOnly: boolean;
   enqueueWatchEvents(events: readonly { relPath: string; kind: "change" }[]): void;
-  drainPendingForPull(): Promise<void>;
   request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
-  applyPendingWatchEvents(): Promise<void>;
   /** LOCAL authority (`CommitLocalObservation`), driven directly for fixture setup. */
   local: {
     head: Manifest;
@@ -118,6 +115,8 @@ interface DaemonInternals {
     errorGeneration: number;
     state: "trusted" | "suspect" | "fused";
     nativePruneKey: string;
+    lastTransientDropMs: number;
+    recoveryHoldMs: number;
     localSettled(): boolean;
   };
   gitDiscovery: { registry?: unknown };
@@ -334,60 +333,46 @@ test("design 277 B1: the P-chain is mode-independent — a pull-only daemon reac
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
 });
 
-test("design 277 B3: enqueue saturates at the cap, drops, and latches the hole (#477)", async () => {
-  const remote = new MiniRemote();
-  await fs.writeFile(path.join(root, "a.txt"), "one");
-  const d = await armed(remote);
-
-  const flood = Array.from({ length: PENDING_EVENT_CAP + 10 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
-  d.enqueueWatchEvents(flood);
-
-  expect(d.pendingEvents.length).toBe(PENDING_EVENT_CAP);
-  expect(d.pendingEventsOverflow).toBe(true);
-  // The latch alone withholds settlement: a bounded queue must not read as quiet.
-  expect(d.watcherTrust.localSettled()).toBe(false);
-  d.pendingEvents.length = 0;
-  expect(d.watcherTrust.localSettled()).toBe(false);
-});
-
-test("design 277 B3: a pull consumes the overflow latch, so P2 fails until a covering scan (#477)", async () => {
+test("design 277 B3: queue saturation is a watcher drop — trust falls, the pull goes scan-backed, a witnessed scan re-trusts (#477)", async () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
   const base = await d.loadSyncBase();
-  d.enqueueWatchEvents(Array.from({ length: PENDING_EVENT_CAP + 1 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const })));
+  expect((await d.buildTrustedPullView(base)).view).toBeDefined();
 
-  expect((await d.buildTrustedPullView(base)).skip).toBe("p2-observation");
-  expect(d.pendingEventsOverflow).toBe(false); // consumed exactly once
-  expect(d.local.complete).toBe(false);
+  const flood = Array.from({ length: PENDING_EVENT_CAP + 10 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
+  d.enqueueWatchEvents(flood);
 
-  // A FAILED covering scan restores nothing: only a committed observation may.
-  const observe = d.localObserver.observe.bind(d.localObserver);
-  d.localObserver.observe = () => Promise.reject(new Error("injected scan failure"));
-  await d.doFullScan().catch(() => {});
-  expect(d.local.complete).toBe(false);
-  expect((await d.buildTrustedPullView(base)).skip).toBe("p2-observation");
-  d.localObserver.observe = observe;
+  // The queue is CLEARED, not retained: dropped events are unobservable, and the
+  // trust machine — not a bespoke latch — owns what follows.
+  expect(d.pendingEvents.length).toBe(0);
+  expect(d.watcherTrust.state).toBe("suspect");
+  expect(lines.filter((line) => line.includes("watch queue overflowed")).length).toBe(1);
+  expect((await d.buildTrustedPullView(base)).skip).toBe("p1-watcher");
 
-  await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: base.lastSyncedManifest, mode: "unpruned" });
+  // Recovery is today's, unchanged: the hold elapses and a clean full-tree scan
+  // re-trusts through the ordinary scan tail.
+  d.watcherTrust.lastTransientDropMs -= d.watcherTrust.recoveryHoldMs;
+  d.want.fullScan = true;
+  await d.pump();
+  expect(d.watcherTrust.state).toBe("trusted");
   expect((await d.buildTrustedPullView(base)).view).toBeDefined();
 });
 
-test("design 277 B3: the saturation log fires once per episode, not per dropped event (#477)", async () => {
+test("design 277 B3: every saturation reports its own drop episode (#477)", async () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
-  const flood = Array.from({ length: PENDING_EVENT_CAP + 50 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
-  const saturationLines = (): number => lines.filter((line) => line.includes("watch queue saturated")).length;
+  const flood = Array.from({ length: PENDING_EVENT_CAP + 10 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
 
   d.enqueueWatchEvents(flood);
+  const firstGeneration = d.watcherTrust.errorGeneration;
   d.enqueueWatchEvents(flood);
-  expect(saturationLines()).toBe(1);
 
-  d.pendingEvents.length = 0; // the applied work is not this test's subject
-  await d.drainPendingForPull(); // consumes the latch, closing the episode
-  d.enqueueWatchEvents(flood);
-  expect(saturationLines()).toBe(2);
+  expect(lines.filter((line) => line.includes("watch queue overflowed")).length).toBe(2);
+  expect(d.watcherTrust.errorGeneration).toBe(firstGeneration + 1);
 });
 
 test("design 277 B2: a fused pull-only watcher re-arms, witnesses its fullScan, and re-trusts (#477)", async () => {
@@ -407,15 +392,13 @@ test("design 277 B2: a fused pull-only watcher re-arms, witnesses its fullScan, 
     (opts as { onArm?: () => void }).onArm?.();
     return { backend: "parcel", close: async () => {} };
   };
-  // Pull-only from here on: ambient `fullScan` requests are dropped, so before B2 the
-  // re-arm witness had no route to the scan re-trust is published from.
+  // Pull-only from here on. Before this slice, pull-only dropped every `fullScan`
+  // request, so the re-arm witness had no route to the scan re-trust publishes from;
+  // pull-only now filters push only.
   d.pullOnly = true;
   await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
   d.rebuildMatcher(await d.loadSyncBase());
   expect(d.watcherTrust.state).toBe("fused");
-
-  d.request("fullScan");
-  expect(d.want.fullScan).toBe(false); // ambient requests still drop
 
   const fireRearm = timer!.fn;
   timer = undefined;

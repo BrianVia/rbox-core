@@ -83,7 +83,7 @@ interface SafetyInternals {
   };
   safetyDelay: number;
   pumping: boolean;
-  want: { push: boolean; fullScan: boolean };
+  want: { push: boolean; fullScan: boolean; deepScan: boolean };
   pendingEvents: WatchEvent[];
   watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
@@ -113,7 +113,7 @@ interface SafetyInternals {
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
   request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
   /** The exact effect object the supervisor holds — reached so the fuse-recovery
-   *  witness route is proven WIRED, not merely present on the daemon. */
+   *  re-arm route is proven WIRED, not merely present on the daemon. */
   watcherSessions: { effects: { requestFullScan(): void } };
   pump(): Promise<void>;
 }
@@ -387,7 +387,7 @@ test("pull-only daemon watcher path never queues push", async () => {
   }
 });
 
-test("design 277 B2: pull-only drops ambient fullScan but the fuse witness queues AND pumps one (#477)", async () => {
+test("design 277: pull-only filters PUSH only — every scan route stays open (#477)", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root, { pullOnly: true });
   let pumps = 0;
@@ -397,15 +397,21 @@ test("design 277 B2: pull-only drops ambient fullScan but the fuse witness queue
   };
 
   try {
+    // Design 178 dropped `fullScan`/`deepScan` in pull-only because a watcherless
+    // pull-only daemon scanned inside every pull anyway. B1 gives it a watcher, so that
+    // rationale is dead — and the fuse-recovery re-arm needs a witnessed full-tree scan
+    // it can only get through this route.
     daemon.request("fullScan");
-    expect(daemon.want.fullScan).toBe(false); // ambient requests still drop in pull-only
-    expect(pumps).toBe(0);
-
-    daemon.watcherSessions.effects.requestFullScan();
-    // Re-trust publishes only from a witnessed full-tree scan, and a bare queue()
-    // would set the bit without ever waking the loop.
     expect(daemon.want.fullScan).toBe(true);
-    expect(pumps).toBe(1);
+    daemon.request("deepScan");
+    expect(daemon.want.deepScan).toBe(true);
+    daemon.request("push");
+    expect(daemon.want.push).toBe(false); // publish suppression is the whole of pull-only
+
+    daemon.want.fullScan = false;
+    daemon.watcherSessions.effects.requestFullScan(); // the supervisor's re-arm witness
+    expect(daemon.want.fullScan).toBe(true);
+    expect(pumps).toBe(4);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
