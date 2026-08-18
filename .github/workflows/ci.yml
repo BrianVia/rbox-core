@@ -28,6 +28,7 @@ jobs:
     outputs:
       run_ci: ${{ steps.scope.outputs.run_ci }}
       run_rboxbar: ${{ steps.scope.outputs.run_rboxbar }}
+      run_tui: ${{ steps.scope.outputs.run_tui }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -75,6 +76,26 @@ jobs:
           fi
           echo "run_rboxbar=$RUN_RBOXBAR" >> "$GITHUB_OUTPUT"
           echo "RboxBar lane: $RUN_RBOXBAR"
+          # The compiled-TUI family (cross-build + 3 smokes + perf budget +
+          # onboarding rig) verifies the shipped binary, which is built only
+          # from src/, scripts/, and the root package set. PRs confined to
+          # docs/, apps/, or macos/ cannot change it; anything else (including
+          # workflow edits) runs the lane. Main pushes always run (release gate).
+          RUN_TUI=true
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            RUN_TUI=false
+            while IFS= read -r -d '' changed_path; do
+              case "$changed_path" in
+                docs/*|apps/*|macos/*) ;;
+                *)
+                  RUN_TUI=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --no-renames --name-only -z "$BASE_SHA" "$PR_HEAD_SHA")
+          fi
+          echo "run_tui=$RUN_TUI" >> "$GITHUB_OUTPUT"
+          echo "compiled-TUI lane: $RUN_TUI"
 
   rboxbar-build:
     name: "RboxBar · swift build + test (release toolchain)"
@@ -405,7 +426,8 @@ jobs:
   compiled-tui-build:
     name: "compiled TUI · cross-build"
     needs: changes
-    if: needs.changes.outputs.run_ci == 'true'
+    # Skipping this skips every `needs: compiled-tui-build` dependent too.
+    if: needs.changes.outputs.run_ci == 'true' && needs.changes.outputs.run_tui == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
