@@ -360,14 +360,14 @@ export class RefPlaneTransaction {
       }
       // The typed code is the ONLY carrier of the connectivity verdict; the
       // human reason stays a log string (design 278 M0).
-      // A boundary failure authors its own blockers, so the code is minted only
-      // when this site authors the blocker that would carry it. The receipt
-      // reports exactly the code that reached a blocker and nothing else.
+      // ONE fact, one variable: the code this site is willing to act on. A
+      // boundary failure authors its own blockers, so a code that cannot reach a
+      // blocker must not steer the reason either — the receipt, the blocker, and
+      // the reason all read the same value.
       const mintedCode = result.status === "defer" && !boundaryFailure ? result.code : undefined;
-      const deferCode = result.status === "defer" ? result.code : undefined;
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
-        : deferCode === "connectivity-unproven" ? "artifact"
+        : mintedCode === "connectivity-unproven" ? "artifact"
         : result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "local-operation"
         : boundaryFailure?.reason ?? "other";
       const detail = result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY

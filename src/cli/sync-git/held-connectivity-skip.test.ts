@@ -334,33 +334,44 @@ test("producer isolation: a staging fetch/import failure stores no attempt and n
   expect(two.record?.attempt).toBeUndefined();
 });
 
-test("a boundary race defers without storing an attempt, so the next pull re-attempts at once", async () => {
-  await commit("one\n", "c1");
-  const c1 = await git(sender, "rev-parse", "HEAD");
-  await git(sender, "branch", "side");
+test("a reflog-only boundary failure stores no attempt, so the next pull re-attempts at once", async () => {
+  const c1 = await commit("one\n", "c1");
   await commit("two\n", "c2");
+  // `keep` exists BEFORE the base capture and never moves, so this sync
+  // publishes no ref of its own: the only thing that changes on disk is the
+  // reflog appended inside the checkout boundary.
+  await git(sender, "branch", "keep");
   const base = await capture();
   const state = await materialize(base);
-  await commit("three\n", "c3");
-  await git(sender, "branch", "-f", "side", "main");
+  // The sender rewrites main while keeping the old tip alive on another branch.
+  // The receiver's current tip is therefore displaced (not reachable from the
+  // incoming `main`) yet still owned by the incoming ref set, so classification
+  // is clean and the checkout captures a branch reflog fingerprint for the
+  // boundary to re-verify. That is the only shape that arms this check.
+  await git(sender, "reset", "-q", "--hard", c1);
+  await commit("rewritten\n", "c3 rewritten");
   const incoming = await capture();
-  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "rewritten\n");
 
-  // A concurrent writer moves an already-published ref inside the checkout
-  // boundary. The transaction refuses, and its reason — `local-commits` — is one
-  // the held allowlist admits on reason alone. Storing an attempt here would
-  // stall a repository that is ready to apply until the hourly floor, so the M1
-  // store is gated on the connectivity code and this exit must write nothing.
+  // The narrowest boundary failure there is: the checked-out branch's REFLOG
+  // gains an entry while the checkout transaction holds the ref, and nothing
+  // else moves. Reflogs live outside the design-176 fingerprint bracket, so the
+  // classification store would succeed here — and the failure's reason,
+  // `local-commits`, is one the held allowlist admits without any code. Only the
+  // gate on the connectivity code keeps this repository, which is ready to
+  // apply, from memoizing itself out of the next pull until the hourly floor.
+  const reflog = path.join(receiver, ".git", "logs", "refs", "heads", "main");
+  const before = await fs.readFile(reflog, "utf8");
   let raced = false;
   const one = await pull(state, incoming, 2, {
     beforeCheckoutSecondProof: async () => {
       if (raced) return;
       raced = true;
-      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "side"), `${c1}\n`);
+      await fs.appendFile(reflog, before.split("\n").filter(Boolean).at(-1) + "\n");
     },
   });
   expect(raced).toBe(true);
-  expect(one.logs).toEqual(["git-sync deferred repo: published ref changed at refs/heads/side"]);
+  expect(one.logs).toEqual(["git-sync deferred repo: branch reflog changed at refs/heads/main"]);
   expect(one.deferral?.reason).toBe("local-commits");
   expect(one.record?.attempt).toBeUndefined();
 
