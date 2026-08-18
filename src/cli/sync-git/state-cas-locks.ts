@@ -1,3 +1,4 @@
+/** Never: journal encoding, restart recovery policy, directory-batch mechanics, deferral persistence, apply proof policy, or generic workspace locking. */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";

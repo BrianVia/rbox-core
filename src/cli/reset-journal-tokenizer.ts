@@ -1,3 +1,4 @@
+/** Never: filesystem access, reset authorization, or artifact paths. */
 import type { JsonObject, JsonValue } from "../json.js";
 
 export type ResetJournalTokenErrorCode =

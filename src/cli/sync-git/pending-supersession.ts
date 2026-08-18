@@ -1,3 +1,4 @@
+/** Never: clear pending/sidecars, publish a candidate, mutate refs, or grant BASE authority. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";

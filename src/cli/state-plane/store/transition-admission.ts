@@ -1,6 +1,9 @@
 /** What a transition row and a transition stage must prove before either is
  * admitted. Kept apart from the builder so the rules can be read — and reused by
- * the sealed reader's re-admission — without the SQLite plumbing around them. */
+ * the sealed reader's re-admission — without the SQLite plumbing around them.
+ *
+ * Never: SQLite plumbing, sealing, or authority mutation.
+ */
 import { canonicalStageBinding, sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { ProoflessBaseError } from "../errors.js";
@@ -38,6 +41,7 @@ export const canonicalEvidenceOf = (evidence: TransitionEvidenceBindings): strin
  * so no implicit proof default exists in this seam. Whatever proof is supplied
  * is then bound by the transition digest to this repository, its
  * expected generation, the source evidence, and the coherent snapshot token.
+ *
  */
 export function assertBaseProof(
   input: Pick<TransitionInput, "relPath" | "newRecord" | "baseProof">,

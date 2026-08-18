@@ -1,3 +1,4 @@
+/** Never: manifest/file-plane events, sync planning, safety cadence, or telemetry attribution. */
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";

@@ -1,3 +1,4 @@
+/** Never: HTTP/crypto details (sibling domain modules). */
 import type { BlobStore, Manifest } from "../../engine/index.js";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";

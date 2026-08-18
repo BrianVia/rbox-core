@@ -1,3 +1,4 @@
+/** Never: filesystem access, classification, or retry policy. */
 import path from "node:path";
 
 /** A caller selected a different manifest stream than the durable baseline. */

@@ -1,3 +1,4 @@
+/** Never: lifecycle policy or namespace mutation. */
 import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";

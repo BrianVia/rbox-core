@@ -1,3 +1,4 @@
+/** Never: leases, durable cursor movement, intent opening, candidate mutation, or object deletion. */
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { dbFor } from "./db.js";

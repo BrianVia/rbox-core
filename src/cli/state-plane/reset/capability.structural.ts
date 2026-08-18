@@ -1,3 +1,4 @@
+/** Never: runtime behavior or capability construction. */
 import {
   sqliteResetFacade,
   type SqliteResetFacade,

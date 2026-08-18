@@ -1,3 +1,4 @@
+/** Never: ownership proof or lock deletion mechanics (state-cas-lock-recovery owns both), planner/apply decisions, or rendering. */
 import path from "node:path";
 import fs from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";

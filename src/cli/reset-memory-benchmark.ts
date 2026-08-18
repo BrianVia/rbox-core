@@ -1,3 +1,4 @@
+/** Never: production reset orchestration or filesystem mutation. */
 import { RESET_MATERIALIZED_BYTE_LIMIT, RESET_PARSE_EXPANSION_MULTIPLIER } from "./reset-io.js";
 
 export const RESET_JSON_FLOOD_FAMILIES = ["arrays", "objects", "strings", "mixed"] as const;

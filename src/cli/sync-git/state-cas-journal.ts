@@ -1,3 +1,4 @@
+/** Never: disk discovery, lock publication/release, recovery decisions, Git validation, or reporting. */
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";

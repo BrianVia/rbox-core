@@ -1,3 +1,4 @@
+/** Never: probe/capture Git, retain/upload artifacts, authorize branch absence, or persist state. */
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { GitSection } from "../../engine/index.js";

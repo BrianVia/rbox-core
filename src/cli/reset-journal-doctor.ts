@@ -1,3 +1,4 @@
+/** Never: daemon lifecycle, ordinary doctor collection, or unfenced reset mutation. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { acquireLock } from "../engine/lockfile.js";

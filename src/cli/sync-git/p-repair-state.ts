@@ -1,3 +1,4 @@
+/** Never: Git/Q/pin mutation or tombstone authorization. */
 import {
   applyStateSavePacket,
   loadRawState,

@@ -1,3 +1,4 @@
+/** Never: live acquisition orchestration, journal encoding, deferral persistence, apply policy, or generic workspace locking. */
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";

@@ -1,3 +1,4 @@
+/** Never: the lockfile primitive itself (engine/lockfile.ts) or adoption content/Git mutation. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import {

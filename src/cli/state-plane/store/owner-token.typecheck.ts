@@ -3,6 +3,8 @@
  * only accepts a branded `OwnedLockCasToken`. A bare structural `{ isOwner }`
  * must NOT authorize a commit — that is the whole point of the OwnedLock →
  * CasOwnerToken bridge, and it is enforced here by the type checker.
+ *
+ * Never: runtime behavior.
  */
 import type { CasPacket } from "./write-packet.js";
 import { casOwnerTokenForTest } from "./owner-token-testkit.js";

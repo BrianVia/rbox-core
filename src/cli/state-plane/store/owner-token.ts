@@ -13,6 +13,8 @@
  * mint through a single sibling test-kit module instead. The CLI owns the
  * factory so the engine never imports a CLI type: the engine exposes
  * `isOwnerSync`, and state-plane brands the token.
+ *
+ * Never: lock acquisition, engine-type imports leaking into the store, or authority selection.
  */
 import type { OwnedLock } from "../../../engine/lockfile.js";
 import type { CasOwnerToken } from "../ports.js";

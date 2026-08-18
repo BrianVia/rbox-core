@@ -1,3 +1,4 @@
+/** Never: follow/ref mutation, BASE composition, or unrelated state persistence. */
 import { hashBytes, type GitSection } from "../../engine/index.js";
 import { readRepoIdentityV1, repositoryIdentityHash } from "./repo-lineage.js";
 import { canonicalString } from "../../engine/e2ee/index.js";

@@ -4,6 +4,8 @@
  * reset/artifact table and genesis artifact paths
  * live here so the compatibility boundary and its adapters name one authority
  * for where the state plane sits on disk.
+ *
+ * Never: I/O, locking, or reading/writing the documents it names.
  */
 import path from "node:path";
 import { RBOX_DIR } from "../workspace-config.js";

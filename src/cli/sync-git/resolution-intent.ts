@@ -1,3 +1,4 @@
+/** Never: persist resolution authority/receipts, publish candidates, mutate refs, or grant BASE authority. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { hashBytes, type AppliedManifestOracle, type GitSection } from "../../engine/index.js";

@@ -1,3 +1,4 @@
+/** Never: journal decoding, row policy, or SQLite opens. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { constants } from "node:fs";

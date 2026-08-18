@@ -6,6 +6,8 @@
  * name it has already trusted. {@link copyWhileHashing} is the load-bearing one:
  * the hash and the private copy come from the same reads, so "the bytes I verified"
  * and "the bytes I will consume" are one object rather than two observations.
+ *
+ * Never: pathname-derived decisions, locks, or SQLite schemas.
  */
 import fs from "node:fs";
 import { createHash } from "node:crypto";

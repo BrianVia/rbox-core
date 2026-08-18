@@ -1,3 +1,4 @@
+/** Never: subprocess mechanics, sync policy, or timing attribution. */
 import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";

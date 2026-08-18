@@ -1,3 +1,4 @@
+/** Never: Git probing, hold policy, or sync-state persistence. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../../engine/index.js";

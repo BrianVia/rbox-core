@@ -1,3 +1,4 @@
+/** Never: parsing Git artifacts from disk or performing ref mutations. */
 import { validateGitSection, type GitSection } from "../../engine/index.js";
 import { branchBaseOriginMatches, type BranchBaseOrigin } from "./base-composer.js";
 

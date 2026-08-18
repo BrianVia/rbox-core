@@ -1,3 +1,4 @@
+/** Never: waiver eligibility/classification, journal/checkout commit, or state persistence. */
 import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";

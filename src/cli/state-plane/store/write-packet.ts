@@ -3,7 +3,11 @@
  * Every input reaching `BEGIN IMMEDIATE` is a connection-owned TEMP copy of an
  * already-verified sealed artifact, so no external path can affect the outcome
  * after the transaction opens. The headers, evidence, and proofs that commit are
- * the ones the sealed artifacts authenticate — never a caller's parallel claim. */
+ * the ones the sealed artifacts authenticate — never a caller's parallel claim.
+ *
+ * Never: stage construction, in-transaction step bodies, authority selection, or lock-acquisition
+ * policy.
+ */
 import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { ElisionExpectation, GlobalManifestMeta } from "../../sync-state-model.js";
@@ -230,6 +234,7 @@ interface ConsumedDelta {
  * sealed binding is compared to the caller's carrier here, where the artifact's
  * own value has just been proven, and the whole copy is SAVEPOINT-contained and
  * precedes `BEGIN IMMEDIATE`.
+ *
  */
 function consumeDeltaStage(db: Database, directory: string, delta: CasDeltaGlobal): ConsumedDelta {
   const lock = StageLock.acquire(directory, delta.stage.stageId);

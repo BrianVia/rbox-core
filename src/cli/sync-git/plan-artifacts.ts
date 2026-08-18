@@ -1,3 +1,4 @@
+/** Never: decide which candidate survives, mutate plan fields, grant proof authority, or publish a manifest. */
 import fs from "node:fs/promises";
 import type { BlobStore } from "../../engine/blobstore.js";
 import { flushGitArtifact, type GitArtifactReadStore, type PendingGitUpload } from "./git-state.js";

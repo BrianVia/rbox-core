@@ -1,3 +1,4 @@
+/** Never: own an attempt across calls, checkout HEAD/index/op-state, journal lifecycle, BASE composition, or state persistence. */
 import crypto from "node:crypto";
 import { receiverEquivalentCollisionNames } from "../../engine/index.js";
 import { tipOwnedByIncoming } from "./reachability.js";

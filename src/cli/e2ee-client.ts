@@ -1,3 +1,4 @@
+/** Never: raw HTTP transport or generic workspace sync policy. */
 import fs from "node:fs/promises";
 import {
   assertCurrentRecoveryWrap,

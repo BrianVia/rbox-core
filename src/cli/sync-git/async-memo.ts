@@ -1,4 +1,7 @@
-/** One-shot async memo with explicit invalidation. */
+/** One-shot async memo with explicit invalidation.
+ *
+ * Never: repository policy, I/O, or cross-key cache ownership.
+ */
 export function asyncMemo<T>(fn: () => Promise<T>): (() => Promise<T>) & { reset: () => void } {
   let done = false;
   let value: T;

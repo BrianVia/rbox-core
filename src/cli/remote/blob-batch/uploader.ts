@@ -1,3 +1,4 @@
+/** Never: pack framing, download logic, wire codecs. */
 import fs from "node:fs/promises";
 import type { ByteProgressCallback } from "../../../engine/blobstore.js";
 import { fromHex } from "../../../engine/e2ee/index.js";

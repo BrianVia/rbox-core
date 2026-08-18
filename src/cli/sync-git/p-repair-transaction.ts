@@ -1,3 +1,4 @@
+/** Never: tombstone authorization, checkout mutation, or inventing BASE authority outside the composer-backed state port. */
 import { hashBytes } from "../../engine/hash.js";
 import { canonicalize } from "../../engine/e2ee/jcs.js";
 import { basePresentKeepRef, type BasePresentPayload, type PreparedProtocolRef } from "./base-artifacts.js";

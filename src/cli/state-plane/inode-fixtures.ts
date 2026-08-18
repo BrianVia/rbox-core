@@ -9,6 +9,8 @@
  * The replacement is created at a sibling path while the original is STILL
  * linked, so the kernel cannot hand its number back, and only then renamed over
  * the original. The rename is atomic, so no observer ever sees the path absent.
+ *
+ * Never: production imports.
  */
 import fs from "node:fs";
 

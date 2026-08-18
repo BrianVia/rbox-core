@@ -1,3 +1,4 @@
+/** Never: Git/protocol locking, state-port construction, persistence, deferral writes, or follower preparation. */
 import type { GitRefScope, GitSection } from "../../engine/index.js";
 import type { ArtifactBinding } from "./repo-lineage.js";
 import type { ArtifactReadResult, BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";

@@ -7,6 +7,8 @@
  * writers still publish inline, because a lost lease is a typed *result* for
  * them rather than a throw; the pinning inventory test is what holds every
  * writer, inline or not, to both obligations.
+ *
+ * Never: state composition, locking policy, SQLite storage, or reset recovery.
  */
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";

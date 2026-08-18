@@ -1,3 +1,4 @@
+/** Never: Git planning, candidate/commit/ACK work, and scheduler-boundary report draining remain in the sync spine and scheduler. */
 import type { CaseFoldCollisionGroup, Manifest } from "../../engine/index.js";
 import type { DaemonActivity } from "../activity.js";
 import { saveMetrics, type SyncMetrics } from "../metrics.js";

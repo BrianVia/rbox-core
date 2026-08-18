@@ -6,6 +6,8 @@
  * `safeResolveOutput` first, so workspace paths, credentials and terminal
  * control sequences are stripped at a single boundary that a future verb cannot
  * route around. The individual writers below are internal to that boundary.
+ *
+ * Never: state machines or filesystem access.
  */
 import os from "node:os";
 import path from "node:path";

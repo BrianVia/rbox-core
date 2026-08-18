@@ -10,6 +10,8 @@ type RboxResidue = Record<string, string>;
  *
  * Lock files and the locking health probe are excluded because their contents
  * legitimately differ between otherwise equivalent runs.
+ *
+ * Never: production imports, workspace construction, or syscall injection.
  */
 export function rboxResidue(root: string): RboxResidue {
   const base = path.join(root, ".rbox");

@@ -17,6 +17,9 @@
  * appear on the first run with no manual step, and it cannot resurrect an
  * untracked workspace because `untrack` deletes the daemon runtime directory the
  * desired row lives in.
+ *
+ * Never: network calls, workspace mutation, authority over a binding (`.rbox/workspace.json` is),
+ * or failing ordinary best-effort record/refresh commands.
  */
 import fsp from "node:fs/promises";
 import path from "node:path";

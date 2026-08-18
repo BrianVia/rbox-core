@@ -1,3 +1,4 @@
+/** Never: Git I/O, prefix observation, or retirement mutation. */
 import type { RepoIdentityV1 } from "../cli/sync-git/repo-lineage.js";
 
 /** A durable reset-journal `old.z` member. `type`, not `interface`, so it keeps

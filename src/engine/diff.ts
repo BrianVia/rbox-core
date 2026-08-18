@@ -1,3 +1,4 @@
+/** Never: I/O. */
 import type { FileEntry, Manifest } from "./types.js";
 
 export interface ManifestDiff {

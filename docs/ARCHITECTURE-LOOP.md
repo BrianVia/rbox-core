@@ -98,11 +98,11 @@ retired.
     today ("file saved on A appears on B" = ~55 files, 6 barrels). One
     interface owning candidate→capture→encrypt→upload→commit→acknowledge,
     composed from the deepened parts. Do LAST — it consumes batches 1-3.
-12. **(#42) Retire the migration tree.** 29 modules / 6,415 lines for the
+12. **(#42) COMPLETE — Retire the migration tree.** 29 modules / 6,415 lines for the
     completed one-way JSON→SQLite flip; external users start fresh on 2.0
     (founder decision 2026-08-14) so the path is dead for all users.
-    ~35 CODEMAP entries — the largest single deletion. NEEDS founder
-    sign-off on the support window before executing.
+    ~35 CODEMAP entries — the largest single deletion. Founder support-window
+    sign-off received 2026-08-18; executed and validated.
 
 ## Loop prompt (paste into any session)
 
@@ -117,19 +117,19 @@ retired.
 
 | metric | baseline (2026-08-14) | current | target |
 |---|---:|---:|---:|
-| anti-slop warnings, repo-wide | 3,421 | **2,390** | 0 |
-| — no-runtime-typeof | — | 852 | 0 |
-| — no-conditional-empty-object-spread | — | 555 | 0 |
-| — no-shape-in-symbol-names | — | 424 | 0 |
-| — no-unknown-parameters | — | 257 | 0 |
-| — no-chained-type-assertions | — | 155 | 0 |
-| — no-known-value-widening | — | 124 | 0 |
-| — no-unsafe-dictionary-type / no-object-parameters | — | 23 | 0 |
-| CODEMAP.md size (lines) | 460 | 460 | **deleted** |
-| size-gate allowlist entries | 69 | 65 | 0 |
+| anti-slop warnings, repo-wide | 3,421 | **1,585** | 0 |
+| — no-runtime-typeof | — | 753 | 0 |
+| — no-conditional-empty-object-spread | — | 400 | 0 |
+| — no-shape-in-symbol-names | — | 142 | 0 |
+| — no-unknown-parameters | — | 150 | 0 |
+| — no-chained-type-assertions | — | 66 | 0 |
+| — no-known-value-widening | — | 53 | 0 |
+| — no-unsafe-dictionary-type / no-object-parameters | — | 21 | 0 |
+| CODEMAP.md size (lines) | 460 | **deleted** | **deleted** |
+| size-gate allowlist entries | 69 | 60 | 0 |
 | local branches | ~300 | 55 | ~10 |
 | worktrees | 61 | 33 | active-only |
-| loop tasks complete | 0/12 | **11/12** (#31-41 done; #42 awaits sign-off) | 12/12 |
+| loop tasks complete | 0/12 | **12/12** | 12/12 |
 
 Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| grep -oE 'anti-slop\([a-z-]+\)' \| sort \| uniq -c`; allowlist `grep -cE '^  \["' src/cli/state-plane/file-size.test.ts` (÷2).
 
@@ -199,3 +199,13 @@ Measurement commands: warnings `bunx oxlint --config .oxlintrc.json src apps \| 
   recorded (daemon-activity pr8, rerun-proven). REMAINING: #42 only —
   awaiting founder support-window sign-off. e2ee-client.ts flagged as a
   decomposition candidate (838 lines, warnings clustered).
+- 2026-08-18: **CAPSTONE #42 COMPLETE (design 262)** — PR 1 retired the
+  44-file JSON→SQLite migration tree after founder support-window sign-off,
+  deleting 29 CODEMAP entries and 19,108 lines while preserving the live
+  legacy-JSON authority path. PR 2 deleted the remaining 445-line CODEMAP and
+  inverted the law: 346 entries judged, 168 load-bearing `Never:` constraints
+  moved into their modules, 20 already present, 158 navigation/boilerplate
+  entries killed. Ceremony killed: the migration command/copy/benchmark/
+  replay surfaces plus the parallel ownership map and its same-PR maintenance
+  rule. Combined burn-down at branch tip: 1,777 → **1,585** anti-slop warnings
+  (−192); size allowlist 60; architecture loop **12/12**.

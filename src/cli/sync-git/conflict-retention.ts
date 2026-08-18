@@ -1,3 +1,4 @@
+/** Never: granting push carry/capture authority, deleting other namespaces, or state persistence. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { commitProtocolRefTransaction } from "./base-artifacts.js";

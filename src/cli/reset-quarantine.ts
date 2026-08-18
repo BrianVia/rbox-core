@@ -1,3 +1,4 @@
+/** Never: doctor CLI policy, daemon healing, DB opening, or deterministic recovery-ref deletion. */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";

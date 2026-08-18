@@ -5,6 +5,8 @@
  * members REJECT. The generic shape walker keeps that rule explicit and local.
  *
  * Pure: no filesystem, no SQLite, no paths.
+ *
+ * Never: filesystem access, canonical encoding, or record-specific policy.
  */
 import { jsonCounter, jsonObject, jsonText, type JsonObject, type JsonValue } from "../../json.js";
 

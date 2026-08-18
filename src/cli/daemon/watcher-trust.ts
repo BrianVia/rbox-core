@@ -1,3 +1,4 @@
+/** Never: subscription/re-arm attempt lifecycle, matcher generation/construction, scan execution, scheduler cadence/timers, drift records, or status persistence. */
 import crypto from "node:crypto";
 import {
   effectiveIgnoreRules,

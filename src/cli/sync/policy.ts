@@ -1,3 +1,4 @@
+/** Never: I/O drivers, rendering. */
 import { buildIgnoreMatcher, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import type { WorkspaceConfig } from "../config.js";
 import { RboxApi, type SyncRemote } from "../remote.js";
