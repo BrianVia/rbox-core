@@ -1999,6 +1999,9 @@ export class RboxDaemon {
   private enqueueWatchEvents(events: readonly WatchEvent[]): void {
     for (const event of events) {
       if (this.pendingEvents.length >= PENDING_EVENT_CAP) {
+        if (!this.pendingEventsOverflow) {
+          this.log(`watch queue saturated at ${PENDING_EVENT_CAP} events — dropping; the next operation reconciles by scan`);
+        }
         this.pendingEventsOverflow = true;
         return;
       }
