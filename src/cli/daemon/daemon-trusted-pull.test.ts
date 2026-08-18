@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 
 import { HashCache, nativePruneGlobs, scanManifest, type BlobStore, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
-import { RboxDaemon, type ScanCadenceClock } from "./daemon.js";
+import { PENDING_EVENT_CAP, RboxDaemon, type ScanCadenceClock } from "./daemon.js";
 import type { WatcherAttemptWitness, WatcherRearmClock } from "./watcher-session-supervisor.js";
 import type { ScanGenerationPlan, ScanObservationReceipt } from "./local-workspace-observer.js";
 import type { LocalObservationCommitIntent, LocalObservationCommitReceipt, UnsettledDirective } from "./local-observation-transition.js";
@@ -94,6 +94,10 @@ interface DaemonInternals {
   pumpRun: Promise<void>;
   retryQueue: { stop(): void; scheduleWriteFinish(paths: Set<string>): void };
   pendingEvents: { relPath: string; kind: string }[];
+  pendingEventsOverflow: boolean;
+  pullOnly: boolean;
+  enqueueWatchEvents(events: readonly { relPath: string; kind: "change" }[]): void;
+  applyPendingWatchEvents(): Promise<void>;
   /** LOCAL authority (`CommitLocalObservation`), driven directly for fixture setup. */
   local: {
     head: Manifest;
@@ -112,6 +116,7 @@ interface DaemonInternals {
     errorGeneration: number;
     state: "trusted" | "suspect" | "fused";
     nativePruneKey: string;
+    localSettled(): boolean;
   };
   gitDiscovery: { registry?: unknown };
   openDriftAudits: Set<{ candidates: unknown[]; timer?: ReturnType<typeof setTimeout> }>;
@@ -306,6 +311,62 @@ test("design 277 B3: a fused watcher's pull still drains pendingEvents before it
   expect((await d.buildTrustedPullView(await d.loadSyncBase())).skip).toBe("p1-watcher");
   expect(d.pendingEvents.length).toBe(0);
   expect(d.local.manifest.files.some((f) => f.path === "b.txt")).toBe(true);
+});
+
+test("design 277 B1: a pull-only daemon's steady pull takes the watcher-backed path (#477)", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  // Armed read-write (the fixture needs one publish), then switched to the mode that
+  // could not reach P at all before B1 — the predicate itself is mode-independent.
+  d.pullOnly = true;
+  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
+
+  d.want.pull = true;
+  await d.pump();
+
+  expect(pullLine()).toBe("pull local=trusted");
+  expect(d.want.push).toBe(false);
+  expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
+});
+
+test("design 277 B3: enqueue saturates at the cap, drops, and latches the hole (#477)", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+
+  const flood = Array.from({ length: PENDING_EVENT_CAP + 10 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const }));
+  d.enqueueWatchEvents(flood);
+
+  expect(d.pendingEvents.length).toBe(PENDING_EVENT_CAP);
+  expect(d.pendingEventsOverflow).toBe(true);
+  // The latch alone withholds settlement: a bounded queue must not read as quiet.
+  expect(d.watcherTrust.localSettled()).toBe(false);
+  d.pendingEvents.length = 0;
+  expect(d.watcherTrust.localSettled()).toBe(false);
+});
+
+test("design 277 B3: a pull consumes the overflow latch, so P2 fails until a covering scan (#477)", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const base = await d.loadSyncBase();
+  d.enqueueWatchEvents(Array.from({ length: PENDING_EVENT_CAP + 1 }, (_, i) => ({ relPath: `f${i}.txt`, kind: "change" as const })));
+
+  expect((await d.buildTrustedPullView(base)).skip).toBe("p2-observation");
+  expect(d.pendingEventsOverflow).toBe(false); // consumed exactly once
+  expect(d.local.complete).toBe(false);
+
+  // A FAILED covering scan restores nothing: only a committed observation may.
+  const observe = d.localObserver.observe.bind(d.localObserver);
+  d.localObserver.observe = () => Promise.reject(new Error("injected scan failure"));
+  await d.doFullScan().catch(() => {});
+  expect(d.local.complete).toBe(false);
+  expect((await d.buildTrustedPullView(base)).skip).toBe("p2-observation");
+  d.localObserver.observe = observe;
+
+  await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: base.lastSyncedManifest, mode: "unpruned" });
+  expect((await d.buildTrustedPullView(base)).view).toBeDefined();
 });
 
 // ── 12. trusted-pull log line ─────────────────────────────────────────────────

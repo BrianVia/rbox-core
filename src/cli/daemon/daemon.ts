@@ -193,6 +193,10 @@ const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
 const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 export const GIT_BUSY_RETRY_DELAYS_MS = [2_000, 8_000] as const;
+/** Resident bound on undrained watch events. A drain-time bound would cap apply work
+ *  but not memory — events accumulate BETWEEN operations, and a pull-only host under a
+ *  fused watcher has no push prologue to drain them. */
+export const PENDING_EVENT_CAP = 65_536;
 
 interface ReloadStatToken { mtimeMs: number; size: number }
 
@@ -395,6 +399,10 @@ export class RboxDaemon {
   private walCrashRetries = 0;
   private readonly resetHaltLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
+  /** Set when {@link PENDING_EVENT_CAP} forced events to be dropped: the local view
+   *  now has an unobserved hole. Consumed by the next drain, which withdraws
+   *  observation completeness so only a covering scan can testify it away. */
+  private pendingEventsOverflow = false;
   /** Sole owner of repository topology, absence authority, and the Linux
    * safety-cadence floor. The daemon supplies discovery effects and consumes
    * receipts; it holds none of that state itself. */
@@ -562,7 +570,7 @@ export class RboxDaemon {
     this.telemetry = new TelemetryQueue(this.api, this.log);
     this.retryQueue = new LocalRetryQueue({
       requeue: (paths) => {
-        for (const p of paths) this.pendingEvents.push({ relPath: p, kind: "change" });
+        this.enqueueWatchEvents(paths.map((relPath) => ({ relPath, kind: "change" })));
         this.request("push");
       },
       markUnsettled: (p) => this.local.markUnsettled(p),
@@ -647,6 +655,7 @@ export class RboxDaemon {
       externalLocalWorkSettled: () => this.activePumpOp === undefined
         && !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan
         && this.pendingEvents.length === 0
+        && !this.pendingEventsOverflow
         && this.retryQueue.deferredPaths.size === 0,
       fuseSession: () => this.watcherSessions.fused(),
       fatalSession: () => this.watcherSessions.fatalError(),
@@ -675,7 +684,7 @@ export class RboxDaemon {
         if (this.resetLifecycle !== "ready") return;
         this.watcherTrust.observe({ kind: "watch-activity" });
         this.noteChurn();
-        this.pendingEvents.push(...events);
+        this.enqueueWatchEvents(events);
         this.request("push");
       },
       onRawEvent: (event) => {
@@ -1981,7 +1990,30 @@ export class RboxDaemon {
     return visibleChanged;
   }
 
+  /**
+   * The saturating intake for watch events, and the sole writer of `pendingEvents`.
+   * Dropping at the cap is the overflow contract: the latch it sets keeps local work
+   * unsettled and forces the next operation onto a scan-backed path, so a dropped
+   * event can never be silently mistaken for "nothing happened here".
+   */
+  private enqueueWatchEvents(events: readonly WatchEvent[]): void {
+    for (const event of events) {
+      if (this.pendingEvents.length >= PENDING_EVENT_CAP) {
+        this.pendingEventsOverflow = true;
+        return;
+      }
+      this.pendingEvents.push(event);
+    }
+  }
+
   private async applyPendingWatchEvents(): Promise<void> {
+    if (this.pendingEventsOverflow) {
+      // Consumed atomically with the drain: dropped events are an unobserved hole in
+      // LOCAL, and only a covering scan may restore completeness (P2 false until then,
+      // so re-trust cannot bless the incomplete view).
+      this.pendingEventsOverflow = false;
+      this.local.setObservationComplete(false);
+    }
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
       this.pendingEvents = [];
