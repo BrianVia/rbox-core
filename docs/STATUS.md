@@ -1,5 +1,30 @@
 # rbox status — living state snapshot
 
+## 2026-08-18 (late) — CI cost pass (#783 merged; Depot parked)
+
+- **CI bill sized from job durations** (billing API needs `user` scope):
+  ~941 CI runs/30d × 21 jobs ≈ $500–550/mo of runner compute; macOS
+  (darwin smoke + perf budget) is ~60% of it; per-job minute rounding
+  ~30% of the Linux share.
+- **#783 MERGED**: job-level `timeout-minutes` on every hosted job
+  (default was 360 min — one hung test billed 6h), plus a
+  `run_tui` gate: PRs confined to docs/, apps/, or macos/ skip the
+  compiled-TUI family (cross-build, 3 smokes, darwin perf budget,
+  regress flows, onboarding rig — both always-on macOS jobs included).
+  Main pushes still run everything (release gate). One heap flake on
+  the way in (cas-operations "does not scale heap", run 32150872804,
+  3× green locally).
+- **Depot runners PARKED (#784 closed, branch kept on origin)**:
+  Depot's Actions runners refuse personal-account installs — the repo
+  must live in a GitHub org. Founder keeping today's savings and
+  re-evaluating. If the repo ever moves to an org: reopen #784 (label
+  swaps only), expect ~$540→~$235/mo; org move also requires
+  reconnecting both Cloudflare git integrations + Team plan for
+  private-repo branch protection. Cloudflare's Workflows-based CI was
+  evaluated and rejected for now (private beta, Linux-only, full
+  TS rewrite). Depot CLI installed + logged in (org "Via Labs");
+  $20/mo Developer plan is the entry point if revived.
+
 ## 2026-08-18 (day) — 277 soaked + design 278 SHIPPED same-day (FM pulls 44→20.5s)
 
 - **277 soaked numbers (overnight, n=733/547/158/116)**: desktop push
