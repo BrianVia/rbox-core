@@ -13,6 +13,8 @@
  * descriptor, a regular-file check, and a byte cap. It runs on the hot path
  * while the state lock is held, so a FIFO, a symlink to something enormous, or
  * a directory must refuse rather than block or load.
+ *
+ * Never: SQLite, writing or retiring the intent, or deciding anything from it.
  */
 import fs, { constants } from "node:fs";
 import { jsonObject, type JsonValue } from "../../json.js";

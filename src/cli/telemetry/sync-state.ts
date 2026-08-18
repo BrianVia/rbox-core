@@ -1,3 +1,4 @@
+/** Never: alert evaluation or sync-state mutation. */
 import { ensureTelemetryBindingId, repoRecordsForState, type GitDeferralReason, type SyncState as LocalSyncState, type WorkspaceConfig } from "../config.js";
 import { projectGitDeferralRepos } from "../status-view/git-projection.js";
 import { SYNC_STATE_NUMERIC_DOMAINS, telemetryEnabled, type SyncState, type SyncStateEnvelope } from "./contract.js";

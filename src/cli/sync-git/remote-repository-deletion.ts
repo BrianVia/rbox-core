@@ -1,3 +1,4 @@
+/** Never: local `.git` mutation, BASE minting, durable state persistence, or reading sync state directly. */
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";

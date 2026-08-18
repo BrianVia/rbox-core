@@ -4,6 +4,8 @@
  * The raw token is never returned or exported as a value.  Binding a complete
  * executor set produces closures that retain it, while the WeakSets below
  * authenticate both executor calls and the public facade.
+ *
+ * Never: reset implementation, format-conversion policy, or an exported token/construction key.
  */
 import {
   beginSqliteReset,

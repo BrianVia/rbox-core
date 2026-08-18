@@ -1,3 +1,4 @@
+/** Never: watcher trust, scan scheduling, deferral hygiene, or ref arming/reconcile (the registry's). */
 import type { DiscoveredGitRepo } from "../../engine/index.js";
 import type { OwnedRefMutationLease } from "../sync-git/pins.js";
 import { errCode } from "./logger.js";

@@ -1,3 +1,4 @@
+/** Never: SQLite artifact implementation, ordinary BASE composition, consent minting, or P-repair policy. */
 import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";

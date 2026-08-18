@@ -1,3 +1,4 @@
+/** Never: class state, I/O. */
 import { UNPRUNED_DEADLINE_MS, ManifestChainError } from "../../engine/index.js";
 import type { SuffixInfo } from "../chain-repair.js";
 import { envInt } from "../remote/resilient.js";

@@ -1,3 +1,4 @@
+/** Never: raw-byte parsing, filesystem access, or SQLite dispatch. */
 import type { JsonValue } from "../json.js";
 import { constructResetJournal } from "./reset-journal-schema.js";
 import {

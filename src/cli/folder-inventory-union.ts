@@ -3,6 +3,9 @@
  *
  * This Module preserves the evidence from each discovery source independently.
  * It never heals a registry row, binding, desired record, or catalog entry.
+ *
+ * Never: admission policy, healing, any write, remote mutation, daemon transitions, or sync
+ * orchestration.
  */
 import fs from "node:fs/promises";
 import path from "node:path";

@@ -1,3 +1,4 @@
+/** Never: observing disk, scheduling scans, or interpreting push/pull outcomes. */
 import type { Manifest } from "../../engine/index.js";
 import { omitPaths, type ManifestUpdate } from "./manifest-update.js";
 

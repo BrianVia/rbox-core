@@ -1,3 +1,4 @@
+/** Never: cache persistence, probing. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { hashBytes, isSyncableRef } from "../../engine/index.js";

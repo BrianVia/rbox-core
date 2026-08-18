@@ -1,4 +1,7 @@
-/** Explicit, crash-convergent repair of a folder moved on the local filesystem. */
+/** Explicit, crash-convergent repair of a folder moved on the local filesystem.
+ *
+ * Never: guessing copies, remote mutation, catalog edits, or workspace-ID-only admission.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, isAbsent } from "../engine/fsutil.js";

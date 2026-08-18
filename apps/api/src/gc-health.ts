@@ -1,3 +1,4 @@
+/** Never: candidate mutation, leases, root traversal, or scheduling. */
 import type { Env } from "./env.js";
 import { json, logErr } from "./util.js";
 import { dbFor } from "./db.js";

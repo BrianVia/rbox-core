@@ -1,3 +1,4 @@
+/** Never: worker spawning, I/O. */
 import type { EncryptFileOptions } from "../crypto.js";
 
 export type CiphertextLocation = { kind: "memory"; bytes: Uint8Array } | { kind: "file"; path: string };

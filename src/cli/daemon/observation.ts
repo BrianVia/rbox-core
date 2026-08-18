@@ -1,3 +1,4 @@
+/** Never: process mutation, runtime-record serialization, status/doctor wording, or daemon-loop decisions. */
 import {
   AMBIENT_STATUS_STALE_MS,
   readAmbientDaemonStatusRecord,

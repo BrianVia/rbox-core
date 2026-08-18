@@ -1,6 +1,9 @@
 /** How long a terminal reset halt (W2/W3/J0 and every non-recoverable reason)
  * waits before retrying. Fail-closed conditions need an operator, so retrying
- * sooner only fills the log. */
+ * sooner only fills the log.
+ *
+ * Never: daemon lifecycle state, journal inspection, or I/O.
+ */
 export const RESET_RECOVERY_RETRY_MS = 60 * 60 * 1000;
 
 /** Design 276 F2.3. A W1 writer takeover that loses a race with a foreign

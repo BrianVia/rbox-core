@@ -1,3 +1,4 @@
+/** Never: filesystem recovery policy, row actions, or authority election. */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { canonicalize } from "../engine/e2ee/jcs.js";

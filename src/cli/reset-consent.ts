@@ -1,3 +1,4 @@
+/** Never: prompting, remote creation, reset mutation, or durable authorization storage. */
 import path from "node:path";
 
 /**

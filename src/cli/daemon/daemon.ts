@@ -1,3 +1,4 @@
+/** Never: watcher, wakeup, scheduler, subscription, policy, adoption, or rendering ownership; those live in sibling modules. */
 import os from "node:os";
 import crypto from "node:crypto";
 import fsSync from "node:fs";

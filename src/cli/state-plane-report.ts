@@ -1,4 +1,7 @@
-/** Rendering for fresh SQLite genesis admission failures. */
+/** Rendering for fresh SQLite genesis admission failures.
+ *
+ * Never: mutation, filesystem access, or migration outcomes.
+ */
 import {
   GENESIS_ADMISSION_REFUSAL_COPY,
   type OperatorCopy,

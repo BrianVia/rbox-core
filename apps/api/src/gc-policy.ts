@@ -1,3 +1,4 @@
+/** Never: persistence, cursors, leases, metrics, responses, or candidate mutation. */
 export const GC_BUDGET_SAFE = 8_000;
 export const GC_FIXED_COST = 10;
 export const GC_PER_EXECUTE = 5;

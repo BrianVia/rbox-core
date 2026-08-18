@@ -1,4 +1,7 @@
-/** Closed schema-v1 projection for `rbox config --json`. */
+/** Closed schema-v1 projection for `rbox config --json`.
+ *
+ * Never: machine-triage compatibility fields, filesystem discovery, rendering, or mutation.
+ */
 import {
   FOLDER_TRASH_MAX_BYTES,
   FOLDER_TRASH_MAX_DAYS,

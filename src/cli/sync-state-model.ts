@@ -1,3 +1,4 @@
+/** Never: filesystem I/O, locks, journal recovery, telemetry identity creation, or reset policy. */
 import {
   readManifestChain,
   validateGitRepos,

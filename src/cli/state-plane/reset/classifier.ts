@@ -1,3 +1,4 @@
+/** Never: mutation, journal-derived namespace discovery, or DB opening. */
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import {

@@ -1,3 +1,4 @@
+/** Never: mutation, authority selection, or recovery actions. */
 import crypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";

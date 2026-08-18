@@ -1,5 +1,8 @@
 /** Sealed multi-repository CAS inputs. A transition stage is the only way a
- * RepoRecord reaches the CAS, and every row carries its own source evidence. */
+ * RepoRecord reaches the CAS, and every row carries its own source evidence.
+ *
+ * Never: authority mutation, BASE composition, the CAS TEMP schema, or global file promotion.
+ */
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { RepoRecord, RepoRecordInput } from "../../sync-state-model.js";
@@ -259,6 +262,7 @@ const digestRow = (row: PersistedTransitionRow) => ({
  * run on every decoded row through `revalidate` and own the named refusals — a
  * proofless BASE must surface as a ProoflessBaseError, never as a decode
  * TypeError.
+ *
  */
 /** The one container test every persisted-payload decode in this seam shares. */
 export const isJsonObject = (value: JsonValue | undefined): value is JsonObject =>

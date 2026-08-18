@@ -1,3 +1,4 @@
+/** Never: command presentation, daemon scheduling, writable store/journal exposure, replica implementation, or persisted-format mechanics. */
 import {
   type Action,
   type CaseFoldCollisionGroup,

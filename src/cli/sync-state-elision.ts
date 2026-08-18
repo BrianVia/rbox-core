@@ -6,6 +6,8 @@
  * The proof travels as an ElisionReceipt: a pull constructs one only when it
  * holds every input first-hand. No receipt means the full packet, which is the
  * standing backstop for every caller that is not a pull.
+ *
+ * Never: composing or applying a packet, filesystem or SQLite access, or minting its own evidence.
  */
 import { isDeepStrictEqual } from "node:util";
 import { canonicalManifestHashStreaming } from "../engine/index.js";

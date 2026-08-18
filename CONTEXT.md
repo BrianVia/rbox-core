@@ -5,8 +5,9 @@ workspace root, a **CLI** drives it, and a Cloudflare Worker (`apps/api`) is a
 zero-knowledge sequencer: it stores ciphertext and orders commits, and can
 decrypt nothing.
 
-`docs/CODEMAP.md` says who owns what; this says what the words mean, so a
-symbol is readable without opening 259 design docs. Every entry is verified
+Modules state their own ownership constraints in one-line `Never:` headers;
+this says what the words mean, so a symbol is readable without opening 259
+design docs. Every entry is verified
 against the owning module, not the design doc — where they disagree the code
 wins and the disagreement is noted. Paths are repo-relative.
 

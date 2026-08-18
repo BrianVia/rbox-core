@@ -1,3 +1,4 @@
+/** Never: artifact creation/retirement or follower mutation decisions. */
 import { gitRaw } from "../../engine/git-spawn.js";
 import { hashBytes } from "../../engine/hash.js";
 import {

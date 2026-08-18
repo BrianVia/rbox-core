@@ -1,3 +1,4 @@
+/** Never: pool logic, protocol. */
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";

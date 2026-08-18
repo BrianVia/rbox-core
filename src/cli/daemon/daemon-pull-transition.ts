@@ -1,3 +1,4 @@
+/** Never: reconcile/apply policy, durable BASE, watcher lifecycle, and scheduling remain in their owning modules. */
 import { actionPath, isIgnoreRuleFile, type Action, type Manifest } from "../../engine/index.js";
 import type { DaemonActivity } from "../activity.js";
 import type { SyncState } from "../config.js";

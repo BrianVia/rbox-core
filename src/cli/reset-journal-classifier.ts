@@ -1,3 +1,4 @@
+/** Never: filesystem/Git I/O, mutation, or authorization minting. */
 import type { ResetPhase } from "./reset-journal-codec.js";
 
 export type StateDisposition = "old" | "next" | "absent" | "other";

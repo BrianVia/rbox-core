@@ -1,4 +1,8 @@
-/** Read-only FolderInventory classifier and public facade (design 231 §3.2). */
+/** Read-only FolderInventory classifier and public facade (design 231 §3.2).
+ *
+ * Never: discovery I/O, healing/writes, remote mutation, daemon transitions, scope policy, or sync
+ * orchestration.
+ */
 import path from "node:path";
 import type { BindingRegistryRow } from "./binding-registry.js";
 import type { DesiredStateRow } from "./autostart/desired-state.js";

@@ -11,6 +11,9 @@
  * NOTHING HERE OPENS A DATABASE IT HAS NOT PROVEN IT OWNS (163 v13): every
  * refusal is decided from file-level facts, so a workspace this adapter refuses
  * is byte-identical afterwards, sidecars included.
+ *
+ * Never: authority selection/opening belongs to authority-open.ts; CasResult translation belongs to
+ * cas-translation.ts.
  */
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";

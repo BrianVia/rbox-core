@@ -1,3 +1,4 @@
+/** Never: measurement state ownership, network, or file I/O. */
 import { currentFirstPublishTiming, firstPublishTimingView, type FirstPublishStats } from "./push-spans.js";
 
 export type { FirstPublishStats } from "./push-spans.js";

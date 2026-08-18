@@ -1,3 +1,4 @@
+/** Never: held decisions, metrics, deletion/config/materialization policy, proof composition, and transition commit belong to their dedicated owners. */
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";

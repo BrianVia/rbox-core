@@ -1,3 +1,4 @@
+/** Never: process control or runtime-state mutation. */
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { daemonCrashLogPath, daemonRuntimeDir } from "../rbox-paths.js";

@@ -1,3 +1,4 @@
+/** Never: composition policy, authority, or I/O. */
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
 import type { RepoRecordInput } from "./sync-state-model.js";
 

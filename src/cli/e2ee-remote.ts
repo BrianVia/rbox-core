@@ -1,3 +1,4 @@
+/** Never: raw HTTP, crypto primitives, or pure contract ownership. */
 import {
   buildCommit,
   createWorkspaceKey,

@@ -1,4 +1,8 @@
-/** Resolve the absent/authoritative/damaged activation rule before catalog use. */
+/** Resolve the absent/authoritative/damaged activation rule before catalog use.
+ *
+ * Never: mutation commands, generation discovery internals, policy resolution, runtime admission,
+ * or daemon transitions.
+ */
 import { initializeFolderCatalog } from "./folder-catalog-generate.js";
 import publishInternals, { inspectFolderCatalog } from "./folder-catalog-publish.js";
 import { observeFolderGeneration } from "./folder-inventory.js";

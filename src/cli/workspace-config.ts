@@ -1,3 +1,4 @@
+/** Never: credentials/keystore loading, sync-state persistence, reset authorization, or repository state. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/fsutil.js";

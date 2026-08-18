@@ -4,6 +4,9 @@
  * recovery-probe and git-busy retries stay outside. Publisher acknowledgement is
  * conditional: ordinary acceptance acknowledges, while resolution transitions
  * settle and return without it.
+ *
+ * Never: candidate admission, commit classification, ACK composition, and capture-observation
+ * persistence belong to their dedicated owners.
  */
 import {
   canonicalManifestHashStreaming,

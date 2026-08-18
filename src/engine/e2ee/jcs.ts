@@ -10,6 +10,8 @@
  * integer, bigint, undefined, functions) rather than guess, because a silent
  * coercion across runtimes is exactly the canonicalization ambiguity this
  * codec exists to exclude. There is no float-formatting code here on purpose.
+ *
+ * Never: I/O.
  */
 
 /* `value` stays `unknown` deliberately. This is a leaf primitive: naming its real

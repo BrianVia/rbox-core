@@ -1,3 +1,4 @@
+/** Never: network dispatch, queue policy, server auth. */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";

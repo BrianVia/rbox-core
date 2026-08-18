@@ -1,3 +1,4 @@
+/** Never: candidate planning, BASE minting/advancement, publication, or reading sync state directly. */
 import type { GitDeferralReason, GitDeferrals } from "../config.js";
 import { orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates, type RepoStateValues } from "../sync-state.js";
 import { carriedLineageProof, type RepoBaseProof } from "./base-composer.js";

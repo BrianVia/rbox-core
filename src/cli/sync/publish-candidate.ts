@@ -1,3 +1,4 @@
+/** Never: state reads, BASE advancement, wire effects, or Git mutation outside the capture executor. */
 import {
   diffManifests,
   type CaseFoldCollisionGroup,

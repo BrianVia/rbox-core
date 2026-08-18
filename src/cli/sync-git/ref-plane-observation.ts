@@ -1,3 +1,4 @@
+/** Never: mutate refs, write journals, classify checkout state, or persist sync state. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { receiverEquivalentCollisionNames } from "../../engine/index.js";

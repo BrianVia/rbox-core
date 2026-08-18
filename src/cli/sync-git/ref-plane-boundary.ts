@@ -1,3 +1,4 @@
+/** Never: invoke checkout commit, own journals/plans, classify initial checkout safety, or persist state. */
 import path from "node:path";
 import { receiverEquivalentCollisionNames } from "../../engine/index.js";
 import { ownershipProofContext } from "./reachability.js";

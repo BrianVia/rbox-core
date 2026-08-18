@@ -2,6 +2,8 @@
  *
  * These helpers intentionally return raw Responses. Retry policy, response
  * interpretation, and user-facing errors belong to the command workflows.
+ *
+ * Never: prompting, persistence, response policy, enrollment, or RemoteContext.
  */
 import { fetchWithDeadline } from "./resilient.js";
 

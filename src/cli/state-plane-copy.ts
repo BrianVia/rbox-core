@@ -1,4 +1,7 @@
-/** User-facing copy for fresh SQLite genesis admission failures. */
+/** User-facing copy for fresh SQLite genesis admission failures.
+ *
+ * Never: filesystem reads, outcome-union inspection, or migration vocabulary.
+ */
 import type { TriageFinding, TriageSeverity } from "./doctor-triage.js";
 import type { GenesisAdmissionRefusal } from "./state-plane/authority-bootstrap.js";
 

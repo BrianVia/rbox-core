@@ -1,3 +1,4 @@
+/** Never: construct branch inverses, classify checkout safety, recover journals, compose BASE, or persist sync state. */
 import crypto from "node:crypto";
 import path from "node:path";
 import { ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";

@@ -1,3 +1,4 @@
+/** Never: planning or wire effects, and no sync-state reads outside RepoTransitionPort. */
 import type { GitSection, Manifest } from "../../engine/index.js";
 import type { GitDeferrals, GitResolutionPublicationReceipt, GlobalManifestMeta } from "../config.js";
 import { gitIncomingKey } from "../sync-git.js";

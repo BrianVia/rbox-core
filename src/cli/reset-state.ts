@@ -1,3 +1,4 @@
+/** Never: state/marker serialization, workspace config parsing, reset-journal encoding/durability, or consent semantics. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { SETTLED_ABSENCE_PREFIX, readSettledAbsence, settleBaseAbsentArtifact, readBasePresentArtifact } from "./sync-git/base-artifacts.js";

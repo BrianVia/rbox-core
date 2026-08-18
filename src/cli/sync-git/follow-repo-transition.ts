@@ -1,3 +1,4 @@
+/** Never: Git/state I/O, checkout orchestration, standing-P settlement, or sidecar persistence. */
 import type { GitRefScope, GitSection } from "../../engine/index.js";
 import { DEFERRAL_LANES, type GitDeferralReason, type GitDeferrals, type RepoRecord } from "../config.js";
 import type { GitDeferralUpdates } from "../sync-state.js";

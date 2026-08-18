@@ -1,3 +1,4 @@
+/** Never: network calls. */
 import { quotaUsage } from "../quota-format.js";
 
 /** The server can't serve a contiguous commit span (the `since` is below the

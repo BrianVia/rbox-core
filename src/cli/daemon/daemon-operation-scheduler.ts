@@ -1,3 +1,4 @@
+/** Never: what a pull/push/scan/probe DOES, halt records, or activity/ambient persistence (the executor's). */
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";

@@ -1,3 +1,4 @@
+/** Never: Git/state I/O, lock acquisition, or retry orchestration. */
 import { canonicalize, verifyRoundTrip } from "../../engine/e2ee/jcs.js";
 import { hashBytes } from "../../engine/hash.js";
 import type { JsonObject, JsonValue } from "../../json.js";

@@ -1,3 +1,4 @@
+/** Never: per-request logic. */
 let downloadDisabledForProcess = false;
 let uploadDisabledForProcess = false;
 let packUploadDisabledForProcess = false;

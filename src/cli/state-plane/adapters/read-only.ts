@@ -1,3 +1,4 @@
+/** Never: expected-stream checking, whole-state writes, or JSON/SQLite authority selection. */
 import type { Manifest } from "../../../engine/index.js";
 import {
   type GlobalManifestMeta, type RepoRecord, type SyncState,
