@@ -23,6 +23,8 @@ export { stateSemanticDigest } from "./digest/state-semantic-v1.js";
 export {
   loadRawStateFromStore,
   materializeManifestFromStore,
+  readStateFreshnessFromStore,
+  type StateFreshnessToken,
 } from "./adapters/read-only.js";
 export {
   applySavePacketToStore,

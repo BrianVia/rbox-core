@@ -173,6 +173,7 @@ import {
 } from "./key-delivery-fulfill.js";
 import { admitGenesisAuthority, GenesisAdmissionRefusedError, requireSelected } from "../state-plane/authority-bootstrap.js";
 import { describeGenesisAdmissionRefusal, renderOperatorReport } from "../state-plane-report.js";
+import { forgetState } from "../state-plane/adapters/state-memo.js";
 import {
   RemoteWakeupChannel,
   type PullWakeupReceipt,
@@ -1162,6 +1163,10 @@ export class RboxDaemon {
       Promise.resolve().then(() => this.cache?.save(this.root)),
     ]);
     await this.writePausedAmbientStatus().catch(() => {});
+    // Design 277: the loaded-state memo is process-resident. A stopped daemon
+    // holds no workspace, and a full SyncState is the largest thing this process
+    // keeps — release it rather than carrying it to whatever runs next.
+    forgetState(this.root);
     if (firstStop) {
       this.log("rbox daemon stopped");
       this.onStopped?.();

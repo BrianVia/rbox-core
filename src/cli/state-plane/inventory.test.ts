@@ -73,10 +73,13 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/authority-bootstrap.ts", symbol: "admitGenesisAuthority", kind: "read", sites: 1, guards: ["readGenesisIntent", "observeStateAuthority", "withGenesisAdmissionLocks"] },
   // The held and observation-only branches are deliberately mutually exclusive,
   // so pin both calls without pretending they execute in sequence.
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["observeStateAuthority"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority"] },
+  { file: "src/cli/state-plane/adapters/authority-open.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["observeStateAuthority"] },
+  { file: "src/cli/state-plane/adapters/authority-open.ts", symbol: "selectAuthority", kind: "read", sites: 0, guards: ["admitGenesisAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
+  // Design 277: the O(1) lineage identity read routes through the same
+  // selection and ownership-proving open as the whole-state loads.
+  { file: "src/cli/state-plane/adapters/lineage-reads.ts", symbol: "loadRawStateIdentity", kind: "read", sites: 0, guards: ["selectAuthority", "openAuthorityStore"] },
   // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
   // legacy document, so the repositories it covers are the same set in either
   // format. It used to classify and refuse instead, which made every lock bundle
@@ -112,7 +115,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // writer delegates its recognition to it, the same discipline
   // `loadLegacyJsonState` uses for `loadRawLegacyJsonState`, so the ordered
   // chain is still proved end to end — with one hop instead of three copies.
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "fencedAuthorityUnderHeldLock", kind: "write", sites: 0, guards: ["assertAuthorityWritable", "observeStateAuthority"] },
+  { file: "src/cli/state-plane/adapters/authority-open.ts", symbol: "fencedAuthorityUnderHeldLock", kind: "write", sites: 0, guards: ["assertAuthorityWritable", "observeStateAuthority"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "fencedAuthorityUnderHeldLock", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "replaceResetLineageStream", kind: "reset", sites: 0, guards: ["selectAuthority", "acquireLock", "fencedAuthorityUnderHeldLock", "inventoryResetNamespace", "stableDbHash", "openAuthorityStore", "replaceStreamAndApplySavePacketToStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 0, guards: ["selectAuthority", "acquireLock", "fencedAuthorityUnderHeldLock", "openAuthorityStore", "ensureStoreTelemetryBindingId"] },

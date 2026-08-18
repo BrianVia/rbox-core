@@ -12,7 +12,6 @@ import {
   applyStateSavePacket,
   DEFERRAL_LANES,
   expectedStateNonce,
-  loadRawState,
   MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
   saveStateUnsafeLegacyOrTest,
@@ -39,6 +38,7 @@ import { ResetCorruptionError } from "./reset-io.js";
 import { rethrowIfStateBarrier } from "./state-plane/authority-marker.js";
 import { stateWasStreamMismatch } from "./state-plane/reset-lineage.js";
 import { replaceResetLineageStream } from "./state-plane/adapters/whole-state-compat.js";
+import { loadRawStateIdentity } from "./state-plane/adapters/lineage-reads.js";
 
 /** The record's config-lane members, in persisted order. Durable field names,
  * not code symbols (docs/wire-rename-candidates.md). */
@@ -499,12 +499,15 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
 }
 
 /** Daemon iteration-start binding fence. Unlike loadState, this inspects the raw
- * stream and nonce so a reset/rebind while the daemon idles cannot be hidden. */
+ * stream and nonce so a reset/rebind while the daemon idles cannot be hidden.
+ * It reads the lineage identity only: the fence compares two tokens, and
+ * materializing every file and repository to answer that is design 277's
+ * fifth boundary load. */
 export async function daemonBindingMatches(root: string, expectedStream: string, expectedNonce: string): Promise<boolean> {
-  let raw: SyncState | undefined;
+  let raw: Pick<SyncState, "stream" | "stateNonce"> | undefined;
   for (let attempt = 0; ; attempt++) {
     try {
-      raw = await loadRawState(root);
+      raw = await loadRawStateIdentity(root);
       break;
     } catch (error) {
       // State publication is an atomic rename and some writers intentionally do

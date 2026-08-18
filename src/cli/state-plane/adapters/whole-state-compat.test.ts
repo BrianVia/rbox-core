@@ -43,6 +43,8 @@ const AUTHORITY = "a".repeat(32);
 const LINEAGE = "b".repeat(32);
 const NONCE = "c".repeat(32);
 const COMPAT = path.join(import.meta.dir, "whole-state-compat.ts");
+const AUTHORITY_OPEN = path.join(import.meta.dir, "authority-open.ts");
+const LINEAGE_READS = path.join(import.meta.dir, "lineage-reads.ts");
 
 const roots: string[] = [];
 afterEach(() => {
@@ -740,25 +742,37 @@ test("an unretired genesis intent refuses the save before anything opens the dat
 
 test("each selected write fences exactly once and never through a static import", async () => {
   const source = fs.readFileSync(COMPAT, "utf8");
+  const authorityOpen = fs.readFileSync(AUTHORITY_OPEN, "utf8");
+  const lineageReads = fs.readFileSync(LINEAGE_READS, "utf8");
   // ONE fence call site, reached by all three held-lock writers. Design 266 fold
   // R4 collapsed three inline copies into `fencedAuthorityUnderHeldLock`, which
   // is strictly stronger than three: the writers can no longer drift apart on
-  // the order of fence, re-observation, and open.
-  expect(source.split("assertAuthorityWritable(").length - 1).toBe(1);
+  // the order of fence, re-observation, and open. Design 277 moved that owner,
+  // the selection seam, and the ownership-proving open into `authority-open.ts`
+  // so the O(1) lineage reads reach the authority the same single way.
+  expect(authorityOpen.split("assertAuthorityWritable(").length - 1).toBe(1);
   expect(source.split("await fencedAuthorityUnderHeldLock(root)").length - 1).toBe(3);
-  expect(source).toContain('await import("../authority-bootstrap.js")');
-  // Both read paths take a read-only handle; only the save path takes the
+  expect(authorityOpen).toContain('await import("../authority-bootstrap.js")');
+  // Every read path takes a read-only handle; only the save path takes the
   // writer. 163 v13 is specifically about what a READ is allowed to do.
   expect(source.match(/openAuthorityStore\(authority, true\)/g) ?? []).toHaveLength(2);
   expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(3);
-  expect(source).toContain("facade.openStateStore(authority.file, { readonly })");
-  // Five closes: the two read paths, save, telemetry, and the authority-id
-  // refusal that closes the handle it had to open to compare ids.
-  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(6);
+  expect(lineageReads.match(/openAuthorityStore\(sqliteAuthority\(root, selection\), true\)/g) ?? []).toHaveLength(1);
+  expect(lineageReads).not.toContain("openAuthorityStore(sqliteAuthority(root, selection), false)");
+  expect(authorityOpen).toContain("facade.openStateStore(authority.file, { readonly })");
+  // Five closes in the whole-state adapter: its two read paths, save, telemetry,
+  // and the reset-lineage replacement; the authority-id refusal closes the
+  // handle it had to open to compare ids, in `authority-open.ts`, and the O(1)
+  // lineage identity read closes its own.
+  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(5);
+  expect(authorityOpen.match(/store\.close\(\);/g) ?? []).toHaveLength(1);
+  expect(lineageReads.match(/store\.close\(\);/g) ?? []).toHaveLength(1);
   // A static import of either the coordinator or the store would drag
   // `bun:sqlite` into the CLI's eager graph, which `schema/inventory.test.ts`
   // forbids — and would stop the adapter being inert before the flip.
-  expect(source).not.toMatch(/^import .*(authority-bootstrap|store-facade)\.js/m);
+  for (const module of [source, authorityOpen, lineageReads]) {
+    expect(module).not.toMatch(/^import .*(authority-bootstrap|store-facade)\.js/m);
+  }
 });
 
 /**

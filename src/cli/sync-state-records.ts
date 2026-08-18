@@ -109,7 +109,7 @@ export function repoRecordsForState(state: SyncState): RepoRecordsByPath {
   return records;
 }
 
-export const expectedStateNonce = (state: SyncState): string => state.stateNonce ?? "legacy";
+export const expectedStateNonce = (state: Pick<SyncState, "stateNonce">): string => state.stateNonce ?? "legacy";
 
 function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined {
   const result: Record<string, T> = {};

@@ -96,6 +96,28 @@ Success prints the report id + auto-delete date.
   with an AE metric for backlog). Account deletion (design 37) purges the
   account's reports (R2-delete before row-delete, retried) before `finishD1`.
 
+## Sync-state load switches (design 277)
+
+The daemon's sync state is materialized from SQLite — every file and repository
+the workspace holds. `loadState` skips that projection when the store's lineage
+token (authority, lineage, stream, nonce, revision, telemetry binding) still
+matches the state this process already holds.
+
+| Variable | Effect | Notes |
+|---|---|---|
+| `RBOX_STATE_LOAD_CACHE=0` | Every load materializes, as before design 277. | Kill switch. Correct, just slower: a clean zero-change push cycle goes from 0 materializations back to 4. **Deletion condition: two clean fleet weeks.** |
+| `RBOX_STATE_FREEZE=1` | Deep-freezes every state handed out of the memo. | Debug/test only — O(state) per load. Callers share one loaded object, which is safe only because nothing mutates a `SyncState` in place; running a suite under this flag is how that is proved rather than assumed. A mutation surfaces as a `TypeError` at the mutating line. |
+
+If a workspace ever looks like it is acting on stale sync state, set
+`RBOX_STATE_LOAD_CACHE=0` in the daemon's environment and restart it: that
+restores per-load materialization without touching any durable byte. The
+retention is process-resident only — stopping the daemon releases it.
+
+One related change has **no kill switch**: the daemon's boundary binding fence
+reads the lineage identity row instead of materializing the whole state. With
+`RBOX_STATE_LOAD_CACHE=0` a clean cycle therefore performs 4 materializations,
+not the 5 it performed before design 277.
+
 ## In the test bench
 
 The rig (design 56) runs every device with `RBOX_DIAGNOSTICS=1` so the exact
