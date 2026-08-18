@@ -293,6 +293,21 @@ test("design 202 P3: the pre-pull drain applies pending events into the view; a 
   expect(d.local.update).toEqual({ kind: "partial", source: "watch-events", paths: new Set(["b.txt"]) });
 });
 
+test("design 277 B3: a fused watcher's pull still drains pendingEvents before it refuses (#477)", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  await fs.writeFile(path.join(root, "b.txt"), "two");
+  d.pendingEvents.push({ relPath: "b.txt", kind: "change" });
+  d.watcherTrust.state = "fused";
+
+  // Behind P1 the queue grew for the whole fuse interval and held local work
+  // unsettled, interlocking against the recovery that would clear P1.
+  expect((await d.buildTrustedPullView(await d.loadSyncBase())).skip).toBe("p1-watcher");
+  expect(d.pendingEvents.length).toBe(0);
+  expect(d.local.manifest.files.some((f) => f.path === "b.txt")).toBe(true);
+});
+
 // ── 12. trusted-pull log line ─────────────────────────────────────────────────
 test("design 202: an armed daemon logs `pull local=trusted` and refreshes with the O(applied) patch", async () => {
   const remote = new MiniRemote();

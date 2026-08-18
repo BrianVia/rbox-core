@@ -141,8 +141,8 @@ import {
   ApplyRemoteWorkspaceTransition,
   buildTrustedPullView,
   classifyPullOutcome,
-  type PullTrustAfterDrain,
-  type PullTrustBeforeDrain,
+  type PullTrustGate,
+  type PullTrustRecheck,
 } from "./daemon-pull-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
@@ -2043,7 +2043,7 @@ export class RboxDaemon {
     return this.local.observationComplete && this.activeCaseCollisions.length === 0;
   }
 
-  private pullTrustBeforeDrain(base: SyncState): PullTrustBeforeDrain {
+  private pullTrustGate(base: SyncState): PullTrustGate {
     return {
       killSwitchOff: !pullTrustWatcherEnabled(),
       watcherTrusted: this.watcherTrust.trustedForPull(),
@@ -2055,7 +2055,7 @@ export class RboxDaemon {
     };
   }
 
-  private pullTrustAfterDrain(): PullTrustAfterDrain {
+  private pullTrustRecheck(): PullTrustRecheck {
     return {
       pendingEmpty: this.pendingEvents.length === 0,
       watcherTrusted: this.watcherTrust.trustedForPull(),
@@ -2066,9 +2066,9 @@ export class RboxDaemon {
 
   private buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
     return buildTrustedPullView(
-      this.pullTrustBeforeDrain(base),
       () => this.applyPendingWatchEvents(),
-      () => this.pullTrustAfterDrain(),
+      () => this.pullTrustGate(base),
+      () => this.pullTrustRecheck(),
     );
   }
 
@@ -2149,14 +2149,14 @@ export class RboxDaemon {
         const watcherErrorGeneration = this.watcherTrust.captureOperation().errorGeneration;
         const preBase = this.syncBase ?? await this.loadSyncBase();
         return {
-          beforeDrain: this.pullTrustBeforeDrain(preBase),
           preBase,
           watcherErrorGeneration,
           notifyPendingAt: receipt?.notifyPendingAt,
         };
       },
       drainPendingEvents: () => this.applyPendingWatchEvents(),
-      afterDrain: () => this.pullTrustAfterDrain(),
+      trustGate: (preBase) => this.pullTrustGate(preBase),
+      trustRecheck: () => this.pullTrustRecheck(),
       open: () => {
         const metricsReport = beginReport("pull");
         const report = metricsReport ?? (telemetryEnabled() || this.propagationTrace ? PhaseReport.pull() : undefined);
