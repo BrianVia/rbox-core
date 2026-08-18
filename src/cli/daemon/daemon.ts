@@ -701,7 +701,7 @@ export class RboxDaemon {
       detachRefBackend: () => this.gitDiscovery.detachRefBackend(),
       abandonRefBackend: () => this.gitDiscovery.abandonRefBackend(),
       noteRefBackendUnavailable: () => this.gitDiscovery.noteRefBackendUnavailable(),
-      requestFullScan: () => this.request("fullScan"),
+      requestFullScan: () => this.requestWitnessFullScan(),
       publishTrust: (errorGeneration) => {
         this.watcherTrust.observe({ kind: "rearmed", errorGeneration });
       },
@@ -949,7 +949,11 @@ export class RboxDaemon {
 
     if (this.stopped) return;
     this.armStandingRecovery();
-    if (this.pullOnly) {
+    // Design 277 B1/B4: pull-only is not a reason to skip the watcher — a pull-only
+    // daemon still needs P1 to make design-202 trusted pulls reachable (#477). Only a
+    // SCOPED binding keeps the periodic-scan floor: it publishes nothing and is torn
+    // down on any scope change (`this.scoped`, not the destructively-forced `pullOnly`).
+    if (this.scoped) {
       this.scheduleSafetyScan();
       this.scheduleDeepScan();
     }
@@ -1221,6 +1225,24 @@ export class RboxDaemon {
       if (this.pullOnly && kind !== "pull" && kind !== "deepScan") return;
       this.scheduler.request(kind);
     }
+    this.wake();
+  }
+
+  /**
+   * The ONLY `fullScan` route that survives pull-only mode, and it belongs to the
+   * watcher fuse-recovery witness alone: re-trust publishes only from a witnessed
+   * full-tree scan (watcher-session-supervisor `requestFullScan` → settleScan's
+   * `fullScan` gate; `deepScan` does not substitute), so a pull-only daemon whose
+   * watcher fused would otherwise re-arm forever. Ambient `fullScan` requests keep
+   * being dropped by `request()`.
+   */
+  private requestWitnessFullScan(): void {
+    this.scheduler.queue("fullScan");
+    this.wake();
+  }
+
+  /** Publish the queue and wake the pump — `scheduler.queue`/`request` only set a bit. */
+  private wake(): void {
     this.writeAmbientStatus();
     if (this.resetLifecycle !== "ready" && this.now() < this.nextResetRetryAt) return;
     void this.pump();

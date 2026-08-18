@@ -111,6 +111,11 @@ interface SafetyInternals {
   acknowledgeFolderPolicyRecycle(): Promise<boolean>;
   gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
+  request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
+  /** The exact effect object the supervisor holds — reached so the fuse-recovery
+   *  witness route is proven WIRED, not merely present on the daemon. */
+  watcherSessions: { effects: { requestFullScan(): void } };
+  pump(): Promise<void>;
 }
 
 /** The discovery owner's public receipt surface plus the continuity fields these
@@ -371,10 +376,39 @@ test("pull-only daemon watcher path never queues push", async () => {
     await daemon.startLiveWatch();
     deliver!([{ type: "update", path: path.join(root, "a.txt") }]);
     expect(daemon.want.push).toBe(false);
+    // Design 277 B1: the watcher path is LIVE in pull-only now, so "no push" must be
+    // the suppression proving itself, not a dead watcher — the event still lands.
+    expect(daemon.pendingEvents.length).toBe(1);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("design 277 B2: pull-only drops ambient fullScan but the fuse witness queues AND pumps one (#477)", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root, { pullOnly: true });
+  let pumps = 0;
+  daemon.pump = () => {
+    pumps++;
+    return Promise.resolve();
+  };
+
+  try {
+    daemon.request("fullScan");
+    expect(daemon.want.fullScan).toBe(false); // ambient requests still drop in pull-only
+    expect(pumps).toBe(0);
+
+    daemon.watcherSessions.effects.requestFullScan();
+    // Re-trust publishes only from a witnessed full-tree scan, and a bare queue()
+    // would set the bit without ever waking the loop.
+    expect(daemon.want.fullScan).toBe(true);
+    expect(pumps).toBe(1);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -6,7 +6,7 @@ import { HashCache, scanManifest, type BlobStore, type FileEntry, type GitSectio
 import { gitIdentity } from "../sync-git/identity.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
-import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon, type DaemonTimerHandle, type ScanCadenceClock } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonPidRecord } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
@@ -918,6 +918,11 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     const clock = new FakeScanCadenceClock();
     const remote = new MiniRemote();
     const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
+    // Design 277 B1: a pull-only boot now starts the live watcher, and a trusted
+    // watcher makes every scan PRUNED — which cannot mint an absence proof. The
+    // periodic-scan floor this test pins is therefore the degraded world: force the
+    // watcher factory to reject, exactly as production does when it cannot arm.
+    daemon.startWatcherFn = () => Promise.reject(new Error("forced watcher-init failure (pr8 fixture)"));
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
       ...(daemon.syncBase ?? await daemon.loadSyncBase()),
@@ -951,6 +956,49 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
     expect(daemon.want.push).toBe(false);
     expect(remote.head).toBe(0);
+  });
+});
+
+test("design 277 B1: an unscoped pull-only boot starts the live watcher session (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const clock = new FakeScanCadenceClock();
+    const daemon = await makeDaemon(new MiniRemote(), "pull-only-watch", { pullOnly: true, now: () => TEST_NOW, scanCadenceClock: clock });
+    let started = 0;
+    daemon.startWatcherFn = () => {
+      started++;
+      return Promise.resolve({ backend: "parcel", close: async () => {} });
+    };
+
+    await daemon.start();
+
+    expect(started).toBe(1);
+    expect(daemon.watcher).toBeDefined();
+    // The periodic floor stays armed alongside the watcher, exactly as read-write.
+    expect(clock.safetyArmed).toBe(true);
+    expect(clock.deepArmed).toBe(true);
+  });
+});
+
+test("design 277 B4: a scoped binding boots without a live watcher (#477)", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const scopedCfg = testConfig({ scope: ["sub"], scopeGeneration: 1 });
+    await saveConfig(root, scopedCfg);
+    const clock = new FakeScanCadenceClock();
+    const daemon = await makeDaemon(new MiniRemote(), "scoped-no-watch", { now: () => TEST_NOW, scanCadenceClock: clock }, { scope: ["sub"], scopeGeneration: 1 });
+    let started = 0;
+    daemon.startWatcherFn = () => {
+      started++;
+      return Promise.resolve({ backend: "parcel", close: async () => {} });
+    };
+
+    await daemon.start();
+
+    expect(started).toBe(0);
+    expect(daemon.watcher).toBeUndefined();
+    // Negative control: the boot really reached the mode gate (a halted scope seal
+    // would also leave the watcher unstarted) and armed the periodic-scan floor.
+    expect(clock.safetyArmed).toBe(true);
+    expect(clock.deepArmed).toBe(true);
   });
 });
 
