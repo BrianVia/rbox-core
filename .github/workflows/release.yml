@@ -38,6 +38,7 @@ jobs:
   #    (release.ts asserts presence). Intel Macs (darwin-x64) are not a release target.
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: release # scopes the signing secret to this env (no reviewer gate on free plan)
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -91,6 +92,7 @@ jobs:
   # 2) RBOXBAR — build one universal, version-stamped app without release secrets.
   rboxbar:
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -149,6 +151,7 @@ jobs:
           - target: linux-arm64
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -206,6 +209,7 @@ jobs:
   publish:
     needs: [smoke, rboxbar]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: release
     # contents: write ONLY for the GitHub Release step below; R2 publication
     # and signing are untouched by this grant.

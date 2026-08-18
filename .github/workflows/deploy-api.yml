@@ -26,6 +26,7 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/production'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CLOUDFLARE_ACCOUNT_ID: d1d5680013391ca21665add23eee6426
     steps:
