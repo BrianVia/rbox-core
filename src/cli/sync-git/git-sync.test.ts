@@ -493,21 +493,21 @@ test("D2 pre-save partial revalidation invalidates a human-moved non-current ref
   await git(repo, "update-ref", "refs/heads/side", human);
   const state: SyncState = {
     ...gitState(),
-    repoRecords: {
+    repoRecords: { r: { repoGen: 1, sourceSeq: 1 } },
+  };
+  // Design 279: the CAS re-proves what THIS pull authored, so the marker under
+  // test is the pull's own transition rather than a carried record.
+  const outcome = {
+    partial: {
       r: {
-        repoGen: 1,
-        sourceSeq: 1,
-        partial: {
-          incomingKey: "incoming",
-          checkoutPending: false,
-          appliedRefs: { "refs/heads/side": { kind: "direct", oid: recorded } },
-          heldRefs: { "refs/heads/held": "ownership" },
-          configApplied: true,
-        },
+        incomingKey: "incoming",
+        checkoutPending: false,
+        appliedRefs: { "refs/heads/side": { kind: "direct" as const, oid: recorded } },
+        heldRefs: { "refs/heads/held": "ownership" as const },
+        configApplied: true,
       },
     },
   };
-  const outcome = {};
   const gate = new ShutdownMutationGate();
   let saveRan = false;
   let drainSettled = false;

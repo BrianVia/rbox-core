@@ -55,14 +55,17 @@ test("R2 real-process crash matrix preserves end state at both design-268 seams"
     const state = {
       stream: "stream", stateNonce: "1".repeat(32), lastSyncedSequence: 0,
       lastSyncedManifest: { generatedAt: "", files: [] },
-      repoRecords: { repo: { repoGen: 1, sourceSeq: 0, partial: {
-        incomingKey: "incoming", checkoutPending: false, configApplied: true, heldRefs: {},
-        appliedRefs: Object.fromEntries(refs.map((ref) => [ref, { kind: "direct", oid }]))
-      } } }
+      repoRecords: { repo: { repoGen: 1, sourceSeq: 0 } }
     };
+    // Design 279: only markers THIS pull authored are locked, so the seams below
+    // are reachable on an authoring pull, never on a steady carried-marker one.
+    const outcome = { partial: { repo: {
+      incomingKey: "incoming", checkoutPending: false, configApplied: true, heldRefs: {},
+      appliedRefs: Object.fromEntries(refs.map((ref) => [ref, { kind: "direct", oid }]))
+    } } };
     const crash = () => process.kill(process.pid, "SIGKILL");
     let appended = 0;
-    await withRevalidatedGitPartialApplies(root, state, {}, async () => {
+    await withRevalidatedGitPartialApplies(root, state, outcome, async () => {
       if (point === "during-state-save") crash();
     }, {
       afterStateCasJournalPrepared: () => { if (point === "after-journal") crash(); },

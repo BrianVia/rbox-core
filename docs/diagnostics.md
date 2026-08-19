@@ -118,6 +118,20 @@ reads the lineage identity row instead of materializing the whole state. With
 `RBOX_STATE_LOAD_CACHE=0` a clean cycle therefore performs 4 materializations,
 not the 5 it performed before design 277.
 
+## State-CAS lock scope switches (design 279)
+
+The state CAS holds one `<commonDir>/<ref>.lock` per partial-apply ref, from the
+final exact-ref proof through the state save. It requests them only for the
+markers the pull being committed **authored**: a carried marker keeps the proof
+it was committed with, and every consumer re-proves before acting.
+
+| Variable | Effect | Notes |
+|---|---|---|
+| `RBOX_CAS_DELTA_LOCKS=0` | Both the lock plan and the pre-CAS re-proof take the carried+authored union, as before design 279. | Kill switch. Correct, just slower: a steady no-op pull goes from 0 locks back to one per carried applied ref (1,882 on flat-meadow, ~12s). Diagnostic, not a safe steady mode — on a host whose carried set exceeds 4096 it reinstates the pre-existing `MAX_V2_LOCKS` hard throw. Flipping it on also makes drifted carried markers drop on the next pull, a one-time cleanup cost rather than a symmetric restore. **Deletion condition: two clean fleet weeks.** |
+
+The pull span's `cas …` detail now also carries a `release` step, so the lock
+release that runs after the save is attributed rather than landing in the gap.
+
 ## In the test bench
 
 The rig (design 56) runs every device with `RBOX_DIAGNOSTICS=1` so the exact
