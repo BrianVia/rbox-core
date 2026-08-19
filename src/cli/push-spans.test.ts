@@ -40,7 +40,7 @@ test("complete daemon push line stays byte-identical to the pre-consolidation fi
   const memoryUsage = spyOn(process, "memoryUsage").mockReturnValue({
     rss: 1_234,
     heapTotal: 0,
-    heapUsed: 0,
+    heapUsed: 1_024,
     external: 0,
     arrayBuffers: 0,
   });

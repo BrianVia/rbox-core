@@ -101,6 +101,7 @@ export interface PhaseReportJson {
   files: number;
   blobs: number;
   peakRssBytes: number;
+  peakHeapUsedBytes: number;
   phases: Partial<Record<PhaseName, PhaseTotals>>;
   /** Wall time between phases, keyed `<prev>→<next>` (`start` before the first phase).
    *  `tailMs` is the still-open gap since the last phase ended, measured at toJSON time.
@@ -125,6 +126,7 @@ export class PhaseReport {
   private lastBoundaryAt: number;
   private lastPhase = "start";
   private peakRss = 0;
+  private peakHeapUsed = 0;
 
   private constructor(op: "push" | "pull" | "sync", enabled: boolean) {
     this.op = op;
@@ -234,8 +236,12 @@ export class PhaseReport {
 
   private sampleRss(): void {
     if (!this.enabled) return;
-    const { rss } = process.memoryUsage();
+    // rss alone misleads on darwin: JSC's MADV_FREE'd pages stay resident
+    // until memory pressure (#664 measured 2.46GB rss / 656MB footprint).
+    // heapUsed is the live-JS number that stays honest cross-platform.
+    const { rss, heapUsed } = process.memoryUsage();
     if (rss > this.peakRss) this.peakRss = rss;
+    if (heapUsed > this.peakHeapUsed) this.peakHeapUsed = heapUsed;
   }
 
   toJSON(): PhaseReportJson {
@@ -250,6 +256,7 @@ export class PhaseReport {
       files: this.files,
       blobs: this.blobs,
       peakRssBytes: this.peakRss,
+      peakHeapUsedBytes: this.peakHeapUsed,
       phases,
       gaps: Object.fromEntries(this.gaps),
       tailMs: this.phases.size > 0 ? Date.now() - this.lastBoundaryAt : 0,
@@ -282,7 +289,7 @@ export class PhaseReport {
     if (tailMs >= 100) gapParts.push(`${this.lastPhase}→end ${fmtMs(tailMs)}`);
     const gapSection = gapParts.length > 0 ? ` | gaps ${gapParts.join(" ")}` : "";
     const head = `rbox ${this.op} files=${this.files} blobs=${this.blobs} ct=${fmtBytes(ct)} wire=${fmtBytes(wire)} changed=${fmtBytes(changed)} ${fmtMs(wallMs)}`;
-    return `${head} | ${parts.join(" ")}${gapSection} | rss ${fmtBytes(this.peakRss)}`;
+    return `${head} | ${parts.join(" ")}${gapSection} | rss ${fmtBytes(this.peakRss)} heap ${fmtBytes(this.peakHeapUsed)}`;
   }
 }
 
