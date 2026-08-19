@@ -415,9 +415,10 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
           rec.assert("diverged sibling ref is held", bSide.out.trim() === beforeSide && sibling.out.trim() === beforeSide && incomingSide !== beforeSide, `held=${beforeSide.slice(0, 12)} incoming=${incomingSide.slice(0, 12)}`);
           const state = await readSyncState(ctx.b);
           const record = state.repoRecords?.[TOP];
-          // Design 200 P2 / #462: a non-HEAD ownership hold is durable per ref,
-          // but must not escalate into a repository-level apply deferral.
-          rec.assert("diverged sibling records a non-checkout ownership hold", record?.pending !== undefined && record.partial?.checkoutPending === false && record.partial.heldRefs?.["refs/heads/side"] === "ownership" && record.deferrals?.apply === undefined, JSON.stringify(record));
+          // Design 273 P2 (supersedes 200 P2 / #462's record-clearing): an
+          // ownership-only hold KEEPS its apply record, classed as an
+          // ownership hold, so status can show the repo without nagging.
+          rec.assert("diverged sibling records a non-checkout ownership hold", record?.pending !== undefined && record.partial?.checkoutPending === false && record.partial.heldRefs?.["refs/heads/side"] === "ownership" && record.deferrals?.apply?.reason === "worktree-ownership", JSON.stringify(record));
         });
 
         await rec.step("removing sibling lets held side retry without another push", async () => {
@@ -513,9 +514,12 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
             await ageDeviceApplyDeferral(ctx.b, GUEST.workDir, TOP, agedAt);
             await ctx.b.daemonStart(GUEST.workDir);
 
+            // Design 273 rewrote the human --git listing to the pause-story
+            // grammar; the frozen `git deferred` line (design 176) lives on as
+            // the daemon-log/doctor contract, pinned by doctor's parser tests.
             const agedHuman = await ctx.b.rbox(["status", "--git"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
-            const agedHumanLine = agedHuman.stdout.trim().split("\n").find((line) => line.includes(TOP) && /git deferred\s+\d+[smhd]:/.test(line));
-            rec.assert("[edit] aged human status uses frozen grammar and rendered reason", agedHumanLine?.includes("local edits") === true, agedHumanLine ?? agedHuman.stdout.trim().slice(-800));
+            const agedHumanLine = agedHuman.stdout.trim().split("\n").find((line) => line.includes(TOP) && /changed here/.test(line));
+            rec.assert("[edit] aged human status lists the repo with the local-edits story and rendered age", agedHumanLine !== undefined && /paused 11 minutes/.test(agedHumanLine), agedHumanLine ?? agedHuman.stdout.trim().slice(-800));
             await ctx.b.daemonStop(GUEST.workDir);
             expectedDeferredSince = agedAt;
           }

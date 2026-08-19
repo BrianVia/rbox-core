@@ -23,7 +23,10 @@ const CONSUMER_FREEZE = [
   ["git-commit-propagation", "scripts/rig/scenarios/git-commit-propagation.ts", ["git-sync: captured [1-9]", "git-sync (followed|applied) ${repo}"]],
   ["git-shapes", "scripts/rig/scenarios/git-shapes.ts", ['GIT_SHAPE_SURFACES.applied("s1-b")', "GIT_SHAPE_SURFACES.operationDeferredPrefix(rel)"]],
   ["daemon-control deferral collapse", "src/cli/daemon/daemon-deferral-visibility.test.ts", ['"git deferred 30m: local edits on branch release/0.9forged (repo)"']],
-  ["git-entanglement", "scripts/rig/scenarios/git-entanglement.ts", ["/git deferred\\s+\\d+[smhd]:/"]],
+  // Design 273 rewrote the human --git listing to the pause-story grammar;
+  // the scenario now pins that surface (the frozen `git deferred` line's
+  // remaining parser-consumers are doctor + status-view, pinned above).
+  ["git-entanglement", "scripts/rig/scenarios/git-entanglement.ts", ["/changed here/", "paused 11 minutes"]],
 ] as const;
 
 for (const [consumer, relative, markers] of CONSUMER_FREEZE) {
