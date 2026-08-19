@@ -16,7 +16,7 @@ import { stateWasStreamMismatch } from "../state-plane/reset-lineage.js";
 import { workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { elisionReceipt, type ElisionReceipt } from "../sync-state-elision.js";
 import type { GlobalManifestMeta, SyncState } from "../sync-state-model.js";
-import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource, type StateSource } from "../sync-state.js";
+import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource, type RepoStateValues, type StateSource } from "../sync-state.js";
 import { repoRecordsForState, syncStreamId, type WorkspaceConfig } from "../config.js";
 import type { SyncDeps } from "./deps.js";
 import { formatCasSteps } from "./format.js";
@@ -65,9 +65,11 @@ export function pullElisionReceipt(
   });
 }
 
-export async function savePulledState(input: PullStateSave): Promise<SyncState> {
-  const { root, cfg, deps, report, state, scoped, gitOutcome, sequence } = input;
-  const values = {
+/** Every repo-state member the git outcome owns, read from the outcome AS IT
+ * STANDS. The CAS window withdraws repositories by reassigning these containers,
+ * so the packet must re-derive them inside the window (design 279 §0, #785). */
+export function outcomeRepoValues(gitOutcome: GitOutcome, state: SyncState): RepoStateValues {
+  return {
     bases: gitOutcome.gitRepos,
     branchBaseOrigins: gitOutcome.branchBaseOrigins,
     pending: gitOutcome.gitPendingRemote,
@@ -79,6 +81,11 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
     attempt: gitOutcome.attempt,
     idxProj: gitOutcome.idxProj,
   };
+}
+
+export async function savePulledState(input: PullStateSave): Promise<SyncState> {
+  const { root, cfg, deps, report, state, scoped, gitOutcome, sequence } = input;
+  const values = outcomeRepoValues(gitOutcome, state);
   const receipt = pullElisionReceipt(input);
   const casStepMs: Record<string, number> = {};
   let casCounts: { locks: number; blocked: number } | undefined;
@@ -95,10 +102,16 @@ export async function savePulledState(input: PullStateSave): Promise<SyncState> 
   // The meta is persisted only alongside an unprojected remote base; a scoped
   // projection must never carry another base's meta forward.
   if (scoped.storedBaseIsRemote && input.manifestMeta) source.manifestMeta = input.manifestMeta;
-  const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () =>
-    report.phase("state-save", () => saveStateSource(root, state, source, {
+  const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => {
+    // Only the outcome-derived members are refreshed here: `observedRepos` is
+    // key-set invariant across the window, and rebuilding the whole source would
+    // drag probeKeys/receipt I/O inside the held locks (design 279 §0).
+    source.values = outcomeRepoValues(gitOutcome, state);
+    source.repoProofs = gitOutcome.repoProofs;
+    return report.phase("state-save", () => saveStateSource(root, state, source, {
       allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-    })), {
+    }));
+  }, {
     mutationBoundary: deps.mutationBoundary,
     observeStep: report.enabled ? (step, ms) => { casStepMs[step] = (casStepMs[step] ?? 0) + ms; } : undefined,
     observeLockCounts: (locks, blocked) => { casCounts = { locks, blocked }; },
