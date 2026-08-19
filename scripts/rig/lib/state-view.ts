@@ -107,7 +107,7 @@ export async function ageDeviceApplyDeferral(
   agedAt: string,
 ): Promise<void> {
   const script = `import { applyStateSavePacket, loadRawState } from '/app/src/cli/sync-state-store.ts';
-import { expectedStateNonce, repoRecordsForState } from '/app/src/cli/sync-state-model.ts';
+import { expectedStateNonce, repoRecordsForState } from '/app/src/cli/sync-state-records.ts';
 import { requireRepoBaseProof } from '/app/src/cli/sync-git/base-proof-selection.ts';
 const [root, relPath, agedAt] = process.argv.slice(1);
 const state = await loadRawState(root);
