@@ -1,6 +1,49 @@
 # rbox status — living state snapshot
 
-## 2026-08-18 (late) — CI cost pass (#783 merged; Depot parked)
+## 2026-08-19 — design 279 SHIPPED same-day: FM steady pull 21-22s → 8.2s (#749 residual KILLED) + #785 half-persist fix
+
+- **PR #786 MERGED (947622c), fleet on it, field-proven within minutes**:
+  every steady zero-change FM pull was acquiring **1,882 CAS locks**
+  (~12.5s fsync at the 268 hardware floor) to re-prove partial markers
+  merely CARRIED in state — 53 held/deferred repos' appliedRefs summed to
+  exactly the lock count; pegasus+savvy-core alone were half. Slice 1
+  delta-scopes `planStateCasLocks` + `revalidateGitPartialApplies` to
+  markers the pull AUTHORS (`markersThisCommitOwns`; `effectivePartial`
+  deleted); kill switch RBOX_CAS_DELTA_LOCKS=0 (two clean fleet weeks);
+  release path now timed into the cas span. **Field: FM steady pull
+  8.2s, zero locks, no acquire span** (was 21-22s); desktop push
+  1.5-1.9s, Mac pull 2.0s/push 2.8s — both lanes unregressed. Also
+  defuses the MAX_V2_LOCKS=4096 hard-throw cliff FM was 46% toward.
+- **#785 found by the review loop, fixed as Slice 0, CLOSED**: every
+  CAS-window state withdrawal HALF-persisted — `savePulledState` captured
+  values/repoProofs before the window; reassign-style drops
+  (dropPartial, most carryUnreadableRefDatabase arms) never landed while
+  the delete arms did. Worst arm: a BASE withdrawal with no prior base
+  persisted BASE-deleted + pending-lost + no deferral. Fix: outcome
+  members re-derived inside the save closure (`outcomeRepoValues`),
+  probeKeys/receipt deliberately kept outside the held-lock window.
+  Tests missed it because only production built the source outside the
+  closure — production-shaped pins added.
+- **Review shape**: 2 parallel opus lanes → fold → final serial opus
+  review → delta-confirm ALIGNED r3 (codex quota out until 08-20 05:57;
+  **owed: codex confirm passes on #786 AND #782**). 14 red-first pins;
+  268's crash matrix re-pointed at an authoring pull (carried shape now
+  appends 0 locks — vacuous; measured 140 on authoring).
+- **Pre-merge rig gate: differential clean, two MAIN defects filed**:
+  git-entanglement fails identically on clean main — #787 (rig
+  state-view helper imports repoRecordsForState from its pre-#756 home;
+  aged-visibility step crashes) and **#788 (regression vs #462: per-ref
+  worktree ownership hold escalates to a repo-level apply deferral;
+  window Aug 16-18** — the rig skipped 3 merge days; bisect recipe on
+  the issue). Rig-every-few-PRs rule earned its keep the hard way.
+- **docs/2.0-RELEASE-CHECKLIST.md refreshed against live issue state**
+  (founder ask): #668/#649/#658/#683/#685/#688-via-#774 checked off;
+  added the wire-rename cutover gate (window closes at external ship),
+  held-repo doctor story (#775/#781), #702, #660; FM pull-lane target
+  now MET. Top remaining hard gate: **#664 Mac field acceptance**
+  (re-measure RSS post-#683/#685).
+- Queue: #788 bisect (fresh, small), #787 (one-liner class),
+  unreadable-journal class (#775), 274 PR-B, design 262 §2, #781.
 
 - **CI bill sized from job durations** (billing API needs `user` scope):
   ~941 CI runs/30d × 21 jobs ≈ $500–550/mo of runner compute; macOS
