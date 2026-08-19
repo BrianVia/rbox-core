@@ -73,6 +73,13 @@ async function persist(state: SyncState): Promise<SyncState> {
   return loaded;
 }
 
+/** Design 279: the CAS is answerable for the markers a pull AUTHORS. A recorded
+ * marker is carried, not re-proved, so these fixtures put the marker under test
+ * in the outcome — the shape production takes on any pull that applied refs. */
+function authoring(value: GitPartialApply): GitPullOutcome {
+  return { partial: { [REL]: value } };
+}
+
 function stateWithPartial(value: GitPartialApply | undefined): SyncState {
   return {
     stream: "stream",
@@ -92,9 +99,9 @@ function stateWithPartial(value: GitPartialApply | undefined): SyncState {
 
 test("a direct applied ref that still holds keeps the partial marker", async () => {
   const oid = await git("rev-parse", REF);
-  const outcome: GitPullOutcome = {};
-  await revalidateGitPartialApplies(root, stateWithPartial(partial({ [REF]: { kind: "direct", oid } })), outcome);
-  expect(outcome.partial).toBeUndefined();
+  const outcome = authoring(partial({ [REF]: { kind: "direct", oid } }));
+  await revalidateGitPartialApplies(root, stateWithPartial(undefined), outcome);
+  expect(outcome.partial?.[REL]).not.toBeNull();
 });
 
 test("every applied-ref witness kind is re-proved independently against live refs", async () => {
@@ -115,9 +122,9 @@ test("every applied-ref witness kind is re-proved independently against live ref
   ];
   for (const [label, appliedRefs, expected] of cases) {
     expect(await partialRefsStillMatch(repo, partial(appliedRefs)), label).toBe(expected);
-    const outcome: GitPullOutcome = {};
-    await revalidateGitPartialApplies(root, stateWithPartial(partial(appliedRefs)), outcome);
-    expect(outcome.partial, label).toEqual(expected ? undefined : { [REL]: null });
+    const outcome = authoring(partial(appliedRefs));
+    await revalidateGitPartialApplies(root, stateWithPartial(undefined), outcome);
+    expect(outcome.partial?.[REL] === null, label).toBe(!expected);
   }
 });
 
@@ -146,9 +153,9 @@ test("this pull's partial transition, not the recorded marker, is what gets re-p
 
 test("the save runs while one lock per applied ref is held under the repository common dir", async () => {
   const oid = await git("rev-parse", REF);
-  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  const state = await persist(stateWithPartial(undefined));
   const observed: string[] = [];
-  const saved = await withRevalidatedGitPartialApplies(root, state, {}, async () => {
+  const saved = await withRevalidatedGitPartialApplies(root, state, authoring(partial({ [REF]: { kind: "direct", oid } })), async () => {
     observed.push(...(await fs.readdir(path.join(repo, ".git", "refs", "heads"))));
     return "saved";
   });
@@ -159,16 +166,16 @@ test("the save runs while one lock per applied ref is held under the repository 
 
 test("a partial whose repository context disappeared is dropped before any lock is requested", async () => {
   const oid = await git("rev-parse", REF);
-  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  const state = await persist(stateWithPartial(undefined));
+  const outcome = authoring(partial({ [REF]: { kind: "direct", oid } }));
   await fs.rm(repo, { recursive: true, force: true });
-  const outcome: GitPullOutcome = {};
   await withRevalidatedGitPartialApplies(root, state, outcome, async () => undefined);
   expect(outcome.partial).toEqual({ [REL]: null });
 });
 
 test("an applied ref whose lock path escapes the common dir drops the partial", async () => {
-  const state = await persist(stateWithPartial(partial({ "../../escape": { kind: "direct", oid: "d".repeat(40) } })));
-  const outcome: GitPullOutcome = {};
+  const state = await persist(stateWithPartial(undefined));
+  const outcome = authoring(partial({ "../../escape": { kind: "direct", oid: "d".repeat(40) } }));
   await withRevalidatedGitPartialApplies(root, state, outcome, async () => undefined);
   expect(outcome.partial).toEqual({ [REL]: null });
   expect(await fs.readdir(root)).not.toContain("escape.lock");
@@ -176,9 +183,9 @@ test("an applied ref whose lock path escapes the common dir drops the partial", 
 
 test("a lock another writer already holds drops every partial that requested it", async () => {
   const oid = await git("rev-parse", REF);
-  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  const state = await persist(stateWithPartial(undefined));
+  const outcome = authoring(partial({ [REF]: { kind: "direct", oid } }));
   await fs.writeFile(path.join(repo, ".git", "refs", "heads", "topic.lock"), "foreign\n");
-  const outcome: GitPullOutcome = {};
   await withRevalidatedGitPartialApplies(root, state, outcome, async () => undefined);
   expect(outcome.partial).toEqual({ [REL]: null });
   expect(await fs.readFile(path.join(repo, ".git", "refs", "heads", "topic.lock"), "utf8")).toBe("foreign\n");
@@ -256,9 +263,9 @@ test("a gate closed after the journal is prepared refuses before any lock is pub
 
 test("production wrapper retains authority after batch finalization cleanup until recovery re-fsyncs its parent", async () => {
   const oid = await git("rev-parse", REF);
-  const state = await persist(stateWithPartial(partial({ [REF]: { kind: "direct", oid } })));
+  const state = await persist(stateWithPartial(undefined));
   let saved = false;
-  await expect(withRevalidatedGitPartialApplies(root, state, {}, async () => { saved = true; }, {
+  await expect(withRevalidatedGitPartialApplies(root, state, authoring(partial({ [REF]: { kind: "direct", oid } })), async () => { saved = true; }, {
     stateCasLockHooks: { afterCreate: () => { throw new Error("injected batch-finalization failure"); } },
   })).rejects.toThrow("injected batch-finalization failure");
   expect(saved).toBe(false);

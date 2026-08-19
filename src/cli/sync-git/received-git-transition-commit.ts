@@ -48,35 +48,40 @@ export async function partialRefsStillMatch(repoDir: string, partial: GitPartial
   return true;
 }
 
-/** The partial marker this pull would persist for a repository: its own
- * transition when it authored one, otherwise the recorded marker it inherits. */
-function effectivePartial(
-  rel: string,
-  records: Record<string, RepoRecord>,
+/**
+ * The markers this commit is answerable for: the ones it AUTHORED this pull.
+ * A carried marker keeps the proof it was committed with, so re-proving it here
+ * would spend O(workspace) durable work to compute a drop no consumer needs
+ * (design 279 §2). `RBOX_CAS_DELTA_LOCKS=0` restores the carried+authored union.
+ */
+function markersThisCommitOwns(
+  state: SyncState,
   outcome: GitPullOutcome,
-): GitPartialApply | undefined {
-  const transition = outcome.partial?.[rel];
-  return transition === null ? undefined : transition ?? records[rel]?.partial;
+): Array<{ rel: string; partial: GitPartialApply }> {
+  const authored = Object.entries(outcome.partial ?? {})
+    .flatMap(([rel, partial]) => partial ? [{ rel, partial }] : []);
+  if (process.env.RBOX_CAS_DELTA_LOCKS !== "0") return authored;
+  const dropped = new Set(Object.entries(outcome.partial ?? {}).filter(([, value]) => value === null).map(([rel]) => rel));
+  const authoredRels = new Set(authored.map(({ rel }) => rel));
+  return [
+    ...authored,
+    ...Object.entries(repoRecordsForState(state)).flatMap(([rel, record]) =>
+      record.partial && !authoredRels.has(rel) && !dropped.has(rel) ? [{ rel, partial: record.partial }] : []),
+  ];
 }
 
-/** Re-prove partial crash hints immediately before the state CAS. */
+/** Re-prove the partial crash hints this commit authored, immediately before
+ * the state CAS. */
 export async function revalidateGitPartialApplies(
   root: string,
   state: SyncState,
   outcome: GitPullOutcome,
 ): Promise<void> {
-  const records = repoRecordsForState(state);
-  const rels = new Set([
-    ...Object.entries(records).filter(([, record]) => record.partial !== undefined).map(([rel]) => rel),
-    ...Object.entries(outcome.partial ?? {}).filter(([, value]) => value !== null).map(([rel]) => rel),
-  ]);
   const locks = new Map<string, Promise<void>>();
-  await Promise.all([...rels].map(async (rel) => {
-    const effective = effectivePartial(rel, records, outcome);
-    if (!effective) return;
+  await Promise.all(markersThisCommitOwns(state, outcome).map(async ({ rel, partial }) => {
     const key = await gitApplyMutationKey(root, rel);
     await chainLock(locks, key, async () => {
-      if (await partialRefsStillMatch(repoDirOf(root, rel), effective)) return;
+      if (await partialRefsStillMatch(repoDirOf(root, rel), partial)) return;
       dropPartial(rel, outcome);
     });
   }));
@@ -89,22 +94,18 @@ interface StateCasLockPlan {
 }
 
 /** Derive the exact per-common-dir lock set this commit must hold: one lock per
- * applied partial ref plus one per branch-proof artifact ref. A repository whose
- * context or lock path cannot be trusted loses its partial marker here, before
- * any lock is requested — an unprovable marker must never survive the CAS. */
+ * partial ref THIS COMMIT APPLIED plus one per branch-proof artifact ref.
+ *
+ * No marker this commit writes survives the CAS unproven; a carried marker keeps
+ * the proof it was committed with; every consumer re-proves before acting
+ * (design 279 §2). A repository whose context or lock path cannot be trusted
+ * loses the marker it authored here, before any lock is requested. */
 async function planStateCasLocks(
   root: string,
   state: SyncState,
   outcome: GitPullOutcome,
 ): Promise<StateCasLockPlan> {
-  const records = repoRecordsForState(state);
-  const partials = [...new Set([
-    ...Object.keys(records),
-    ...Object.keys(outcome.partial ?? {}),
-  ])].flatMap((rel) => {
-    const partial = effectivePartial(rel, records, outcome);
-    return partial ? [{ rel, partial }] : [];
-  });
+  const partials = markersThisCommitOwns(state, outcome);
   const requested: StateCasLockPlan["requested"] = new Map();
   for (const { rel, partial } of partials) {
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
@@ -218,7 +219,7 @@ export async function withRevalidatedGitPartialApplies<T>(
     afterStateCasCommitted?: () => void | Promise<void>;
     stateCasLockHooks?: LockfileHooks;
     /** Observation only: wall ms per CAS step, for the pull phase report. */
-    observeStep?: (step: "plan" | "prepare" | "acquire" | "revalidate-partials" | "revalidate-proofs" | "settle", ms: number) => void;
+    observeStep?: (step: "plan" | "prepare" | "acquire" | "revalidate-partials" | "revalidate-proofs" | "settle" | "release", ms: number) => void;
     observeLockCounts?: (locks: number, blocked: number) => void;
   } = {},
 ): Promise<T> {
@@ -283,7 +284,7 @@ export async function withRevalidatedGitPartialApplies<T>(
     });
     return saved;
   } finally {
-    await acquired?.release().catch(() => false);
+    if (acquired) await timed("release", () => acquired!.release().catch(() => false));
     lease?.finish();
   }
 }
