@@ -132,6 +132,7 @@ export const GIT_DEFERRAL_FIELD_COVERAGE = {
   bytesChanged: true,
   reproof: true,
   detail: true,
+  code: true,
 } as const satisfies Record<keyof GitDeferral, true>;
 
 export const GIT_PARTIAL_FIELD_COVERAGE = {

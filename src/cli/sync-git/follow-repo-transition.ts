@@ -1,6 +1,6 @@
 /** Never: Git/state I/O, checkout orchestration, standing-P settlement, or sidecar persistence. */
 import type { GitRefScope, GitSection } from "../../engine/index.js";
-import { DEFERRAL_LANES, type GitDeferralReason, type GitDeferrals, type RepoRecord } from "../config.js";
+import { DEFERRAL_LANES, type GitDeferral, type GitDeferralReason, type GitDeferrals, type RepoRecord, type TypedBlocker } from "../config.js";
 import type { GitDeferralUpdates } from "../sync-state.js";
 import {
   composeRepoBase,
@@ -86,7 +86,7 @@ export type FollowPartialDirective =
 
 export type FollowDeferralDirective =
   | { readonly kind: "clear" }
-  | { readonly kind: "set"; readonly reason: GitDeferralReason };
+  | { readonly kind: "set"; readonly reason: GitDeferralReason; readonly code?: GitDeferral["code"] };
 
 export interface FollowBaseAdvance {
   readonly proof: RepoBaseProof;
@@ -191,6 +191,23 @@ export function followBaseProof(
     },
   };
 }
+
+/** Design 280: the durable typed code for a deferral, taken from the blocker
+ * that caused it. Only the checkout transaction's connectivity proof mints one,
+ * so this reads through to at most one value; a deferral whose blockers minted
+ * none records none and can never be offered the repair that code gates. */
+export function deferralCodeFor(blockers: readonly TypedBlocker[]): GitDeferral["code"] {
+  for (const blocker of blockers) {
+    if ((blocker.provenance === "boundary" || blocker.provenance === "checkout")
+      && blocker.code === "connectivity-unproven") return blocker.code;
+  }
+  return undefined;
+}
+
+const codeDirective = (blockers: readonly TypedBlocker[]): { code?: GitDeferral["code"] } => {
+  const code = deferralCodeFor(blockers);
+  return code === undefined ? {} : { code };
+};
 
 /** Ranked hold reason for an escalating apply-lane deferral. */
 export function followHeldDeferralReason(
@@ -325,7 +342,7 @@ export function composeFollowRepoTransition(
         : advanceFrom(composeFollowAuthority(input, proof, absence, false)),
       pending: input.incoming,
       partial: { kind: "from-progress", checkoutPending: true },
-      deferral: { kind: "set", reason: execution.deferralReason },
+      deferral: { kind: "set", reason: execution.deferralReason, ...codeDirective(progress.blockers) },
       heldAttempt: "retain",
       indexProjection: "retain",
       resolutionMemory: "retain",
@@ -359,7 +376,7 @@ export function composeFollowRepoTransition(
       // instead of erasing it.
       deferral: gitOwnershipNoEscalateEnabled() && authority.ownershipOnly
         ? { kind: "set", reason: "worktree-ownership" }
-        : { kind: "set", reason: heldRefCount ? followHeldDeferralReason(progress) : "artifact" },
+        : { kind: "set", reason: heldRefCount ? followHeldDeferralReason(progress) : "artifact", ...codeDirective(progress.blockers) },
       heldAttempt: "retain",
     };
   }

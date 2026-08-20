@@ -14,6 +14,8 @@ import {
 } from "../../engine/index.js";
 import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import { applyGitSections } from "./apply.js";
+import { nextDeferral } from "./shared.js";
+import { REPO_RECORD_COLUMN_BY_FIELD, decodeRepoRecord, encodeRepoRecord, type RepoRecordRow } from "../state-plane/codecs/repo-record.js";
 import { captureGitState } from "./capture.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
@@ -216,7 +218,7 @@ async function unsatisfiableImportFixture(): Promise<{ state: SyncState; incomin
  * Every pull therefore fetches, decrypts, imports, fails the same proof, and
  * defers again: the fixpoint design 278 exists to break.
  */
-async function connectivityFixpointFixture(): Promise<{ state: SyncState; incoming: GitSection }> {
+async function connectivityFixpointFixture(): Promise<{ state: SyncState; incoming: GitSection; repairGraph: () => Promise<void> }> {
   await commit("one\n", "c1");
   const c2 = await commit("two\n", "c2");
   await exec("git", ["-C", sender, "checkout", "-q", "--orphan", "archive"], { env: TEST_GIT_ENV });
@@ -236,8 +238,16 @@ async function connectivityFixpointFixture(): Promise<{ state: SyncState; incomi
   await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
 
   await looseAllObjects();
-  await fs.rm(path.join(receiver, ".git", "objects", o1Tree.slice(0, 2), o1Tree.slice(2)), { force: true });
-  return { state, incoming };
+  const missing = path.join(receiver, ".git", "objects", o1Tree.slice(0, 2), o1Tree.slice(2));
+  const removedBytes = await fs.readFile(missing);
+  await fs.rm(missing, { force: true });
+  // The repair a person performs out of band: the object comes back, so the
+  // very same planned roots now prove connected.
+  const repairGraph = async (): Promise<void> => {
+    await fs.mkdir(path.dirname(missing), { recursive: true });
+    await fs.writeFile(missing, removedBytes);
+  };
+  return { state, incoming, repairGraph };
 }
 
 
@@ -263,6 +273,120 @@ test("red-first: a connectivity-defer fixpoint stops re-fetching the bundle that
   expect(two.deferral?.deferredSince).toBe(one.deferral!.deferredSince);
   expect(two.deferral?.lastSeen).toBe(one.deferral!.lastSeen);
   expect(two.logs).toEqual([]);
+});
+
+// ---- design 280 Slice A -----------------------------------------------------
+
+test("280 (b): a proof that RAN and failed mints the typed code and makes it durable", async () => {
+  const { state, incoming } = await connectivityFixpointFixture();
+  const one = await pull(state, incoming, 2);
+
+  expect(one.deferral?.reason).toBe("artifact");
+  // The durable discriminator #781 asked for: `artifact` alone cannot tell the
+  // connectivity sub-class from a fetch/import failure, and the remedy differs.
+  expect(one.deferral?.code).toBe("connectivity-unproven");
+  expect(one.record?.attempt?.blockers).toEqual([
+    { provenance: "boundary", reason: "artifact", detail: "planned graph connectivity proof failed", code: "connectivity-unproven" },
+  ]);
+});
+
+test("280 (a): a proof that could not RUN defers as artifact with no code, no attempt, and re-proves", async () => {
+  const { state, incoming } = await connectivityFixpointFixture();
+  const unavailable = { connectivityProof: async () => "unavailable" as const };
+
+  const one = await pull(state, incoming, 2, unavailable);
+  expect(one.logs).toEqual(["git-sync deferred repo: planned graph connectivity proof could not run"]);
+  expect(one.deferral?.reason).toBe("artifact");
+  // No verdict was reached about this repository, so nothing downstream may act
+  // on one: no skip allowlist entry, no attempt latch, no repair offer.
+  expect(one.deferral?.code).toBeUndefined();
+  expect(one.record?.attempt).toBeUndefined();
+  // deferral-hygiene selects `git-busy`/`stale-unattributed` rows into the
+  // stale-lock sweep, where a lock-free repo has its deferral deleted or its
+  // reasonSince restamped. `artifact` is outside that selector, so the 24h
+  // escalation clock can actually accumulate.
+  expect(["git-busy", "stale-unattributed"]).not.toContain(one.deferral?.reason);
+
+  const two = await pull(one.state, incoming, 3, unavailable);
+  expect(two.counts.blobGets).toBeGreaterThan(0);
+  expect(two.counts.fetchOrImportSpawns).toBeGreaterThan(0);
+  expect(two.deferral?.reason).toBe("artifact");
+  expect(two.deferral?.code).toBeUndefined();
+});
+
+test("280 (d): an unavailable proof landing on a standing artifact row keeps its clock", async () => {
+  const { state, incoming } = await connectivityFixpointFixture();
+  const one = await pull(state, incoming, 2);
+  expect(one.deferral?.code).toBe("connectivity-unproven");
+
+  const anHourAndAChangeLater = () => Date.now() + 61 * 60 * 1000;
+  const two = await pull(one.state, incoming, 3, {
+    heldNow: anHourAndAChangeLater,
+    connectivityProof: async () => "unavailable" as const,
+  });
+
+  // Same reason, so the cause clock is NOT restamped: the repo has genuinely
+  // been broken this long and must keep escalating.
+  expect(two.deferral?.reason).toBe("artifact");
+  expect(two.deferral?.reasonSince).toBe(one.deferral!.reasonSince);
+  expect(two.deferral?.deferredSince).toBe(one.deferral!.deferredSince);
+  // The code is curated per defer, never inherited: this pull proved nothing.
+  expect(two.deferral?.code).toBeUndefined();
+});
+
+test("280 (c): a repaired object database is re-proved at the floor and the pause clears", async () => {
+  const { state, incoming, repairGraph } = await connectivityFixpointFixture();
+  const one = await pull(state, incoming, 2);
+  expect(one.record?.attempt).toBeDefined();
+
+  // The fixpoint is holding: cycle 2 pays nothing and stays deferred.
+  const two = await pull(one.state, incoming, 3);
+  expect(two.counts).toEqual({ blobGets: 0, fetchOrImportSpawns: 0 });
+  expect(two.deferral?.reason).toBe("artifact");
+
+  await repairGraph();
+
+  // The 278 liveness promise: the hourly floor re-proves, the repaired graph
+  // now passes, and the repo applies instead of skipping forever.
+  const three = await pull(two.state, incoming, 4, { heldNow: () => Date.now() + 61 * 60 * 1000 });
+  // Restoring the object moved the repository's fingerprint, so the memoized
+  // skip refuses itself out loud before the floor even matters — the honest
+  // report of a repo that changed under a stored classification.
+  expect(three.logs).toEqual(["git-sync WARNING repo: held-skip fingerprint miss", "git-sync followed repo"]);
+  expect(three.deferral).toBeUndefined();
+  expect(three.record?.attempt).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(await git(sender, "rev-parse", "main"));
+});
+
+test("280 (l): the durable code round-trips through the repo-record codec in field order", async () => {
+  const deferral = nextDeferral(
+    "apply", undefined, "artifact", "2026-08-20T00:00:00.000Z", "incoming-v1",
+    { kind: "branch", label: "main" }, "planned graph connectivity proof failed", "connectivity-unproven",
+  );
+  // The two call-site-curated members are assigned last, in this order.
+  expect(Object.keys(deferral).slice(-2)).toEqual(["detail", "code"]);
+
+  const record: RepoRecord = { repoGen: 1, sourceSeq: 1, deferrals: { apply: deferral } };
+  const encoded = encodeRepoRecord("repo", record);
+  // Every column the record codec owns, absent, then exactly what this row has —
+  // named from the codec's own map so a new column cannot silently go untested.
+  const decoded = decodeRepoRecord({
+    ...Object.fromEntries(Object.values(REPO_RECORD_COLUMN_BY_FIELD).map((column) => [column, null])),
+    rel_path: "repo",
+    repo_gen: encoded.repoGen,
+    source_seq: encoded.sourceSeq,
+    deferrals_cjson: encoded.values.deferrals_cjson,
+    extras_cjson: encoded.extrasCjson,
+    canonical_bytes: encoded.canonicalBytes,
+    retained_estimate: encoded.retainedEstimate,
+  } as RepoRecordRow);
+
+  const restored = decoded.deferrals!.apply!;
+  expect(restored).toEqual(deferral);
+  // Durable order is the canonical UTF-16 key order, and it survives the trip:
+  // re-encoding the decoded record reproduces the same bytes.
+  expect(Object.keys(restored)).toEqual([...Object.keys(deferral)].sort());
+  expect(encodeRepoRecord("repo", decoded).canonical).toBe(encoded.canonical);
 });
 
 test("the kill switch restores today's behaviour exactly", async () => {
