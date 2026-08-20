@@ -1,5 +1,41 @@
 # rbox status — living state snapshot
 
+## 2026-08-20 — 2.0 final run OPEN: 664 evidence complete, rig healed (#787/#788), 6 lanes fanned out
+
+- **Session renamed "2.0 release final run"** — founder driving toward the
+  tag; docs/2.0-RELEASE-CHECKLIST.md is the gate list.
+- **#664 evidence package COMPLETE, founder ruling requested on the
+  issue**: (a) memory — the 8GB-rss bar measured wrong on darwin: at
+  4.95GB `ps rss` the kernel phys_footprint was **524MB** (JSC MADV_FREE
+  pages stay in rss); proposed bar "<2GB phys_footprint"; cross-host
+  control desktop 1.8-2.9GB / FM 2.1-2.8GB / Mac working set ~0.5GB
+  (best in fleet). PR #789 MERGED: summary line now `rss X heap Y`.
+  (b) fuses — terminal-fuse era over: every fuse re-arms in ~2min
+  (dozens field-proven); one 61min escalated-backoff exception named;
+  boot-3 of the controlled cycles fused once (recovered 2m05s), so the
+  literal 5-clean-boots gate keeps failing on a churned Mac — reframe
+  requested (transient self-healing episode ≠ the terminal failure the
+  gate guarded).
+- **#787 + #788 CLOSED (PR #790 MERGED)**: git-entanglement's 2 failures
+  + crashed step were ALL stale-rig-vs-shipped-behavior (#756 export
+  move; design 273's ownership-hold record + pause-story status
+  grammar). No product regression; no bisect needed. Scenario now 0
+  failures; the design-176 grammar-freeze test caught the assertion
+  change and its inventory row was updated intentionally. Flake note:
+  #660 bit again (design 206 matcher, shard 5, run 32293614036, 3×
+  green locally).
+- **Litter sweep (founder ask)**: 196 rbox *.conflict.* copies deleted
+  repo-wide (incl. two .env shadows with secrets), .depot/ removed,
+  tracked REVIEW-1/2.md + stale .goals/43 deleted (4d2cd2041).
+- **6 parallel lanes running**: codex confirm passes on #786 + #782
+  (quota back); opus: b2 empty-sequence field verification, #660
+  shard-leak class fix (worktree ci-shard-leak), RboxBar
+  upgrade-management recon+draft, changelog 2.0 draft. Fable driving
+  the held-repo doctor story (#775/#781) design next.
+- Awaiting founder: #664 ruling, #667, wire-rename cutover pass,
+  next-channel stranding, sharp-edge triage (#672/#669/#659/#535/#702,
+  cli-audit #515/#516/#518).
+
 ## 2026-08-19 — design 279 SHIPPED same-day: FM steady pull 21-22s → 8.2s (#749 residual KILLED) + #785 half-persist fix
 
 - **PR #786 MERGED (947622c), fleet on it, field-proven within minutes**:
