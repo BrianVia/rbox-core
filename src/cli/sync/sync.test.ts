@@ -46,15 +46,18 @@ const fakeGitSection = (): GitSection => ({
   generatedAt: "",
 });
 
-const localEntry = (entryPath: string, content = entryPath, type: "file" | "symlink" = "file"): FileEntry => ({
-  path: entryPath,
-  type,
-  sha256: sha(content),
-  size: Buffer.byteLength(content),
-  mode: type === "symlink" ? 0o777 : 0o644,
-  mtimeMs: 1,
-  ...(type === "symlink" ? { symlinkTarget: content } : {}),
-});
+const localEntry = (entryPath: string, content = entryPath, type: "file" | "symlink" = "file"): FileEntry => {
+  const entry: FileEntry = {
+    path: entryPath,
+    type,
+    sha256: sha(content),
+    size: Buffer.byteLength(content),
+    mode: type === "symlink" ? 0o777 : 0o644,
+    mtimeMs: 1,
+  };
+  if (type === "symlink") entry.symlinkTarget = content;
+  return entry;
+};
 
 test("projectLocalManifest deterministically skips complete file/symlink case-fold groups", () => {
   const local: Manifest = {
@@ -1093,7 +1096,7 @@ test("missingBlobsChunked splits checks at 50,000 and unions missing results", a
       calls.push([...batch]);
       return batch.filter((address) => expected.includes(address));
     },
-  } as Pick<SyncRemote, "missingBlobs"> as SyncRemote;
+  } satisfies Pick<SyncRemote, "missingBlobs">;
 
   const missing = await missingBlobsChunked(api, shas);
 

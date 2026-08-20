@@ -94,9 +94,9 @@ export interface EncryptAndUploadOptions {
 }
 
 const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
-const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const isRuntimeEpoch = (v: number | undefined): v is number => v !== undefined && Number.isInteger(v) && v >= 0;
 
-export async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
+export async function missingBlobsChunked(api: Pick<SyncRemote, "missingBlobs">, shas: string[]): Promise<string[]> {
   const missing = new Set<string>();
   for (let i = 0; i < shas.length; i += MAX_SHAS_PER_CHECK) {
     for (const sha of await timeMissingBlobs(api, shas.slice(i, i + MAX_SHAS_PER_CHECK))) missing.add(sha);
@@ -197,7 +197,7 @@ export async function encryptAndUpload(
     if (usePipeline) {
       const preflightDelta = preflightDeltaEnabled();
       const fullAudit = fullAuditEnabled(options.forceFullAudit);
-      const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({
+      const pipelineArgs: Omit<Parameters<typeof runPublishPipeline>[0], "pool"> = {
         api,
         root,
         kek,
@@ -212,15 +212,15 @@ export async function encryptAndUpload(
         report,
         onProgress,
         backoff,
-        pool,
         preflightDelta,
         fullAudit,
         recoverAddresses: options.recoverAddresses,
         deferred,
         retryLater,
         uploadsDir: path.join(root, ".rbox", "state", "uploads"),
-        ...(options.warningSink ? { warningSink: options.warningSink } : {}),
-      }), options.warningSink);
+      };
+      if (options.warningSink) pipelineArgs.warningSink = options.warningSink;
+      const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({ ...pipelineArgs, pool }), options.warningSink);
       needsUpload = result.needsUpload;
     } else {
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
@@ -534,7 +534,8 @@ export async function encryptAndUpload(
       if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
-  return { deferred, retryLater, ...(needsUpload ? { needsUpload } : {}) };
+  if (!needsUpload) return { deferred, retryLater };
+  return { deferred, retryLater, needsUpload };
 }
 
 /** Build the manifest to COMMIT when some files were deferred (never settled under a
