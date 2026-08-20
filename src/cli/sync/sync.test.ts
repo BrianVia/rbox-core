@@ -459,20 +459,20 @@ test("209/7 normalized paths never reach classifyCacheHit; rename, mode, and mis
   expect(byPath.get("missing.txt")!.mtimeMs).not.toBe(missingBase.mtimeMs);
 });
 
-// QUARANTINED locally (design 156): red on clean main on dev machines while CI has
-// never seen it fail — the design-123 registry's one tolerated flake. A known-red
-// test means a red `bun test src/cli` needs hand-triage every run, so local runs
-// skip it; CI still runs it, and RBOX_RUN_QUARANTINED=1 opts back in. Root cause
-// is NOT established: it passes isolated AND full-suite on Linux under bun 1.3.11
-// and 1.3.14 (15+ attempts, 2026-07-18); all known failures are on macOS dev
-// machines. The combined assertion below makes the next opted-in failure
-// self-attributing (scan/churn defer vs re-encrypt vs conflict) — capture that
-// output, root-cause, then delete the skip.
-const quarantinedLocally = !process.env.CI && process.env.RBOX_RUN_QUARANTINED !== "1";
-test.skipIf(quarantinedLocally)("same-SHA size mismatch commits a metadata heal without re-encrypting or conflicting", async () => {
+// Design 156 quarantine RESOLVED (2026-08-20): the flake was umask sensitivity —
+// under umask 077 the local write landed as 0o600 while seedEntry hard-codes
+// 0o644, a mode-only sameContent divergence, so pull correctly minted a conflict
+// (the "conflict" channel of the combined assertion). Deterministically reproduced
+// on Cloudflare CI runners and in a umask-077 container; the write helper now
+// chmods explicitly, making the test umask-independent, so the skip is deleted.
+test("same-SHA size mismatch commits a metadata heal without re-encrypting or conflicting", async () => {
   const remote = new FakeRemote();
   const content = "coherent bytes\n";
   await write("heal.txt", content);
+  // seedEntry hard-codes mode 0o644 while writeFile's result is umask-masked
+  // (0o600 under umask 077) — a mode-only sameContent divergence this test must
+  // not measure. Pin the local mode to the seeded one.
+  await fs.chmod(path.join(root, "heal.txt"), 0o644);
   const coherent = await remote.seedEntry("heal.txt", content);
   const poisoned = { ...coherent, size: coherent.size - 1 };
   remote.injectCommit([poisoned]);
