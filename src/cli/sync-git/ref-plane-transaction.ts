@@ -1,7 +1,7 @@
 /** Never: construct branch inverses, classify checkout safety, recover journals, compose BASE, or persist sync state. */
 import crypto from "node:crypto";
 import path from "node:path";
-import { ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutDeferCode, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";
+import { CONNECTIVITY_PROOF_UNAVAILABLE, ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY, commitCheckout, type CheckoutDeferCode, type CheckoutPlan, type CheckoutRefUpdate, type CommitCheckoutOptions } from "./checkout-txn.js";
 import { basePresentKeepRef } from "./base-artifacts.js";
 import { clearCheckoutJournal, markCheckoutJournalPublished, updateCheckoutJournal, writeCheckoutJournal, type CheckoutJournal } from "./journal.js";
 import { tipOwnedByIncoming, type OwnershipProofContext } from "./reachability.js";
@@ -333,6 +333,7 @@ export class RefPlaneTransaction {
 
     const commitOptions: CommitCheckoutOptions<FollowIntended> = {
       capabilityProbe: opts.capabilityProbe,
+      connectivityProof: opts.connectivityProof,
       capabilitySupported: true,
       journal: { workspaceRoot: opts.workspaceRoot, relPath: opts.relPath, value: this.journal },
       mutationBoundary: opts.mutationBoundary,
@@ -368,6 +369,10 @@ export class RefPlaneTransaction {
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
         : mintedCode === "connectivity-unproven" ? "artifact"
+        // Design 280: a proof that could not run tells the same self-healing
+        // story as one that ran and failed, and carries no code, so it is not
+        // skip-eligible, latches no attempt, and is offered no repair.
+        : result.reason === CONNECTIVITY_PROOF_UNAVAILABLE ? "artifact"
         : result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "local-operation"
         : boundaryFailure?.reason ?? "other";
       const detail = result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY

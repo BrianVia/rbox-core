@@ -16,7 +16,7 @@ import type { DaemonActivity } from "./activity.js";
 import type { AdoptFenceInspection } from "./adopt-journal.js";
 import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
-import type { GitDeferralRepoProjection } from "./status-view/git-projection.js";
+import { rowNeedsYou, rowStuck, type GitDeferralRepoProjection } from "./status-view/git-projection.js";
 import { storyInstruction } from "./status-view/git-stories.js";
 import { loudRows, renderGitPauseSummary } from "./status-view/git-story-render.js";
 import { ageBucket } from "./status-view/text.js";
@@ -100,17 +100,19 @@ function repoArg(repo: string): string {
 }
 
 function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: number): TriageFinding {
-  const age = ageBucket(repo.oldestDeferredSince, now);
+  const stuck = rowStuck(repo, now);
+  // A stuck row is measured by its CURRENT cause, the clock the predicate used.
+  const age = ageBucket(stuck ? repo.reasonSince : repo.oldestDeferredSince, now);
   const command = repo.canKeepMine
     ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`)
     : scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`);
   const safety = REPOSITORY_PROVEN_HEALTHY.has(repo.displayReason)
     ? `Your repository is healthy; only rbox's bookkeeping is paused. ${SAFE_LOCAL_FILES}`
     : `rbox could not read or reconcile part of this repository (${repo.reasonLabel}). It has changed nothing there — look at the repository itself before changing anything.`;
-  // Design 273 P2/P5: an ownership hold and a young transient are never
-  // escalated. The age-only rule below would otherwise call ~51 multi-day
-  // ownership holds "blocked" the moment P2 made them visible again.
-  const severity: TriageSeverity = !repo.story.needsYou || repo.quiet
+  // Design 280: the stuck arm goes FIRST — after the short-circuit below it is
+  // unreachable. Design 273 P2/P5: an ownership hold and a young transient are
+  // never escalated; the age-only rule would call multi-day holds blocked.
+  const severity: TriageSeverity = !stuck && (!repo.story.needsYou || repo.quiet)
     ? "info"
     : age === "unknown" || age.endsWith("m") ? "attention" : "blocked";
   const quietNote = repo.quiet ? " It was paused only recently and usually sorts itself out." : "";
@@ -515,7 +517,7 @@ export function renderWorkspaceTriage(
 ): string[] {
   const lines = [`${style.bold("rbox doctor")} — ${triage.workspace} ${style.dim(`(${triage.root})`)}`, ""];
   // The git block is one item, and only when it says someone must act.
-  const gitCollapsedItems = gitRows.length > 0 && loudRows(gitRows).some((row) => row.story.needsYou) ? 1 : 0;
+  const gitCollapsedItems = gitRows.length > 0 && loudRows(gitRows).some((row) => rowNeedsYou(row, now)) ? 1 : 0;
   lines.push(headline(triage, gitCollapsedItems));
   if (gitRows.length > 0) {
     lines.push("");

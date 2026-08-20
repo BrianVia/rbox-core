@@ -16,6 +16,7 @@ import { gitRebuildSettlement } from "./git-rebuild-settlement.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
 import { gitHeldLivelock } from "./git-held-livelock.js";
 import { gitStaleOpstate } from "./git-stale-opstate.js";
+import { gitStuckRepair } from "./git-stuck-repair.js";
 import { worktreeSquashLifecycle } from "./worktree-squash-lifecycle.js";
 import { webPairing } from "./web-pairing.js";
 import { sqliteFreshInstall } from "./sqlite-fresh-install.js";
@@ -39,6 +40,7 @@ export const SCENARIOS = {
   "git-commit-propagation": gitCommitPropagation,
   "git-held-livelock": gitHeldLivelock,
   "git-stale-opstate": gitStaleOpstate,
+  "git-stuck-repair": gitStuckRepair,
   "worktree-squash-lifecycle": worktreeSquashLifecycle,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
@@ -82,6 +84,11 @@ export const SCENARIOS = {
  * goes GREEN on today's defective product and RED once p-settlement is fixed.
  * Wiring a scenario that passes on a live defect into a gate would be worse than
  * useless. Run it on demand: `bun run rig run git-rebuild-settlement`.
+ * git-stuck-repair is EXCLUDED (explicit/pre-merge): it is design 280's hard gate,
+ * the run that FALSIFIED the proposed resolve offer on 2026-08-20 and now pins its
+ * absence — it breaks a device's object database, runs two propagation rounds and
+ * drives a real mutating `take-theirs` that must refuse cleanly. Run it before
+ * merging any change to the stuck-escalation copy: `bun run rig run git-stuck-repair`.
  * pull-only-conflict-copies is EXCLUDED for now (design 272 §7): it is the only
  * scenario that drives `rbox start --pull-only`, and it has not yet run against a
  * live container fleet. An unmeasured scenario does not belong in the every-PR

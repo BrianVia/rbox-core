@@ -23,12 +23,13 @@ import {
 } from "./status-view/brief.js";
 import { renderGitDeferralCompanion, renderGitDeferralLine } from "./status-view/git-render.js";
 import { gitPauseCounts, loudRows } from "./status-view/git-story-render.js";
+import { rowNeedsYou, rowStuck } from "./status-view/git-projection.js";
 import { gitRepoFallbackNote, renderGitPauseSection, renderGitSingleRepo } from "./status-render-git.js";
 import { statusStaleLockDetail } from "./status-maintenance.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
-import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { checkoutJson, serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { StatusMode, StatusRenderOptions, WorkspaceStatusProjection } from "./status-contract.js";
 
@@ -191,18 +192,15 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
         oldestDeferredSince: repo.oldestDeferredSince,
         displayReason: repo.displayReason,
         story: repo.story.code,
-        needsYou: repo.story.needsYou,
+        needsYou: rowNeedsYou(repo, now),
+        stuck: rowStuck(repo, now),
         quiet: repo.quiet,
         remediationClass: repo.remediationClass,
         ageSeconds: Number.isFinite(Date.parse(repo.oldestDeferredSince)) && Date.parse(repo.oldestDeferredSince) <= now
           ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
           : null,
         bytesChanged: repo.bytesChanged,
-        ...(repo.checkout?.kind === "branch"
-          ? { checkout: { kind: "branch" as const, ...(repo.checkout.label === undefined ? {} : { label: repo.checkout.label }) } }
-          : repo.checkout?.kind === "detached"
-            ? { checkout: { kind: "detached" as const } }
-            : {}),
+        ...checkoutJson(repo.checkout),
       })),
       conflictSnapshots: counts.conflictSnapshots,
     },
@@ -278,7 +276,7 @@ export function renderStatusBrief(
     daemonVersionSkew: daemon.versionSkew,
     locking: projection.locking,
     ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
-    git: loudGitRepos.length > 0 ? { ...gitPauseCounts(loudGitRepos), listed: gitDetail } : undefined,
+    git: loudGitRepos.length > 0 ? { ...gitPauseCounts(loudGitRepos, now), listed: gitDetail } : undefined,
     ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
     ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
     now,

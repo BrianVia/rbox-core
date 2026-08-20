@@ -6,9 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
+  CONNECTIVITY_PROOF_UNAVAILABLE,
   checkoutTransactionCapability,
   checkoutTransactionSupported,
   commitCheckout,
+  defaultConnectivityProof,
   ownershipAwareGitBusy,
   resetCheckoutCapabilityProbeCacheForTests,
   type CheckoutPlan,
@@ -92,6 +94,7 @@ function plan(candidateIndexPath: string, overrides: Partial<CheckoutPlan> = {})
 
 const supported = async () => true;
 const proof = async () => true;
+const connected = async () => "connected" as const;
 
 async function checkoutJournal(expectedHead = "ref: refs/heads/main\n"): Promise<{ binding: CheckoutJournalBinding; journal: CheckoutJournal<{ snapshot: string }> }> {
   const binding: CheckoutJournalBinding = {
@@ -188,13 +191,45 @@ test("design 278: the real connectivity proof defers with the typed connectivity
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
 });
 
+test("design 280 (a): the classifier separates a proof that could not run from one that ran", async () => {
+  const roots = [await git(repo, "rev-parse", "HEAD")];
+  // Node reports a completed child's nonzero exit as a NUMBER and every failure
+  // to execute one as a string errno. That is the whole discriminator.
+  const ranAndFailed = Object.assign(new Error("fatal: bad object"), { code: 128 });
+  const couldNotSpawn = Object.assign(new Error("spawn git EACCES"), { code: "EACCES" });
+  const overflowed = Object.assign(new Error("stdout maxBuffer exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+
+  expect(await defaultConnectivityProof(repo, roots, false)).toBe("connected");
+  expect(await defaultConnectivityProof(repo, roots, false, async () => { throw ranAndFailed; })).toBe("unproven");
+  expect(await defaultConnectivityProof(repo, roots, false, async () => { throw couldNotSpawn; })).toBe("unavailable");
+  expect(await defaultConnectivityProof(repo, roots, false, async () => { throw overflowed; })).toBe("unavailable");
+  // A child killed by a signal produced no verdict either, and lands on the
+  // conservative side: not skip-eligible.
+  expect(await defaultConnectivityProof(repo, roots, false, async () => { throw Object.assign(new Error("killed"), { signal: "SIGKILL" }); })).toBe("unavailable");
+});
+
+test("design 280 (a): an unavailable proof defers with the sentinel and mints no typed code", async () => {
+  const headBefore = await git(repo, "rev-parse", "HEAD");
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), {
+    capabilityProbe: supported,
+    connectivityProof: async () => "unavailable" as const,
+    secondProof: proof,
+  });
+
+  // Exact equality also pins the ABSENCE of `code`: nothing was proved here, so
+  // no downstream plane may skip, latch, or offer a repair on this defer.
+  expect(result).toEqual({ status: "defer", reason: CONNECTIVITY_PROOF_UNAVAILABLE });
+  expect(await git(repo, "rev-parse", "HEAD")).toBe(headBefore);
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+});
+
 test("design 116 checkout transaction commits detached HEAD", async () => {
   await git(repo, "checkout", "-q", "--detach", oldOid);
   const detachedIndex = await fs.readFile(path.join(ctx.gitDir, "index"));
   const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
     refUpdates: [],
     head: { kind: "detached", newOid, oldOid },
-  }), { capabilityProbe: supported, connectivityProof: proof, secondProof: proof });
+  }), { capabilityProbe: supported, connectivityProof: connected, secondProof: proof });
 
   expect(result.status).toBe("committed");
   await expect(git(repo, "symbolic-ref", "HEAD")).rejects.toThrow();
@@ -699,7 +734,7 @@ async function deferWithProbeLock(duringSecondProof: () => Promise<void>) {
   journal.expectedNew.reservedLocks = { [probeRef]: { marker: "probe-marker" } };
   return commitCheckout(ctx, plan(await candidateFor(newOid)), {
     capabilityProbe: supported,
-    connectivityProof: proof,
+    connectivityProof: connected,
     journal: { workspaceRoot: root, relPath: "repo", value: journal },
     // Runs after the ownership-aware busy probe, so the fixture below perturbs
     // only the post-abort journal-retention decision.
@@ -744,7 +779,7 @@ test("an unreadable ORIG_HEAD.lock defers with the journal instead of escaping a
   const { journal } = await checkoutJournal();
   const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), {
     capabilityProbe: supported,
-    connectivityProof: proof,
+    connectivityProof: connected,
     journal: { workspaceRoot: root, relPath: "repo", value: journal },
     secondProof: async () => {
       await fs.mkdir(path.join(ctx.gitDir, "ORIG_HEAD.lock"));

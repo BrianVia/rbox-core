@@ -6,7 +6,7 @@ import {
   repoRecordsForState,
   syncStreamId,
 } from "../config.js";
-import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "../status-view/git-projection.js";
+import { projectGitDeferralRepos, rowNeedsYou, rowStuck, type GitDeferralRepoProjection } from "../status-view/git-projection.js";
 import type { GitDeferral, RepoRecord, RepoRecordsByPath } from "../sync-state-model.js";
 import { storyInstruction } from "../status-view/git-stories.js";
 import { ageBucket } from "../status-view/text.js";
@@ -135,7 +135,8 @@ export async function gitDeferralsCmd(
           reason: repo.displayReason,
           lane: repo.displayLane,
           story: repo.story.code,
-          needsYou: repo.story.needsYou,
+          needsYou: rowNeedsYou(repo, now.getTime()),
+          stuck: rowStuck(repo, now.getTime()),
           quiet: repo.quiet,
           remediationClass: repo.remediationClass,
           oldestDeferredSince: repo.oldestDeferredSince,

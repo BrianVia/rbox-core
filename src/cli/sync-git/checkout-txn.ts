@@ -83,7 +83,7 @@ export interface SecondProofContext {
 
 export interface CommitCheckoutOptions<TIntended = unknown> {
   chainTimings?: GitChainTimings;
-  connectivityProof?: (repoDir: string, roots: readonly string[]) => Promise<boolean>;
+  connectivityProof?: (repoDir: string, roots: readonly string[]) => Promise<ConnectivityProofResult>;
   secondProof: (context: SecondProofContext) => Promise<boolean>;
   /** Branch-switch compatibility phase: proof run after the post-HEAD ref
    * transaction has prepared its locks and before it commits. */
@@ -111,6 +111,12 @@ export type CommitCheckoutResult =
   | { status: "unsupported"; reason: string };
 
 export const ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY = "ORIG_HEAD changed at checkout boundary";
+
+/** Design 280: the defer a proof that could not RUN produces. It mints no
+ * `CheckoutDeferCode` on purpose — nothing was proved about this repository, so
+ * nothing downstream may skip, latch an attempt, or offer a repair on it. The
+ * reason ladder matches this exact sentinel, never free prose. */
+export const CONNECTIVITY_PROOF_UNAVAILABLE = "planned graph connectivity proof could not run";
 
 export type CheckoutCapabilityProbe = (gitVersion: string) => Promise<boolean>;
 export type CheckoutTransactionCapabilityStatus = "supported" | "git-missing" | "version-unavailable" | "probe-failed" | "unsupported";
@@ -288,28 +294,54 @@ export async function checkoutTransactionSupported(repoDir: string, probe?: Chec
   return (await checkoutTransactionCapability(repoDir, probe)).status === "supported";
 }
 
-async function defaultConnectivityProof(repoDir: string, roots: readonly string[], malformedOrigHeadPreserved: boolean): Promise<boolean> {
-  if (roots.length === 0) return true;
+/**
+ * Design 280 Slice A. `unproven` means the proof RAN and returned a verdict:
+ * this object database cannot reach the planned roots. `unavailable` means it
+ * could not run at all (spawn errno, maxBuffer, signal death) and therefore
+ * returned no verdict about the repository.
+ *
+ * Named limitation: a git child that exits nonzero because of EACCES/EIO INSIDE
+ * the repository still reads `unproven`. The split separates could-not-run from
+ * ran-and-failed; it deliberately does not audit git's own errno taxonomy.
+ */
+export type ConnectivityProofResult = "connected" | "unproven" | "unavailable";
+
+/** What a rejected git child carries. Node reports a completed child's nonzero
+ * exit as an INTEGER `code`; every failure to execute one — ENOENT, EACCES,
+ * EAGAIN, ERR_CHILD_PROCESS_STDIO_MAXBUFFER — carries a string code or none. */
+interface ChildFailure { code?: number | string }
+
+const proofProducedAVerdict = (error: ChildFailure): boolean => Number.isInteger(error.code);
+
+export type ConnectivityProofRun = (args: readonly string[]) => Promise<unknown>;
+
+export async function defaultConnectivityProof(
+  repoDir: string,
+  roots: readonly string[],
+  malformedOrigHeadPreserved: boolean,
+  run: ConnectivityProofRun = (args) => exec("git", [...args], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 }),
+): Promise<ConnectivityProofResult> {
+  if (roots.length === 0) return "connected";
   try {
-    await exec("git", ["-C", repoDir, "rev-list", "--quiet", ...roots, "--"], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+    await run(["-C", repoDir, "rev-list", "--quiet", ...roots, "--"]);
     // fsck is deliberately pre-commit (r2 F4); there is no post-commit broad
     // rollback that could clobber a human commit.
     if (malformedOrigHeadPreserved) {
       // Keep ordinary refs/* validation exact. Only pseudo-ref parsing is
       // bypassed, and only after malformed ORIG_HEAD bytes were quarantined.
       try {
-        await exec("git", ["-C", repoDir, "show-ref"], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+        await run(["-C", repoDir, "show-ref"]);
       } catch (error) {
         // show-ref uses 1 for a valid empty ref database; malformed refs are 128.
         if ((error as { code?: unknown }).code !== 1) throw error;
       }
-      await exec("git", ["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", "--no-references", ...roots], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+      await run(["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", "--no-references", ...roots]);
     } else {
-      await exec("git", ["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+      await run(["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots]);
     }
-    return true;
-  } catch {
-    return false;
+    return "connected";
+  } catch (error) {
+    return proofProducedAVerdict(error as ChildFailure) ? "unproven" : "unavailable";
   }
 }
 
@@ -695,9 +727,10 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     const connected = await addTimedMs(opts.chainTimings, "connectivityProofMs", () => opts.connectivityProof
       ? opts.connectivityProof(ctx.repoDir, plan.plannedGraphRoots)
       : defaultConnectivityProof(ctx.repoDir, plan.plannedGraphRoots, plan.malformedOrigHeadPreserved === true));
-    if (!connected) {
+    if (connected === "unproven") {
       return { status: "defer", reason: "planned graph connectivity proof failed", code: "connectivity-unproven" };
     }
+    if (connected === "unavailable") return { status: "defer", reason: CONNECTIVITY_PROOF_UNAVAILABLE };
     try { opts.crashAt?.("after-connectivity-proof"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
     const locksBeforePrepare = new Map<string, string>();

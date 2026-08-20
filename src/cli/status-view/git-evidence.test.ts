@@ -186,7 +186,7 @@ test("project() and every human surface it feeds spawn ZERO git processes", () =
   const spawns: string[][] = [];
   setGitSpawnObserver((_root, args) => { spawns.push([...args]); });
   const now = Date.parse("2026-08-17T00:00:00.000Z");
-  gitPauseHeadline(gitPauseCounts(rows));
+  gitPauseHeadline(gitPauseCounts(rows, now));
   renderGitPauseListing(rows, { now });
   renderGitPauseSummary(rows, now);
   renderGitRepoDetail(rows[0]!, undefined, now);

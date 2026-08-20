@@ -16,7 +16,7 @@
  * sanitized. That is deliberately the opposite of the daemon log line in
  * `git-render.ts`, whose head-truncation is part of a frozen redaction contract.
  */
-import type { GitDeferralRepoProjection } from "./git-projection.js";
+import { rowNeedsYou, rowStuck, type GitDeferralRepoProjection } from "./git-projection.js";
 import { evidenceRisk, type GitRepoEvidence } from "./git-evidence-model.js";
 import { evidenceRowSuffix } from "./git-evidence-render.js";
 import { storyHeadline } from "./git-stories.js";
@@ -34,17 +34,19 @@ export const loudRows = (rows: readonly GitDeferralRepoProjection[]): GitDeferra
 export interface GitPauseCounts {
   needsYou: number;
   selfHealing: number;
+  /** The subset of `needsYou` that got there by being stuck (design 280). The
+   * headline needs it: those repos were never paused to protect your work. */
+  stuck: number;
   total: number;
 }
 
-export function gitPauseCounts(rows: readonly GitDeferralRepoProjection[]): GitPauseCounts {
-  const needsYou = rows.filter((row) => row.story.needsYou).length;
-  return { needsYou, selfHealing: rows.length - needsYou, total: rows.length };
+export function gitPauseCounts(rows: readonly GitDeferralRepoProjection[], now: number): GitPauseCounts {
+  const needsYou = rows.filter((row) => rowNeedsYou(row, now)).length;
+  const stuck = rows.filter((row) => rowStuck(row, now)).length;
+  return { needsYou, selfHealing: rows.length - needsYou, stuck, total: rows.length };
 }
 
 const repos = (count: number): string => `${count} repo${count === 1 ? "" : "s"}`;
-
-const DAY_MS = 86_400_000;
 
 /**
  * S1: the two-number split every glance surface shows. `undefined` when nothing
@@ -52,7 +54,7 @@ const DAY_MS = 86_400_000;
  * never warns about a population that is only sorting itself out.
  */
 export function gitPauseHeadline(
-  { needsYou, selfHealing, listed }: Omit<GitPauseCounts, "total"> & { listed?: boolean },
+  { needsYou, selfHealing, stuck = 0, listed }: Omit<GitPauseCounts, "total" | "stuck"> & { stuck?: number; listed?: boolean },
 ): string[] {
   if (needsYou === 0 && selfHealing === 0) return [];
   // The pointer is for readers who cannot see the list. Printing it directly
@@ -65,23 +67,43 @@ export function gitPauseHeadline(
   const healing = selfHealing > 0
     ? ` ${selfHealing} more ${selfHealing === 1 ? "is" : "are"} sorting ${selfHealing === 1 ? "itself" : "themselves"} out.`
     : "";
-  return [
-    `⚠ ${repos(needsYou)} ${needsYou === 1 ? "is" : "are"} waiting on you — rbox paused git sync there so nothing you did gets overwritten.${healing}`,
-    ...pointer,
-  ];
+  const warnings: string[] = [];
+  // Design 280: "nothing you did gets overwritten" is why rbox pauses to PROTECT
+  // your work. It is simply false for a repo that has spent days failing to put
+  // the other computer's version in place, so that population gets its own true
+  // sentence instead of borrowing this one.
+  const protecting = needsYou - stuck;
+  if (protecting > 0) {
+    warnings.push(`⚠ ${repos(protecting)} ${protecting === 1 ? "is" : "are"} waiting on you — rbox paused git sync there so nothing you did gets overwritten.`);
+  }
+  if (stuck > 0) {
+    warnings.push(`⚠ ${repos(stuck)} ${stuck === 1 ? "has" : "have"} been stuck syncing for over a day — rbox needs your help to get ${stuck === 1 ? "it" : "them"} moving.`);
+  }
+  warnings[warnings.length - 1] += healing;
+  return [...warnings, ...pointer];
 }
 
 // Resolvability is part of the key because a group prints only commands EVERY
 // repo in it supports (design 273 S2). Keying without it made one unresolvable
 // row silence the commands for the whole group; keying with it SPLITS the
 // group, and the half that can act keeps its instructions.
-const groupKey = (row: GitDeferralRepoProjection): string =>
-  `${row.story.code}|${row.story.needsYou ? "you" : "rbox"}|${row.resolvable ? "can" : "cannot"}`;
+//
+// Stuckness is part of the key for the same reason (design 280): a group prints
+// ONE handling line derived from its oldest row, so a single stuck repo sitting
+// among young siblings would tell all of them "rbox has been retrying these for
+// over a day". Keying on it splits the stuck rows into their own group, which
+// gets the escalated copy while the young remainder keeps "rbox is handling
+// these".
+const groupKey = (row: GitDeferralRepoProjection, now: number): string =>
+  `${row.story.code}|${rowNeedsYou(row, now) ? "you" : "rbox"}|${rowStuck(row, now) ? "stuck" : "moving"}|${row.resolvable ? "can" : "cannot"}`;
 
 interface StoryGroup {
   rows: GitDeferralRepoProjection[];
   story: GitDeferralRepoProjection["story"];
   resolvable: boolean;
+  /** Uniform across the group by construction — both are part of the key. */
+  needsYou: boolean;
+  stuck: boolean;
 }
 
 /** Groups by (story, actionability, resolvability). Within a group the repos
@@ -95,8 +117,11 @@ export function groupByStory(
 ): StoryGroup[] {
   const groups = new Map<string, StoryGroup>();
   for (const row of rows) {
-    const key = groupKey(row);
-    const group = groups.get(key) ?? { rows: [], story: row.story, resolvable: row.resolvable };
+    const key = groupKey(row, now);
+    const group = groups.get(key) ?? {
+      rows: [], story: row.story, resolvable: row.resolvable,
+      needsYou: rowNeedsYou(row, now), stuck: rowStuck(row, now),
+    };
     group.rows.push(row);
     groups.set(key, group);
   }
@@ -107,7 +132,7 @@ export function groupByStory(
       || a.repo.localeCompare(b.repo));
   }
   return [...groups.values()].sort((a, b) =>
-    Number(a.story.needsYou ? 0 : 1) - Number(b.story.needsYou ? 0 : 1)
+    Number(a.needsYou ? 0 : 1) - Number(b.needsYou ? 0 : 1)
     || b.rows.length - a.rows.length
     || a.story.code.localeCompare(b.story.code)
     || Number(a.resolvable ? 0 : 1) - Number(b.resolvable ? 0 : 1));
@@ -144,12 +169,21 @@ function resolveLines(group: StoryGroup): string[] {
   return lines;
 }
 
-/** rbox retrying for days is no longer "handling it", and saying so anyway is
- * how a self-healing group becomes a place problems go to be ignored. */
-function selfHealingLines(group: StoryGroup, now: number): string[] {
-  const oldest = Math.min(...group.rows.map((row) => pausedAt(row, now)));
-  const stuck = !Number.isFinite(oldest) || now - oldest > DAY_MS;
-  return stuck
+/**
+ * rbox retrying for days is no longer "handling it", and saying so anyway is
+ * how a self-healing group becomes a place problems go to be ignored.
+ *
+ * A stuck group is told it is stuck and pointed at doctor — never at a resolve
+ * command. Design 280 proposed offering take-theirs to the connectivity
+ * sub-class and the rig FALSIFIED it on 2026-08-20: `stageIncoming` re-fetches
+ * only the incoming section's bundle/packChain window, so an object broken
+ * BELOW that window is never restored, and the connectivity proof inside
+ * take-theirs' own transaction correctly refuses (`operation-failed`). rbox has
+ * no remedy for this class today, and a command that refuses is a dead end the
+ * design 273 bar forbids. Owner of the remaining copy question: #775.
+ */
+function selfHealingLines(group: StoryGroup): string[] {
+  return group.stuck
     ? [
       "   rbox has been retrying these for over a day — that is longer than it should take.",
       commandLine("Get a closer look:", "rbox doctor"),
@@ -160,10 +194,10 @@ function selfHealingLines(group: StoryGroup, now: number): string[] {
     ];
 }
 
-function groupActionLines(group: StoryGroup, now: number): string[] {
+function groupActionLines(group: StoryGroup): string[] {
   switch (group.story.action.kind) {
     case "resolve": return resolveLines(group);
-    case "self-healing": return selfHealingLines(group, now);
+    case "self-healing": return selfHealingLines(group);
     case "instruction": return [`   ${group.story.action.text}`];
     // Never a dead end: rbox cannot name this condition, so it names the person
     // who can read it.
@@ -247,7 +281,7 @@ export function renderGitPauseListing(
       lines.push("   the full list:        rbox status --git --all");
       lines.push("   one repo in detail:   rbox status --git <repo>");
     }
-    lines.push(...groupActionLines(group, options.now));
+    lines.push(...groupActionLines(group));
   }
   return lines;
 }
@@ -258,10 +292,10 @@ export function renderGitPauseListing(
 export function renderGitPauseSummary(rows: readonly GitDeferralRepoProjection[], now: number): string[] {
   if (rows.length === 0) return [];
   const visible = loudRows(rows);
-  const { needsYou, selfHealing } = gitPauseCounts(visible);
+  const { needsYou, selfHealing } = gitPauseCounts(visible, now);
   const groups = groupByStory(visible, now);
-  const lead = groups.find((group) => group.story.needsYou);
-  const otherStories = groups.filter((group) => group.story.needsYou).length - 1;
+  const lead = groups.find((group) => group.needsYou);
+  const otherStories = groups.filter((group) => group.needsYou).length - 1;
   const lines = [`git · ${repos(rows.length)} paused`];
   if (needsYou > 0 && lead) {
     lines.push(`  ${needsYou} waiting on you — ${storyHeadline(lead.story, lead.rows.length)}${otherStories > 0 ? ` (and ${otherStories} more ${otherStories === 1 ? "story" : "stories"})` : ""}`);

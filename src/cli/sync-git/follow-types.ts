@@ -3,7 +3,7 @@
  * classification into a typed deferral. Moved verbatim out of follow.ts. */
 import type { MutationBoundary } from "../../engine/mutation-gate.js";
 import type { AppliedManifestOracle, BlobStore, GitSection } from "../../engine/index.js";
-import type { CheckoutCapabilityProbe, CheckoutDeferCode } from "./checkout-txn.js";
+import type { CheckoutCapabilityProbe, CheckoutDeferCode, CommitCheckoutOptions } from "./checkout-txn.js";
 import type { CheckoutJournalBinding } from "./journal.js";
 import type { GitChainTimings } from "./chain-timings.js";
 import type { RepoCtx } from "./git-state.js";
@@ -103,6 +103,9 @@ export interface FollowOptions {
   makeIntended: (progress: FollowProgress) => FollowIntended | Promise<FollowIntended>;
   chainTimings?: GitChainTimings;
   capabilityProbe?: CheckoutCapabilityProbe;
+  /** Test seam for the checkout transaction's graph-connectivity classifier,
+   * plumbed exactly like `capabilityProbe`. Absent in production. */
+  connectivityProof?: CommitCheckoutOptions["connectivityProof"];
   crashAt?: (point: FollowCrashPoint) => void;
   /** Loud receiver-ambiguity diagnostics supplied by pull orchestration. */
   log?: (line: string) => void;

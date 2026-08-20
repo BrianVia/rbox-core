@@ -185,6 +185,11 @@ export interface GitDeferral {
   /** Curated by the deferral-WRITING site only; never composed or extended by a
    * codec, projection, or renderer, and never folded into `reason`. */
   detail?: string;
+  /** Design 280: the deferring blocker's typed code, made durable so a later
+   * surface can tell the two `artifact` sub-classes apart without reading
+   * `detail` prose. Local state only — never on the wire, never in telemetry.
+   * Absent on every deferral whose blocker minted no code. */
+  code?: "connectivity-unproven";
 }
 
 export const DEFERRAL_LANES = ["apply", "capture", "config"] as const satisfies readonly GitDeferral["lane"][];

@@ -284,7 +284,7 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
   const projectedDeferrals = loudRows(projectGitDeferralRepos(Object.entries(input.repoRecords ?? {}).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])
   ), input.now));
-  const split = gitPauseCounts(projectedDeferrals);
+  const split = gitPauseCounts(projectedDeferrals, input.now);
   const deferredRepos = projectedDeferrals.length;
   const oldestDeferredSince = Date.parse(projectedDeferrals[0]?.oldestDeferredSince ?? "");
   const oldestDeferralAgeSeconds = deferredRepos === 0

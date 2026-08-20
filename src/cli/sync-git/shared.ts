@@ -165,6 +165,9 @@ export function nextDeferral(
   checkout?: GitDeferral["checkout"],
   /** Curated at this call site or omitted; never carried over from `current`. */
   detail?: string,
+  /** The deferring blocker's typed code, on the same call-site-curated terms as
+   * `detail`: a re-defer that mints none must not inherit the previous one. */
+  code?: GitDeferral["code"],
 ): GitDeferral {
   const deferral: GitDeferral = {
     lane,
@@ -177,8 +180,10 @@ export function nextDeferral(
     ...(current?.bytesChanged === undefined ? {} : { bytesChanged: current.bytesChanged }),
     ...(current?.reproof === undefined || current.subjectKey !== subjectKey ? {} : { reproof: current.reproof }),
   };
-  // Assigned last, which is also its position in the durable field order.
+  // Assigned last, which is also their position in the durable field order:
+  // detail, then code — the two members curated by the deferring call site.
   if (detail !== undefined) deferral.detail = detail;
+  if (code !== undefined) deferral.code = code;
   return deferral;
 }
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {

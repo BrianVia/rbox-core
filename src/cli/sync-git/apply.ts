@@ -15,7 +15,7 @@ import { inspectLockedPRepairReceipt, persistPRepairTerminal, runLockedPRepairAt
 import { preserveGitConflict } from "./quarantine.js";
 import { repoCtxFromDisk, type RepoCtx } from "./git-state.js";
 import { readBasePresentArtifact } from "./base-artifacts.js";
-import { type CheckoutCapabilityProbe } from "./checkout-txn.js";
+import { type CheckoutCapabilityProbe, type CommitCheckoutOptions } from "./checkout-txn.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "./config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "./config-txn.js";
 import { addTimedMs } from "./chain-timings.js";
@@ -156,6 +156,7 @@ opts: {
     /** Degraded workspace mutex disables follow and independent ref publication. */
     degradedMutex?: boolean;
     capabilityProbe?: CheckoutCapabilityProbe;
+    connectivityProof?: CommitCheckoutOptions["connectivityProof"];
     crashAt?: (point: FollowCrashPoint) => void;
     /** Test seam for a reflog-only move after pin enumeration. */
     afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
@@ -267,8 +268,9 @@ opts: {
     reason: GitDeferralReason,
     subjectKey?: string,
     checkout?: GitDeferral["checkout"],
+    code?: GitDeferral["code"],
   ): void => {
-    const next = nextDeferral(lane, currentDeferral(rel, lane), reason, new Date().toISOString(), subjectKey, checkout);
+    const next = nextDeferral(lane, currentDeferral(rel, lane), reason, new Date().toISOString(), subjectKey, checkout, undefined, code);
     deferrals[rel] = { ...(deferrals[rel] ?? {}), [lane]: next };
   };
   const clearDeferral = (rel: string, lane: GitDeferral["lane"]): void => {
@@ -1011,7 +1013,7 @@ opts: {
             ? partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false)
             : null;
         if (transition.deferral.kind === "clear") clearDeferral(rel, "apply");
-        else setDeferral(rel, "apply", transition.deferral.reason, incomingKey, await checkoutOf(repoDir));
+        else setDeferral(rel, "apply", transition.deferral.reason, incomingKey, await checkoutOf(repoDir), transition.deferral.code);
         // Design 273 P3: pinned HERE, on the paused branch only, from the same
         // incoming section the record write beside it carries. `cleanupRefs` has
         // already dropped the staging namespace, so without this the imported
@@ -1055,6 +1057,7 @@ opts: {
         makeIntended: intendedFor,
         chainTimings,
         capabilityProbe: opts.capabilityProbe,
+        connectivityProof: opts.connectivityProof,
         crashAt: opts.crashAt,
         log: glog,
         forcedHeldRefs,

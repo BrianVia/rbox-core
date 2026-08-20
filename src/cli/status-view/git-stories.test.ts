@@ -10,7 +10,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import { GIT_DEFERRAL_REASONS, type GitDeferral, type RepoRecord } from "../sync-state-model.js";
-import { projectGitDeferralRepos, type GitDeferralDisplayEntry, type GitDeferralRepoProjection } from "./git-projection.js";
+import { projectGitDeferralRepos, rowNeedsYou, rowStuck, type GitDeferralDisplayEntry, type GitDeferralRepoProjection } from "./git-projection.js";
 import { BANNED_HUMAN_WORDS, detailProvesPostApplySettle, gitStoryFor } from "./git-stories.js";
 import {
   gitPauseCounts,
@@ -74,19 +74,33 @@ const PENDING: RepoRecord["pending"] = {
 };
 const withPending: RepoRecord = { repoGen: 1, sourceSeq: 1, pending: PENDING };
 
-const row = (over: Partial<GitDeferral> & { repo: string; ageMs: number }): GitDeferralDisplayEntry => {
+const row = (over: Partial<GitDeferral> & {
+  repo: string;
+  ageMs: number;
+  /** Cause age, when it differs from the episode age (a reason that flipped). */
+  reasonAgeMs?: number;
+  /** How long ago this cause was last re-observed. Default: the cause's own age
+   * (a row nobody has looked at since it appeared). */
+  lastSeenAgeMs?: number;
+}): GitDeferralDisplayEntry => {
   const since = new Date(NOW - over.ageMs).toISOString();
+  const reasonSince = new Date(NOW - (over.reasonAgeMs ?? over.ageMs)).toISOString();
   const deferral: GitDeferral = {
     lane: over.lane ?? "apply",
     reason: over.reason ?? "local-edits",
     deferredSince: since,
-    reasonSince: since,
-    lastSeen: since,
+    reasonSince,
+    lastSeen: new Date(NOW - (over.lastSeenAgeMs ?? over.reasonAgeMs ?? over.ageMs)).toISOString(),
   };
   if (over.detail !== undefined) deferral.detail = over.detail;
   if (over.bytesChanged !== undefined) deferral.bytesChanged = over.bytesChanged;
+  if (over.code !== undefined) deferral.code = over.code;
   return { repo: over.repo, deferral, record: withPending };
 };
+
+/** A repo actively re-observed on every pull — the FM shape: `lastSeen` fresh
+ * to the minute while the cause has stood for days. */
+const FRESHLY_SEEN = 60_000;
 
 test("an ownership hold is visible, never escalated, and never handed a command", () => {
   const [hold] = projectGitDeferralRepos([row({ repo: "a", ageMs: 5 * 86_400_000, reason: "worktree-ownership" })], NOW);
@@ -122,7 +136,7 @@ test("a deferral re-set every 60s for an hour stays visible to the support flow"
   // doctor, or a permanently-broken repo is permanently unreportable.
   const flapping = projectGitDeferralRepos([row({ repo: "flapper", ageMs: 30_000, reason: "local-edits" })], NOW);
   expect(flapping[0]!.quiet).toBe(true);
-  expect(gitPauseHeadline(gitPauseCounts(loudRows(flapping)))).toEqual([]);
+  expect(gitPauseHeadline(gitPauseCounts(loudRows(flapping), NOW))).toEqual([]);
   expect(renderGitPauseListing(flapping, { now: NOW }))
     .toEqual(["Nothing needs you — 1 repo paused in the last few minutes and usually sorts itself out."]);
   const summary = renderGitPauseSummary(flapping, NOW).join("\n");
@@ -211,7 +225,7 @@ function loadFieldState(file: string): GitDeferralDisplayEntry[] {
 
 const humanSurfaces = (rows: GitDeferralRepoProjection[], now: number): string =>
   [
-    ...gitPauseHeadline(gitPauseCounts(loudRows(rows))),
+    ...gitPauseHeadline(gitPauseCounts(loudRows(rows), NOW)),
     ...renderGitPauseListing(rows, { now, all: true }),
     ...renderGitPauseSummary(rows, now),
   ].join("\n");
@@ -228,7 +242,7 @@ for (const [file, expectedRepos] of [["2026-08-17-flat-meadow.jsonl", 52], ["202
 
     // The population invariant: headline == group sums == JSON record count.
     const visible = loudRows(rows);
-    const counts = gitPauseCounts(visible);
+    const counts = gitPauseCounts(visible, NOW);
     expect(counts.needsYou + counts.selfHealing).toBe(visible.length);
     const groups = groupByStory(visible, NOW);
     expect(groups.reduce((sum, group) => sum + group.rows.length, 0)).toBe(visible.length);
@@ -253,15 +267,20 @@ for (const [file, expectedRepos] of [["2026-08-17-flat-meadow.jsonl", 52], ["202
 
 test("field replay: the FM capture splits into needs-you and self-healing without losing a repo", () => {
   const rows = projectGitDeferralRepos(loadFieldState("2026-08-17-flat-meadow.jsonl"), NOW);
-  const counts = gitPauseCounts(loudRows(rows));
+  const counts = gitPauseCounts(loudRows(rows), NOW);
   expect(counts.total).toBe(52);
-  // 43 local-index + 2 local-edits + 2 unreadable need a person; the 5 artifact
-  // pauses download-retry on their own.
-  expect(counts.needsYou).toBe(47);
-  expect(counts.selfHealing).toBe(5);
+  // 43 local-index + 2 local-edits + 2 unreadable need a person. Design 280
+  // moves the 5 artifact pauses across too: every one of them has been telling
+  // the same self-healing story for days while still being re-observed every
+  // pull, which is the definition of "the retrying has gone on too long".
+  expect(counts.needsYou).toBe(52);
+  expect(counts.stuck).toBe(5);
+  expect(counts.selfHealing).toBe(0);
   const headline = gitPauseHeadline(counts).join("\n");
   expect(headline).toContain("47 repos are waiting on you");
-  expect(headline).toContain("5 more are sorting themselves out.");
+  expect(headline).toContain("5 repos have been stuck syncing for over a day");
+  // The protective claim is never made about the stuck five.
+  expect(headline.split("\n")[1]).not.toContain("nothing you did gets overwritten");
 });
 
 test("field replay: held ownership rows stay visible once P2 keeps their record", () => {
@@ -275,7 +294,7 @@ test("field replay: held ownership rows stay visible once P2 keeps their record"
     expect(projected.remediationClass).toBe("ownership-hold");
     expect(projected.quiet).toBe(false);
   }
-  expect(gitPauseCounts(loudRows(rows))).toEqual({ needsYou: 0, selfHealing: 3, total: 3 });
+  expect(gitPauseCounts(loudRows(rows), NOW)).toEqual({ needsYou: 0, selfHealing: 3, stuck: 0, total: 3 });
 });
 
 test("a self-healing group never also asks the reader to choose a side", () => {
@@ -369,7 +388,7 @@ test("an ownership hold beside an unreadable lane still needs a person", () => {
   expect(mixed!.resolvable).toBe(false);
   // The oldest lane still owns the age the reader sees.
   expect(mixed!.oldestDeferredSince).toBe(new Date(NOW - 5 * 86_400_000).toISOString());
-  expect(gitPauseCounts(loudRows([mixed!]))).toEqual({ needsYou: 1, selfHealing: 0, total: 1 });
+  expect(gitPauseCounts(loudRows([mixed!]), NOW)).toEqual({ needsYou: 1, selfHealing: 0, stuck: 0, total: 1 });
 });
 
 test("an ownership hold beside a config lane is not an ownership hold", () => {
@@ -405,7 +424,8 @@ test("a self-healing group escalates once it has been retrying for over a day", 
   expect(youngLines.join("\n").match(/on its own/g)).toHaveLength(1);
 
   const old = renderGitPauseListing(
-    projectGitDeferralRepos([row({ repo: "a", ageMs: 3 * 86_400_000, reason: "git-busy" })], NOW),
+    // Still being re-observed every pull: genuinely stuck, not a sleeping laptop.
+    projectGitDeferralRepos([row({ repo: "a", ageMs: 3 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "git-busy" })], NOW),
     { now: NOW },
   );
   expect(old).toContain("   rbox has been retrying these for over a day — that is longer than it should take.");
@@ -488,4 +508,204 @@ test("the dry-run surface keeps the same jargon bar as the listing", async () =>
     if (reason === "conflict" || reason === "other" || reason === "artifact") continue;
     expect(surface).not.toContain(reason);
   }
+});
+
+// ------------------------------------------------- design 280: stuck escalation
+
+const stuckArtifact = (repo: string, over: Partial<Parameters<typeof row>[0]> = {}) =>
+  row({ repo, ageMs: 3 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact", ...over });
+
+test("280 (e): the clock is the CURRENT cause, not the episode", () => {
+  // A month-old episode whose reason flipped to a download failure a minute ago
+  // is a one-minute-old download failure. `deferredSince` survives a reason
+  // change, so reading it here would escalate a brand-new cause.
+  const [flipped] = projectGitDeferralRepos([
+    row({ repo: "flipped", ageMs: 30 * 86_400_000, reasonAgeMs: 60_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact" }),
+  ], NOW);
+  expect(rowStuck(flipped!, NOW)).toBe(false);
+  expect(rowNeedsYou(flipped!, NOW)).toBe(false);
+
+  const [standing] = projectGitDeferralRepos([stuckArtifact("standing", { ageMs: 25 * 3600_000 })], NOW);
+  expect(rowStuck(standing!, NOW)).toBe(true);
+  expect(rowNeedsYou(standing!, NOW)).toBe(true);
+});
+
+test("280 (k): a computer that was asleep does not wake into an escalation", () => {
+  // The same-reason arm never restamps `reasonSince`, so age alone cannot tell
+  // "broken for three days" from "closed the laptop three days ago".
+  const [asleep] = projectGitDeferralRepos([
+    row({ repo: "asleep", ageMs: 3 * 86_400_000, reason: "artifact" }),
+  ], NOW);
+  expect(asleep!.lastSeen).toBe(new Date(NOW - 3 * 86_400_000).toISOString());
+  expect(rowStuck(asleep!, NOW)).toBe(false);
+
+  const [awake] = projectGitDeferralRepos([stuckArtifact("awake")], NOW);
+  expect(rowStuck(awake!, NOW)).toBe(true);
+});
+
+test("280: an unreadable or future timestamp is never evidence of age", () => {
+  const [undated] = projectGitDeferralRepos([{
+    repo: "undated",
+    deferral: { lane: "apply", reason: "artifact", deferredSince: "not-a-date", reasonSince: "not-a-date", lastSeen: "not-a-date" },
+    record: withPending,
+  }], NOW);
+  expect(rowStuck(undated!, NOW)).toBe(false);
+
+  const future = new Date(NOW + 5 * 86_400_000).toISOString();
+  const [ahead] = projectGitDeferralRepos([{
+    repo: "ahead",
+    deferral: { lane: "apply", reason: "artifact", deferredSince: future, reasonSince: future, lastSeen: future },
+    record: withPending,
+  }], NOW);
+  expect(rowStuck(ahead!, NOW)).toBe(false);
+});
+
+test("280 (f): a mixed-lane repo never escalates on another lane's age", () => {
+  // The ownership lane is the older one, so it is the displayed cause — and it
+  // can never be self-healing, whatever its age.
+  const [ownershipLed] = projectGitDeferralRepos([
+    row({ repo: "a", ageMs: 30 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "worktree-ownership" }),
+    row({ repo: "a", ageMs: 3 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact", lane: "capture" }),
+  ], NOW);
+  expect(ownershipLed!.story.code).toBe("branch-in-use-elsewhere");
+  expect(rowStuck(ownershipLed!, NOW)).toBe(false);
+  expect(rowNeedsYou(ownershipLed!, NOW)).toBe(false);
+
+  // With the artifact lane displayed, the clock is that lane's own — the 30-day
+  // ownership hold beside it contributes nothing.
+  const [artifactLed] = projectGitDeferralRepos([
+    row({ repo: "b", ageMs: 30 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact" }),
+    row({ repo: "b", ageMs: 60_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "worktree-ownership", lane: "capture" }),
+  ], NOW);
+  expect(artifactLed!.story.code).toBe("sync-download-failed");
+  expect(artifactLed!.reasonSince).toBe(new Date(NOW - 30 * 86_400_000).toISOString());
+  expect(rowStuck(artifactLed!, NOW)).toBe(true);
+});
+
+test("280 (i): ownership holds and quiet transients are still never escalated", () => {
+  const [hold] = projectGitDeferralRepos([
+    row({ repo: "hold", ageMs: 30 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "worktree-ownership" }),
+  ], NOW);
+  expect(rowStuck(hold!, NOW)).toBe(false);
+  expect(renderGitPauseListing([hold!], { now: NOW }).join("\n")).toContain("no command needed");
+
+  const [quiet] = projectGitDeferralRepos([row({ repo: "quiet", ageMs: 60_000, reason: "local-edits" })], NOW);
+  expect(quiet!.quiet).toBe(true);
+  expect(rowStuck(quiet!, NOW)).toBe(false);
+});
+
+test("280 (h): the stuck rows split out of their young siblings, and keep their own copy", () => {
+  const rows = projectGitDeferralRepos([
+    stuckArtifact("old-one"),
+    stuckArtifact("old-two"),
+    row({ repo: "young", ageMs: 3600_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact" }),
+  ], NOW);
+  const lines = renderGitPauseListing(rows, { now: NOW });
+  const text = lines.join("\n");
+  // Two groups of the same story: the stuck pair and the young remainder. The
+  // young repo must not be told rbox has been retrying IT for over a day.
+  expect(text).toContain("2 repos — rbox couldn't put the other computer's version in place here");
+  expect(text).toContain("1 repo — rbox couldn't put the other computer's version in place here");
+  expect(text).toContain("   rbox has been retrying these for over a day — that is longer than it should take.");
+  expect(text).toContain("   rbox is handling these on its own — nothing to do");
+  const young = text.slice(text.indexOf("   young"));
+  expect(young).not.toContain("longer than it should take");
+});
+
+test("280 (h): the headline never claims a stuck download was protecting your work", () => {
+  const rows = loudRows(projectGitDeferralRepos([stuckArtifact("a"), stuckArtifact("b")], NOW));
+  const counts = gitPauseCounts(rows, NOW);
+  expect(counts).toEqual({ needsYou: 2, selfHealing: 0, stuck: 2, total: 2 });
+  const headline = gitPauseHeadline({ ...counts, listed: true });
+  expect(headline).toEqual([
+    "⚠ 2 repos have been stuck syncing for over a day — rbox needs your help to get them moving.",
+  ]);
+  expect(headline.join("\n")).not.toContain("nothing you did gets overwritten");
+  for (const banned of BANNED_HUMAN_WORDS) expect(headline.join("\n").toLowerCase()).not.toContain(banned);
+});
+
+test("280 (h): a mixed population keeps both sentences, each true of its own half", () => {
+  const rows = loudRows(projectGitDeferralRepos([
+    stuckArtifact("stuck"),
+    row({ repo: "mine", ageMs: 2 * 86_400_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "local-edits" }),
+    row({ repo: "young", ageMs: 3600_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact" }),
+  ], NOW));
+  const counts = gitPauseCounts(rows, NOW);
+  expect(counts).toEqual({ needsYou: 2, selfHealing: 1, stuck: 1, total: 3 });
+  expect(gitPauseHeadline({ ...counts, listed: true })).toEqual([
+    "⚠ 1 repo is waiting on you — rbox paused git sync there so nothing you did gets overwritten.",
+    "⚠ 1 repo has been stuck syncing for over a day — rbox needs your help to get it moving. 1 more is sorting itself out.",
+  ]);
+});
+
+test("280: a stuck repo is never handed a resolve command, coded or not", () => {
+  // THE falsification pin. Design 280 proposed offering take-theirs to the
+  // connectivity sub-class; the rig ran it on 2026-08-20 and the repair failed:
+  // `stageIncoming` re-fetches only the incoming section's bundle/packChain
+  // window, so an object broken BELOW that window is never restored and the
+  // proof inside take-theirs' own transaction refuses (`operation-failed`). The
+  // offer is withdrawn — a stuck group says it is stuck and points at doctor,
+  // whatever its durable code or resolvability says.
+  const coded = projectGitDeferralRepos([stuckArtifact("a", { code: "connectivity-unproven" })], NOW);
+  expect(coded[0]!.code).toBe("connectivity-unproven");
+  expect(coded[0]!.resolvable).toBe(true);
+  const codedText = renderGitPauseListing(coded, { now: NOW }).join("\n");
+  expect(codedText).toContain("   rbox has been retrying these for over a day — that is longer than it should take.");
+  expect(codedText).toContain("Get a closer look:");
+  expect(codedText).not.toContain("rbox git resolve");
+
+  // The uncoded sub-classes read identically: the legacy row, and the
+  // fetch-failure producer that mints no code.
+  const uncoded = projectGitDeferralRepos([
+    stuckArtifact("b"),
+    stuckArtifact("c", { detail: "git artifact fetch/decrypt/import failed: bundle verify failed" }),
+  ], NOW);
+  expect(uncoded.every((r) => r.code === undefined)).toBe(true);
+  expect(renderGitPauseListing(uncoded, { now: NOW }).join("\n")).not.toContain("rbox git resolve");
+
+  // A young coded row is not stuck at all, so it keeps the self-healing copy.
+  const young = projectGitDeferralRepos([
+    row({ repo: "f", ageMs: 3600_000, lastSeenAgeMs: FRESHLY_SEEN, reason: "artifact", code: "connectivity-unproven" }),
+  ], NOW);
+  const youngText = renderGitPauseListing(young, { now: NOW }).join("\n");
+  expect(youngText).toContain("   rbox is handling these on its own — nothing to do");
+  expect(youngText).not.toContain("rbox git resolve");
+});
+
+test("280 (g): every surface agrees about one stuck repo", async () => {
+  const { projectAmbientDaemonStatus } = await import("../daemon/ambient-status.js");
+  const { renderShellDeferrals } = await import("../activity.js");
+  const { ageBucket } = await import("./text.js");
+
+  const deferral: GitDeferral = {
+    lane: "apply",
+    reason: "artifact",
+    deferredSince: new Date(NOW - 3 * 86_400_000).toISOString(),
+    reasonSince: new Date(NOW - 3 * 86_400_000).toISOString(),
+    lastSeen: new Date(NOW - FRESHLY_SEEN).toISOString(),
+    code: "connectivity-unproven",
+  };
+  const records = {
+    "acme/checkout": { repoGen: 1, sourceSeq: 1, pending: PENDING, deferrals: { apply: deferral } },
+  } satisfies Record<string, RepoRecord>;
+  const rows = projectGitDeferralRepos([{ repo: "acme/checkout", deferral, record: records["acme/checkout"] }], NOW);
+
+  // 1. the predicate itself
+  expect(rowNeedsYou(rows[0]!, NOW)).toBe(true);
+  // 2. the headline
+  expect(gitPauseCounts(loudRows(rows), NOW)).toEqual({ needsYou: 1, selfHealing: 0, stuck: 1, total: 1 });
+  // 3. doctor's summary block
+  expect(renderGitPauseSummary(rows, NOW).join("\n")).toContain("1 waiting on you");
+  // 4. the ambient sidecar RboxBar renders
+  const ambient = projectAmbientDaemonStatus({
+    activity: { at: new Date(NOW).toISOString() }, settled: true, now: NOW, repoRecords: records,
+  });
+  expect(ambient.deferredNeedsYou).toBe(1);
+  expect(ambient.deferredSelfHealing).toBe(0);
+  // 5. the shell prompt sidecar
+  const shell = renderShellDeferrals(
+    { stream: "s", stateNonce: "n", lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "", files: [] } },
+    NOW, ageBucket, records,
+  );
+  expect(shell).toContain("acme%2Fcheckout\tartifact");
 });
