@@ -1,5 +1,43 @@
 # rbox status — living state snapshot
 
+## 2026-08-20 (evening) — CI on Cloudflare runners (#797) + design-156 flake ROOT-CAUSED (#798); Mac rolled
+
+- **PR #797 MERGED: the 6 test shards run on `cloudflare-ubuntu-latest`**
+  (ephemeral Firecracker containers via the private GitHub App pool from
+  `biw/cloudflare-github-actions-runner`; setup wizard run by founder,
+  Worker `cloudflare-github-actions-runner.brian-via.workers.dev`, R2
+  dep cache). Motive: August month-to-date rbox-core burned 12,421
+  GitHub-hosted Linux minutes ($67.60); Cloudflare bills actual seconds
+  vs GitHub's per-job minute round-up. Stays on GitHub: docker rig (no
+  DinD in the image), arm lane (amd64-only), macOS, release.yml. Two
+  workflow shims, each with an upstream deletion condition
+  (biw/cloudflare-github-actions-runner#2): node20 symlink (image pruned
+  the runner's hashFiles() interpreter) and a user-space git 2.55
+  install (image ships stock noble git 2.43, below rbox's own ≥2.46
+  floor). Shard wall-time 117–201s on 2vCPU vs ~60–180s on GitHub's
+  4vCPU — acceptable; bump to a 4vCPU custom label if it grates.
+  **Value check owed ~1 week**: GitHub `settings/billing/usage` (needs
+  `gh auth refresh -s user`) Linux line should collapse; compare against
+  the new Cloudflare Containers charge; watch for queue stalls/OOMs
+  (8GiB vs 16GB).
+- **PR #798 MERGED: the design-156 quarantined flake is DEAD — root
+  cause umask.** The CF runner's strict umask made the only tolerated
+  flake in the design-123 registry fail deterministically (first time
+  ever): local write lands 0o600 under umask 077 while
+  FakeRemote.seedEntry hard-codes mode 0o644; `sameContent` counts mode
+  as identity, so pull correctly minted a conflict — the combined
+  assertion's 'conflict' channel. Verified BOTH directions on the
+  MacBook itself (umask 022 pass / 077 fail): the month of macOS-only
+  reds was codex-sandbox/nightly umask context. Skip deleted per its
+  own contract; product behavior untouched. Bonus:
+  `missingBlobsChunked` narrowed to `Pick<SyncRemote, "missingBlobs">`.
+- **Mac ROLLED to 3c78a055a** (supersedes the owed 7555c8a): read-write,
+  syncing normally, 280 headline copy live. Whole fleet now ≥7555c8a.
+- Playbook: CF-runner job debugging = push a temp `cf-debug` forensics
+  job (uname/statfs/clock-drift/umask + the failing test alone), delete
+  before merge. The runner VM clock ran ~14s fast; nothing depended on
+  it yet.
+
 ## 2026-08-20 (later) — design 280 SHIPPED + field-proven: stuck held repos escalate (#781/#792/#678 closed)
 
 - **PRs #795 + #796 MERGED, fleet on 7555c8a (desktop+FM; Mac
