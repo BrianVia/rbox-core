@@ -15,7 +15,7 @@
  * rather than asserted about one file.
  *
  */
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -42,7 +42,15 @@ import { StateFormatTooNewError } from "./errors.js";
 import { rboxResidue } from "./fault-rig.js";
 import { sqliteResetPaths, statePath } from "./paths.js";
 
+// Every row drives the real `~/.rbox` paths, so the whole file shares one
+// throwaway home. It is restored at the end: `bun test` gives the rest of the
+// shard this same process (#660).
+const homeBeforeSuite = process.env.RBOX_HOME;
 process.env.RBOX_HOME = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-u3-5c-compat-home-"));
+afterAll(() => {
+  if (homeBeforeSuite === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = homeBeforeSuite;
+});
 
 const configOf = (root: string): WorkspaceConfig => ({
   schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev",

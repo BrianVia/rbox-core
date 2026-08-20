@@ -18,7 +18,7 @@
  * byte-identical across the read. Sidecar reaping is timing-sensitive, so each
  * case runs `ROUNDS` times rather than once.
  */
-import { expect, spyOn, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -37,7 +37,15 @@ import { stableDbHash } from "../reset/artifacts.js";
 import { openStateStore, stateStoreDatabase } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
 
+// The consumers below resolve real `~/.rbox` paths, so the whole file shares
+// one throwaway home. It is restored at the end: `bun test` gives the rest of
+// the shard this same process (#660).
+const homeBeforeSuite = process.env.RBOX_HOME;
 process.env.RBOX_HOME = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-at-rest-home-"));
+afterAll(() => {
+  if (homeBeforeSuite === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = homeBeforeSuite;
+});
 
 const ROUNDS = 8;
 const configOf = (root: string): WorkspaceConfig => ({

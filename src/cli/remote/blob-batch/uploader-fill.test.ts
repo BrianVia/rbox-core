@@ -13,7 +13,7 @@ import { withPushLaneAccumulator } from "../../push-spans.js";
 
 const ENV_KEYS = [
   "RBOX_BATCH_FILL", "RBOX_BATCH_RECORDS", "RBOX_UPLOAD_SLOTS",
-  "RBOX_BATCH_BODY_BYTES", "RBOX_LANE_TIMING",
+  "RBOX_BATCH_BODY_BYTES", "RBOX_LANE_TIMING", "RBOX_BLOB_PACK",
 ] as const;
 const savedEnv = new Map<(typeof ENV_KEYS)[number], string | undefined>();
 const originalFetch = globalThis.fetch;
