@@ -36,14 +36,28 @@ export interface GitDivergenceStatus {
    *  nothing was indeterminate, and false as soon as one busy/unprobed repo (a
    *  transient "cannot prove it this instant") contributed. */
   pendingOnly: boolean;
-  /** Durable lane projection. Read-only and intentionally excludes opaque keys. */
+  /** Durable lane projection. Read-only and intentionally excludes opaque keys.
+   *
+   * It MUST carry every input the status projection's predicates read. This list
+   * is what the human headline and listing project from, while `--json` projects
+   * from the durable records directly — so a field missing here does not degrade
+   * one surface, it makes two surfaces disagree about the same repo. That is
+   * exactly how design 280 shipped a headline that contradicted the counts
+   * beside it: `lastSeen` was absent, so the stuck predicate's wake guard read
+   * undefined and every escalated row silently un-escalated itself (FM,
+   * 2026-08-20). Optional only because a record written by an older rbox may
+   * genuinely lack them; absent reads as unknown, which fails safe. */
   deferrals: Array<{
     relPath: string;
     lane: GitDeferral["lane"];
     reason: GitDeferral["reason"];
     deferredSince: string;
+    reasonSince?: string;
+    lastSeen?: string;
     bytesChanged?: boolean;
     detail?: string;
+    code?: GitDeferral["code"];
+    checkout?: GitDeferral["checkout"];
   }>;
   /** Repos whose config snapshot could not be stabilized/read. These count as
    * divergent and render as the explicit indeterminate `config: checking` state. */
@@ -101,8 +115,12 @@ export async function gitDivergenceStatus(
         reason: deferral.reason,
         deferredSince: deferral.deferredSince,
       };
+      if (deferral.reasonSince !== undefined) projected.reasonSince = deferral.reasonSince;
+      if (deferral.lastSeen !== undefined) projected.lastSeen = deferral.lastSeen;
       if (deferral.bytesChanged !== undefined) projected.bytesChanged = deferral.bytesChanged;
       if (deferral.detail !== undefined) projected.detail = deferral.detail;
+      if (deferral.code !== undefined) projected.code = deferral.code;
+      if (deferral.checkout !== undefined) projected.checkout = deferral.checkout;
       deferrals.push(projected);
     }
   }

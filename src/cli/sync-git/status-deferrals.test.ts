@@ -41,9 +41,14 @@ test("gitDivergenceStatus projects durable lanes read-only even when git sync is
     configChecking: [],
     configDisabled: [],
     conflictSnapshots: { total: 0, prunable: 0 },
+    // Design 280 field follow-up: the clocks travel WITH the row. The human
+    // headline projects from this list while `--json` projects from the durable
+    // records, so anything the predicates read has to be here or the two
+    // surfaces disagree about the same repo. `subjectKey` stays excluded — it is
+    // an opaque key, not a predicate input.
     deferrals: [
-      { relPath: "repo", lane: "apply", reason: "local-edits", deferredSince: since, bytesChanged: true },
-      { relPath: "repo", lane: "config", reason: "config", deferredSince: since },
+      { relPath: "repo", lane: "apply", reason: "local-edits", deferredSince: since, reasonSince: since, lastSeen: since, bytesChanged: true },
+      { relPath: "repo", lane: "config", reason: "config", deferredSince: since, reasonSince: since, lastSeen: since },
     ],
   });
 });
@@ -68,5 +73,7 @@ test("a curated deferral detail reaches the divergence projection verbatim", asy
     },
   };
   const status = await gitDivergenceStatus("/unused", { syncGit: false } as WorkspaceConfig, state);
-  expect(status.deferrals).toEqual([{ relPath: "repo", lane: "apply", reason: "artifact", deferredSince: since, detail }]);
+  expect(status.deferrals).toEqual([
+    { relPath: "repo", lane: "apply", reason: "artifact", deferredSince: since, reasonSince: since, lastSeen: since, detail },
+  ]);
 });
