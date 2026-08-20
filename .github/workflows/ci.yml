@@ -115,30 +115,6 @@ jobs:
           swift build -c release
           swift test
 
-  # TEMPORARY (pilot forensics, delete before merge): the design-156 quarantined
-  # test fails deterministically on Cloudflare runners only. Capture environment
-  # facts + the single test's full output on that exact machine.
-  cf-debug:
-    name: "cf-debug · quarantined-test forensics"
-    runs-on: cloudflare-ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-      - name: Environment forensics
-        run: |
-          uname -a
-          echo "fs: $(stat -f -c %T .) / tmp: $(stat -f -c %T /tmp)"
-          echo "date: $(date -u +%s.%N) github: $(curl -sI https://api.github.com | grep -i ^date)"
-          touch probe && stat -c "mtime precision: %y" probe
-          echo x > probe && stat -c "after write: %y (size %s)" probe
-          bun --version; git --version; nproc; free -m
-      - name: Run the quarantined test alone
-        run: |
-          bun install --frozen-lockfile
-          CI=1 bun test --timeout 15000 src/cli/sync/sync.test.ts -t "same-SHA size mismatch" || true
-          CI=1 bun test --timeout 15000 src/cli/sync/sync.test.ts 2>&1 | tail -5
-
   sqlite-contract-floor:
     name: "SQLite contract · Bun 1.4.0 floor"
     needs: changes
