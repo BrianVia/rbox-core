@@ -1,5 +1,52 @@
 # rbox status — living state snapshot
 
+## 2026-08-20 (later) — design 280 SHIPPED + field-proven: stuck held repos escalate (#781/#792/#678 closed)
+
+- **PRs #795 + #796 MERGED, fleet on 7555c8a (desktop+FM; Mac
+  off-network, roll owed)**. FM headline now reads the designed split:
+  "47 waiting on you" (protective sentence correctly scoped) + "**6
+  repos have been stuck syncing for over a day — rbox needs your
+  help**". The 4-day silent-spin era is over.
+- **Design 280 (4 review rounds + 2 delta-confirms, ALIGNED r3.1)**:
+  three-valued connectivity proof (transient exec failures no longer
+  branded connectivity-unproven — #792), durable typed deferral `code`
+  (#781's original ask, adopted on evidence), ONE actionability
+  predicate (self-healing ∧ reasonSince>24h ∧ lastSeen<6h) across every
+  surface. **Rig FALSIFIED the take-theirs remedy offer** (re-staging
+  only re-fetches the incoming window; below-window damage never
+  restores — clean refusal, no data movement) — offer withdrawn per the
+  design's pre-agreed arm, guarded by a red-provable pin; remedy copy
+  folds into #775. Rig: git-stuck-repair + FAST 9/9 green.
+- **Field acceptance caught what the matrix couldn't (#796)**: TWO lossy
+  row carriers (GitDivergenceStatus's 4-field lane projection feeding
+  the headline; ambient snapshot rows) dropped the predicate's inputs —
+  headline said 47+6-self-healing while counts/JSON said 53/6-stuck.
+  Both carriers now carry reasonSince/lastSeen; ambient deferral
+  contract decomposed to daemon/ambient-deferrals.ts (one owner, was
+  ~130 lines apart — how the drift happened).
+- **#794 MERGED**: 3 real cross-file env leakers fixed + the #678
+  preload guard (env+cwd drift fails the shard naming the keys). #660
+  re-scoped: original failure did NOT reproduce from state — residual
+  is load-timing; the guard makes recurrence self-diagnosing. #678
+  CLOSED.
+- **Codex confirm debts cleared**: #786 CONFIRMED no findings; #782
+  FINDINGS→#792 (fixed same day by 280 Slice A).
+- **b2 CLOSED with evidence** (zero field instances, detector proven in
+  binaries) but "last empty-sequence source" falsified → **#793** filed
+  (~40 empty ops=0 publishes/48h from permanent-carry post-pull
+  re-arms; desktop's carry is #702's field form).
+- **Drafts awaiting founder**: changelog 2.0 (scratchpad; flags the
+  fresh-start-vs-healing #774 discrepancy — checklist has the ruling
+  ask), RboxBar upgrade-management design (scratchpad; 2 pipeline
+  blockers found: app zip 404s via release route regex + zip outside
+  signed manifest; quarantine finding makes CLI install dialog-free).
+- **Process incident logged**: an agent's bare `git stash` in a shared
+  worktree popped a foreign stash (recovered, verified byte-identical;
+  rule: no bare git stash in shared worktrees).
+- Owed: Mac roll to 7555c8a when reachable; #664 founder ruling;
+  founder decision stack unchanged (#667, wire-renames, next-channel,
+  sharp-edge triage incl. #793).
+
 ## 2026-08-20 — 2.0 final run OPEN: 664 evidence complete, rig healed (#787/#788), 6 lanes fanned out
 
 - **Session renamed "2.0 release final run"** — founder driving toward the
