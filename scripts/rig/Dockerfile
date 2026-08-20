@@ -6,8 +6,8 @@
 FROM docker.io/library/ubuntu:24.04
 
 # Pin Bun so the image is reproducible + staleness-hashable. package.json declares
-# engines.bun ^1.3.14; this exact pin is also gated by bun-refwatch-contract.
-ARG BUN_VERSION=1.3.14
+# engines.bun ^1.4.0; this exact pin is also gated by bun-refwatch-contract.
+ARG BUN_VERSION=1.4.0
 
 # git >= 2.46 (transactional symref-update) is a product floor since design 118;
 # ubuntu 24.04 ships 2.43, so pull git from the git-core PPA like the fleet does.
