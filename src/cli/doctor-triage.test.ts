@@ -1058,3 +1058,69 @@ test("a git population that only sorts itself out is not counted as needing atte
   expect(text).toContain("1 thing needs your attention.");
   expect(text).toContain("1 sorting itself out");
 });
+
+// ------------------------------------------- design 280: stuck repos escalate
+
+/** The FM shape: a self-healing cause standing for days, re-observed every pull. */
+const stuckRow = (over: Partial<TriageInputs["deferrals"][number]> = {}) => deferral({
+  displayReason: "artifact",
+  reasonLabel: "Git artifact",
+  story: gitStoryFor("artifact"),
+  reasonSince: new Date(NOW - 3 * 86400_000).toISOString(),
+  oldestDeferredSince: new Date(NOW - 3 * 86400_000).toISOString(),
+  lastSeen: new Date(NOW - 60_000).toISOString(),
+  ...over,
+});
+
+test("280 (j): a stuck self-healing repo reaches blocked, past the two-term short-circuit", () => {
+  // Its story says rbox is handling it, so the `!needsYou || quiet` arm would
+  // have parked it at "info" forever — that is the defect design 280 closes.
+  const stuck = findingById(triageWorkspace(inputs({ deferrals: [stuckRow()] })).findings, "git-paused:savvy-core");
+  expect(stuck?.severity).toBe("blocked");
+  expect(stuck?.problem).toContain("waiting for over a day");
+
+  const young = findingById(
+    triageWorkspace(inputs({ deferrals: [stuckRow({
+      reasonSince: new Date(NOW - 60_000).toISOString(),
+      oldestDeferredSince: new Date(NOW - 60_000).toISOString(),
+    })] })).findings,
+    "git-paused:savvy-core",
+  );
+  expect(young?.severity).toBe("info");
+});
+
+test("280 (j): the stuck ladder reads reasonSince, so a corrupt episode date cannot demote it", () => {
+  // `oldestDeferredSince` is unreadable here. Reading it would bucket the row as
+  // "unknown" and quietly downgrade a genuinely stuck repo to attention.
+  const finding = findingById(
+    triageWorkspace(inputs({ deferrals: [stuckRow({ oldestDeferredSince: "not-a-date" })] })).findings,
+    "git-paused:savvy-core",
+  );
+  expect(finding?.severity).toBe("blocked");
+});
+
+test("280: a sleeping computer and an ownership hold are still never escalated", () => {
+  const asleep = findingById(
+    triageWorkspace(inputs({ deferrals: [stuckRow({ lastSeen: new Date(NOW - 3 * 86400_000).toISOString() })] })).findings,
+    "git-paused:savvy-core",
+  );
+  expect(asleep?.severity).toBe("info");
+
+  const hold = findingById(
+    triageWorkspace(inputs({ deferrals: [stuckRow({
+      displayReason: "worktree-ownership",
+      reasonLabel: "worktree ownership",
+      story: gitStoryFor("worktree-ownership"),
+      remediationClass: "ownership-hold",
+    })] })).findings,
+    "git-paused:savvy-core",
+  );
+  expect(hold?.severity).toBe("info");
+});
+
+test("280 (g): doctor's collapsed git block counts a stuck repo as needing you", () => {
+  const rows = [stuckRow()];
+  const rendered = renderWorkspaceTriage(triageWorkspace(inputs({ deferrals: rows })), rows, NOW).join("\n");
+  expect(rendered).toContain("1 thing needs your attention.");
+  expect(rendered).toContain("1 waiting on you");
+});

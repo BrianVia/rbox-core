@@ -1,6 +1,16 @@
 # 280 — Stuck held repos escalate: one actionability predicate on the honest clock
 
-Status: DRAFT r3. Review ledger: r1 → codex + opus parallel
+Status: SHIPPED r3.1, with one arm FALSIFIED IN THE RIG and withdrawn.
+The escalation predicate and the durable typed code shipped. The
+take-theirs resolve offer did NOT: `git-stuck-repair` round one ran on
+live devices 2026-08-20, take-theirs refused
+(`{status: refused, code: operation-failed}`) and the repo stayed
+broken, because `stageIncoming` re-fetches only the incoming section's
+bundle/packChain window and the damage sits below it (§2, §4). A stuck
+group now states the verdict and points at doctor; the remedy-copy
+question folds into #775.
+
+Review ledger: r1 → codex + opus parallel
 (CHANGES-REQUIRED, convergent). r2 → final serial opus review
 (CHANGES-REQUIRED: 3 blockers — git-busy landing contaminates doctor's
 healthy-set AND the stale-lock hygiene sweep would DELETE the deferral so
@@ -11,7 +21,9 @@ reviewer's `artifact` landing, and REVERSES the r2 ledger decision on
 #781's typed deferral: the FM capture shows the live rows persist no
 discriminator (the schema's `detail` exists but is unpopulated, and 278
 M0 forbids prose as the verdict carrier), so the typed code is the only
-sanctioned gate for the remedy offer — #781's original ask was right. FM captures 2026-08-20 (rows +
+sanctioned discriminator for the artifact class — #781's original ask
+was right (it was adopted as the gate for a remedy that the rig then
+falsified; the field it added is kept, the gate is gone). FM captures 2026-08-20 (rows +
 durable deferral records) pinned below.
 
 Issues: **#781**, **#792** (foundation), touches **#775** (scope boundary
@@ -114,9 +126,14 @@ into the deferral record: `setDeferral` gains an optional `code` carried
 from `TypedBlocker.code` when the deferring blocker has one — local
 durable state only (the telemetry contract's reason set is untouched;
 codec coverage updated). This IS #781's "typed structural deferral",
-adopted on evidence after r2 declined it. The resolve-offer gate (below)
-reads it; rows without a code (pre-existing deferrals, fetch-failure
-sub-class) simply get no resolve offer.
+adopted on evidence after r2 declined it.
+
+**Correction (2026-08-20)**: the paragraph above reasons that take-theirs
+"REPAIRS the connectivity sub-class (genuine re-fetch/import)". The rig
+disproved exactly that claim — see the withdrawn-offer section below. The
+code is still the sanctioned discriminator and still durable; what it no
+longer does is gate a remedy, because there is no remedy to gate. No
+surface acts on it.
 
 ### Primitive 2 (Slice B): ONE effective actionability predicate, on `reasonSince`
 
@@ -180,7 +197,47 @@ ingest rejects unknown fields — fleet-visible stuckness is a wire+ingest
 in. r1's claim is withdrawn. With that, "local presentation only, no
 kill switch, revert-is-the-switch" is true as stated.
 
-### The remedy is rbox's own command, not prose
+### The remedy is rbox's own command, not prose — **WITHDRAWN 2026-08-20 (rig falsification)**
+
+**The rig falsified this section. It is retained as the record of what was
+tried and why it is gone; nothing below it shipped.** `git-stuck-repair` round
+one ran on live devices on 2026-08-20. The connectivity-broken repo deferred
+exactly as designed (`artifact` + `connectivity-unproven`), and take-theirs
+did NOT repair it:
+
+```
+{status: refused, code: operation-failed,
+ message: "the Git resolution could not complete safely"}
+```
+
+after which the deferral row survived, the head stayed behind, and the
+convergence poll timed out at 120s.
+
+**Root cause, structural**: `stageIncoming` re-fetches only the incoming
+section's bundle and packChain window. An object broken BELOW that window is
+never re-supplied by it, so take-theirs' own checkout transaction runs the same
+planned-graph connectivity proof, reaches the same verdict, and correctly
+refuses. The repair theory — "re-staging re-fetches the objects this repo
+cannot reach" — is false for exactly the class the offer was gated to. The
+premise held for the wrong reason: re-staging does re-fetch, but only within a
+window that by construction excludes the damage.
+
+**Ruling (§2's own falsification arm, applied): the resolve offer is
+withdrawn.** A stuck self-healing group always renders the existing stuck copy
+plus the doctor pointer, whatever its durable code or resolvability says. rbox
+has no remedy for either `artifact` sub-class today, and a command that refuses
+is the dead end the 273 bar forbids. The durable `code` from Slice A is KEPT: it
+is the honest classification the fleet had no way to record before, it is what
+made this falsification legible in one run rather than a support thread, and it
+is the carrier for whatever remedy does land. No surface acts on it.
+
+The remaining question — what a stuck repo's copy should tell a person to DO
+when rbox cannot fix it — is a re-clone/journal-class remedy and folds into
+**#775**, which already owns that copy for the `repo-unreadable` family. This
+design does not invent one.
+
+<details>
+<summary>Withdrawn: the original offer design</summary>
 
 All six target rows are `apply-resolvable` today (§0). The stuck arm
 renders the EXISTING resolve block that `groupActionLines`
@@ -206,6 +263,8 @@ falsified the resolve offer is withdrawn and the design returns to
 review (hard gate — founder machines are never the first test of
 take-theirs, standing rule).
 
+</details>
+
 ## 3. What deliberately does not change
 
 Ownership holds (`branch-in-use-elsewhere`, instruction-action — can
@@ -229,10 +288,13 @@ escalating (the ruling in §2).
 
 Typed-code pins (the new durable field): (l) a defer whose blocker
 carries `connectivity-unproven` persists `code` and reads it back
-through the codec; (m) a legacy row without `code` ⇒ no resolve offer;
-(n) a fetch-failure defer (no typed code) ⇒ no resolve offer; (o) the
-offer renders exactly for stuck ∧ resolvable ∧ code ===
-"connectivity-unproven".
+through the codec. Pins (m) (n) (o) — the three that graded the resolve
+offer — are **RETIRED with the offer (2026-08-20)** and replaced by ONE
+falsification pin: a stuck, `apply-resolvable` row that DOES carry
+`code === "connectivity-unproven"` still renders no resolve command,
+only the stuck copy and the doctor pointer. Restoring the gate turns it
+red, which is verified; it is the guard that keeps a falsified remedy
+from creeping back in.
 
 Slice B pins: (e) reason-flip clock (30d episode, new reason 1m ⇒ not
 stuck; same reason 25h ⇒ stuck); (f) mixed-lane repo (ownership lane +
@@ -246,23 +308,30 @@ short-circuit (doctor-triage.ts:113) and feeds the existing ladder from
 reasonSince; (k) wake guard: reasonSince 3d old + lastSeen 3d stale ⇒
 NOT stuck; same row with lastSeen fresh ⇒ stuck (opus R10, resolved by
 the §2 lastSeen guard).
-Rig: BOTH §2 precondition scenarios — (i) connectivity repair via
-take-theirs clears the deferral, (ii) fetch-failure row gets no offer
-and a forced take-theirs refuses cleanly — plus the FAST suite.
+Rig (`git-stuck-repair`, RUN 2026-08-20): round (i) connectivity-broken
+repo — the pause classifies correctly, and take-theirs REFUSES
+(`{status: refused, code: operation-failed, "the Git resolution could
+not complete safely"}`), the deferral survives, the head stays behind.
+That is the falsification recorded in §2; the scenario's expectations
+now pin that refusal as the product promise (clean refusal, no conflict
+ref, only quarantine litter, workspace intact). Round (ii)
+fetch-failure repo — unchanged and consistent: no offer, clean refusal.
+Plus the FAST suite.
 Field: FM acceptance graded ONLY on the artifact class — 6 repos flip
-the headline and doctor shows blocked; the resolve command appears only
-after a row re-defers under the new build and mints its durable code
-(the 6 live rows carry none today, and any fetch-failure row never
-will); one rig-validated take-theirs on a founder-approved repo clears
-one of them end-to-end.
+the headline and doctor shows blocked. NO resolve command is expected on
+any of them, before or after they re-defer under the new build: the
+offer is withdrawn, and the durable code is recorded for classification
+only. Acceptance is therefore the escalation itself — those six stop
+reading "nothing needs you" — not a repair.
 
 ## 5. Requirement-challenge ledger
 
 | Requirement | Cost | Alternative | Decision |
 |---|---|---|---|
-| #781's "typed structural deferral" | a durable optional `code` on the local deferral record | r2 declined it; the r3 FM capture proved no discriminator exists and the remedy gate needs one | **ADOPTED in r3** (Slice A stamps TypedBlocker.code; local-only, telemetry reason-set untouched) |
+| #781's "typed structural deferral" | a durable optional `code` on the local deferral record | r2 declined it; the r3 FM capture proved no discriminator exists and the remedy gate needs one | **ADOPTED in r3** (Slice A stamps TypedBlocker.code; local-only, telemetry reason-set untouched). KEPT after the 2026-08-20 falsification took away the gate it was adopted for: it is the only durable discriminator between the two `artifact` sub-classes, it is what made that falsification legible in one rig run, and it carries whatever remedy #775 lands. No surface acts on it today; owner: the deferral-writing sites. Deletion condition: a remedy or support flow that reads it never materialises. |
 | Journal-specific re-clone copy for pegasus/savvy-core | a new reason code or persisted detail on a 6-reason shared story | #775 owns the journal class; copy stays generic-but-true | deferred to #775, founder visibility |
+| Remedy copy for a STUCK repo rbox cannot fix ("what do I do about it") | a re-clone/repair instruction rbox can honestly stand behind for a below-window object break | the withdrawn take-theirs offer; a prose repair table (failed the 273 bar in r1) | **folded into #775** after the 2026-08-20 falsification — same journal/re-clone remedy question, same owner. Until then a stuck group states the verdict and points at doctor. |
 | Fleet-visible stuck telemetry | client wire + strict ingest + schema + rbox-admin surface | local-only (this design) | founder decision, not blocking 2.0 |
 | Kill switch | flag + owner + deletion condition | local presentation only; revert-is-the-switch | no flag |
-| Auto-repair | mutating user repos on inference | resolve-command offer (rig-validated) | rejected — state-surgery bar |
-| errno-audit of git children (EACCES/EIO inside repo reads as unproven) | parsing git stderr taxonomies | named limitation, bounded by floor + resolve-shaped remedy | accepted, documented |
+| Auto-repair | mutating user repos on inference | resolve-command offer | rejected — state-surgery bar. The offer that replaced it was itself **withdrawn on 2026-08-20** when the rig proved take-theirs cannot repair a below-window object break (§2). Both alternatives are now closed: rbox states the verdict and offers nothing it cannot perform. |
+| errno-audit of git children (EACCES/EIO inside repo reads as unproven) | parsing git stderr taxonomies | named limitation, bounded by the hourly floor and the escalation that now surfaces a persistent one | accepted, documented |

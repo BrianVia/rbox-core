@@ -94,7 +94,7 @@ function gitDeferralReasonPrecedence(reason: string): number {
 export interface GitDeferralDisplayEntry {
   repo: string;
   deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">
-    & Partial<Pick<GitDeferral, "reasonSince" | "detail">>;
+    & Partial<Pick<GitDeferral, "reasonSince" | "lastSeen" | "detail" | "code">>;
   record?: RepoRecord;
 }
 
@@ -146,6 +146,53 @@ export interface GitDeferralRepoProjection {
   checkout?: GitDeferral["checkout"];
   /** The displayed lane's curated detail, verbatim. Never a composed string. */
   detail?: string;
+  /** The displayed lane's last re-observation. The stuck predicate's wake guard
+   * reads it; absence (a record written before design 280) reads as unknown. */
+  lastSeen?: string;
+  /** The displayed lane's durable typed code (design 280). The ONE thing that
+   * distinguishes the two `artifact` sub-classes. No surface acts on it: the
+   * repair it was going to gate was falsified in the rig (2026-08-20 — see
+   * `selfHealingLines`), so it is carried as honest classification for support
+   * reads and for whatever remedy #775's journal work lands. */
+  code?: GitDeferral["code"];
+}
+
+/**
+ * Design 280: rbox promised in the story table that a self-healing pause
+ * "escalates when the retrying has gone on too long". This is that promise, in
+ * one predicate every surface reads.
+ *
+ * The clock is `reasonSince`, not `deferredSince`: `deferredSince` survives a
+ * reason change, so a month-old episode that became a download failure this
+ * morning must not read as a month-old download failure. The guard is
+ * `lastSeen`: the same-reason arm never restamps `reasonSince`, so a laptop
+ * asleep for three days would otherwise wake straight into escalation. A row
+ * escalates only while its cause is still being actively re-observed.
+ *
+ * Unparseable or future timestamps are never evidence of age — they read as NOT
+ * stuck.
+ */
+export const STUCK_SELF_HEALING_MS = 24 * 60 * 60_000;
+export const STUCK_WAKE_GUARD_MS = 6 * 60 * 60_000;
+
+const elapsedSince = (iso: string | undefined, now: number): number | undefined => {
+  if (iso === undefined) return undefined;
+  const at = Date.parse(iso);
+  return Number.isFinite(at) && at <= now ? now - at : undefined;
+};
+
+export function rowStuck(row: GitDeferralRepoProjection, now: number): boolean {
+  if (row.story.action.kind !== "self-healing") return false;
+  const causeAge = elapsedSince(row.reasonSince, now);
+  const sinceSeen = elapsedSince(row.lastSeen, now);
+  return causeAge !== undefined && causeAge > STUCK_SELF_HEALING_MS
+    && sinceSeen !== undefined && sinceSeen < STUCK_WAKE_GUARD_MS;
+}
+
+/** THE actionability predicate. A story that asks for a decision needs you; so
+ * does one that promised to sort itself out and then did not. */
+export function rowNeedsYou(row: GitDeferralRepoProjection, now: number): boolean {
+  return row.story.needsYou || rowStuck(row, now);
 }
 
 const parsedDeferralTime = (iso: string, now: number): number => {
@@ -239,6 +286,11 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
     if (additional.length) row.alsoDeferred = `Also deferred: ${additional.join("; ")}.`;
     if (checkout !== undefined) row.checkout = checkout;
     if (display.detail !== undefined) row.detail = display.detail;
+    // Both read from the DISPLAYED lane, exactly like `reasonSince` and
+    // `detail`: the row speaks for one cause, and its clock, its curated text
+    // and its typed code must all describe that same cause.
+    if (display.lastSeen !== undefined) row.lastSeen = display.lastSeen;
+    if (display.code !== undefined) row.code = display.code;
     projected.push(row);
   }
   return projected.sort((a, b) =>
