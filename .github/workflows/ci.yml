@@ -196,6 +196,17 @@ jobs:
         with:
           node-version: 24
 
+      # The Cloudflare runner image prunes the runner's bundled node20, but the
+      # runner still spawns it to evaluate hashFiles() in step templates.
+      # Point node20 at the image's node24 until upstream restores it.
+      - name: Restore pruned node20 external (Cloudflare runner image)
+        if: needs.changes.outputs.run_ci == 'true'
+        run: |
+          ext=/home/runner/actions-runner/externals
+          if [ -d "$ext/node24" ] && [ ! -e "$ext/node20" ]; then
+            ln -s node24 "$ext/node20"
+          fi
+
       # Cache Bun's global package store (setup-bun caches only the bun binary),
       # keyed on the lockfile hash + --frozen-lockfile so versions come solely from
       # bun.lock (sha512-integrity-verified).
