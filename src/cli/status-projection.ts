@@ -328,8 +328,13 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
           reason: d.reason,
           deferredSince: d.deferredSince,
         };
+        // Same carrier, same law: every predicate input travels with the row.
+        if (d.reasonSince !== undefined) projected.reasonSince = d.reasonSince;
+        if (d.lastSeen !== undefined) projected.lastSeen = d.lastSeen;
         if (d.bytesChanged !== undefined) projected.bytesChanged = d.bytesChanged;
         if (d.detail !== undefined) projected.detail = d.detail;
+        if (d.code !== undefined) projected.code = d.code;
+        if (d.checkout !== undefined) projected.checkout = d.checkout;
         return projected;
       }),
       conflictSnapshots,

@@ -709,3 +709,122 @@ test("280 (g): every surface agrees about one stuck repo", async () => {
   );
   expect(shell).toContain("acme%2Fcheckout\tartifact");
 });
+
+// ------------------- design 280 field follow-up: carrier round-trips
+
+/**
+ * FM, 2026-08-20, after the fleet rolled 280: `git deferrals --json` and the
+ * daemon's ambient COUNTS both said 6 stuck, while `rbox status --git` printed
+ * the pre-280 split and gave those repos "rbox is handling these on its own".
+ *
+ * The predicate was never the problem — its INPUTS were. The human headline
+ * projects from a narrowed row carrier that dropped `reasonSince`/`lastSeen`,
+ * so `rowStuck`'s wake guard read undefined and the row silently un-stuck
+ * itself. The original consistency matrix could not catch it: it built display
+ * rows directly, with every field present, so it never crossed a carrier.
+ *
+ * One predicate means one set of inputs. Any row list a surface projects from
+ * must carry them, so these assert the counts AGREE after a real round trip.
+ */
+const stuckDeferral: GitDeferral = {
+  lane: "apply",
+  reason: "artifact",
+  deferredSince: new Date(NOW - 3 * 86_400_000).toISOString(),
+  reasonSince: new Date(NOW - 3 * 86_400_000).toISOString(),
+  lastSeen: new Date(NOW - FRESHLY_SEEN).toISOString(),
+  code: "connectivity-unproven",
+};
+
+test("280 field follow-up: the divergence carrier round-trips the predicate's inputs", async () => {
+  const { gitDivergenceStatus } = await import("../sync-git/status.js");
+  const os = await import("node:os");
+  const fsp = await import("node:fs/promises");
+
+  const record: RepoRecord = { repoGen: 1, sourceSeq: 1, pending: PENDING, deferrals: { apply: stuckDeferral } };
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-280-carrier-"));
+  try {
+    const state = {
+      stream: "s", stateNonce: "n".repeat(32), lastSyncedSequence: 1,
+      lastSyncedManifest: { generatedAt: "", files: [] },
+      repoRecords: { "acme/checkout": record },
+    } as never;
+    const cfg = {
+      remoteWorkspaceId: "ws", projectId: "root", deviceId: "d",
+      rootPath: root, remoteUrl: "https://example.invalid", token: "", syncGit: true,
+    } as never;
+
+    // What the durable record says — the one truth every surface must reproduce.
+    const truth = gitPauseCounts(
+      loudRows(projectGitDeferralRepos([{ repo: "acme/checkout", deferral: stuckDeferral, record }], NOW)),
+      NOW,
+    );
+    expect(truth.stuck).toBe(1);
+    expect(truth.needsYou).toBe(1);
+
+    // The carrier the human headline and listing actually project from
+    // (status-projection.ts feeds `counts.gitDeferrals` straight into it).
+    const divergence = await gitDivergenceStatus(root, cfg, state, undefined, [], true, {});
+    const viaCarrier = gitPauseCounts(
+      loudRows(projectGitDeferralRepos(
+        divergence.deferrals.map((row) => ({ repo: row.relPath, deferral: row, record })),
+        NOW,
+      )),
+      NOW,
+    );
+    expect(viaCarrier).toEqual(truth);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("280 field follow-up: ambient rows survive their own serialize/parse round trip", async () => {
+  const { projectAmbientDaemonStatus, readAmbientDaemonStatusRecord } = await import("../daemon/ambient-status.js");
+  const { daemonStatusPath, daemonRuntimeDir } = await import("../rbox-paths.js");
+  const os = await import("node:os");
+  const fsp = await import("node:fs/promises");
+  const record: RepoRecord = { repoGen: 1, sourceSeq: 1, pending: PENDING, deferrals: { apply: stuckDeferral } };
+  const repoRecords = { "acme/checkout": record };
+
+  const truth = gitPauseCounts(
+    loudRows(projectGitDeferralRepos([{ repo: "acme/checkout", deferral: stuckDeferral, record }], NOW)),
+    NOW,
+  );
+
+  const ambient = projectAmbientDaemonStatus({
+    activity: { at: new Date(NOW).toISOString() }, settled: true, now: NOW, repoRecords,
+  });
+  // The daemon computes with full records, so its COUNTS were always right.
+  expect(ambient.deferredNeedsYou).toBe(truth.needsYou);
+  expect(ambient.deferredSelfHealing).toBe(truth.selfHealing);
+
+  // `code` is deliberately NOT published: nothing reads it, so its absence
+  // cannot make a reader disagree. Only the predicate's own inputs must travel.
+  // The rows it publishes beside those counts must be able to reproduce them —
+  // through the REAL on-disk reader, which drops any field it does not know.
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-280-ambient-"));
+  await fsp.mkdir(daemonRuntimeDir(root), { recursive: true });
+  await fsp.writeFile(daemonStatusPath(root), JSON.stringify(ambient));
+  const record0 = readAmbientDaemonStatusRecord(root);
+  await fsp.rm(root, { recursive: true, force: true });
+  expect(record0.kind).toBe("ok");
+  const rows = record0.kind === "ok" ? record0.status.deferrals ?? [] : [];
+  expect(rows).toHaveLength(1);
+  const viaAmbient = gitPauseCounts(
+    loudRows(projectGitDeferralRepos(
+      rows.map((row) => ({
+        repo: row.repo,
+        deferral: {
+          lane: "apply" as const,
+          reason: row.reason,
+          deferredSince: row.deferredSince,
+          reasonSince: row.reasonSince,
+          ...(row.lastSeen === undefined ? {} : { lastSeen: row.lastSeen }),
+        },
+        record,
+      })),
+      NOW,
+    )),
+    NOW,
+  );
+  expect(viaAmbient).toEqual(truth);
+});
