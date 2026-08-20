@@ -135,7 +135,9 @@ jobs:
   test:
     name: ${{ matrix.name }}
     needs: changes
-    runs-on: ubuntu-latest
+    # CF-runner pilot (2 vCPU / 8 GiB, per-second billing). Revert to
+    # ubuntu-latest if a shard OOMs or queue time blocks merges.
+    runs-on: cloudflare-ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -193,6 +195,32 @@ jobs:
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind != 'src'
         with:
           node-version: 24
+
+      # The Cloudflare runner image prunes the runner's bundled node20, but the
+      # runner still spawns it to evaluate hashFiles() in step templates.
+      # Point node20 at the image's node24 until upstream restores it.
+      - name: Restore pruned node20 external (Cloudflare runner image)
+        if: needs.changes.outputs.run_ci == 'true'
+        run: |
+          ext=/home/runner/actions-runner/externals
+          if [ -d "$ext/node24" ] && [ ! -e "$ext/node20" ]; then
+            ln -s node24 "$ext/node20"
+          fi
+
+      # The Cloudflare runner image ships Ubuntu 24.04's stock git 2.43, below
+      # rbox's checkout-transaction floor of git >= 2.46 (doctor-cmd.ts). The
+      # image has no sudo, so extract the git-core PPA build into the home dir.
+      - name: Upgrade git past the 2.46 floor (Cloudflare runner image)
+        if: needs.changes.outputs.run_ci == 'true'
+        run: |
+          case "$(git version)" in "git version 2.4"[0-5].*) ;; *) exit 0 ;; esac
+          deb=git_2.55.0-0ppa1~ubuntu24.04.2_amd64.deb
+          curl -fsSLO "http://ppa.launchpad.net/git-core/ppa/ubuntu/pool/main/g/git/$deb"
+          echo "6238a37c11c1bd4b18a5194f766ccfcb2f26c116e7d8ecd07bac143863b69498  $deb" | sha256sum -c
+          dpkg -x "$deb" "$HOME/git-2.55" && rm "$deb"
+          echo "$HOME/git-2.55/usr/bin" >> "$GITHUB_PATH"
+          { echo "GIT_EXEC_PATH=$HOME/git-2.55/usr/lib/git-core"
+            echo "GIT_TEMPLATE_DIR=$HOME/git-2.55/usr/share/git-core/templates"; } >> "$GITHUB_ENV"
 
       # Cache Bun's global package store (setup-bun caches only the bun binary),
       # keyed on the lockfile hash + --frozen-lockfile so versions come solely from
