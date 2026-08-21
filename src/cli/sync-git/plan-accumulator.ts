@@ -1,10 +1,9 @@
 /** Never: probe/capture Git, retain/upload artifacts, authorize branch absence, or persist state. */
 import path from "node:path";
-import { isDeepStrictEqual } from "node:util";
-import type { GitSection } from "../../engine/index.js";
+import { gitSectionsDiffer, type GitSection } from "../../engine/index.js";
 import type { GitDeferralReason, SyncState } from "../config.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { repoRecordsForState } from "../config.js";
+import { repoRecordsForState, validManifestMeta } from "../config.js";
 import { emptyToUndef } from "./shared.js";
 import { sanitizeGitSectionForPersistence } from "./config-sync.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
@@ -29,6 +28,11 @@ export type GitPlanDeferred = { relPath: string; reason: string; typedReason?: G
 
 const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
   Object.fromEntries(Object.entries(sections ?? {}).map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
+
+/** The git layer of the manifest the remote actually holds, verbatim — the exact bytes
+ *  the delta encoder diffs against. `undefined` when no admissible meta is persisted. */
+const wireBaseGitSections = (state: SyncState): Record<string, GitSection> | undefined =>
+  validManifestMeta(state.manifestMeta)?.gitRepos;
 
 const captureReason = (reason: string): GitDeferralReason => {
   if (/ref-read-unreadable/i.test(reason)) return "ref-read-unreadable";
@@ -268,13 +272,20 @@ export class GitPlanAccumulator {
     }
   }
 
-  plan(): GitPushPlan {
-    const records = repoRecordsForState(this.state);
-    const outgoing = this.finalizedOutgoing ?? this.normalizeOutgoing();
+  /** Pre-MDE fallback for {@link wireBaseGitSections}: approximate the remote's git
+   *  layer from local records when no admissible manifest meta exists (older or
+   *  foreign state, pre-first-commit, MDE master kill). BASE lags for a pending repo
+   *  (see gitBaseAfterCommit) and advertised is only this host's own last ACK, so the
+   *  approximation drifts on any section adopted from a peer — issue #793. Delete this
+   *  path once a valid meta is an invariant of loaded state. */
+  private reconstructedWireBase(records: ReturnType<typeof repoRecordsForState>) {
     const previous = { ...this.base } satisfies Record<string, GitSection>;
     for (const [relPath, record] of Object.entries(records)) {
       if (!record.advertised) continue;
       const expected = sanitizeGitSectionForPersistence(record.advertised);
+      // A cfgSynced baseline over config-absent BASE is the pull lane's durable witness
+      // that an invalid-present field was sanitized: comparing a safe carry against this
+      // publisher's older config-present ACK would author the corrective echo it suppresses.
       if (this.base[relPath]?.config === undefined && record.cfgSynced !== undefined && expected.config !== undefined) {
         const withoutConfig = { ...expected };
         delete withoutConfig.config;
@@ -283,12 +294,17 @@ export class GitPlanAccumulator {
         previous[relPath] = expected;
       }
     }
-    Object.assign(previous, this.durablePending);
+    Object.assign(previous, this.durablePending); // PENDING has final precedence (design 178 §D).
+    return previous;
+  }
+
+  plan(): GitPushPlan {
+    const records = repoRecordsForState(this.state);
+    const outgoing = this.finalizedOutgoing ?? this.normalizeOutgoing();
+    const previous = wireBaseGitSections(this.state) ?? this.reconstructedWireBase(records);
     const authoredCount = Object.keys(this.authoredCfgHashByRepo).length;
     const flagArmed = this.supersededPending.size > 0 || this.resolvedPending.size > 0 || authoredCount > 0;
-    const sectionsDiffer = [...new Set([...Object.keys(outgoing), ...Object.keys(previous)])].some((rel) =>
-      !outgoing[rel] || !previous[rel]
-      || (outgoing[rel] !== previous[rel] && !isDeepStrictEqual(outgoing[rel], previous[rel])));
+    const sectionsDiffer = gitSectionsDiffer(outgoing, previous);
     if (flagArmed && !sectionsDiffer) {
       this.glog(`git-sync plan: no section change; armed by superseded=${this.supersededPending.size} resolved=${this.resolvedPending.size} authoredCfg=${authoredCount}`);
     }

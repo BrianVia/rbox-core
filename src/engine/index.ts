@@ -26,6 +26,7 @@ export {
   canonicalManifestHashStreaming,
   encodeSnapshotEnvelope,
   diffToOps,
+  gitSectionsDiffer,
   encodeDeltaEnvelope,
   decodeEnvelope,
   hasEnvelopePrefix,
