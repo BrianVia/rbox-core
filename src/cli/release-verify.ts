@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fromB64url, utf8, verify } from "../engine/e2ee/index.js";
+import { jsonObject, jsonText, type JsonValue } from "../json.js";
 import { RELEASE_KEYS } from "./release-key.js";
 
 const DOMAIN = "rbox-release/v1\n"; // signature domain separator
@@ -23,6 +24,25 @@ export function releaseSigningInput(manifestBytes: Uint8Array): Uint8Array {
   return new Uint8Array([...utf8(DOMAIN), ...manifestBytes]);
 }
 
+/** Parse a signature-verified manifest body into its domain type. The signer
+ *  never shape-checks what it signs, so a mis-signed or buggy release must fail
+ *  here rather than surface as `undefined` deep inside the upgrade path. */
+export function parseReleaseManifest(value: JsonValue, tampered = "refusing to upgrade (possible tampered update channel)"): Manifest {
+  if (!jsonObject(value) || !jsonText(value.version) || !jsonText(value.keyId) || !jsonObject(value.artifacts)) {
+    throw new Error(`release manifest is malformed — ${tampered}`);
+  }
+  const artifacts: Record<string, Artifact> = {};
+  for (const [name, artifact] of Object.entries(value.artifacts)) {
+    if (!jsonObject(artifact) || !jsonText(artifact.sha256) || !jsonText(artifact.path)) {
+      throw new Error(`release manifest artifact ${name} is malformed — ${tampered}`);
+    }
+    artifacts[name] = { sha256: artifact.sha256, path: artifact.path };
+  }
+  const manifest: Manifest = { version: value.version, keyId: value.keyId, artifacts };
+  if (jsonText(value.releasedAt)) manifest.releasedAt = value.releasedAt;
+  return manifest;
+}
+
 /**
  * Verify the detached signature over the RAW manifest bytes against the embedded
  * keyring, then parse. Throws on unknown key id or bad signature — the ONLY way to
@@ -31,14 +51,15 @@ export function releaseSigningInput(manifestBytes: Uint8Array): Uint8Array {
  */
 export function verifyAndParseManifest(manifestBytes: Uint8Array, sigBytes: Uint8Array): Manifest {
   const tampered = "refusing to upgrade (possible tampered update channel)";
-  let manifest: Manifest;
+  let body: JsonValue;
   try {
-    manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Manifest;
+    body = JSON.parse(new TextDecoder().decode(manifestBytes)) as JsonValue;
   } catch {
     throw new Error(`release manifest is not valid JSON — ${tampered}`);
   }
-  const key = RELEASE_KEYS.find((k) => k.keyId === manifest.keyId);
-  if (!key) throw new Error(`release manifest names an unknown signing key (${manifest.keyId}) — refusing`);
+  const keyId = jsonObject(body) && jsonText(body.keyId) ? body.keyId : undefined;
+  const key = RELEASE_KEYS.find((k) => k.keyId === keyId);
+  if (!key) throw new Error(`release manifest names an unknown signing key (${String(keyId)}) — refusing`);
   // A tampered channel may serve a malformed (non-b64url) signature; treat any
   // decode/verify failure as the same security refusal rather than leaking a
   // low-level "invalid characters" decode error to the user.
@@ -49,7 +70,7 @@ export function verifyAndParseManifest(manifestBytes: Uint8Array, sigBytes: Uint
     ok = false;
   }
   if (!ok) throw new Error(`release signature did not verify — ${tampered}`);
-  return manifest;
+  return parseReleaseManifest(body, tampered);
 }
 
 /**

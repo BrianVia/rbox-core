@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RELEASE_KEYS } from "./release-key.js";
-import { verifyReleaseArtifacts, type Manifest } from "./release-verify.js";
+import { parseReleaseManifest, verifyReleaseArtifacts, type Manifest } from "./release-verify.js";
 
 // verifyReleaseArtifacts is the SINGLE gate BOTH publish paths go through — the single-shot
 // `release.ts` upload and the split `--upload-only` both call uploadRelease() → this. So
@@ -71,4 +71,37 @@ test("refuses a TAMPERED / malformed manifest (not valid JSON)", () => {
   } finally {
     cleanup(d);
   }
+});
+
+// A signature proves the bytes came from CI, not that CI produced a well-formed
+// manifest. `parseReleaseManifest` is the shape gate behind that signature, so a
+// buggy publisher fails here instead of surfacing as `undefined` mid-upgrade. It
+// is tested directly: minting a valid signature needs the CI-only private key.
+test("manifest parser accepts a well-formed manifest and keeps optional releasedAt", () => {
+  const parsed = parseReleaseManifest(JSON.parse(manifestJson({ releasedAt: "2026-08-20T00:00:00.000Z" })));
+  expect(parsed).toEqual({
+    version: VER,
+    keyId: KNOWN_KEY,
+    artifacts: { "rbox-linux-x64": { sha256: "ab".repeat(32), path: `v${VER}/rbox-linux-x64` } },
+    releasedAt: "2026-08-20T00:00:00.000Z",
+  });
+});
+
+test.each([
+  ["a non-object body", 7],
+  ["a missing version", { keyId: KNOWN_KEY, artifacts: {} }],
+  ["a non-string version", { version: 2, keyId: KNOWN_KEY, artifacts: {} }],
+  ["a missing keyId", { version: VER, artifacts: {} }],
+  ["non-object artifacts", { version: VER, keyId: KNOWN_KEY, artifacts: "none" }],
+])("manifest parser refuses %s", (_label, body) => {
+  expect(() => parseReleaseManifest(body as never)).toThrow(/malformed/);
+});
+
+test.each([
+  ["a non-object artifact", "binary"],
+  ["a missing sha256", { path: `v${VER}/rbox-linux-x64` }],
+  ["a non-string path", { sha256: "ab".repeat(32), path: 3 }],
+])("manifest parser refuses an artifact with %s", (_label, artifact) => {
+  expect(() => parseReleaseManifest({ version: VER, keyId: KNOWN_KEY, artifacts: { "rbox-linux-x64": artifact } } as never))
+    .toThrow(/artifact rbox-linux-x64 is malformed/);
 });
