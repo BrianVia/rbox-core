@@ -24,7 +24,7 @@ import {
 } from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
-import { parseFlags, unknownFlagError } from "./flags.js";
+import { extraPositionalError, parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { refreshSystemLockIdentityLedger } from "../engine/lockfile.js";
 import { expandUserPath } from "./directory-picker.js";
@@ -243,6 +243,11 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       fail(err);
       return;
     }
+    const positionalError = extraPositionalError(cmd, positional);
+    if (positionalError) {
+      fail(positionalError);
+      return;
+    }
   }
 
   // Bare `rbox` (cmd === undefined) is excluded too: in a tracked dir it renders the
@@ -265,7 +270,6 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "adopt": {
-      if (positional.length > 2) throw new Error("usage: rbox adopt <status|resume|abort|clean> [path] [--json] [--yes]");
       const { adoptCmd } = await import("./adopt-cmd.js");
       await adoptCmd(positional[0], positional[1] ?? process.cwd(), { json: jsonMode, yes: flags.yes === "true" });
       break;
@@ -346,7 +350,6 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "pair": {
-      if (positional.length !== 0) throw new Error("usage: rbox pair");
       const { pairCreate } = await (deps.authCommandImport ?? (() => import("./auth-cmd.js")))();
       await pairCreate();
       break;
@@ -448,10 +451,6 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "status": {
-      if (positional.length > 1) {
-        fail("usage: rbox status [path] [--all] [--json | --verbose | --git]");
-        break;
-      }
       const presentations = [flags.json, flags.verbose, flags.git].filter((value) => value === "true").length;
       if (presentations > 1) {
         fail("choose only one status presentation flag: --json, --verbose, or --git");
@@ -594,7 +593,6 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     case "connect": {
       // The canonical onboarding path accepts the short-lived, single-use token
       // in argv for one-shot setup. Bare `connect` retains masked prompt/stdin.
-      if (positional.length > 1) throw new Error("usage: rbox connect [<pairing-token>] [--remote <url>]");
       const { readPairingTokenInteractive, redeemPair } = await (deps.authCommandImport ?? (() => import("./auth-cmd.js")))();
       const token = positional[0] ?? await readPairingTokenInteractive();
       if (!token) throw new Error("no pairing token provided (run `rbox pair` on a signed-in machine, then run the displayed `rbox connect <pairing-token>` command here)");

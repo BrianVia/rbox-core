@@ -17,6 +17,15 @@ import {
 const firstWord = (s: string) => s.split(" ")[0]!;
 const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));
 
+test("every command declares enough positional capacity for its sub-verb tokens", () => {
+  for (const entry of COMMAND_HELP) {
+    expect(entry.positionals, `${entry.name} must declare positional capacity`).toBeDefined();
+    if (entry.positionals !== "variadic") {
+      expect(entry.positionals, entry.name).toBeGreaterThanOrEqual(entry.name.split(" ").length - 1);
+    }
+  }
+});
+
 test("per-command help: leaf lookup returns exactly that command", () => {
   const track = helpFor("track");
   expect(track).toHaveLength(1);

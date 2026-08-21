@@ -22,6 +22,11 @@ interface FlagSyntax {
   repeatable: boolean;
 }
 
+interface ParsedFlags {
+  positional: string[];
+  flags: Record<string, string>;
+}
+
 function flagName(flag: CommandFlag): string | undefined {
   const token = flag.flag.split(/\s+/, 1)[0];
   return token?.startsWith("--") ? token.slice(2) : undefined;
@@ -88,7 +93,7 @@ function longFlagSyntaxFor(cmd: string | undefined): Map<string, FlagSyntax> {
   return syntax;
 }
 
-export function parseFlags(args: string[], cmd?: string): { positional: string[]; flags: Record<string, string> } {
+export function parseFlags(args: string[], cmd?: string): ParsedFlags {
   const longFlagSyntax = longFlagSyntaxFor(cmd);
   const positional: string[] = [];
   const flags: Record<string, string> = {};
@@ -129,4 +134,22 @@ export function unknownFlagError(cmd: string, positional: string[], flags: Recor
   }
   const key = Object.keys(flags).find((candidate) => !allowed.has(candidate));
   return key ? `unknown flag --${key} for \`rbox ${cmd}\` — run \`rbox ${cmd} --help\` to see its flags` : undefined;
+}
+
+/**
+ * Surplus-positional gate (#515). `rbox export ~/code/myapp` used to exit 0
+ * having exported the CWD workspace: the argument parsed, and no handler read
+ * it. Capacity is DECLARED per registry entry, not read out of the usage prose.
+ */
+export function extraPositionalError(cmd: string, positional: string[]): string | undefined {
+  const key = helpKeyFor(cmd, positional);
+  const entries = helpFor(key);
+  if (!entries) return undefined;
+  let allowed = 0;
+  for (const entry of entries) {
+    if (entry.positionals === "variadic") return undefined;
+    allowed = Math.max(allowed, entry.positionals);
+  }
+  if (positional.length <= allowed) return undefined;
+  return `unexpected argument "${positional[allowed]}" for \`rbox ${key}\` — usage: ${entries[0]!.usage}`;
 }
