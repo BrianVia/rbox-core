@@ -73,7 +73,7 @@ export const GIT_SHAPE_REFUSALS = Object.freeze({
 });
 
 /** Shared exact public/log surfaces used by more than one cell assertion. */
-export const GIT_SHAPE_SURFACES = Object.freeze({
+export const GIT_LAYOUT_SURFACES = Object.freeze({
   applied: (rel: string) => `git-sync applied ${rel}`,
   followed: (rel: string) => `git-sync followed ${rel}`,
   unsupportedCapability: (gitVersion: string, rel: string) => `needs Git >= 2.46 transactional symref-update; found ${gitVersion} on checkout unavailable (${rel})`,

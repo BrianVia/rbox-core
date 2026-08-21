@@ -140,6 +140,7 @@ test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras",
 
 test("values JSON cannot produce, and unbounded nesting, are refused", () => {
   const arena = new EntryArena();
+  expect(new EntryStructureError("extras", "invalid").name).toBe("EntryStructureError");
   for (const value of [() => 1, Symbol("x"), 1n]) {
     expect(() => arena.internExact(entryWithExtras(value))).toThrow(EntryStructureError);
   }
