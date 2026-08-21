@@ -91,6 +91,14 @@ tagged checkout's `CHANGELOG.md` to `releases/changelog.md` and triggers the
 `releases/next/manifest.json.sig` after the shared immutable upload. It never
 reads or mutates the stable channel, changelog, or deploy hook.
 
+The universal RboxBar zip is another signed manifest artifact published through
+`scripts/release.ts`. Every channel publishes its immutable
+`releases/v<version>/RboxBar-<version>.zip`; stable also updates
+`releases/RboxBar.zip`, while prerelease deliberately leaves that stable alias
+untouched. On macOS, `rbox upgrade` installs or updates RboxBar by default in the
+existing system Applications location or the user's Applications directory.
+Set `RBOX_NO_MENUBAR_APP=1` to skip menu-bar app management.
+
 The API exposes the changelog at `https://api.rbox.to/changelog.md`; Astro
 renders it at `https://rbox.to/changelog/` during the stable rebuild. CLI
 releases remain tag-driven and are unaffected by the branch promotion model.

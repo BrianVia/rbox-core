@@ -14,6 +14,9 @@ All notable changes to rbox are recorded here. The format follows
   start, retry, or abandon.
 
 ### Added
+- `rbox upgrade` now installs and updates the rbox Bar macOS menu-bar app from
+  the same signed release manifest as the CLI, with `RBOX_NO_MENUBAR_APP=1` as
+  an opt-out.
 - `rbox status` now counts the conflict copies rbox saved for you and still
   sitting in the workspace, so they are visible without hunting for
   `*.conflict*` files by hand. The count is also in `rbox status --json` as

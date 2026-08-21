@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { Manifest } from "../src/cli/release-verify.js";
 import {
+  addAppArtifact,
   checkedInRboxVersion,
   deriveDevVersion,
   isWranglerMissingDiagnostic,
@@ -14,6 +15,8 @@ import {
   workflowPublishesChangelog,
   withTemporaryVersionFile,
 } from "./release.js";
+import { RELEASE_KEYS } from "../src/cli/release-key.js";
+import { releaseSigningInput, verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { semverGt } from "../src/cli/semver.js";
 import type { ReleaseObjectStore } from "./release-publish.js";
 
@@ -109,6 +112,53 @@ test("next installer uses the next manifest and its signed immutable artifact pa
   expect(fs.readFileSync(new URL("./install.sh", import.meta.url), "utf8")).toBe(stable);
 });
 
+test("app input appends exactly one bound artifact after unchanged binary entries", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-release-app-"));
+  dirs.push(dir);
+  const dist = path.join(dir, "dist");
+  fs.mkdirSync(dist);
+  const app = path.join(dir, "RboxBar-2.0.0.zip");
+  fs.writeFileSync(app, "app zip");
+  const artifacts: Manifest["artifacts"] = {
+    "rbox-darwin-arm64": { sha256: "a".repeat(64), path: "v2.0.0/rbox-darwin-arm64" },
+    "rbox-linux-arm64": { sha256: "b".repeat(64), path: "v2.0.0/rbox-linux-arm64" },
+    "rbox-linux-x64": { sha256: "c".repeat(64), path: "v2.0.0/rbox-linux-x64" },
+  };
+  const before = JSON.stringify(artifacts);
+  addAppArtifact(app, dist, "2.0.0", artifacts);
+  expect(Object.keys(artifacts)).toEqual(["rbox-darwin-arm64", "rbox-linux-arm64", "rbox-linux-x64", "RboxBar.zip"]);
+  expect(JSON.stringify(Object.fromEntries(Object.entries(artifacts).slice(0, 3)))).toBe(before);
+  expect(artifacts["RboxBar.zip"]).toEqual({
+    sha256: createHash("sha256").update("app zip").digest("hex"),
+    path: "v2.0.0/RboxBar-2.0.0.zip",
+  });
+  expect(fs.readFileSync(path.join(dist, "RboxBar.zip"), "utf8")).toBe("app zip");
+});
+
+test("release verification gates a missing or sha-mismatched app zip", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-release-app-verify-"));
+  dirs.push(dir);
+  const app = Buffer.from("signed app zip");
+  const manifest: Manifest = {
+    version: "2.0.0",
+    keyId: "test-app-key",
+    artifacts: { "RboxBar.zip": { sha256: createHash("sha256").update(app).digest("hex"), path: "v2.0.0/RboxBar-2.0.0.zip" } },
+  };
+  const keys = generateKeyPairSync("ed25519");
+  const publicKey = keys.publicKey.export({ format: "jwk" }) as { x: string };
+  RELEASE_KEYS.push({ keyId: manifest.keyId, pubKey: publicKey.x });
+  const bytes = Buffer.from(JSON.stringify(manifest));
+  fs.writeFileSync(path.join(dir, "version.json"), bytes);
+  fs.writeFileSync(path.join(dir, "version.json.sig"), sign(null, releaseSigningInput(bytes), keys.privateKey).toString("base64url"));
+  try {
+    expect(() => verifyReleaseArtifacts(dir, manifest.version)).toThrow("RboxBar.zip has no binary");
+    fs.writeFileSync(path.join(dir, "RboxBar.zip"), "wrong bytes");
+    expect(() => verifyReleaseArtifacts(dir, manifest.version)).toThrow("RboxBar.zip sha");
+  } finally {
+    RELEASE_KEYS.pop();
+  }
+});
+
 test("stable and next installers persist their effective channel beside the installed binary", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-channel-install-"));
   dirs.push(dir);
@@ -182,6 +232,10 @@ const prereleaseManifest: Manifest = {
       path: "v2.0.0-beta.1/rbox-linux-x64",
       sha256: "a".repeat(64),
     },
+    "RboxBar.zip": {
+      path: "v2.0.0-beta.1/RboxBar-2.0.0-beta.1.zip",
+      sha256: "a".repeat(64),
+    },
   },
 };
 
@@ -225,10 +279,12 @@ test("prerelease publish reads and writes only next mutable state plus shared im
   expect(reads).toEqual(["releases/next/manifest.json", "releases/next/manifest.json"]);
   expect(writes.map(({ key }) => key)).toEqual([
     "releases/v2.0.0-beta.1/rbox-linux-x64",
+    "releases/v2.0.0-beta.1/RboxBar-2.0.0-beta.1.zip",
     "releases/next/install.sh",
     "releases/next/manifest.json",
     "releases/next/manifest.json.sig",
   ]);
+  expect(writes.map(({ key }) => key)).not.toContain("releases/RboxBar.zip");
   expect(writes.find(({ key }) => key === "releases/next/install.sh")!.file).toBe(path.join(f.dist, "install-next.sh"));
   expect(reads).not.toContain("releases/version.json");
 });

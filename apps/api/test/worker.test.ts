@@ -881,8 +881,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // A shape-VALID alg:none token (three nonempty segments) passes shape parsing
     // and must be rejected by the semantic RS256 pin at clerk.ts:80.
     const none = await signJwt(claims({ sub: "u_none_sig" }), { alg: "none" });
-    const shapeValid = `${none}Zm9yZ2Vk`; // append a nonempty base64url signature
-    expect((await webExchange(shapeValid)).status).toBe(401);
+    const forgedToken = `${none}Zm9yZ2Vk`; // append a nonempty base64url signature
+    expect((await webExchange(forgedToken)).status).toBe(401);
   });
 
   test("wrong issuer → 401", async () => {
@@ -2273,6 +2273,8 @@ describe("release distribution (design 14)", () => {
     await env.rbox_releases.put("releases/rbox-darwin-arm64", "LATEST-DARWIN");
     await env.rbox_releases.put("releases/v0.0.2/rbox-linux-x64", "VERSIONED-BIN");
     await env.rbox_releases.put("releases/v1.2.3/rbox-darwin-arm64", "VERSIONED-DARWIN");
+    await env.rbox_releases.put("releases/RboxBar.zip", "LATEST-APP");
+    await env.rbox_releases.put("releases/v1.2.3/RboxBar-1.2.3.zip", "VERSIONED-APP");
   });
 
   // The SELF test above covers the real ctx.exports loopback; these gateway-unit tests
@@ -2363,6 +2365,33 @@ describe("release distribution (design 14)", () => {
     expect(await latest.text()).toBe("LATEST-DARWIN");
   });
 
+  test("RboxBar aliases and version-bound artifacts have zip headers and correct caching", async () => {
+    const latest = await releaseGateway("/bin/RboxBar.zip");
+    expect(latest.status).toBe(200);
+    expect(latest.headers.get("content-type")).toBe("application/zip");
+    expect(latest.headers.get("content-disposition")).toContain('filename="RboxBar.zip"');
+    expect(latest.headers.get("cache-control")).toBe("public, max-age=300");
+
+    const versioned = await releaseGateway("/bin/v1.2.3/RboxBar-1.2.3.zip");
+    expect(versioned.status).toBe(200);
+    expect(versioned.headers.get("content-type")).toBe("application/zip");
+    expect(versioned.headers.get("content-disposition")).toContain('filename="RboxBar.zip"');
+    expect(versioned.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+  });
+
+  test("RboxBar paths reject mismatched, misplaced, and unknown names", async () => {
+    for (const bad of [
+      "/bin/v1.2.3/RboxBar-9.9.9.zip",
+      "/bin/v1.2.3/RboxBar.zip",
+      "/bin/RboxBar-1.2.3.zip",
+      "/bin/Evil.zip",
+    ]) {
+      const res = await releaseGateway(bad);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
+  });
+
   test("rejects bad name / bad version / path traversal; 404s are no-store", async () => {
     for (const bad of ["/bin/evil", "/bin/v0.0.2/evil", "/bin/notaversion/rbox-linux-x64", "/bin/rbox-windows-x64"]) {
       const r = await releaseGateway(bad);
@@ -2411,6 +2440,8 @@ describe("routeTemplate privacy masking", () => {
     [`/v1/admin/account/acct_11223344/plan`, "/v1/admin/account/:id/plan"],
     [`/v1/keys/workspace/ws_zzz999`, "/v1/keys/workspace/:ws"],
     [`/bin/v0.1.2/rbox-darwin-arm64`, "/bin/:ver/:bin"],
+    [`/bin/v1.2.3/RboxBar-1.2.3.zip`, "/bin/:ver/:app"],
+    ["/bin/RboxBar.zip", "/bin/:app"],
     ["/changelog.md", "/changelog.md"],
     ["/health", "/health"], // static vocabulary is untouched
     // A project literally NAMED after a vocab word must still be masked (the project

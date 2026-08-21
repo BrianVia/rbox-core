@@ -79,7 +79,10 @@ export default {
     const cors = corsHeaders(req, env);
     // CORS preflight: the browser dashboard sends OPTIONS before any cross-origin
     // authed request (Authorization/content-type headers make it non-simple).
-    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...cors, "cache-control": "no-store" } });
+    if (req.method === "OPTIONS") {
+      cors.set("cache-control", "no-store");
+      return new Response(null, { status: 204, headers: cors });
+    }
     // Wrap env's D1 for the whole request (via op.env) so pre-DO work (authz,
     // account-epoch lookups in route()) is timed + counted into the `request` row.
     // Per-op handlers (blobs.ts) wrap again → their row counts their own D1; the
@@ -120,11 +123,11 @@ export default {
     if (res.status === 101 || res.webSocket) return res;
     // Echo CORS headers on the real response (incl. errors) and default-deny
     // cacheability for non-release responses (design 70).
-    const needsCors = Boolean(cors["Access-Control-Allow-Origin"]);
+    const needsCors = cors.has("Access-Control-Allow-Origin");
     const needsCacheControl = !res.headers.has("cache-control");
     if (needsCors || needsCacheControl) {
       const h = new Headers(res.headers);
-      if (needsCors) for (const [k, v] of Object.entries(cors)) h.set(k, v);
+      if (needsCors) for (const [k, v] of cors) h.set(k, v);
       if (needsCacheControl) h.set("cache-control", "no-store");
       res = new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
     }
@@ -445,6 +448,7 @@ export function routeTemplate(pathname: string): string {
     // Release distribution (public, non-sensitive but variable): version + binary.
     if (/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(s)) return ":ver";
     if (/^rbox-(darwin|linux)-(arm64|x64)$/.test(s)) return ":bin";
+    if (/^RboxBar(-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)?\.zip$/.test(s)) return ":app";
     if (/^\d+$/.test(s)) return ":n";
     if (/^[0-9a-f]{64}$/.test(s)) return ":sha";
     // Unknown ⇒ dynamic/user-influenced. Label by position for readable dashboards,
@@ -527,33 +531,33 @@ function apiKeyAllowed(method: string, seg: string[]): boolean {
  * Auth is via Bearer token, not cookies, so Allow-Credentials is intentionally
  * omitted.
  */
-function corsHeaders(req: Request, env: Env): Record<string, string> {
+function corsHeaders(req: Request, env: Env) {
   const origin = req.headers.get("Origin");
-  if (!origin) return {};
+  if (!origin) return new Headers();
   // The admin cockpit SPA (admin.rbox.to) calls /v1/admin/* cross-origin and relies
   // on the Cloudflare Access SSO cookie, so it needs credentialed CORS. It's a
   // SEPARATE allowlist from the Clerk dashboard origins and is the only origin granted
   // Allow-Credentials.
   const adminOrigin = env.ADMIN_ALLOWED_ORIGIN?.trim();
   if (adminOrigin && origin === adminOrigin) {
-    return {
+    return new Headers({
       "Access-Control-Allow-Origin": origin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "authorization, content-type",
       "Access-Control-Allow-Credentials": "true",
       "Access-Control-Max-Age": "86400",
       Vary: "Origin",
-    };
+    });
   }
   const allowed = (env.CLERK_ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (!allowed.includes(origin)) return {};
-  return {
+  if (!allowed.includes(origin)) return new Headers();
+  return new Headers({
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "authorization, content-type",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
-  };
+  });
 }
 
 const jsonResponse = json; // worker uses jsonResponse; shared impl is util.json

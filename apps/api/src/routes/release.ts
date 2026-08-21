@@ -6,12 +6,15 @@ import { ipKey, rateLimited } from "../ratelimit.js";
 // edge — design 14 U7).
 const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const SHELL_HEADERS = { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300, stale-while-revalidate=3600" };
-const MANIFEST_KEYS: Readonly<Record<string, string>> = {
-  "/version": "releases/version.json",
-  "/version.sig": "releases/version.json.sig",
-  "/next/version": "releases/next/manifest.json",
-  "/next/version.sig": "releases/next/manifest.json.sig",
-};
+function manifestKey(pathname: string): string | undefined {
+  switch (pathname) {
+    case "/version": return "releases/version.json";
+    case "/version.sig": return "releases/version.json.sig";
+    case "/next/version": return "releases/next/manifest.json";
+    case "/next/version.sig": return "releases/next/manifest.json.sig";
+    default: return undefined;
+  }
+}
 const AGENT_SH = `#!/bin/sh
 set -eu
 
@@ -56,11 +59,11 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
   // verifies the signature against an embedded key before trusting it). Keep the
   // manifest JSON shape aligned with scripts/release.ts; install.sh greps the
   // artifact sha256 from that compact field layout before installing.
-  const manifestKey = MANIFEST_KEYS[url.pathname];
-  if (manifestKey && req.method === "GET") {
+  const releaseManifestKey = manifestKey(url.pathname);
+  if (releaseManifestKey && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
-    const obj = await env.rbox_releases.get(manifestKey);
+    const obj = await env.rbox_releases.get(releaseManifestKey);
     if (!obj) return releaseNotFound();
     const type = url.pathname.endsWith("version") ? "application/json" : "text/plain; charset=utf-8";
     return new Response(obj.body, { headers: { "content-type": type, "cache-control": "no-cache" } });
@@ -103,12 +106,17 @@ export async function cachedReleaseResponse(url: URL, env: Env): Promise<Respons
     const versioned = seg.length === 3;
     const ver = versioned ? seg[1]! : null;
     const name = versioned ? seg[2]! : seg[1]!;
-    if (!/^rbox-(darwin|linux)-(arm64|x64)$/.test(name)) return releaseNotFound();
     if (versioned && !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(ver!)) return releaseNotFound();
+    const resolved = /^rbox-(darwin|linux)-(arm64|x64)$/.test(name)
+      ? { contentType: "application/octet-stream", filename: "rbox" }
+      : name === (versioned ? `RboxBar-${ver!.slice(1)}.zip` : "RboxBar.zip")
+        ? { contentType: "application/zip", filename: "RboxBar.zip" }
+        : null;
+    if (!resolved) return releaseNotFound();
     const obj = await env.rbox_releases.get(versioned ? `releases/${ver}/${name}` : `releases/${name}`);
     if (!obj) return releaseNotFound();
     const cacheControl = versioned ? "public, max-age=31536000, immutable" : "public, max-age=300";
-    return new Response(obj.body, { headers: { "content-type": "application/octet-stream", "content-disposition": `attachment; filename="rbox"`, "cache-control": cacheControl } });
+    return new Response(obj.body, { headers: { "content-type": resolved.contentType, "content-disposition": `attachment; filename="${resolved.filename}"`, "cache-control": cacheControl } });
   }
 
   return releaseNotFound();
