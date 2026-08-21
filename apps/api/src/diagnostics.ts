@@ -15,7 +15,9 @@ export const DIAGNOSTICS_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PENDING_RETENTION_MS = 60 * 60 * 1000;
 const SWEEP_LIMIT = 200;
 
-const TOP_KEYS = ["version", "platform", "bunVersion", "checks", "daemonLogTail", "metrics", "activity", "workspaceShape"] as const;
+const TOP_KEYS_COMMON = ["version", "platform", "bunVersion", "checks", "daemonLogTail", "metrics", "activity", "leftoverWorktrees", "repoResidue"] as const;
+const WORKSPACE_SIZE_KEYS_ACCEPTED = ["workspaceSize", "workspaceShape"] as const;
+const TOP_KEYS = [...TOP_KEYS_COMMON, ...WORKSPACE_SIZE_KEYS_ACCEPTED] as const;
 const REQUIRED_CHECK_KEYS = ["credentials", "enrollment", "daemon", "remote", "version", "state"] as const;
 const OPTIONAL_CHECK_KEYS = ["device", "crypto", "locking", "git", "chain"] as const;
 const CHECK_KEYS = [...REQUIRED_CHECK_KEYS, ...OPTIONAL_CHECK_KEYS] as const;
@@ -24,6 +26,10 @@ const PLATFORM_KEYS = ["os", "arch"] as const;
 const METRICS_KEYS = ["syncs", "commitConflicts409", "fileConflicts", "lockStarved", "lastConflictAt", "excluded", "truncated", "originalBytes"] as const;
 const ACTIVITY_KEYS = ["at", "lastPush", "lastPull", "active", "halt", "excluded", "truncated", "originalBytes"] as const;
 const WORKSPACE_SIZE_KEYS = ["fileCount", "totalBytes"] as const;
+const LEFTOVER_WORKTREES_KEYS = ["count", "entries"] as const;
+const LEFTOVER_WORKTREE_ENTRY_KEYS = ["branch", "prunable", "holdsSyncedRef"] as const;
+const REPO_RESIDUE_KEYS = ["count", "gitPresent", "rboxPresent", "identity", "quarantinePresent"] as const;
+const REPO_RESIDUE_IDENTITY_KEYS = ["match", "mismatch", "unknown"] as const;
 
 type ValidationResult<T> = { ok: true; value: T } | { ok: false; message: string };
 
@@ -62,6 +68,15 @@ export interface DiagnosticsActivity {
   originalBytes?: number;
 }
 export interface DiagnosticsWorkspaceSize { fileCount: number; totalBytes: number }
+export interface DiagnosticsLeftoverWorktreeEntry { branch?: string; prunable: boolean; holdsSyncedRef: boolean }
+export interface DiagnosticsLeftoverWorktreeSection { count: number; entries: DiagnosticsLeftoverWorktreeEntry[] }
+export interface DiagnosticsRepoResidueSection {
+  count: number;
+  gitPresent: number;
+  rboxPresent: number;
+  identity: { match: number; mismatch: number; unknown: number };
+  quarantinePresent: number;
+}
 export interface DiagnosticsBundle {
   version: string;
   platform: DiagnosticsPlatform;
@@ -70,7 +85,9 @@ export interface DiagnosticsBundle {
   daemonLogTail: string | DiagnosticsExcluded;
   metrics: DiagnosticsMetrics | DiagnosticsExcluded;
   activity: DiagnosticsActivity | DiagnosticsExcluded;
-  workspaceShape: DiagnosticsWorkspaceSize;
+  workspaceSize: DiagnosticsWorkspaceSize;
+  leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
+  repoResidue: DiagnosticsRepoResidueSection;
 }
 
 export interface DiagnosticsDeps {
@@ -297,21 +314,72 @@ function validateDaemonLogTail(v: JsonValue): ValidationResult<string | Diagnost
   return { ok: false, message: "daemonLogTail must be a string or excluded object" };
 }
 
-function validateWorkspaceSize(v: JsonValue): ValidationResult<DiagnosticsWorkspaceSize> {
-  if (!objectWithKeys(v, WORKSPACE_SIZE_KEYS, WORKSPACE_SIZE_KEYS)) return { ok: false, message: "workspaceShape must be an object" };
-  const unknown = assertOnlyKeys(v, WORKSPACE_SIZE_KEYS, "workspaceShape") ?? requireKeys(v, WORKSPACE_SIZE_KEYS, "workspaceShape");
+function validateWorkspaceSize(v: JsonValue, name: (typeof WORKSPACE_SIZE_KEYS_ACCEPTED)[number]): ValidationResult<DiagnosticsWorkspaceSize> {
+  if (!objectWithKeys(v, WORKSPACE_SIZE_KEYS, WORKSPACE_SIZE_KEYS)) return { ok: false, message: `${name} must be an object` };
+  const unknown = assertOnlyKeys(v, WORKSPACE_SIZE_KEYS, name) ?? requireKeys(v, WORKSPACE_SIZE_KEYS, name);
   if (unknown) return { ok: false, message: unknown };
-  const fileCount = safeNumber(v.fileCount, "workspaceShape.fileCount");
+  const fileCount = safeNumber(v.fileCount, `${name}.fileCount`);
   if (!fileCount.ok) return fileCount;
-  const totalBytes = safeNumber(v.totalBytes, "workspaceShape.totalBytes");
+  const totalBytes = safeNumber(v.totalBytes, `${name}.totalBytes`);
   if (!totalBytes.ok) return totalBytes;
   return { ok: true, value: { fileCount: fileCount.value, totalBytes: totalBytes.value } };
 }
 
+function validateLeftoverWorktrees(v: JsonValue): ValidationResult<DiagnosticsLeftoverWorktreeSection> {
+  const name = "leftoverWorktrees";
+  if (!objectWithKeys(v, LEFTOVER_WORKTREES_KEYS, LEFTOVER_WORKTREES_KEYS)) return { ok: false, message: `${name} must be an object` };
+  const unknown = assertOnlyKeys(v, LEFTOVER_WORKTREES_KEYS, name) ?? requireKeys(v, LEFTOVER_WORKTREES_KEYS, name);
+  if (unknown) return { ok: false, message: unknown };
+  const count = safeNumber(v.count, `${name}.count`);
+  if (!count.ok) return count;
+  if (!Array.isArray(v.entries)) return { ok: false, message: `${name}.entries must be an array` };
+  const entries: DiagnosticsLeftoverWorktreeEntry[] = [];
+  for (let index = 0; index < v.entries.length; index++) {
+    const entryName = `${name}.entries[${index}]`;
+    const entry = v.entries[index];
+    if (!objectWithKeys(entry, LEFTOVER_WORKTREE_ENTRY_KEYS, ["prunable", "holdsSyncedRef"] as const)) return { ok: false, message: `${entryName} must be an object` };
+    const entryUnknown = assertOnlyKeys(entry, LEFTOVER_WORKTREE_ENTRY_KEYS, entryName) ?? requireKeys(entry, ["prunable", "holdsSyncedRef"] as const, entryName);
+    if (entryUnknown) return { ok: false, message: entryUnknown };
+    if (entry.branch !== undefined && typeof entry.branch !== "string") return { ok: false, message: `${entryName}.branch must be a string` };
+    if (typeof entry.prunable !== "boolean") return { ok: false, message: `${entryName}.prunable must be boolean` };
+    if (typeof entry.holdsSyncedRef !== "boolean") return { ok: false, message: `${entryName}.holdsSyncedRef must be boolean` };
+    const validatedEntry: DiagnosticsLeftoverWorktreeEntry = { prunable: entry.prunable, holdsSyncedRef: entry.holdsSyncedRef };
+    if (entry.branch !== undefined) validatedEntry.branch = truncateUtf8(entry.branch, SECTION_STRING_CAP_BYTES);
+    entries.push(validatedEntry);
+  }
+  return { ok: true, value: { count: count.value, entries } };
+}
+
+function validateRepoResidue(v: JsonValue): ValidationResult<DiagnosticsRepoResidueSection> {
+  const name = "repoResidue";
+  if (!objectWithKeys(v, REPO_RESIDUE_KEYS, REPO_RESIDUE_KEYS)) return { ok: false, message: `${name} must be an object` };
+  const unknown = assertOnlyKeys(v, REPO_RESIDUE_KEYS, name) ?? requireKeys(v, REPO_RESIDUE_KEYS, name);
+  if (unknown) return { ok: false, message: unknown };
+  const numbers = { count: 0, gitPresent: 0, rboxPresent: 0, quarantinePresent: 0 };
+  for (const key of ["count", "gitPresent", "rboxPresent", "quarantinePresent"] as const) {
+    const validated = safeNumber(v[key], `${name}.${key}`);
+    if (!validated.ok) return validated;
+    numbers[key] = validated.value;
+  }
+  if (!objectWithKeys(v.identity, REPO_RESIDUE_IDENTITY_KEYS, REPO_RESIDUE_IDENTITY_KEYS)) return { ok: false, message: `${name}.identity must be an object` };
+  const identityUnknown = assertOnlyKeys(v.identity, REPO_RESIDUE_IDENTITY_KEYS, `${name}.identity`) ?? requireKeys(v.identity, REPO_RESIDUE_IDENTITY_KEYS, `${name}.identity`);
+  if (identityUnknown) return { ok: false, message: identityUnknown };
+  const identity = { match: 0, mismatch: 0, unknown: 0 };
+  for (const key of REPO_RESIDUE_IDENTITY_KEYS) {
+    const validated = safeNumber(v.identity[key], `${name}.identity.${key}`);
+    if (!validated.ok) return validated;
+    identity[key] = validated.value;
+  }
+  return { ok: true, value: { ...numbers, identity } };
+}
+
 export function validateDiagnosticsBundle(parsed: JsonValue): ValidationResult<DiagnosticsBundle> {
-  if (!objectWithKeys(parsed, TOP_KEYS, TOP_KEYS)) return { ok: false, message: "body must be a JSON object" };
-  const top = assertOnlyKeys(parsed, TOP_KEYS, "body") ?? requireKeys(parsed, TOP_KEYS, "body");
+  if (!objectWithKeys(parsed, TOP_KEYS, TOP_KEYS_COMMON)) return { ok: false, message: "body must be a JSON object" };
+  const top = assertOnlyKeys(parsed, TOP_KEYS, "body") ?? requireKeys(parsed, TOP_KEYS_COMMON, "body");
   if (top) return { ok: false, message: top };
+  const hasWorkspaceSize = "workspaceSize" in parsed;
+  const hasLegacyWorkspaceKey = "workspaceShape" in parsed;
+  if (hasWorkspaceSize === hasLegacyWorkspaceKey) return { ok: false, message: hasWorkspaceSize ? "body contains both workspaceSize and workspaceShape" : "body missing workspaceSize or workspaceShape" };
 
   const version = boundedString(parsed.version, "version", 128);
   if (!version.ok) return version;
@@ -327,8 +395,13 @@ export function validateDiagnosticsBundle(parsed: JsonValue): ValidationResult<D
   if (!metrics.ok) return metrics;
   const activity = validateActivity(parsed.activity);
   if (!activity.ok) return activity;
-  const workspaceSize = validateWorkspaceSize(parsed.workspaceShape);
+  const workspaceKey = hasWorkspaceSize ? "workspaceSize" : "workspaceShape";
+  const workspaceSize = validateWorkspaceSize(parsed[workspaceKey]!, workspaceKey);
   if (!workspaceSize.ok) return workspaceSize;
+  const leftoverWorktrees = validateLeftoverWorktrees(parsed.leftoverWorktrees);
+  if (!leftoverWorktrees.ok) return leftoverWorktrees;
+  const repoResidue = validateRepoResidue(parsed.repoResidue);
+  if (!repoResidue.ok) return repoResidue;
 
   return {
     ok: true,
@@ -340,7 +413,9 @@ export function validateDiagnosticsBundle(parsed: JsonValue): ValidationResult<D
       daemonLogTail: daemonLogTail.value,
       metrics: metrics.value,
       activity: activity.value,
-      workspaceShape: workspaceSize.value,
+      workspaceSize: workspaceSize.value,
+      leftoverWorktrees: leftoverWorktrees.value,
+      repoResidue: repoResidue.value,
     },
   };
 }
@@ -364,6 +439,10 @@ export async function createDiagnosticsReport(
   }
   const validated = validateDiagnosticsBundle(parsed);
   if (!validated.ok) return invalidBody(validated.message);
+  if (objectWithKeys(parsed, TOP_KEYS) && "workspaceShape" in parsed) {
+    // Delete after rbox-admin telemetry shows no device below the first 2.0 release for 30 days.
+    console.warn(JSON.stringify({ event: "diagnostics_legacy_workspace_shape", version: validated.value.version }));
+  }
 
   const reportId = `diag_${crypto.randomUUID().replace(/-/g, "")}`;
   const r2Key = `diagnostics/${p.accountId}/${reportId}.json`;

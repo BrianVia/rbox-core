@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { classifyHealthProbe, normalizeGuestHex, renderGitShapeFindings, settleSequenceFixedPoint, type SettlementRound } from "./git-shapes.js";
+import { classifyHealthProbe, normalizeGuestHex, renderGitLayoutFindings, settleSequenceFixedPoint, type SettlementRound } from "./git-layouts.js";
 
-describe("git-shapes pure scenario helpers", () => {
+describe("git-layouts pure scenario helpers", () => {
   test("normalizes guest-emitted hex and rejects decoded text", () => {
     expect(normalizeGuestHex("63 61 66 c3 a9 0a")).toBe("636166c3a90a");
     expect(() => normalizeGuestHex("café")).toThrow("invalid guest hex");
@@ -16,11 +16,11 @@ describe("git-shapes pure scenario helpers", () => {
   });
 
   test("renders the required findings without suppression semantics", () => {
-    const markdown = renderGitShapeFindings([
+    const markdown = renderGitLayoutFindings([
       { slug: "engine-gap: bisect-invisible", cell: "s5-bisect", summary: "metadata persisted", evidence: ["no deferral"] },
       { slug: "engine-gap: rebase-post-abort-epipe", cell: "s5-rebase", summary: "follow deferred", evidence: ["EPIPE"] },
     ]);
-    expect(markdown).toContain("# Git-shapes findings");
+    expect(markdown).toContain("# Git-layouts findings");
     expect(markdown).toContain("## engine-gap: bisect-invisible");
     expect(markdown).toContain("## engine-gap: rebase-post-abort-epipe");
     expect(markdown).toContain("do not suppress assertions");

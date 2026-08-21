@@ -2,7 +2,7 @@ import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { createWebSession } from "../src/auth.js";
-import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics, type DiagnosticsBundle, type DiagnosticsCheckResult, type DiagnosticsChecks } from "../src/diagnostics.js";
+import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics, validateDiagnosticsBundle, type DiagnosticsBundle, type DiagnosticsCheckResult, type DiagnosticsChecks } from "../src/diagnostics.js";
 import type { Principal } from "../src/authz.js";
 
 const BASE = "https://example.com";
@@ -52,7 +52,9 @@ function bundle(over: Partial<DiagnosticsFixture> = {}): DiagnosticsFixture {
     daemonLogTail: "2026-07-03T00:00:00Z push: published sequence 1 (1 files)\n",
     metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 2 },
     activity: { at: "2026-07-03T00:00:00.000Z", lastPush: { at: "2026-07-03T00:00:00.000Z", files: 1, sequence: 1 } },
-    workspaceShape: { fileCount: 1, totalBytes: 42 },
+    workspaceSize: { fileCount: 1, totalBytes: 42 },
+    leftoverWorktrees: { count: 1, entries: [{ branch: "feature", prunable: true, holdsSyncedRef: false }] },
+    repoResidue: { count: 1, gitPresent: 1, rboxPresent: 0, identity: { match: 0, mismatch: 1, unknown: 0 }, quarantinePresent: 0 },
     ...over,
   };
 }
@@ -62,6 +64,28 @@ function req(body: unknown): Request {
 }
 
 describe("POST /v1/diagnostics", () => {
+  test("accepts exactly one workspace-size spelling and normalizes the legacy spelling", () => {
+    const current = bundle();
+    expect(validateDiagnosticsBundle(current)).toMatchObject({ ok: true, value: { workspaceSize: { fileCount: 1, totalBytes: 42 } } });
+
+    const { workspaceSize: legacyWorkspaceSize, ...currentWithoutWorkspaceSize } = current;
+    const legacyBody = { ...currentWithoutWorkspaceSize, workspaceShape: legacyWorkspaceSize };
+    const validatedLegacy = validateDiagnosticsBundle(legacyBody);
+    expect(validatedLegacy).toMatchObject({ ok: true, value: { workspaceSize: { fileCount: 1, totalBytes: 42 } } });
+    if (validatedLegacy.ok) expect(validatedLegacy.value).not.toHaveProperty("workspaceShape");
+    expect(validateDiagnosticsBundle({ ...legacyBody, workspaceShape: { fileCount: "many", totalBytes: 42 } })).toEqual({ ok: false, message: "workspaceShape.fileCount must be a non-negative safe integer" });
+    expect(validateDiagnosticsBundle({ ...current, workspaceSize: { fileCount: "many", totalBytes: 42 } } as never)).toEqual({ ok: false, message: "workspaceSize.fileCount must be a non-negative safe integer" });
+
+    expect(validateDiagnosticsBundle({ ...current, workspaceShape: current.workspaceSize } as never)).toEqual({ ok: false, message: "body contains both workspaceSize and workspaceShape" });
+    expect(validateDiagnosticsBundle(currentWithoutWorkspaceSize)).toEqual({ ok: false, message: "body missing workspaceSize or workspaceShape" });
+  });
+
+  test("rejects local leftover-worktree paths", () => {
+    const body = bundle();
+    body.leftoverWorktrees.entries = [{ branch: "feature", prunable: true, holdsSyncedRef: false, path: "/secret" } as never];
+    expect(validateDiagnosticsBundle(body)).toEqual({ ok: false, message: "leftoverWorktrees.entries[0] must be an object" });
+  });
+
   test("accepts the legacy six checks while allowing the exact new optional vocabulary", async () => {
     const a = await bootstrap("diag-compatible-checks");
     const legacy = bundle();

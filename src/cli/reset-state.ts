@@ -201,7 +201,7 @@ async function prepareResetArtifactsUnderFence<T>(
         const mismatches = {
           live: exact.reason === "live",
           reflog: exact.reason === "reflog",
-          baseShape: exact.reason === "base-shape",
+          baseRefs: exact.reason === "base-shape",
         };
         let repaired;
         if (accepted) {

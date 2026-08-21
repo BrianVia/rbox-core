@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { canonicalize } from "../../engine/e2ee/jcs.js";
 import { basePresentArtifactRef, basePresentKeepRef, type BasePresentPayload } from "./base-artifacts.js";
-import { buildPRepairQ, buildPRepairReceipt } from "./p-repair.js";
+import { buildPRepairQ, buildPRepairReceipt, parsePRepairReceipt } from "./p-repair.js";
 import type { GitSection } from "../../engine/types.js";
 import { loadRawState, statePath, type SyncState } from "../config.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
@@ -35,7 +35,7 @@ function receipt(at: string) {
     lineageHash: L, repositoryIdentityHash: I, artifactRef: p.ref, artifactOid: P_OID,
     pPayload: payload, payloadBytes: p.payloadBytes,
     observed: { liveOid: NEXT, baseOid: PRIOR, repoGen: 0, stateRevision: 0, incomingKey: "incoming", reflogBytes: Buffer.from("reflog"), reflogEntries: 1, reflogTop: Buffer.from("top") },
-    skeep: [PRIOR, NEXT], at, mismatches: { live: true, reflog: false, baseShape: false },
+    skeep: [PRIOR, NEXT], at, mismatches: { live: true, reflog: false, baseRefs: false },
   });
   return buildPRepairReceipt({
     lineageHash: L, repositoryIdentityHash: I, ref: REF, episode: EPISODE,
@@ -87,8 +87,14 @@ test("§130 state port advances BASE through composer and mutates only the P-bou
   expect(saved.partial?.appliedRefs["refs/tags/keep"]).toEqual({ kind: "direct", oid: PRIOR });
   expect(saved.partial?.pRepaired?.[REF]).toEqual(first);
 
+  const legacy = structuredClone(first);
+  legacy.q.value.repair.reason = "base-shape-mismatch";
+  expect(await port.replaceReceipt!({ expected: await port.read(), prior: first, next: legacy })).toBe("accepted");
+  saved = (await loadRawState(root))!.repoRecords!.repo!;
+  expect(parsePRepairReceipt(saved.partial!.pRepaired![REF]!).q.value.repair.reason).toBe("base-shape-mismatch");
+
   const second = receipt("2026-07-17T12:00:00.000Z");
-  expect(await port.replaceReceipt!({ expected: await port.read(), prior: first, next: second })).toBe("accepted");
+  expect(await port.replaceReceipt!({ expected: await port.read(), prior: legacy, next: second })).toBe("accepted");
   saved = (await loadRawState(root))!.repoRecords!.repo!;
   expect(saved.base?.refs[REF]).toBe(NEXT);
   expect(saved.partial?.pRepaired?.[REF]).toEqual(second);

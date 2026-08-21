@@ -49,7 +49,14 @@ export interface PRepairQ {
   preserved: { count: number; oidsSha256: string };
   repair: {
     at: string;
-    reason: "live-mismatch" | "reflog-mismatch" | "base-shape-mismatch";
+    reason:
+      | "live-mismatch"
+      | "reflog-mismatch"
+      | "base-refs-mismatch"
+      // Delete after the first 2.0 release is fleet-live for one full
+      // pRepairEviction cycle on every founder host, and grepping their
+      // recovery ref namespaces finds no legacy spelling.
+      | "base-shape-mismatch";
     baseDisposition: "advance-prior-to-next" | "already-next" | "preserve-absent" | "preserve-third";
   };
 }
@@ -158,7 +165,7 @@ export interface BuildPRepairQInput {
   };
   skeep: readonly string[];
   at: string;
-  mismatches: { live: boolean; reflog: boolean; "baseShape": boolean };
+  mismatches: { live: boolean; reflog: boolean; baseRefs: boolean };
 }
 
 const bytesOf = (value: string | Uint8Array): Uint8Array => Object(value) !== value ? Buffer.from(String(value), "utf8") : value as Uint8Array;
@@ -189,7 +196,7 @@ export function pRepairBaseDisposition(
 }
 
 export function pRepairReason(mismatches: BuildPRepairQInput["mismatches"]): PRepairQ["repair"]["reason"] {
-  if (mismatches["baseShape"]) return "base-shape-mismatch";
+  if (mismatches.baseRefs) return "base-refs-mismatch";
   if (mismatches.live) return "live-mismatch";
   if (mismatches.reflog) return "reflog-mismatch";
   throw new Error("P-repair requires a repairable mismatch");
@@ -316,7 +323,7 @@ export function parsePRepairQ(bytes: Uint8Array): PRepairQ {
     || !HEX64.test(parsed.p.payloadSha256) || !HEX64.test(parsed.observed.reflog.sha256)
     || !projection(parsed.p.artifactRef, 384) || !projection(parsed.p.payload.ref, 768)
     || !(parsed.observed.reflog.top === null || projection(parsed.observed.reflog.top, 2_048))
-    || !(["live-mismatch", "reflog-mismatch", "base-shape-mismatch"] as const).includes(parsed.repair.reason)
+    || !(["live-mismatch", "reflog-mismatch", "base-refs-mismatch", "base-shape-mismatch"] as const).includes(parsed.repair.reason)
     || !(["advance-prior-to-next", "already-next", "preserve-absent", "preserve-third"] as const).includes(parsed.repair.baseDisposition)) {
     throw new Error("invalid P-repair Q fields");
   }

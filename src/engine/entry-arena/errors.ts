@@ -41,7 +41,7 @@ export class WorkerLifecycleError extends Error {
 export class EntryStructureError extends Error {
   constructor(key: string, detail: string) {
     super(`entry field ${key} is not internable: ${detail}`);
-    this.name = "EntryShapeError";
+    this.name = "EntryStructureError";
   }
 }
 

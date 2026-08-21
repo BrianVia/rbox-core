@@ -304,7 +304,7 @@ test("a bundle recapture with identical semantics keeps the skip, and re-stands 
 const ALL_HOLD_CODES = [
   "missing-branch-proof", "mismatched-branch-proof", "missing-safe-ref-proof",
   "mismatched-safe-ref-proof", "wrong-ref-class", "scope-refused",
-  "manual-proof-mismatch", "p-repair-shape-mismatch", "checkout-incomplete",
+  "manual-proof-mismatch", "p-repair-witness-mismatch", "checkout-incomplete",
 ] as const satisfies readonly NonNullable<Extract<TypedBlocker, { provenance: "composer" }>["code"]>[];
 const ELIGIBLE_HOLD_CODES = new Set(["missing-branch-proof", "missing-safe-ref-proof"]);
 

@@ -190,7 +190,7 @@ export type RepoBaseHoldCode =
   | "wrong-ref-class"
   | "scope-refused"
   | "manual-proof-mismatch"
-  | "p-repair-shape-mismatch";
+  | "p-repair-witness-mismatch";
 
 export interface RepoBaseHardHold {
   ref: string;
@@ -434,7 +434,7 @@ export function composeRepoBase(
       const repair = authority.repairs[ref];
       if (!repair) {
         after = before;
-        if (requested !== before) holds.push({ ref, code: "p-repair-shape-mismatch" });
+        if (requested !== before) holds.push({ ref, code: "p-repair-witness-mismatch" });
       } else {
         const witness = repair.witness;
         const locked = lockedProof.branches[ref];
@@ -443,7 +443,7 @@ export function composeRepoBase(
           || !locked || !sameWitness(witness, locked.witness) || !locked.artifactsClear
           || !locked.ownershipStable || !locked.reflogStable) {
           after = before;
-          holds.push({ ref, code: "p-repair-shape-mismatch" });
+          holds.push({ ref, code: "p-repair-witness-mismatch" });
           if (after !== null) composedBranchRefs[ref] = after;
           if (after !== null && usableOrigin(priorOrigin, after, identity.lineageHash)) origins[ref] = priorOrigin;
           continue;
@@ -458,7 +458,7 @@ export function composeRepoBase(
           after = before;
           if (!((before === null && repair.disposition === "preserve-absent")
             || (before !== null && before !== prior && before !== witness.nextOid && repair.disposition === "preserve-third"))) {
-            holds.push({ ref, code: "p-repair-shape-mismatch" });
+            holds.push({ ref, code: "p-repair-witness-mismatch" });
           }
         }
       }

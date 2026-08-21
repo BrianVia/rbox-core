@@ -400,7 +400,7 @@ files-first, ~13 scan-fault-isolation). `116` is `checkout-follows-sync`;
 code is always `git-capture-upload-after-decide` —
 `226-cli-daemon-runtime-primitives` lives on the `2.0` branch with zero code
 citations. `21` resolves to `21-account-linking.md`; `30` to
-`large-ref-commit-accounting`; `141` to `git-shapes-burn-in`.
+`large-ref-commit-accounting`; `141` to `git-layouts-burn-in`.
 
 **Read with care.** 163 v13 amends v12 after a falsified premise (a read-only
 SQLite open still writes `-wal`/`-shm`); 222 r6 carries the same correction.

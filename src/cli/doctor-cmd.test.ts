@@ -143,7 +143,7 @@ function sampleBundle(): DiagnosticsBundle {
     daemonLogTail: "daemon line with path src/app.ts\n",
     metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 1 },
     activity: { at: "2026-07-03T00:00:00.000Z" },
-    workspaceShape: { fileCount: 1, totalBytes: 42 },
+    workspaceSize: { fileCount: 1, totalBytes: 42 },
     leftoverWorktrees: { count: 0, entries: [] },
     repoResidue: {
       count: 0,
@@ -368,7 +368,7 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
     expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.metrics).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.activity).toEqual({ excluded: "stale daemon binding" });
-    expect(bundle.workspaceShape).toEqual({ fileCount: 2, totalBytes: 99 });
+    expect(bundle.workspaceSize).toEqual({ fileCount: 2, totalBytes: 99 });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

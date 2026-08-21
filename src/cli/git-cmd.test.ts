@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LocalBlobStore, buildIgnoreMatcher, type GitSection, type Manifest } from "../engine/index.js";
+import { LocalBlobStore, buildIgnoreMatcher, oracleFromState, type GitSection, type Manifest } from "../engine/index.js";
+import { hashBytes } from "../engine/hash.js";
 import { captureGitState } from "./sync-git/capture.js";
 import { setGitSpawnObserver } from "../engine/git-spawn.js";
 import { checkoutJournalDir } from "../cli/sync-git/journal.js";
@@ -18,6 +19,7 @@ import { applyGitSections } from "./sync-git/apply.js";
 import { settleCommittedBranchArtifacts } from "./sync-git/received-git-transition-commit.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
 import { prepareFollowerBranchProtocol } from "./sync-git/follower-protocol.js";
+import { resolutionBindingIdentity } from "./sync-git/resolution-intent.js";
 import { gitFollowEnabled } from "./sync-git/shared.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 
@@ -777,6 +779,47 @@ test("take-theirs rejects a stale confirmation before quarantine when a ref move
 
   expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(1);
   expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "snapshot-mismatch" });
+  await expect(fs.access(path.join(root, ".rbox", "git-quarantine"))).rejects.toThrow();
+});
+
+test("take-theirs treats a pre-storeIdentity confirmation token as a snapshot mismatch", async () => {
+  await fixture();
+  const current = await show([]);
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = repoRecordsForState(state).repo!;
+  const ctx = (await repoCtx(receiver))!;
+  const matcher = buildIgnoreMatcher(root, {
+    respectGitignore: cfg.respectGitignore === true,
+    knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+  });
+  const identity = await resolutionBindingIdentity({
+    root,
+    rel: "repo",
+    ctx,
+    state,
+    record,
+    incoming: record.pending!,
+    oracle: oracleFromState({ base: state.lastSyncedManifest, matcher, root }),
+    cfg,
+    boundary: false,
+  });
+  expect(identity.config.storeIdentity).toBeDefined();
+  expect(hashBytes(Buffer.from(JSON.stringify(identity)))).toBe(current.snapshot);
+
+  const legacyConfig = Object.fromEntries(Object.entries(identity.config).map(([key, value]) => [
+    key === "storeIdentity" ? "shape" : key,
+    value,
+  ]));
+  const legacyToken = hashBytes(Buffer.from(JSON.stringify({ ...identity, config: legacyConfig })));
+  expect(legacyToken).not.toBe(current.snapshot);
+
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: legacyToken }, deps(lines))).toBe(1);
+  expect(JSON.parse(lines.at(-1)!)).toMatchObject({
+    status: "snapshot-mismatch",
+    verb: "take-theirs",
+    current: { snapshot: current.snapshot },
+  });
   await expect(fs.access(path.join(root, ".rbox", "git-quarantine"))).rejects.toThrow();
 });
 

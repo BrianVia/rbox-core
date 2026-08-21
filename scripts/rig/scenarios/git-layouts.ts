@@ -5,16 +5,16 @@ import { GUEST } from "../lib/config.js";
 import type { Device } from "../lib/device.js";
 import {
   GIT_FIXTURE_BUILDERS,
-  GIT_SHAPE_OUTCOMES,
-  GIT_SHAPE_OP_STATE_ROOTS,
-  GIT_SHAPE_REFUSALS,
-  GIT_SHAPE_SURFACES,
+  GIT_LAYOUT_OUTCOMES,
+  GIT_LAYOUT_OP_STATE_ROOTS,
+  GIT_LAYOUT_REFUSALS,
+  GIT_LAYOUT_SURFACES,
   LFS_PAYLOAD,
   NFC_FILENAME_HEX,
   NFD_FILENAME_HEX,
   formatFixturePlanLine,
   type GitFixtureDescription,
-  type GitShapeCell,
+  type GitLayoutCell,
 } from "../lib/git-fixtures.js";
 import { createRecorder, errMsg, type Recorder } from "./harness.js";
 import { CONCURRENCY, provisionPair, teardownAccount } from "./preamble.js";
@@ -87,7 +87,7 @@ export interface HealthProbeEvidence {
   haltSideFile?: string;
 }
 
-export interface GitShapeFinding {
+export interface GitLayoutFinding {
   slug: string;
   cell: string;
   summary: string;
@@ -121,8 +121,8 @@ export function normalizeGuestHex(output: string): string {
 }
 
 /** Pure findings renderer; the host-side write remains in the scenario. */
-export function renderGitShapeFindings(findings: readonly GitShapeFinding[]): string {
-  const lines = ["# Git-shapes findings", "", "Design 141 burn-in sidecar. These entries pin current behavior; they do not suppress assertions.", ""];
+export function renderGitLayoutFindings(findings: readonly GitLayoutFinding[]): string {
+  const lines = ["# Git-layouts findings", "", "Design 141 burn-in sidecar. These entries pin current behavior; they do not suppress assertions.", ""];
   for (const finding of findings) {
     lines.push(`## ${finding.slug}`, "", `- cell: \`${finding.cell}\``, `- summary: ${finding.summary}`);
     for (const evidence of finding.evidence) lines.push(`- evidence: ${evidence}`);
@@ -132,7 +132,7 @@ export function renderGitShapeFindings(findings: readonly GitShapeFinding[]): st
 }
 
 async function executeFixture(device: Device, description: GitFixtureDescription): Promise<void> {
-  const aux = `/tmp/rbox-git-shapes-${description.cell}`;
+  const aux = `/tmp/rbox-git-layouts-${description.cell}`;
   await device.exec(["rm", "-rf", aux], { allowFail: true });
   await device.exec(["mkdir", "-p", GUEST.workDir, aux]);
   for (const command of description.commands) {
@@ -182,7 +182,7 @@ function requireAssertion(rec: Recorder, name: string, ok: boolean, detail: stri
   if (!ok) throw new Error(`${name}: ${detail}`);
 }
 
-async function probeHealth(ctx: RigCtx, rec: Recorder, findings: GitShapeFinding[], cell: string, boundary: string): Promise<void> {
+async function probeHealth(ctx: RigCtx, rec: Recorder, findings: GitLayoutFinding[], cell: string, boundary: string): Promise<void> {
   for (const [side, device] of [["A", ctx.a], ["B", ctx.b]] as const) {
     const status = await device.rbox(["status", "--json"], { cwd: GUEST.workDir, allowFail: true });
     const activity = await device.readFileIfExists(`${GUEST.workDir}/.rbox/state/activity.json`);
@@ -203,7 +203,7 @@ async function probeHealth(ctx: RigCtx, rec: Recorder, findings: GitShapeFinding
 async function resetBetweenCells(ctx: RigCtx, cell: string): Promise<void> {
   await Promise.all([ctx.a.daemonStop(GUEST.workDir), ctx.b.daemonStop(GUEST.workDir)]);
   const clean = async (device: Device) => {
-    await device.exec(["rm", "-rf", GUEST.workDir, GUEST.rboxHome, `/tmp/rbox-git-shapes-${cell}`], { allowFail: true });
+    await device.exec(["rm", "-rf", GUEST.workDir, GUEST.rboxHome, `/tmp/rbox-git-layouts-${cell}`], { allowFail: true });
   };
   await Promise.all([clean(ctx.a), clean(ctx.b)]);
 }
@@ -213,7 +213,7 @@ interface ProvisionCellOptions {
   readonly afterPair?: boolean;
 }
 
-async function provisionCell(ctx: RigCtx, rec: Recorder, cell: GitShapeCell, opts: ProvisionCellOptions = {}) {
+async function provisionCell(ctx: RigCtx, rec: Recorder, cell: GitLayoutCell, opts: ProvisionCellOptions = {}) {
   const description = GIT_FIXTURE_BUILDERS[cell]();
   const provisioned = await provisionPair(ctx, rec, {
     push: false,
@@ -358,7 +358,7 @@ async function runS1A(ctx: RigCtx, rec: Recorder): Promise<void> {
   rec.assert("[s1-a] product preflight refusal exact", await productPreflightReason(ctx.a, "s1-a") === d.refusal, d.refusal);
   const expected = planLine({ captured: ["s1-a/mod"], deferred: [{ relPath: "s1-a", reason: `${d.refusal} — section not captured` }] });
   rec.assert("[s1-a] exact parent refusal/child capture plan", `${initA.stdout}\n${initA.stderr}`.includes(expected), expected);
-  rec.assert("[s1-a/mod] exact apply log", `${initB.stdout}\n${initB.stderr}`.includes(GIT_SHAPE_SURFACES.applied("s1-a/mod")), GIT_SHAPE_SURFACES.applied("s1-a/mod"));
+  rec.assert("[s1-a/mod] exact apply log", `${initB.stdout}\n${initB.stderr}`.includes(GIT_LAYOUT_SURFACES.applied("s1-a/mod")), GIT_LAYOUT_SURFACES.applied("s1-a/mod"));
   const [parentGit, childGit, parentFile] = await Promise.all([
     ctx.b.exec(["test", "-e", `${GUEST.workDir}/s1-a/.git`], { allowFail: true }),
     ctx.b.exec(["test", "-d", `${GUEST.workDir}/s1-a/mod/.git`], { allowFail: true }),
@@ -377,7 +377,7 @@ async function runS1A(ctx: RigCtx, rec: Recorder): Promise<void> {
   rec.assert("[s1-a] capture/unsupported durable JSON", rows.length === 1 && row?.repo === "s1-a" && row?.lane === "capture" && row?.reason === "unsupported" && row?.bytesChanged === false && row?.checkout === undefined && typeof row?.deferredSince === "string" && !Number.isNaN(Date.parse(row.deferredSince as string)) && projected.length === 1 && projected[0]?.displayReason === "unsupported", `${JSON.stringify(rows)} ${JSON.stringify(projected)}`);
   const human = await ctx.a.rbox(["status"], { cwd: GUEST.workDir, env: { NO_COLOR: "1" }, allowFail: true });
   const version = (await ctx.a.exec(["git", "--version"])).stdout.trim();
-  rec.assert("[s1-a] misleading capability display pinned", human.stdout.includes(GIT_SHAPE_SURFACES.unsupportedCapability(version, "s1-a")), human.stdout.trim().slice(-500));
+  rec.assert("[s1-a] misleading capability display pinned", human.stdout.includes(GIT_LAYOUT_SURFACES.unsupportedCapability(version, "s1-a")), human.stdout.trim().slice(-500));
   await assertEmptyDeferrals(rec, ctx.b, "s1-a/mod", "s1-a/mod/settled");
   await assertNoopCycle(ctx, rec, "s1-a");
 }
@@ -385,7 +385,7 @@ async function runS1A(ctx: RigCtx, rec: Recorder): Promise<void> {
 async function runS1B(ctx: RigCtx, rec: Recorder): Promise<void> {
   const { initA, initB } = await provisionCell(ctx, rec, "s1-b");
   rec.assert("[s1-b] exact capture plan", `${initA.stdout}\n${initA.stderr}`.includes(planLine({ captured: ["s1-b"] })), planLine({ captured: ["s1-b"] }));
-  rec.assert("[s1-b] exact apply log", `${initB.stdout}\n${initB.stderr}`.includes(GIT_SHAPE_SURFACES.applied("s1-b")), GIT_SHAPE_SURFACES.applied("s1-b"));
+  rec.assert("[s1-b] exact apply log", `${initB.stdout}\n${initB.stderr}`.includes(GIT_LAYOUT_SURFACES.applied("s1-b")), GIT_LAYOUT_SURFACES.applied("s1-b"));
   const dotgit = await ctx.b.exec(["test", "-d", `${GUEST.workDir}/s1-b/.git`], { allowFail: true });
   rec.assert("[s1-b] B has standalone .git directory", dotgit.exitCode === 0, `exit ${dotgit.exitCode}`);
   const [aHead, bHead, refs, stash] = await Promise.all([git(ctx.a, "s1-b", ["rev-parse", "HEAD"]), git(ctx.b, "s1-b", ["rev-parse", "HEAD"]), git(ctx.b, "s1-b", ["for-each-ref", "--format=%(refname)", "refs/heads"]), git(ctx.b, "s1-b", ["rev-parse", "--verify", "refs/stash"], true)]);
@@ -400,7 +400,7 @@ async function runS1B(ctx: RigCtx, rec: Recorder): Promise<void> {
 
 async function runS1C(ctx: RigCtx, rec: Recorder): Promise<void> {
   const { initA, initB } = await provisionCell(ctx, rec, "s1-c");
-  rec.assert("[s1-c] exact capture/apply lines", `${initA.stdout}\n${initA.stderr}`.includes(planLine({ captured: ["s1-c"] })) && `${initB.stdout}\n${initB.stderr}`.includes(GIT_SHAPE_SURFACES.applied("s1-c")), `${initA.stdout}${initA.stderr}\n${initB.stdout}${initB.stderr}`.trim().slice(-800));
+  rec.assert("[s1-c] exact capture/apply lines", `${initA.stdout}\n${initA.stderr}`.includes(planLine({ captured: ["s1-c"] })) && `${initB.stdout}\n${initB.stderr}`.includes(GIT_LAYOUT_SURFACES.applied("s1-c")), `${initA.stdout}${initA.stderr}\n${initB.stdout}${initB.stderr}`.trim().slice(-800));
   const [aEntry, bEntry, mod] = await Promise.all([git(ctx.a, "s1-c", ["ls-files", "--stage", "mod"]), git(ctx.b, "s1-c", ["ls-files", "--stage", "mod"]), ctx.b.exec(["test", "-e", `${GUEST.workDir}/s1-c/mod`], { allowFail: true })]);
   rec.assert("[s1-c] mode-160000/OID index entry exact", aEntry.stdout === bEntry.stdout && /^160000 [0-9a-f]{40} 0\tmod\n$/.test(bEntry.stdout), JSON.stringify(bEntry.stdout));
   rec.assert("[s1-c] empty mod path not materialized", mod.exitCode !== 0, `exit ${mod.exitCode}`);
@@ -451,7 +451,7 @@ async function runLfs(ctx: RigCtx, rec: Recorder, configured: boolean): Promise<
   const attachPush = await pushA(ctx);
   const attachPull = await pullB(ctx);
   const attachedRepo = await ctx.b.exec(["test", "-d", `${GUEST.workDir}/${rel}/.git`], { allowFail: true });
-  rec.assert(`[${rel}] follow-up capture/apply materializes native repo`, attachPush.exitCode === 0 && attachPull.exitCode === 0 && `${attachPush.stdout}\n${attachPush.stderr}`.includes(planLine({ captured: [rel] })) && `${attachPull.stdout}\n${attachPull.stderr}`.includes(GIT_SHAPE_SURFACES.applied(rel)) && attachedRepo.exitCode === 0, `push=${attachPush.exitCode} pull=${attachPull.exitCode} git=${attachedRepo.exitCode}\n${attachPush.stdout}${attachPush.stderr}\n${attachPull.stdout}${attachPull.stderr}`.trim().slice(-800));
+  rec.assert(`[${rel}] follow-up capture/apply materializes native repo`, attachPush.exitCode === 0 && attachPull.exitCode === 0 && `${attachPush.stdout}\n${attachPush.stderr}`.includes(planLine({ captured: [rel] })) && `${attachPull.stdout}\n${attachPull.stderr}`.includes(GIT_LAYOUT_SURFACES.applied(rel)) && attachedRepo.exitCode === 0, `push=${attachPush.exitCode} pull=${attachPull.exitCode} git=${attachedRepo.exitCode}\n${attachPush.stdout}${attachPush.stderr}\n${attachPull.stdout}${attachPull.stderr}`.trim().slice(-800));
   const pointer = (await git(ctx.b, rel, ["cat-file", "-p", pointerRef])).stdout;
   const cache = lfsCachePath(rel, pointer);
   const expectedOid = (await ctx.b.exec(["sha256sum", `${GUEST.workDir}/${rel}/asset.bin`])).stdout.split(/\s+/)[0];
@@ -529,8 +529,8 @@ async function runCase(ctx: RigCtx, rec: Recorder): Promise<void> {
   const afterB = (await readState(ctx.b)).lastSyncedSequence ?? -1;
   const body1 = first.stdout + first.stderr; const body2 = second.stdout + second.stderr;
   rec.assert("[s3-case] source publish accepted", published.exitCode === 0 && accepted > (beforeA.lastSyncedSequence ?? -1), `exit=${published.exitCode} before=${beforeA.lastSyncedSequence} accepted=${accepted}`);
-  rec.assert("[s3-case] exact receiver manifest rejection", first.exitCode !== 0 && body1.includes(GIT_SHAPE_REFUSALS.caseCollision), body1.trim().slice(-500));
-  rec.assert("[s3-case] identical receiver rejection on retry", second.exitCode !== 0 && body2.includes(GIT_SHAPE_REFUSALS.caseCollision), body2.trim().slice(-500));
+  rec.assert("[s3-case] exact receiver manifest rejection", first.exitCode !== 0 && body1.includes(GIT_LAYOUT_REFUSALS.caseCollision), body1.trim().slice(-500));
+  rec.assert("[s3-case] identical receiver rejection on retry", second.exitCode !== 0 && body2.includes(GIT_LAYOUT_REFUSALS.caseCollision), body2.trim().slice(-500));
   rec.assert("[s3-case] accepted sequence remains unconsumed on B", afterB === (beforeB.lastSyncedSequence ?? -1) && afterB < accepted, `before=${beforeB.lastSyncedSequence} accepted=${accepted} B=${afterB}`);
   const bEntries = await ctx.b.exec(["sh", "-ceu", `find '${GUEST.workDir}' -mindepth 1 -maxdepth 1 ! -name .rbox -print`]);
   rec.assert("[s3-case] B unchanged", bEntries.stdout.trim() === "", bEntries.stdout.trim() || "empty");
@@ -557,7 +557,7 @@ async function runShallow(ctx: RigCtx, rec: Recorder): Promise<void> {
   rec.assert("[s4-shallow] exact refusal/suffix when emission gate is reached", emittedPlan === undefined || emittedPlan === planLine({ deferred: [{ relPath: "s4-shallow", reason: expectedReason }] }), emittedPlan ?? "no forensic plan line (allowed no-op gate)");
   const human = await ctx.a.rbox(["status"], { cwd: GUEST.workDir, env: { NO_COLOR: "1" }, allowFail: true });
   const version = (await ctx.a.exec(["git", "--version"])).stdout.trim();
-  rec.assert("[s4-shallow] misleading capability display pinned", human.stdout.includes(GIT_SHAPE_SURFACES.unsupportedCapability(version, "s4-shallow")), human.stdout.trim().slice(-500));
+  rec.assert("[s4-shallow] misleading capability display pinned", human.stdout.includes(GIT_LAYOUT_SURFACES.unsupportedCapability(version, "s4-shallow")), human.stdout.trim().slice(-500));
   await assertNoopCycle(ctx, rec, "s4-shallow");
 }
 
@@ -567,7 +567,7 @@ async function missingObjects(device: Device, rel: string): Promise<string[]> {
 }
 
 async function expectedPartialMissing(device: Device, cell: "s4-partial-online" | "s4-partial-offline"): Promise<string[]> {
-  const origin = `/tmp/rbox-git-shapes-${cell}/${cell}-origin`;
+  const origin = `/tmp/rbox-git-layouts-${cell}/${cell}-origin`;
   const [o1, o2] = await Promise.all([
     device.exec(["git", "-C", origin, "rev-parse", "HEAD~2:payload.bin"]),
     device.exec(["git", "-C", origin, "rev-parse", "HEAD~1:payload.bin"]),
@@ -578,7 +578,7 @@ async function expectedPartialMissing(device: Device, cell: "s4-partial-online" 
 const PARTIAL_ONLINE_CONFIG = [
   ["remote.origin.promisor", "true"],
   ["remote.origin.partialclonefilter", "blob:none"],
-  ["remote.origin.url", "file:///tmp/rbox-git-shapes-s4-partial-online/s4-partial-online-origin"],
+  ["remote.origin.url", "file:///tmp/rbox-git-layouts-s4-partial-online/s4-partial-online-origin"],
 ] as const;
 
 async function runPartialOnline(ctx: RigCtx, rec: Recorder): Promise<void> {
@@ -647,7 +647,7 @@ async function runPartialOffline(ctx: RigCtx, rec: Recorder): Promise<void> {
   rec.assert("[s4-partial-offline] guest Git version ratified", version === EXPECTED_GIT_VERSION, version);
   const expectedMissing = await expectedPartialMissing(ctx.a, "s4-partial-offline");
   const pre = await missingObjects(ctx.a, "s4-partial-offline");
-  await ctx.a.exec(["mv", "/tmp/rbox-git-shapes-s4-partial-offline/s4-partial-offline-origin", "/tmp/rbox-git-shapes-s4-partial-offline/origin-offline"]);
+  await ctx.a.exec(["mv", "/tmp/rbox-git-layouts-s4-partial-offline/s4-partial-offline-origin", "/tmp/rbox-git-layouts-s4-partial-offline/origin-offline"]);
   const push = await pushA(ctx, { ...UPLOAD, GIT_NO_LAZY_FETCH: "1" });
   await pullB(ctx);
   const post = await missingObjects(ctx.a, "s4-partial-offline");
@@ -660,7 +660,7 @@ async function runPartialOffline(ctx: RigCtx, rec: Recorder): Promise<void> {
   rec.assert("[s4-partial-offline] first push deferral rows empty", rows.length === 0, JSON.stringify(rows));
   rec.assert("[s4-partial-offline] first push deferredRepos empty", projected.length === 0, JSON.stringify(projected));
   const human = await ctx.a.rbox(["status"], { cwd: GUEST.workDir, env: { NO_COLOR: "1" }, allowFail: true });
-  rec.assert("[s4-partial-offline] exact pending-Git human surface", human.stdout.includes(GIT_SHAPE_SURFACES.partialOfflinePendingHuman) && human.stdout.includes("git-sync: 0 repos synced") && !human.stdout.includes("git deferral:") && !/git deferred \S+:/.test(human.stdout), human.stdout.trim().slice(-800));
+  rec.assert("[s4-partial-offline] exact pending-Git human surface", human.stdout.includes(GIT_LAYOUT_SURFACES.partialOfflinePendingHuman) && human.stdout.includes("git-sync: 0 repos synced") && !human.stdout.includes("git deferral:") && !/git deferred \S+:/.test(human.stdout), human.stdout.trim().slice(-800));
   const bGit = await ctx.b.exec(["test", "-e", `${GUEST.workDir}/s4-partial-offline/.git`], { allowFail: true });
   const bPayload = await ctx.b.readFileIfExists(`${GUEST.workDir}/s4-partial-offline/payload.bin`);
   rec.assert("[s4-partial-offline] B exact plain bytes/no repo", bGit.exitCode !== 0 && bPayload === "payload-three\n", `git=${bGit.exitCode} payload=${JSON.stringify(bPayload)}`);
@@ -671,24 +671,24 @@ async function runPartialOffline(ctx: RigCtx, rec: Recorder): Promise<void> {
   const durableAfterCapture = stateAfterCapture.repoRecords?.["s4-partial-offline"]?.deferrals?.capture;
   const episode = captureRow?.deferredSince;
   const episodeDatesValid = typeof episode === "string" && !Number.isNaN(Date.parse(episode)) && captureRow?.reasonSince === episode && typeof captureRow?.ageSeconds === "number";
-  const publicRowExact = captureRows.length === 1 && captureRow?.repo === "s4-partial-offline" && captureRow.lane === "capture" && captureRow.reason === GIT_SHAPE_SURFACES.partialOfflineReason && captureRow.bytesChanged === false && captureRow.checkout === undefined && episodeDatesValid;
+  const publicRowExact = captureRows.length === 1 && captureRow?.repo === "s4-partial-offline" && captureRow.lane === "capture" && captureRow.reason === GIT_LAYOUT_SURFACES.partialOfflineReason && captureRow.bytesChanged === false && captureRow.checkout === undefined && episodeDatesValid;
   const projectedRow = captureProjected[0];
-  const projectionExact = captureProjected.length === 1 && projectedRow?.repo === "s4-partial-offline" && projectedRow.oldestDeferredSince === episode && projectedRow.displayReason === GIT_SHAPE_SURFACES.partialOfflineReason && typeof projectedRow.ageSeconds === "number" && projectedRow.bytesChanged === false && projectedRow.checkout === undefined;
-  const durableExact = durableAfterCapture?.lane === "capture" && durableAfterCapture.reason === GIT_SHAPE_SURFACES.partialOfflineReason && durableAfterCapture.deferredSince === episode && durableAfterCapture.reasonSince === episode && durableAfterCapture.lastSeen === episode && durableAfterCapture.bytesChanged !== true;
+  const projectionExact = captureProjected.length === 1 && projectedRow?.repo === "s4-partial-offline" && projectedRow.oldestDeferredSince === episode && projectedRow.displayReason === GIT_LAYOUT_SURFACES.partialOfflineReason && typeof projectedRow.ageSeconds === "number" && projectedRow.bytesChanged === false && projectedRow.checkout === undefined;
+  const durableExact = durableAfterCapture?.lane === "capture" && durableAfterCapture.reason === GIT_LAYOUT_SURFACES.partialOfflineReason && durableAfterCapture.deferredSince === episode && durableAfterCapture.reasonSince === episode && durableAfterCapture.lastSeen === episode && durableAfterCapture.bytesChanged !== true;
   rec.assert("[s4-partial-offline] first Git capture attempt holds exact sequence with no prior episode", captureAttempt.exitCode === 0 && /\bgit-plan \S+ hit0m0u0 pps0 sp1 prc0\b/.test(captureAttempt.stdout) && beforeCapture === 1 && afterCapture === 1 && durableBeforeCapture === undefined, `exit=${captureAttempt.exitCode} ${beforeCapture}/${afterCapture} before=${JSON.stringify(durableBeforeCapture)} ${captureAttempt.stdout.trim().slice(-300)}`);
   rec.assert("[s4-partial-offline] first Git capture public worktree-ownership projection exact", publicRowExact && projectionExact, `${JSON.stringify(captureRows)} ${JSON.stringify(captureProjected)}`);
   rec.assert("[s4-partial-offline] first Git capture durable worktree-ownership episode exact", durableExact, JSON.stringify(durableAfterCapture));
 }
 
 async function opSnapshot(device: Device, rel: string): Promise<string> {
-  const roots = GIT_SHAPE_OP_STATE_ROOTS.join(" ");
+  const roots = GIT_LAYOUT_OP_STATE_ROOTS.join(" ");
   const script = `set -e; cd '${GUEST.workDir}/${rel}'; gd=$(git rev-parse --git-dir); printf 'HEAD '; od -An -tx1 -v "$gd/HEAD"; printf 'INDEX '; od -An -tx1 -v "$gd/index"; for n in ${roots}; do p=$(git rev-parse --git-path "$n"); test ! -e "$p" || { printf '%s ' "$n"; if test -d "$p"; then find "$p" -type f -print0 | sort -z | xargs -0 -r sha256sum; else sha256sum "$p"; fi; }; done; printf 'WORK '; sha256sum conflict.txt`;
   return (await device.exec(["sh", "-ceu", script])).stdout;
 }
 
 const OP_IDENT = ["-c", "user.name=Rig Tester", "-c", "user.email=rig@example.com"] as const;
 
-async function runOperation(ctx: RigCtx, rec: Recorder, findings: GitShapeFinding[], kind: "merge" | "rebase" | "cherry-pick"): Promise<void> {
+async function runOperation(ctx: RigCtx, rec: Recorder, findings: GitLayoutFinding[], kind: "merge" | "rebase" | "cherry-pick"): Promise<void> {
   const rel = `s5-${kind}` as const;
   await provisionCell(ctx, rec, rel); await pushA(ctx); await pullB(ctx);
   const [baseA, baseB, cleanA, cleanB] = await Promise.all([
@@ -763,10 +763,10 @@ async function runOperation(ctx: RigCtx, rec: Recorder, findings: GitShapeFindin
   rec.assert(`[${rel}] exact status JSON projection`, statusRows.length === 1 && statusRows[0]?.repo === rel && statusRows[0]?.lane === "apply" && statusRows[0]?.reason === "local-edits" && statusRows[0]?.bytesChanged === false && statusRepos.length === 1 && statusRepos[0]?.displayReason === "local-edits", `${JSON.stringify(statusRows)} ${JSON.stringify(statusRepos)}`);
   const human = await ctx.b.rbox(["status"], { cwd: GUEST.workDir, env: { NO_COLOR: "1" }, allowFail: true });
   const branch = kind === "rebase" ? undefined : "main";
-  rec.assert(`[${rel}] exact 0m human deferral row`, human.stdout.includes(GIT_SHAPE_SURFACES.operationHuman(rel, branch)), human.stdout.trim().slice(-500));
-  rec.assert(`[${rel}] exact deferred log reasons`, pullOutput.includes(GIT_SHAPE_SURFACES.operationDeferredPrefix(rel)), pullOutput.trim().slice(-800));
+  rec.assert(`[${rel}] exact 0m human deferral row`, human.stdout.includes(GIT_LAYOUT_SURFACES.operationHuman(rel, branch)), human.stdout.trim().slice(-500));
+  rec.assert(`[${rel}] exact deferred log reasons`, pullOutput.includes(GIT_LAYOUT_SURFACES.operationDeferredPrefix(rel)), pullOutput.trim().slice(-800));
   const resolve = await ctx.b.rbox(["git", "resolve", rel], { cwd: GUEST.workDir, allowFail: true });
-  rec.assert(`[${rel}] resolve proves hidden operation veto`, resolve.stdout.includes(GIT_SHAPE_SURFACES.operationResolve), resolve.stdout.trim());
+  rec.assert(`[${rel}] resolve proves hidden operation veto`, resolve.stdout.includes(GIT_LAYOUT_SURFACES.operationResolve), resolve.stdout.trim());
   await git(ctx.b, rel, kind === "merge" ? ["merge", "--abort"] : kind === "rebase" ? ["rebase", "--abort"] : ["cherry-pick", "--abort"]);
   const [markerCleared, cleanAfterAbort, branchAfterAbort, bytesAfterAbort] = await Promise.all([
     ctx.b.exec(["test", "!", "-e", markerPath], { allowFail: true }),
@@ -779,7 +779,7 @@ async function runOperation(ctx: RigCtx, rec: Recorder, findings: GitShapeFindin
   const settledPull = await pullB(ctx);
   const settledOutput = `${settledPull.stdout}\n${settledPull.stderr}`;
   if (kind === "rebase") {
-    rec.assert(`[${rel}] post-abort follow exposes exact EPIPE engine gap`, settledPull.exitCode === 0 && /\bresults=deferred=1\b/.test(settledOutput) && settledOutput.includes(GIT_SHAPE_SURFACES.rebasePostAbortEpipe) && !settledOutput.includes(GIT_SHAPE_SURFACES.followed(rel)), settledOutput.trim().slice(-500));
+    rec.assert(`[${rel}] post-abort follow exposes exact EPIPE engine gap`, settledPull.exitCode === 0 && /\bresults=deferred=1\b/.test(settledOutput) && settledOutput.includes(GIT_LAYOUT_SURFACES.rebasePostAbortEpipe) && !settledOutput.includes(GIT_LAYOUT_SURFACES.followed(rel)), settledOutput.trim().slice(-500));
     await assertStatusAndFsck(rec, ctx.b, rel, "", `${rel}/post-abort-gap`);
     const [status, state] = await Promise.all([readStatus(ctx.b), readState(ctx.b)]);
     const statusRows = status.parsed?.git?.deferrals ?? [];
@@ -799,11 +799,11 @@ async function runOperation(ctx: RigCtx, rec: Recorder, findings: GitShapeFindin
       slug: "engine-gap: rebase-post-abort-epipe",
       cell: rel,
       summary: "a completed clean rebase abort is followed by an EPIPE deferral that retains pending/partial state and blocks native B-to-A propagation",
-      evidence: [abortDetail, "results=deferred=1", GIT_SHAPE_SURFACES.rebasePostAbortEpipe, "apply reason=other on branch main", "pending and partial.checkoutPending remain", `B commit=${roundTrip.oid}`, `A main=${roundTrip.got}`],
+      evidence: [abortDetail, "results=deferred=1", GIT_LAYOUT_SURFACES.rebasePostAbortEpipe, "apply reason=other on branch main", "pending and partial.checkoutPending remain", `B commit=${roundTrip.oid}`, `A main=${roundTrip.got}`],
     });
     return;
   }
-  rec.assert(`[${rel}] clean follow log`, settledOutput.includes(GIT_SHAPE_SURFACES.followed(rel)), `${settledPull.stdout}${settledPull.stderr}`.trim().slice(-500));
+  rec.assert(`[${rel}] clean follow log`, settledOutput.includes(GIT_LAYOUT_SURFACES.followed(rel)), `${settledPull.stdout}${settledPull.stderr}`.trim().slice(-500));
   await assertStatusAndFsck(rec, ctx.b, rel, "", `${rel}/settled`);
   await assertEmptyDeferrals(rec, ctx.b, rel, `${rel}/settled`);
   await assertEmptyDeferrals(rec, ctx.a, rel, `${rel}/A-settled`);
@@ -816,7 +816,7 @@ async function bisectMetadata(device: Device, rel: string): Promise<string> {
   return (await device.exec(["sh", "-ceu", script])).stdout;
 }
 
-async function runBisect(ctx: RigCtx, rec: Recorder, findings: GitShapeFinding[]): Promise<void> {
+async function runBisect(ctx: RigCtx, rec: Recorder, findings: GitLayoutFinding[]): Promise<void> {
   const rel = "s5-bisect";
   await provisionCell(ctx, rec, rel); await pushA(ctx); await pullB(ctx);
   await git(ctx.b, rel, ["bisect", "start", "HEAD", "HEAD~4"]);
@@ -836,14 +836,14 @@ async function runBisect(ctx: RigCtx, rec: Recorder, findings: GitShapeFinding[]
   await assertEmptyDeferrals(rec, ctx.b, rel, rel);
   await assertEmptyDeferrals(rec, ctx.a, rel, `${rel}/A`);
   const deferrals = await ctx.b.rbox(["git", "deferrals"], { cwd: GUEST.workDir, allowFail: true });
-  rec.assert("[s5-bisect] no deferred surface and positive follow log", deferrals.stdout.includes(GIT_SHAPE_SURFACES.noDeferredRepos) && !(pull.stdout + pull.stderr).includes("git-sync deferred") && (pull.stdout + pull.stderr).includes(GIT_SHAPE_SURFACES.followed("s5-bisect")), `${deferrals.stdout}\n${pull.stdout}${pull.stderr}`.trim().slice(-800));
+  rec.assert("[s5-bisect] no deferred surface and positive follow log", deferrals.stdout.includes(GIT_LAYOUT_SURFACES.noDeferredRepos) && !(pull.stdout + pull.stderr).includes("git-sync deferred") && (pull.stdout + pull.stderr).includes(GIT_LAYOUT_SURFACES.followed("s5-bisect")), `${deferrals.stdout}\n${pull.stdout}${pull.stderr}`.trim().slice(-800));
   await commitRoundTrip(ctx, rec, rel);
   await assertNoopCycle(ctx, rec, rel);
   findings.push({ slug: "engine-gap: bisect-invisible", cell: rel, summary: "sync reattached HEAD and replaced the semantic index while unmanaged bisect metadata persisted", evidence: [`candidate=${candidate.stdout.trim()}`, `incoming=${incoming}`, "HEAD=ref: refs/heads/main", "semantic index=incoming", "BISECT_* and refs/bisect unchanged", "no deferral fired"] });
 }
 
-type CellRunner = (ctx: RigCtx, rec: Recorder, findings: GitShapeFinding[]) => Promise<void>;
-const CELL_RUNNERS: readonly [GitShapeCell, CellRunner][] = [
+type CellRunner = (ctx: RigCtx, rec: Recorder, findings: GitLayoutFinding[]) => Promise<void>;
+const CELL_RUNNERS: readonly [GitLayoutCell, CellRunner][] = [
   ["s1-a", (ctx, rec) => runS1A(ctx, rec)],
   ["s1-b", (ctx, rec) => runS1B(ctx, rec)],
   ["s1-c", (ctx, rec) => runS1C(ctx, rec)],
@@ -860,15 +860,15 @@ const CELL_RUNNERS: readonly [GitShapeCell, CellRunner][] = [
   ["s5-bisect", runBisect],
 ];
 
-export const gitShapes: Scenario = {
-  name: "git-shapes",
+export const gitLayouts: Scenario = {
+  name: "git-layouts",
   async run(ctx: RigCtx): Promise<ScenarioReport> {
     const startedAt = new Date().toISOString();
     const rec = createRecorder(ctx);
-    const findings: GitShapeFinding[] = [];
-    rec.assert("fifteen normative outcomes registered", GIT_SHAPE_OUTCOMES.length === 15, GIT_SHAPE_OUTCOMES.join(", "));
+    const findings: GitLayoutFinding[] = [];
+    rec.assert("fifteen normative outcomes registered", GIT_LAYOUT_OUTCOMES.length === 15, GIT_LAYOUT_OUTCOMES.join(", "));
     for (const [cell, runner] of CELL_RUNNERS) {
-      ctx.log(`\n── git-shapes cell ${cell} ──`);
+      ctx.log(`\n── git-layouts cell ${cell} ──`);
       try {
         await rec.step(`[${cell}] full normative lifecycle`, () => runner(ctx, rec, findings));
         await probeHealth(ctx, rec, findings, cell, "cell-boundary");
@@ -876,13 +876,13 @@ export const gitShapes: Scenario = {
         ctx.log(`✗ ${cell} aborted: ${errMsg(error)}`);
         await probeHealth(ctx, rec, findings, cell, "operation-timeout-or-abort").catch((probeError) => ctx.log(`health probe failed: ${errMsg(probeError)}`));
       }
-      await writeFile(path.join(ctx.runDir, "git-shapes-findings.md"), renderGitShapeFindings(findings), "utf8");
+      await writeFile(path.join(ctx.runDir, "git-layouts-findings.md"), renderGitLayoutFindings(findings), "utf8");
       try { await teardownAccount(ctx, rec); } catch (error) { ctx.log(`cell teardown failed: ${errMsg(error)}`); }
       await resetBetweenCells(ctx, cell);
     }
     rec.assert("bisect engine gap recorded", findings.some((f) => f.slug === "engine-gap: bisect-invisible"), findings.map((f) => f.slug).join(", "));
     rec.assert("rebase post-abort engine gap recorded", findings.some((f) => f.slug === "engine-gap: rebase-post-abort-epipe"), findings.map((f) => f.slug).join(", "));
-    await writeFile(path.join(ctx.runDir, "git-shapes-findings.md"), renderGitShapeFindings(findings), "utf8");
-    return finalizeReport({ scenario: gitShapes.name, startedAt, finishedAt: new Date().toISOString(), steps: rec.steps, assertions: rec.assertions });
+    await writeFile(path.join(ctx.runDir, "git-layouts-findings.md"), renderGitLayoutFindings(findings), "utf8");
+    return finalizeReport({ scenario: gitLayouts.name, startedAt, finishedAt: new Date().toISOString(), steps: rec.steps, assertions: rec.assertions });
   },
 };

@@ -9,7 +9,7 @@ import { conductorInitialSync } from "./conductor-initial-sync.js";
 import { chaosRestart } from "./chaos-restart.js";
 import { gitEntanglement } from "./git-entanglement.js";
 import { gitConfigSync } from "./git-config-sync.js";
-import { gitShapes } from "./git-shapes.js";
+import { gitLayouts } from "./git-layouts.js";
 import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
 import { gitRebuildSettlement } from "./git-rebuild-settlement.js";
@@ -33,7 +33,7 @@ export const SCENARIOS = {
   "daemon-idle-cpu": daemonIdleCpu,
   "git-entanglement": gitEntanglement,
   "git-config-sync": gitConfigSync,
-  "git-shapes": gitShapes,
+  "git-layouts": gitLayouts,
   "git-ff": gitFf,
   "git-join-ahead": gitJoinAhead,
   "git-rebuild-settlement": gitRebuildSettlement,

@@ -104,13 +104,13 @@ export async function preflightManualPresentArtifacts(args: {
             resumed.status === "refresh-receipt"
               ? refreshLockedAcceptedPRepair({
                   repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(), acceptedReceipt: accepted,
-                  mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
+                  mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
                   validateArtifacts,
                 })
               : resumed.status === "restart" ? { status: "restart" as const } : { status: "hold" as const, reason: resumed.reason })
         : await runLockedPRepairAttempt({
             repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(),
-            mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
+            mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
             validateArtifacts,
           });
       if (repaired.status === "hold") return { status: "hold", reason: repaired.reason };

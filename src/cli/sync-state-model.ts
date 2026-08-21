@@ -241,7 +241,7 @@ export type TypedBlocker =
         | "wrong-ref-class"
         | "scope-refused"
         | "manual-proof-mismatch"
-        | "p-repair-shape-mismatch"
+        | "p-repair-witness-mismatch"
         | "checkout-incomplete";
     };
 
@@ -294,7 +294,7 @@ export interface GitResolutionBinding {
     read: "ok" | "over-bounds" | "failed" | "not-owned";
     hash?: string;
     detail?: string;
-    shape?: string;
+    storeIdentity?: string;
   };
   effectiveRefScope: "all" | "scoped";
   capturePolicy: { syncGit: boolean; respectGitignore: boolean; incremental?: boolean };
@@ -394,4 +394,3 @@ export interface StateSaveOptions {
    * physical state lock. The writer must assert and reuse it, never re-enter. */
   heldLock?: OwnedLock;
 }
-

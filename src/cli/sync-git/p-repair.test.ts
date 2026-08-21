@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { canonicalize } from "../../engine/e2ee/jcs.js";
 import { hashBytes } from "../../engine/hash.js";
 import {
   MAX_P_REPAIR_Q_BYTES,
@@ -30,7 +31,7 @@ const input = () => ({
     reflogEntries: 42, reflogTop: Buffer.from(Array.from({ length: 8_000 }, (_, i) => 255 - (i & 0xff))),
   },
   skeep: [U, A, B, U], at: "2026-07-16T12:00:00.000Z",
-  mismatches: { live: true, reflog: true, baseShape: false },
+  mismatches: { live: true, reflog: true, baseRefs: false },
 });
 
 test("§130 maximal Q projections retain full counts/hashes and remain below 8,192 bytes", () => {
@@ -48,10 +49,10 @@ test("§130 maximal Q projections retain full counts/hashes and remain below 8,1
 });
 
 test("§130 repair reason and BASE disposition tables are total and ordered", () => {
-  expect(pRepairReason({ live: true, reflog: true, baseShape: true })).toBe("base-shape-mismatch");
-  expect(pRepairReason({ live: true, reflog: true, baseShape: false })).toBe("live-mismatch");
-  expect(pRepairReason({ live: false, reflog: true, baseShape: false })).toBe("reflog-mismatch");
-  expect(() => pRepairReason({ live: false, reflog: false, baseShape: false })).toThrow();
+  expect(pRepairReason({ live: true, reflog: true, baseRefs: true })).toBe("base-refs-mismatch");
+  expect(pRepairReason({ live: true, reflog: true, baseRefs: false })).toBe("live-mismatch");
+  expect(pRepairReason({ live: false, reflog: true, baseRefs: false })).toBe("reflog-mismatch");
+  expect(() => pRepairReason({ live: false, reflog: false, baseRefs: false })).toThrow();
   expect(pRepairBaseDisposition(A, B, A)).toBe("advance-prior-to-next");
   expect(pRepairBaseDisposition(A, B, B)).toBe("already-next");
   expect(pRepairBaseDisposition(A, B, null)).toBe("preserve-absent");
@@ -73,6 +74,15 @@ test("§130 Q parser rejects unknown fields and projection lies", () => {
   const badProjection = structuredClone(built.value);
   badProjection.p.payload.ref.truncated = false;
   expect(() => parsePRepairQ(Buffer.from(JSON.stringify(badProjection)))).toThrow();
+});
+
+test("legacy base-shape-mismatch Q bytes parse without normalization", () => {
+  const legacy = structuredClone(buildPRepairQ(input()).value);
+  legacy.repair.reason = "base-shape-mismatch";
+  const bytes = canonicalize(legacy);
+  const parsed = parsePRepairQ(bytes);
+  expect(parsed.repair.reason).toBe("base-shape-mismatch");
+  expect(canonicalize(parsed)).toEqual(bytes);
 });
 
 test("§130 retry matrix is closed over every specified durable shape", () => {

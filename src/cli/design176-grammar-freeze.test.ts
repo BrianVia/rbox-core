@@ -21,7 +21,7 @@ const CONSUMER_FREEZE = [
   ["shared rig fixtures", "scripts/rig/lib/git-fixtures.ts", ['`git-sync applied ${rel}`', '`git-sync followed ${rel}`', "return `git-sync: captured"]],
   ["git-held-livelock", "scripts/rig/scenarios/git-held-livelock.ts", ["git-sync superseded pending ${REPO}: local history subsumes the unapplied remote section"]],
   ["git-commit-propagation", "scripts/rig/scenarios/git-commit-propagation.ts", ["git-sync: captured [1-9]", "git-sync (followed|applied) ${repo}"]],
-  ["git-shapes", "scripts/rig/scenarios/git-shapes.ts", ['GIT_SHAPE_SURFACES.applied("s1-b")', "GIT_SHAPE_SURFACES.operationDeferredPrefix(rel)"]],
+  ["git-layouts", "scripts/rig/scenarios/git-layouts.ts", ['GIT_LAYOUT_SURFACES.applied("s1-b")', "GIT_LAYOUT_SURFACES.operationDeferredPrefix(rel)"]],
   ["daemon-control deferral collapse", "src/cli/daemon/daemon-deferral-visibility.test.ts", ['"git deferred 30m: local edits on branch release/0.9forged (repo)"']],
   // Design 273 rewrote the human --git listing to the pause-story grammar;
   // the scenario now pins that surface (the frozen `git deferred` line's

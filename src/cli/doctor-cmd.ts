@@ -95,7 +95,7 @@ export interface DiagnosticsBundle {
   daemonLogTail: DaemonLogSection;
   metrics: MetricsSection;
   activity: ActivitySection;
-  "workspaceShape": WorkspaceSize;
+  workspaceSize: WorkspaceSize;
   leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
   repoResidue: DiagnosticsRepoResidueSection;
 }
@@ -911,7 +911,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     daemonLogTail: sidecars.daemonLogTail,
     metrics: sidecars.metrics,
     activity: sidecars.activity,
-    "workspaceShape": ctx.workspaceSize,
+    workspaceSize: ctx.workspaceSize,
     leftoverWorktrees: ctx.diagnostics.leftoverWorktrees,
     repoResidue: ctx.diagnostics.repoResidue ?? {
       count: 0,

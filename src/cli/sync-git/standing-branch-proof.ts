@@ -83,7 +83,7 @@ export interface StandingRepairAttempt {
   readonly effectiveRefScope: GitRefScope;
   readonly p: PreparedProtocolRef<BasePresentPayload>;
   readonly repairAt: string;
-  readonly mismatches: { readonly live: boolean; readonly reflog: boolean; readonly baseShape: boolean };
+  readonly mismatches: { readonly live: boolean; readonly reflog: boolean; readonly baseRefs: boolean };
   validateArtifacts(): Promise<boolean>;
 }
 
@@ -195,7 +195,7 @@ export async function settleStandingBranchProof(
         effectiveRefScope: scope(),
         p,
         repairAt: effects.now(),
-        mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
+        mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
         validateArtifacts,
       };
       const accepted = record?.partial?.pRepaired?.[p.payload.ref];
