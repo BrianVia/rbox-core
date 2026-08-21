@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,8 @@ import { promptConfirm } from "./prompt.js";
 import { verifyAndParseManifest } from "./release-verify.js";
 import { RBOX_VERSION } from "./version.js";
 import { semverGt } from "./semver.js";
+import { isStandaloneBinary } from "./runtime.js";
+import { readUpgradeChannel, resolveUpgradeChannel } from "./upgrade-channel.js";
 import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -416,17 +419,47 @@ async function checkRemote(creds: Credentials | undefined, cfg: WorkspaceConfig)
   }
 }
 
-async function checkVersion(creds: Credentials | undefined, cfg: WorkspaceConfig): Promise<DoctorCheck> {
+class DoctorManifestFetchError extends Error {}
+
+export interface DoctorVersionDeps {
+  isStandaloneBinary?: typeof isStandaloneBinary;
+  executable?: string;
+  fetchBytes?: (url: string) => Promise<Uint8Array>;
+  verifyManifest?: typeof verifyAndParseManifest;
+}
+
+export async function checkVersion(
+  creds: Credentials | undefined,
+  cfg: WorkspaceConfig,
+  deps: DoctorVersionDeps = {},
+): Promise<DoctorCheck> {
   const base = creds?.remoteUrl ?? cfg.remoteUrl;
   try {
-    const [manifest, sig] = await Promise.all([fetchWithTimeout(`${base}/version`), fetchWithTimeout(`${base}/version.sig`)]);
-    if (!manifest.res.ok || !sig.res.ok) return { ok: false, label: "version", message: "could not fetch release manifest", current: RBOX_VERSION };
-    const latest = verifyAndParseManifest(new Uint8Array(await manifest.res.arrayBuffer()), new Uint8Array(await sig.res.arrayBuffer())).version;
+    const standalone = (deps.isStandaloneBinary ?? isStandaloneBinary)();
+    const executable = deps.executable ?? (standalone ? fs.realpathSync(process.execPath) : undefined);
+    const persisted = executable === undefined ? "latest" : await readUpgradeChannel(executable);
+    const fetchBytes = deps.fetchBytes ?? (async (url: string) => {
+      const { res } = await fetchWithTimeout(url);
+      if (!res.ok) throw new DoctorManifestFetchError();
+      return new Uint8Array(await res.arrayBuffer());
+    });
+    const resolved = await resolveUpgradeChannel({
+      remoteUrl: base,
+      requested: undefined,
+      persisted,
+      fetchBytes,
+      verifyManifest: deps.verifyManifest ?? verifyAndParseManifest,
+    });
+    const latest = resolved.manifest.version;
+    const channelSuffix = resolved.channel === "next" ? ", next channel" : "";
     if (semverGt(latest, RBOX_VERSION)) {
-      return { ok: false, label: "version", message: `update available (${latest})`, hint: "run `rbox upgrade`", current: RBOX_VERSION, latest };
+      return { ok: false, label: "version", message: `update available (${latest}${channelSuffix})`, hint: "run `rbox upgrade`", current: RBOX_VERSION, latest };
     }
-    return { ok: true, label: "version", message: `up to date (${RBOX_VERSION})`, current: RBOX_VERSION, latest };
-  } catch {
+    return { ok: true, label: "version", message: `up to date (${RBOX_VERSION}${channelSuffix})`, current: RBOX_VERSION, latest };
+  } catch (error) {
+    if (error instanceof DoctorManifestFetchError) {
+      return { ok: false, label: "version", message: "could not fetch release manifest", current: RBOX_VERSION };
+    }
     return { ok: false, inconclusive: true, label: "version", message: "could not verify latest release", current: RBOX_VERSION };
   }
 }

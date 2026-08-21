@@ -2,6 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
+import { jsonObject, jsonText, type JsonValue } from "../json.js";
+import type { Manifest } from "./release-verify.js";
+import { semverGt } from "./semver.js";
 
 export type UpgradeChannel = "latest" | "next";
 
@@ -18,6 +21,70 @@ export const upgradeChannelPath = (executable: string): string => `${executable}
 export function upgradeManifestBase(remoteUrl: string, channel: UpgradeChannel): string {
   const base = remoteUrl.replace(/\/+$/, "");
   return channel === "latest" ? base : `${base}/next`;
+}
+
+export interface ResolvedUpgradeChannel {
+  /** Channel whose manifest we adopted. */
+  channel: UpgradeChannel;
+  /** Verified manifest of the adopted channel. */
+  manifest: Manifest;
+  /** Persisted next was superseded by a newer stable. */
+  supersedesNext: boolean;
+  /** Stable could not be fetched or verified, so persisted next was kept. */
+  stableUnavailable: boolean;
+  /** Version on next when a newer stable superseded it. */
+  supersededNextVersion?: string;
+}
+
+interface ResolveUpgradeChannelArgs {
+  remoteUrl: string;
+  requested: UpgradeChannel | undefined;
+  persisted: UpgradeChannel;
+  fetchBytes: (url: string) => Promise<Uint8Array>;
+  verifyManifest: (manifest: Uint8Array, sig: Uint8Array) => Manifest;
+}
+
+async function fetchManifest(
+  base: string,
+  fetchBytes: ResolveUpgradeChannelArgs["fetchBytes"],
+  verifyManifest: ResolveUpgradeChannelArgs["verifyManifest"],
+): Promise<Manifest> {
+  const [manifest, signature] = await Promise.all([
+    fetchBytes(`${base}/version`),
+    fetchBytes(`${base}/version.sig`),
+  ]);
+  return verifyManifest(manifest, signature);
+}
+
+export async function resolveUpgradeChannel(args: ResolveUpgradeChannelArgs): Promise<ResolvedUpgradeChannel> {
+  const selected = args.requested ?? args.persisted;
+  if (args.requested !== undefined || selected === "latest") {
+    const manifest = await fetchManifest(
+      upgradeManifestBase(args.remoteUrl, selected),
+      args.fetchBytes,
+      args.verifyManifest,
+    );
+    return { channel: selected, manifest, supersedesNext: false, stableUnavailable: false };
+  }
+
+  const [next, stable] = await Promise.allSettled([
+    fetchManifest(upgradeManifestBase(args.remoteUrl, "next"), args.fetchBytes, args.verifyManifest),
+    fetchManifest(upgradeManifestBase(args.remoteUrl, "latest"), args.fetchBytes, args.verifyManifest),
+  ]);
+  if (next.status === "rejected") throw next.reason;
+  if (stable.status === "rejected") {
+    return { channel: "next", manifest: next.value, supersedesNext: false, stableUnavailable: true };
+  }
+  if (semverGt(stable.value.version, next.value.version)) {
+    return {
+      channel: "latest",
+      manifest: stable.value,
+      supersedesNext: true,
+      stableUnavailable: false,
+      supersededNextVersion: next.value.version,
+    };
+  }
+  return { channel: "next", manifest: next.value, supersedesNext: false, stableUnavailable: false };
 }
 
 function sameFile(
@@ -56,18 +123,18 @@ export async function readUpgradeChannel(executable: string): Promise<UpgradeCha
     if (bytesRead !== size || !sameFile(opened, afterHandle) || !sameFile(afterHandle, afterPath)) {
       throw new Error("upgrade channel setting changed while reading");
     }
-    let value: unknown;
+    let value: JsonValue;
     try {
       value = JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"));
     } catch (error) {
       throw new Error("upgrade channel setting is malformed", { cause: error });
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)
+    if (!jsonObject(value)
       || Object.keys(value).sort().join(",") !== "channel,schema"
-      || (value as { schema?: unknown }).schema !== 1) {
+      || value.schema !== 1) {
       throw new Error("upgrade channel setting is malformed");
     }
-    const channel = parseUpgradeChannel((value as { channel?: unknown }).channel as string | undefined);
+    const channel = parseUpgradeChannel(jsonText(value.channel) ? value.channel : undefined);
     if (channel === undefined) throw new Error("upgrade channel setting is malformed");
     return channel;
   } finally {
