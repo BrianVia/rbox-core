@@ -14,7 +14,7 @@ import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { verifyAndParseManifest } from "./release-verify.js";
 import { fetchWithDeadline } from "./remote/resilient.js";
-import { parseUpgradeChannel, readUpgradeChannel, upgradeManifestBase, writeUpgradeChannel } from "./upgrade-channel.js";
+import { parseUpgradeChannel, readUpgradeChannel, resolveUpgradeChannel, writeUpgradeChannel } from "./upgrade-channel.js";
 import { withUpgradeLock } from "./upgrade-lock.js";
 import { downloadToTemp } from "./release-download.js";
 import { syncMenuBarApp } from "./menubar-app.js";
@@ -28,6 +28,8 @@ import { syncMenuBarApp } from "./menubar-app.js";
  *    version (a signed-but-old manifest can't roll you back);
  *  - downloads the immutable versioned artifact, checks its sha256, then replaces
  *    the running binary by an atomic rename (no torn/partial binary).
+ *
+ * Which channel it follows is decided by `resolveUpgradeChannel`, not here.
  */
 
 function artifactName(): string {
@@ -277,14 +279,13 @@ async function readJsonNoFollow(filePath: string, label: string): Promise<JsonVa
 
 function parseCanonicalReleaseState(value: JsonValue): ReleaseState {
   if (!jsonObject(value)) throw new Error("upgrade release state is malformed");
-  const { schema, phase } = value;
+  const { schema, phase, version } = value;
   if (Object.keys(value).sort().join(",") !== "phase,schema,version"
     || schema !== 1
     || (phase !== "pending" && phase !== "committed")
-    || !jsonText(value.version)) {
+    || !jsonText(version)) {
     throw new Error("upgrade release state is malformed");
   }
-  const version = value.version;
   parseSemver(version);
   return { schema, version, phase };
 }
@@ -298,7 +299,9 @@ async function readLegacyFloor(): Promise<string | undefined> {
   try {
     const value = await readJsonNoFollow(legacyReleaseStatePath(), "legacy upgrade release state");
     if (value === undefined) return undefined;
-    if (!jsonObject(value) || Object.keys(value).join(",") !== "version" || !jsonText(value.version)) return undefined;
+    if (!jsonObject(value)
+      || Object.keys(value).join(",") !== "version"
+      || !jsonText(value.version)) return undefined;
     const version = value.version;
     parseSemver(version);
     return version;
@@ -351,11 +354,21 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
   // An explicit selection is authoritative and repairs an unreadable persisted
   // setting. Silent reads retain the fail-closed behavior.
   const priorChannel = requestedChannel === undefined ? await readUpgradeChannel(exe) : undefined;
-  const channel = requestedChannel ?? priorChannel!;
-  const manifestBase = upgradeManifestBase(remoteUrl, channel);
-  console.log(`checking the ${channel} channel…`);
-  const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${manifestBase}/version`), fetchBytes(`${manifestBase}/version.sig`)]);
-  const manifest = (opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest)(manifestBytes, sigBytes);
+  const selectedChannel = requestedChannel ?? priorChannel!;
+  console.log(`checking the ${selectedChannel} channel…`);
+  const resolved = await resolveUpgradeChannel({
+    remoteUrl,
+    requested: requestedChannel,
+    persisted: selectedChannel,
+    fetchBytes,
+    verifyManifest: opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest,
+  });
+  const manifest = resolved.manifest;
+  if (resolved.supersedesNext) {
+    console.log(`the latest channel now has ${manifest.version} (newer than next ${resolved.supersededNextVersion}) — following latest and clearing the next selection`);
+  } else if (resolved.stableUnavailable) {
+    console.log("could not check the latest channel — staying on next");
+  }
 
   const noUpgrade = async (floor: EffectiveFloor): Promise<void> => {
     if (semverGt(floor.version, RBOX_VERSION)) {
@@ -376,7 +389,9 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     && semverGt(floor.state.version, RBOX_VERSION);
   const artifact = () => {
     const art = manifest.artifacts[name];
-    if (!art || !/^[0-9a-f]{64}$/.test(art.sha256) || art.path !== String(art.path)) {
+    // Shape is already guaranteed by `verifyAndParseManifest`; what remains is
+    // the release-specific contract on the values themselves.
+    if (!art || !/^[0-9a-f]{64}$/.test(art.sha256)) {
       throw new Error(`release has no valid artifact for ${name}`);
     }
     if (art.path !== `v${manifest.version}/${name}`) {
@@ -388,6 +403,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     if (requestedChannel === undefined) {
       const currentChannel = await readUpgradeChannel(exe);
       if (currentChannel !== priorChannel) throw new Error("upgrade channel changed while this upgrade was running — retry");
+      if (resolved.supersedesNext) await writeUpgradeChannel(exe, "latest");
       return;
     }
     if (requestedChannel === "latest" && semverGt(lockedFloor.version, manifest.version)) {
@@ -402,7 +418,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
   if (requestedChannel !== undefined) artifact();
   const pendingRetry = isPendingRetry(floor);
   if (!semverGt(manifest.version, floor.version) && !pendingRetry) {
-    if (requestedChannel !== undefined) {
+    if (requestedChannel !== undefined || (resolved.supersedesNext && !opts.check)) {
       await withUpgradeLock(ctx, async () => applyChannelSelection(await effectiveFloor(ctx)));
     }
     if (opts.check) {

@@ -143,6 +143,25 @@ function serve(binary = Buffer.from("new-binary")): void {
   };
 }
 
+function serveChannels(binary = Buffer.from("new-binary")): string[] {
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+    if (url.includes("/bin/")) return new Response(binary, { status: 200 });
+    return new Response(url.includes("/next/") ? "next" : "stable", { status: 200 });
+  };
+  return urls;
+}
+
+function channelCommandDeps(next: ReleaseManifest, stable: ReleaseManifest) {
+  return {
+    isStandaloneBinary: () => true,
+    isElevated: () => true,
+    verifyAndParseManifest: (bytes: Uint8Array) => new TextDecoder().decode(bytes) === "next" ? next : stable,
+  };
+}
+
 test("upgrade command first current-version gate restarts stale daemons", async () => {
   await liveRuntime("outer-gate", 501, "1.7.18");
   serve();
@@ -216,8 +235,127 @@ test("next channel persists per install and derives both manifest URLs", async (
     "https://releases.example/next/version.sig",
     "https://releases.example/next/version",
     "https://releases.example/next/version.sig",
+    "https://releases.example/version",
+    "https://releases.example/version.sig",
   ]);
   expect(consoleLogs.filter((line) => line === "checking the next channel…")).toHaveLength(2);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("persisted next follows a newer stable and clears the selection after installing", async () => {
+  const binary = Buffer.from("stable-binary");
+  const next = manifest(RBOX_VERSION);
+  const stable = manifest("2.0.0", binary);
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  serveChannels(binary);
+  const consoleLogs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
+  try {
+    await upgradeCmd("https://releases.example", { commandDeps: channelCommandDeps(next, stable) });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(await fs.readFile(executable)).toEqual(binary);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "latest" });
+  expect(consoleLogs).toContain(
+    `the latest channel now has 2.0.0 (newer than next ${RBOX_VERSION}) — following latest and clearing the next selection`,
+  );
+  expect(consoleLogs).toContain(`upgraded ${RBOX_VERSION} → 2.0.0`);
+});
+
+test("check mode reports adopted stable without clearing persisted next", async () => {
+  const next = manifest(RBOX_VERSION);
+  const stable = manifest("2.0.0");
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  serveChannels();
+  const consoleLogs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
+  try {
+    await upgradeCmd("https://releases.example", { check: true, commandDeps: channelCommandDeps(next, stable) });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(consoleLogs).toContain(`update available: 2.0.0 (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("persisted next stays selected when stable is not newer", async () => {
+  const next = manifest(RBOX_VERSION);
+  const stable = manifest("1.12.0");
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  const urls = serveChannels();
+  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await upgradeCmd("https://releases.example", { check: true, commandDeps: channelCommandDeps(next, stable) });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(urls.filter((url) => url.endsWith("version") || url.endsWith("version.sig"))).toEqual([
+    "https://releases.example/next/version",
+    "https://releases.example/next/version.sig",
+    "https://releases.example/version",
+    "https://releases.example/version.sig",
+  ]);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("superseded next clears even when there is nothing to install", async () => {
+  const next = manifest("1.12.0");
+  const stable = manifest(RBOX_VERSION);
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  serveChannels();
+  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await upgradeCmd("https://releases.example", { commandDeps: channelCommandDeps(next, stable) });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "latest" });
+});
+
+test("explicit next never observes or follows a newer stable", async () => {
+  const next = manifest(RBOX_VERSION);
+  const stable = manifest("2.0.0");
+  const urls = serveChannels();
+  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await upgradeCmd("https://releases.example", {
+      check: true,
+      channel: "next",
+      commandDeps: channelCommandDeps(next, stable),
+    });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(urls).toEqual([
+    "https://releases.example/next/version",
+    "https://releases.example/next/version.sig",
+  ]);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("stable failure keeps persisted next and continues", async () => {
+  const binary = Buffer.from("next-binary");
+  const next = manifest(nextVersion(), binary);
+  const stable = manifest("2.0.0");
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/bin/")) return new Response(binary, { status: 200 });
+    if (!url.includes("/next/")) return new Response("unavailable", { status: 500 });
+    return new Response("next", { status: 200 });
+  };
+  const consoleLogs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
+  try {
+    await upgradeCmd("https://releases.example", { commandDeps: channelCommandDeps(next, stable) });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(consoleLogs).toContain("could not check the latest channel — staying on next");
+  expect(await fs.readFile(executable)).toEqual(binary);
+  expect(consoleLogs).toContain(`upgraded ${RBOX_VERSION} → ${next.version}`);
   expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
 });
 
@@ -287,7 +425,7 @@ test("a signed manifest without this platform does not persist the requested cha
   expect(fsSync.existsSync(`${executable}.channel.json`)).toBe(false);
 });
 
-test.skipIf(process.geteuid === undefined || process.geteuid() === 0)(
+test.skipIf(process.geteuid?.() === undefined || process.geteuid() === 0)(
   "unreadable legacy sudo state cannot block the first non-sudo daemon repair",
   async () => {
     await liveRuntime("legacy-sudo-state", 5021, "1.7.18");

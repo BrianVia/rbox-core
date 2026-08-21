@@ -118,9 +118,12 @@ For founder-fleet prerelease dogfood, use
 `curl -fsSL https://rbox.to/next/install.sh | sh` or
 `rbox upgrade --channel next`. The selection persists in
 `<installed-rbox>.channel.json`, so later unflagged upgrades continue checking
-`next`. Use `rbox upgrade --channel latest` to switch back after stable catches
-up. Running the stable installer also clears a persisted `next` selection;
-running the next installer writes it.
+`next` until stable ships a newer version; the next unflagged `rbox upgrade`
+then follows stable and clears the persisted selection. An explicit
+`rbox upgrade --channel next` always stays on next. Use
+`rbox upgrade --channel latest` to switch back sooner. Running the stable
+installer also clears a persisted `next` selection; running the next installer
+writes it.
 The installer is intentionally a binary swap only, so fleet/install-script
 deployments retain that explicit stop/start step. The managed `rbox upgrade`
 command instead snapshots every live daemon under `~/.rbox/daemons`, waits for

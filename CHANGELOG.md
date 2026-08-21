@@ -28,6 +28,8 @@ All notable changes to rbox are recorded here. The format follows
   so the comparison was skipped" — instead of an unexplained pause.
 
 ### Fixed
+- Devices following the `next` release channel now move back to stable once
+  stable is newer, so prerelease installs no longer get stranded after launch.
 - A Git repo whose local copy rbox cannot verify no longer re-downloads the
   same history on every sync. Repos in that state were downloading, unpacking,
   and re-checking the same unchanged history every few seconds, forever, which
