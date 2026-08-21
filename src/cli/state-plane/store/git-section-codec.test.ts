@@ -278,9 +278,9 @@ test("a corrupt plane_heads extras row is StateDataCorruptionError(planeHead)", 
   handle.close();
 });
 
-test("a corrupt migration_completion source-shape row is StateDataCorruptionError(migrationCompletion)", () => {
+test("a corrupt migration_completion source-presence row is StateDataCorruptionError(migrationCompletion)", () => {
   const { handle, db } = freshStore("rbox-gitsec-migcomp-");
-  db.query("UPDATE migration_completion SET source_shape_flags_cjson=? WHERE singleton=1").run(NON_CANONICAL);
+  db.query("UPDATE migration_completion SET source_presence_flags_cjson=? WHERE singleton=1").run(NON_CANONICAL);
   expectCorruption(() => openReadSnapshot(handle), "migrationCompletion", LINEAGE);
   handle.close();
 });

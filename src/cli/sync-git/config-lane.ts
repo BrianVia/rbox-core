@@ -81,7 +81,7 @@ export async function readLocalGitConfig(
 }
 
 export function sameConfigStoreIdentity(a: ConfigStoreIdentity | undefined, b: ConfigStoreIdentity | undefined): boolean {
-  return a !== undefined && b !== undefined && a.shape === b.shape &&
+  return a !== undefined && b !== undefined && a.repoKind === b.repoKind &&
     a.commonDir.realpath === b.commonDir.realpath && a.commonDir.dev === b.commonDir.dev &&
     a.commonDir.ino === b.commonDir.ino && a.commonDir.birthtime === b.commonDir.birthtime;
 }
@@ -98,7 +98,7 @@ export async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owne
   const relative = path.relative(rootReal, commonReal);
   const contained = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
   const storeIdentity: ConfigStoreIdentity = {
-    shape: ctx.kind,
+    repoKind: ctx.kind,
     commonDir: {
       realpath: commonReal,
       dev: stat.dev.toString(),

@@ -45,7 +45,7 @@ test("genesis read projections, state digest, and backup publication agree", () 
     repoRecords: {},
   });
   expect(stateSemanticDigest(stateStoreDatabase(handle)))
-    .toBe("cf4c1f7481d725a468cf3679d4eb99eb14040df7dc2438a37887b424ef6b8700");
+    .toBe("55723dda4a0a5b8659dc7f858233f01c0616dab069ab73ffcd195cef5a797ec6");
 
   const destination = path.join(root, "backups", "state.db");
   const result = publishStateBackup({

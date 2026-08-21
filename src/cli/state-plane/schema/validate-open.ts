@@ -66,7 +66,16 @@ export function validateOpen(db: Database, file: string): StoreHeader {
     throw new StateStoreOpenError("wrong-schema-version", file, `schema is ${header.schema_version}, expected ${STATE_STORE_SCHEMA_VERSION}`);
   }
   if (header.ddl_fingerprint !== STATE_STORE_DDL_FINGERPRINT) {
-    throw new StateStoreOpenError("ddl-fingerprint", file, "frozen DDL fingerprint mismatch");
+    // There is no migration, by design (2026-08-21 founder ruling): these
+    // records simply cannot be read, so the refusal carries the remedy rather
+    // than a fingerprint a reader can do nothing with. Same instruction the
+    // doctor prints for the sibling `authority-corrupt` case, because it is the
+    // same fix: start the local records over with the files left where they are.
+    throw new StateStoreOpenError(
+      "ddl-fingerprint",
+      file,
+      "these sync records were written by a different version of rbox. Stop rbox, move this workspace's .rbox folder aside, then run `rbox adopt` here to start its local records over — your files stay where they are",
+    );
   }
   const applicationId = selectRow<{ application_id: number }>(db, "PRAGMA application_id")!.application_id;
   const userVersion = selectRow<{ user_version: number }>(db, "PRAGMA user_version")!.user_version;

@@ -192,8 +192,8 @@ function realisticState(): SyncState {
     ...records["repo-02"]!,
     packedRefsIdentity: { mtimeMs: 12.5 },
     cfgToken: { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" },
-    cfgShape: {
-      shape: "standalone",
+    cfgStore: {
+      repoKind: "standalone",
       commonDir: { realpath: "/repo/.git", dev: "1", ino: "2", birthtime: "3" },
     },
     attempt: {
@@ -284,7 +284,7 @@ function insertEntry(handle: StateStoreHandle, entry: FileEntry): void {
 const REPO_VALUE_COLUMNS = [
   "base_cjson", "advertised_cjson", "branch_base_origins_cjson", "packed_refs_identity",
   "pending_cjson", "repo_absent", "removed_key", "resolution_key", "cfg_synced", "cfg_applied",
-  "cfg_token_cjson", "cfg_shape_cjson", "deferrals_cjson", "partial_cjson", "attempt_cjson",
+  "cfg_token_cjson", "cfg_store_cjson", "deferrals_cjson", "partial_cjson", "attempt_cjson",
   "resolution_receipt_cjson", "idx_proj",
 ] as const;
 
@@ -317,7 +317,7 @@ function insertState(handle: StateStoreHandle, state: SyncState): void {
       LINEAGE,
     );
     db.query(`UPDATE migration_completion SET source_repo_records_present=1,
-      source_shape_flags_cjson=?,entry_count=?,repo_count=? WHERE singleton=1`).run(
+      source_presence_flags_cjson=?,entry_count=?,repo_count=? WHERE singleton=1`).run(
       canonicalJson({
         stream: true,
         stateNonce: true,
@@ -501,7 +501,7 @@ test("empty manifest gitRepos presence survives independently of child rows", ()
     plane: "base", purpose: "wire-snapshot", projectionToken: absent.token,
   })).not.toHaveProperty("gitRepos");
   stateStoreDatabase(handle).query(
-    "UPDATE migration_completion SET source_shape_flags_cjson=? WHERE singleton=1",
+    "UPDATE migration_completion SET source_presence_flags_cjson=? WHERE singleton=1",
   ).run(canonicalJson({ lastSyncedManifest: { gitRepos: true } }));
   const present = openReadSnapshot(handle);
   expect(materializeManifestFromStore(handle, {

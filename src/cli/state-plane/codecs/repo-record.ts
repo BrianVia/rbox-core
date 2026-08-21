@@ -18,7 +18,7 @@ export const REPO_RECORD_COLUMN_BY_FIELD = {
   cfgSynced: "cfg_synced",
   cfgApplied: "cfg_applied",
   cfgToken: "cfg_token_cjson",
-  cfgShape: "cfg_shape_cjson",
+  cfgStore: "cfg_store_cjson",
   deferrals: "deferrals_cjson",
   partial: "partial_cjson",
   attempt: "attempt_cjson",
@@ -30,7 +30,7 @@ export const REPO_RECORD_KEYS = Object.keys(REPO_RECORD_COLUMN_BY_FIELD) as Arra
 
 const JSON_FIELDS = [
   "base", "advertised", "branchBaseOrigins", "packedRefsIdentity", "pending",
-  "cfgToken", "cfgShape", "deferrals", "partial", "attempt", "resolutionReceipt",
+  "cfgToken", "cfgStore", "deferrals", "partial", "attempt", "resolutionReceipt",
 ] as const satisfies readonly (keyof RepoRecord)[];
 
 function counter(value: number, field: string): void {
@@ -44,8 +44,8 @@ function counter(value: number, field: string): void {
 type RepoRecordFixedMember =
   | NonNullable<RepoRecord["packedRefsIdentity"]>
   | NonNullable<RepoRecord["cfgToken"]>
-  | NonNullable<RepoRecord["cfgShape"]>
-  | NonNullable<RepoRecord["cfgShape"]>["commonDir"]
+  | NonNullable<RepoRecord["cfgStore"]>
+  | NonNullable<RepoRecord["cfgStore"]>["commonDir"]
   | NonNullable<RepoRecord["resolutionReceipt"]>;
 
 function exactObject(
@@ -69,7 +69,7 @@ function textMembers(value: RepoRecordFixedMember, field: string, keys: readonly
   }
 }
 
-function validateFixedShapes(value: RepoRecord): void {
+function validateFixedFields(value: RepoRecord): void {
   if (value.packedRefsIdentity !== undefined) {
     exactObject(value.packedRefsIdentity, "packedRefsIdentity", ["mtimeMs"]);
     if (typeof value.packedRefsIdentity.mtimeMs !== "number" || !Number.isFinite(value.packedRefsIdentity.mtimeMs)) {
@@ -80,11 +80,11 @@ function validateFixedShapes(value: RepoRecord): void {
     exactObject(value.cfgToken, "cfgToken", ["dev", "ino", "size", "mtimeNs", "ctimeNs"]);
     textMembers(value.cfgToken, "cfgToken", ["dev", "ino", "size", "mtimeNs", "ctimeNs"]);
   }
-  if (value.cfgShape !== undefined) {
-    exactObject(value.cfgShape, "cfgShape", ["shape", "commonDir"]);
-    if (typeof value.cfgShape.shape !== "string") throw new TypeError("cfgShape.shape must be text");
-    exactObject(value.cfgShape.commonDir, "cfgShape.commonDir", ["realpath", "dev", "ino", "birthtime"]);
-    textMembers(value.cfgShape.commonDir, "cfgShape.commonDir", ["realpath", "dev", "ino", "birthtime"]);
+  if (value.cfgStore !== undefined) {
+    exactObject(value.cfgStore, "cfgStore", ["repoKind", "commonDir"]);
+    if (typeof value.cfgStore.repoKind !== "string") throw new TypeError("cfgStore.repoKind must be text");
+    exactObject(value.cfgStore.commonDir, "cfgStore.commonDir", ["realpath", "dev", "ino", "birthtime"]);
+    textMembers(value.cfgStore.commonDir, "cfgStore.commonDir", ["realpath", "dev", "ino", "birthtime"]);
   }
   if (value.resolutionReceipt !== undefined) {
     exactObject(value.resolutionReceipt, "resolutionReceipt", [
@@ -121,7 +121,7 @@ export function encodeRepoRecord(relPath: string, input: RepoRecord): EncodedRep
     if (value[field] === null) throw new TypeError(`${field} must be absent rather than null`);
   }
   if (value.repoAbsent !== undefined && value.repoAbsent !== true) throw new TypeError("repoAbsent must be true or absent");
-  validateFixedShapes(value);
+  validateFixedFields(value);
   for (const field of ["base", "advertised", "pending"] as const) {
     const section = value[field];
     if (section !== undefined && !validateGitRepos({ [relPath]: section }).ok) throw new TypeError(`invalid ${field} GitSection`);
@@ -170,7 +170,7 @@ export interface RepoRecordRow {
   cfg_synced: string | null;
   cfg_applied: string | null;
   cfg_token_cjson: string | null;
-  cfg_shape_cjson: string | null;
+  cfg_store_cjson: string | null;
   deferrals_cjson: string | null;
   partial_cjson: string | null;
   attempt_cjson: string | null;

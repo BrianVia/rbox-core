@@ -111,7 +111,7 @@ test("schema and authority-state logical digest golden vectors are frozen", () =
     authorityId: "a".repeat(32), lineageId: "b".repeat(32), stream: "s", createdBy: "test",
   });
   expect(stateSemanticDigest(stateStoreDatabase(handle)))
-    .toBe("01983b922af309c935d8ee15277083ada69cd417fcb9a1229cc1fa1cff2a79c3");
+    .toBe("f44ded7d79e066817f69cc54343777d8549f86b0642c86b41cb07046142ef705");
   handle.close();
   fs.rmSync(root, { recursive: true, force: true });
 });

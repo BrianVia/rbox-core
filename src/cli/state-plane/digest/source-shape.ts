@@ -1,5 +1,5 @@
 /**
- * The `source_shape_flags_cjson` presence bits, built in ONE place for both
+ * The `source_presence_flags_cjson` presence bits, built in ONE place for both
  * origin kinds (design 222 §M-5).
  *
  * `installGenesisLineage` used to spell this object inline, and U3's importer

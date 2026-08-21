@@ -130,14 +130,14 @@ async function withHarness<T>(
 
 test("one repository-bound operation applies an existing target and records warnings", async () => {
   await withHarness({
-    priorLane: { cfgShape: standalone },
+    priorLane: { cfgStore: standalone },
     result: completedTransaction({ warnings: ["dropped credential"], baseHash: "basePre" }),
   }, async ({ receiver, calls, logs }) => {
     expect(await receiver.prepare(undefined)).toMatchObject({ due: true, requiresMaterialization: false });
     expect(await receiver.applyExisting()).toEqual({
       cfgApplied: gitConfigHash(INCOMING),
       cfgToken: token("post"),
-      cfgShape: standalone,
+      cfgStore: standalone,
     });
     expect(calls).toEqual(["applyExisting"]);
     expect(logs).toEqual(["git-sync WARNING repo: config dropped credential"]);
@@ -146,7 +146,7 @@ test("one repository-bound operation applies an existing target and records warn
 
 test("independent retry leaves the config transition byte-exact on failure", async () => {
   await withHarness({
-    priorLane: { cfgApplied: "old", cfgToken: token("old"), cfgShape: standalone },
+    priorLane: { cfgApplied: "old", cfgToken: token("old"), cfgStore: standalone },
     result: { status: "deferred", attempts: 3, fault: { disposition: "transient", reason: "unstable" } },
   }, async ({ receiver }) => {
     await receiver.prepare(undefined);
@@ -172,7 +172,7 @@ test("fresh config is unrepresentable in existing and follow windows", async () 
 
 test("clean materialization window applies a due existing receiver", async () => {
   await withHarness({
-    priorLane: { cfgShape: standalone },
+    priorLane: { cfgStore: standalone },
     result: completedTransaction(),
   }, async ({ receiver, calls }) => {
     expect(await receiver.prepare(undefined)).toMatchObject({
@@ -188,7 +188,7 @@ test("follow config refuses an escaped common-directory lock scope", async () =>
   let escaped: ReturnType<typeof harness> | undefined;
   await chainLock(new Map(), path.join(repoDir, ".git"), async (lock) => {
     escaped = harness(lock, {
-      priorLane: { cfgShape: standalone },
+      priorLane: { cfgStore: standalone },
       result: completedTransaction(),
     });
     await escaped.receiver.prepare(undefined);
@@ -200,7 +200,7 @@ test("follow config refuses an escaped common-directory lock scope", async () =>
 test("follow config refuses a live lock for another common directory", async () => {
   await chainLock(new Map(), path.join(root, "other", ".git"), async (lock) => {
     const { receiver, calls } = harness(lock, {
-      priorLane: { cfgShape: standalone },
+      priorLane: { cfgStore: standalone },
       result: completedTransaction(),
     });
     await receiver.prepare(undefined);
@@ -213,7 +213,7 @@ test("follow config refuses a live lock for another common directory", async () 
 
 test("follow config executes while the actual common-directory lock is held", async () => {
   await withHarness({
-    priorLane: { cfgShape: standalone },
+    priorLane: { cfgStore: standalone },
     result: completedTransaction(),
   }, async ({ receiver, calls }) => {
     await receiver.prepare(undefined);
@@ -264,7 +264,7 @@ test("prepare observes the config lane landed by published-journal recovery", as
       sourceSeq: 9,
       cfgApplied: gitConfigHash(INCOMING),
       cfgToken: snapshot.snapshot.token,
-      cfgShape: standalone,
+      cfgStore: standalone,
     };
     expect(await receiver.prepare(undefined)).toEqual({
       due: false,
@@ -286,7 +286,7 @@ test("after-materialization derives state from the installed config", async () =
     expect(await receiver.applyAfterMaterialization()).toEqual({
       cfgApplied: gitConfigHash(OTHER),
       cfgToken: token("fresh"),
-      cfgShape: standalone,
+      cfgStore: standalone,
     });
   });
 });
@@ -303,20 +303,20 @@ test("after-materialization claims authorship only when install equals incoming"
 
 test("sanitize-present seeds the local hash and preserves a same-shape baseline", async () => {
   await withHarness({
-    priorLane: { cfgSynced: "hash-A", cfgApplied: "applied-A", cfgShape: standalone },
+    priorLane: { cfgSynced: "hash-A", cfgApplied: "applied-A", cfgStore: standalone },
     wireSection: section(INCOMING, "scoped"),
     incomingAbsent: true,
   }, async ({ receiver }) => {
     const transition = await receiver.recordBaseline();
     expect(transition?.cfgSynced).toBe("hash-A");
     expect(transition?.cfgApplied).toBe("applied-A");
-    expect(transition?.cfgShape).toEqual(standalone);
+    expect(transition?.cfgStore).toEqual(standalone);
   });
 });
 
 test("sanitize-present resets a foreign shape before seeding the local hash", async () => {
   const pointer: ConfigStoreIdentity = {
-    shape: "worktree",
+    repoKind: "worktree",
     commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
   };
   await withHarness({
@@ -324,7 +324,7 @@ test("sanitize-present resets a foreign shape before seeding the local hash", as
       cfgSynced: "hash-A",
       cfgApplied: "applied-A",
       cfgToken: token("old"),
-      cfgShape: pointer,
+      cfgStore: pointer,
     },
     wireSection: section(INCOMING, "scoped"),
     incomingAbsent: true,
@@ -332,7 +332,7 @@ test("sanitize-present resets a foreign shape before seeding the local hash", as
     const transition = await receiver.recordBaseline();
     expect(transition).toEqual({
       cfgSynced: gitConfigHash({}),
-      cfgShape: standalone,
+      cfgStore: standalone,
     });
   });
 });
@@ -343,7 +343,7 @@ test("wire absence consumes only the authorship marker", async () => {
       cfgSynced: "hash-A",
       cfgApplied: "applied-A",
       cfgToken: token("old"),
-      cfgShape: standalone,
+      cfgStore: standalone,
     },
     wireSection: section(undefined),
     incomingAbsent: true,
@@ -351,14 +351,14 @@ test("wire absence consumes only the authorship marker", async () => {
     expect(await receiver.recordBaseline()).toEqual({
       cfgApplied: "applied-A",
       cfgToken: token("old"),
-      cfgShape: standalone,
+      cfgStore: standalone,
     });
   });
 });
 
 test("wire absence with no authorship marker is a no-op", async () => {
   await withHarness({
-    priorLane: { cfgApplied: "applied-A", cfgShape: standalone },
+    priorLane: { cfgApplied: "applied-A", cfgStore: standalone },
     wireSection: section(undefined),
     incomingAbsent: true,
   }, async ({ receiver }) => {
@@ -369,17 +369,17 @@ test("wire absence with no authorship marker is a no-op", async () => {
 
 test("shape invalidation returns the existing ConfigLaneState shape exactly once", async () => {
   const pointer: ConfigStoreIdentity = {
-    shape: "worktree",
+    repoKind: "worktree",
     commonDir: { realpath: "/foreign/.git", dev: "1", ino: "2", birthtime: "3" },
   };
   await withHarness({
-    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgShape: pointer },
+    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgStore: pointer },
   }, async ({ receiver }) => {
     const first = await receiver.prepare(undefined);
-    expect(first.transition).toEqual({ cfgShape: standalone });
+    expect(first.transition).toEqual({ cfgStore: standalone });
     const second = await receiver.prepare(undefined);
-    expect(second.transition).toEqual({ cfgShape: standalone });
-    expect(receiver.transition()).toEqual({ cfgShape: standalone });
+    expect(second.transition).toEqual({ cfgStore: standalone });
+    expect(receiver.transition()).toEqual({ cfgStore: standalone });
   });
 });
 
@@ -390,7 +390,7 @@ test("unchanged hash and stat token perform no config effect or state transition
     priorLane: {
       cfgApplied: gitConfigHash(INCOMING),
       cfgToken: snapshot.snapshot.token,
-      cfgShape: standalone,
+      cfgStore: standalone,
     },
     result: completedTransaction(),
   }, async ({ receiver, calls }) => {
@@ -406,7 +406,7 @@ test("unchanged hash and stat token perform no config effect or state transition
 
 test("the config-lane kill switch preserves the prior lane and performs no effects", async () => {
   await withHarness({
-    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgShape: standalone },
+    priorLane: { cfgSynced: "s", cfgApplied: "a", cfgToken: token("t"), cfgStore: standalone },
     laneDisabled: true,
     result: completedTransaction(),
   }, async ({ receiver, calls }) => {

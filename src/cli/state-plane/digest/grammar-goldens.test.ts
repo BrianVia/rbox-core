@@ -213,7 +213,7 @@ const FULL_RECORD: RepoRecordInput = {
   cfgSynced: "synced",
   cfgApplied: "applied",
   cfgToken: { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" },
-  cfgShape: { shape: "standalone", commonDir: { realpath: "/repo/.git", dev: "1", ino: "2", birthtime: "3" } },
+  cfgStore: { repoKind: "standalone", commonDir: { realpath: "/repo/.git", dev: "1", ino: "2", birthtime: "3" } },
   deferrals: { apply: { lane: "apply", deferredSince: "t0", reasonSince: "t0", lastSeen: "t1", reason: "local-commits" } },
   partial: { incomingKey: "incoming", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: false },
   attempt: HELD_ATTEMPT as GitHeldAttempt,
@@ -273,7 +273,7 @@ const withRecord = (patch: (record: Mutable<RepoRecordInput>) => void): Transiti
 };
 
 test("repo-transition-v1 base construction is pinned", () => {
-  expect(transitionDigest(TRANSITION_BASE)).toBe("4609dd749435b32b66eae636e3964233c665e283f65f5bc280906aa8d429f616");
+  expect(transitionDigest(TRANSITION_BASE)).toBe("7cd6d76bb52b57fa03f2eb717c0671098fb792141f6475adca793ed156a461ab");
 });
 
 test("repo-transition-v1 moves for every RepoRecord member it frames", () => {

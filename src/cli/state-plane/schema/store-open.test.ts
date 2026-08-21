@@ -221,6 +221,29 @@ test("wrong SQLite version, missing frozen object, and corrupt header are typed"
   }
 });
 
+// A store written by another version's DDL is the one refusal the founder fleet
+// and any 1.x holdover actually hit, and there is no migration to rescue it
+// (2026-08-21 ruling). The remedy is therefore part of the refusal's contract,
+// not incidental prose: pin the command so the copy cannot rot silently.
+test("a store from another version's DDL refuses with the fresh-start remedy", () => {
+  const target = file();
+  createStateStore(target, genesis).close();
+  const db = new Database(target);
+  db.exec(`UPDATE store_meta SET ddl_fingerprint='${"0".repeat(64)}' WHERE singleton=1`);
+  db.close();
+
+  let error: unknown;
+  try { openStateStore(target); } catch (caught) { error = caught; }
+  expect(error).toBeInstanceOf(StateStoreOpenError);
+  expect((error as StateStoreOpenError).reason).toBe("ddl-fingerprint");
+  const message = (error as StateStoreOpenError).message;
+  expect(message).toContain("written by a different version of rbox");
+  expect(message).toContain("rbox adopt");
+  expect(message).toContain("your files stay where they are");
+  // Never "upgrade": the reader is already running the binary that refuses.
+  expect(message).not.toContain("upgrade");
+});
+
 test("genesis identifiers and counters reject outside their exact domains", () => {
   expect(() => createStateStore(file(), { ...genesis, authorityId: "no" })).toThrow("authorityId");
   expect(() => createStateStore(file(), { ...genesis, stateRevision: -1 })).toThrow("stateRevision");

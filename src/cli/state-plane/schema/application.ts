@@ -8,7 +8,7 @@ export const STATE_STORE_APPLICATION_ID = "rbox-state-plane";
 export const STATE_STORE_SCHEMA_VERSION = 1;
 export const STATE_STORE_SQLITE_APPLICATION_ID = 0x52424f58;
 export const STATE_STORE_SQLITE_USER_VERSION = 1;
-export const STATE_STORE_DDL_FINGERPRINT = "4d2a960d759fad3a1ce3367b45b24f4b0c91a85c7f0a75025979a0db38e9e4d3";
+export const STATE_STORE_DDL_FINGERPRINT = "94b519282f6efaed3c51b96e0bf0ca6b998922f149a0600501eedc0cb2224695";
 
 export interface GenesisLineage {
   stream: string;
@@ -68,7 +68,7 @@ export function installGenesisLineage(db: Database, genesis: GenesisLineage): vo
     head.finalize();
     runStatement(db, `INSERT INTO migration_completion(
       singleton,origin_kind,migration_id,importer_version,authority_id,
-      source_json_sha256,source_semantic_digest,source_bytes,source_shape_flags_cjson,
+      source_json_sha256,source_semantic_digest,source_bytes,source_presence_flags_cjson,
       source_repo_records_present,entry_count,repo_count,per_table_counts_cjson,completed_at
     ) VALUES (1,'genesis',?,?,?,NULL,NULL,NULL,?,0,0,0,?,?)`,
       `genesis:${genesis.lineageId}`,

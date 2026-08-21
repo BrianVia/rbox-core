@@ -76,7 +76,7 @@ export const REPO_RECORD_FIELD_COVERAGE = {
   cfgSynced: true,
   cfgApplied: true,
   cfgToken: true,
-  cfgShape: true,
+  cfgStore: true,
   deferrals: true,
   partial: true,
   attempt: true,
@@ -109,7 +109,7 @@ export const GIT_SECTION_FIELD_COVERAGE = {
 } as const satisfies Record<keyof GitSection, true>;
 
 export const CONFIG_STORE_IDENTITY_FIELD_COVERAGE = {
-  shape: true,
+  repoKind: true,
   commonDir: true,
 } as const satisfies Record<keyof ConfigStoreIdentity, true>;
 

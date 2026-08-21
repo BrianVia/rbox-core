@@ -78,8 +78,8 @@ test("RepoRecord validates fixed nested carrier shapes before persistence", () =
     sourceSeq: 2,
     packedRefsIdentity: { mtimeMs: 1.5 },
     cfgToken: { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" },
-    cfgShape: {
-      shape: "standalone",
+    cfgStore: {
+      repoKind: "standalone",
       commonDir: { realpath: "/repo/.git", dev: "1", ino: "2", birthtime: "3" },
     },
     resolutionReceipt: {
@@ -97,8 +97,8 @@ test("RepoRecord validates fixed nested carrier shapes before persistence", () =
     ...fixed, cfgToken: { dev: "1", ino: "2", size: "3", mtimeNs: "4" },
   } as never)).toThrow("cfgToken");
   expect(() => encodeRepoRecord("repo", {
-    ...fixed, cfgShape: { shape: "standalone", commonDir: { realpath: "/repo", dev: "1", ino: "2" } },
-  } as never)).toThrow("cfgShape.commonDir");
+    ...fixed, cfgStore: { repoKind: "standalone", commonDir: { realpath: "/repo", dev: "1", ino: "2" } },
+  } as never)).toThrow("cfgStore.commonDir");
   expect(() => encodeRepoRecord("repo", {
     ...fixed,
     resolutionReceipt: {

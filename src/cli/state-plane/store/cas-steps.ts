@@ -204,7 +204,7 @@ export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: st
 const REPO_VALUE_COLUMNS = [
   "base_cjson", "advertised_cjson", "branch_base_origins_cjson", "packed_refs_identity",
   "pending_cjson", "repo_absent", "removed_key", "resolution_key", "cfg_synced", "cfg_applied",
-  "cfg_token_cjson", "cfg_shape_cjson", "deferrals_cjson", "partial_cjson", "attempt_cjson",
+  "cfg_token_cjson", "cfg_store_cjson", "deferrals_cjson", "partial_cjson", "attempt_cjson",
   "resolution_receipt_cjson", "idx_proj",
 ] as const;
 

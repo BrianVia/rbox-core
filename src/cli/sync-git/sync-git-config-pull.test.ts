@@ -88,7 +88,7 @@ async function dirStoreIdentity(dir = receiver): Promise<ConfigStoreIdentity> {
   const common = await fs.realpath(path.join(dir, ".git"));
   const stat = await fs.stat(common, { bigint: true });
   return {
-    shape: "dir",
+    repoKind: "dir",
     commonDir: {
       realpath: common,
       dev: stat.dev.toString(),
@@ -130,7 +130,7 @@ test("pull sync-point uses BOTH pinned ownership traces and preserves an unrelat
     await git(receiver, "config", "--add", "remote.upstream.url", ours["remote.upstream.url"]![0]!);
     const baseRow = { ...base, ...(row.baseConfig === undefined ? {} : { config: row.baseConfig }) };
     const remote = { ...base, config: desired };
-    const state = stateWith(baseRow, { cfgSynced: row.cfgSynced, cfgShape: storeIdentity });
+    const state = stateWith(baseRow, { cfgSynced: row.cfgSynced, cfgStore: storeIdentity });
     state.repoRecords!.unrelated = { repoGen: 7, sourceSeq: 1, cfgSynced: "keep-me" };
     const outcome = await apply(remote, state);
 
@@ -278,7 +278,7 @@ test("grammar-invalid incoming config is ignored while Git state applies", async
 
 test("config failure advances unchanged Git while an unauthorized converged branch remains pending", async () => {
   const storeIdentity = await dirStoreIdentity();
-  const oldLane = { cfgShape: storeIdentity, cfgApplied: "old-applied", cfgSynced: "old-synced" };
+  const oldLane = { cfgStore: storeIdentity, cfgApplied: "old-applied", cfgSynced: "old-synced" };
   const remoteSameGit = { ...base, config: desired };
   const first = await apply(remoteSameGit, stateWith(base, oldLane), { applyConfig: configFailure });
   expect(first.gitRepos?.["."]).toEqual(remoteSameGit);
@@ -292,7 +292,7 @@ test("config failure advances unchanged Git while an unauthorized converged bran
   await fs.rm(receiver, { recursive: true, force: true });
   await git(tmp, "clone", "-q", source, receiver);
   await git(receiver, "remote", "remove", "origin");
-  const convergedLane = { ...oldLane, cfgShape: await dirStoreIdentity() };
+  const convergedLane = { ...oldLane, cfgStore: await dirStoreIdentity() };
   const converged = await apply(remoteNewGit, stateWith(base, convergedLane), {
     applyConfig: configFailure,
     oracle: {
@@ -322,7 +322,7 @@ test("combined config failure keeps safe Git progress and defers only config", a
   const remote = { ...(await capture()), config: desired };
   const oldHead = await git(receiver, "rev-parse", "HEAD");
   const storeIdentity = await dirStoreIdentity();
-  const lane = { cfgShape: storeIdentity, cfgApplied: "old", cfgSynced: "old" };
+  const lane = { cfgStore: storeIdentity, cfgApplied: "old", cfgSynced: "old" };
 
   const ordinary = await apply(remote, stateWith(base, lane), { applyConfig: configFailure });
   expect(ordinary.gitPendingRemote).toBeUndefined();
@@ -446,6 +446,6 @@ test("pinned cross-shape receiver skips config once and advances Git normally", 
   expect(outcome.gitRepos?.wt).toEqual(remote);
   expect(await git(main, "config", "--get", "remote.upstream.url").catch(() => "missing")).toBe("missing");
   expect(logs.filter((line) => line.includes("config skipped wt"))).toHaveLength(1);
-  expect(outcome.configLane?.wt?.cfgShape?.shape).toBe("pointer");
+  expect(outcome.configLane?.wt?.cfgStore?.repoKind).toBe("pointer");
   expect(outcome.configLane?.wt?.cfgApplied).toBeUndefined();
 });
