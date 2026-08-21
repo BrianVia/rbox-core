@@ -1,5 +1,63 @@
 # rbox status — living state snapshot
 
+## 2026-08-21 (overnight run) — all six ruled workstreams LANDED (#799-#804)
+
+Six parallel opus-orchestrator agents (codex implementing per /arbitrage),
+every PR carrying a mandatory "Guessed decisions" section; Fable reviewed
+diffs and merged on green. All merged:
+
+- **#799 (#515)**: central surplus-positional gate; 62 registry arity
+  declarations; unexpected args now error naming the arg + usage.
+- **#800 (next-channel)**: `resolveUpgradeChannel` single owner; persisted
+  `next` + newer stable → adopts stable + clears selection; explicit
+  `--channel next` wins; manifest now boundary-parsed AFTER signature
+  verify (agent caught codex deleting a load-bearing guard).
+- **#802 (#793)**: root cause was NOT the re-arm — `record.advertised` is
+  only written on own-ACK, never refreshed by pull, so post-ADOPT plans
+  compared against stale reconstruction and echoed the peer's bytes back
+  (all 35 field ops=0 events correlate). Publish oracle is now the
+  persisted wire base (one authority deleted). Post-merge acceptance:
+  ops=0 count → 0 while ADOPTED lines continue — CHECK THIS after the
+  next fleet roll.
+- **#803 (#535)**: reframed with field proof — apply ALWAYS preserved
+  bytes via conflict copies on the reported path; the copies were
+  UNREPORTED (plan-derived reporters), which also wedged the git lane.
+  Now: `onConflictCopy` outcome reporting (INVARIANTS.md entry), plus two
+  REAL byte-loss edges fixed (rule-authority expectedLocal defeat on
+  .rboxignore; post-hash TOCTOU). Size-ratchet trip resolved by a real
+  seam: `engine/apply-target.ts` owns "what is at this path now".
+  Residuals honestly named in the PR (typeFlipsSincePull contract).
+- **#801 (RboxBar, design 282)**: zip rides the signed manifest (bespoke
+  wrangler steps deleted); API serves both zip shapes (DEV verified:
+  binary 200, zip 404-until-first-tag); `syncMenuBarApp` default ON +
+  RBOX_NO_MENUBAR_APP=1; first install LAUNCHES (agent caught the draft
+  violating the default-on ruling); install.sh = binary swap + one darwin
+  line. **Darwin e2e owed on the MacBook — 10 named checks in the PR;
+  load-bearing: the quarantine negative control.**
+- **#804 (wire-renames)**: 9 of 12+ renamed w/ dual-accept + deletion
+  conditions; 4 DEFERRED — state.db has no migration mechanism (DDL
+  fingerprint hard-refusal); founder ruling owed: schema-v2 migration vs
+  2.0 re-genesis (recommend re-genesis). BONUS: production
+  `rbox doctor --upload` had been 400ing (TOP_KEYS missing
+  leftoverWorktrees/repoResidue) — fixed.
+
+CF-runner pilot night-1 health: 4-5 runs hit the pool's "runner
+assignment not observed within 30s" fast-fail (reruns recovered every
+time), one recovery-kit concurrency flake (passes 5/5 locally at 2 CPUs);
+tally in docs/papercuts.md, feeds the Aug-27 verdict. The whole test
+MATRIX (typecheck/workers-API/regress too, not just 6 shards) runs on CF
+— the matrix shares one runs-on.
+
+#664 sampler running on the Mac (~/rbox-664-footprint.log, 5-min
+cadence): overnight ~491-566MB footprint, peak 1375MB — comfortably
+under the 2GB bar so far.
+
+Owed / founder queue: state.db ruling (above); darwin RboxBar e2e; #802
+field acceptance check; changelog draft review
+(docs/2.0-changelog-draft.md, NOTES FOR REVIEW at bottom); manifest-delta
+24 pre-existing anti-slop warnings (deferred cleanup, named follow-up);
+#664 24h collection completes ~2026-08-22 03:20Z.
+
 ## 2026-08-20 (evening) — CI on Cloudflare runners (#797) + design-156 flake ROOT-CAUSED (#798); Mac rolled
 
 - **PR #797 MERGED: the 6 test shards run on `cloudflare-ubuntu-latest`**
