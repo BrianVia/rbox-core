@@ -60,12 +60,12 @@ async function configBinding(root: string, rel: string, ctx: RepoCtx): Promise<G
   } catch {
     return { ownership: "indeterminate", read: "failed", detail: "ownership-read" };
   }
-  const shape = canonicalString(receiver.storeIdentity);
-  if (!receiver.owned) return { ownership: "unowned", read: "not-owned", shape };
+  const storeIdentity = canonicalString(receiver.storeIdentity);
+  if (!receiver.owned) return { ownership: "unowned", read: "not-owned", storeIdentity };
   const local = await readLocalGitConfig(root, rel, ctx);
-  if (local.status === "ok") return { ownership: "owned", read: "ok", hash: local.cached.hash, shape };
-  if (local.status === "over-bounds") return { ownership: "owned", read: "over-bounds", detail: local.reason, shape };
-  return { ownership: "owned", read: "failed", detail: `${local.fault.disposition}:${local.fault.reason}`, shape };
+  if (local.status === "ok") return { ownership: "owned", read: "ok", hash: local.cached.hash, storeIdentity };
+  if (local.status === "over-bounds") return { ownership: "owned", read: "over-bounds", detail: local.reason, storeIdentity };
+  return { ownership: "owned", read: "failed", detail: `${local.fault.disposition}:${local.fault.reason}`, storeIdentity };
 }
 
 /** Recompute the complete show-me/intent binding. No mutation is permitted here. */

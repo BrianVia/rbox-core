@@ -294,7 +294,7 @@ export interface GitResolutionBinding {
     read: "ok" | "over-bounds" | "failed" | "not-owned";
     hash?: string;
     detail?: string;
-    shape?: string;
+    storeIdentity?: string;
   };
   effectiveRefScope: "all" | "scoped";
   capturePolicy: { syncGit: boolean; respectGitignore: boolean; incremental?: boolean };
