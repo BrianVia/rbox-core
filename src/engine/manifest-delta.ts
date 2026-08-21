@@ -260,6 +260,17 @@ function deepEqual(a: CanonicalInput | undefined, b: CanonicalInput | undefined)
   return canonicalJson(a) === canonicalJson(b);
 }
 
+/** Whether two complete git layers would produce different canonical JSON. */
+export function gitSectionsDiffer(
+  a: Record<string, GitSection> | undefined,
+  b: Record<string, GitSection> | undefined,
+): boolean {
+  const left = a ?? {};
+  const right = b ?? {};
+  return [...new Set([...Object.keys(left), ...Object.keys(right)])]
+    .some((repo) => !deepEqual(left[repo], right[repo]));
+}
+
 function opKey(op: ManifestDeltaOp): string {
   return op.op === "set" ? op.entry.path : op.op === "del" ? op.path : op.repo;
 }
