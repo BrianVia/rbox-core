@@ -698,3 +698,5 @@ Manual fix each time: delete the blocking untracked copies, merge.
 Recurred 4 times in one night. Also: an agent wrote REVIEW-1/2.md at the
 primary repo root and rbox synced the litter fleet-wide within minutes —
 agent-output hygiene matters on a synced checkout.
+
+- 2026-08-21: `BlobBatchDownloader … liveness watchdog` timing test flaked once on the 2vCPU Cloudflare runner (PR #800 shard 5), rerun green. Second timing-sensitive test to wobble on CF (first: design-156, root-caused to umask). If it recurs → 4vCPU label or deflake the timer; feeds the Aug-27 pilot health check.
