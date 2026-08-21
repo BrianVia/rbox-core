@@ -2,7 +2,6 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { jsonObject, jsonText, type JsonValue } from "../json.js";
 import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
@@ -14,9 +13,11 @@ import { requireFolderAdmission } from "./autostart/folder-admission-gate.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { verifyAndParseManifest } from "./release-verify.js";
-import { DOWNLOAD_IDLE_MS, blobDownloadTimeoutMs, fetchWithDeadline } from "./remote/resilient.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 import { parseUpgradeChannel, readUpgradeChannel, resolveUpgradeChannel, writeUpgradeChannel } from "./upgrade-channel.js";
 import { withUpgradeLock } from "./upgrade-lock.js";
+import { downloadToTemp } from "./release-download.js";
+import { syncMenuBarApp } from "./menubar-app.js";
 
 /**
  * `rbox upgrade` (design 14) — self-update the installed binary, SAFELY:
@@ -89,6 +90,7 @@ export interface UpgradeCommandDeps {
   isElevated?: () => boolean;
   afterPendingState?: () => void | Promise<void>;
   afterExecutableRename?: () => void | Promise<void>;
+  syncMenuBarApp?: typeof syncMenuBarApp;
 }
 
 class UpgradeDaemonRestartError extends Error {
@@ -332,56 +334,6 @@ async function fetchBytes(url: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-/** Slow-drip backstop for the artifact download. The rbox binary is ~100 MB, so a flat
- *  small-control deadline would kill a healthy transfer on a thin link; this clamps to the
- *  shared download ceiling (1h by default, `RBOX_NET_BLOB_MAX_TIMEOUT_MS`). The real bound is
- *  the no-progress watchdog below. */
-const UPGRADE_DOWNLOAD_MAX_MS = blobDownloadTimeoutMs(Number.MAX_SAFE_INTEGER);
-
-/** Stream `url` to an O_EXCL temp file in `dir`, hashing as it lands. Returns the
- *  temp path + hex sha256. Caller verifies the sha then renames or unlinks. */
-async function downloadToTemp(url: string, dir: string): Promise<{ tmp: string; sha256: string }> {
-  const tmp = path.join(dir, `.rbox.upgrade.${process.pid}.${Date.now()}.tmp`);
-  const fd = fs.openSync(tmp, "wx", 0o755); // O_CREAT|O_EXCL|O_WRONLY
-  const hash = createHash("sha256");
-  // Same no-progress watchdog as blob downloads (remote/blobs.ts): abort only when NO bytes
-  // arrive for DOWNLOAD_IDLE_MS, reset on every chunk, and armed BEFORE the fetch so a
-  // black-holed connect trips it too instead of hanging `rbox upgrade` forever.
-  const ctrl = new AbortController();
-  let idle: ReturnType<typeof setTimeout> | undefined;
-  const armIdle = () => {
-    if (idle) clearTimeout(idle);
-    idle = setTimeout(() => ctrl.abort(new DOMException("upgrade download stalled", "TimeoutError")), DOWNLOAD_IDLE_MS);
-  };
-  armIdle();
-  try {
-    const res = await fetchWithDeadline(url, { redirect: "follow", signal: ctrl.signal }, UPGRADE_DOWNLOAD_MAX_MS);
-    if (!res.ok || !res.body) throw new Error(`download ${url} → ${res.status}`);
-    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      armIdle(); // progress → reset the no-progress watchdog
-      if (value) {
-        hash.update(value);
-        fs.writeSync(fd, value);
-      }
-    }
-    return { tmp, sha256: hash.digest("hex") };
-  } catch (e) {
-    fs.closeSync(fd);
-    await fsp.rm(tmp, { force: true }).catch(() => {});
-    throw e;
-  } finally {
-    if (idle) clearTimeout(idle);
-    try {
-      fs.closeSync(fd);
-    } catch {
-      /* already closed on the error path */
-    }
-  }
-}
-
 export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; channel?: string; daemonDeps?: UpgradeDaemonDeps; commandDeps?: UpgradeCommandDeps } = {}): Promise<void> {
   if (!(opts.commandDeps?.isStandaloneBinary ?? isStandaloneBinary)()) {
     throw new Error("`rbox upgrade` only works on an installed binary — you're running from source. Use git, or install via the one-liner.");
@@ -424,7 +376,11 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     } else if (ctx.elevated) {
       console.log(`already up to date (${RBOX_VERSION})`);
     } else {
-      await restartStaleDaemonsIfAny(opts.daemonDeps);
+      try {
+        await restartStaleDaemonsIfAny(opts.daemonDeps);
+      } finally {
+        await (opts.commandDeps?.syncMenuBarApp ?? syncMenuBarApp)(manifest, remoteUrl);
+      }
     }
   };
   const isPendingRetry = (floor: EffectiveFloor): boolean =>
@@ -536,7 +492,11 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     if (ctx.elevated) {
       console.log("run `rbox upgrade` once without sudo to restart user daemons on the new version");
     } else {
-      await restartDaemonsAfterUpgrade(opts.daemonDeps);
+      try {
+        await restartDaemonsAfterUpgrade(opts.daemonDeps);
+      } finally {
+        await (opts.commandDeps?.syncMenuBarApp ?? syncMenuBarApp)(manifest, remoteUrl);
+      }
     }
   });
 }

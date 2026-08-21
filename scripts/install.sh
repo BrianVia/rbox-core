@@ -93,6 +93,11 @@ echo "  ✓ rbox installed to $DEST/rbox"
 echo "  (download sha256 matched $BASE/version; Ed25519 release verification runs in rbox upgrade)"
 echo ""
 
+if [ "$OS" = "darwin" ]; then
+  echo "  macOS menu-bar app: run \`rbox upgrade\` to install rbox Bar"
+  echo ""
+fi
+
 # Optional: dependency-change notifications (design 29) — commented out
 # (design 51): `rbox deps notify install` runs through the `deps` CLI group,
 # which is currently disabled (src/cli/index.ts). Offering this now would

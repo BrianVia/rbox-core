@@ -47,15 +47,25 @@ changing the icon:
 ./icon/generate-icons.sh
 ```
 
-## Bundle And Run
+## Install A Released Build
+
+Released builds install and update through the signed CLI release path:
+
+```sh
+rbox upgrade
+```
+
+Set `RBOX_NO_MENUBAR_APP=1` to opt out of menu-bar app management.
+
+## Build And Run From Source
 
 ```sh
 ./scripts/bundle.sh
 open ./RboxBar.app
 ```
 
-If Gatekeeper blocks a local build, remove quarantine metadata and run the
-bundle script again so the app is ad-hoc signed:
+If quarantine metadata from an earlier downloaded copy interferes with a local
+developer build, remove it and bundle again:
 
 ```sh
 xattr -dr com.apple.quarantine RboxBar.app

@@ -199,6 +199,16 @@ test("upgrade command check mode does not restart stale daemons at the current-v
   ]);
 });
 
+test("check mode never syncs the menu-bar app", async () => {
+  serve();
+  let syncs = 0;
+  await upgradeCmd("https://releases.example", {
+    check: true,
+    commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), syncMenuBarApp: async () => { syncs += 1; } },
+  });
+  expect(syncs).toBe(0);
+});
+
 test("next channel persists per install and derives both manifest URLs", async () => {
   const urls: string[] = [];
   const consoleLogs: string[] = [];
@@ -486,6 +496,36 @@ test("successful upgrade runs the full daemon pass without current-version filte
   }
   expect(actions).toEqual(["stop", "start"]);
   expect(await fs.readFile(executable)).toEqual(binary);
+});
+
+test("current and upgraded paths both sync the menu-bar app", async () => {
+  serve();
+  const synced: string[] = [];
+  await upgradeCmd("https://releases.example", {
+    commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), syncMenuBarApp: async (release) => { synced.push(release.version); } },
+  });
+  const binary = Buffer.from("menu-bar-upgrade");
+  serve(binary);
+  const release = manifest(nextVersion(), binary);
+  await upgradeCmd("https://releases.example", {
+    commandDeps: { ...commandDeps(release), syncMenuBarApp: async (candidate) => { synced.push(candidate.version); } },
+  });
+  expect(synced).toEqual([RBOX_VERSION, release.version]);
+});
+
+test("daemon restart failure still syncs the menu-bar app before propagating", async () => {
+  await liveRuntime("restart-failure", 505, RBOX_VERSION);
+  const binary = Buffer.from("restart-failure-upgrade");
+  serve(binary);
+  let synced = false;
+  await expect(upgradeCmd("https://releases.example", {
+    commandDeps: { ...commandDeps(manifest(nextVersion(), binary)), syncMenuBarApp: async () => { synced = true; } },
+    daemonDeps: {
+      ...daemonDeps([], []),
+      stopDaemon: async () => { throw new Error("cannot stop"); },
+    },
+  })).rejects.toThrow("could not be restarted");
+  expect(synced).toBe(true);
 });
 
 test("elevated equal-version upgrade never enters home-scoped daemon or release paths", async () => {

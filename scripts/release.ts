@@ -8,7 +8,7 @@
  *   5. upload and fetch-verify immutable binaries, then publish latest aliases,
  *      install.sh, manifest, signature, and changelog to the rbox-releases bucket
  *
- * Usage: bun scripts/release.ts <version> [--targets=linux-x64,darwin-arm64] [--no-upload]
+ * Usage: bun scripts/release.ts <version> [--targets=linux-x64,darwin-arm64] [--app=RboxBar.zip] [--no-upload]
  *        bun scripts/release.ts --dev [--targets=linux-x64,darwin-arm64]
  * Env:   RBOX_RELEASE_PRIVATE_KEY (Ed25519 pkcs8 b64url), RBOX_RELEASE_KEY_ID
  */
@@ -20,6 +20,7 @@ import { RELEASE_KEYS } from "../src/cli/release-key.js";
 import { parseSemver, releaseChannelForVersion, semverGt, type ReleaseChannel } from "../src/cli/semver.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 import { publishReleaseObjects, wranglerReleaseStore, type ReleaseObjectStore } from "./release-publish.js";
+import { jsonObject, jsonText, type JsonValue } from "../src/json.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
@@ -31,11 +32,11 @@ export type ReleaseTarget = (typeof ALL)[number];
 // single host can cross-`--compile` without their `.node` bytes being resolved.
 // NB: the TARGET's package must be installed on the build host for its watcher to
 // embed — otherwise that binary still runs, but degrades to periodic-scan-only.
-export const PARCEL_PKG: Record<ReleaseTarget, string> = {
+export const PARCEL_PKG = {
   "darwin-arm64": "@parcel/watcher-darwin-arm64",
   "linux-arm64": "@parcel/watcher-linux-arm64-glibc",
   "linux-x64": "@parcel/watcher-linux-x64-glibc",
-};
+} as const satisfies Record<ReleaseTarget, string>;
 export const externalFlagsFor = (t: ReleaseTarget): string[] =>
   ALL.filter((o) => o !== t).flatMap((o) => ["--external", PARCEL_PKG[o]]);
 
@@ -62,6 +63,20 @@ export function releaseChannelForInput(version: string): ReleaseChannel {
 /** Mirrors release.yml's `!contains(github.ref_name, '-')` changelog guard. */
 export function workflowPublishesChangelog(version: string): boolean {
   return !version.includes("-");
+}
+
+export function addAppArtifact(
+  appPath: string,
+  dist: string,
+  version: string,
+  artifacts: Record<string, { sha256: string; path: string }>,
+): void {
+  const destination = path.join(dist, "RboxBar.zip");
+  fs.copyFileSync(appPath, destination);
+  artifacts["RboxBar.zip"] = {
+    sha256: createHash("sha256").update(fs.readFileSync(destination)).digest("hex"),
+    path: `v${version}/RboxBar-${version}.zip`,
+  };
 }
 
 function replaceOnce(source: string, before: string, after: string): string {
@@ -118,8 +133,8 @@ function nextChannelStore(store: ReleaseObjectStore, nextInstaller: string): Rel
   return {
     sha256: (key) => store.sha256(key),
     put: (key, file, contentType) => {
-      if (/^releases\/v[^/]+\/rbox-/.test(key)) return store.put(key, file, contentType);
-      if (/^releases\/rbox-/.test(key)) return Promise.resolve();
+      if (/^releases\/v[^/]+\/(?:rbox-|RboxBar-)/.test(key)) return store.put(key, file, contentType);
+      if (/^releases\/(?:rbox-|RboxBar\.zip$)/.test(key)) return Promise.resolve();
       if (key === "releases/install.sh") return store.put("releases/next/install.sh", nextInstaller, contentType);
       if (key === "releases/version.json") return store.put("releases/next/manifest.json", file, contentType);
       if (key === "releases/version.json.sig") return store.put("releases/next/manifest.json.sig", file, contentType);
@@ -186,6 +201,7 @@ function arg(name: string): string | undefined {
 async function main(): Promise<void> {
 const argv = process.argv.slice(2);
 const dev = argv.includes("--dev");
+const appPath = arg("app");
 const positional = argv.filter((value) => !value.startsWith("--"));
 const uploadOnly = argv.includes("--upload-only");
 let channel: ReleaseChannel | undefined;
@@ -200,6 +216,8 @@ if ((dev && (positional.length !== 0 || uploadOnly)) || (!dev && (positional.len
   console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]\n       bun scripts/release.ts --dev [--targets=...]");
   process.exit(2);
 }
+if (dev && appPath) throw new Error("--app cannot be used with --dev");
+if (appPath && !fs.existsSync(appPath)) throw new Error(`--app path does not exist: ${appPath}`);
 if (!dev && workflowPublishesChangelog(positional[0]!) !== (channel === "latest")) {
   throw new Error(`release channel and workflow changelog gate disagree for ${positional[0]}`);
 }
@@ -254,8 +272,8 @@ async function uploadRelease(): Promise<void> {
       if (channel === "next" && isWranglerMissingDiagnostic(stderr)) return { status: "missing" };
       throw new Error(`could not read the live ${channel} release manifest — refusing mutable publication${stderr ? `: ${stderr}` : ""}`);
     }
-    const parsed = JSON.parse(got.stdout.toString()) as { version?: unknown };
-    if (typeof parsed.version !== "string") throw new Error(`live ${channel} release manifest has no valid version`);
+    const parsed = JSON.parse(got.stdout.toString()) as JsonValue;
+    if (!jsonObject(parsed) || !jsonText(parsed.version)) throw new Error(`live ${channel} release manifest has no valid version`);
     parseSemver(parsed.version);
     return { status: "found", version: parsed.version };
   };
@@ -314,6 +332,7 @@ for (const t of targets) {
   sh(["bun", "build", "--compile", "--minify", "--splitting", `--target=bun-${t}`, ...externalFlagsFor(t), "./src/cli/index.ts", "--outfile", out]);
   artifacts[`rbox-${t}`] = { sha256: sha256File(out), path: `${tag}/rbox-${t}` };
 }
+if (appPath) addAppArtifact(appPath, dist, version, artifacts);
 
 // 3. manifest
 // COMPATIBILITY CONTRACT: scripts/install.sh extracts the platform artifact sha

@@ -1,5 +1,5 @@
 # Release pipeline (design 14/150): on a `v*` tag, require exact-SHA main CI,
-# build the 3 standalone binaries,
+# build the 3 standalone binaries and universal RboxBar app,
 # sign the version manifest, and publish to the rbox-releases R2 bucket.
 #
 # REPO SETUP (done — see docs/cicd-release-setup.md):
@@ -33,10 +33,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # 1) BUILD — cross-compile + sign all 3 binaries (darwin-arm64, linux-x64, linux-arm64)
+  # 1) BUILD — cross-compile all 3 binaries (darwin-arm64, linux-x64, linux-arm64),
+  #    bind the universal RboxBar zip into their signed manifest,
   #    on one host, but DO NOT upload. Each embeds its own native @parcel/watcher.node
   #    (release.ts asserts presence). Intel Macs (darwin-x64) are not a release target.
   build:
+    needs: rboxbar
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: release # scopes the signing secret to this env (no reviewer gate on free plan)
@@ -70,11 +72,17 @@ jobs:
         # would silently ship without the live watcher.
         run: bun install --frozen-lockfile --os=* --cpu=*
 
+      - name: Download universal RboxBar app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rboxbar-dist
+          path: rboxbar-dist
+
       - name: Build + sign (no upload)
         env:
           RBOX_RELEASE_PRIVATE_KEY: ${{ secrets.RBOX_RELEASE_PRIVATE_KEY }}
           RBOX_RELEASE_KEY_ID: ${{ secrets.RBOX_RELEASE_KEY_ID }}
-        run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --no-upload
+        run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --no-upload --app="rboxbar-dist/RboxBar-${GITHUB_REF_NAME#v}.zip"
 
       - name: Compile Linux Bun ref-watch contract probes
         run: |
@@ -203,9 +211,9 @@ jobs:
         if: startsWith(matrix.target, 'darwin-')
         run: dist/rbox-${{ matrix.target }} __git-refwatch-platform-selftest
 
-  # 4) PUBLISH — gated on ALL smoke legs and the universal app build. Upload the
+  # 4) PUBLISH — gated on ALL smoke legs and the universal app build. Publish the
   #    EXACT built+signed+smoked bytes to R2
-  #    (release.ts --upload-only re-verifies each binary's sha against the signed manifest).
+  #    (release.ts --upload-only re-verifies every manifest artifact's sha).
   publish:
     needs: [smoke, rboxbar]
     runs-on: ubuntu-latest
@@ -228,44 +236,16 @@ jobs:
         with:
           name: rbox-dist
           path: dist
-      - name: Download universal RboxBar app
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rboxbar-dist
-          path: rboxbar-dist
       - name: Version consistency (tag == package.json)
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG="$(node -p "require('./package.json').version")"
           test "$TAG" = "$PKG" || { echo "::error::git tag ($TAG) != package.json ($PKG)"; exit 1; }
-      - name: Publish immutable RboxBar app to R2
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          bunx wrangler@4.107.0 r2 object put \
-            "rbox-releases/releases/v$VERSION/RboxBar-$VERSION.zip" \
-            --file="rboxbar-dist/RboxBar-$VERSION.zip" \
-            --content-type=application/zip \
-            --remote
       - name: Publish smoke-tested CLI artifacts to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --upload-only
-      - name: Publish stable RboxBar alias to R2
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          bunx wrangler@4.107.0 r2 object put \
-            rbox-releases/releases/RboxBar.zip \
-            --file="rboxbar-dist/RboxBar-$VERSION.zip" \
-            --content-type=application/zip \
-            --remote
       - name: GitHub Release (notes + binaries)
         env:
           GH_TOKEN: ${{ github.token }}
