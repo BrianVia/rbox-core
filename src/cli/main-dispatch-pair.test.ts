@@ -6,15 +6,25 @@ import { main, type MainDispatchDeps } from "./main-dispatch.js";
 
 const oldArgv = process.argv;
 const oldRboxHome = process.env.RBOX_HOME;
+const oldStderrWrite = process.stderr.write;
 let temp: string;
+let stderr = "";
 
 beforeEach(async () => {
   temp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pair-dispatch-"));
   process.env.RBOX_HOME = temp;
+  process.exitCode = 0;
+  stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += chunk.toString();
+    return true;
+  }) as typeof process.stderr.write;
 });
 
 afterEach(async () => {
   process.argv = oldArgv;
+  process.stderr.write = oldStderrWrite;
+  process.exitCode = 0;
   if (oldRboxHome === undefined) delete process.env.RBOX_HOME;
   else process.env.RBOX_HOME = oldRboxHome;
   await fs.rm(temp, { recursive: true, force: true });
@@ -46,7 +56,10 @@ test("pair creates with no argument and rejects arguments before importing or mi
 
   const bad = harness();
   process.argv = [process.execPath, "rbox", "pair", "unexpected"];
-  await expect(main(bad.deps)).rejects.toThrow("usage: rbox pair");
+  await main(bad.deps);
+  expect(stderr).toContain('unexpected argument "unexpected"');
+  expect(stderr).toContain("usage: rbox pair");
+  expect(process.exitCode).toBe(1);
   expect(bad.state()).toMatchObject({ imports: 0, creates: 0, reads: 0, redeems: [] });
 });
 
@@ -77,6 +90,9 @@ test("bare connect retains the prompt-or-stdin reader", async () => {
 test("connect rejects extra arguments before importing, prompting, or redeeming", async () => {
   const h = harness();
   process.argv = [process.execPath, "rbox", "connect", "token", "extra"];
-  await expect(main(h.deps)).rejects.toThrow("usage: rbox connect");
+  await main(h.deps);
+  expect(stderr).toContain('unexpected argument "extra"');
+  expect(stderr).toContain("usage: rbox connect");
+  expect(process.exitCode).toBe(1);
   expect(h.state()).toMatchObject({ imports: 0, creates: 0, reads: 0, redeems: [] });
 });

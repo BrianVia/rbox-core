@@ -31,6 +31,8 @@ All notable changes to rbox are recorded here. The format follows
   nothing — waking every other device for no reason. rbox now compares against
   what the server actually holds, so it only publishes when there is something
   to say.
+- Devices following the `next` release channel now move back to stable once
+  stable is newer, so prerelease installs no longer get stranded after launch.
 - A Git repo whose local copy rbox cannot verify no longer re-downloads the
   same history on every sync. Repos in that state were downloading, unpacking,
   and re-checking the same unchanged history every few seconds, forever, which
