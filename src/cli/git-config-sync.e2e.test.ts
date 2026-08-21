@@ -353,7 +353,7 @@ test("§11 E2E: old-writer strip and structural drop both recover through presen
   await pull(rootA, cfgA, depsA);
   const strippedState = await state(rootA, cfgA);
   expect(strippedState.repoRecords?.repo?.cfgSynced).toBeUndefined();
-  expect(strippedState.repoRecords?.repo?.cfgShape).toBeUndefined();
+  expect(strippedState.repoRecords?.repo?.cfgStore).toBeUndefined();
   const presencePlan = await planGitSections(rootA, cfgA, strippedState, remote, new Set(), buildIgnoreMatcher(rootA));
   expect(presencePlan.gitRepos?.repo?.config?.["remote.origin.url"]).toEqual(["https://example.test/present.git"]);
   await push(rootA, cfgA, depsA);

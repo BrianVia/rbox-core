@@ -4,10 +4,11 @@ Shape-named fields that anti-slop flags but that could not be renamed in place:
 they are serialized wire keys, durable record members, or values hashed into
 stored evidence.
 
-**Status 2026-08-21 — the 2.0 cutover pass is done.** Founder ruling
-2026-08-20 put all twelve candidates in scope before the 2.0 tag. Nine landed;
-four fields across three entries are DEFERRED behind one shared blocker (see
-"Deferred cluster" below), pending a founder decision.
+**Status 2026-08-21 — the 2.0 cutover pass is COMPLETE. All twelve candidates
+landed.** Founder ruling 2026-08-20 put them all in scope before the 2.0 tag.
+Nine landed first; the last four unblocked on 2026-08-21 when the founder ruled
+that **no state.db migration mechanism gets built** (see "Formerly deferred
+cluster" below), which let them land plainly in the DDL.
 
 Each entry records what actually constrained it, verified against the code.
 Several original entries overstated their blast radius; those corrections are
@@ -133,47 +134,70 @@ runs that actually happened under that id.
 
 ---
 
-## DEFERRED cluster — blocked on one state-store decision
+## Formerly deferred cluster — DONE in the v2 DDL (2026-08-21)
 
-Four fields across three entries. **One root cause: `state.db` has no
-migration mechanism at all.**
+Four fields across three entries, blocked for one day on one root cause:
+**`state.db` has no migration mechanism at all.** `applySchemaV1` is a bare
+`db.exec(SCHEMA_V1_DDL)`; there is no `ALTER TABLE` anywhere in
+`src/cli/state-plane/`. `STATE_STORE_DDL_FINGERPRINT`
+(`schema/application.ts`) is `sha256(SCHEMA_V1_DDL)`, written into every store's
+`store_meta` at genesis, and `validate-open.ts` refuses any store whose stored
+fingerprint differs. Renaming a column changes the DDL, changes the
+fingerprint, and refuses every existing store.
 
-`applySchemaV1` is a bare `db.exec(SCHEMA_V1_DDL)`; there is no `ALTER TABLE`
-anywhere in `src/cli/state-plane/`. `STATE_STORE_DDL_FINGERPRINT`
-(`schema/application.ts`) is `sha256(SCHEMA_V1_DDL)` and is written into every
-store's `store_meta` at genesis. `validate-open.ts` refuses to open any store
-whose stored fingerprint differs, raising `StateAuthorityCorruptError` — whose
-message is "rbox has changed nothing and will not try to repair this
-automatically." There is no rebuild, re-import, or quarantine path for that
-reason.
+Separately, `ConfigStoreIdentity.shape`(5) → `repoKind`(8) changes the canonical
+byte length of every encoded RepoRecord, and `repo_records.canonical_bytes` /
+`retained_estimate` are checksums over `canonicalJson(record)` that
+`decodeRepoRecord` re-verifies on every read.
 
-Separately, `repo_records.canonical_bytes` / `retained_estimate` are checksums
-over `canonicalJson(record)` including the TypeScript key spelling;
-`decodeRepoRecord` re-encodes on every read and throws
-`structural corruption in RepoRecord <relPath>` on mismatch.
+### How it was resolved
 
-| field | suggested | blocker |
+Two options were live: **(i)** build a real migration at open, or **(ii)**
+re-genesis — mint a fresh store when the fingerprint does not match.
+
+(ii) was ruled first and taken through a full design cycle:
+`docs/design/283-state-regenesis.md`, twelve adversarial review rounds, PR #805.
+That design reached ALIGNED but at a cost that only made sense for a large
+fleet: a retained per-generation access port, plus a **permanent** publication
+quiesce on every rebuilt device, because no automatic release turned out to be
+safe (the client cannot enumerate its own repositories completely — ignored
+subtrees are pruned and `readdir` failures are swallowed).
+
+**Founder step-out re-ruling, 2026-08-21 — NO mechanism is built.** Externals
+start fresh on 2.0, so only the three founder machines hold v1 stores. A
+permanent quiesce and a recurring port tax are the wrong layer for a population
+of three. PR #805 was closed with that framing and its branch preserved as the
+negative result.
+
+So the renames land **plainly**, and old stores keep refusing:
+
+| field | now | note |
 |---|---|---|
-| `RepoRecordInput.cfgShape` + column `cfg_shape_cjson` | `cfgStore` / `cfg_store_cjson` | column rename changes `SCHEMA_V1_DDL` → changes the DDL fingerprint → every existing store refuses to open, with no repair path |
-| `ConfigStoreIdentity.shape` | `repoKind` | nested inside `cfg_shape_cjson`; `shape`(5) → `repoKind`(8) changes the canonical byte length → `canonical_bytes` mismatch → every existing row fails to decode |
-| `migration_completion.source_shape_flags_cjson` | `source_presence_flags_cjson` | same DDL-fingerprint block |
-| digest token `"source-shape-flags"` | `"source-presence-flags"` | framed into `domainHash("state-semantic-v1")`; technically free today (the legacy-vs-SQL differential has zero production callers and `source_semantic_digest` is always NULL) but meaningless without the column rename |
+| `RepoRecordInput.cfgShape` + column `cfg_shape_cjson` | `cfgStore` / `cfg_store_cjson` | renamed in the DDL |
+| `ConfigStoreIdentity.shape` | `repoKind` | nested inside that column's CJSON; the canonical-length change is irrelevant because only freshly created stores exist |
+| `migration_completion.source_shape_flags_cjson` | `source_presence_flags_cjson` | renamed in the DDL |
+| digest token `"source-shape-flags"` | `"source-presence-flags"` | framed into `domainHash("state-semantic-v1")` |
 
-**This is not a naming problem.** Renaming these requires one of two product
-decisions, neither of which belongs in a rename PR:
+`STATE_STORE_DDL_FINGERPRINT` moved to
+`94b519282f6efaed3c51b96e0bf0ca6b998922f149a0600501eedc0cb2224695`.
 
-- **(i) Schema v2 + a migration step at open.** Build the first real
-  state-plane migration: bump the schema version and `user_version`, add a
-  versioned DDL plus an `ALTER TABLE`/re-encode step under the existing inode
-  claim, recompute `canonical_bytes`/`retained_estimate` per row, and settle
-  crash-safety and reset-journal interaction. That is a design doc.
-- **(ii) 2.0 re-genesis.** Declare that 2.0 mints a fresh state store on every
-  device and take these renames for free in the new `SCHEMA_V1_DDL`. Far
-  cheaper — *if* re-baselining sync state on every device is acceptable.
+**Deliberately NOT changed:** `STATE_STORE_SCHEMA_VERSION` (still 1),
+`STATE_STORE_SQLITE_USER_VERSION` (still 1), and both application ids.
+`requireOwnedStateStoreFile` (`store/open.ts`) rejects on a `user_version`
+mismatch read from the raw file header *before* the database is opened, and
+`validateOpen` checks `schema_version` *before* `ddl_fingerprint`. Bumping
+either constant would route old stores to an earlier, less informative refusal
+and make the fingerprint refusal — the one that now carries the remedy —
+unreachable. The fingerprint is the discriminator; the version numbers carry no
+operational meaning while exactly one schema is supported.
 
-Recommendation: **(ii)**, folded into whatever 2.0 does about state stores.
-It needs an explicit founder yes, because it costs every device a sync
-re-baseline.
+**The refusal now names its remedy.** A store from another version's DDL
+refuses with the same fresh-start instruction the doctor already prints for
+`authority-corrupt`: stop rbox, move the workspace's `.rbox` folder aside, then
+`rbox adopt`, with files left in place. `doctor` reports it as
+`state-from-other-version`. Never "upgrade" — the reader is already running the
+binary that refuses.
 
-**Unblock condition:** a founder ruling on (i) vs (ii). Until then these four
-fields keep their current spelling.
+Founder-fleet crossover (the three machines that hold v1 stores) is an
+operational one-time step, not a code path:
+`docs/design/283-state-regenesis-resolution.md`.

@@ -92,15 +92,12 @@ function hashedManifestMeta(meta: ManifestMetaRow): JsonObject {
 
 function projectSemanticDigest(db: Database, statements: DigestStatements): StateSemanticDigest {
   const hash = domainHash("state-semantic-v1");
-  // The column keeps its durable name; only the read alias is a code symbol
-  // (docs/wire-rename-candidates.md). The DIGEST TOKEN below is framed into the
-  // hash and can never be renamed without a new grammar.
   const completion = statements.one<{
     presence_flags_cjson: string; source_repo_records_present: number;
-  }>(db, `SELECT source_shape_flags_cjson AS presence_flags_cjson,source_repo_records_present
+  }>(db, `SELECT source_presence_flags_cjson AS presence_flags_cjson,source_repo_records_present
     FROM migration_completion WHERE singleton=1`);
   if (!completion) throw new Error("state semantic digest requires migration_completion singleton");
-  tokens(hash, "source-shape-flags", parseCanonicalJson(completion.presence_flags_cjson));
+  tokens(hash, "source-presence-flags", parseCanonicalJson(completion.presence_flags_cjson));
   tokens(hash, "source-repo-records-present", completion.source_repo_records_present === 1);
   const lineage = statements.one<LegacyLineageRow>(db, `SELECT l.* FROM state_lineage l JOIN store_meta m
     ON m.active_lineage_id=l.lineage_id WHERE m.singleton=1`)!;
@@ -141,7 +138,7 @@ function projectSemanticDigest(db: Database, statements: DigestStatements): Stat
 /** The same grammar, walked over the row plan instead of the tables. */
 export function legacyStateSemanticDigest(plan: NormalizedLegacyState): StateSemanticDigest {
   const hash = domainHash("state-semantic-v1");
-  tokens(hash, "source-shape-flags", plan.presenceFlags);
+  tokens(hash, "source-presence-flags", plan.presenceFlags);
   tokens(hash, "source-repo-records-present", plan.repoRecordsPresent);
   tokens(hash, "lineage", plan.lineage);
   tokens(hash, "base-head", plan.baseHead);

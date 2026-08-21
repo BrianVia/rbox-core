@@ -43,7 +43,7 @@ import { loadRawStateIdentity } from "./state-plane/adapters/lineage-reads.js";
 
 /** The record's config-lane members, in persisted order. Durable field names,
  * not code symbols (docs/wire-rename-candidates.md). */
-export const CONFIG_LANE_FIELDS = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
+export const CONFIG_LANE_FIELDS = ["cfgSynced", "cfgApplied", "cfgToken", "cfgStore"] as const;
 
 export type ConfigLaneState = Pick<RepoRecordInput, (typeof CONFIG_LANE_FIELDS)[number]>;
 /** Planner-facing lane results. Persistence converts these to ordered

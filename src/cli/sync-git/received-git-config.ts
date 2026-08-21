@@ -130,10 +130,10 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
 
   const invalidateStoreIdentity = (storeIdentity: ConfigStoreIdentity | undefined): RepoRecordInput => {
     const current = record();
-    if (sameConfigStoreIdentity(current.cfgShape, storeIdentity)) return current;
+    if (sameConfigStoreIdentity(current.cfgStore, storeIdentity)) return current;
     const reset: RepoRecordInput = {
       sourceSeq: current.sourceSeq,
-      ...(storeIdentity === undefined ? {} : { cfgShape: storeIdentity }),
+      ...(storeIdentity === undefined ? {} : { cfgStore: storeIdentity }),
     };
     replace(reset);
     return reset;
@@ -150,7 +150,7 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
     },
   ): ConfigLaneState => replace({
     ...completeConfigApply(record(), hashes),
-    cfgShape: storeIdentity,
+    cfgStore: storeIdentity,
   });
 
   const skipOnce = (message: string): void => {
@@ -210,14 +210,14 @@ export function createReceivedGitConfig(input: ReceivedGitConfigInput) {
         if (local.status !== "ok") return transition();
         const before = record();
         const lane = invalidateStoreIdentity(receiver.storeIdentity);
-        const priorBaseline = before.cfgShape === undefined
-          || sameConfigStoreIdentity(before.cfgShape, receiver.storeIdentity)
+        const priorBaseline = before.cfgStore === undefined
+          || sameConfigStoreIdentity(before.cfgStore, receiver.storeIdentity)
           ? before.cfgSynced
           : undefined;
         return replace({
           ...lane,
           cfgSynced: priorBaseline ?? local.cached.hash,
-          cfgShape: receiver.storeIdentity,
+          cfgStore: receiver.storeIdentity,
         });
       }
 

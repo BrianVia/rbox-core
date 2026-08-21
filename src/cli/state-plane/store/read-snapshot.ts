@@ -20,7 +20,7 @@ interface TokenRows {
   authority_id: string; lineage_id: string; stream: string; state_nonce: string | null;
   state_revision: number | null; last_synced_sequence: number;
   active_base_generation: number; local_revision: number; telemetry_binding_id: string | null;
-  extras_cjson: string | null; source_shape_flags_cjson: string;
+  extras_cjson: string | null; source_presence_flags_cjson: string;
 }
 
 interface HeadRow {
@@ -42,7 +42,7 @@ function header(row: HeadRow): ManifestHeader {
 export function currentSnapshot(db: Database): LineageSnapshot {
   const core = selectRow<TokenRows>(db, `SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,
     l.last_synced_sequence,l.active_base_generation,l.local_revision,l.telemetry_binding_id,
-    l.extras_cjson,c.source_shape_flags_cjson
+    l.extras_cjson,c.source_presence_flags_cjson
     FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
     JOIN migration_completion c ON c.singleton=1
     WHERE m.singleton=1`);
@@ -73,7 +73,7 @@ export function currentSnapshot(db: Database): LineageSnapshot {
     } as Omit<GlobalManifestMeta, "chain" | "gitRepos">))
     : undefined;
   const manifestGitReposPresent = decodeAuthorityRow("migrationCompletion", core.lineage_id,
-    () => manifestGitReposWasPresent(parseCanonicalJson(core.source_shape_flags_cjson)));
+    () => manifestGitReposWasPresent(parseCanonicalJson(core.source_presence_flags_cjson)));
   return {
     authorityId: core.authority_id,
     lineageId: core.lineage_id,

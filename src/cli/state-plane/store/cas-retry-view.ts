@@ -44,11 +44,11 @@ CREATE INDEX retry_rows_order ON retry_rows(retry_id,path_order);
  * frozen row for no reader, and the decoder never looks at it. */
 const CURRENT_RECORD_SELECT = `SELECT rel_path,repo_gen,source_seq,base_cjson,advertised_cjson,
   branch_base_origins_cjson,packed_refs_identity,pending_cjson,repo_absent,removed_key,
-  resolution_key,cfg_synced,cfg_applied,cfg_token_cjson,cfg_shape_cjson,deferrals_cjson,
+  resolution_key,cfg_synced,cfg_applied,cfg_token_cjson,cfg_store_cjson,deferrals_cjson,
   partial_cjson,attempt_cjson,resolution_receipt_cjson,idx_proj,extras_cjson,
   canonical_bytes,retained_estimate FROM repo_records WHERE lineage_id=? AND rel_path=?`;
 
-interface RetryRowShape {
+interface RetryRow {
   rel_path: string;
   expected_repo_gen: number;
   record_row_cjson: string | null;
@@ -145,7 +145,7 @@ function openSealedRetryView(
         throw new CursorWindowError("repo", batchSize, MAX_RETRY_BATCH);
       }
       const after = afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath);
-      return boundedStream<RetryRowShape, CasRetryRepo>(
+      return boundedStream<RetryRow, CasRetryRepo>(
         (visit) => streamRows(accessor.db, `SELECT rel_path,expected_repo_gen,record_row_cjson,retained_estimate
           FROM retry_rows WHERE retry_id=? AND path_order>? ORDER BY path_order LIMIT ?`,
         [ref.stageId, after, batchSize], visit),

@@ -124,7 +124,7 @@ export function manifestFromMeta(lastSyncedManifest: Manifest, meta: GlobalManif
 }
 
 export interface ConfigStoreIdentity {
-  shape: string;
+  repoKind: string;
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
@@ -332,7 +332,7 @@ export interface RepoRecord {
   cfgSynced?: string;
   cfgApplied?: string;
   cfgToken?: ConfigStatToken;
-  cfgShape?: ConfigStoreIdentity;
+  cfgStore?: ConfigStoreIdentity;
   deferrals?: GitDeferrals;
   partial?: GitPartialApply;
   /** Local-only design-174 held-follow observation; never wire-visible. */
