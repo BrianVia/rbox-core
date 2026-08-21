@@ -23,6 +23,15 @@ export type HelpGroup =
 export interface CommandHelp {
   /** Command path, e.g. "track" or "deps install". */
   name: string;
+  /**
+   * How many positional argv tokens `rbox <first word of name> …` accepts for
+   * this entry, INCLUDING the sub-verb tokens in `name` (so "key revoke <id>"
+   * is 2: "revoke" + the id). "variadic" for commands with an unbounded list.
+   * Explicit parser arity; never inferred from the display prose in `usage`,
+   * for the same reason `CommandFlag.takesValue` is explicit. Keep it in sync
+   * with `usage`.
+   */
+  positionals: number | "variadic";
   group: HelpGroup;
   /** One line for the grouped screen. */
   summary: string;
@@ -93,7 +102,7 @@ export const GROUP_ORDER: HelpGroup[] = [
 export const COMMAND_HELP: CommandHelp[] = [
   // ── GETTING STARTED ──────────────────────────────────────────────────────
   {
-    name: "setup",
+    name: "setup", positionals: 0,
     group: "GETTING STARTED",
     summary: "guided onboarding: account → folder → start syncing",
     usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
@@ -113,7 +122,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox setup"],
   },
   {
-    name: "login",
+    name: "login", positionals: 0,
     group: "GETTING STARTED",
     summary: "authorize this machine",
     usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>] [--kit] [--kit-path <path>]",
@@ -127,13 +136,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "logout",
+    name: "logout", positionals: 0,
     group: "GETTING STARTED",
     summary: "remove this machine's credential",
     usage: "rbox logout",
   },
   {
-    name: "status",
+    name: "status", positionals: 1,
     group: "GETTING STARTED",
     summary: "synced-folder + background-sync state",
     usage: "rbox status [path] [--all] [--json | --verbose | --git [<repo>]]",
@@ -149,7 +158,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "init",
+    name: "init", positionals: 0,
     group: "GETTING STARTED",
     summary: "headless/CI onboarding (the scripting form of setup)",
     usage: "rbox init [--new | --workspace <id>] [--root <path>] [--scope <folder>[,<folder>…] --pull-only] [--adopt] [--respect-gitignore] [--new-device] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
@@ -173,7 +182,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "include",
+    name: "include", positionals: "variadic",
     group: "SYNCING",
     summary: "sync only the folders you include on this machine",
     usage: "rbox include [add <folder>… | remove <folder>…] [--json]",
@@ -186,7 +195,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox include", "rbox include add Personal/repo-A", "rbox include remove Personal/repo-A"],
   },
   {
-    name: "adopt",
+    name: "adopt", positionals: 2,
     group: "GETTING STARTED",
     summary: "inspect or recover a retained non-empty join",
     usage: "rbox adopt <status|resume|abort|clean> [path] [--json] [--yes]",
@@ -197,7 +206,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
   // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
   {
-    name: "config",
+    name: "config", positionals: 0,
     group: "GETTING STARTED",
     summary: "show this machine's folder configuration",
     usage: "rbox config [--json]",
@@ -205,14 +214,14 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
   // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
   {
-    name: "config add",
+    name: "config add", positionals: 2,
     group: "GETTING STARTED",
     summary: "add an existing synced folder to this machine's configuration",
     usage: "rbox config add <path>",
   },
   // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
   {
-    name: "config regenerate",
+    name: "config regenerate", positionals: 1,
     group: "GETTING STARTED",
     summary: "rebuild folder configuration from local bindings",
     usage: "rbox config regenerate [--yes]",
@@ -220,7 +229,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
   // <!-- FOUNDER-SIGN-OFF: draft copy for rbox config -->
   {
-    name: "config repair",
+    name: "config repair", positionals: 2,
     group: "GETTING STARTED",
     summary: "finish rebinding a folder moved on this machine",
     usage: "rbox config repair <path>",
@@ -228,7 +237,7 @@ export const COMMAND_HELP: CommandHelp[] = [
 
   // ── SYNCING ──────────────────────────────────────────────────────────────
   {
-    name: "start",
+    name: "start", positionals: 1,
     group: "SYNCING",
     summary: "start background sync for this folder",
     usage: "rbox start [path] [--pull-only | --read-write] [--trace[=<streams>]]",
@@ -240,37 +249,37 @@ export const COMMAND_HELP: CommandHelp[] = [
     notes: ["[path] defaults to the current directory; run `rbox` to set one up."],
   },
   {
-    name: "stop",
+    name: "stop", positionals: 1,
     group: "SYNCING",
     summary: "stop background sync",
     usage: "rbox stop [path]",
   },
   {
-    name: "autostart",
+    name: "autostart", positionals: 1,
     group: "SYNCING",
     summary: "start background sync automatically after login",
     usage: "rbox autostart <enable | disable | status>",
   },
   {
-    name: "autostart enable",
+    name: "autostart enable", positionals: 1,
     group: "SYNCING",
     summary: "resume background sync after login",
     usage: "rbox autostart enable",
   },
   {
-    name: "autostart disable",
+    name: "autostart disable", positionals: 1,
     group: "SYNCING",
     summary: "disable login resume",
     usage: "rbox autostart disable",
   },
   {
-    name: "autostart status",
+    name: "autostart status", positionals: 1,
     group: "SYNCING",
     summary: "show autostart state",
     usage: "rbox autostart status",
   },
   {
-    name: "logs",
+    name: "logs", positionals: 1,
     group: "SYNCING",
     summary: "tail background-sync logs",
     usage: "rbox logs [path] [--follow] [--limit N]",
@@ -281,7 +290,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "sync",
+    name: "sync", positionals: 1,
     group: "SYNCING",
     summary: "sync once (pull, then push)",
     usage: "rbox sync [path] [--allow-mass-delete] [--pull-only] [--verbose]",
@@ -292,13 +301,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "git",
+    name: "git", positionals: 1,
     group: "SYNCING",
     summary: "inspect and resolve deferred Git repos",
     usage: "rbox git <deferrals | resolve | republish>",
   },
   {
-    name: "git deferrals",
+    name: "git deferrals", positionals: 1,
     group: "SYNCING",
     summary: "show deferred Git repos and copyable repair guidance",
     usage: "rbox git deferrals [--brief | --json]",
@@ -309,7 +318,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     notes: ["Run from anywhere inside the workspace; no repository argument is accepted."],
   },
   {
-    name: "git resolve",
+    name: "git resolve", positionals: 3,
     group: "SYNCING",
     summary: "inspect or resolve a deferred Git checkout",
     usage: "rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming] [--dry-run]  |  rbox git resolve --under <folder> [show-me|keep-mine] [--group <story>] [--dry-run] [--yes --expect-repos <n>]",
@@ -334,7 +343,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "git republish",
+    name: "git republish", positionals: 2,
     group: "SYNCING",
     summary: "restart one repository's Git pack chain on the next publish",
     usage: "rbox git republish <repo> [--json]",
@@ -346,14 +355,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "push",
+    name: "push", positionals: 1,
     group: "SYNCING",
     summary: "upload local changes",
     usage: "rbox push [path] [--allow-mass-delete]",
     flags: [{ flag: "--allow-mass-delete", desc: "consent to the push-side mass-delete guard (or env RBOX_ALLOW_MASS_DELETE=1)" }],
   },
   {
-    name: "pull",
+    name: "pull", positionals: 1,
     group: "SYNCING",
     summary: "apply remote changes",
     usage: "rbox pull [path] [--allow-mass-delete] [--verbose]",
@@ -363,7 +372,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "export",
+    name: "export", positionals: 0,
     group: "SYNCING",
     summary: "export decrypted files",
     usage: "rbox export [--all | --workspace <id>] [--out <dir | file.tar.gz>]",
@@ -375,7 +384,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox export", "rbox export --workspace ws_ab12cd34", "rbox export --out ~/backup.tar.gz"],
   },
   {
-    name: "track",
+    name: "track", positionals: 1,
     group: "SYNCING",
     summary: "set up a folder for syncing (create/join; no first sync)",
     usage: "rbox track [path] [--workspace <id>] [--include <folder>] [--respect-gitignore] [--new-device]",
@@ -395,14 +404,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox track ~/code/myapp", "rbox track ~/code/myapp --workspace ws_ab12cd34"],
   },
   {
-    name: "untrack",
+    name: "untrack", positionals: 1,
     group: "SYNCING",
     summary: "stop syncing a directory (local unbind; remote untouched)",
     usage: "rbox untrack [path] [--force]",
     flags: [{ flag: "--force", desc: "skip the confirmation prompt and SIGKILL a stuck daemon" }],
   },
   {
-    name: "ignore",
+    name: "ignore", positionals: 1,
     group: "SYNCING",
     summary: "manage .rboxignore",
     usage: "rbox ignore <glob> | --list | --respect-gitignore <on|off> | --purge [--yes] [--path <dir>]",
@@ -417,13 +426,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox ignore 'dist/**'", "rbox ignore --list"],
   },
   {
-    name: "trash",
+    name: "trash", positionals: 1,
     group: "SYNCING",
     summary: "list, restore, or permanently delete locally trashed files",
     usage: "rbox trash <list | restore | empty>",
   },
   {
-    name: "trash list",
+    name: "trash list", positionals: 1,
     group: "SYNCING",
     summary: "list files rbox moved to the local trash",
     usage: "rbox trash list [--path <dir>] [--json]",
@@ -433,7 +442,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "trash restore",
+    name: "trash restore", positionals: 2,
     group: "SYNCING",
     summary: "restore a trashed file back into the workspace",
     usage: "rbox trash restore <path> [--batch <name>] [--path <dir>]",
@@ -444,14 +453,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     notes: ["restores files rbox itself moved to the local trash — to fetch an older synced version, see `rbox restore`"],
   },
   {
-    name: "trash empty",
+    name: "trash empty", positionals: 1,
     group: "SYNCING",
     summary: "permanently delete trashed files (frees disk)",
     usage: "rbox trash empty [--path <dir>]",
     flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true }],
   },
   {
-    name: "versions",
+    name: "versions", positionals: 1,
     group: "SYNCING",
     summary: "list version history (or a file's change history)",
     usage: "rbox versions [file] [--limit <n>] [--json]",
@@ -463,7 +472,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox versions", "rbox versions src/app.ts --limit 20"],
   },
   {
-    name: "restore",
+    name: "restore", positionals: 1,
     group: "SYNCING",
     summary: "restore a file from a past version",
     usage: "rbox restore <file>@<seq>",
@@ -519,13 +528,13 @@ export const COMMAND_HELP: CommandHelp[] = [
 
   // ── DEVICES & ACCOUNT ────────────────────────────────────────────────────
   {
-    name: "pair",
+    name: "pair", positionals: 0,
     group: "DEVICES & ACCOUNT",
     summary: "create a token to add another machine",
     usage: "rbox pair",
   },
   {
-    name: "connect",
+    name: "connect", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "authorize + encrypt this machine with a pairing token",
     usage: "rbox connect [<pairing-token>]",
@@ -534,7 +543,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox connect rbox-pair_<id>.<secret>", "rbox connect", "echo <token> | rbox connect"],
   },
   {
-    name: "recover",
+    name: "recover", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "clear the local head pin and re-baseline a halted workspace",
     usage: "rbox recover [path] [--yes] [--repair-chain] [--allow-mass-delete]",
@@ -545,21 +554,21 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "device",
+    name: "device", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "manage devices",
     usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id>>",
     flags: [{ flag: "--json", desc: "with `list`, print JSON" }],
   },
   {
-    name: "account",
+    name: "account", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "link this CLI to your web login",
     usage: "rbox account <link <code> | status [--json] | unlink>",
     flags: [{ flag: "--json", desc: "with `status`, print JSON" }],
   },
   {
-    name: "key",
+    name: "key", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "encryption and agent sync keys",
     usage: "rbox key <status | save | backup | genesis | recover | create-ci | materialize | list | revoke>",
@@ -571,21 +580,21 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key status",
+    name: "key status", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "show this machine's encryption enrollment state",
     usage: "rbox key status [--json]",
     flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
-    name: "key save",
+    name: "key save", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "save a validated recovery phrase to Keychain or an explicit file",
     usage: "rbox key save [--kit-path <path>]",
     flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default", takesValue: true }],
   },
   {
-    name: "key backup",
+    name: "key backup", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "re-show your recovery phrase (if it was cached at setup)",
     usage: "rbox key backup [--kit] [--kit-path <path>]",
@@ -595,7 +604,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key recover",
+    name: "key recover", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "re-enroll this machine from your recovery phrase (requires `rbox login` first)",
     usage: "rbox key recover [--kit] [--kit-path <path>]",
@@ -605,7 +614,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key genesis",
+    name: "key genesis", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "set up encryption on the first machine",
     usage: "rbox key genesis --yes [--kit] [--kit-path <path>]",
@@ -616,7 +625,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key create-ci",
+    name: "key create-ci", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "create an agent/CI sync key bundle",
     usage: "rbox key create-ci --expires <dur> [--label <text>] [--accept-root-key]",
@@ -627,7 +636,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key materialize",
+    name: "key materialize", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "unpack RBOX_KEY into the local keystore",
     usage: "rbox key materialize [--dir <path>] [--key -] [--key-file <path>]",
@@ -638,14 +647,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "key list",
+    name: "key list", positionals: 1,
     group: "DEVICES & ACCOUNT",
     summary: "list agent/CI sync keys",
     usage: "rbox key list [--json]",
     flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
-    name: "key revoke",
+    name: "key revoke", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "revoke an agent/CI sync key",
     usage: "rbox key revoke <id>",
@@ -653,7 +662,7 @@ export const COMMAND_HELP: CommandHelp[] = [
 
   // ── BILLING & MAINTENANCE ────────────────────────────────────────────────
   {
-    name: "subscribe",
+    name: "subscribe", positionals: 1,
     group: "BILLING & MAINTENANCE",
     summary: "open a checkout to subscribe this account",
     usage: "rbox subscribe <solo | pro> [--annual]",
@@ -662,20 +671,20 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "billing",
+    name: "billing", positionals: 0,
     group: "BILLING & MAINTENANCE",
     summary: "open the billing portal",
     usage: "rbox billing",
   },
   {
-    name: "usage",
+    name: "usage", positionals: 0,
     group: "BILLING & MAINTENANCE",
     summary: "show plan limits and current account usage",
     usage: "rbox usage [--json]",
     flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
-    name: "doctor",
+    name: "doctor", positionals: 2,
     group: "BILLING & MAINTENANCE",
     summary: "explain what is stuck and how to fix it, in plain English",
     usage: "rbox doctor [reset-journal] [path] [--all] [--json | --report | --residue-bytes | --quarantine | --restore <bundle>]",
@@ -692,7 +701,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "upgrade",
+    name: "upgrade", positionals: 0,
     group: "BILLING & MAINTENANCE",
     summary: "update the rbox binary",
     usage: "rbox upgrade [--check] [--channel <latest|next>]",
@@ -703,20 +712,20 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "uninstall",
+    name: "uninstall", positionals: 0,
     group: "BILLING & MAINTENANCE",
     summary: "remove local rbox state and installed files",
     usage: "rbox uninstall [--yes]",
     flags: [{ flag: "--yes", short: "-y", desc: "perform the removal; without it, print the steps only (alias: -y)" }],
   },
   {
-    name: "version",
+    name: "version", positionals: 0,
     group: "BILLING & MAINTENANCE",
     summary: "print the rbox version",
     usage: "rbox version",
   },
   {
-    name: "shell-init",
+    name: "shell-init", positionals: 1,
     group: "BILLING & MAINTENANCE",
     summary: "print shell integration (prompt status + completions)",
     usage: "rbox shell-init zsh",
@@ -724,7 +733,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ['eval "$(rbox shell-init zsh)"'],
   },
   {
-    name: "completions",
+    name: "completions", positionals: 1,
     group: "BILLING & MAINTENANCE",
     summary: "print shell completions",
     usage: "rbox completions zsh",
@@ -732,7 +741,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     examples: ["rbox completions zsh > ~/.zsh/completions/_rbox"],
   },
   {
-    name: "prompt-status",
+    name: "prompt-status", positionals: 1,
     group: "BILLING & MAINTENANCE",
     summary: "print programmatic ambient prompt status",
     usage: "rbox prompt-status [path] [--json]",
@@ -742,7 +751,7 @@ export const COMMAND_HELP: CommandHelp[] = [
 
   // ── hidden: deprecated aliases ───────────────────────────────────────────
   {
-    name: "link",
+    name: "link", positionals: 1,
     group: "SYNCING",
     summary: "deprecated → rbox track",
     usage: "rbox link <path>",
@@ -750,7 +759,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     alias: { kind: "rename", target: "track", notice: "note: 'rbox link' is now 'rbox track'." },
   },
   {
-    name: "daemon",
+    name: "daemon", positionals: 2,
     group: "SYNCING",
     summary: "deprecated → rbox start/stop/logs",
     usage: "rbox daemon <start|stop|status|logs>",
