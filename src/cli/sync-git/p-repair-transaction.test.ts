@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { canonicalize } from "../../engine/e2ee/jcs.js";
 import { prepareBasePresentArtifact, readBasePresentArtifact } from "./base-artifacts.js";
 import { parseKeepPinOrigins, runUpdateRefTransaction } from "./keep-pins.js";
+import { parsePRepairQ, parsePRepairReceipt } from "./p-repair.js";
 import {
   inspectLockedPRepairReceipt,
   MAX_P_REPAIR_STABILIZATION_ATTEMPTS,
@@ -82,7 +84,7 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
       repoDir: repo,
       p: read.artifact,
       repairAt: "2026-07-16T12:00:00.000Z",
-      mismatches: { live: true, reflog: false, baseShape: false },
+      mismatches: { live: true, reflog: false, baseRefs: false },
       crashAt: async (point) => {
         if (point === "after-origin-fsync") {
           churns++;
@@ -110,7 +112,7 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
       repoDir: repo,
       p: read.artifact,
       repairAt: "2026-07-16T12:00:00.000Z",
-      mismatches: { live: true, reflog: false, baseShape: false },
+      mismatches: { live: true, reflog: false, baseRefs: false },
       validateArtifacts: async () => { throw new Error("P-repair state CAS rejected in an unrelated validator"); },
       state: {
         stateLockIdentity: path.join(tmp, "state.lock"),
@@ -124,7 +126,7 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
       repoDir: repo,
       p: read.artifact,
       repairAt: "2026-07-16T12:00:00.000Z",
-      mismatches: { live: true, reflog: false, baseShape: false },
+      mismatches: { live: true, reflog: false, baseRefs: false },
       validateArtifacts: async () => (await readBasePresentArtifact(repo, binding, "refs/heads/main")).status === "valid",
       state: {
         stateLockIdentity: path.join(tmp, "state.lock"),
@@ -140,7 +142,7 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
       repoDir: repo,
       p: read.artifact,
       repairAt: "2026-07-16T12:00:00.000Z",
-      mismatches: { live: true, reflog: false, baseShape: false },
+      mismatches: { live: true, reflog: false, baseRefs: false },
       crashAt: async (point) => {
         if (point === "after-origin-fsync" && !extended) extended = await commit("post-origin extension");
         if (point === "after-state-cas") throw new Error("injected crash after state CAS");
@@ -183,6 +185,20 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
     for (const oid of [prior, next, moved, extended]) expect(origins[oid]?.some((origin) => origin.ref === result.receipt.q.ref
       && origin.episode === episode && origin.class === "human")).toBe(true);
     expect((await inspectLockedPRepairReceipt(repo, result.receipt)).action).toBe("compact-and-restart");
+    setProtocolLockTraceForTests(undefined);
+
+    const legacyReceipt = structuredClone(result.receipt);
+    legacyReceipt.q.value.repair.reason = "base-shape-mismatch";
+    const legacyQBytes = canonicalize(legacyReceipt.q.value);
+    expect(canonicalize(parsePRepairQ(legacyQBytes))).toEqual(legacyQBytes);
+    const legacyQPath = path.join(tmp, "legacy-q.json");
+    await fs.writeFile(legacyQPath, legacyQBytes);
+    const legacyQOid = await git("hash-object", "-w", legacyQPath);
+    await git("update-ref", legacyReceipt.q.ref, legacyQOid, legacyReceipt.q.targetOid);
+    legacyReceipt.q.targetOid = legacyQOid;
+    const storedLegacyReceipt = parsePRepairReceipt(JSON.parse(Buffer.from(canonicalize(legacyReceipt)).toString("utf8")));
+    expect(storedLegacyReceipt.q.value.repair.reason).toBe("base-shape-mismatch");
+    expect((await inspectLockedPRepairReceipt(repo, storedLegacyReceipt)).action).toBe("compact-and-restart");
     expect(trace.map((event) => `${event.action}:${event.class}`)).toEqual([
       "acquire:operation", "acquire:reflog", "acquire:origin",
       "acquire:git", "release:git",
@@ -238,7 +254,7 @@ test.each([
       repoDir: repo,
       p: read.artifact,
       repairAt: "2026-07-16T12:00:00.000Z",
-      mismatches: { live: true, reflog: false, baseShape: false },
+      mismatches: { live: true, reflog: false, baseRefs: false },
       crashAt: (point) => { if (point === crashPoint) throw new Error(`crash:${point}`); },
       validateArtifacts: async () => (await readBasePresentArtifact(repo, binding, "refs/heads/main")).status === "valid",
       state: {

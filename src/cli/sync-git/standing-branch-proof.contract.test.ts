@@ -344,7 +344,7 @@ describe("SettleStandingBranchProof", () => {
       stream: "stream-1",
       effectiveRefScope: "branches",
       repairAt: "1970-01-01T00:00:00.000Z",
-      mismatches: { live: false, reflog: true, baseShape: false },
+      mismatches: { live: false, reflog: true, baseRefs: false },
     });
     expect(result).toMatchObject({ kind: "settled", disposition: { passes: 1, outcomes: ["repaired"] } });
   });
@@ -365,7 +365,7 @@ describe("SettleStandingBranchProof", () => {
     );
 
     expect(effects.trace.calls).toEqual(["inspect", "settle", "resume", "refresh-accepted", "reload", "refresh-protocol"]);
-    expect(effects.trace.repairs[0]).toMatchObject({ mismatches: { live: true, reflog: false, baseShape: false } });
+    expect(effects.trace.repairs[0]).toMatchObject({ mismatches: { live: true, reflog: false, baseRefs: false } });
     expect(result.kind).toBe("settled");
   });
 

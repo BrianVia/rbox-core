@@ -135,7 +135,7 @@ Why exactly these two codes. `RepoBaseHoldCode` splits cleanly into
 `missing-safe-ref-proof`) and "a proof exists and CONTRADICTS the
 composer" or "the request was structurally refused"
 (`mismatched-branch-proof`, `mismatched-safe-ref-proof`,
-`p-repair-shape-mismatch`, `manual-proof-mismatch`, `scope-refused`,
+`p-repair-witness-mismatch`, `manual-proof-mismatch`, `scope-refused`,
 `wrong-ref-class`, plus the synthetic `checkout-incomplete`). The
 first class is the same causal shape as a ref-plane hold — the ref did
 not advance, and re-running the follow reproduces the same nothing.

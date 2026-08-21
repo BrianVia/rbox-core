@@ -241,7 +241,7 @@ export type TypedBlocker =
         | "wrong-ref-class"
         | "scope-refused"
         | "manual-proof-mismatch"
-        | "p-repair-shape-mismatch"
+        | "p-repair-witness-mismatch"
         | "checkout-incomplete";
     };
 
@@ -394,4 +394,3 @@ export interface StateSaveOptions {
    * physical state lock. The writer must assert and reuse it, never re-enter. */
   heldLock?: OwnedLock;
 }
-

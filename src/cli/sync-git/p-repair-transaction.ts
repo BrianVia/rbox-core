@@ -70,7 +70,7 @@ export interface PRepairAttemptInput {
   p: PreparedProtocolRef<BasePresentPayload>;
   state: PRepairStatePort;
   repairAt: string;
-  mismatches: { live: boolean; reflog: boolean; "baseShape": boolean };
+  mismatches: { live: boolean; reflog: boolean; baseRefs: boolean };
   /** Locked A/R/P/K and binding validation. False and errors are hard holds. */
   validateArtifacts(): Promise<boolean>;
   crashAt?(point: PRepairCrashPoint): void | Promise<void>;
