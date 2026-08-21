@@ -11,6 +11,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { Action, FileEntry, Manifest } from "../../engine/index.js";
+import { conflictName } from "../../engine/conflict-name.js";
 import { writeFileAtomic } from "../../engine/fsutil.js";
 import { RBOX_DIR } from "../workspace-config.js";
 import type { ScopeProjection } from "./projection.js";
@@ -52,8 +53,8 @@ export interface RuleFileAuthorityOutcome {
 /**
  * Overlay remote authority for metadata rule files onto a planned action list.
  * Returns the amended actions plus the paths whose local bytes lost. Any planned
- * conflict/delete for such a path is replaced: keeping a local rule file alive as a
- * `.conflict` copy would leave the matcher reading the losing bytes.
+ * conflict/delete for such a path is replaced. Edited local rule bytes are kept
+ * under a conflict name, which is not itself an ignore-rule filename.
  */
 export function applyRuleFileAuthority(
   actions: Action[],
@@ -61,6 +62,8 @@ export function applyRuleFileAuthority(
   base: Manifest,
   local: Manifest,
   remote: Manifest,
+  device: string,
+  now: string,
 ): RuleFileAuthorityOutcome {
   const localByPath = new Map(local.files.map((entry) => [entry.path, entry]));
   const baseByPath = new Map(base.files.map((entry) => [entry.path, entry]));
@@ -76,7 +79,9 @@ export function applyRuleFileAuthority(
     const base = baseByPath.get(entry.path);
     const wasEdited = here !== undefined && (base === undefined || entryDiffers(here, base));
     if (wasEdited) diverged.push(entry.path);
-    forced.set(entry.path, { kind: "write", entry, ...(here ? { expectedLocal: here } : {}) });
+    forced.set(entry.path, wasEdited
+      ? { kind: "conflict", path: entry.path, keepLocalAs: conflictName(entry.path, device, now), entry }
+      : { kind: "write", entry, expectedLocal: here });
   }
   // A rule file the publisher DELETED must go too, even if it was edited here —
   // otherwise a stale local rule outlives the rule set it belonged to and keeps

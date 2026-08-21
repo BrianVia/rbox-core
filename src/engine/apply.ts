@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
@@ -59,6 +60,9 @@ export interface ApplyOptions {
   /** Fired once per type-flip resolved at apply (obstructing dir evicted, or an
    *  ancestor file moved aside). The daemon logs it and counts `lastPull.conflicts`. */
   onTypeFlip?: (relPath: string) => void;
+  /** Fired once after an apply-time precondition mismatch has preserved the local
+   *  bytes. `keptAs` is the conflict-copy path actually claimed on disk. */
+  onConflictCopy?: (relPath: string, keptAs: string) => void;
   warningSink?: (line: string) => void;
   mutationBoundary?: MutationBoundary;
 }
@@ -203,13 +207,13 @@ export async function applyActions(
         await poolMap(rest, dlConc, async (a) => {
           if (a.kind === "write") {
             await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
-              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, onConflictCopy: opts.onConflictCopy, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
             });
           } else if (a.kind === "conflict") {
             // Reconcile already decided both sides diverged. Stage and verify the
             // remote first; only then preserve the local at its chosen conflict name.
             await writeEntry(destRoot, a.entry, undefined, store, device, now, {
-              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, onConflictCopy: opts.onConflictCopy, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
             });
           }
           bytesDone += transferBytesForEntry(a.entry, opts.kek);
@@ -230,7 +234,7 @@ export async function applyActions(
     const lease = opts.mutationBoundary?.enter({ phase: "file-apply", repository: a.path });
     if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
     try {
-      await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
+      await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash, opts.onConflictCopy);
     } finally {
       lease?.finish();
     }
@@ -252,6 +256,7 @@ type WriteEntryOptions = {
   kek?: Buffer;
   trash?: TrashBatch;
   onTypeFlip?: (relPath: string) => void;
+  onConflictCopy?: (relPath: string, keptAs: string) => void;
   keepLocalAs?: string;
   preparedTmp?: string;
   mutationBoundary?: MutationBoundary;
@@ -263,7 +268,7 @@ async function writeEntry(
   store: BlobStore,
   device: string,
   now: string,
-  { kek, trash, onTypeFlip, keepLocalAs, preparedTmp, mutationBoundary }: WriteEntryOptions = {}
+  { kek, trash, onTypeFlip, onConflictCopy, keepLocalAs, preparedTmp, mutationBoundary }: WriteEntryOptions = {}
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -286,12 +291,30 @@ async function writeEntry(
     if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
     try {
       // Final precondition: does the target still match what reconcile assumed?
-      const current = await currentEntryAt(destRoot, entry.path);
+      const observed = await currentEntryAt(destRoot, entry.path);
+      const current = observed?.entry;
+      let movedAside = false;
       if (current && keepLocalAs) {
         await moveAside(destRoot, entry.path, keepLocalAs);
+        movedAside = true;
       } else if (!sameContent(current, expectedLocal) && current) {
         // The user created/edited it in the window — preserve those bytes.
-        await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+        const keptAs = await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+        reportConflictCopy(onConflictCopy, entry.path, keptAs);
+        movedAside = true;
+      }
+      countLstat();
+      const publishStat = await fs.lstat(abs).catch(() => undefined);
+      // The target changed after its precondition hash. Re-checking immediately
+      // before publish reduces the remaining race to the final rename syscall.
+      // Only bytes PRESENT now are worth preserving: a target that vanished in the
+      // window has nothing to keep, and a directory belongs to the type-flip branch
+      // below (which routes it to trash rather than a subtree-sized conflict copy).
+      const publishIdentity = fileStatIdentity(publishStat);
+      if (!movedAside && publishIdentity && !sameStatIdentity(observed?.identity, publishIdentity)) {
+        const keptAs = await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+        reportConflictCopy(onConflictCopy, entry.path, keptAs);
+        movedAside = true;
       }
 
     // Type-flip eviction (§3): currentEntryAt returns undefined for a directory,
@@ -300,9 +323,7 @@ async function writeEntry(
     // rename (else `rename(tmp, dir)` is EISDIR — the flat-meadow outage). It goes
     // to trash when present (a visible in-workspace conflict copy would re-push the
     // entire subtree as new adds — a churn bomb), else to a visible conflict copy.
-      countLstat();
-      const obstruction = await fs.lstat(abs).catch(() => undefined);
-      if (obstruction?.isDirectory()) {
+      if (!movedAside && publishStat?.isDirectory()) {
         onTypeFlip?.(entry.path);
         if (trash) await trash.put(entry.path);
         else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
@@ -446,24 +467,29 @@ async function deleteEntry(
   expectedLocal: FileEntry | undefined,
   device: string,
   now: string,
-  trash?: TrashBatch
+  trash?: TrashBatch,
+  onConflictCopy?: (relPath: string, keptAs: string) => void,
 ): Promise<void> {
   const abs = path.join(destRoot, rel);
   await assertWithinRoot(destRoot, abs);
-  const current = await currentEntryAt(destRoot, rel);
+  const current = (await currentEntryAt(destRoot, rel))?.entry;
   if (!current) return; // already gone
   if (sameContent(current, expectedLocal)) {
     if (trash) await trash.put(rel);
     else await fs.rm(abs, { force: true });
   } else {
-    await moveAside(destRoot, rel, conflictName(rel, device, now));
+    const keptAs = await moveAside(destRoot, rel, conflictName(rel, device, now));
+    reportConflictCopy(onConflictCopy, rel, keptAs);
   }
 }
 
 /** The on-disk entry at `rel`, or undefined if absent. Symlink targets are read,
  *  not followed; directories read as undefined (we never delete/overwrite a dir
  *  as if it were a file). */
-async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry | undefined> {
+type StatIdentity = { mtimeMs: number; size: number; ctimeMs: number };
+type CurrentEntryObservation = { entry: FileEntry; identity: StatIdentity };
+
+async function currentEntryAt(destRoot: string, rel: string): Promise<CurrentEntryObservation | undefined> {
   const abs = path.join(destRoot, rel);
   let st;
   try {
@@ -477,10 +503,16 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   }
   if (st.isSymbolicLink()) {
     const target = await fs.readlink(abs);
-    return { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 };
+    return {
+      entry: { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 },
+      identity: statIdentity(st),
+    };
   }
   if (st.isFile()) {
-    return { path: rel, type: "file", sha256: await hashFile(abs), size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs };
+    return {
+      entry: { path: rel, type: "file", sha256: await hashFile(abs), size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs },
+      identity: statIdentity(st),
+    };
   }
   return undefined; // directory or special file
 }
@@ -488,7 +520,7 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
 /** A conflict-copy destination must never clobber an EARLIER copy: conflictName
  *  has one-second precision, so two conflicts on the same path in the same second
  *  (same device) collide — probe and suffix `~2`, `~3`… (design 50). */
-async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
+async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<string> {
   const from = path.join(destRoot, fromRel);
   countLstat();
   const st = await fs.lstat(from);
@@ -496,13 +528,40 @@ async function moveAside(destRoot: string, fromRel: string, toRel: string): Prom
   // basename gains a `~N` suffix), so the parent is created once here — the
   // caller (writeEntry/deleteEntry) already ran assertWithinRoot on this subtree.
   await mkdirCounted(path.dirname(path.join(destRoot, toRel)));
-  await claimUnclobberedName({
+  return claimUnclobberedName({
     from,
     st,
     baseRel: toRel,
     toAbs: (rel) => path.join(destRoot, rel),
     hooks: { onMkdir: countMkdir, onRename: countRename },
   });
+}
+
+function statIdentity(st: Stats): StatIdentity {
+  return { mtimeMs: st.mtimeMs, size: st.size, ctimeMs: st.ctimeMs };
+}
+
+/** The identity of file/symlink BYTES at a path, or undefined when the path holds
+ *  no bytes to preserve (absent, a directory, or a special file). */
+function fileStatIdentity(st: Stats | undefined): StatIdentity | undefined {
+  if (!st || !(st.isFile() || st.isSymbolicLink())) return undefined;
+  return statIdentity(st);
+}
+
+function sameStatIdentity(a: StatIdentity | undefined, b: StatIdentity): boolean {
+  return a?.mtimeMs === b.mtimeMs && a.size === b.size && a.ctimeMs === b.ctimeMs;
+}
+
+function reportConflictCopy(
+  callback: ((relPath: string, keptAs: string) => void) | undefined,
+  relPath: string,
+  keptAs: string,
+): void {
+  try {
+    callback?.(relPath, keptAs);
+  } catch {
+    // Observability cannot fail a pull after the local bytes have moved.
+  }
 }
 
 

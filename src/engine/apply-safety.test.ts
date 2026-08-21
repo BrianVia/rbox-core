@@ -15,6 +15,7 @@ import {
 } from "./index.js";
 import { openTrashBatch, listTrash } from "./trash.js";
 import { encryptFileToTempInline, generateKek } from "./crypto.js";
+import { overrideHashFileForTests, realHashFileForTests } from "./hash.js";
 
 // Drive the real apply/watch pipeline against a real filesystem and assert on the
 // resulting bytes + trash contents — the safety guarantees are all on-disk effects.
@@ -73,19 +74,21 @@ const encryptedEntry = async (rel: string, content: Buffer, kek: Buffer, compres
   const blob = await encryptFileToTempInline(src, kek, tmp, { compress });
   const ciphertext = await fs.readFile(blob.ciphertextPath);
   await store.put(blob.encSha, ciphertext);
-  return {
-    entry: {
-      path: rel,
-      type: "file",
-      sha256: blob.plaintextSha,
-      encSha: blob.encSha,
-      size: content.length,
-      mode: 0o644,
-      mtimeMs: 0,
-      ...(blob.comp ? { comp: blob.comp, payloadSha: blob.payloadSha, cipherSize: blob.cipherSize } : {}),
-    },
-    ciphertext,
+  const entry: FileEntry = {
+    path: rel,
+    type: "file",
+    sha256: blob.plaintextSha,
+    encSha: blob.encSha,
+    size: content.length,
+    mode: 0o644,
+    mtimeMs: 0,
   };
+  if (blob.comp) {
+    entry.comp = blob.comp;
+    entry.payloadSha = blob.payloadSha;
+    entry.cipherSize = blob.cipherSize;
+  }
+  return { entry, ciphertext };
 };
 
 test("dir-obstruction write: the directory lands in trash, the entry publishes, onTypeFlip fires once", async () => {
@@ -225,6 +228,206 @@ test("dirty delete keeps a VISIBLE conflict copy and never trashes", async () =>
   expect(copies).toHaveLength(1);
   expect(await read(copies[0]!)).toBe("local edit wins");
   expect(await listTrash(root)).toHaveLength(0); // dirty branch never trashes
+});
+
+test("write precondition mismatch reports the claimed conflict copy exactly once", async () => {
+  await write("edited.txt", "newer local bytes");
+  const action = await writeAction("edited.txt", "remote bytes");
+  const reports: Array<{ relPath: string; keptAs: string }> = [];
+
+  await applyActions(root, [action], store, {
+    device: "dev",
+    now: "2026-08-20T12:34:56Z",
+    onConflictCopy: (relPath, keptAs) => reports.push({ relPath, keptAs }),
+  });
+
+  expect(reports).toEqual([{ relPath: "edited.txt", keptAs: "edited.dev.20260820123456.conflict.txt" }]);
+  expect(await read(reports[0]!.keptAs)).toBe("newer local bytes");
+  expect(await read("edited.txt")).toBe("remote bytes");
+});
+
+test("delete precondition mismatch reports the claimed conflict copy exactly once", async () => {
+  await write("edited.txt", "newer local bytes");
+  const stale: FileEntry = { path: "edited.txt", type: "file", sha256: hashBytes(Buffer.from("old bytes")), size: 9, mode: 0o644, mtimeMs: 0 };
+  const reports: Array<{ relPath: string; keptAs: string }> = [];
+
+  await applyActions(root, [{ kind: "delete", path: "edited.txt", expectedLocal: stale }], store, {
+    device: "dev",
+    now: "2026-08-20T12:34:56Z",
+    onConflictCopy: (relPath, keptAs) => reports.push({ relPath, keptAs }),
+  });
+
+  expect(reports).toEqual([{ relPath: "edited.txt", keptAs: "edited.dev.20260820123456.conflict.txt" }]);
+  expect(await read(reports[0]!.keptAs)).toBe("newer local bytes");
+  expect(await exists("edited.txt")).toBe(false);
+});
+
+test("same-second conflict collision reports the suffixed name actually claimed", async () => {
+  const reports: string[] = [];
+  const opts = {
+    device: "dev",
+    now: "2026-08-20T12:34:56Z",
+    onConflictCopy: (_relPath: string, keptAs: string) => reports.push(keptAs),
+  };
+  await write("edited.txt", "local one");
+  await applyActions(root, [await writeAction("edited.txt", "remote one")], store, opts);
+  await write("edited.txt", "local two");
+  await applyActions(root, [await writeAction("edited.txt", "remote two")], store, opts);
+
+  expect(reports).toEqual([
+    "edited.dev.20260820123456.conflict.txt",
+    "edited.dev.20260820123456.conflict.txt~2",
+  ]);
+  expect(await read(reports[0]!)).toBe("local one");
+  expect(await read(reports[1]!)).toBe("local two");
+});
+
+test("clean writes and reconcile-planned conflicts do not report apply-time conflict copies", async () => {
+  await write("clean.txt", "base bytes");
+  const local = await scanManifest(root);
+  const expectedLocal = local.files.find((entry) => entry.path === "clean.txt")!;
+  const clean = await writeAction("clean.txt", "remote clean bytes");
+  if (clean.kind !== "write") throw new Error("test setup expected a write action");
+  clean.expectedLocal = expectedLocal;
+
+  await write("planned.txt", "planned local bytes");
+  const plannedWrite = await writeAction("planned.txt", "planned remote bytes");
+  if (plannedWrite.kind !== "write") throw new Error("test setup expected a write action");
+  const planned: Action = {
+    kind: "conflict",
+    path: "planned.txt",
+    keepLocalAs: "planned.dev_20260820123456.conflict.txt",
+    entry: plannedWrite.entry,
+  };
+  const reports: string[] = [];
+
+  await applyActions(root, [clean, planned], store, {
+    onConflictCopy: (relPath, keptAs) => reports.push(`${relPath}:${keptAs}`),
+  });
+
+  expect(reports).toEqual([]);
+  expect(await read("clean.txt")).toBe("remote clean bytes");
+  expect(await read("planned.txt")).toBe("planned remote bytes");
+  expect(await read("planned.dev_20260820123456.conflict.txt")).toBe("planned local bytes");
+});
+
+test("a write landing after the precondition hash survives the publish as a conflict copy", async () => {
+  await write("racy.txt", "expected bytes");
+  const before = await scanManifest(root);
+  const expectedLocal = before.files.find((entry) => entry.path === "racy.txt")!;
+  const action = await writeAction("racy.txt", "remote bytes");
+  if (action.kind !== "write") throw new Error("test setup expected a write action");
+  action.expectedLocal = expectedLocal;
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "racy.txt")) {
+      injected = true;
+      await fs.writeFile(abs, "post-hash local bytes");
+    }
+    return sha;
+  });
+  const reports: string[] = [];
+  try {
+    await applyActions(root, [action], store, {
+      device: "dev",
+      now: "2026-08-20T12:34:56Z",
+      onConflictCopy: (_relPath, keptAs) => reports.push(keptAs),
+    });
+  } finally {
+    reset();
+  }
+
+  expect(injected).toBe(true);
+  expect(reports).toEqual(["racy.dev.20260820123456.conflict.txt"]);
+  expect(await read(reports[0]!)).toBe("post-hash local bytes");
+  expect(await read("racy.txt")).toBe("remote bytes");
+});
+
+// The publish-time re-check preserves BYTES. A path holding none — vanished, or now
+// a directory — has nothing to keep and must reach its existing owner untouched.
+test("a target deleted after the precondition hash publishes cleanly, with no copy and no throw", async () => {
+  await write("racy.txt", "expected bytes");
+  const before = await scanManifest(root);
+  const action = await writeAction("racy.txt", "remote bytes");
+  if (action.kind !== "write") throw new Error("test setup expected a write action");
+  action.expectedLocal = before.files.find((entry) => entry.path === "racy.txt")!;
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "racy.txt")) {
+      injected = true;
+      await fs.rm(abs); // the user deleted it inside the hash→publish window
+    }
+    return sha;
+  });
+  const reports: string[] = [];
+  try {
+    await applyActions(root, [action], store, { device: "dev", now: "2026-08-20T12:34:56Z", onConflictCopy: (_r, keptAs) => reports.push(keptAs) });
+  } finally {
+    reset();
+  }
+
+  expect(injected).toBe(true);
+  expect(reports).toEqual([]); // a vanished target has no bytes to preserve
+  expect(await read("racy.txt")).toBe("remote bytes");
+  expect(await conflictCopies()).toEqual([]);
+});
+
+test("a target replaced by a DIRECTORY after the precondition hash still routes to trash, not a conflict copy", async () => {
+  await write("racy.txt", "expected bytes");
+  const before = await scanManifest(root);
+  const action = await writeAction("racy.txt", "remote bytes");
+  if (action.kind !== "write") throw new Error("test setup expected a write action");
+  action.expectedLocal = before.files.find((entry) => entry.path === "racy.txt")!;
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "racy.txt")) {
+      injected = true;
+      await fs.rm(abs);
+      await fs.mkdir(abs);
+      await fs.writeFile(path.join(abs, "child.txt"), "subtree");
+    }
+    return sha;
+  });
+  const flips: string[] = [];
+  const reports: string[] = [];
+  const batch = openTrashBatch(root);
+  try {
+    await applyActions(root, [action], store, {
+      device: "dev", now: "2026-08-20T12:34:56Z", trash: batch,
+      onTypeFlip: (rel) => flips.push(rel),
+      onConflictCopy: (_r, keptAs) => reports.push(keptAs),
+    });
+  } finally {
+    reset();
+    await batch.finish();
+  }
+
+  expect(injected).toBe(true);
+  expect(reports).toEqual([]); // a directory is the type-flip branch's business
+  expect(flips).toEqual(["racy.txt"]);
+  expect(await read("racy.txt")).toBe("remote bytes");
+  expect(await conflictCopies()).toEqual([]); // never a subtree-sized visible copy
+  expect(await listTrash(root)).toHaveLength(1);
+});
+
+// The coordinator's guard: reporting apply-time copies must not disturb the
+// delete-vs-modify arm, where local really IS gone and remote really did change.
+test("delete-vs-modify: a genuinely absent local file takes the remote write with no conflict copy", async () => {
+  const action = await writeAction("gone.txt", "remote bytes"); // expectedLocal undefined = absent
+  const reports: string[] = [];
+
+  await applyActions(root, [action], store, {
+    device: "dev",
+    now: "2026-08-20T12:34:56Z",
+    onConflictCopy: (_relPath, keptAs) => reports.push(keptAs),
+  });
+
+  expect(reports).toEqual([]);
+  expect(await read("gone.txt")).toBe("remote bytes");
+  expect(await conflictCopies()).toEqual([]);
 });
 
 test("delete precondition hitting ENOTDIR (descendant of an evicted dir) is a no-op, not a throw", async () => {

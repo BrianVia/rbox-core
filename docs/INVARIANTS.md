@@ -830,6 +830,14 @@ Enforced: `src/cli/sync/pull.ts:168-205`; `src/engine/apply.ts:258-272,393-416`;
 Proven: `src/engine/apply-safety.test.ts`; `src/engine/trash.test.ts`; `src/cli/sync/sync.test.ts`
 Since: 50
 
+### Apply-time conflict copies are always reported
+
+Every conflict copy the apply phase creates from a write or delete precondition mismatch is reported exactly once through `onConflictCopy`, naming the copy actually claimed on disk, and lands in the pull's forensic line and `lastPull.conflicts`. Reconcile-planned conflicts stay counted by the plan, so no path is counted twice, and a reporting failure never fails a pull that already moved bytes.
+
+Enforced: `src/engine/apply.ts:63-65,300-318,466-484,555-565`; `src/cli/sync/pull.ts:358`; `src/cli/daemon/daemon.ts:2590-2618`
+Proven: `src/engine/apply-safety.test.ts`; `src/cli/sync/sync-scan-defer.test.ts`; `src/cli/daemon/daemon-activity.test.ts`
+Since: 281
+
 ### Conflict copies never clobber
 
 Repeated same-path conflicts atomically claim unique destinations rather than overwriting an earlier preserved copy.

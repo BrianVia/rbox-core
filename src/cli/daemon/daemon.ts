@@ -1899,6 +1899,7 @@ export class RboxDaemon {
    *  lives in {@link PublishLocalWorkspaceTransition}. */
   private async doPush(syncMutex: WorkspaceSyncMutex, provenance: PushProvenance): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
+    this.conflictCopiesSincePull = 0;
     const prologueT0 = performance.now();
     await this.applyPendingWatchEvents();
     const prologueMs = performance.now() - prologueT0;
@@ -1922,6 +1923,7 @@ export class RboxDaemon {
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
         onPullAdopted: (adoptedSequence) => this.recordPullAdopted(adoptedSequence),
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
+        onConflictCopy: (rel, keptAs) => this.noteConflictCopy(rel, keptAs),
         telemetry: this.telemetry,
         mutationBoundary: this.mutationGate,
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
@@ -2148,6 +2150,7 @@ export class RboxDaemon {
       this.chainRepairPolicy.assertHeadAllowed(pin);
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
+    this.conflictCopiesSincePull = 0;
     let chainRepaired = false;
     await this.pullTransition.apply({
       seal: async () => {
@@ -2186,6 +2189,7 @@ export class RboxDaemon {
             this.recordPullAdopted(adoptedSequence, phaseMs);
           },
           onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
+          onConflictCopy: (rel, keptAs) => this.noteConflictCopy(rel, keptAs),
           telemetry: this.telemetry,
           mutationBoundary: this.mutationGate,
         };
@@ -2571,6 +2575,7 @@ export class RboxDaemon {
    *  onTypeFlip fires DURING applyActions (before the pull's onPullApplied), so it
    *  accumulates here and recordPullApplied folds it into `lastPull.conflicts` and resets. */
   private typeFlipsSincePull = 0;
+  private conflictCopiesSincePull = 0;
 
   /** A pull moved an obstructing local directory to trash so an incoming file/symlink
    *  could land (the EISDIR-flip heal). Forensic log line + folded into the conflict
@@ -2582,11 +2587,16 @@ export class RboxDaemon {
     this.typeFlipsSincePull++;
   }
 
+  private noteConflictCopy(relPath: string, keptAs: string): void {
+    this.log(`pull conflict copy: ${cleanPath(relPath)} — your newer local version was saved as ${cleanPath(keptAs)}`);
+    this.conflictCopiesSincePull++;
+  }
+
   /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
    *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
    *  is the record that answers "did sync change/delete my files?" after the fact. */
   private recordPullApplied(actions: Action[]): void {
-    this.log(`pull applied: ${summarizeActions(actions)}`);
+    this.log(`pull applied: ${summarizeActions(actions, this.conflictCopiesSincePull)}`);
     let writes = 0;
     let deletes = 0;
     let conflicts = 0;
@@ -2597,8 +2607,14 @@ export class RboxDaemon {
     }
     // Type-flip evictions are conflicts too (a local dir was moved aside), but they arrive
     // out-of-band via onTypeFlip rather than as `conflict` actions — fold + reset the tally.
-    this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts: conflicts + this.typeFlipsSincePull };
+    this.activity.lastPull = {
+      at: new Date().toISOString(),
+      writes,
+      deletes,
+      conflicts: conflicts + this.typeFlipsSincePull + this.conflictCopiesSincePull,
+    };
     this.typeFlipsSincePull = 0;
+    this.conflictCopiesSincePull = 0;
     this.activityDirty = true;
   }
 
