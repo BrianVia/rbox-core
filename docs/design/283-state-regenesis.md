@@ -1055,7 +1055,20 @@ record.
 
 ---
 
-## 13. Open questions for the founder
+## 13. Open questions for the founder — ALL RULED (founder, 2026-08-21)
+
+1. Consent: **EXEMPT** — schema supersession needs no consent witness; the
+   owner-enforced same-stream invariant replaces consent's safety role.
+2. Kill switch: **SHIP WITH KILL SWITCH** (RBOX_STATE_REGENESIS=0 restores
+   hard-refusal); standard two-clean-weeks deletion clock.
+3. Port tax: **ACCEPTED as standing policy**; revisit at v3 if the port stays
+   large. v1 port deletion gated by §9.
+4. Sticky quiesce: **PERMANENT POSTURE ACCEPTED**; surface = existing
+   admission-command grammar + one honest `rbox status` line (non-developer
+   copy bar); no wire change.
+
+The original questions follow for the record.
+
 
 1. **Consent (§6.8).** Re-genesis removes the reset consent witness for this
    trigger, which design 265 requires before every reset mutation. Confirm that
