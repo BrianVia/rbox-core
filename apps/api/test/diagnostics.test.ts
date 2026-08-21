@@ -2,7 +2,7 @@ import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { createWebSession } from "../src/auth.js";
-import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics, type DiagnosticsBundle, type DiagnosticsCheckResult, type DiagnosticsChecks } from "../src/diagnostics.js";
+import { createDiagnosticsReport, DIAGNOSTICS_RETENTION_MS, sweepDiagnostics, validateDiagnosticsBundle, type DiagnosticsBundle, type DiagnosticsCheckResult, type DiagnosticsChecks } from "../src/diagnostics.js";
 import type { Principal } from "../src/authz.js";
 
 const BASE = "https://example.com";
@@ -53,6 +53,8 @@ function bundle(over: Partial<DiagnosticsFixture> = {}): DiagnosticsFixture {
     metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 2 },
     activity: { at: "2026-07-03T00:00:00.000Z", lastPush: { at: "2026-07-03T00:00:00.000Z", files: 1, sequence: 1 } },
     workspaceShape: { fileCount: 1, totalBytes: 42 },
+    leftoverWorktrees: { count: 1, entries: [{ branch: "feature", prunable: true, holdsSyncedRef: false }] },
+    repoResidue: { count: 1, gitPresent: 1, rboxPresent: 0, identity: { match: 0, mismatch: 1, unknown: 0 }, quarantinePresent: 0 },
     ...over,
   };
 }
@@ -62,6 +64,22 @@ function req(body: unknown): Request {
 }
 
 describe("POST /v1/diagnostics", () => {
+  test("accepts the leftoverWorktrees and repoResidue sections the CLI actually sends", () => {
+    expect(validateDiagnosticsBundle(bundle())).toMatchObject({
+      ok: true,
+      value: {
+        leftoverWorktrees: { count: 1, entries: [{ branch: "feature", prunable: true, holdsSyncedRef: false }] },
+        repoResidue: { count: 1, gitPresent: 1, identity: { mismatch: 1 } },
+      },
+    });
+  });
+
+  test("rejects local leftover-worktree paths", () => {
+    const body = bundle();
+    body.leftoverWorktrees.entries = [{ branch: "feature", prunable: true, holdsSyncedRef: false, path: "/secret" } as never];
+    expect(validateDiagnosticsBundle(body)).toEqual({ ok: false, message: "leftoverWorktrees.entries[0] must be an object" });
+  });
+
   test("accepts the legacy six checks while allowing the exact new optional vocabulary", async () => {
     const a = await bootstrap("diag-compatible-checks");
     const legacy = bundle();
