@@ -1,13 +1,12 @@
 import fs from "node:fs/promises";
-import type { Stats } from "node:fs";
 import path from "node:path";
 import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
-import { hashBytes, hashFile } from "./hash.js";
 import { BLOB_CIPHERTEXT_TAG_BYTES, decryptFileToPath } from "./crypto.js";
 import { withCryptoPool } from "./crypto-pool/pool.js";
-import { assertWithinRoot, claimUnclobberedName, isAbsent, RBOX_TMP_PREFIX } from "./fsutil.js";
+import { assertWithinRoot, isAbsent, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName } from "./conflict-name.js";
+import { observeTarget, preserveTarget, sameTargetIdentity, targetBytesIdentity } from "./apply-target.js";
 import type { Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
 import type { TrashBatch } from "./trash.js";
@@ -15,7 +14,7 @@ import type { FileEntry, Manifest } from "./types.js";
 import { MutationGateClosedError, type MutationBoundary } from "./mutation-gate.js";
 import {
   addDirComponentWalks, addPreflightMs, addUniqueDirs, addWritePoolMs,
-  applyStatsEnabled, countLstat, countMkdir, countRename, countStage, mkdirCounted,
+  applyStatsEnabled, countLstat, countRename, countStage, mkdirCounted,
 } from "./apply-stats.js";
 
 /**
@@ -194,7 +193,7 @@ export async function applyActions(
         if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
         try {
           opts.onTypeFlip?.(comp);
-          await moveAside(destRoot, comp, conflictName(comp, device, now));
+          await preserveTarget(destRoot, comp, conflictName(comp, device, now));
         } finally {
           lease?.finish();
         }
@@ -291,15 +290,15 @@ async function writeEntry(
     if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
     try {
       // Final precondition: does the target still match what reconcile assumed?
-      const observed = await currentEntryAt(destRoot, entry.path);
+      const observed = await observeTarget(destRoot, entry.path);
       const current = observed?.entry;
       let movedAside = false;
       if (current && keepLocalAs) {
-        await moveAside(destRoot, entry.path, keepLocalAs);
+        await preserveTarget(destRoot, entry.path, keepLocalAs);
         movedAside = true;
       } else if (!sameContent(current, expectedLocal) && current) {
         // The user created/edited it in the window — preserve those bytes.
-        const keptAs = await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+        const keptAs = await preserveTarget(destRoot, entry.path, conflictName(entry.path, device, now));
         reportConflictCopy(onConflictCopy, entry.path, keptAs);
         movedAside = true;
       }
@@ -310,17 +309,17 @@ async function writeEntry(
       // Only bytes PRESENT now are worth preserving: a target that vanished in the
       // window has nothing to keep, and a directory belongs to the type-flip branch
       // below (which routes it to trash rather than a subtree-sized conflict copy).
-      const publishIdentity = fileStatIdentity(publishStat);
-      if (!movedAside && publishIdentity && !sameStatIdentity(observed?.identity, publishIdentity)) {
+      const publishIdentity = targetBytesIdentity(publishStat);
+      if (!movedAside && publishIdentity && !sameTargetIdentity(observed?.identity, publishIdentity)) {
         // This branch is rare by construction, so re-derive the truth rather than act
         // on the stat alone: bytes that already equal the ones we are about to publish
         // are not worth preserving, and copying them would turn a bulk atomic
         // materialization into conflict-copy churn.
-        const fresh = await currentEntryAt(destRoot, entry.path);
+        const fresh = await observeTarget(destRoot, entry.path);
         if (fresh && !sameContent(fresh.entry, entry)) {
           // A planned conflict that found its target absent earlier still owns this
           // path's count via the plan — preserve under its chosen name, do not report.
-          const keptAs = await moveAside(destRoot, entry.path, keepLocalAs ?? conflictName(entry.path, device, now));
+          const keptAs = await preserveTarget(destRoot, entry.path, keepLocalAs ?? conflictName(entry.path, device, now));
           if (!keepLocalAs) reportConflictCopy(onConflictCopy, entry.path, keptAs);
           movedAside = true;
         }
@@ -335,7 +334,7 @@ async function writeEntry(
       if (!movedAside && publishStat?.isDirectory()) {
         onTypeFlip?.(entry.path);
         if (trash) await trash.put(entry.path);
-        else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+        else await preserveTarget(destRoot, entry.path, conflictName(entry.path, device, now));
       }
       countRename();
       await fs.rename(tmp, abs);
@@ -481,97 +480,25 @@ async function deleteEntry(
 ): Promise<void> {
   const abs = path.join(destRoot, rel);
   await assertWithinRoot(destRoot, abs);
-  const observed = await currentEntryAt(destRoot, rel);
+  const observed = await observeTarget(destRoot, rel);
   if (!observed) return; // already gone
   if (sameContent(observed.entry, expectedLocal)) {
     // Same post-hash window the write path closes: an edit landing between the
     // precondition hash and the removal would otherwise be deleted outright (and
     // with the trash tier off, unrecoverably).
     countLstat();
-    const publishIdentity = fileStatIdentity(await fs.lstat(abs).catch(() => undefined));
-    if (publishIdentity && !sameStatIdentity(observed.identity, publishIdentity)) {
-      const keptAs = await moveAside(destRoot, rel, conflictName(rel, device, now));
+    const publishIdentity = targetBytesIdentity(await fs.lstat(abs).catch(() => undefined));
+    if (publishIdentity && !sameTargetIdentity(observed.identity, publishIdentity)) {
+      const keptAs = await preserveTarget(destRoot, rel, conflictName(rel, device, now));
       reportConflictCopy(onConflictCopy, rel, keptAs);
       return;
     }
     if (trash) await trash.put(rel);
     else await fs.rm(abs, { force: true });
   } else {
-    const keptAs = await moveAside(destRoot, rel, conflictName(rel, device, now));
+    const keptAs = await preserveTarget(destRoot, rel, conflictName(rel, device, now));
     reportConflictCopy(onConflictCopy, rel, keptAs);
   }
-}
-
-/** The on-disk entry at `rel`, or undefined if absent. Symlink targets are read,
- *  not followed; directories read as undefined (we never delete/overwrite a dir
- *  as if it were a file). */
-type StatIdentity = { dev: number; ino: number; mtimeMs: number; size: number; ctimeMs: number };
-type CurrentEntryObservation = { entry: FileEntry; identity: StatIdentity };
-
-async function currentEntryAt(destRoot: string, rel: string): Promise<CurrentEntryObservation | undefined> {
-  const abs = path.join(destRoot, rel);
-  let st;
-  try {
-    countLstat();
-    st = await fs.lstat(abs);
-  } catch (e) {
-    // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
-    // can't exist, so it's already gone.
-    if (isAbsent(e)) return undefined;
-    throw e;
-  }
-  if (st.isSymbolicLink()) {
-    const target = await fs.readlink(abs);
-    return {
-      entry: { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 },
-      identity: statIdentity(st),
-    };
-  }
-  if (st.isFile()) {
-    return {
-      entry: { path: rel, type: "file", sha256: await hashFile(abs), size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs },
-      identity: statIdentity(st),
-    };
-  }
-  return undefined; // directory or special file
-}
-
-/** A conflict-copy destination must never clobber an EARLIER copy: conflictName
- *  has one-second precision, so two conflicts on the same path in the same second
- *  (same device) collide — probe and suffix `~2`, `~3`… (design 50). */
-async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<string> {
-  const from = path.join(destRoot, fromRel);
-  countLstat();
-  const st = await fs.lstat(from);
-  // The conflict destination shares its parent directory with `toRel` (only the
-  // basename gains a `~N` suffix), so the parent is created once here — the
-  // caller (writeEntry/deleteEntry) already ran assertWithinRoot on this subtree.
-  await mkdirCounted(path.dirname(path.join(destRoot, toRel)));
-  return claimUnclobberedName({
-    from,
-    st,
-    baseRel: toRel,
-    toAbs: (rel) => path.join(destRoot, rel),
-    hooks: { onMkdir: countMkdir, onRename: countRename },
-  });
-}
-
-/** `dev`/`ino` are carried alongside the hash cache's `(mtime,size,ctime)` triple so
- *  an atomic same-size replacement cannot evade detection on a coarse-timestamp
- *  filesystem: `rename` installs a different inode even when every timestamp ties. */
-function statIdentity(st: Stats): StatIdentity {
-  return { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size, ctimeMs: st.ctimeMs };
-}
-
-/** The identity of file/symlink BYTES at a path, or undefined when the path holds
- *  no bytes to preserve (absent, a directory, or a special file). */
-function fileStatIdentity(st: Stats | undefined): StatIdentity | undefined {
-  if (!st || !(st.isFile() || st.isSymbolicLink())) return undefined;
-  return statIdentity(st);
-}
-
-function sameStatIdentity(a: StatIdentity | undefined, b: StatIdentity): boolean {
-  return a?.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size && a.ctimeMs === b.ctimeMs;
 }
 
 function reportConflictCopy(

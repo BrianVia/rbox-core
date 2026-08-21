@@ -432,3 +432,24 @@ valid and are folded in; three are named residuals with reasons.
 advance, the mass-delete guard, and mutation-gate leases are unchanged. The
 write guard adds no steady-state syscall — it repurposes the pre-existing
 type-flip `lstat`.
+
+## 8. Module-size ratchet: the extraction it forced
+
+The fix pushed `src/engine/apply.ts` past its allowlisted ceiling (565 nonblank
+vs the 536 the 10% band allows). Per the standing no-re-pins rule that is a
+decomposition trigger, not a number to bump.
+
+`src/engine/apply-target.ts` now owns **the live on-disk state of a path an apply
+is about to overwrite or remove** — `observeTarget` (lstat + hash + stat
+identity), `targetBytesIdentity` / `sameTargetIdentity` (has it changed since we
+looked), and `preserveTarget` (move it aside without clobbering an earlier copy,
+returning the name actually claimed). `apply.ts` keeps what it always owned:
+staging, decryption, the write pool, type-flip eviction, publishing, and the
+`ApplyOptions` reporting surface.
+
+This is a real seam, not a size dodge: apply decides what SHOULD be at a path,
+and exactly one module now answers what IS there. It is also the seam this whole
+design turns on — every guard in §3 is a question about the target's current
+state, and they were previously answered by three private helpers scattered
+through a 500-line file. `apply.ts` lands at 498 nonblank (under its unchanged
+488 ceiling's band), `apply-target.ts` at 92.
