@@ -9,7 +9,7 @@ import type { Action, Manifest } from "../../engine/index.js";
 import type { SyncState } from "../sync-state-model.js";
 import { assertBindingUsable, resolveBindingScope } from "./binding-scope.js";
 import { composeScopedBase, ScopeProjection } from "./projection.js";
-import { applyRuleFileAuthority } from "./rule-authority.js";
+import { applyRuleFileAuthority, type RuleFileAuthorityOutcome } from "./rule-authority.js";
 
 export interface ScopedPull {
   /** Absent on an unscoped binding. */
@@ -67,7 +67,12 @@ export async function prepareScopedPull(root: string, state: SyncState, local: M
  * Remote is authoritative for the ignore-rule files a scoped binding carries as
  * metadata. Returns the amended actions and the rule files whose local bytes lost.
  */
-export function applyScopedRuleAuthority(actions: Action[], scoped: ScopedPull): { actions: Action[]; diverged: string[] } {
+export function applyScopedRuleAuthority(
+  actions: Action[],
+  scoped: ScopedPull,
+  device: string,
+  now: string,
+): RuleFileAuthorityOutcome {
   if (!scoped.projection) return { actions, diverged: [] };
-  return applyRuleFileAuthority(actions, scoped.projection, scoped.reconcileBase, scoped.local, scoped.remote);
+  return applyRuleFileAuthority(actions, scoped.projection, scoped.reconcileBase, scoped.local, scoped.remote, device, now);
 }

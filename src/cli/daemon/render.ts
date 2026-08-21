@@ -19,7 +19,7 @@ export const cleanPath = (p: string) => p.replace(/\p{Cc}/gu, "?");
 
 /** One-line forensic summary of the actions a pull APPLIED to the local tree:
  *  counts by kind plus the paths themselves (`+`write `-`delete `!`conflict). */
-export function summarizeActions(actions: Action[]): string {
+export function summarizeActions(actions: Action[], applyTimeConflicts = 0): string {
   let writes = 0;
   let deletes = 0;
   let conflicts = 0;
@@ -41,5 +41,5 @@ export function summarizeActions(actions: Action[]): string {
     }
   }
   const more = actions.length > LOG_PATHS_MAX ? ` (+${actions.length - LOG_PATHS_MAX} more)` : "";
-  return `${writes} write, ${deletes} delete, ${conflicts} conflict — ${paths.join(" ")}${more}`;
+  return `${writes} write, ${deletes} delete, ${conflicts + applyTimeConflicts} conflict — ${paths.join(" ")}${more}`;
 }

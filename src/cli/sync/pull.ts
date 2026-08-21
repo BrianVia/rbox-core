@@ -304,11 +304,14 @@ export async function applyPulledManifest(
   // Design 212 §3.2: the remote git topology is classified IN / STRADDLE / OOS and
   // every manifest is projected onto this binding's folders BEFORE reconcile, blob
   // fetch, or apply. On an unscoped binding this returns the same manifests.
+  const reconcileNow = new Date().toISOString();
   const { scoped, authority } = await report.phase("reconcile", async () => {
     const scoped = await prepareScopedPull(root, state, local, remote);
     const authority = applyScopedRuleAuthority(
-      reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, new Date().toISOString()),
+      reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, reconcileNow),
       scoped,
+      cfg.deviceId,
+      reconcileNow,
     );
     return { scoped, authority };
   });
@@ -352,6 +355,7 @@ export async function applyPulledManifest(
     keyEpoch: input.keyEpoch ?? cfg.keyEpoch,
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
+    onConflictCopy: deps.onConflictCopy,
     warningSink: deps.warningSink,
     mutationBoundary: deps.mutationBoundary,
     onProgress: deps.onProgress ? (done: number, total: number, bytesDone: number, bytesTotal: number) =>

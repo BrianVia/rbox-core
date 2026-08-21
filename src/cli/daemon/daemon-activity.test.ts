@@ -18,6 +18,7 @@ import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.
 import type { WatchOptions, Watcher } from "./watcher.js";
 import { prepareDaemonFolderAdmission, releaseDaemonFolderAdmission } from "./folder-admission.test-helper.js";
 import { RBOX_VERSION } from "../version.js";
+import { overrideHashFileForTests, realHashFileForTests } from "../../engine/hash.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
 // sync. The load-bearing lifecycle: a pump error records a HALT (the mass-delete
@@ -119,6 +120,8 @@ interface DaemonInternals {
   runSafetyCadenceTick(): Promise<void>;
   hasPublishableLocalDivergence(): Promise<"none" | "some" | "pending-carry" | "indeterminate">;
   doPush(...args: unknown[]): Promise<void>;
+  noteConflictCopy(relPath: string, keptAs: string): void;
+  recordPullApplied(actions: import("../../engine/index.js").Action[]): void;
   ambientStatusFrom(activity: DaemonActivity, settled: boolean, now: number): { deferredRepos: number };
   writeHeartbeatSurfaces(): void;
   writeWsActivity(): void;
@@ -1170,6 +1173,44 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   expect(after?.lastPush?.sequence).toBe(3);
   expect(after?.lastPush?.files).toBe(3); // a.txt + b.txt + c.txt
   expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("theirs");
+});
+
+test("an apply-time conflict copy is named in the forensic log and counted in lastPull", async () => {
+  const remote = new MiniRemote();
+  const logs: string[] = [];
+  const daemon = await makeDaemon(remote, "apply-copy-activity", { log: (line) => logs.push(line) });
+  const cfg = testConfig();
+  remote.injectCommit([await remote.seedEntry("a.txt", "one")]);
+  await pull(root, cfg, { remote, backoff: async () => {} });
+  remote.injectCommit([await remote.seedEntry("a.txt", "two")]);
+
+  await fs.rm(path.join(root, ".rbox/state/hashcache.json"), { force: true });
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "a.txt")) {
+      injected = true;
+      await fs.writeFile(abs, "one-newer-local");
+    }
+    return sha;
+  });
+  try {
+    await pull(root, cfg, {
+      remote,
+      backoff: async () => {},
+      onConflictCopy: (relPath, keptAs) => daemon.noteConflictCopy(relPath, keptAs),
+      onPullApplied: (actions) => daemon.recordPullApplied(actions),
+    });
+  } finally {
+    reset();
+  }
+
+  expect(injected).toBe(true);
+  expect(logs).toContainEqual(expect.stringMatching(/^pull conflict copy: a\.txt — your newer local version was saved as a\..+\.conflict\.txt$/));
+  const applied = logs.find((line) => line.startsWith("pull applied:"));
+  expect(applied).toContain("1 conflict");
+  expect(applied).not.toContain("0 conflict");
+  expect(daemon.activity.lastPull).toEqual({ at: expect.any(String), writes: 1, deletes: 0, conflicts: 1 });
 });
 
 test.serial("propagation tracing enables pull phases with metrics and telemetry off, while trace-off emits nothing", async () => {

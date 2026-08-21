@@ -202,13 +202,18 @@ test("pull with the churning path deferred and remote CHANGED preserves the loca
   await fs.rm(path.join(root, ".rbox/state/hashcache.json"), { force: true });
   mutations.set("a.txt", async (abs) => fs.appendFile(abs, "-edit"));
 
-  await pull(root, cfg, deps(remote));
+  const surfaced: Array<{ relPath: string; keptAs: string }> = [];
+  await pull(root, cfg, {
+    ...deps(remote),
+    onConflictCopy: (relPath, keptAs) => surfaced.push({ relPath, keptAs }),
+  });
   expect(mutations.size).toBe(0); // the churn really fired during the pre-apply scan
   expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("two"); // remote applied
   const names = await fs.readdir(root);
   const conflict = names.find((n) => n.includes(".conflict"));
   expect(conflict).toBeDefined(); // the mid-write bytes survived
   expect(await fs.readFile(path.join(root, conflict!), "utf8")).toBe("one-edit");
+  expect(surfaced).toEqual([{ relPath: "a.txt", keptAs: conflict }]);
 });
 
 test("push with every change scan-deferred publishes no torn entry and makes no spurious commit", async () => {

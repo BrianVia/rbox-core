@@ -116,6 +116,9 @@ export interface SyncDeps {
    *  (design 50 §3): the dir moved to trash. The CLI/daemon logs it and
    *  counts it into `lastPull.conflicts`. Threaded into applyActions via `onTypeFlip`. */
   onTypeFlip?: (relPath: string) => void;
+  /** Apply preserved a newer local version after a write/delete precondition
+   *  mismatch. `keptAs` is the conflict-copy path actually claimed on disk. */
+  onConflictCopy?: (relPath: string, keptAs: string) => void;
   /** Fired by EVERY pull that applied actions to the local tree — including the pull
    *  inside pushManifest's 409 recovery, whose actions the retry loop discards
    *  (design 45: the daemon's forensic log and activity trail must record
