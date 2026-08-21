@@ -9,10 +9,10 @@ import { OP_STATE_DIRS, OP_STATE_FILES } from "../../../src/engine/manifest-vali
 import { formatGitPushLine, type GitPushPlan } from "../../../src/cli/sync-git/plan.js";
 import {
   GIT_FIXTURE_BUILDERS,
-  GIT_SHAPE_CELLS,
-  GIT_SHAPE_OUTCOMES,
-  GIT_SHAPE_OP_STATE_ROOTS,
-  GIT_SHAPE_REFUSALS,
+  GIT_LAYOUT_CELLS,
+  GIT_LAYOUT_OUTCOMES,
+  GIT_LAYOUT_OP_STATE_ROOTS,
+  GIT_LAYOUT_REFUSALS,
   LFS_PAYLOAD,
   NFC_FILENAME,
   NFC_FILENAME_HEX,
@@ -52,10 +52,10 @@ async function executeDescription(description: GitFixtureDescription): Promise<{
 
 describe("git fixture descriptions", () => {
   test("enumerate fourteen builders and all fifteen normative outcomes", () => {
-    expect(GIT_SHAPE_CELLS).toHaveLength(14);
-    expect(GIT_SHAPE_OUTCOMES).toHaveLength(15);
-    expect(new Set(GIT_SHAPE_OUTCOMES).size).toBe(15);
-    expect(GIT_SHAPE_OUTCOMES).toContain("s1-a/mod");
+    expect(GIT_LAYOUT_CELLS).toHaveLength(14);
+    expect(GIT_LAYOUT_OUTCOMES).toHaveLength(15);
+    expect(new Set(GIT_LAYOUT_OUTCOMES).size).toBe(15);
+    expect(GIT_LAYOUT_OUTCOMES).toContain("s1-a/mod");
   });
 
   test("are pure and deterministic", () => {
@@ -93,8 +93,8 @@ describe("git fixture descriptions", () => {
   test("shared preflight refusals drift-fail against product code", async () => {
     const modules = await executeDescription(buildS1InitializedSubmodule());
     const shallow = await executeDescription(buildS4Shallow());
-    expect((await gitPreflight(path.join(modules.root, "s1-a"))).reason).toBe(GIT_SHAPE_REFUSALS.modules);
-    expect((await gitPreflight(path.join(shallow.root, "s4-shallow"))).reason).toBe(GIT_SHAPE_REFUSALS.shallow);
+    expect((await gitPreflight(path.join(modules.root, "s1-a"))).reason).toBe(GIT_LAYOUT_REFUSALS.modules);
+    expect((await gitPreflight(path.join(shallow.root, "s4-shallow"))).reason).toBe(GIT_LAYOUT_REFUSALS.shallow);
   }, 30_000);
 
   test("shared case-collision refusal drift-fails against manifest validation", () => {
@@ -102,7 +102,7 @@ describe("git fixture descriptions", () => {
     const files = fixture.tree
       .filter((entry) => entry.kind === "file")
       .map((entry) => ({ path: entry.path, type: "file", sha256: "0".repeat(64), size: 1, mode: 0o644 }));
-    expect(validateManifest({ manifestSchema: 1, files })).toEqual({ ok: false, error: GIT_SHAPE_REFUSALS.caseCollision });
+    expect(validateManifest({ manifestSchema: 1, files })).toEqual({ ok: false, error: GIT_LAYOUT_REFUSALS.caseCollision });
   });
 
   test("LFS fixtures commit the canonical pointer while retaining payload bytes", async () => {
@@ -153,7 +153,7 @@ describe("git fixture descriptions", () => {
   });
 
   test("fixture plan formatter drift-fails against the product formatter", () => {
-    const summary = { captured: ["s1-a/mod"], deferred: [{ relPath: "s1-a", reason: `${GIT_SHAPE_REFUSALS.modules} — section not captured` }] };
+    const summary = { captured: ["s1-a/mod"], deferred: [{ relPath: "s1-a", reason: `${GIT_LAYOUT_REFUSALS.modules} — section not captured` }] };
     const productPlan = {
       changed: true, authoredCfgHashByRepo: {}, captured: [...summary.captured], carried: [], deferred: [...summary.deferred],
       captureDeferrals: {}, configDeferrals: {}, captureObserved: [], configObserved: [], skipped: [], removed: [],
@@ -162,6 +162,6 @@ describe("git fixture descriptions", () => {
   });
 
   test("op-state snapshot roots drift-fail against the product universe", () => {
-    expect(GIT_SHAPE_OP_STATE_ROOTS).toEqual([...OP_STATE_FILES, ...OP_STATE_DIRS]);
+    expect(GIT_LAYOUT_OP_STATE_ROOTS).toEqual([...OP_STATE_FILES, ...OP_STATE_DIRS]);
   });
 });

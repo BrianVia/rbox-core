@@ -6,7 +6,7 @@
  * the same descriptions without needing a rig guest.
  */
 
-export type GitShapeCell =
+export type GitLayoutCell =
   | "s1-a"
   | "s1-b"
   | "s1-c"
@@ -35,7 +35,7 @@ export interface FixtureTreeEntry {
 }
 
 export interface GitFixtureDescription {
-  readonly cell: GitShapeCell;
+  readonly cell: GitLayoutCell;
   readonly commands: readonly FixtureCommand[];
   readonly tree: readonly FixtureTreeEntry[];
   readonly fsckRepos: readonly string[];
@@ -66,7 +66,7 @@ export const LFS_PAYLOAD = "rbox-lfs-payload\u0000\u0001\u0002\n";
  * gitPreflight/validateManifest against these values, while the live scenario
  * imports them instead of retyping user-visible strings.
  */
-export const GIT_SHAPE_REFUSALS = Object.freeze({
+export const GIT_LAYOUT_REFUSALS = Object.freeze({
   modules: ".git/modules present — unsupported",
   shallow: "shallow clone — unsupported (git fetch --unshallow to sync history)",
   caseCollision: "case-insensitive duplicate path: s3-case/Readme.md",
@@ -87,7 +87,7 @@ export const GIT_LAYOUT_SURFACES = Object.freeze({
 });
 
 /** Product op-state universe, imported by the scenario and drift-pinned in tests. */
-export const GIT_SHAPE_OP_STATE_ROOTS = Object.freeze([
+export const GIT_LAYOUT_OP_STATE_ROOTS = Object.freeze([
   "MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
   "ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE",
   "rebase-merge", "rebase-apply", "sequencer",
@@ -110,7 +110,7 @@ const identity = [
   "export GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'",
 ];
 
-function shell(cell: GitShapeCell, body: readonly string[], tree: readonly FixtureTreeEntry[], fsckRepos: readonly string[], needsGitLfs = false, refusal?: string): GitFixtureDescription {
+function shell(cell: GitLayoutCell, body: readonly string[], tree: readonly FixtureTreeEntry[], fsckRepos: readonly string[], needsGitLfs = false, refusal?: string): GitFixtureDescription {
   return {
     cell,
     commands: [{ argv: ["sh", "-ceu", ["set -e", ...identity, ...body].join("\n")] }],
@@ -147,7 +147,7 @@ export function buildS1InitializedSubmodule(): GitFixtureDescription {
     { path: "s1-a/.gitmodules", kind: "file" },
     { path: "s1-a/parent.txt", kind: "file" },
     { path: "s1-a/mod/module.txt", kind: "file" },
-  ], ["s1-a", "s1-a/mod"], false, GIT_SHAPE_REFUSALS.modules);
+  ], ["s1-a", "s1-a/mod"], false, GIT_LAYOUT_REFUSALS.modules);
 }
 
 export function buildS1Pointer(): GitFixtureDescription {
@@ -220,7 +220,7 @@ export function buildS3CaseCollision(): GitFixtureDescription {
     "printf 'mixed\\n' > \"$FIXTURE_ROOT/s3-case/Readme.md\"",
     "git -C \"$FIXTURE_ROOT/s3-case\" add README.md Readme.md",
     "GIT_AUTHOR_DATE='2026-03-02T00:00:00Z' GIT_COMMITTER_DATE='2026-03-02T00:00:00Z' git -C \"$FIXTURE_ROOT/s3-case\" commit -q -m case",
-  ], [...repoTree("s3-case"), { path: "s3-case/README.md", kind: "file" }, { path: "s3-case/Readme.md", kind: "file" }], ["s3-case"], false, GIT_SHAPE_REFUSALS.caseCollision);
+  ], [...repoTree("s3-case"), { path: "s3-case/README.md", kind: "file" }, { path: "s3-case/Readme.md", kind: "file" }], ["s3-case"], false, GIT_LAYOUT_REFUSALS.caseCollision);
 }
 
 export function buildS4Shallow(): GitFixtureDescription {
@@ -233,7 +233,7 @@ export function buildS4Shallow(): GitFixtureDescription {
     "printf 'two\\n' >> \"$FIXTURE_AUX/s4-shallow-origin/history.txt\"; git -C \"$FIXTURE_AUX/s4-shallow-origin\" add history.txt",
     "GIT_AUTHOR_DATE='2026-04-02T00:00:00Z' GIT_COMMITTER_DATE='2026-04-02T00:00:00Z' git -C \"$FIXTURE_AUX/s4-shallow-origin\" commit -q -m two",
     "git clone -q --depth 1 \"file://$FIXTURE_AUX/s4-shallow-origin\" \"$FIXTURE_ROOT/s4-shallow\"",
-  ], [...repoTree("s4-shallow"), { path: "s4-shallow/.git/shallow", kind: "file" }, { path: "s4-shallow/history.txt", kind: "file" }], ["s4-shallow"], false, GIT_SHAPE_REFUSALS.shallow);
+  ], [...repoTree("s4-shallow"), { path: "s4-shallow/.git/shallow", kind: "file" }, { path: "s4-shallow/history.txt", kind: "file" }], ["s4-shallow"], false, GIT_LAYOUT_REFUSALS.shallow);
 }
 
 function buildPartial(cell: "s4-partial-online" | "s4-partial-offline"): GitFixtureDescription {
@@ -285,7 +285,7 @@ export function buildS5Bisect(): GitFixtureDescription {
   ], [...repoTree("s5-bisect"), { path: "s5-bisect/stable.txt", kind: "file" }], ["s5-bisect"]);
 }
 
-export const GIT_FIXTURE_BUILDERS: Readonly<Record<GitShapeCell, () => GitFixtureDescription>> = {
+export const GIT_FIXTURE_BUILDERS: Readonly<Record<GitLayoutCell, () => GitFixtureDescription>> = {
   "s1-a": buildS1InitializedSubmodule,
   "s1-b": buildS1Pointer,
   "s1-c": buildS1UninitializedGitlink,
@@ -303,10 +303,10 @@ export const GIT_FIXTURE_BUILDERS: Readonly<Record<GitShapeCell, () => GitFixtur
 };
 
 /** Stable construction order used by the scenario and the unit contract. */
-export const GIT_SHAPE_CELLS = Object.freeze(Object.keys(GIT_FIXTURE_BUILDERS) as GitShapeCell[]);
+export const GIT_LAYOUT_CELLS = Object.freeze(Object.keys(GIT_FIXTURE_BUILDERS) as GitLayoutCell[]);
 
 /** The initialized-submodule fixture deliberately contributes two outcomes. */
-export const GIT_SHAPE_OUTCOMES = Object.freeze([
+export const GIT_LAYOUT_OUTCOMES = Object.freeze([
   "s1-a", "s1-a/mod", "s1-b", "s1-c",
   "s2-configured", "s2-unconfigured",
   "s3-unicode", "s3-case",

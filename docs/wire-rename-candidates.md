@@ -1,143 +1,179 @@
 # Wire rename candidates
 
-Shape-named fields that anti-slop flags but that cannot be renamed today: they
-are serialized wire keys, durable record members, or values hashed into stored
-evidence. Each entry is a candidate for the 2.0 cutover (or a future `/v2` API
-surface), not for an in-place rename.
+Shape-named fields that anti-slop flags but that could not be renamed in place:
+they are serialized wire keys, durable record members, or values hashed into
+stored evidence.
 
-Format: field — file:line — suggested name — blast radius.
+**Status 2026-08-21 — the 2.0 cutover pass is done.** Founder ruling
+2026-08-20 put all twelve candidates in scope before the 2.0 tag. Nine landed;
+four fields across three entries are DEFERRED behind one shared blocker (see
+"Deferred cluster" below), pending a founder decision.
 
-## Diagnostics bundle (`workspaceShape`)
+Each entry records what actually constrained it, verified against the code.
+Several original entries overstated their blast radius; those corrections are
+kept here because they are the reason the rename was safe.
 
-- `DiagnosticsBundle.workspaceShape` — `src/cli/doctor-cmd.ts:92`,
-  `apps/api/src/diagnostics.ts:73` — suggested `workspaceSize` — blast radius:
-  the CLI→API diagnostics upload body, the API's `TOP_KEYS` allowlist
-  (`apps/api/src/diagnostics.ts:18`, an exact-keys check that rejects unknown
-  keys), every stored `diagnostics/<account>/<id>.json` R2 report, the
-  `workspaceShape*` validation error strings, and the sample bundles in
-  `src/cli/doctor-cmd.test.ts:144` / `apps/api/test/diagnostics.test.ts:55`.
-  Renaming needs a dual-accept window on the API (old and new key) because
-  older CLIs keep sending `workspaceShape`, plus a decision on whether stored
-  reports are migrated or read through a compatibility shim.
-  The in-memory `DoctorContext` field and the local `WorkspaceSize` type were
-  already renamed; only the serialized key remains.
+---
 
-## Genesis repair proof (`claimShape`)
+## DONE
 
-- `RepairProof.claimShape` — `apps/api/src/genesis-repair.ts:57` — suggested
-  `claimState` (values already read as states: `absent`, `malformed`,
-  `old_endpoint_exact`, `repair_tombstone_v1`) — blast radius: the
-  `genesis_repair_audit.proof_json` and `completion_observation_json` durable
-  columns, the `proof` object echoed in every `/v1/genesis-repair` JSON
-  response, `RepairAuditObservation.claimShape`
-  (`apps/api/src/genesis-repair.ts:226`), and — critically — the
-  `scrubbed_evidence_sha256` digest computed by `canonicalEvidence`, which
-  hashes `proof_json` byte-for-byte. Renaming changes the digest of newly
-  written rows, so it needs an evidence-version marker (or a reader that
-  verifies old rows under the old key ordering) before any historical audit
-  row can still be verified.
-## `cfgShape` (repo record config lane)
+### `DiagnosticsBundle.workspaceShape` → `workspaceSize`
 
-- **Anchor:** `src/cli/sync-state-model.ts:312` (`RepoRecordInput.cfgShape`),
-  column mapping `cfg_shape_cjson` at
-  `src/cli/state-plane/codecs/repo-record.ts:21`.
-- **Suggested name:** `cfgStore` (column `cfg_store_cjson`) — it identifies the
-  physical Git config store the lane's baseline was taken against, not a
-  "shape".
-- **Blast radius:** durable SQLite column + codec validator
-  (`repo-record.ts:33,47,83-87`), digest grammar goldens
-  (`src/cli/state-plane/digest/grammar-goldens.test.ts:216`), codec coverage
-  (`src/cli/state-plane/codecs/coverage.ts:79`), `ConfigLaneState` projection
-  (`src/cli/sync-state.ts:41,43,53`), every sync-git config-lane reader and
-  writer, and the e2e/pull/contract test assertions. Needs a state migration
-  and a client-skew story (records written by older CLIs carry the old key).
+Class: CLI↔API wire key. **Dual-accept window open on the API.**
 
-## `ConfigStoreIdentity.shape` (repo kind inside the store identity)
+The CLI sends only `workspaceSize`. The API accepts `workspaceSize`
+(preferred) or the legacy `workspaceShape`, exactly one of the two — both
+present is rejected as an ambiguous producer, neither is rejected as missing.
+Stored reports always normalize to `workspaceSize`. Validation error strings
+name the key the sender actually used, so a 1.x CLI keeps reading
+`workspaceShape.fileCount …`. Legacy sightings are logged with the bundle
+version.
 
-- **Anchor:** `src/cli/sync-state-model.ts:126`, written at
-  `src/cli/sync-git/config-lane.ts:101`.
-- **Suggested name:** `repoKind` — the value is the `RepoCtx.kind`
-  (`"dir"` / `"pointer"`), which the rest of the codebase already calls
-  `repoKind`.
-- **Blast radius:** nested inside the durable `cfg_shape_cjson` JSON, so it
-  moves only with `cfgShape` above. Also pinned by the codec exact-object check
-  (`repo-record.ts:84-85`), coverage (`coverage.ts:111`), the digest grammar
-  goldens, and `sync-git-config-pull.test.ts:449`.
+Stored R2 reports needed no shim: nothing in the codebase reads a diagnostics
+report back. The only `diagnostics/` prefix operations are put, delete,
+`sweepDiagnostics`, and `purgeDiagnosticR2`; retrieval is a manual
+`wrangler r2 object get` (`docs/diagnostics.md`).
 
-## `GitResolutionBinding["config"].shape`
+**Deletion condition:** drop the legacy branch once rbox-admin version
+telemetry shows no device below the first 2.0 release for 30 days.
 
-- **Anchor:** `src/cli/sync-state-model.ts:274`, populated at
-  `src/cli/sync-git/resolution-intent.ts:62-67`.
-- **Suggested name:** `storeIdentity` — it is the canonicalized
-  `ConfigStoreIdentity`, matching the code-symbol name now used everywhere else.
-- **Blast radius:** hardest of the three. The binding is canonicalized and
-  hashed into resolution receipts, so renaming the key changes every binding
-  identity hash — any in-flight resolution recorded by an older CLI stops
-  matching. Requires the 2.0 receipt-format break, not a standalone rename.
+### `RepairProof.claimShape` → `claimState`
 
-## `"p-repair-shape-mismatch"` (base composer hold code)
+Class: durable D1 record. **No compat window — none was needed.**
 
-- **Anchor:** `src/cli/sync-git/base-composer.ts:191` (union member), emitted at
-  `:434`, `:443`, `:458`; mirrored in the durable hold-code union at
-  `src/cli/sync-state-model.ts:223`.
-- **Suggested name:** `p-repair-witness-mismatch` — the hold fires when the
-  P-repair witness disagrees with the locked proof, not when a "shape" is off.
-- **Blast radius:** the value is a hold code carried in composer output and
-  persisted with the sync state record, so it is design-176 grammar-frozen
-  wire, not a code symbol. Renaming it changes emitted diagnostics and stored
-  hold rows that older CLIs and existing records still spell the old way; it
-  needs the 2.0 grammar break. The surrounding predicates
-  (`branchWitnessWellFormed`, `safeWitnessWellFormed`) were renamed in place.
+The original entry called this evidence-chain-critical. It is not:
+`scrubbed_evidence_sha256` is computed in one place and written in one place,
+is never recomputed and never compared, and its only production read is an
+`IS NOT NULL` existence check in `account-delete.ts`. No index, unique
+constraint, or dedupe is keyed on it. `proof_json` is never parsed by any
+code — it is read only as an opaque string and fed byte-for-byte into the
+hash. No CLI, web, or RboxBar code reads the key.
 
-## `EntryStructureError.name === "EntryShapeError"` (arena error identity)
+The rename therefore changes the digest inputs of newly written rows only,
+and nothing verifies either old or new rows. `canonicalEvidence`'s field list
+is untouched: it names DB columns, and no column was renamed. No D1 migration
+was required or added.
 
-- **Anchor:** `src/engine/entry-arena/errors.ts:44`.
-- **Suggested name:** `"EntryStructureError"`, matching the class after the
-  code-symbol rename.
-- **Blast radius:** the string is the runtime `error.name` surfaced in
-  diagnostics and crash output, so it is emitted text rather than a symbol. No
-  in-repo consumer matches on it today, but any captured log or support
-  transcript spells it the old way; flip it with the next diagnostics-grammar
-  change. The class and every import were renamed to `EntryStructureError`.
+### `GitResolutionBinding["config"].shape` → `storeIdentity`
 
-## `source_shape_flags_cjson` (migration completion presence bits)
+Class: local durable/derived. **No shim; intentionally token-invalidating.**
 
-- **Anchor:** the `migration_completion.source_shape_flags_cjson` durable column
-  (`src/cli/state-plane/schema/`), written by
-  `sourcePresenceFlagsCjson(...)` and read by `manifestGitReposWasPresent`.
-- **Suggested name:** `source_presence_flags_cjson` — the value is a set of
-  "did the source document carry this member" bits, not a schema shape.
-- **Blast radius:** the durable column on every migrated store, plus the
-  `state-semantic-v1` digest token `"source-shape-flags"`, which is FRAMED INTO
-  THE HASH — renaming the token changes every legacy-import digest and would
-  break the migration's JSON-vs-SQL differential. Needs a grammar version, not
-  a rename.
-- **Status:** design 269 renamed the TypeScript symbols around it
-  (`SourcePresenceFlags`, `sourcePresenceFlags`, `plan.presenceFlags`) per the
-  2026-08-15 code-symbol ruling. The column and the digest token stay.
+The original entry said this was hashed into resolution receipts and needed
+the 2.0 receipt-format break. The receipt part was wrong:
+`GitResolutionPublicationReceipt` carries `confirmedReportHash`, which hashes
+the discard report, not the binding, and the binding has no column in
+`repo_records`.
 
-## `mismatches.baseShape` (P-repair trigger contract)
+What the binding feeds is `snapshotId`, surfaced as
+`Confirmation token: <id>` and compared across processes when `--confirm` is
+typed back from an earlier `resolve … show`. So the rename's real effect is
+that a token captured before the upgrade produces the existing designed
+`snapshot-mismatch` — "review the fresh summary and confirm again". Nothing is
+corrupted. Covered by a regression test.
 
-- **Anchor:** `src/cli/sync-git/p-repair.ts:160` and
-  `src/cli/sync-git/standing-branch-proof.ts:78`; call sites in
-  `src/cli/reset-state.ts`, `src/cli/git/resolve-command.ts`, and three suites.
-- **Suggested name:** `baseRefs` or `baseMismatch` — the bit says the standing
-  proof's base refs disagree, not that a "shape" is off.
-- **Blast radius:** in-memory only, BUT it feeds `pRepairReason`, which maps it
-  to the durable receipt reason `"base-shape-mismatch"` persisted inside
-  `GitPartialApply.pRepaired`. The member can be renamed on its own; the reason
-  string cannot without a receipt-compat story, and renaming only half would
-  leave the two spellings disagreeing.
-- **Status:** deliberately NOT renamed by design 269's lint sweep — a
-  cross-module contract owned by the git plane, out of that fold's scope.
+`snapshotId` uses `JSON.stringify`, not canonical JSON, so insertion order is
+byte order — the member kept its position in the object literal.
 
-## `git-shapes` (rig scenario id)
+### `"base-shape-mismatch"` → `"base-refs-mismatch"`
 
-- **Anchor:** `scripts/rig/scenarios/index.ts:12,35` (`gitShapes`),
-  `scripts/rig/scenarios/git-shapes.ts` (`name: "git-shapes"`).
-- **Suggested name:** `git-layouts` — the scenario walks repository LAYOUTS
-  (nested, pointer, bare, submodule), not "shapes".
-- **Blast radius:** the id is typed by hand
-  (`bun run rig run git-shapes`) and recorded in every rig report. The symbol deliberately matches the id;
-  renaming only the symbol would make the registry disagree with the CLI. Flip
-  both together when the rig's scenario vocabulary next changes.
+Class: durable record + git-ref blob. **Dual-accept read.**
+
+Durable in two places: `GitPartialApply.pRepaired` inside `partial_cjson`, and
+the Q blob under `refs/rbox-recovery/base-present/v2/…`, which lives in the
+user's git repo and outlives any state reset. Closed-validated on read by
+`parsePRepairQ`, reached on every pull, whose throw is not caught — a naive
+rename would fail every pull on any repo holding a legacy Q.
+
+Writers emit only the new spelling; the reason union and its `includes` gate
+keep the legacy spelling read-only. **`parsePRepairQ` must stay
+identity-preserving** — normalizing a legacy value on read would change the Q
+blob OID and wedge `resumeAcceptedPRepair`.
+
+The `v2` ref namespace was deliberately not bumped: `v2` is hardcoded in nine
+places and cross-bound by regex to `refs/rbox-local/base-present/v2`.
+
+**Deletion condition:** drop the legacy union member and its `includes` entry
+after the first 2.0 release has been fleet-live for one full `pRepairEviction`
+cycle on every founder host, verified by grepping their recovery ref
+namespaces for the legacy spelling.
+
+### `mismatches.baseShape` → `baseRefs`
+
+Class: in-memory only. Never persisted, never on the wire. Renamed outright;
+the quoted-key form that dodged the lint is gone with it.
+
+### `"p-repair-shape-mismatch"` → `"p-repair-witness-mismatch"`
+
+Class: durable hold code. **No shim.**
+
+The original entry called this design-176 grammar-frozen wire. It is not —
+`design176-grammar-freeze.test.ts` freezes only git log-line grammar and has
+no hold-code assertion. The real constraints are permissive: there is no
+runtime closed-value check on `attempt.blockers[].code`
+(`validateFixedShapes` does not cover `attempt` or `partial`), every consumer
+matches rather than validates, and both spellings fall outside the
+`composerHoldAllowsSkip` set — so a legacy stored hold keeps vetoing
+held-skip exactly as before. Legacy rows self-heal on the next attempt write.
+
+### `EntryStructureError.name === "EntryShapeError"` → `"EntryStructureError"`
+
+Class: emitted text. No in-repo consumer matched on it. The class and imports
+were already renamed; the runtime `error.name` now agrees.
+
+### `git-shapes` → `git-layouts` (rig scenario)
+
+Class: dev tooling. The id, symbol, file, findings sidecar, surface constant,
+fixture symbols, and scratch paths moved together — renaming only the symbol
+would make the registry disagree with the hand-typed CLI id
+(`bun run rig run git-layouts`).
+
+Historical design docs (141/145/146/147/148/176/200/260 and notes) and
+`STATUS.md` deliberately keep the old spelling: they are dated records of rig
+runs that actually happened under that id.
+
+---
+
+## DEFERRED cluster — blocked on one state-store decision
+
+Four fields across three entries. **One root cause: `state.db` has no
+migration mechanism at all.**
+
+`applySchemaV1` is a bare `db.exec(SCHEMA_V1_DDL)`; there is no `ALTER TABLE`
+anywhere in `src/cli/state-plane/`. `STATE_STORE_DDL_FINGERPRINT`
+(`schema/application.ts`) is `sha256(SCHEMA_V1_DDL)` and is written into every
+store's `store_meta` at genesis. `validate-open.ts` refuses to open any store
+whose stored fingerprint differs, raising `StateAuthorityCorruptError` — whose
+message is "rbox has changed nothing and will not try to repair this
+automatically." There is no rebuild, re-import, or quarantine path for that
+reason.
+
+Separately, `repo_records.canonical_bytes` / `retained_estimate` are checksums
+over `canonicalJson(record)` including the TypeScript key spelling;
+`decodeRepoRecord` re-encodes on every read and throws
+`structural corruption in RepoRecord <relPath>` on mismatch.
+
+| field | suggested | blocker |
+|---|---|---|
+| `RepoRecordInput.cfgShape` + column `cfg_shape_cjson` | `cfgStore` / `cfg_store_cjson` | column rename changes `SCHEMA_V1_DDL` → changes the DDL fingerprint → every existing store refuses to open, with no repair path |
+| `ConfigStoreIdentity.shape` | `repoKind` | nested inside `cfg_shape_cjson`; `shape`(5) → `repoKind`(8) changes the canonical byte length → `canonical_bytes` mismatch → every existing row fails to decode |
+| `migration_completion.source_shape_flags_cjson` | `source_presence_flags_cjson` | same DDL-fingerprint block |
+| digest token `"source-shape-flags"` | `"source-presence-flags"` | framed into `domainHash("state-semantic-v1")`; technically free today (the legacy-vs-SQL differential has zero production callers and `source_semantic_digest` is always NULL) but meaningless without the column rename |
+
+**This is not a naming problem.** Renaming these requires one of two product
+decisions, neither of which belongs in a rename PR:
+
+- **(i) Schema v2 + a migration step at open.** Build the first real
+  state-plane migration: bump the schema version and `user_version`, add a
+  versioned DDL plus an `ALTER TABLE`/re-encode step under the existing inode
+  claim, recompute `canonical_bytes`/`retained_estimate` per row, and settle
+  crash-safety and reset-journal interaction. That is a design doc.
+- **(ii) 2.0 re-genesis.** Declare that 2.0 mints a fresh state store on every
+  device and take these renames for free in the new `SCHEMA_V1_DDL`. Far
+  cheaper — *if* re-baselining sync state on every device is acceptable.
+
+Recommendation: **(ii)**, folded into whatever 2.0 does about state stores.
+It needs an explicit founder yes, because it costs every device a sync
+re-baseline.
+
+**Unblock condition:** a founder ruling on (i) vs (ii). Until then these four
+fields keep their current spelling.
