@@ -112,7 +112,7 @@ describe("design 180 atomic genesis",()=>{
     await env.rbox_dev_db.prepare("INSERT INTO genesis_repair_audit(audit_id,account_id,requested_at,dry_run,outcome) VALUES(?,?,1,0,'attempted')").bind(refusedId,refused.accountId).run();
     expect((await SELF.fetch(`${BASE}/v1/keys/account`,{headers:auth(refused.token)})).status).toBe(200);
     const refusedAudit=await env.rbox_dev_db.prepare("SELECT outcome,result_vector,completion_observation_json FROM genesis_repair_audit WHERE audit_id=?").bind(refusedId).first<{outcome:string;result_vector:string;completion_observation_json:string}>();
-    expect(refusedAudit).toMatchObject({outcome:"refused",result_vector:"audit=1,update=0"});expect(JSON.parse(refusedAudit!.completion_observation_json)).toMatchObject({observational:true,claimShape:"old_endpoint_exact"});
+    expect(refusedAudit).toMatchObject({outcome:"refused",result_vector:"audit=1,update=0"});expect(JSON.parse(refusedAudit!.completion_observation_json)).toMatchObject({observational:true,claimState:"old_endpoint_exact"});
   });
 
   test("deletion-first reverse order refuses repair before creating an audit",async()=>{

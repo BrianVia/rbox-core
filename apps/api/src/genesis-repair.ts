@@ -54,7 +54,7 @@ export interface GenesisRepairRequest {
 
 export interface RepairProof {
   eligible: boolean;
-  claimShape: "absent" | "malformed" | "old_endpoint_exact" | "repair_tombstone_v1";
+  claimState: "absent" | "malformed" | "old_endpoint_exact" | "repair_tombstone_v1";
   dependents: GenesisPresence;
   ownsWorkspace: boolean;
 }
@@ -151,9 +151,9 @@ export function isTombstoneFamily(row: GenesisObservationRow): boolean {
 export function classifyRepairObservation(row: GenesisObservationRow): RepairObservation {
   const dependents = presenceOf(row);
   const ownsWorkspace = row.workspaces > 0;
-  let claimShape: RepairProof["claimShape"] = "malformed";
-  if (row.claimPresent === 0) claimShape = "absent";
-  else if (isExactTombstone(row)) claimShape = "repair_tombstone_v1";
+  let claimState: RepairProof["claimState"] = "malformed";
+  if (row.claimPresent === 0) claimState = "absent";
+  else if (isExactTombstone(row)) claimState = "repair_tombstone_v1";
   else if (
     boundedText(row.recoveryWrap, 65536)
     && boundedText(row.recoveryWrapId, 65536)
@@ -163,13 +163,13 @@ export function classifyRepairObservation(row: GenesisObservationRow): RepairObs
     && row.genesisDeviceId === null
     && row.repairId === null
     && row.repairedAt === null
-  ) claimShape = "old_endpoint_exact";
+  ) claimState = "old_endpoint_exact";
 
-  const eligible = claimShape === "old_endpoint_exact" && allPresenceZero(dependents);
-  const proof = { eligible, claimShape, dependents, ownsWorkspace } satisfies RepairProof;
+  const eligible = claimState === "old_endpoint_exact" && allPresenceZero(dependents);
+  const proof = { eligible, claimState, dependents, ownsWorkspace } satisfies RepairProof;
   if (eligible) return { classification: "exact_legacy_orphan", proof };
-  if (claimShape === "absent") return { classification: "not_found", proof };
-  if (claimShape === "repair_tombstone_v1") return { classification: "already_tombstoned", proof };
+  if (claimState === "absent") return { classification: "not_found", proof };
+  if (claimState === "repair_tombstone_v1") return { classification: "already_tombstoned", proof };
   if (ownsWorkspace) return { classification: "workspace_history", proof };
   if (!allPresenceZero(dependents)) return { classification: "dependent_rows", proof };
   return { classification: "malformed_claim", proof };
@@ -223,7 +223,7 @@ interface GenesisRepairAuditRow extends GenesisRepairAuditEvidenceRow {
 interface RepairAuditObservation {
   observational: true;
   eligible?: boolean;
-  claimShape: RepairProof["claimShape"];
+  claimState: RepairProof["claimState"];
   dependents: GenesisPresence;
   ownsWorkspace: boolean;
 }
@@ -379,7 +379,7 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
   ).bind(accountId, id).first();
   const postRow=await readGenesisObservation(env,accountId),post = classifyRepairObservation(postRow).proof;
   const completedCompetitor=isExactTombstone(postRow)?await db.prepare("SELECT audit_id FROM genesis_repair_audit WHERE account_id=? AND audit_id=? AND audit_id<>? AND outcome='tombstone_claim_installed' AND completed_at IS NOT NULL LIMIT 1").bind(accountId,postRow.repairId,id).first<{audit_id:string}>():null;
-  const observation: RepairAuditObservation = { observational: true, claimShape: post.claimShape, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
+  const observation: RepairAuditObservation = { observational: true, claimState: post.claimState, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
   await completeAudit(env, accountId, id, "refused", vector, observation);
   if (competingAttempt || completedCompetitor || post.eligible) {
     await reconcileGenesisRepairAudits(env, accountId);
