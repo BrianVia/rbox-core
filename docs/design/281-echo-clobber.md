@@ -372,3 +372,63 @@ rig, no fleet, no timing sleeps.
   publish, and the download/decrypt pool's concurrency behaviour.
 - Design 272's oracle stays name-grammar-based; §3.1 adds a report, it does not
   change what the oracle excludes.
+
+## 7. Adversarial review round (codex, read-only) — folded and deferred
+
+One refutation round was run against the committed diff. Four findings were
+valid and are folded in; three are named residuals with reasons.
+
+### Folded (each proven RED against the pre-review commit)
+
+- **Clean deletes kept the same post-hash race.** `deleteEntry` hashed the
+  target and then removed it with no publish-time re-check — with the trash tier
+  off (`trashConfig(cfg).days === 0`), an edit landing in that window was
+  destroyed outright. The delete path now runs the same identity re-check as the
+  write path before removing anything. Pinned by "a clean delete whose target is
+  edited after the precondition hash preserves the newer bytes".
+- **§3.2 was only half-fixed.** The forced *delete* branch
+  (`rule-authority.ts:95`) still set `expectedLocal` to the edited bytes, so a
+  publisher-deleted rule file that had been edited locally was removed with no
+  copy. `expectedLocal` now names the LAST-SYNCED entry — what we expected, never
+  what is actually there. Pinned end-to-end with the trash tier OFF.
+- **A planned conflict could be counted twice.** If the target was absent at the
+  precondition check and reappeared before the publish stat, the new branch fired
+  `onConflictCopy` for a path the plan already counts. The branch now preserves
+  under the planned `keepLocalAs` name and stays silent when one is set
+  (invariant 3). No deterministic test seam exists for that timeline — absent
+  targets are never hashed, so `overrideHashFileForTests` cannot reach the
+  window — so this one is correct by construction, not by test.
+- **The identity triple was neither collision-proof nor content-aware.**
+  `StatIdentity` now carries `dev`/`ino` (a `rename` installs a new inode even
+  when every timestamp ties on a coarse filesystem), and a changed identity
+  re-derives the entry before preserving anything: bytes already identical to the
+  ones being published are not copied. Without that, a bulk atomic
+  materialization would turn a 1641-file echo pull into conflict-copy churn —
+  the exact churn bomb this design exists to stop. Pinned by "a concurrent write
+  of the INCOMING bytes makes no pointless conflict copy".
+
+### Named residuals (deliberate, not oversights)
+
+- **Tally leakage across a failed pull.** `conflictCopiesSincePull` is daemon
+  instance state reset at op start and in `recordPullApplied`, so a pull that
+  fails after moving bytes leaves its count armed for a later report inside the
+  same op (e.g. a failed 409-recovery pull followed by a retry). This is exactly
+  the existing `typeFlipsSincePull` contract, and fixing it properly means moving
+  both tallies out of daemon state into the pull's own result — a refactor of the
+  existing owner that does not belong in a data-safety fix. Bounded to a
+  miscounted forensic number; never data loss.
+- **Planned conflicts are only reported on pull success.** A `kind:"conflict"`
+  displaces the local file and is reported by the plan summary, which never runs
+  if a later phase throws. Same pre-existing contract as above, same owner.
+- **Ancestor-obstruction evidence goes stale between detection and
+  displacement** (`apply.ts:155-200`). Untouched by this change and reachable
+  today; a real finding, but a separate defect with its own repro needs.
+
+### Not refuted
+
+`actionPath` handles `kind:"conflict"`, so the two-phase rule-file filtering in
+`pull.ts` still recognises rule conflicts. Conflict-named `.rboxignore` /
+`.gitignore` copies are provably not matcher inputs. Push behaviour, base
+advance, the mass-delete guard, and mutation-gate leases are unchanged. The
+write guard adds no steady-state syscall — it repurposes the pre-existing
+type-flip `lstat`.

@@ -89,10 +89,37 @@ test("a rule file the publisher DELETED is removed even when it was edited here"
     "dev",
     "2026-08-20T12:34:56Z",
   );
+  // `expectedLocal` must name the LAST-SYNCED bytes, never the edited ones on disk:
+  // naming the edit makes apply's precondition true by construction and deletes it.
   expect(result.actions).toEqual([
-    { kind: "delete", path: "Personal/.gitignore", expectedLocal: entry("Personal/.gitignore", "local") },
+    { kind: "delete", path: "Personal/.gitignore", expectedLocal: entry("Personal/.gitignore", "r1") },
   ]);
   expect(result.diverged).toEqual(["Personal/.gitignore"]);
+});
+
+test("a forced rule DELETE preserves an edited local copy even with the trash tier OFF", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-rule-delete-"));
+  const storeDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-rule-delete-store-"));
+  try {
+    await fs.writeFile(path.join(root, ".gitignore"), "local-edit.txt\n");
+    const based = entry(".gitignore", "r1");
+    const result = applyRuleFileAuthority([], projection, manifest(based), manifest(entry(".gitignore", "local")), manifest(), "dev", "2026-08-20T12:34:56Z");
+    const action = result.actions[0]!;
+    if (action.kind !== "delete") throw new Error("expected a forced delete");
+
+    // No trash batch — design 50's tier is off when trashConfig(cfg).days === 0.
+    await applyActions(root, [action], new LocalBlobStore(storeDir), { device: "dev", now: "2026-08-20T12:34:56Z" });
+
+    const names = await fs.readdir(root);
+    const kept = names.find((n) => n.includes(".conflict"));
+    expect(kept).toBeDefined(); // the edit survived the forced deletion
+    expect(await fs.readFile(path.join(root, kept!), "utf8")).toBe("local-edit.txt\n");
+    expect(isIgnoreRuleFile(kept!)).toBe(false); // and no longer steers the matcher
+    expect(names).not.toContain(".gitignore"); // remote authority still removed it
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(storeDir, { recursive: true, force: true });
+  }
 });
 
 test("a rule file that merely lags behind is not a divergence finding", () => {

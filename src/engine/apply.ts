@@ -312,9 +312,18 @@ async function writeEntry(
       // below (which routes it to trash rather than a subtree-sized conflict copy).
       const publishIdentity = fileStatIdentity(publishStat);
       if (!movedAside && publishIdentity && !sameStatIdentity(observed?.identity, publishIdentity)) {
-        const keptAs = await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
-        reportConflictCopy(onConflictCopy, entry.path, keptAs);
-        movedAside = true;
+        // This branch is rare by construction, so re-derive the truth rather than act
+        // on the stat alone: bytes that already equal the ones we are about to publish
+        // are not worth preserving, and copying them would turn a bulk atomic
+        // materialization into conflict-copy churn.
+        const fresh = await currentEntryAt(destRoot, entry.path);
+        if (fresh && !sameContent(fresh.entry, entry)) {
+          // A planned conflict that found its target absent earlier still owns this
+          // path's count via the plan — preserve under its chosen name, do not report.
+          const keptAs = await moveAside(destRoot, entry.path, keepLocalAs ?? conflictName(entry.path, device, now));
+          if (!keepLocalAs) reportConflictCopy(onConflictCopy, entry.path, keptAs);
+          movedAside = true;
+        }
       }
 
     // Type-flip eviction (§3): currentEntryAt returns undefined for a directory,
@@ -472,9 +481,19 @@ async function deleteEntry(
 ): Promise<void> {
   const abs = path.join(destRoot, rel);
   await assertWithinRoot(destRoot, abs);
-  const current = (await currentEntryAt(destRoot, rel))?.entry;
-  if (!current) return; // already gone
-  if (sameContent(current, expectedLocal)) {
+  const observed = await currentEntryAt(destRoot, rel);
+  if (!observed) return; // already gone
+  if (sameContent(observed.entry, expectedLocal)) {
+    // Same post-hash window the write path closes: an edit landing between the
+    // precondition hash and the removal would otherwise be deleted outright (and
+    // with the trash tier off, unrecoverably).
+    countLstat();
+    const publishIdentity = fileStatIdentity(await fs.lstat(abs).catch(() => undefined));
+    if (publishIdentity && !sameStatIdentity(observed.identity, publishIdentity)) {
+      const keptAs = await moveAside(destRoot, rel, conflictName(rel, device, now));
+      reportConflictCopy(onConflictCopy, rel, keptAs);
+      return;
+    }
     if (trash) await trash.put(rel);
     else await fs.rm(abs, { force: true });
   } else {
@@ -486,7 +505,7 @@ async function deleteEntry(
 /** The on-disk entry at `rel`, or undefined if absent. Symlink targets are read,
  *  not followed; directories read as undefined (we never delete/overwrite a dir
  *  as if it were a file). */
-type StatIdentity = { mtimeMs: number; size: number; ctimeMs: number };
+type StatIdentity = { dev: number; ino: number; mtimeMs: number; size: number; ctimeMs: number };
 type CurrentEntryObservation = { entry: FileEntry; identity: StatIdentity };
 
 async function currentEntryAt(destRoot: string, rel: string): Promise<CurrentEntryObservation | undefined> {
@@ -537,8 +556,11 @@ async function moveAside(destRoot: string, fromRel: string, toRel: string): Prom
   });
 }
 
+/** `dev`/`ino` are carried alongside the hash cache's `(mtime,size,ctime)` triple so
+ *  an atomic same-size replacement cannot evade detection on a coarse-timestamp
+ *  filesystem: `rename` installs a different inode even when every timestamp ties. */
 function statIdentity(st: Stats): StatIdentity {
-  return { mtimeMs: st.mtimeMs, size: st.size, ctimeMs: st.ctimeMs };
+  return { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size, ctimeMs: st.ctimeMs };
 }
 
 /** The identity of file/symlink BYTES at a path, or undefined when the path holds
@@ -549,7 +571,7 @@ function fileStatIdentity(st: Stats | undefined): StatIdentity | undefined {
 }
 
 function sameStatIdentity(a: StatIdentity | undefined, b: StatIdentity): boolean {
-  return a?.mtimeMs === b.mtimeMs && a.size === b.size && a.ctimeMs === b.ctimeMs;
+  return a?.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size && a.ctimeMs === b.ctimeMs;
 }
 
 function reportConflictCopy(

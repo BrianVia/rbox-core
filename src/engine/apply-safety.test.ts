@@ -413,6 +413,68 @@ test("a target replaced by a DIRECTORY after the precondition hash still routes 
   expect(await listTrash(root)).toHaveLength(1);
 });
 
+test("a clean delete whose target is edited after the precondition hash preserves the newer bytes", async () => {
+  await write("doomed.txt", "expected bytes");
+  const before = await scanManifest(root);
+  const expectedLocal = before.files.find((entry) => entry.path === "doomed.txt")!;
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "doomed.txt")) {
+      injected = true;
+      await fs.writeFile(abs, "post-hash local bytes");
+    }
+    return sha;
+  });
+  const reports: string[] = [];
+  try {
+    // Trash OFF — the branch where the old code deleted the bytes outright.
+    await applyActions(root, [{ kind: "delete", path: "doomed.txt", expectedLocal }], store, {
+      device: "dev", now: "2026-08-20T12:34:56Z", onConflictCopy: (_r, keptAs) => reports.push(keptAs),
+    });
+  } finally {
+    reset();
+  }
+
+  expect(injected).toBe(true);
+  expect(reports).toEqual(["doomed.dev.20260820123456.conflict.txt"]);
+  expect(await read(reports[0]!)).toBe("post-hash local bytes");
+  expect(await exists("doomed.txt")).toBe(false);
+});
+
+test("a concurrent write of the INCOMING bytes makes no pointless conflict copy", async () => {
+  await write("racy.txt", "expected bytes");
+  const before = await scanManifest(root);
+  const action = await writeAction("racy.txt", "remote bytes");
+  if (action.kind !== "write") throw new Error("test setup expected a write action");
+  action.expectedLocal = before.files.find((entry) => entry.path === "racy.txt")!;
+  let injected = false;
+  const reset = overrideHashFileForTests(async (abs, size) => {
+    const sha = await realHashFileForTests(abs, size);
+    if (!injected && abs === path.join(root, "racy.txt")) {
+      injected = true;
+      // A peer materialized the SAME content the pull is about to publish —
+      // matching the incoming entry's mode too, so this is byte-for-byte identical.
+      await fs.writeFile(abs, "remote bytes");
+      await fs.chmod(abs, 0o644);
+    }
+    return sha;
+  });
+  const reports: string[] = [];
+  try {
+    await applyActions(root, [action], store, {
+      device: "dev", now: "2026-08-20T12:34:56Z", onConflictCopy: (_r, keptAs) => reports.push(keptAs),
+    });
+  } finally {
+    reset();
+  }
+
+  expect(injected).toBe(true);
+  expect(reports).toEqual([]); // identical bytes are not worth preserving
+  expect(await conflictCopies()).toEqual([]); // no copy-churn on bulk materialization
+  expect(await read("racy.txt")).toBe("remote bytes");
+});
+
 // The coordinator's guard: reporting apply-time copies must not disturb the
 // delete-vs-modify arm, where local really IS gone and remote really did change.
 test("delete-vs-modify: a genuinely absent local file takes the remote write with no conflict copy", async () => {

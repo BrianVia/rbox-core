@@ -91,8 +91,13 @@ export function applyRuleFileAuthority(
     if (!projection.isMetadata(entry.path) || remotePaths.has(entry.path)) continue;
     const here = localByPath.get(entry.path);
     if (here === undefined) continue;
-    if (entryDiffers(here, entry)) diverged.push(entry.path);
-    forced.set(entry.path, { kind: "delete", path: entry.path, expectedLocal: here });
+    const wasEdited = entryDiffers(here, entry);
+    if (wasEdited) diverged.push(entry.path);
+    // `expectedLocal` states what we EXPECTED to find, never what is actually there:
+    // naming the edited bytes would make apply's precondition true by construction and
+    // delete them outright (unrecoverably when the trash tier is off). Passing the
+    // last-synced entry lets the existing guard preserve the edit as a conflict copy.
+    forced.set(entry.path, { kind: "delete", path: entry.path, expectedLocal: wasEdited ? entry : here });
   }
   if (forced.size === 0) return { actions, diverged };
   const kept = actions.filter((action) => !forced.has(action.kind === "write" ? action.entry.path : action.path));
