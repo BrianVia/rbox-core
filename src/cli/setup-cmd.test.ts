@@ -120,32 +120,7 @@ test("fresh setup against a legacy server surfaces the exact terminal error and 
   }finally{globalThis.fetch=priorFetch;if(priorRboxHome===undefined)delete process.env.RBOX_HOME;else process.env.RBOX_HOME=priorRboxHome;if(priorHome===undefined)delete process.env.HOME;else process.env.HOME=priorHome;await fs.rm(home,{recursive:true,force:true});}
 });
 
-test("setup step header numbers fresh and enrolled flows", () => {
-  expect([stepHeader(1, 3, "Account"), stepHeader(2, 3, "Folder"), stepHeader(3, 3, "Start syncing")]).toEqual([
-    "Step 1 of 3 · Account",
-    "Step 2 of 3 · Folder",
-    "Step 3 of 3 · Start syncing",
-  ]);
-  expect([stepHeader(1, 2, "Folder"), stepHeader(2, 2, "Start syncing")]).toEqual([
-    "Step 1 of 2 · Folder",
-    "Step 2 of 2 · Start syncing",
-  ]);
-});
 
-test("enrolled setup skip notice renders cached identity or the exact account-id fallback", async () => {
-  const writes: string[] = [];
-  await writeEnrolledSkipNotice("acct_hidden", {
-    getIdentity: async () => ({ email: "owner@example.com", signInMethod: "github" }),
-    writeStderr: (text) => void writes.push(text),
-  });
-  expect(writes.pop()).toBe("Signed in as owner@example.com (github) — skipping account setup.\n");
-
-  await writeEnrolledSkipNotice("acct_fallback", {
-    getIdentity: async () => undefined,
-    writeStderr: (text) => void writes.push(text),
-  });
-  expect(writes.pop()).toBe("Signed in and enrolled (acct_fallback) — skipping account setup.\n");
-});
 
 // The guided flow's menus are arrow-key selects (thin widgets we
 // don't unit-test). The one pure step-transition left is `workspaceFlags` — the
@@ -184,36 +159,7 @@ test("Step 2 → runInit flags: a create answer is explicit for both values and 
   expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
 });
 
-test("Step 2 choices lead with the recommended folder and keep both escape hatches", () => {
-  expect(WORKSPACE_KIND_CHOICES).toEqual([
-    {
-      name: "Sync ~/rbox (recommended)",
-      value: "default",
-      description: "create it if needed, then sync everything inside",
-    },
-    { name: "Sync another folder on this machine", value: "new" },
-    {
-      name: "Sync a folder from another machine",
-      value: "existing",
-      description: "choose one you've synced before",
-    },
-  ]);
-});
 
-test("Step 2 gitignore prompt defaults to skipping, with both escape hatches and an honest sync-all opt-in", () => {
-  expect(SETUP_GITIGNORE_CHOICES).toEqual([
-    {
-      name: "Skip gitignored untracked files (recommended)",
-      value: "true",
-      description: "sync a secrets file anyway (encrypted, never committed) with ! lines in .rboxignore — e.g. !.env or !.dev.vars; switch later with `rbox ignore --respect-gitignore off`",
-    },
-    {
-      name: "Sync gitignored files too (end-to-end encrypted)",
-      value: "false",
-      description: "relaxes nested .gitignore rules only — your root .gitignore and built-ins (node_modules, .env, …) still apply; re-include secrets with ! lines in .rboxignore (e.g. !.env)",
-    },
-  ]);
-});
 
 // Step 3 collapsed the keep→resume double-confirm into one `select` (the founder once
 // typed a workspace name into a Y/N). The widget itself we don't unit-test, but the
@@ -277,28 +223,7 @@ test("authorize routing: browser uses device-code; pair redeems a token", () => 
   expect(authorizePath("browser")).toBe("device-code");
 });
 
-test("authorization choices put browser first and omit the duplicate approve entry", () => {
-  expect(PAIRING_TOKEN_SOURCE_DESCRIPTION).toBe(
-    "run `rbox pair` in a terminal on an already-set-up machine — never shown in the dashboard because it carries your encryption key"
-  );
-  expect(AUTHORIZATION_CHOICES).toEqual([
-    { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
-    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
-  ]);
-  expect(EXISTING_ENROLLMENT_CHOICES[0]).toEqual({
-    name: "Paste a pairing token",
-    value: "pair",
-    description: PAIRING_TOKEN_SOURCE_DESCRIPTION,
-  });
-});
 
-test("genesis prompt and authorization recovery footer use the split guided copy", () => {
-  expect(GENESIS_BROWSER_PROMPT).toBe("Press Enter to sign up in your browser.");
-  expect(GENESIS_BOOTSTRAP_HINT).toBe("(have a bootstrap secret? type it now — input hidden)");
-  expect(AUTHORIZATION_RECOVERY_FOOTER).toBe(
-    "lost access to your other machines? Sign in via browser, then choose 'Recover with my 24-word phrase'"
-  );
-});
 
 test("resolveEnrollment: keyless account renders the first-machine choice and runs genesis", async () => {
   let choices: Array<{ name: string; value: string; description?: string }> = [];
@@ -332,32 +257,6 @@ test("resolveEnrollment: keyless account renders the first-machine choice and ru
   expect(genesisCalls).toBe(1);
 });
 
-test("resolveEnrollment: existing key world keeps the current three choices and warning copy", async () => {
-  let choices: Array<{ name: string; value: string; description?: string }> = [];
-  const err: string[] = [];
-
-  const ok = await resolveEnrollment("https://api.test", {
-    alreadyEnrolled: async () => false,
-    loadCredentials: validSetupCredentials,
-    makeApi: () => ({
-      getAccountKeys: async () => ACCOUNT_KEYS,
-      bootstrapKeys: async () => {},
-    }),
-    promptSelect: (async (cfg: { choices: typeof choices }) => {
-      choices = cfg.choices;
-      return "later";
-    }) as never,
-    writeStderr: (s) => void err.push(s),
-  });
-
-  expect(ok).toBe(false);
-  expect(choices).toEqual([
-    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
-    { name: "Recover with my 24-word phrase", value: "recover" },
-    { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
-  ]);
-  expect(err[0]).toBe("\n⚠  This machine is authorized (acct_100000000000000b) but NOT yet enrolled for encryption. Enroll it now:\n");
-});
 
 test("resolveEnrollment pairing and recovery exhaust their own local budget back to enrollment menu", async () => {
   for (const method of ["pair", "recover"] as const) {
@@ -1323,12 +1222,6 @@ test("wizard token gate retries only local shape failures and treats post-send e
   }
 });
 
-test("both setup pairing sites share the wizard-context gate", async () => {
-  const source = await fs.readFile(path.join(import.meta.dir, "setup-cmd.ts"), "utf8");
-  expect(source).toContain("const runPair = deps.redeemPairInWizard ?? redeemPairInWizard");
-  expect(source).toContain("const result = await redeemPairInWizard(remote");
-  expect(source).toContain('await redeem(remote, token, undefined, "wizard")');
-});
 
 test("Step-1 pairing exhaustion returns to its authorization parent with an independent budget", async () => {
   const methods = ["pair", "browser"];
@@ -1428,21 +1321,5 @@ test("keyed setup requires key input when --workspace is present", async () => {
   } finally {
     if (oldKey === undefined) delete process.env.RBOX_KEY;
     else process.env.RBOX_KEY = oldKey;
-  }
-});
-
-test("guided setup warns about keyed-only flags before the non-TTY exit", async () => {
-  const writes: string[] = [];
-  const originalWrite = process.stderr.write;
-  process.stderr.write = ((chunk: string | Uint8Array) => {
-    writes.push(String(chunk));
-    return true;
-  }) as typeof process.stderr.write;
-  try {
-    await runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { daemon: "true" }, interactive: () => false });
-    expect(writes.join("")).toContain("note: --dir/--daemon/--pull-only/--force only apply to keyed setup");
-  } finally {
-    process.stderr.write = originalWrite;
-    process.exitCode = 0;
   }
 });

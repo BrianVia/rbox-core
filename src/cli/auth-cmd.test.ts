@@ -152,19 +152,7 @@ test("pairing token input drains stdin when non-interactive", async () => {
   expect(prompted).toBe(false);
 });
 
-test("pairing redemption success chains to the existing-workspace setup step", () => {
-  expect(pairingRedemptionSuccessMessages("dev_new")).toEqual([
-    "device authorized + encryption enrolled: dev_new",
-    WORKSPACE_SYNC_NEXT_STEP,
-  ]);
-});
 
-test("wizard pairing success suppresses the standalone workspace next step", () => {
-  expect(pairingRedemptionSuccessMessages("dev_new", "wizard")).toEqual([
-    "device authorized + encryption enrolled: dev_new",
-  ]);
-  expect(pairingRedemptionSuccessMessages("dev_new", "standalone")).toContain(WORKSPACE_SYNC_NEXT_STEP);
-});
 
 test("RBOX_PAIR_TOKEN redemption inherits login's explicit presentation context", async () => {
   const previous = process.env.RBOX_PAIR_TOKEN;
@@ -851,55 +839,7 @@ describe("device-code approval validation", () => {
   });
 });
 
-test("device-code login leaves the shared workspace step to the enrolled-elsewhere note", async () => {
-  installImmediateTimers();
-  const output: string[] = [];
-  const errors: string[] = [];
-  const priorWrite = process.stderr.write;
-  console.log = (...args: unknown[]) => void output.push(args.map(String).join(" "));
-  process.stderr.write = ((chunk: string | Uint8Array) => {
-    errors.push(String(chunk));
-    return true;
-  }) as typeof process.stderr.write;
-  globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(input);
-    if (url.endsWith("/v1/auth/device/start")) {
-      return new Response(JSON.stringify({ deviceCode: "e".repeat(64), userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
-    }
-    if (url.endsWith("/v1/auth/device/poll")) {
-      return new Response(JSON.stringify({ status: "approved", token: "tok", deviceId: "dev_success", accountId: "acct_1000000000000007" }));
-    }
-    if (url.endsWith("/v1/keys/account")) return new Response(JSON.stringify(ACCOUNT_KEYS));
-    throw new Error(`unexpected fetch: ${url}`);
-  }) as typeof fetch;
 
-  try {
-    await login("https://api.test");
-  } finally {
-    process.stderr.write = priorWrite;
-  }
-
-  expect(output).toContain("device authorized: dev_success");
-  expect(output).not.toContain(WORKSPACE_SYNC_NEXT_STEP);
-  expect(errors.join("").match(new RegExp(WORKSPACE_SYNC_NEXT_STEP.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))).toHaveLength(1);
-});
-
-test("device-code login assigns the shared workspace step to exactly one output owner", () => {
-  const results = [
-    "existing-keys",
-    "headless-command",
-    "declined",
-    "enrolled",
-    "already-setup",
-  ] as const;
-  expect(results.map((result) => [result, deviceCodeLoginShouldPrintWorkspaceStep(result)])).toEqual([
-    ["existing-keys", false],
-    ["headless-command", true],
-    ["declined", true],
-    ["enrolled", true],
-    ["already-setup", false],
-  ]);
-});
 
 test("bootstrap login success prints the shared workspace step", async () => {
   const output: string[] = [];

@@ -186,17 +186,6 @@ describe("design 166 remaining binding matrix", () => {
     expect(await fs.lstat(path.join(root, ".rbox", "adopt", "journal.json")).then(() => true, () => false)).toBe(false);
   });
 
-  test("unsupported adoption modes and wizard keyed routes are closed before lifecycle dispatch", async () => {
-    const [init, setup] = await Promise.all([
-      fs.readFile(path.join(import.meta.dir, "init-cmd.ts"), "utf8"),
-      fs.readFile(path.join(import.meta.dir, "setup-cmd.ts"), "utf8"),
-    ]);
-    expect(init).toContain('plan.workspace.kind !== "join" || plan.firstSync !== "sync"');
-    expect(init).toContain("--pull-only and --no-sync are unsupported");
-    expect(setup).toContain("!setupOpts.noSync && !oldStream && await rootHasAdoptableContent(dir)");
-    const keyed = await fs.readFile(path.join(import.meta.dir, "setup-keyed.ts"), "utf8");
-    expect(keyed).not.toContain("adoptConsent");
-  });
 
   test("socket and device identities are special and a live socket is retained unplaced", async () => {
     if (process.platform === "win32") return;
@@ -240,20 +229,4 @@ describe("design 166 remaining binding matrix", () => {
     expect(await fs.readFile(path.join(root, "local"), "utf8")).toBe("B\n");
   });
 
-  test("all 47 binding rows remain named in executable adoption coverage", async () => {
-    const design = await fs.readFile(path.join(import.meta.dir, "..", "..", "docs", "design", "166-forward-adopt.md"), "utf8");
-    const rows = [...design.matchAll(/^\| ([^|]+?) \([^\n]+\) \|/gm)].map((match) => match[1]!.trim());
-    expect(rows).toEqual([
-      "Forward gate", "A-only survival", "File collision", "Type flips", "Literal selective fetch",
-      "source-moved-before-fetch", "source-moved-after-proof", "proved-object-GC'd", "Diverged branch", "B behind",
-      "Detached HEAD", "Stash and tags", "B-only repository", "Nested repos", "Pointer target scope",
-      "linked-worktree source", "Linked-worktree ownership", "CAS/ABA classifier", "conflicted-merge repo", "clean repo",
-      "Ref/index crash matrix", "Git-plane containment", "Same-stream re-init", "Unsupported modes", "Consent routes",
-      "Journal kill matrix", "Power-loss shape", "Abort phases", "Crash before config", "Degraded mutex",
-      "Shared fence choke point", "Continuation propagation", "Continuation rejection", "Kill switch", "Hardlinks",
-      "Large-file identity alias", "No-clobber writer races", "Symlink escape", "Mode-000 directory", "Mount point",
-      "Special entries", "Ignore independence", "Warm cache", "Resident daemon generation", "Git incarnation",
-      "Finish fanout", "Retention lifecycle",
-    ]);
-  });
 });

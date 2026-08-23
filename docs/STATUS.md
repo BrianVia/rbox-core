@@ -1,5 +1,42 @@
 # rbox status — living state snapshot
 
+## 2026-08-22/23 — fleet v2 crossover DONE; chromium stress week; toward the tag
+
+- **All 3 machines crossed to the v2 store** (2026-08-21/22, playbook in
+  docs/design/283-state-regenesis-resolution.md): desktop + Mac read-write,
+  FM pull-only (read-write flip offered, founder deferred). Old v1 stores
+  preserved in ~/rbox-v1-state/<ts>/ per machine — delete after a clean week.
+  The 4 deferred wire renames are LIVE fleet-wide. Bonus: the desktop's #702
+  field instance was CURED during crossover (pruned 49 dead branch.* config
+  sections → 422 allowlisted keys < 512; remedy documented in the issue).
+- **The chromium stress week (founder's browser fork in ~/Development):**
+  34GB repo + a build that added ~1M artifact files. Findings all in #808
+  (loop monopolization + heartbeat freeze + host-deference requirements,
+  founder rulings verbatim) and #807 (RESET_NAMESPACE_BUSY crash-not-defer,
+  fix in flight). The chromium BUILD memory-exhausted the host (hard lock,
+  reboot 08-22 07:52); the v2 store took the hard reset mid-push and
+  reopened CLEAN — incidental crash-durability proof on day one.
+  Resolution: `chromium/src/out/` added to .rboxignore (Claude decision
+  under founder's "do it without me" — regenerable artifacts; the repo
+  itself still syncs), daemon restarted to apply (no hot re-arm: #473).
+- **Issue hygiene sweep (2026-08-23)**: #667 closed (ruled), #664/#775/#660/
+  #702/#808 updated to current truth, ship-with-note stamps on #672/#669/
+  #659/#516/#518. Tracker now matches the checklist.
+- **FLAKE-011/012 registered** (#660 acceptance w/ preload-guard net; the
+  three CF-runner sensitivity classes).
+- **Test cull PR #809** (founder rubric): 66 ceremony/existence/provider-
+  shape/copy tests deleted across 31 files, 7 classifier flags overturned on
+  adjudication; honest headline — the suite is ~99% contract-dense. Ledger
+  in CULL-REPORT.md in the PR.
+- Remaining to tag: #807 fix (agent), #809 merge, #664 24h completion (Mac
+  sampler restart owed when reachable), #802 field acceptance + 30-attempt
+  propagation bench (both once desktop settles post-ignore), rig FAST +
+  regress on the candidate SHA, founder: RboxBar darwin e2e + changelog
+  review + the tag yes.
+- Standing note: the .claude/worktrees echo-clobber carve-out in
+  ~/Development/.rboxignore cites a root cause that #803 has since fixed —
+  candidate for removal after a quiet week, founder call.
+
 ## 2026-08-21 (overnight run) — all six ruled workstreams LANDED (#799-#804)
 
 Six parallel opus-orchestrator agents (codex implementing per /arbitrage),

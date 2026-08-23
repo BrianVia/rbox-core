@@ -67,12 +67,6 @@ test("getIdentity requires email and returns unstyled cached identity data", asy
   expect(await getIdentity("acct_other")).toBeUndefined();
 });
 
-test("identityText applies the shared email then method fallback precedence", () => {
-  expect(identityText("owner@example.com", "github")).toBe("owner@example.com (github)");
-  expect(identityText("owner@example.com", null)).toBe("owner@example.com");
-  expect(identityText(null, "github")).toBe("github");
-  expect(identityText(null, null)).toBeUndefined();
-});
 
 test("clear waits behind queued writes and tolerates an already-missing file", async () => {
   scheduleAccountProfileWrite({ accountId: "acct_one", email: "owner@example.com", signInMethod: null });

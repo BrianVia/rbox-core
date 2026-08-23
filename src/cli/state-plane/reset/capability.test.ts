@@ -12,13 +12,6 @@ import {
 } from "./recovery.js";
 
 describe("DB-artifact reset capability", () => {
-  test("is structurally derived from the complete lexical entry arena", () => {
-    expect(hasDbArtifactResetCapability()).toBe(true);
-    expect(Object.isFrozen(sqliteResetFacade)).toBe(true);
-    expect(Object.keys(sqliteResetFacade).sort()).toEqual([
-      "begin", "inspect", "kind", "observeControlPlane", "observeJournal", "recover",
-    ]);
-  });
 
   test("exports no token/key and raw executors reject structural forgeries", async () => {
     expect(Object.keys(ownerSurface).sort()).toEqual([

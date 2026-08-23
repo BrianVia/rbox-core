@@ -1,7 +1,7 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { createHmac } from "node:crypto";
-import { PING_TIMEOUT_MS, pingSlackpipes, pingNewAccount, formatNewAccount, formatNewSubscription } from "../src/slackpipes.js";
+import { PING_TIMEOUT_MS, pingSlackpipes, pingNewAccount, formatNewSubscription } from "../src/slackpipes.js";
 import { stripeWebhook } from "../src/stripe.js";
 import type { Env } from "../src/env.js";
 
@@ -281,50 +281,8 @@ describe("pingSlackpipes — never throws, self-gates on config", () => {
   });
 });
 
-describe("formatNewAccount — env tag + rich web-signup line, graceful per-segment degradation", () => {
-  test("bootstrap carries only the (origin, env) tag — no rich suffix, no account id", () => {
-    expect(formatNewAccount({ accountId: "acct_abc", origin: "bootstrap", env: "dev" })).toBe(
-      ":seedling: New rbox account onboarded (bootstrap, dev)",
-    );
-  });
-
-  test("web signup renders email + sign-in method + plan — no account id", () => {
-    expect(
-      formatNewAccount({ accountId: "acct_xyz", origin: "web", env: "prod", email: "jane@doe.com", signInMethod: "github", plan: "none" }),
-    ).toBe(":seedling: New rbox account onboarded (web, prod) — jane@doe.com via github · plan none");
-  });
-
-  test("missing email drops only the email — method + plan survive", () => {
-    expect(formatNewAccount({ accountId: "acct_1", origin: "web", env: "prod", signInMethod: "google", plan: "none" })).toBe(
-      ":seedling: New rbox account onboarded (web, prod) — via google · plan none",
-    );
-  });
-
-  test("missing sign-in method drops only 'via …'", () => {
-    expect(formatNewAccount({ accountId: "acct_2", origin: "web", env: "dev", email: "a@b.com", plan: "solo" })).toBe(
-      ":seedling: New rbox account onboarded (web, dev) — a@b.com · plan solo",
-    );
-  });
-
-  test("all rich fields absent ⇒ bare tag line (never a dangling separator)", () => {
-    expect(formatNewAccount({ accountId: "acct_3", origin: "web", env: "prod" })).toBe(
-      ":seedling: New rbox account onboarded (web, prod)",
-    );
-  });
-});
-
 describe("formatNewSubscription — email + coupon over account id, graceful degradation", () => {
-  test("renders plan, email, and coupon", () => {
-    expect(
-      formatNewSubscription({ accountId: "acct_xyz", plan: "pro", env: "prod", email: "jane@doe.com", coupon: "SUMMER20" }),
-    ).toBe(":moneybag: New subscription — *pro* · jane@doe.com · coupon: SUMMER20 (prod)");
-  });
 
-  test("missing email degrades to 'unknown'; missing coupon degrades to 'none'", () => {
-    expect(formatNewSubscription({ accountId: "acct_1", plan: "solo", env: "dev" })).toBe(
-      ":moneybag: New subscription — *solo* · unknown · coupon: none (dev)",
-    );
-  });
 
   test("never renders the raw account id", () => {
     expect(

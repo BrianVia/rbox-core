@@ -626,3 +626,28 @@ dedicated-process runner), not a threshold bump.
 - Signature: fails at exactly ~15055ms (15s cap) on the shard runner; green on rerun of the same SHA; passes locally.
 - Class: timing-sensitive perf pin on loaded runners. Suspect the #501 amplification measurement needs a load-tolerant bound, not a wall-clock cap.
 - Status: green-on-rerun eligible; if it recurs on an untouched-subsystem diff twice more, split the measurement out of the CI wall-clock budget.
+
+## FLAKE-011 — #660 daemon-harness cross-file state leak (ACCEPTED for 2.0, founder 2026-08-20)
+- Original report: CI shard reds attributed to daemon-harness tests poisoning
+  shard neighbors via leaked env/cwd (issue #660).
+- Root-cause outcome (PR #794, 2026-08-20): the persisted-state theory did NOT
+  reproduce; 3 real cross-file env leakers were fixed (RBOX_HOME ×2
+  module-scope, RBOX_BLOB_PACK missing from ENV_KEYS). Residual class is
+  load-timing only.
+- The net: scripts/test-preload.ts now snapshots env+cwd per shard and a
+  global afterAll FAILS the shard NAMING the drifted keys — any recurrence is
+  self-diagnosing, never a mystery red.
+- Disposition: green-on-rerun eligible. A red that names drifted keys is NOT
+  this flake — it is a new leaker; fix it at the source.
+
+## FLAKE-012 — Cloudflare-runner environment sensitivities (pilot, since #797 2026-08-20)
+- Three classes seen in week one, all documented in docs/papercuts.md:
+  (1) "runner assignment was not observed within 30 seconds" infra fast-fail —
+  pool-side, rerun always recovers, tally feeds the Aug-27 pilot verdict;
+  (2) timing-sensitive tests wobble on 2vCPU (BlobBatchDownloader watchdog,
+  recovery-kit once-only claims) — pass 5/5 locally, rerun-green;
+  (3) environment differences that exposed REAL bugs (strict umask →
+  design-156 root cause, PR #798): investigate before assuming flake.
+- Disposition: fast-fail (<60s) with the assignment-timeout line →
+  rerun without investigation. A test failing repeatedly on CF but 5/5
+  locally → candidate for the 4vCPU label, papercut it either way.
