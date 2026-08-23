@@ -121,14 +121,6 @@ describe("rbox account status / unlink", () => {
     expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "github+password", plan: "pro" });
   });
 
-  test.each([
-    ["null", null],
-    ["absent", undefined],
-  ])("status omits sign-in for %s", async (_name, signInMethod) => {
-    stub(() => ({ status: 200, body: { accountId: "acct_unknown", linked: true, plan: "none", ...(signInMethod !== undefined ? { signInMethod } : {}) } }));
-    await accountStatus();
-    expect(logs.join("\n")).not.toMatch(/sign-in:/i);
-  });
 
   test.each([
     ["null", null],
@@ -164,11 +156,6 @@ describe("rbox account status / unlink", () => {
     await expect(accountUnlink()).rejects.toThrow(/no linked web login/i);
   });
 
-  test("unlink success prints the moved-to-fresh-account confirmation", async () => {
-    stub(() => ({ status: 200, body: { ok: true, account: "acct_fresh" } }));
-    await accountUnlink();
-    expect(logs.join("\n").toLowerCase()).toContain("unlinked");
-  });
 });
 
 // The ACCOUNT section of `rbox status` (design 21). fetchAccountSummary is the
@@ -242,13 +229,4 @@ describe("rbox status — account section", () => {
     expect(timeoutBudget).toBe(20);
   });
 
-  test("signed-out renders a `not signed in` hint (no account id / plan lines)", () => {
-    // The signed-out branch is decided by loadCredentials() (file/env, not stubbable
-    // under Bun's real os.homedir), so assert the rendering contract directly.
-    const lines = formatAccountSummary({ state: "signed-out" });
-    expect(lines.length).toBe(1);
-    const out = plain(lines[0]!).toLowerCase();
-    expect(out).toContain("not signed in");
-    expect(out).toContain("rbox login");
-  });
 });

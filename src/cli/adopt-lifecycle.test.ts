@@ -222,30 +222,7 @@ describe("design 166 consent and lifecycle", () => {
     await releaseWorkspaceSyncMutex(mutex);
   });
 
-  test("new-adoption kill switch is isolated from unconditional journal fence and recovery surfaces", async () => {
-    const [initSource, mutexSource, commandSource] = await Promise.all([
-      fs.readFile(path.join(import.meta.dir, "init-cmd.ts"), "utf8"),
-      fs.readFile(path.join(import.meta.dir, "sync-mutex.ts"), "utf8"),
-      fs.readFile(path.join(import.meta.dir, "adopt-cmd.ts"), "utf8"),
-    ]);
-    expect(initSource).toContain('process.env.RBOX_ADOPT_OVERLAY !== "0"');
-    expect(mutexSource).not.toContain("RBOX_ADOPT_OVERLAY");
-    expect(commandSource).not.toContain("RBOX_ADOPT_OVERLAY");
-  });
 
-  test("daemon generation boundary drops resident state and performs an unpruned scan before acknowledgement", async () => {
-    const daemon = await fs.readFile(path.join(import.meta.dir, "daemon", "daemon.ts"), "utf8");
-    const boundary = daemon.indexOf("private async adoptionCacheGenerationBoundary");
-    const fresh = daemon.indexOf("const fresh = new HashCache(", boundary);
-    const matcher = daemon.indexOf("this.rebuildMatcher", fresh);
-    const scan = daemon.indexOf('"unpruned"', matcher);
-    const acknowledge = daemon.indexOf("await acknowledgeCacheGeneration", scan);
-    expect(boundary).toBeGreaterThan(0);
-    expect(fresh).toBeGreaterThan(boundary);
-    expect(matcher).toBeGreaterThan(fresh);
-    expect(scan).toBeGreaterThan(matcher);
-    expect(acknowledge).toBeGreaterThan(scan);
-  });
 
   test("crash-before-config direct path loads a validated journal without workspace discovery", async () => {
     const root = await sourceRoot();

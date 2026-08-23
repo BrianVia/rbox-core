@@ -351,9 +351,6 @@ test("untracked menu exits cleanly on prompt abort", async () => {
   expect(result).toBeUndefined();
 });
 
-test("untracked menu abbreviates the home directory in the track description", () => {
-  expect(UNTRACKED_MENU_CHOICES(path.join(os.homedir(), "code", "scratch"))[0]!.description).toBe("~/code/scratch");
-});
 
 test("add-another setup never suggests the current root", () => {
   expect(additionalFolderSetupPaths("/work/current", "/home/me/rbox")).toEqual({

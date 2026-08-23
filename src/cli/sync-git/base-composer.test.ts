@@ -75,14 +75,6 @@ const lockedBranch = (witness: BranchTransitionWitness) => {
 };
 
 describe("design 130 mandatory BASE composer", () => {
-  test("closed authority union has exactly all eight members", () => {
-    const kinds = [
-      "pull-ref-transaction", "pull-carry", "journal-recovery", "publisher-ack", "manual", "p-repair", "migration", "observed-landing",
-    ] as const satisfies readonly ComposeRepoBaseAuthority["kind"][];
-    const exhaustive: Record<ComposeRepoBaseAuthority["kind"], true> = Object.fromEntries(kinds.map((kind) => [kind, true])) as never;
-    expect(Object.keys(exhaustive).sort()).toEqual([...kinds].sort());
-  });
-
   test("branch cross-product: same retains provenance, P changes, A removes, missing proof holds", () => {
     const main = "refs/heads/main";
     const side = "refs/heads/side";

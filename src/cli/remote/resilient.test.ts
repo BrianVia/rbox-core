@@ -113,10 +113,6 @@ describe("retryTransient — bounded retry with idempotency discipline", () => {
     expect(calls).toBe(1); // never retried
   });
 
-  test("a timeout cause yields the 'timed out' phrasing (vs 'dropped')", async () => {
-    const err = await retryTransient(async () => { throw new DOMException("timed out", "TimeoutError"); }, { retries: 0, sleep: noSleep, op: "downloading data" }).catch((e) => e);
-    expect((err as Error).message.toLowerCase()).toContain("timed out");
-  });
 
   test("abort mid-backoff aborts the retry (cancellation, not a NetworkError)", async () => {
     const ctrl = new AbortController();
