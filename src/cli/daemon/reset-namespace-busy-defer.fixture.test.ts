@@ -3,6 +3,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+// Top-level mock.module swaps reset-namespace-inventory for EVERY later file in a
+// shared shard process (35 downstream failures when this ran in shard 4). Run
+// the real body only in an isolated subprocess, like the other *.fixture tests.
+if (process.env.RBOX_RESET_BUSY_FIXTURE !== "1") {
+  test.skip("reset-busy fixture runs in an isolated subprocess", () => {});
+} else {
+
 const inventoryPath = path.resolve(import.meta.dir, "../reset-namespace-inventory.js");
 const realInventory = await import(inventoryPath);
 const realInventoryResetNamespace = realInventory.inventoryResetNamespace;
@@ -169,3 +176,5 @@ test("invalid namespace verdicts still propagate without arming a retry", async 
   expect(d.resetRetryTimer).toBeUndefined();
   expect(d.nextResetRetryAt).toBe(Number.NEGATIVE_INFINITY);
 });
+
+}
