@@ -153,10 +153,13 @@ import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { formatPushResiduals, formatPushSpan } from "../sync/format.js";
 import { inspectResetJournalSafety, unhandledResetInspection } from "../reset-halt-inspection.js";
+import { ResetNamespaceInventoryError } from "../reset-namespace-inventory.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
 import {
   RESET_RECOVERY_RETRY_MS,
+  RESET_NAMESPACE_BUSY_DEFER_ATTEMPTS,
+  RESET_NAMESPACE_BUSY_RETRY_MS,
   RESET_WAL_CRASH_RETRY_ATTEMPTS,
   RESET_WAL_CRASH_RETRY_MS,
   ResetHaltLogGate,
@@ -361,6 +364,12 @@ function divergenceNeedsPush(verdict: "none" | "some" | "pending-carry" | "indet
   return verdict === "some" || verdict === "indeterminate";
 }
 
+/** A namespace census that lost the directory-identity race is a transient
+ * condition, never a reset verdict (#807, design 284). */
+function resetNamespaceBusy(error: Error): error is ResetNamespaceInventoryError {
+  return error instanceof ResetNamespaceInventoryError && error.code === "RESET_NAMESPACE_BUSY";
+}
+
 /**
  * The rbox daemon: passive, continuous, resource-disciplined sync.
  *
@@ -397,9 +406,11 @@ export class RboxDaemon {
   private nextResetRetryAt = Number.NEGATIVE_INFINITY;
   private resetHaltIdentity?: string;
   private resetHaltReason?: string;
+  private resetNamespaceBusyDeferrals = 0;
   /** Design 276 F2.3: consecutive W1 takeover failures in the current episode. */
   private walCrashRetries = 0;
   private readonly resetHaltLogGate = new ResetHaltLogGate();
+  private readonly resetBusyLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
   /** Sole owner of repository topology, absence authority, and the Linux
    * safety-cadence floor. The daemon supplies discovery effects and consumes
@@ -1292,6 +1303,20 @@ export class RboxDaemon {
     this.scheduleResetRetry();
   }
 
+  private async deferResetNamespaceBusy(error: ResetNamespaceInventoryError): Promise<false> {
+    if (this.resetBusyLogGate.shouldLog(error.message, this.now())) {
+      this.log(`reset namespace busy; deferring operation boundary (${error.message})`);
+    }
+    this.resetNamespaceBusyDeferrals++;
+    if (this.resetLifecycle !== "ready" && this.resetNamespaceBusyDeferrals >= RESET_NAMESPACE_BUSY_DEFER_ATTEMPTS) {
+      await this.enterResetHalt(error.message);
+      return false;
+    }
+    this.nextResetRetryAt = this.now() + RESET_NAMESPACE_BUSY_RETRY_MS;
+    this.scheduleResetRetry();
+    return false;
+  }
+
   /**
    * Design 276 F2.3. A W1 writer takeover fails when something else still holds
    * the store ("reset checkpoint remained busy"), which is a race, not a
@@ -1332,7 +1357,17 @@ export class RboxDaemon {
   /** Called only while the workspace sync mutex is held. Returns true exactly
    * when scan/pull/push work may proceed. */
   private async resetOperationBoundary(heldMutex?: WorkspaceSyncMutex): Promise<boolean> {
+    try {
+      return await this.resetOperationBoundaryInspection(heldMutex);
+    } catch (error) {
+      if (!(error instanceof Error) || !resetNamespaceBusy(error)) throw error;
+      return this.deferResetNamespaceBusy(error);
+    }
+  }
+
+  private async resetOperationBoundaryInspection(heldMutex?: WorkspaceSyncMutex): Promise<boolean> {
     const inspection = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
+    this.resetNamespaceBusyDeferrals = 0;
     const persisted = await readResetHaltHealth(this.root);
     if (inspection.status === "halt") {
       await this.enterResetHalt(inspection.reason, inspection.journalIdentityHash);
@@ -1349,6 +1384,7 @@ export class RboxDaemon {
         // loadState owns the classifier-gated forward-recovery implementation.
         state = await this.loadSyncBase(heldMutex);
       } catch (error) {
+        if (error instanceof Error && resetNamespaceBusy(error)) throw error;
         if (walCrash && await this.retryWalCrashRecovery()) return false;
         await this.enterResetHalt(error instanceof Error ? error.message : String(error), inspection.status === "recoverable" ? inspection.journalIdentityHash : undefined);
         return false;
@@ -1625,33 +1661,38 @@ export class RboxDaemon {
    *  every operation passes through with the workspace mutex held. `false` ends the
    *  loop WITHOUT consuming the selected operation. */
   private async openOperationBoundary(syncMutex: WorkspaceSyncMutex): Promise<boolean> {
-    if (!await this.refreshScopeAuthority()) return false;
-    if (!await this.resetOperationBoundary(syncMutex)) return false;
-    if (this.stopped) return false;
-    // The contended-start path reaches genesis here, under the scheduler's
-    // already-held mutex, before any adoption or folder-policy scan. Keep this
-    // unconditional: a resident base may predate a surviving genesis intent.
     try {
-      await this.loadSyncBase(syncMutex);
+      if (!await this.refreshScopeAuthority()) return false;
+      if (!await this.resetOperationBoundary(syncMutex)) return false;
+      if (this.stopped) return false;
+      // The contended-start path reaches genesis here, under the scheduler's
+      // already-held mutex, before any adoption or folder-policy scan. Keep this
+      // unconditional: a resident base may predate a surviving genesis intent.
+      try {
+        await this.loadSyncBase(syncMutex);
+      } catch (error) {
+        if (!(error instanceof GenesisAdmissionRefusedError)) throw error;
+        await this.reportGenesisAdmissionRefusal(error, true);
+        return false;
+      }
+      if (!await this.folderOperationBoundary(syncMutex)) return false;
+      await this.recoverOwnedLocksAtBoundary();
+      if (this.stopped) return false;
+      await this.adoptionCacheGenerationBoundary();
+      if (!await this.acknowledgeFolderPolicyRecycle(syncMutex)) return false;
+      const binding = this.syncBase ?? await this.loadSyncBase(syncMutex);
+      const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
+      if (!bindingMatches) {
+        this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
+        this.stopped = true;
+        return false;
+      }
+      this.pushTerminalBlocked = false;
+      return true;
     } catch (error) {
-      if (!(error instanceof GenesisAdmissionRefusedError)) throw error;
-      await this.reportGenesisAdmissionRefusal(error, true);
-      return false;
+      if (!(error instanceof Error) || !resetNamespaceBusy(error)) throw error;
+      return this.deferResetNamespaceBusy(error);
     }
-    if (!await this.folderOperationBoundary(syncMutex)) return false;
-    await this.recoverOwnedLocksAtBoundary();
-    if (this.stopped) return false;
-    await this.adoptionCacheGenerationBoundary();
-    if (!await this.acknowledgeFolderPolicyRecycle(syncMutex)) return false;
-    const binding = this.syncBase ?? await this.loadSyncBase(syncMutex);
-    const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
-    if (!bindingMatches) {
-      this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
-      this.stopped = true;
-      return false;
-    }
-    this.pushTerminalBlocked = false;
-    return true;
   }
 
   async reportGenesisAdmissionRefusal(

@@ -18,6 +18,15 @@ export const RESET_RECOVERY_RETRY_MS = 60 * 60 * 1000;
 export const RESET_WAL_CRASH_RETRY_MS = 5_000;
 export const RESET_WAL_CRASH_RETRY_ATTEMPTS = 6;
 
+/** A reset namespace census can lose directory identity while SQLite sidecars
+ * churn. That is a race, not a corruption verdict, so retry briefly; a pending
+ * reset escalates after a half-minute instead of remaining silently stuck.
+ * Deletion condition: the census stops depending on directory-identity
+ * stability (for example via an O_DIRECTORY-fd-pinned census), or the daemon
+ * stops racing its own sidecars. */
+export const RESET_NAMESPACE_BUSY_RETRY_MS = 5_000;
+export const RESET_NAMESPACE_BUSY_DEFER_ATTEMPTS = 6;
+
 /** The halt log gate's own interval. Split from RESET_RECOVERY_RETRY_MS (design
  * 276 F2.3) so a shorter retry deadline can never shorten log suppression. */
 const RESET_HALT_LOG_INTERVAL_MS = 60 * 60 * 1000;
