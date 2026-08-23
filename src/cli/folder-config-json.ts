@@ -3,6 +3,8 @@
  * Never: machine-triage compatibility fields, filesystem discovery, rendering, or mutation.
  */
 import {
+  FOLDER_IGNORE_PATHS_MAX,
+  FOLDER_PATH_MAX_BYTES,
   FOLDER_TRASH_MAX_BYTES,
   FOLDER_TRASH_MAX_DAYS,
   type FolderCatalogState,
@@ -58,9 +60,17 @@ function boundedInteger(value: JsonField, max: number, at: string): number {
 
 function options(value: JsonField, at: string, resolved: boolean): FolderOptions | ResolvedFolderPolicy {
   const raw = record(value, at);
-  closed(raw, ["syncGit", "git", "respectGitignore", "noDrift", "trash"], at);
+  closed(raw, ["syncGit", "git", "respectGitignore", "ignorePaths", "noDrift", "trash"], at);
   for (const key of ["syncGit", "respectGitignore", "noDrift"] as const) {
     if ((resolved || Object.hasOwn(raw, key)) && typeof raw[key] !== "boolean") throw new Error(`${at}.${key} must be boolean`);
+  }
+  if (resolved || Object.hasOwn(raw, "ignorePaths")) {
+    if (!Array.isArray(raw.ignorePaths)) throw new Error(`${at}.ignorePaths must be an array`);
+    if (raw.ignorePaths.length > FOLDER_IGNORE_PATHS_MAX) throw new Error(`${at}.ignorePaths exceeds ${FOLDER_IGNORE_PATHS_MAX} entries`);
+    for (const [index, entry] of raw.ignorePaths.entries()) {
+      if (typeof entry !== "string") throw new Error(`${at}.ignorePaths[${index}] must be a string`);
+      if (Buffer.byteLength(entry, "utf8") > FOLDER_PATH_MAX_BYTES) throw new Error(`${at}.ignorePaths[${index}] is too long`);
+    }
   }
   for (const [key, child] of [["git", "incremental"], ["trash", "days"], ["trash", "maxBytes"]] as const) {
     if (!Object.hasOwn(raw, key)) {

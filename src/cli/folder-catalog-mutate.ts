@@ -21,6 +21,7 @@ export interface FolderOptionsPatch {
   syncGit?: boolean | undefined;
   git?: { incremental?: boolean | undefined } | undefined;
   respectGitignore?: boolean | undefined;
+  ignorePaths?: string[] | undefined;
   noDrift?: boolean | undefined;
   trash?: { days?: number | undefined; maxBytes?: number | undefined } | undefined;
 }
@@ -38,6 +39,7 @@ function cloneCatalog(catalog: FolderCatalog): FolderCatalog {
 function hasFields(options: FolderOptions): boolean {
   return options.syncGit !== undefined
     || options.respectGitignore !== undefined
+    || options.ignorePaths !== undefined
     || options.noDrift !== undefined
     || options.git?.incremental !== undefined
     || options.trash?.days !== undefined
@@ -50,13 +52,17 @@ function assertKeys(value: object, allowed: readonly string[], at: string): void
 }
 
 function applyPatch(current: FolderOptions, patch: FolderOptionsPatch): FolderOptions {
-  assertKeys(patch, ["syncGit", "git", "respectGitignore", "noDrift", "trash"], "folder options patch");
+  assertKeys(patch, ["syncGit", "git", "respectGitignore", "ignorePaths", "noDrift", "trash"], "folder options patch");
   const next = structuredClone(current);
   for (const key of ["syncGit", "respectGitignore", "noDrift"] as const) {
     if (!Object.hasOwn(patch, key)) continue;
     const value = patch[key];
     if (value === undefined) delete next[key];
     else next[key] = value;
+  }
+  if (Object.hasOwn(patch, "ignorePaths")) {
+    if (patch.ignorePaths === undefined) delete next.ignorePaths;
+    else next.ignorePaths = [...patch.ignorePaths];
   }
   if (Object.hasOwn(patch, "git")) {
     if (patch.git === undefined) delete next.git;

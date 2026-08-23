@@ -225,6 +225,9 @@ function sameWorkspaceBindingIdentity(boot: WorkspaceConfig, loaded: WorkspaceCo
     && bindingRoot(boot) === bindingRoot(loaded);
 }
 
+const matcherKey = (cfg: Pick<WorkspaceConfig, "respectGitignore" | "ignorePaths">): string =>
+  JSON.stringify([cfg.respectGitignore === true, cfg.ignorePaths ?? []]);
+
 export type DaemonTimerHandle = ReturnType<typeof setTimeout> | number;
 export interface GitBusyRetryClock {
   setTimeout(fn: () => void, ms: number): DaemonTimerHandle;
@@ -600,7 +603,10 @@ export class RboxDaemon {
       },
     }, this.retryQueue);
     this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
-    this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
+    this.matcher = buildIgnoreMatcher(root, {
+      respectGitignore: cfg.respectGitignore === true,
+      ignorePaths: cfg.ignorePaths ?? [],
+    });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
@@ -660,6 +666,7 @@ export class RboxDaemon {
     this.watcherTrust = new WatcherTrust(root, {
       watcher: () => this.watcherSessions.watcher,
       respectGitignore: () => this.cfg.respectGitignore === true,
+      ignorePaths: () => this.cfg.ignorePaths ?? [],
       knownGitRepos: () => Object.keys(this.syncBase?.lastSyncedManifest.gitRepos ?? {}),
       externalLocalWorkSettled: () => this.activePumpOp === undefined
         && !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan
@@ -2935,6 +2942,7 @@ export class RboxDaemon {
   private rebuildMatcher(state?: { lastSyncedManifest: Manifest }, armRecertification = false): void {
     this.matcher = buildIgnoreMatcher(this.root, {
       respectGitignore: this.cfg.respectGitignore === true,
+      ignorePaths: this.cfg.ignorePaths ?? [],
       knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
     });
     this.matcherGitReposKey = gitReposMatcherKey(state);
@@ -3014,27 +3022,27 @@ export class RboxDaemon {
         return;
       }
       const loaded = folderPolicyFields(admission.policy);
-      const wasRespecting = this.cfg.respectGitignore === true;
+      const beforeMatcherKey = matcherKey(this.cfg);
       const needsRecycle = this.cfg.syncGit !== loaded.syncGit
         || this.cfg.git?.incremental !== loaded.git?.incremental;
       const safeFieldsOnly = {
         ...loaded,
         git: { ...this.cfg.git, incremental: loaded.git?.incremental },
       };
-      // Take ONLY the field this reload exists for. Rebuilding cfg from `loaded`
+      // Take ONLY the policy fields this reload exists for. Rebuilding cfg from `loaded`
       // clobbers the RUNTIME-ATTACHED fields buildAuthedRemote layered on at boot
       // (`encrypted: true`, `kek`, the credential `remoteUrl` override) — none of
       // which live in workspace.json. That shipped in v0.9.2 and killed every
       // daemon push with "E2EE required" minutes after start (first reload tick),
       // live on 2026-07-07. cfg stays the boot object; only the hot-reloadable
-      // setting moves.
+      // settings move.
       this.cfg = { ...this.cfg, ...safeFieldsOnly };
-      if (wasRespecting !== (this.cfg.respectGitignore === true)) {
+      if (beforeMatcherKey !== matcherKey(this.cfg)) {
         this.folderMatcherRebuildPending = true;
         try {
           this.rebuildMatcher(await this.loadSyncBase(heldMutex));
           this.folderMatcherRebuildPending = false;
-          this.log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
+          this.log(`workspace config reloaded: ignore rules changed (respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}, ignorePaths ${this.cfg.ignorePaths?.length ?? 0})`);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           this.log(`folder config matcher rebuild deferred: ${reason}`);
@@ -3061,7 +3069,10 @@ export class RboxDaemon {
     const admission = await observeFolderAdmission(this.root, state);
     if (admission.kind !== "admitted") throw runtimeRefusal(admission);
     this.cfg = applyFolderPolicy(this.cfg, admission.policy);
-    this.matcher = buildIgnoreMatcher(this.root, { respectGitignore: this.cfg.respectGitignore === true });
+    this.matcher = buildIgnoreMatcher(this.root, {
+      respectGitignore: this.cfg.respectGitignore === true,
+      ignorePaths: this.cfg.ignorePaths ?? [],
+    });
   }
 
   private setFolderAdmissionHalt(reason: string): void {

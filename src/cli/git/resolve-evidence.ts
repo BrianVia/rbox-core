@@ -76,6 +76,7 @@ export async function buildSnapshot(args: {
 }): Promise<ResolveSnapshot> {
   const matcher = buildIgnoreMatcher(args.root, {
     respectGitignore: args.cfg.respectGitignore === true,
+    ignorePaths: args.cfg.ignorePaths ?? [],
     knownGitRepos: Object.keys(args.state.lastSyncedManifest.gitRepos ?? {}),
   });
   const oracle = oracleFromState({ base: args.state.lastSyncedManifest, matcher, root: args.root });

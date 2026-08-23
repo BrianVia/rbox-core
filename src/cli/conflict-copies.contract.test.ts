@@ -111,7 +111,7 @@ function readPort<M extends StatusMode>(mode: M = "json" as M, activity?: Daemon
     readPopulateStatus: async () => undefined,
     readRemoteSequence: async () => undefined,
     readCryptoPoolStatus: () => ({ state: "off" as const, workers: 0, jobsRun: 0, workerExecutions: 0 }),
-    buildMatcher: (_root, opts) => buildIgnoreMatcher(root, { respectGitignore: opts?.respectGitignore === true }),
+    buildMatcher: (_root, opts) => buildIgnoreMatcher(root, opts),
     loadHashCache: async () => ({ prune: () => {}, save: async () => {} }) as never,
     scanManifest: (async () => scanned()) as StatusReadPort<M>["scanManifest"],
     gitDivergenceFastRepoSource: async () => [],

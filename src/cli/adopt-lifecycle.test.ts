@@ -243,6 +243,7 @@ describe("design 166 consent and lifecycle", () => {
       syncGit: false,
       git: { incremental: false },
       respectGitignore: true,
+      ignorePaths: [],
       noDrift: true,
       trash: { days: 7, maxBytes: 1234 },
     }, mutex);
@@ -251,10 +252,16 @@ describe("design 166 consent and lifecycle", () => {
       syncGit: false,
       git: { incremental: false },
       respectGitignore: true,
+      ignorePaths: [],
       noDrift: true,
       trash: { days: 7, maxBytes: 1234 },
     });
     const raw = JSON.parse(await fs.readFile(adoptJournalPath(root), "utf8"));
+    raw.pinnedFolderPolicy.ignorePaths = ["../escape"];
+    await fs.writeFile(adoptJournalPath(root), JSON.stringify(raw));
+    await expect(loadAdoptJournal(root)).rejects.toThrow("invalid adoption journal schema");
+    raw.pinnedFolderPolicy.ignorePaths = [];
+    delete raw.pinnedFolderPolicy.ignorePaths;
     raw.pinnedFolderPolicy.extra = true;
     await fs.writeFile(adoptJournalPath(root), JSON.stringify(raw));
     await expect(loadAdoptJournal(root)).rejects.toThrow("invalid adoption journal schema");

@@ -532,6 +532,7 @@ async function measureWorkspaceSize(root: string, cfg: WorkspaceConfig): Promise
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
     respectGitignore: cfg.respectGitignore === true,
+    ignorePaths: cfg.ignorePaths ?? [],
     knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
   });
   const size: WorkspaceSize = { fileCount: 0, totalBytes: 0 };

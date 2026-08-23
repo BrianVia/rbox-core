@@ -35,6 +35,7 @@ export interface WatcherTrustClock {
 export interface WatcherTrustPort {
   watcher(): { readonly backend: "parcel" | "chokidar" } | undefined;
   respectGitignore(): boolean;
+  ignorePaths(): string[];
   knownGitRepos(): readonly string[];
   externalLocalWorkSettled(): boolean;
   fuseSession(): void;
@@ -194,7 +195,7 @@ export class WatcherTrust {
     const authorityFingerprint = crypto.createHash("sha256").update(JSON.stringify({
       respectGitignore: this.port.respectGitignore(),
       knownGitRepos: [...this.port.knownGitRepos()].sort(),
-      rules: effectiveIgnoreRules(this.root),
+      rules: effectiveIgnoreRules(this.root, this.port.ignorePaths()),
     })).digest("hex");
     return {
       admission,

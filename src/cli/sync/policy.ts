@@ -116,6 +116,8 @@ export const fileCountOf = (m: Manifest): number => m.files.reduce((n, f) => n +
 export const matcherForState = (root: string, cfg: WorkspaceConfig, state?: { lastSyncedManifest: Manifest }, opts: { purgeSafety?: boolean } = {}) =>
   buildIgnoreMatcher(root, {
     respectGitignore: cfg.respectGitignore === true,
+    // Machine-local ignores are forward-only and must never become fleet-wide purge deletes.
+    ignorePaths: opts.purgeSafety === true ? [] : cfg.ignorePaths ?? [],
     forceTrackedEvaluation: opts.purgeSafety === true,
     protectTrackedPaths: opts.purgeSafety === true,
     knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),

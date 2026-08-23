@@ -76,9 +76,9 @@ Options resolve **field by field**: a folder's own value wins, then
 `globalOptions`, then the built-in default (`resolveFolderPolicy`,
 `src/cli/folder-config-codec.ts:282`). `false` and `0` are real values, never
 "inherit". The options it owns are `syncGit`, `git.incremental`,
-`respectGitignore`, `noDrift`, and `trash.days` / `trash.maxBytes`; built-in
+`respectGitignore`, `ignorePaths`, `noDrift`, and `trash.days` / `trash.maxBytes`; built-in
 defaults are `syncGit: true`, `git.incremental: true`,
-`respectGitignore: false`, `noDrift: false`, `trash: 30 days / 2 GiB`
+`respectGitignore: false`, `ignorePaths: []`, `noDrift: false`, `trash: 30 days / 2 GiB`
 (`DEFAULT_FOLDER_POLICY`).
 
 The file is in exactly one of three states:
@@ -212,7 +212,9 @@ change it later, use `rbox ignore --respect-gitignore <on|off>` (that one *does*
 take a value) or edit `respectGitignore` in `~/.rbox/config.json`.
 
 **Precedence when `.gitignore` is enabled:** `BUILTIN_IGNORE` → `.gitignore` →
-`.rboxignore` (later rules win). `.rboxignore` can re-include an individual file an earlier rule
+`.rboxignore` → machine-local folder-config `ignorePaths` (later rules win).
+Each `ignorePaths` entry is a literal workspace-relative file or directory prefix;
+globs, negations, absolute paths, and `..` are rejected. `.rboxignore` can re-include an individual file an earlier rule
 excluded (`!important.log`), but **cannot** resurrect files inside a directory
 an earlier rule pruned wholesale — `!dist/keep.txt` won't work if `dist/` was
 already pruned as a directory; you'd have to re-include the directory itself.

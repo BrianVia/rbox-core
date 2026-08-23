@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { normalizeIgnorePath } from "../engine/ignore.js";
+import { FOLDER_IGNORE_PATHS_MAX, FOLDER_PATH_MAX_BYTES, hasOnlyUnicodeScalars } from "./folder-config-codec.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import type { JsonObject, JsonValue } from "../json.js";
 
@@ -159,6 +161,8 @@ export type JournalPinnedFolderPolicy = {
   syncGit: boolean;
   git: { incremental: boolean };
   respectGitignore: boolean;
+  /** Optional for journals written before folder-config ignorePaths shipped. */
+  ignorePaths?: string[];
   noDrift: boolean;
   trash: { days: number; maxBytes: number };
 };
@@ -327,12 +331,18 @@ function validJournal(value: JsonValue): value is AdoptJournal {
     && typeof workspace.syncGit === "boolean" && typeof workspace.respectGitignore === "boolean"
     && (workspace.name === undefined || string(workspace.name))
     && (pinned === undefined || object(pinned)
-      && Object.keys(pinned).length === 6
       && ["generation", "syncGit", "git", "respectGitignore", "noDrift", "trash"].every((key) => Object.hasOwn(pinned, key))
+      && Object.keys(pinned).every((key) => ["generation", "syncGit", "git", "respectGitignore", "ignorePaths", "noDrift", "trash"].includes(key))
       && hex(pinned.generation, 64)
       && typeof pinned.syncGit === "boolean"
       && object(pinned.git) && Object.keys(pinned.git).length === 1 && typeof pinned.git.incremental === "boolean"
       && typeof pinned.respectGitignore === "boolean" && typeof pinned.noDrift === "boolean"
+      && (pinned.ignorePaths === undefined || Array.isArray(pinned.ignorePaths)
+        && pinned.ignorePaths.length <= FOLDER_IGNORE_PATHS_MAX
+        && pinned.ignorePaths.every((candidate) => string(candidate)
+          && hasOnlyUnicodeScalars(candidate)
+          && Buffer.byteLength(candidate, "utf8") <= FOLDER_PATH_MAX_BYTES
+          && normalizeIgnorePath(candidate) !== undefined))
       && object(pinned.trash) && Object.keys(pinned.trash).length === 2
       && bounded(pinned.trash.days, 0, 365)
       && bounded(pinned.trash.maxBytes, 0, 1099511627776))

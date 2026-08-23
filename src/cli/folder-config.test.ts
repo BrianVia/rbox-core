@@ -5,6 +5,8 @@ import path from "node:path";
 import {
   DEFAULT_FOLDER_POLICY,
   FOLDER_CATALOG_MAX_BYTES,
+  FOLDER_IGNORE_PATHS_MAX,
+  FOLDER_PATH_MAX_BYTES,
   FOLDER_TRASH_MAX_BYTES,
   FOLDER_TRASH_MAX_DAYS,
   collapseFolderPath,
@@ -86,7 +88,7 @@ describe("closed bounded folder catalog codec", () => {
       folders: [{
         name: "Development",
         path: "~/Development/../Development",
-        options: { syncGit: true, respectGitignore: true, noDrift: true, trash: { days: 0 } },
+        options: { syncGit: true, respectGitignore: true, ignorePaths: ["a", "b/c"], noDrift: true, trash: { days: 0 } },
       }],
     });
     const parsed = parseFolderCatalog(serializeFolderCatalog(value, home), home);
@@ -96,6 +98,7 @@ describe("closed bounded folder catalog codec", () => {
       syncGit: true,
       git: { incremental: false },
       respectGitignore: true,
+      ignorePaths: ["a", "b/c"],
       noDrift: true,
       trash: { days: 0, maxBytes: 100 },
     });
@@ -124,6 +127,25 @@ describe("closed bounded folder catalog codec", () => {
     }
     for (const maxBytes of [-1, 1.5, 1099511627777]) {
       expect(() => parseFolderCatalog(JSON.stringify(catalog({ globalOptions: { trash: { maxBytes } } })), home)).toThrow(/maxBytes/);
+    }
+  });
+
+  test("ignorePaths inherits globally, replaces per folder, and is closed and bounded", async () => {
+    const { home } = await isolate();
+    expect(resolveFolderPolicy({ ignorePaths: ["global"] }, {}).ignorePaths).toEqual(["global"]);
+    expect(resolveFolderPolicy({ ignorePaths: ["global"] }, { ignorePaths: [] }).ignorePaths).toEqual([]);
+    const invalid: unknown[] = [
+      "nope",
+      [1],
+      ["../x"],
+      ["/x"],
+      ["!x"],
+      ["x*"],
+      ["é".repeat(FOLDER_PATH_MAX_BYTES)],
+      Array.from({ length: FOLDER_IGNORE_PATHS_MAX + 1 }, () => "x"),
+    ];
+    for (const ignorePaths of invalid) {
+      expect(() => parseFolderCatalog(JSON.stringify(catalog({ globalOptions: { ignorePaths } as never })), home)).toThrow(/ignorePaths/);
     }
   });
 
@@ -181,6 +203,7 @@ describe("pre-catalog policy snapshot", () => {
       syncGit: false,
       git: { incremental: true },
       respectGitignore: false,
+      ignorePaths: [],
       noDrift: false,
       trash: { days: 30, maxBytes: 2147483648 },
     });
@@ -188,12 +211,14 @@ describe("pre-catalog policy snapshot", () => {
       syncGit: true,
       git: { incremental: false },
       respectGitignore: true,
+      ignorePaths: ["local/cache"],
       noDrift: true,
       trash: { days: 0, maxBytes: 0 },
     }))).toMatchObject({
       syncGit: true,
       git: { incremental: false },
       respectGitignore: true,
+      ignorePaths: ["local/cache"],
       noDrift: true,
       trash: { days: 0, maxBytes: 0 },
     });
@@ -230,6 +255,7 @@ describe("pre-catalog policy snapshot", () => {
         syncGit: false,
         git: { incremental: fixture.raw.git.incremental === false ? false : true },
         respectGitignore: false,
+        ignorePaths: [],
         noDrift: false,
         trash: fixture.expectedTrash,
       });

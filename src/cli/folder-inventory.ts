@@ -50,12 +50,13 @@ export type FolderInventoryDeps = FolderUnionDeps;
  * material, scope, and every future non-policy field remain caller-owned. */
 export function folderPolicyFields(policy: ResolvedFolderPolicy): Pick<
   WorkspaceConfig,
-  "syncGit" | "git" | "respectGitignore" | "noDrift" | "trash"
+  "syncGit" | "git" | "respectGitignore" | "ignorePaths" | "noDrift" | "trash"
 > {
   return {
     syncGit: policy.syncGit,
     git: { incremental: policy.git.incremental },
     respectGitignore: policy.respectGitignore,
+    ignorePaths: [...policy.ignorePaths],
     noDrift: policy.noDrift,
     trash: { days: policy.trash.days, maxBytes: policy.trash.maxBytes },
   };

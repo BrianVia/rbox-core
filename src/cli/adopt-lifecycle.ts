@@ -65,6 +65,7 @@ export async function pinAdoptionFolderPolicy(
     syncGit: policy.syncGit,
     git: { incremental: policy.git.incremental },
     respectGitignore: policy.respectGitignore,
+    ignorePaths: [...(policy.ignorePaths ?? [])],
     noDrift: policy.noDrift,
     trash: { days: policy.trash.days, maxBytes: policy.trash.maxBytes },
   };

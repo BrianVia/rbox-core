@@ -101,7 +101,7 @@ export interface StatusReadPort<M extends StatusMode> {
   readPopulateStatus: (root: string, cfg: WorkspaceConfig, now: number) => Promise<PopulateStatusV1 | undefined>;
   readRemoteSequence: (cfg: WorkspaceConfig, creds: Credentials | undefined) => Promise<number | undefined>;
   readCryptoPoolStatus: () => CryptoPoolStatus;
-  buildMatcher: (root: string, opts: { respectGitignore: boolean; knownGitRepos: string[] }) => IgnoreMatcher;
+  buildMatcher: (root: string, opts: { respectGitignore: boolean; ignorePaths: string[]; knownGitRepos: string[] }) => IgnoreMatcher;
   loadHashCache: (root: string) => Promise<HashCache>;
   scanManifest: typeof scanManifest;
   gitDivergenceFastRepoSource: (

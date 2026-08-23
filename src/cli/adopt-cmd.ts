@@ -106,6 +106,7 @@ function journalPolicy(journal: AdoptJournal): ResolvedFolderPolicy {
       syncGit: pinned.syncGit,
       git: { incremental: pinned.git.incremental },
       respectGitignore: pinned.respectGitignore,
+      ignorePaths: pinned.ignorePaths ?? [],
       noDrift: pinned.noDrift,
       trash: { days: pinned.trash.days, maxBytes: pinned.trash.maxBytes },
     };

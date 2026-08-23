@@ -287,6 +287,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   if (trusted) {
     const matcher = port.buildMatcher(root, {
       respectGitignore: false,
+      ignorePaths: cfg.ignorePaths ?? [],
       knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
     });
     const repoHints = cfg.syncGit ? await port.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
@@ -343,6 +344,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   } else {
     const matcher = port.buildMatcher(root, {
       respectGitignore: cfg.respectGitignore === true,
+      ignorePaths: cfg.ignorePaths ?? [],
       knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
     });
     const hashCache = await port.loadHashCache(root);
