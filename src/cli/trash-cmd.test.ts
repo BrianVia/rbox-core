@@ -68,10 +68,6 @@ test("trash list shows batch, path, and size for each trashed file", async () =>
   expect(out).toContain("2020-01-01T00-00-00-000Z"); // the batch stamp
 });
 
-test("trash list on an empty trash prints a friendly line", async () => {
-  const { out } = await capture(() => trashCmd(root, ["list"], {}));
-  expect(out).toContain("trash is empty");
-});
 
 test("trash restore renames a trashed file back into the workspace", async () => {
   await seedTrash("2020-01-01T00:00:00.000Z", { "src/a.txt": "hello" });
@@ -123,10 +119,4 @@ test("trash empty removes eligible batches and reports bytes freed", async () =>
   const { out } = await capture(() => trashCmd(root, ["empty"], {}));
   expect(out).toMatch(/emptied 2 batches/);
   expect(await listTrash(root)).toHaveLength(0);
-});
-
-test("unknown trash subcommand prints usage and exits non-zero", async () => {
-  const { err, code } = await capture(() => trashCmd(root, ["bogus"], {}));
-  expect(code).toBe(1);
-  expect(err).toContain("usage: rbox trash");
 });

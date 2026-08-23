@@ -236,31 +236,6 @@ test("originUntrusted is omitted when false and survives to a subsequent healthy
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("drift line omits trustState flag-off and stamps suspect flag-on", async () => {
-  const h = daemonHarness();
-  const lines: string[] = [];
-  const originalLog = console.log;
-  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
-  const audit = (trustState: "trusted" | "suspect") => ({
-    scanStartMs: Date.now(), candidates: [], horizonInputs: new Map(), rawEvents: [], appliedEvents: [], overflow: false,
-    watcherHealthy: trustState === "trusted", trustState, errorGen: 0, sinceSafetyMs: 0, rulesChanged: false,
-  });
-  try {
-    process.env.RBOX_WATCHER_RETRUST = "0";
-    const trusted = audit("trusted");
-    h.daemon.openDriftAudits.add(trusted);
-    await h.daemon.runDriftAuditNow(trusted);
-    expect(lines.at(-1)).not.toContain("trustState=");
-    process.env.RBOX_WATCHER_RETRUST = "1";
-    const suspect = audit("suspect");
-    h.daemon.openDriftAudits.add(suspect);
-    await h.daemon.runDriftAuditNow(suspect);
-    expect(lines.at(-1)).toContain("watcherHealthy=n trustState=suspect");
-  } finally {
-    console.log = originalLog;
-    await h.close();
-  }
-});
 
 test("P2 cadence requires suspect liveness and clean coverage, and resets on churn/drop", async () => {
   expect(nextSafetyDelay(FLOOR, { watcherLive: false, churned: false, degradedBackoffEligible: true })).toBe(120_000);

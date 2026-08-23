@@ -5,7 +5,6 @@ import path from "node:path";
 import type { DirCacheChild, DirCacheFile } from "./dircache.js";
 
 if (process.env.RBOX_WALK_ABORT_FIXTURE !== "1") {
-  test.skip("abort fixture runs in an isolated subprocess", () => {});
 } else {
   const root = await realFs.mkdtemp(path.join(os.tmpdir(), "rbox-walk-abort-"));
   const blockers = Array.from({ length: 15 }, (_, index) => `blocker-${String(index).padStart(2, "0")}`);

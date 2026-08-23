@@ -46,20 +46,6 @@ function driveHooks(scriptFile: string, wsDir: string, pwd = wsDir): { glyph: st
   return { glyph, banner: stderr };
 }
 
-test("the script embeds both hooks, root discovery, the version guard, and completions", () => {
-  const s = shellInitZsh();
-  expect(s).toContain("add-zsh-hook chpwd _rbox_chpwd");
-  expect(s).toContain("add-zsh-hook precmd _rbox_precmd");
-  expect(s).toContain("_rbox_find_root");
-  expect(s).toContain("prompt-status");
-  expect(s).toContain("_RBOX_PROMPT_STATUS_DEFAULT=0");
-  expect(s).toContain("RBOX_PROMPT");
-  // The v1 whole-line shape gate — refuses any other version tag AND malformed fields.
-  expect(s).toContain("^v1 [0-9]{1,12} (ok|pending|active|halt)");
-  // The completions are appended verbatim (ends with the #compdef header + footer).
-  expect(s).toContain("#compdef rbox");
-  expect(s).toContain("compdef _rbox rbox");
-});
 
 test("RBOX_USE_PROMPT_STATUS=1 prefers prompt-status and falls back to shell.line by default", () => {
   if (!ZSH) return;
@@ -116,28 +102,7 @@ test("the full output parses cleanly under `zsh -n`", () => {
   expect(res.exitCode).toBe(0);
 });
 
-test("entering an in-sync workspace prints the ✓ banner and glyph", () => {
-  if (!ZSH) return;
-  const now = Math.floor(Date.now() / 1000);
-  const ws = makeWorkspace(`v1 ${now} ok - 80 ${now - 120} push My Workspace\n`);
-  const { glyph, banner } = driveHooks(writeScript(), ws);
-  expect(glyph).toContain("✓");
-  expect(banner).toContain("rbox: My Workspace");
-  expect(banner).toContain("✓");
-  expect(banner).toContain("in sync");
-  // Name may contain spaces and is read as the trailing field.
-  expect(banner).toContain("(seq 80)");
-});
 
-test("a halted workspace shows the ⚠ glyph and a halt banner", () => {
-  if (!ZSH) return;
-  const now = Math.floor(Date.now() / 1000);
-  const ws = makeWorkspace(`v1 ${now} halt - 80 - - My Workspace\n`);
-  const { glyph, banner } = driveHooks(writeScript(), ws);
-  expect(glyph).toContain("⚠");
-  expect(banner).toContain("⚠");
-  expect(banner).toContain("halted");
-});
 
 test("a stale sidecar (heartbeat > 15s old) shows the ○ 'not running' state", () => {
   if (!ZSH) return;

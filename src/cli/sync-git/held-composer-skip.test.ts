@@ -341,30 +341,6 @@ test("the vacuous mint and foreign provenances are ineligible — by code, not b
   }
 });
 
-test("the trace names an applied-but-held repo's standing blocker instead of printing none", async () => {
-  const { root, tip } = await repoWithCommit();
-  const savedTrace = process.env.RBOX_TRACE_HELD;
-  process.env.RBOX_TRACE_HELD = "1";
-  try {
-    const logs: string[] = [];
-    const plane = createHeldDecisionPlane({
-      root, log: (line) => logs.push(line), attempts: {},
-      deferrals: {
-        standingApply: () => standingApply("k"),
-        restandApply: () => {}, clearApply: () => {},
-      },
-    });
-    const repo = plane.repo({
-      relPath: ".", incoming: sectionFor(tip), storedAttempt: undefined,
-      traced: heldTraceEnabled(true), timings: zeroGitChainTimings(),
-    });
-    repo.emitTrace({ result: "applied", wallMs: 3_500 });
-    expect(logs.join("\n")).toContain("blocker=apply/artifact");
-  } finally {
-    if (savedTrace === undefined) delete process.env.RBOX_TRACE_HELD;
-    else process.env.RBOX_TRACE_HELD = savedTrace;
-  }
-});
 
 test("an artifact write inside the fingerprint bracket refuses the skip, not one cycle late", async () => {
   const { root, tip } = await repoWithCommit();

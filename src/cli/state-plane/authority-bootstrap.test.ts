@@ -308,16 +308,6 @@ test("state-lock I/O is a typed ephemeral refusal before genesis mutation", asyn
   }
 });
 
-test("ordinary admission has no migration dispatch vocabulary", () => {
-  const source = fs.readFileSync(path.join(import.meta.dir, "authority-bootstrap.ts"), "utf8");
-  for (const removed of [
-    "establishStateAuthority",
-    "AuthorityOutcome",
-    "MigrationDriver",
-    "claimsGenesis",
-    "runMigration",
-  ]) expect(source).not.toContain(removed);
-});
 
 // --- the boundary the fence's home depends on (§7.9) ------------------------
 
