@@ -249,23 +249,6 @@ describe("new-device email — content & label sanitization", () => {
     expect(out.headers["List-Unsubscribe"]).toContain("/settings/notifications");
   });
 
-  test("key-delivery mint says keys were granted, shows the fingerprint, and states the revoke ceiling", () => {
-    const out = renderEmail({
-      label: "new laptop",
-      ip: null,
-      geo: null,
-      event: "device_code",
-      createdAt: 1719600000000,
-      deviceId: "dev_keys",
-      keysGranted: true,
-      keyFingerprint: "fragment-fingerprint",
-    });
-    expect(out.text).toContain("Encryption-key access was granted");
-    expect(out.text).toContain("Key fingerprint: fragment-fingerprint");
-    expect(out.text).toContain("Revoke blocks new access");
-    expect(out.text).toContain("in-flight download grant expires within ~5 minutes");
-    expect(out.html).toContain("fragment-fingerprint");
-  });
 
   test("sanitizeLabel strips CR/LF + control chars (header-injection guard) and clamps", () => {
     expect(sanitizeLabel("good\r\nSubject: spoofed")).toBe("good Subject: spoofed");

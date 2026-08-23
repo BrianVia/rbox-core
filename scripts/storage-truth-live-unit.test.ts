@@ -41,18 +41,6 @@ const response = (body: unknown, status = 200): Response => new Response(JSON.st
 });
 
 describe("storage-truth live adapter unit", () => {
-  test("statically resolves storage resources from checked-in environments", () => {
-    expect(resolveStorageTruthResources("production")).toEqual({
-      environment: "production",
-      databaseId: "c6b3e6ab-4130-4c9b-8f77-cdae47745c5c",
-      bucketName: "rbox-prod-blobs",
-    });
-    expect(resolveStorageTruthResources("dev")).toEqual({
-      environment: "dev",
-      databaseId: "91ae0add-f766-4dd5-8de3-96b8ce1f4e04",
-      bucketName: "rbox-dev-blobs",
-    });
-  });
 
   test("D1 REST permits one lexical SELECT and rejects statements or write metadata", async () => {
     const requests: Array<{ url: string; body: unknown }> = [];

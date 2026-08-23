@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 
 if (process.env.RBOX_WATCHER_BACKEND_FIXTURE !== "1") {
-  test.skip("watcher backend fixture runs in an isolated subprocess", () => {});
 } else {
   interface NativeOptions {
     backend?: "fs-events" | "inotify";

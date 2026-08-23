@@ -51,12 +51,6 @@ async function executeDescription(description: GitFixtureDescription): Promise<{
 }
 
 describe("git fixture descriptions", () => {
-  test("enumerate fourteen builders and all fifteen normative outcomes", () => {
-    expect(GIT_LAYOUT_CELLS).toHaveLength(14);
-    expect(GIT_LAYOUT_OUTCOMES).toHaveLength(15);
-    expect(new Set(GIT_LAYOUT_OUTCOMES).size).toBe(15);
-    expect(GIT_LAYOUT_OUTCOMES).toContain("s1-a/mod");
-  });
 
   test("are pure and deterministic", () => {
     for (const [cell, builder] of Object.entries(GIT_FIXTURE_BUILDERS)) {

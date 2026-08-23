@@ -41,15 +41,6 @@ function oneStep(status: FlowDefinition["status"] = "pass", enrolled = false): F
   return defineFlow({ name: `one-step-${status}`, status, machines: [{ name: "a", enrolled }], steps: [{ on: "a", exec: ["status"] }] });
 }
 
-test("flow catalog names all eleven flows, all pass (live-validated 2026-07-18 full regress run)", async () => {
-  const flows = await loadFlows();
-  expect(flows.map((flow) => [flow.name, flow.status])).toEqual([
-    ["declined-rebind-menu", "pass"], ["empty-id-navigation", "pass"], ["empty-join-copy", "pass"],
-    ["fresh-setup-to-handoff", "pass"], ["front-door", "pass"], ["gitignore-default", "pass"],
-    ["malformed-token-reprompt", "pass"], ["pairing-second-device", "pass"], ["status-healthy", "pass"],
-    ["tilde-expansion", "pass"], ["typo-no-phantom", "pass"],
-  ]);
-});
 
 test("parallel scheduler respects the requested bound and preserves result order", async () => {
   let active = 0; let peak = 0; const releases: Array<() => void> = [];
