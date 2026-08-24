@@ -16,8 +16,9 @@ export interface ManifestCommitEffectPlan {
   readonly manifest: Manifest;
   /** §3.6.3: a chain repair posts the PIN's sequence, not the accepted one. */
   readonly parentSequence: number;
-  /** Design 204 §4.2: the base the planner verified, or nothing. */
-  readonly deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
+  /** Design 204 §4.2: the base the planner verified, or nothing. `validated`
+   * carries that verification forward so the writer does not repeat it (#816). */
+  readonly deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta; validated?: true };
   /** Design 204 §7: why the planner withheld `deltaBase`, so the writer logs the
    * true non-delta cause instead of inferring one from an absent base. */
   readonly deltaBaseRejection?: "no-base" | "integrity";

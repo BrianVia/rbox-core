@@ -20,6 +20,7 @@ import {
 } from "../../engine/index.js";
 import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type WorkspaceConfig } from "../config.js";
 import { mdeWritePolicy } from "../e2ee-remote.js";
+import { attestSavedBase, baseHashIsAttested } from "./base-hash-attestation.js";
 import {
   deferManifest,
   encryptAndUpload,
@@ -752,13 +753,19 @@ async function runPushAttempt(
     // Under the master kill (or with deltas killed) NOTHING is reconstructed: the
     // meta validate + manifestFromMeta + O(N) validateManifest + O(N) canonical
     // hash below are pure waste for a base the writer would immediately discard.
-    let deltaBase: { manifest: Manifest; meta: GlobalManifestMeta } | undefined;
+    let deltaBase: { manifest: Manifest; meta: GlobalManifestMeta; validated?: true } | undefined;
     let deltaBaseRejection: "no-base" | "integrity" | undefined;
     spans.span("delta_base_ms", () => {
       if (mdeWritePolicy().delta && !forceSnapshot) {
         const manifestMeta = validManifestMeta(state.manifestMeta);
+        // #816: this base is the manifest the PREVIOUS push committed, and that
+        // push recorded the encoder's own `resultHash` for it against this exact
+        // state object. When that attestation stands, both O(N) passes below —
+        // the shape validation and the canonical re-hash — restate a proof we
+        // already hold. Absent or mismatched, nothing is skipped.
+        const attested = manifestMeta !== undefined && baseHashIsAttested(state, manifestMeta);
         const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
-        if (!manifestMeta || !reconstructedBase || !validateManifest(reconstructedBase).ok || state.lastSyncedSequence !== appliedSequence) {
+        if (!manifestMeta || !reconstructedBase || (!attested && !validateManifest(reconstructedBase).ok) || state.lastSyncedSequence !== appliedSequence) {
           deltaBaseRejection = "no-base";
         } else {
           const integrityKey = JSON.stringify([
@@ -766,7 +773,7 @@ async function runPushAttempt(
             manifestMeta.encManifestSha,
             manifestMeta.manifestHash,
           ]);
-          let integrityOk = baseIntegrityByMeta.get(integrityKey);
+          let integrityOk = attested ? true : baseIntegrityByMeta.get(integrityKey);
           if (integrityOk === undefined) {
             integrityOk = canonicalManifestHashStreaming(reconstructedBase) === manifestMeta.manifestHash;
             baseIntegrityByMeta.set(integrityKey, integrityOk);
@@ -780,7 +787,10 @@ async function runPushAttempt(
           // which rewrites the meta and self-heals the next push.
             deltaBaseRejection = "integrity";
           } else {
-            deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+            // The writer re-validates the base it is handed; this seam has just
+            // established that validity (freshly, or by the standing attestation
+            // which covers the same content), so say so and spare it the pass.
+            deltaBase = { manifest: reconstructedBase, meta: manifestMeta, validated: true };
           }
         }
       }
@@ -919,7 +929,7 @@ async function runPushAttempt(
       observedRepos: (values) => observedRepoKeys(state, committed.gitRepos, values),
       announce: (line) => { (deps.onGitLog ?? ((l: string) => console.error(l)))(line); },
       save: async (write) => {
-        await spans.span("state-save", () => saveStateSource(root, state, {
+        const saved = await spans.span("state-save", () => saveStateSource(root, state, {
             expectedStream: syncStreamId(cfg),
             sourceGlobalSeq: write.acceptedSequence,
             globalManifest: write.globalManifest,
@@ -934,6 +944,10 @@ async function runPushAttempt(
           }, {
             allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
           }));
+        // #816: the meta just persisted carries the encoder's own canonical hash
+        // of `write.globalManifest`. Record that, so the next push reads the
+        // proof instead of re-deriving it over every entry.
+        if (write.manifestMeta) attestSavedBase(saved, write.globalManifest, write.manifestMeta, write.acceptedSequence);
       },
     };
     const acknowledgement = await spans.span("ack_ms", () => acknowledgePublishedGitTransitions(

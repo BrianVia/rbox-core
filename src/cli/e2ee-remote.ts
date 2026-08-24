@@ -836,6 +836,7 @@ export class E2eeRemote implements SyncRemote {
         baseEncSha: deltaBase.meta.encManifestSha,
         baseManifestHash: deltaBase.meta.manifestHash,
         compress: true,
+        baseValidated: deltaBase.validated === true,
       });
       const candidateBuilt = await buildEncoded(candidate.bytes, chain);
       if (deltaBase.meta.chainBytes + candidateBuilt.encManifest.byteLength < deltaBase.meta.snapshotBytes) {
