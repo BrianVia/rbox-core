@@ -84,6 +84,7 @@ test("generation sorts normalized paths before naming and emits complete reparsa
     syncGit: false,
     git: { incremental: false },
     respectGitignore: true,
+    ignorePaths: [],
     noDrift: false,
     trash: { days: 30, maxBytes: 2147483648 },
   });

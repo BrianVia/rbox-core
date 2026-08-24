@@ -139,7 +139,7 @@ function boundedInteger(value: ConfigValue, min: number, max: number, at: string
   return value;
 }
 
-export function hasOnlyUnicodeScalars(value: string): boolean {
+function hasOnlyUnicodeScalars(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
     const unit = value.charCodeAt(index);
     if (unit >= 0xd800 && unit <= 0xdbff) {
@@ -151,6 +151,13 @@ export function hasOnlyUnicodeScalars(value: string): boolean {
   }
   return true;
 }
+
+/** Shape check for an ALREADY-PERSISTED ignorePaths list (the adoption journal's
+ *  pinned policy). Catalog ingress uses {@link parseOptions} instead, which reports
+ *  which entry was rejected and why; a durable record only needs a yes/no. */
+export const isIgnorePathList = (value: JsonValue | undefined): value is string[] =>
+  Array.isArray(value) && value.length <= FOLDER_IGNORE_PATHS_MAX
+    && value.every((entry) => typeof entry === "string" && normalizeIgnorePath(entry) !== undefined);
 
 function parseOptions(value: ConfigValue, at: string): FolderOptions {
   const raw = object(value, at);

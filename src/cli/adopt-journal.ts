@@ -3,8 +3,7 @@ import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { normalizeIgnorePath } from "../engine/ignore.js";
-import { FOLDER_IGNORE_PATHS_MAX, FOLDER_PATH_MAX_BYTES, hasOnlyUnicodeScalars } from "./folder-config-codec.js";
+import { isIgnorePathList } from "./folder-config-codec.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import type { JsonObject, JsonValue } from "../json.js";
 
@@ -337,12 +336,7 @@ function validJournal(value: JsonValue): value is AdoptJournal {
       && typeof pinned.syncGit === "boolean"
       && object(pinned.git) && Object.keys(pinned.git).length === 1 && typeof pinned.git.incremental === "boolean"
       && typeof pinned.respectGitignore === "boolean" && typeof pinned.noDrift === "boolean"
-      && (pinned.ignorePaths === undefined || Array.isArray(pinned.ignorePaths)
-        && pinned.ignorePaths.length <= FOLDER_IGNORE_PATHS_MAX
-        && pinned.ignorePaths.every((candidate) => string(candidate)
-          && hasOnlyUnicodeScalars(candidate)
-          && Buffer.byteLength(candidate, "utf8") <= FOLDER_PATH_MAX_BYTES
-          && normalizeIgnorePath(candidate) !== undefined))
+      && (pinned.ignorePaths === undefined || isIgnorePathList(pinned.ignorePaths))
       && object(pinned.trash) && Object.keys(pinned.trash).length === 2
       && bounded(pinned.trash.days, 0, 365)
       && bounded(pinned.trash.maxBytes, 0, 1099511627776))
