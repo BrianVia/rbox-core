@@ -34,7 +34,7 @@ The name nods to rsync/rclone, but the architecture is **Dropbox-model** (centra
 | D8 | **Headless onboarding via device authorization flow** (OAuth device code). | "Fire up a Docker container and sign in easily" = `gh auth login`-style code approval. |
 | D9 | **Single R2 bucket, tenant isolation enforced in D1/Worker authz**, not bucket-per-user. | R2 caps buckets in the low thousands; per-user buckets break dedup, ops, and don't improve the security boundary. |
 | D10 | **GC computes reachability from live manifests**; no per-commit ref-count increment. | v1's `blob_refs.ref_count` only ever incremented — it leaked forever and GC could never run. |
-| D11 | Global rename `codesync`/`.codesync` → `rbox`/`.rbox` (**shipped**); ~~project config file is **`rbox.yml`**~~ (**REVERSED — never built**; `rbox.yml` appears nowhere in the codebase. Ignore rules come from the builtin list, `.gitignore` behind `respectGitignore`, and `.rboxignore`; user options live in `~/.rbox/config.json` per design 231). | — |
+| D11 | Global rename `codesync`/`.codesync` → `rbox`/`.rbox` (**shipped**); ~~project config file is **`rbox.yml`**~~ (**REVERSED — never built**; `rbox.yml` appears nowhere in the codebase. Ignore rules come from the builtin list, `.gitignore` behind `respectGitignore`, `.rboxignore`, and machine-local `ignorePaths`; user options live in `~/.rbox/config.json` per design 231). | — |
 
 ---
 
@@ -228,7 +228,7 @@ rbox link ~/code --workspace ws_abc123     # same workspace, different local roo
 ```
 loop:
   1. watch filesystem (**`@parcel/watcher`**, not chokidar — native prune plus an authoritative JS matcher), debounce ~500ms of quiet
-  2. scan changed subtree → apply ignore rules (built-in + .gitignore behind `respectGitignore` + .rboxignore; **no rbox.yml — see D11**)
+  2. scan changed subtree → apply ignore rules (built-in + .gitignore behind `respectGitignore` + .rboxignore + machine-local `ignorePaths`; **no rbox.yml — see D11**)
   3. for the project(s) touched: build candidate manifest (hash changed files only;
      reuse cached hashes where mtime+size unchanged)
   4. diff candidate vs last-synced manifest → {addedOrChanged blobs, deleted paths}

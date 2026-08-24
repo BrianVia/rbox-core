@@ -8,11 +8,13 @@ import path from "node:path";
 import { homeDir } from "./rbox-paths.js";
 import type { JsonValue } from "../json.js";
 import { trashConfig, type WorkspaceConfig } from "./workspace-config.js";
+import { normalizeIgnorePath } from "../engine/ignore.js";
 
 export const FOLDER_CATALOG_MAX_BYTES = 1024 * 1024;
 export const FOLDER_CATALOG_MAX_FOLDERS = 1024;
 export const FOLDER_NAME_MAX_SCALARS = 128;
 export const FOLDER_PATH_MAX_BYTES = 4096;
+export const FOLDER_IGNORE_PATHS_MAX = 1024;
 export const FOLDER_TRASH_MAX_DAYS = 365;
 export const FOLDER_TRASH_MAX_BYTES = 1099511627776;
 
@@ -20,6 +22,7 @@ export type FolderOptions = {
   syncGit?: boolean;
   git?: { incremental?: boolean };
   respectGitignore?: boolean;
+  ignorePaths?: string[];
   noDrift?: boolean;
   trash?: { days?: number; maxBytes?: number };
 };
@@ -28,14 +31,19 @@ export interface ResolvedFolderPolicy {
   syncGit: boolean;
   git: { incremental: boolean };
   respectGitignore: boolean;
+  ignorePaths: string[];
   noDrift: boolean;
   trash: { days: number; maxBytes: number };
 }
+
+const EMPTY_IGNORE_PATHS: string[] = [];
+Object.freeze(EMPTY_IGNORE_PATHS);
 
 export const DEFAULT_FOLDER_POLICY: Readonly<ResolvedFolderPolicy> = Object.freeze({
   syncGit: true,
   git: Object.freeze({ incremental: true }),
   respectGitignore: false,
+  ignorePaths: EMPTY_IGNORE_PATHS,
   noDrift: false,
   trash: Object.freeze({ days: 30, maxBytes: 2147483648 }),
 });
@@ -144,13 +152,38 @@ function hasOnlyUnicodeScalars(value: string): boolean {
   return true;
 }
 
+/** Shape check for an ALREADY-PERSISTED ignorePaths list (the adoption journal's
+ *  pinned policy). Catalog ingress uses {@link parseOptions} instead, which reports
+ *  which entry was rejected and why; a durable record only needs a yes/no. */
+export const isIgnorePathList = (value: JsonValue | undefined): value is string[] =>
+  Array.isArray(value) && value.length <= FOLDER_IGNORE_PATHS_MAX
+    && value.every((entry) => typeof entry === "string" && normalizeIgnorePath(entry) !== undefined);
+
 function parseOptions(value: ConfigValue, at: string): FolderOptions {
   const raw = object(value, at);
-  closed(raw, ["syncGit", "git", "respectGitignore", "noDrift", "trash"], at);
+  closed(raw, ["syncGit", "git", "respectGitignore", "ignorePaths", "noDrift", "trash"], at);
   const result: FolderOptions = {};
   if (Object.hasOwn(raw, "syncGit")) result.syncGit = booleanField(raw.syncGit, `${at}.syncGit`);
   if (Object.hasOwn(raw, "respectGitignore")) {
     result.respectGitignore = booleanField(raw.respectGitignore, `${at}.respectGitignore`);
+  }
+  if (Object.hasOwn(raw, "ignorePaths")) {
+    if (!Array.isArray(raw.ignorePaths)) throw new FolderCatalogError(`${at}.ignorePaths must be an array`);
+    if (raw.ignorePaths.length > FOLDER_IGNORE_PATHS_MAX) {
+      throw new FolderCatalogError(`${at}.ignorePaths exceeds ${FOLDER_IGNORE_PATHS_MAX} entries`);
+    }
+    result.ignorePaths = raw.ignorePaths.map((entry, index) => {
+      const entryAt = `${at}.ignorePaths[${index}]`;
+      if (typeof entry !== "string") throw new FolderCatalogError(`${entryAt} must be a string`);
+      if (!hasOnlyUnicodeScalars(entry)) throw new FolderCatalogError(`${entryAt} contains an invalid Unicode scalar`);
+      if (Buffer.byteLength(entry, "utf8") > FOLDER_PATH_MAX_BYTES) {
+        throw new FolderCatalogError(`${entryAt} exceeds ${FOLDER_PATH_MAX_BYTES} UTF-8 bytes`);
+      }
+      if (normalizeIgnorePath(entry) === undefined) {
+        throw new FolderCatalogError(`${entryAt} must be a workspace-relative path with no globs, negations, or "..": ${JSON.stringify(entry)}`);
+      }
+      return entry;
+    });
   }
   if (Object.hasOwn(raw, "noDrift")) result.noDrift = booleanField(raw.noDrift, `${at}.noDrift`);
   if (Object.hasOwn(raw, "git")) {
@@ -297,6 +330,7 @@ export function resolveFolderPolicy(globalOptions: FolderOptions, folderOptions:
     respectGitignore: folder.respectGitignore
       ?? global.respectGitignore
       ?? DEFAULT_FOLDER_POLICY.respectGitignore,
+    ignorePaths: folder.ignorePaths ?? global.ignorePaths ?? DEFAULT_FOLDER_POLICY.ignorePaths,
     noDrift: folder.noDrift ?? global.noDrift ?? DEFAULT_FOLDER_POLICY.noDrift,
     trash: {
       days: folder.trash?.days ?? global.trash?.days ?? DEFAULT_FOLDER_POLICY.trash.days,
@@ -313,6 +347,7 @@ export function snapshotPreCatalogPolicy(binding: WorkspaceConfig): FolderOption
     syncGit: binding.syncGit === true,
     git: { incremental: binding.git?.incremental === false ? false : true },
     respectGitignore: binding.respectGitignore === true,
+    ignorePaths: binding.ignorePaths ?? [],
     noDrift: binding.noDrift === true,
     trash: trashConfig(binding),
   };

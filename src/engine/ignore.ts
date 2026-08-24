@@ -313,6 +313,8 @@ export interface IgnoreMatcher {
 export interface BuildIgnoreMatcherOptions {
   /** Extra top-layer rules, kept for the existing test seam. */
   extra?: string[];
+  /** Machine-local, root-relative literal path prefixes from the folder config. */
+  ignorePaths?: string[];
   /** Opt-in design-72 file-sync behavior: nested `.gitignore` rules exclude only
    *  gitignored + untracked paths. */
   respectGitignore?: boolean;
@@ -373,10 +375,11 @@ type RuleDecision = { ignored: boolean; source: RuleSource };
 
 function matcherOptions(extraOrOptions: string[] | BuildIgnoreMatcherOptions): Required<BuildIgnoreMatcherOptions> {
   if (Array.isArray(extraOrOptions)) {
-    return { extra: extraOrOptions, respectGitignore: false, forceTrackedEvaluation: false, protectTrackedPaths: false, knownGitRepos: [] };
+    return { extra: extraOrOptions, ignorePaths: [], respectGitignore: false, forceTrackedEvaluation: false, protectTrackedPaths: false, knownGitRepos: [] };
   }
   return {
     extra: extraOrOptions.extra ?? [],
+    ignorePaths: extraOrOptions.ignorePaths ?? [],
     respectGitignore: extraOrOptions.respectGitignore === true,
     forceTrackedEvaluation: extraOrOptions.forceTrackedEvaluation === true,
     protectTrackedPaths: extraOrOptions.protectTrackedPaths === true,
@@ -391,7 +394,8 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
   if (rootGitignoreText) legacyIg.add(rootGitignoreText);
   const rootGitIg = ignore();
   if (rootGitignoreText) rootGitIg.add(rootGitignoreText);
-  const rboxLines = [...ruleLines(readIfExists(path.join(root, ".rboxignore"))), ...opts.extra];
+  const configLines = opts.ignorePaths.map(normalizeIgnorePath).filter((rule): rule is string => rule !== undefined);
+  const rboxLines = [...ruleLines(readIfExists(path.join(root, ".rboxignore"))), ...configLines, ...opts.extra];
   legacyIg.add(rboxLines);
   const rboxIg = ignore().add(rboxLines);
   const rboxNegations = negationInfos(rboxLines);
@@ -604,6 +608,16 @@ function ruleLines(text: string | undefined): string[] {
     .filter((l) => l && !l.startsWith("#"));
 }
 
+/** Validate one machine-local literal path prefix and return its anchored matcher rule. */
+export function normalizeIgnorePath(value: string): string | undefined {
+  if (value.length === 0 || value.trim() !== value) return undefined;
+  if (value.includes("\0") || value.includes("\n") || value.includes("\r") || value.includes("\\") || value.startsWith("/") || value.startsWith("~") || value.startsWith("!")) return undefined;
+  if (/[*?[\]{}]/.test(value)) return undefined;
+  const cleaned = value.endsWith("/") ? value.slice(0, -1) : value;
+  if (cleaned.length === 0 || cleaned.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) return undefined;
+  return `/${cleaned}`;
+}
+
 interface NegationInfo {
   slashless: boolean;
   staticPrefix?: string;
@@ -813,13 +827,13 @@ function writeTrackedCache(filePath: string, data: TrackedCacheFile): void {
 }
 
 export interface IgnoreRule {
-  source: "builtin" | ".gitignore" | ".rboxignore";
+  source: "builtin" | ".gitignore" | ".rboxignore" | "config";
   pattern: string;
 }
 
 /** The effective rule set in precedence order (later overrides earlier; a
  *  `.rboxignore` `!negation` can re-include a builtin/gitignore-excluded path). */
-export function effectiveIgnoreRules(root: string): IgnoreRule[] {
+export function effectiveIgnoreRules(root: string, ignorePaths: readonly string[] = []): IgnoreRule[] {
   const rules: IgnoreRule[] = BUILTIN_IGNORE.map((pattern) => ({ source: "builtin" as const, pattern }));
   const fromFile = (rel: string, source: IgnoreRule["source"]) => {
     const text = readIfExists(path.join(root, rel));
@@ -831,5 +845,9 @@ export function effectiveIgnoreRules(root: string): IgnoreRule[] {
   };
   fromFile(".gitignore", ".gitignore");
   fromFile(".rboxignore", ".rboxignore");
+  for (const value of ignorePaths) {
+    const pattern = normalizeIgnorePath(value);
+    if (pattern !== undefined) rules.push({ source: "config", pattern });
+  }
   return rules;
 }

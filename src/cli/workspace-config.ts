@@ -42,6 +42,9 @@ export interface WorkspaceConfig {
   /** Design 72 opt-in: when true, nested `.gitignore` rules exclude gitignored
    *  untracked files from the FILE layer. Existing workspaces default false. */
   respectGitignore?: boolean;
+  /** Machine-local path prefixes from the folder config. NEVER synced and never
+   *  used to drive `rbox ignore --purge` fleet-wide deletes. */
+  ignorePaths?: string[];
   /** Per-repo opt-out for dependency-drift nudges (design 29). When true, a sync
    *  that writes a changed lockfile into this tree prints no drift notice. */
   noDrift?: boolean;

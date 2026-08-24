@@ -51,10 +51,11 @@ export async function addIgnorePattern(root: string, pattern: string): Promise<v
 
 /** Print the ignore rule set, labeled by source and current activity, in precedence order. */
 export async function listIgnoreRules(root: string, opts: { full?: boolean } = {}): Promise<void> {
-  const respectGitignore = (await admittedPolicy(root)).respectGitignore;
-  const rules = effectiveIgnoreRules(root);
+  const policy = await admittedPolicy(root);
+  const respectGitignore = policy.respectGitignore;
+  const rules = effectiveIgnoreRules(root, policy.ignorePaths);
   console.log(`respectGitignore: ${respectGitignore ? "on" : "off"}`);
-  console.log(`ignore rules (precedence: builtin → .gitignore → .rboxignore):`);
+  console.log(`ignore rules (precedence: builtin → .gitignore → .rboxignore → config ignorePaths):`);
   const label = (source: (typeof rules)[number]["source"]): string => {
     if (source !== ".gitignore") return source;
     return respectGitignore ? ".gitignore ACTIVE" : ".gitignore present but NOT applied (respectGitignore off)";

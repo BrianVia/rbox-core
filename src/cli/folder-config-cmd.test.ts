@@ -5,7 +5,7 @@ import path from "node:path";
 import { bindingRegistryPath } from "./binding-registry.js";
 import { folderConfigCmd } from "./folder-config-cmd.js";
 import { parseFolderConfigJson, projectFolderConfigJson } from "./folder-config-json.js";
-import { inspectFolderCatalog, readFolderCatalog, serializeFolderCatalog } from "./folder-config.js";
+import { inspectFolderCatalog, readFolderCatalog, serializeFolderCatalog, type FolderOptions } from "./folder-config.js";
 import { listFolderInventory } from "./folder-inventory.js";
 import { folderCatalogPath } from "./rbox-paths.js";
 import type { WorkspaceConfig } from "./workspace-config.js";
@@ -48,7 +48,7 @@ async function writeBinding(root: string, value = binding(root)): Promise<void> 
   await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify(value));
 }
 
-async function writeCatalog(folders: Array<{ name: string; path: string }> = []): Promise<void> {
+async function writeCatalog(folders: Array<{ name: string; path: string; options?: FolderOptions }> = []): Promise<void> {
   await fs.mkdir(path.dirname(folderCatalogPath()), { recursive: true });
   await fs.writeFile(folderCatalogPath(), serializeFolderCatalog({
     schemaVersion: 1,
@@ -74,11 +74,13 @@ test("human and JSON views project every inventory row without using machine tri
   const bound = path.join(scratch, "bound");
   const missing = path.join(scratch, "missing");
   await writeBinding(bound);
-  await writeCatalog([{ name: "Bound", path: bound }, { name: "Missing", path: missing }]);
+  await writeCatalog([{ name: "Bound", path: bound, options: { ignorePaths: ["a", "b/c"] } }, { name: "Missing", path: missing }]);
   const lines: string[] = [];
   await folderConfigCmd([], { json: false, yes: false }, { write: (line) => lines.push(line) });
   expect(lines.join("\n")).toContain(folderCatalogPath());
   expect(lines.join("\n")).toContain("global defaults: syncGit=false");
+  expect(lines.join("\n")).toContain("ignorePaths=none");
+  expect(lines.join("\n")).toContain("ignorePaths=a b/c");
   expect(lines.join("\n")).toContain("Bound");
   expect(lines.join("\n")).toContain("Missing");
   expect(lines.join("\n")).toContain("missing: the folder does not exist");
@@ -91,7 +93,7 @@ test("human and JSON views project every inventory row without using machine tri
     schemaVersion: 1,
     catalogPath: folderCatalogPath(),
     folders: [
-      { path: bound, name: "Bound", status: "admitted" },
+      { path: bound, name: "Bound", status: "admitted", options: { ignorePaths: ["a", "b/c"] }, effectiveOptions: { ignorePaths: ["a", "b/c"] } },
       { path: missing, name: "Missing", status: "missing" },
     ],
   });

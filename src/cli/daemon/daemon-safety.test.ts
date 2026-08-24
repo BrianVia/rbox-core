@@ -312,7 +312,7 @@ test("direct fresh-state refusal precedes folder authority and every daemon side
   }
 });
 
-function writeFolderCatalog(root: string, respectGitignore: boolean): string {
+function writeFolderCatalog(root: string, respectGitignore: boolean, ignorePaths: string[] = []): string {
   const file = folderCatalogPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({
@@ -324,7 +324,7 @@ function writeFolderCatalog(root: string, respectGitignore: boolean): string {
       noDrift: false,
       trash: { days: 30, maxBytes: 2147483648 },
     },
-    folders: [{ name: "Safety", path: root, options: { respectGitignore } }],
+    folders: [{ name: "Safety", path: root, options: { respectGitignore, ignorePaths } }],
   }, null, respectGitignore ? 2 : 0));
   return file;
 }
@@ -523,6 +523,11 @@ test("design 72: safety tick reloads workspace.json and rebuilds the matcher", a
     await daemon.reloadWorkspaceConfigIfChanged();
     expect(daemon.cfg.respectGitignore).toBe(true);
     expect(daemon.matcher.ignores("pkg/ignored.txt")).toBe(true);
+
+    writeFolderCatalog(root, true, ["machine-only"]);
+    await daemon.reloadWorkspaceConfigIfChanged();
+    expect(daemon.cfg.ignorePaths).toEqual(["machine-only"]);
+    expect(daemon.matcher.ignores("machine-only/file.txt")).toBe(true);
   } finally {
     fs.rmSync(folderCatalogPath(), { force: true });
     fs.rmSync(root, { recursive: true, force: true });

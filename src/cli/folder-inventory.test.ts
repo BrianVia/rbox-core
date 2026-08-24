@@ -223,10 +223,12 @@ test("folder policy overlays only safe fields and preserves runtime attachments"
     syncGit: true,
     git: { incremental: true, runtimeSentinel: "keep" },
   } as WorkspaceConfig & { git: { incremental?: boolean; runtimeSentinel: string } };
+  const ignorePaths = ["local-only"];
   const result = applyFolderPolicy(cfg, {
     syncGit: false,
     git: { incremental: false },
     respectGitignore: true,
+    ignorePaths,
     noDrift: true,
     trash: { days: 0, maxBytes: 0 },
   }) as typeof cfg;
@@ -235,6 +237,7 @@ test("folder policy overlays only safe fields and preserves runtime attachments"
     syncGit: false,
     git: { incremental: false, runtimeSentinel: "keep" },
     respectGitignore: true,
+    ignorePaths: ["local-only"],
     noDrift: true,
     trash: { days: 0, maxBytes: 0 },
     encrypted: true,
@@ -245,6 +248,11 @@ test("folder policy overlays only safe fields and preserves runtime attachments"
     keyEpoch: 9,
   });
   expect(result.kek).toBe(kek);
+  // The overlay must COPY the policy's list: the resolved policy can hand over the
+  // frozen DEFAULT_FOLDER_POLICY array, and an aliased cfg field would let a later
+  // mutation reach every other binding resolved from that same default.
+  expect(result.ignorePaths).not.toBe(ignorePaths);
   expect(cfg.git.incremental).toBe(true);
   expect(cfg.respectGitignore).toBeUndefined();
+  expect(cfg.ignorePaths).toBeUndefined();
 });

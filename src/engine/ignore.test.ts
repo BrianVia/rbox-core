@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BUILTIN_IGNORE, buildIgnoreMatcher, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneCoverageComplete, nativePruneGlobs } from "./ignore.js";
+import { BUILTIN_IGNORE, buildIgnoreMatcher, effectiveIgnoreRules, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneCoverageComplete, nativePruneGlobs, normalizeIgnorePath } from "./ignore.js";
 import { applyWatchEvents, scanManifest } from "./manifest.js";
 
 const exec = promisify(execFile);
@@ -78,6 +78,42 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
     expect(m.ignores(".git/config")).toBe(true);
     expect(m.ignores("wt/.git")).toBe(true);
     expect(m.ignores("repo/.git/HEAD")).toBe(true);
+  });
+});
+
+describe("machine-local ignorePaths", () => {
+  test("normalizes only literal workspace-relative prefixes", () => {
+    for (const value of ["", " x", "x ", "a//b", "a/./b", "a/../b", "/x", "~x", "!x", "x*", "x?", "x[y]", "x{y}", "a\\b", "a\0b", "a\nb", "a\rb"]) {
+      expect(normalizeIgnorePath(value)).toBeUndefined();
+    }
+    expect(normalizeIgnorePath("dir/" )).toBe("/dir");
+    expect(normalizeIgnorePath("notes/big.bin")).toBe("/notes/big.bin");
+  });
+
+  test("adds anchored directory and file rules after .rboxignore", async () => {
+    const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-config-ignore-"));
+    try {
+      await fs.writeFile(path.join(d, ".rboxignore"), "!chromium\n");
+      const matcher = buildIgnoreMatcher(d, { ignorePaths: ["chromium", "notes/big.bin"] });
+      expect(matcher.ignores("chromium/")).toBe(true);
+      expect(matcher.ignores("chromium/a/b.txt")).toBe(true);
+      expect(matcher.prunes?.("chromium")).toBe(true);
+      expect(matcher.ignores("chromium-other/x")).toBe(false);
+      expect(matcher.ignores("src/chromium/x")).toBe(false);
+      expect(matcher.ignores("notes/big.bin")).toBe(true);
+      expect(matcher.ignores("notes/small.bin")).toBe(false);
+      expect(matcher.ignores(".rbox/state.json")).toBe(true);
+      expect(nativePruneCoverageComplete(d, nativePruneGlobs(d), matcher)).toBe(true);
+      expect(effectiveIgnoreRules(d, ["chromium"]).at(-1)).toEqual({ source: "config", pattern: "/chromium" });
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("skips malformed entries while keeping valid siblings", () => {
+    const matcher = buildIgnoreMatcher(root, { ignorePaths: ["../escape", "/abs", "!neg", "glob*", "a/./b", "", "keep"] });
+    expect(matcher.ignores("keep/x")).toBe(true);
+    for (const candidate of ["escape/x", "abs/x", "neg/x", "glob-one", "a/b"]) expect(matcher.ignores(candidate)).toBe(false);
   });
 });
 

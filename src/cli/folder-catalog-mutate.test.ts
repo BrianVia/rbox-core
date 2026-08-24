@@ -80,17 +80,20 @@ test("set options patches nested fields and own-key undefined deletes for inheri
     syncGit: undefined,
     git: { incremental: undefined },
     respectGitignore: true,
+    ignorePaths: [],
     trash: { days: undefined, maxBytes: 0 },
   }, mutationOptions);
   expect(policy).toEqual({
     syncGit: false,
     git: { incremental: false },
     respectGitignore: true,
+    ignorePaths: [],
     noDrift: false,
     trash: { days: 20, maxBytes: 0 },
   });
   expect((await readFolderCatalog()).catalog.folders[0]?.options).toEqual({
     respectGitignore: true,
+    ignorePaths: [],
     trash: { maxBytes: 0 },
   });
 });

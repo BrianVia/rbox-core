@@ -41,6 +41,7 @@ function policyLine(policy: ReturnType<typeof resolveFolderPolicy>): string {
     `syncGit=${policy.syncGit}`,
     `git.incremental=${policy.git.incremental}`,
     `respectGitignore=${policy.respectGitignore}`,
+    `ignorePaths=${policy.ignorePaths.length === 0 ? "none" : policy.ignorePaths.join(" ")}`,
     `noDrift=${policy.noDrift}`,
     `trash.days=${policy.trash.days}`,
     `trash.maxBytes=${policy.trash.maxBytes}`,
@@ -63,6 +64,7 @@ export function renderFolderConfig(
     const detail = row.admission.kind === "admitted" ? "admitted" : `${row.admission.kind}: ${row.admission.reason}`;
     lines.push(`${row.admission.kind === "admitted" ? style.sym.ok : style.sym.warn} ${style.bold(label)} ${style.dim(row.root)}`);
     lines.push(`    ${detail}`);
+    if (row.catalog !== undefined) lines.push(`    ${policyLine(row.catalog.policy)}`);
     if (row.overlap) lines.push(`    overlap: ${row.overlap.kind} of ${row.overlap.of}`);
   }
   return lines;

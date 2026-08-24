@@ -25,6 +25,7 @@ class TrustHarness {
   readonly contaminations: Array<{ watcherHealthy: false; trustState?: "trusted" | "suspect" | "fused" }> = [];
   readonly calls = { fuse: 0, fatal: 0, status: 0, floor: 0 };
   watcher: { backend: "parcel" | "chokidar" } | undefined = { backend: "parcel" };
+  ignorePaths: string[] = [];
   now = 0;
   readonly trust: WatcherTrust;
 
@@ -32,6 +33,7 @@ class TrustHarness {
     const port: WatcherTrustPort = {
       watcher: () => this.watcher,
       respectGitignore: () => false,
+      ignorePaths: () => this.ignorePaths,
       knownGitRepos: () => [],
       externalLocalWorkSettled: () => true,
       fuseSession: () => { this.calls.fuse++; },
@@ -52,6 +54,18 @@ class TrustHarness {
     fs.rmSync(this.root, { recursive: true, force: true });
   }
 }
+
+test("machine-local ignore changes the watcher authority fingerprint", () => {
+  const harness = new TrustHarness();
+  try {
+    const before = harness.trust.armCertification(buildIgnoreMatcher(harness.root));
+    harness.ignorePaths = ["machine-only"];
+    const after = harness.trust.armCertification(buildIgnoreMatcher(harness.root, { ignorePaths: harness.ignorePaths }));
+    expect(after.authorityFingerprint).not.toBe(before.authorityFingerprint);
+  } finally {
+    harness.close();
+  }
+});
 
 test("episode fuse and suspect re-trust use the injected monotonic clock", () => {
   const burst = new TrustHarness();

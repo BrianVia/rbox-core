@@ -26,7 +26,7 @@ export default defineFlow({
       exec: ["ignore", "--list"],
       assertStdout: [
         /^respectGitignore:\s+on$/m,
-        /^ignore rules \(precedence: builtin → \.gitignore → \.rboxignore\):$/m,
+        /^ignore rules \(precedence: builtin → \.gitignore → \.rboxignore → config ignorePaths\):$/m,
         /^\s+\[\.gitignore ACTIVE\]\s+node_modules\/$/m,
       ],
     },

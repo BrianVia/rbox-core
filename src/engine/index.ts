@@ -47,6 +47,7 @@ export {
   isGitRefSignalTail,
   nativePruneGlobs,
   nativePruneCoverageComplete,
+  normalizeIgnorePath,
   buildIgnoreMatcher,
   effectiveIgnoreRules,
   isIgnoreRuleFile,
