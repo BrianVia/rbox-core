@@ -18,7 +18,7 @@ import { readBasePresentArtifact } from "./base-artifacts.js";
 import { type CheckoutCapabilityProbe, type CommitCheckoutOptions } from "./checkout-txn.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "./config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "./config-txn.js";
-import { addTimedMs } from "./chain-timings.js";
+import { addFollowTimedMs, addTimedMs } from "./chain-timings.js";
 import { readAllRefs, readAllRefsStrict } from "./refs.js";
 import { readHead, warnOnce } from "./git-state.js";
 import { git } from "../../engine/git-spawn.js";
@@ -1037,7 +1037,7 @@ opts: {
         if (transition.publishJournal) publishedJournals.push(rel);
       };
       const classificationWorktreeRegistryDigest = await readWorktreeRegistryDigest(repoDir);
-      const follow = await runMutation(repoDir, () => followDivergedRepo({
+      const follow = await addFollowTimedMs(chainTimings, () => runMutation(repoDir, () => followDivergedRepo({
         workspaceRoot: root,
         relPath: rel,
         ctx,
@@ -1090,7 +1090,7 @@ opts: {
               : classification.blockers,
           });
         },
-      }));
+      })));
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") {
         clearAttempt(rel);

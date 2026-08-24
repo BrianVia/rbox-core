@@ -88,6 +88,7 @@ const GIT_CHAIN_TIMING_FIELDS = {
   classifyExclusiveMs: { abbr: "cx", label: "classifyExclusiveMs" },
   heldInputMs: { abbr: "hi", label: "heldInputMs" },
   standingProofMs: { abbr: "sp", label: "standingProofMs" },
+  followMs: { abbr: "fw", label: "followMs" },
   classifyMs: { abbr: "cl", label: "classifyMs" },
   residualMs: { abbr: "rs", label: "residualMs" },
 } as const satisfies Record<keyof GitChainTimings, { abbr: string; label: string }>;

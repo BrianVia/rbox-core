@@ -3086,7 +3086,10 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
   const leafSum = chain.fetchDecryptMs + chain.bundleVerifyMs + chain.gitImportMs
     + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
     + chain.connectivityProofMs + chain.indexOpStateMs + chain.journalMs
-    + chain.classifyExclusiveMs + chain.heldInputMs + chain.standingProofMs;
+    + chain.classifyExclusiveMs + chain.heldInputMs + chain.standingProofMs
+    // #814: the full follow's own cost is a named term, not residual.
+    + chain.followMs;
+  expect(chain.followMs).toBeGreaterThan(0);
   expect(chain.classifyMs).toBeGreaterThan(0);
   expect(chain.classifyExclusiveMs).toBeGreaterThan(0);
   expect(chain.heldInputMs).toBeGreaterThan(0);
