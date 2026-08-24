@@ -73,6 +73,21 @@ export function connectivityHoldAllowsSkip(blocker: TypedBlocker): boolean {
   return blocker.provenance === "boundary" && blocker.code === "connectivity-unproven";
 }
 
+/**
+ * The one eligibility line. Every reason listed here has its evidence INSIDE
+ * the attempt's `gitFingerprint` bracket, so the user resolving it voids the
+ * attempt and forces a full follow on the very next pull.
+ *
+ * `local-edits` is absent for exactly that reason and its absence is load
+ * bearing: the fingerprint covers Git metadata, never tracked working-tree
+ * bytes, so rewriting an edited file back to the incoming bytes changes
+ * nothing this predicate can see and the repo would carry its pending lane
+ * until the one-hour safety floor forced a re-follow. Design 176 §4 v5 ruled
+ * it out, #641 added it unaudited, and design 241 removed it again against a
+ * red rig scenario and an FM field twin. Re-admitting it is a product call
+ * about convergence latency (issue #814), not a perf cleanup — it needs a
+ * working-tree witness the cheap Git-only key does not have.
+ */
 export function heldBlockersAllowSkip(
   blockers: readonly TypedBlocker[],
   env: NodeJS.ProcessEnv = process.env,

@@ -19,6 +19,12 @@ export interface GitChainTimings {
   heldInputMs: number;
   /** Standing branch-artifact proof and settlement. */
   standingProofMs: number;
+  /** Full-follow wall time after subtracting every named leaf accrued inside
+   * it. `followDivergedRepo` is the parent of nearly every leaf above, so a
+   * gross bucket would double-count; this is `classifyExclusiveMs`'s
+   * discipline generalized to the whole leaf set. Without it the follow's own
+   * unattributed cost is indistinguishable from cost outside the follow. */
+  followMs: number;
   residualMs: number;
 }
 
@@ -38,12 +44,24 @@ export function zeroGitChainTimings(): GitChainTimings {
     classifyExclusiveMs: 0,
     heldInputMs: 0,
     standingProofMs: 0,
+    followMs: 0,
     residualMs: 0,
   };
 }
 
 type GitTimedField = Exclude<keyof GitChainTimings,
-  "chainLength" | "classifyMs" | "classifyExclusiveMs" | "residualMs">;
+  "chainLength" | "classifyMs" | "classifyExclusiveMs" | "followMs" | "residualMs">;
+
+/** The exclusive leaf partition, in one place: what `residualMs` closes
+ * against, and what an exclusive parent bucket must subtract. */
+const LEAF_FIELDS = [
+  "fetchDecryptMs", "bundleVerifyMs", "gitImportMs", "refTxnExclusiveMs",
+  "ownershipMs", "reflogMs", "connectivityProofMs", "indexOpStateMs",
+  "journalMs", "classifyExclusiveMs", "heldInputMs", "standingProofMs",
+] as const satisfies ReadonlyArray<keyof GitChainTimings>;
+
+const leafMs = (timings: GitChainTimings): number =>
+  LEAF_FIELDS.reduce((sum, field) => sum + timings[field], 0);
 
 export async function addTimedMs<T>(timings: GitChainTimings | undefined, field: GitTimedField, fn: () => T | Promise<T>): Promise<T> {
   if (!timings) return fn();
@@ -73,11 +91,22 @@ export async function addClassifyTimedMs<T>(timings: GitChainTimings | undefined
   }
 }
 
+/** Bill the full follow's own cost — everything it spends outside the named
+ * leaves it parents. Design 573/814: without this the dominant term of a
+ * held-repo pull lands in `residualMs` and the phase report cannot name it. */
+export async function addFollowTimedMs<T>(timings: GitChainTimings | undefined, fn: () => T | Promise<T>): Promise<T> {
+  if (!timings) return fn();
+  const t0 = performance.now();
+  const leavesBefore = leafMs(timings);
+  try {
+    return await fn();
+  } finally {
+    const elapsed = performance.now() - t0;
+    timings.followMs += Math.max(0, elapsed - (leafMs(timings) - leavesBefore));
+  }
+}
+
 /** Close the explicit residual against the exact per-repo wall interval. */
 export function finalizeGitChainTimings(timings: GitChainTimings, repoWallMs: number): void {
-  const attributed = timings.fetchDecryptMs + timings.bundleVerifyMs + timings.gitImportMs
-    + timings.refTxnExclusiveMs + timings.ownershipMs + timings.reflogMs
-    + timings.connectivityProofMs + timings.indexOpStateMs + timings.journalMs
-    + timings.classifyExclusiveMs + timings.heldInputMs + timings.standingProofMs;
-  timings.residualMs = Math.max(0, repoWallMs - attributed);
+  timings.residualMs = Math.max(0, repoWallMs - leafMs(timings) - timings.followMs);
 }

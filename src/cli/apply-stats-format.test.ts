@@ -84,12 +84,13 @@ test("git metrics preserve the complete legacy timing line byte-for-byte", () =>
       classifyExclusiveMs: 100.4,
       heldInputMs: 110.5,
       standingProofMs: 120.6,
+      followMs: 125.4,
       classifyMs: 130.7,
       residualMs: 140.8,
     },
   }], { applied: 1 }));
 
-  expect(detail).toBe("mode=steady repos=1 commonDirs=0 skippedHeld=0 results=applied=1 queueMs p50=4 p95=4 max=4 wallMs p50=999 p95=999 max=999 fetchDecryptMs p50=10 p95=10 max=10 bundleVerifyMs p50=21 p95=21 max=21 gitImportMs p50=31 p95=31 max=31 indexOpStateMs p50=41 p95=41 max=41 journalMs p50=51 p95=51 max=51 refTxnExclusiveMs p50=61 p95=61 max=61 ownershipMs p50=70 p95=70 max=70 reflogMs p50=80 p95=80 max=80 connectivityProofMs p50=90 p95=90 max=90 classifyExclusiveMs p50=100 p95=100 max=100 heldInputMs p50=111 p95=111 max=111 standingProofMs p50=121 p95=121 max=121 classifyMs p50=131 p95=131 max=131 residualMs p50=141 p95=141 max=141 repoMs=i2q4w999ag1 L3fd10bv21gi31io41jr51rt61ow70rl80cp90cx100hi111sp121cl131rs141");
+  expect(detail).toBe("mode=steady repos=1 commonDirs=0 skippedHeld=0 results=applied=1 queueMs p50=4 p95=4 max=4 wallMs p50=999 p95=999 max=999 fetchDecryptMs p50=10 p95=10 max=10 bundleVerifyMs p50=21 p95=21 max=21 gitImportMs p50=31 p95=31 max=31 indexOpStateMs p50=41 p95=41 max=41 journalMs p50=51 p95=51 max=51 refTxnExclusiveMs p50=61 p95=61 max=61 ownershipMs p50=70 p95=70 max=70 reflogMs p50=80 p95=80 max=80 connectivityProofMs p50=90 p95=90 max=90 classifyExclusiveMs p50=100 p95=100 max=100 heldInputMs p50=111 p95=111 max=111 standingProofMs p50=121 p95=121 max=121 followMs p50=125 p95=125 max=125 classifyMs p50=131 p95=131 max=131 residualMs p50=141 p95=141 max=141 repoMs=i2q4w999ag1 L3fd10bv21gi31io41jr51rt61ow70rl80cp90cx100hi111sp121fw125cl131rs141");
 });
 
 test("residual timing alone does not make an unmeasured chain present", () => {
@@ -147,7 +148,7 @@ test("git metrics preserve legacy non-finite distribution bytes", () => {
     },
   }], { unchanged: 1 }));
 
-  expect(detail).toBe("mode=steady repos=1 commonDirs=0 skippedHeld=0 results=unchanged=1 queueMs p50=0 p95=0 max=0 wallMs p50=0 p95=0 max=0 fetchDecryptMs p50=NaN p95=NaN max=NaN bundleVerifyMs p50=Infinity p95=Infinity max=Infinity gitImportMs p50=-Infinity p95=-Infinity max=-Infinity indexOpStateMs p50=NaN p95=NaN max=NaN journalMs p50=0 p95=0 max=0 refTxnExclusiveMs p50=0 p95=0 max=0 ownershipMs p50=0 p95=0 max=0 reflogMs p50=0 p95=0 max=0 connectivityProofMs p50=0 p95=0 max=0 classifyExclusiveMs p50=0 p95=0 max=0 heldInputMs p50=0 p95=0 max=0 standingProofMs p50=0 p95=0 max=0 classifyMs p50=0 p95=0 max=0 residualMs p50=0 p95=0 max=0 repoMs=i0q0w0u L1fd0bv0gi0io0jr0rt0ow0rl0cp0cx0hi0sp0cl0rs0");
+  expect(detail).toBe("mode=steady repos=1 commonDirs=0 skippedHeld=0 results=unchanged=1 queueMs p50=0 p95=0 max=0 wallMs p50=0 p95=0 max=0 fetchDecryptMs p50=NaN p95=NaN max=NaN bundleVerifyMs p50=Infinity p95=Infinity max=Infinity gitImportMs p50=-Infinity p95=-Infinity max=-Infinity indexOpStateMs p50=NaN p95=NaN max=NaN journalMs p50=0 p95=0 max=0 refTxnExclusiveMs p50=0 p95=0 max=0 ownershipMs p50=0 p95=0 max=0 reflogMs p50=0 p95=0 max=0 connectivityProofMs p50=0 p95=0 max=0 classifyExclusiveMs p50=0 p95=0 max=0 heldInputMs p50=0 p95=0 max=0 standingProofMs p50=0 p95=0 max=0 followMs p50=0 p95=0 max=0 classifyMs p50=0 p95=0 max=0 residualMs p50=0 p95=0 max=0 repoMs=i0q0w0u L1fd0bv0gi0io0jr0rt0ow0rl0cp0cx0hi0sp0fw0cl0rs0");
 });
 
 test("git metrics select at most eight deterministic deduplicated exemplars", () => {
