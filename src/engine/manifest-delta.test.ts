@@ -69,6 +69,48 @@ describe("manifest delta envelope", () => {
     }
   });
 
+  test("baseValidated skips the base's shape pass and NOTHING else (#816)", async () => {
+    // A base the push seam has already validated this cycle must not be walked
+    // again. An INVALID base makes that observable exactly: the default arm
+    // rejects it, the opted-in arm never looks — which is the skip, proved
+    // without counting calls or timing anything.
+    const target = manifest("new", [entry("a", 3)]);
+    const invalidBase = { generatedAt: "old", files: [entry("a"), entry("a")] } as Manifest;
+    const baseManifestHash = await canonicalManifestHash(invalidBase);
+    const options = { baseEncSha: SHA_A, baseManifestHash, compress: false };
+
+    await expect(encodeDeltaEnvelope(invalidBase, target, options)).rejects.toThrow();
+    await expect(encodeDeltaEnvelope(invalidBase, target, { ...options, baseValidated: false })).rejects.toThrow();
+    const skipped = await encodeDeltaEnvelope(invalidBase, target, { ...options, baseValidated: true });
+    expect(skipped.opCount).toBe(1);
+
+    // The TARGET's pass is never optional — a caller can only vouch for a base
+    // it reconstructed, never for the manifest it is about to publish.
+    const invalidTarget = { generatedAt: "new", files: [entry("a"), entry("a")] } as Manifest;
+    await expect(encodeDeltaEnvelope(manifest("old", [entry("a")]), invalidTarget, { ...options, baseValidated: true }))
+      .rejects.toThrow();
+  });
+
+  test("the validated and unvalidated arms produce byte-identical envelopes (#816)", async () => {
+    // The differential: same inputs, both paths, nothing about the wire moves.
+    const base = manifest("old", [entry("a"), entry("gone", 2), entry("kept", 5)]);
+    const target: Manifest = {
+      ...manifest("new", [entry("a", 3), entry("new", 4), entry("kept", 5)]),
+      manifestSchema: KNOWN_MANIFEST_SCHEMA,
+      gitRepos: { repo: MINIMAL_GIT_SECTION },
+    };
+    const baseManifestHash = await canonicalManifestHash(base);
+    for (const compress of [false, true]) {
+      const options = { baseEncSha: SHA_A, baseManifestHash, compress };
+      const validated = await encodeDeltaEnvelope(base, target, { ...options, baseValidated: true });
+      const plain = await encodeDeltaEnvelope(base, target, options);
+      expect(validated).toEqual(plain);
+      const decoded = await decodeEnvelope(validated.bytes);
+      if (decoded.kind !== "delta") throw new Error("expected delta");
+      expect(foldDelta(base, decoded.ops, decoded.header)).toEqual(target);
+    }
+  });
+
   test("fails closed on unknown version, truncation, and body mismatch", async () => {
     await expect(decodeEnvelope(utf8.encode("rbox-mde2\n{}\n"))).rejects.toThrow("manifest envelope version not supported — upgrade rbox");
     await expect(decodeEnvelope(utf8.encode(MANIFEST_ENVELOPE_MAGIC))).rejects.toThrow();

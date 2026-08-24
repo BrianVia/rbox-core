@@ -365,10 +365,10 @@ export async function encodeSnapshotEnvelope(manifest: Manifest, options: { comp
 export async function encodeDeltaEnvelope(
   base: Manifest,
   target: Manifest,
-  options: { baseEncSha: string; baseManifestHash: string; compress: boolean }
+  options: { baseEncSha: string; baseManifestHash: string; compress: boolean; baseValidated?: boolean }
 ): Promise<{ bytes: Uint8Array; resultHash: string; opCount: number; uncompressedBodyBytes: number }> {
   if (!SHA_RE.test(options.baseEncSha) || !SHA_RE.test(options.baseManifestHash)) throw new Error("delta base hash malformed");
-  assertManifest(base);
+  if (!options.baseValidated) assertManifest(base); // #816: the push seam shape-checked this base moments ago; default still validates.
   assertManifest(target);
   const ops = diffToOps(base, target);
   const body = utf8(canonicalJson(ops));

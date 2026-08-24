@@ -59,8 +59,11 @@ export class CommitRejectedError extends Error {
 export interface CommitOptions {
   blockedFingerprint?: string;
   onCommitTimings?: (timings: CommitTimings) => void;
-  /** Applied manifest + its verified wire identity; only sync.ts may select this base. */
-  deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
+  /** Applied manifest + its verified wire identity; only sync.ts may select this base.
+   *  `validated` is that seam's assertion that it has ALREADY established this
+   *  manifest's shape this cycle (#816) — the writer then skips its own O(N)
+   *  re-validation of the base. Absent, the writer validates as it always has. */
+  deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta; validated?: true };
   /** Design 204 §7: why the push seam withheld `deltaBase`, so the writer can log
    *  the TRUE non-delta cause. Only the push seam can tell "there was no usable
    *  persisted meta" (`no-base`) from "the meta failed the base-hash binding"
