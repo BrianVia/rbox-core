@@ -101,7 +101,7 @@ jobs:
     name: "RboxBar · swift build + test (release toolchain)"
     needs: changes
     if: needs.changes.outputs.run_rboxbar == 'true'
-    runs-on: macos-14
+    runs-on: namespace-profile-rbox-core
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -492,7 +492,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            os: macos-14
+            os: namespace-profile-rbox-core
           - target: linux-x64
             os: ubuntu-24.04
           - target: linux-arm64
@@ -534,7 +534,7 @@ jobs:
   compiled-tui-performance:
     name: "compiled TUI · startup/size budget"
     needs: compiled-tui-build
-    runs-on: macos-14
+    runs-on: namespace-profile-rbox-core
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
