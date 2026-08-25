@@ -129,7 +129,7 @@ function branchProtocol(logicalBaseRefs: Record<string, string>): FollowerBranch
   };
 }
 
-async function offHeadManualCheckout(beforeBaseOid: string | null) {
+async function offHeadManualCheckout(beforeBaseOid: string | null, extraSideBranch = false) {
   const base = await git("rev-parse", "HEAD");
   await fs.writeFile(path.join(repo, "tracked.txt"), "candidate\n");
   await git("add", "tracked.txt");
@@ -138,6 +138,7 @@ async function offHeadManualCheckout(beforeBaseOid: string | null) {
   const currentRef = "refs/heads/side";
   const incomingRef = "refs/heads/main";
   await git("branch", "side");
+  if (extraSideBranch) await git("branch", "extra");
   await git("checkout", "-q", "side");
   let intendedProgress: FollowProgress | undefined;
   const intended = { record: {}, expectedRepoGen: 0, relPath: "repo" } as FollowIntended;
@@ -173,14 +174,14 @@ async function offHeadManualCheckout(beforeBaseOid: string | null) {
     effectiveRefs(opts.ctx, opts.incoming),
     incomingRef,
   );
-  await transaction.publishIndependentRefs(input, live.indexProjection);
+  const publication = await transaction.publishIndependentRefs(input, live.indexProjection);
   const first: CheckoutClassification = {
     safe: true,
     breadcrumbMismatches: [],
     breadcrumbWaived: false,
     blockers: [],
   };
-  return { base, baseProjection: live.indexProjection, candidate, currentRef, input, first, intendedProgress: () => intendedProgress, opts, roots, transaction };
+  return { base, baseProjection: live.indexProjection, candidate, currentRef, input, first, intendedProgress: () => intendedProgress, opts, publication, roots, transaction };
 }
 
 test("publication burns prepared-old authority before its first await", async () => {
@@ -335,6 +336,21 @@ test("manual current-ref no-op carries a null record BASE predecessor", async ()
     beforeBaseOid: null,
     afterOid: setup.candidate,
   });
+});
+
+test("publication mints a null-base terminal for a side branch already at the candidate (F6)", async () => {
+  const setup = await offHeadManualCheckout(null, true);
+
+  expect(setup.publication.manualBranchTerminals?.["refs/heads/extra"]).toEqual({
+    beforeBaseOid: null,
+    afterOid: setup.candidate,
+  });
+  expect(setup.publication.heldRefs["refs/heads/extra"]).toBeUndefined();
+
+  const result = await setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  });
+  expect(result.status).toBe("committed");
 });
 
 test("manual unborn current ref builds a null-before install plan", async () => {

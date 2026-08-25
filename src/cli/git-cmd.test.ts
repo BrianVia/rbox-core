@@ -1429,14 +1429,39 @@ test("the two makeIntended error classes classify into their own resolve codes",
   }
 });
 
-test("take-theirs names a stale-BASE side-ref hold before writing a checkout journal", async () => {
+test("take-theirs completes a null-base side ref already at the candidate (F6)", async () => {
+  await fixture();
+  {
+    const state = await loadState(root, syncStreamId(cfg));
+    const record = repoRecordsForState(state).repo!;
+    const equalRef = "refs/heads/genesis-equal";
+    const candidate = record.pending!.refs["refs/heads/main"]!;
+    await git(receiver, "fetch", "-q", sender, candidate);
+    await git(receiver, "update-ref", equalRef, candidate);
+    await saveStateUnsafeLegacyOrTest(root, {
+      ...state,
+      repoRecords: {
+        ...state.repoRecords,
+        repo: { ...record, pending: { ...record.pending!, refs: { ...record.pending!.refs, [equalRef]: candidate } } },
+      },
+    });
+    const current = await show([]);
+    const lines: string[] = [];
+
+    expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(0);
+    expect(JSON.parse(lines.at(-1)!).status).toBe("resolved");
+    expect(await git(receiver, "rev-parse", equalRef)).toBe(candidate);
+  }
+});
+
+test("take-theirs adopts the incoming value for a genuinely diverged side ref (local value quarantined)", async () => {
   await fixture();
   const state = await loadState(root, syncStreamId(cfg));
   const record = repoRecordsForState(state).repo!;
   const staleRef = "refs/heads/stale";
   const candidate = record.pending!.refs["refs/heads/main"]!;
-  await git(receiver, "fetch", "-q", sender, candidate);
-  await git(receiver, "update-ref", staleRef, candidate);
+  const divergent = await git(receiver, "rev-parse", "HEAD");
+  await git(receiver, "update-ref", staleRef, divergent);
   await saveStateUnsafeLegacyOrTest(root, {
     ...state,
     repoRecords: {
@@ -1447,13 +1472,12 @@ test("take-theirs names a stale-BASE side-ref hold before writing a checkout jou
   const current = await show([]);
   const lines: string[] = [];
 
-  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(1);
-
-  expect(JSON.parse(lines.at(-1)!)).toEqual({
-    status: "refused", verb: "take-theirs", repo: "repo", code: "manual-base-proof",
-    message: `rbox could not prove branch ${staleRef} safe to adopt (missing-branch-proof); it already shared this repo's other branches, but did not touch ${staleRef} or your files — reconcile ${staleRef} with git, then retry`,
-  });
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(0);
+  expect(JSON.parse(lines.at(-1)!).status).toBe("resolved");
+  // take-theirs' promise: theirs wins, mine is set aside — the consented
+  // adoption rewrites the diverged ref; the local value rides the quarantine.
   expect(await git(receiver, "rev-parse", staleRef)).toBe(candidate);
+  expect(divergent).not.toBe(candidate);
   expect(await fs.readFile(path.join(receiver, "tracked.txt"), "utf8")).toBe("local\n");
   await expect(fs.access(checkoutJournalDir(root, "repo"))).rejects.toThrow();
 });

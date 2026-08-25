@@ -1,6 +1,6 @@
 # 285 — manual resolve: every changed ref gets a decision (fix #829)
 
-**Status:** v4 — codex round 2 amendments folded · **Blocks:** the v2.0.0 tag (founder
+**Status:** v5 — F6 added from field acceptance (FM dynomite named its real blockers) · **Blocks:** the v2.0.0 tag (founder
 ruling 2026-08-25) · **Issue:** #829
 
 ## Problem
@@ -131,6 +131,24 @@ must come from the same base view the composer validates
 (`record.base` as surfaced to the transaction as `logicalBefore`) — never
 from `branchProtocol.logicalBaseRefs` — so a divergence between the two
 records cannot turn every terminal into a `manual-proof-mismatch` hold.
+
+### F6 — null-base side refs at publication (field-driven, same proof shape as F2a)
+
+Field acceptance on FM dynomite (fixed binary) refused honestly, naming
+its true blockers: four side branches whose live tips are byte-identical
+on both machines but whose base predecessors are null (crossover
+genesis). Publication's manual terminal arm requires
+`logicalBaseOid !== null` (`ref-plane-publication.ts:132` region); the
+null-base case falls through to a hold and reaches the composer
+undecided. Amendment: drop that conjunct — mint
+`{ beforeBaseOid: null, afterOid }` when `oldOid === newOid`,
+`manualResolution`, `newOid`, and `artifactsClear` hold. Laundering-safe
+by construction: held refs `continue` out of the loop BEFORE this arm
+(`:97-106`), so publication's own hold ordering is inherited — the exact
+property F0 protects. Reservation posture matches the existing non-null
+publication terminals (none today; unchanged). The composer's no-p
+null-acceptance (F2a) already validates the result. This is the
+fleet-dominant shape: every crossover-genesis repo with side branches.
 
 ### F4 — residual holds are NAMED, not pre-checked (reshaped in round 2)
 
