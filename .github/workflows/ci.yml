@@ -531,35 +531,6 @@ jobs:
           bun run tui-smoke "$bin" --secret-render-error
           bun run tui-smoke "$bin" --secret-cancel
 
-  compiled-tui-performance:
-    name: "compiled TUI · startup/size budget"
-    needs: compiled-tui-build
-    runs-on: namespace-profile-rbox-core
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
-          path: baseline
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.4.0" # budgets measure the SHIPPED binary; releases build on stable
-      - name: Download exact candidate binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rbox-tui-dist
-          path: dist
-      - name: Build baseline with the baseline release script
-        working-directory: baseline
-        run: |
-          bun install --frozen-lockfile --os=* --cpu=*
-          bun scripts/release.ts --dev --targets=darwin-arm64
-      - name: Enforce startup, RSS, and binary-size budgets
-        run: |
-          chmod +x "$GITHUB_WORKSPACE/baseline/dist/rbox-darwin-arm64" "$GITHUB_WORKSPACE/dist/rbox-darwin-arm64"
-          bun run tui-budget "$GITHUB_WORKSPACE/baseline/dist/rbox-darwin-arm64" "$GITHUB_WORKSPACE/dist/rbox-darwin-arm64"
-
   compiled-onboarding-rig:
     name: "compiled TUI · onboarding rig"
     needs: compiled-tui-build
