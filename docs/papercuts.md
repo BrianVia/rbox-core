@@ -715,3 +715,9 @@ live daemons could not be restarted" — nothing was installed and none of those
 daemons are alive. Two defects: dead/unreadable records counted as live restart
 failures, and the failure copy claims an install on the no-op path. Filed as an
 issue. Zero app-sync lines appeared (the #801 silent no-op posture held).
+
+## 2026-08-25 — purge dry-run won't name its victims; ignored-path pause ghosts
+`rbox ignore --purge` dry-run: "4 paths would be deleted from other machines.
+top-level: Personal" — no path names, while status --json strandedIgnored=6916.
+Refused to --yes blind. Also: 132 chromium ghost pause records persist for
+config-ignored paths with no cleanup verb. Both in the same issue (filed).
