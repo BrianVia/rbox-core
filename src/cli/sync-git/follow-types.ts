@@ -26,8 +26,8 @@ export class WorktreeOwnershipUnreadableError extends Error {
   }
 }
 
-export function boundedRefFailure(error: unknown): string {
-  const clean = String((error as Error)?.message ?? error)
+export function boundedRefFailure(cause: unknown): string {
+  const clean = (cause instanceof Error ? cause.message : String(cause))
     .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -77,7 +77,7 @@ export interface FollowProgress {
   branchLockedProofs?: Record<string, LockedBranchProof>;
   safeRefWitnesses?: Record<string, SafeRefWitness>;
   /** Positive branch already at the confirmed candidate, with no ref mutation/P. */
-  manualBranchTerminals?: Record<string, { beforeBaseOid: string; afterOid: string }>;
+  manualBranchTerminals?: Record<string, { beforeBaseOid: string | null; afterOid: string }>;
   tombstonePrunedThisCycle?: boolean;
 }
 

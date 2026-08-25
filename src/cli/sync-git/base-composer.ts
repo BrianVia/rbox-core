@@ -114,7 +114,7 @@ interface ProofAuthorityBase {
 
 export type ManualBranchDecision =
   | { kind: "artifact"; beforeBaseOid: string | null; witness: BranchTransitionWitness }
-  | { kind: "no-p"; beforeOid: string; afterOid: string; episode: string };
+  | { kind: "no-p"; beforeOid: string | null; afterOid: string; episode: string };
 
 export type ComposeRepoBaseAuthority =
   | ({ kind: "pull-ref-transaction" } & ProofAuthorityBase)
@@ -470,7 +470,7 @@ export function composeRepoBase(
         && lockedProof.freshConfirmation === true;
       if (decision?.kind === "no-p") {
         const locked = lockedProof.branches[ref];
-        const valid = commonManual && before !== null && requested !== null
+        const valid = commonManual && requested !== null
           && decision.beforeOid === before && decision.afterOid === requested && decision.episode === authority.episode
           && EPISODE.test(decision.episode)
           && locked?.liveOid === requested && locked.artifactsClear && locked.ownershipStable

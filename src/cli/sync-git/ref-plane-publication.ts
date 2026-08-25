@@ -128,7 +128,11 @@ export async function publishObservedRefPlane(state: RefPlaneObservation): Promi
           };
         } else if (logicalBaseOid === (newOid ?? null) && newOid) {
           appliedRefs[ref] = { kind: "direct", oid: newOid };
-        } else if (opts.manualResolution && newOid && logicalBaseOid !== null && artifactsClear) {
+        } else if (opts.manualResolution && newOid && artifactsClear) {
+          // A null logicalBaseOid is the crossover-genesis shape: the base
+          // record never learned a ref whose live tip already equals the
+          // candidate. Holds `continue` out above, so this cannot launder a
+          // held ref. (Design 285 F6.)
           manualBranchTerminals[ref] = { beforeBaseOid: logicalBaseOid, afterOid: newOid };
           appliedRefs[ref] = { kind: "direct", oid: newOid };
         } else if ((opts.manualResolution || deletionWitnessRefs.has(ref))

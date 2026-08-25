@@ -215,7 +215,9 @@ export async function classifyCheckout(args: {
   // Convert once before manual reason deletion so take-theirs can explicitly
   // waive local-operation. Presence gates only the automatic waiver.
   if (breadcrumbMismatches.length > 0 && !breadcrumbWaived) {
-    logVetoOnce(args.opts.workspaceRoot, args.opts.relPath, breadcrumbVetoGate ?? "indeterminate", args.opts.log);
+    if (!args.opts.manualResolution) {
+      logVetoOnce(args.opts.workspaceRoot, args.opts.relPath, breadcrumbVetoGate ?? "indeterminate", args.opts.log);
+    }
     reasons.add("local-operation");
     for (const mismatch of breadcrumbMismatches) {
       details.push(`operation state differs at ${opStateDetailToken(args.opts.ctx, mismatch.rel)}`);

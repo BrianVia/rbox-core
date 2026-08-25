@@ -153,11 +153,12 @@ export async function gitResolveCmd(
   const run = withWorkspaceSyncMutex(root, async (mutex) => {
     const env = await (deps.build ?? defaultBuild)(root);
     if (confirmedKeepMine) {
-      await reconcileResolutionReceipt(root, env.cfg, {
-        ...(env.remote ? { remote: env.remote } : {}),
+      const receiptDeps: Parameters<typeof reconcileResolutionReceipt>[2] = {
         syncMutex: mutex,
         warningSink: deps.stderr,
-      });
+      };
+      if (env.remote) receiptDeps.remote = env.remote;
+      await reconcileResolutionReceipt(root, env.cfg, receiptDeps);
     }
     let state = await loadState(root, syncStreamId(env.cfg));
     const repoDir = repoDirOf(root, rel);
@@ -165,9 +166,13 @@ export async function gitResolveCmd(
     // keep-mine confirmation is a sidecar-only transition. A journal must be
     // handled by an ordinary sync first; resolving or quarantining it here would
     // mutate checkout state before the publisher ACK.
-    const recovered = verb === "keep-mine"
-      ? { state, ...(await checkoutJournalPresent(root, rel) ? { error: "checkout journal is present" } : {}) }
-      : await recoverFirst(root, rel, ctx, state);
+    let recovered: Awaited<ReturnType<typeof recoverFirst>>;
+    if (verb === "keep-mine") {
+      recovered = { state };
+      if (await checkoutJournalPresent(root, rel)) recovered.error = "checkout journal is present";
+    } else {
+      recovered = await recoverFirst(root, rel, ctx, state);
+    }
     state = recovered.state;
     if (recovered.error || !ctx) {
       emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
@@ -237,9 +242,9 @@ export async function gitResolveCmd(
     }
     const progressScheduler = deps.progressScheduler ?? {
       setInterval: (fn: () => void, ms: number) => setInterval(fn, ms),
-      clearInterval: (handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>),
+      clearInterval: (handle: number | ReturnType<typeof setInterval>) => clearInterval(handle),
     };
-    let progressTimer: unknown;
+    let progressTimer: ReturnType<typeof progressScheduler.setInterval> | undefined;
     let progressStarted = 0;
     const progressWrite = deps.stderr ?? console.error;
     const setProgressPhase = verb === "show-me" ? (phase: "staging" | "proving" | "found", count?: number) => {
@@ -254,10 +259,13 @@ export async function gitResolveCmd(
         }, deps.progressIntervalMs ?? 10_000);
       }
     } : undefined;
-    const takeSnapshot = () => buildSnapshot({
-      root, rel, ctx: ctx!, state, record: record!, incoming: incoming!, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
-      ...(setProgressPhase ? { progress: (phase: "proving" | "found", count: number) => setProgressPhase(phase, count) } : {}),
-    });
+    const takeSnapshot = () => {
+      const snapshotArgs: Parameters<typeof buildSnapshot>[0] = {
+        root, rel, ctx: ctx!, state, record: record!, incoming: incoming!, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
+      };
+      if (setProgressPhase) snapshotArgs.progress = (phase, count) => setProgressPhase(phase, count);
+      return buildSnapshot(snapshotArgs);
+    };
     if (setProgressPhase) {
       setProgressPhase("staging");
     }
@@ -286,6 +294,9 @@ export async function gitResolveCmd(
   return run.catch((error) => {
     const busy = error instanceof WorkspaceSyncBusyError;
     const timedOut = error instanceof WorkspaceSyncTimeoutError;
+    const manualBaseMessage = error instanceof ManualBaseProofIncompleteError && error.holds.length > 0
+      ? error.holds.map(({ ref, code }) => `rbox could not prove branch ${ref} safe to adopt (${code}); it already shared this repo's other branches, but did not touch ${ref} or your files — reconcile ${ref} with git, then retry`).join("\n")
+      : undefined;
     const classified: ResolveRefusalCode | undefined = error instanceof ManualLineageProofUnavailableError
       ? "manual-lineage-proof"
       : error instanceof ManualBaseProofIncompleteError ? "manual-base-proof" : undefined;
@@ -294,10 +305,10 @@ export async function gitResolveCmd(
       verb,
       repo: rel,
       code: classified ?? (busy || timedOut ? "sync-busy" : "operation-failed"),
-      message: classified ? RESOLVE_TYPED_REFUSAL[classified]
+      message: manualBaseMessage ?? (classified ? RESOLVE_TYPED_REFUSAL[classified]
         : timedOut ? "timed out waiting for the current sync cycle to finish; try again"
         : busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first"
-        : "the Git resolution could not complete safely; no confirmation can be reused",
+        : "the Git resolution could not complete safely; no confirmation can be reused"),
     }, json, deps, root);
     return 1;
   });
