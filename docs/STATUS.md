@@ -1,5 +1,49 @@
 # rbox status — living state snapshot
 
+## 2026-08-25 — beta.5 shipped through the new pipeline; PROD PROMOTED; darwin sweep complete; CI on Namespace
+
+- **v2.0.0-beta.5 tagged + released (next channel)** — first tag to carry
+  RboxBar.zip through the signed manifest. Two release-SHA bugs found+fixed
+  first: a doctor test hardcoding "2.0.0-beta.5" as a future version (now
+  99.0.0), and regress wholesale-failing on Namespace runners (#827, job
+  pinned back to ubuntu-latest; lesson: force-run input-gated jobs when
+  moving runners).
+- **PRODUCTION PROMOTED** (founder yes, 2026-08-25): main→production at
+  77febd093 — 281 commits, prod D1 migrations + API deploy green, dashboard
+  rebuilt. Prod API now serves the RboxBar zip routes. 2.0's server side is
+  LIVE.
+- **PR #801 darwin e2e sweep COMPLETE** — all 10 checks recorded on the PR
+  (quarantine negative control both halves on the founder's Mac; live update
+  0.1.0→beta.5 pid-swap against real prod; idempotence; non-running update;
+  failure posture field-proven twice via the pre-promotion 404). Method
+  documented in local skill `.claude/skills/mac-remote-verify/`.
+- **CI runner topology finalized** (#825/#826): mac PR jobs + all Linux
+  non-shard jobs → Namespace (pay-as-you-go; darwin smoke 2m22s→27s via
+  their same-DC cache); CF keeps the 9 shard jobs; MacBook keeps e2e; GHA =
+  release/deploy ceremony only. Budget job retired (founder; spot-check =
+  `bun run tui-budget`). Mac mini purchase DEAD (docs/ci-macos-cost.md
+  addendum). Est. total CI ~$65–90/mo at the real ~772 runs/30d; Aug-27
+  three-provider dashboard check will replace estimates.
+- **2.x perf roadmap filed** from the re-verified 10x-hunt audit: #818
+  (quick wins: pull matcher reuse + dircache + parallel keys GET), #819
+  (S1 WS commit-in-frame + gap detector), #820 (S2 refset delta,
+  design-first), #821 (S3 one-RTT publish), #822 (EncryptAddressCache→
+  SQLite), #823 (per-record elision). S4 parked. Triage stamp in the audit.
+- **Changelog draft founder-approved** (my verification accepted as the
+  review) + synced to post-draft reality (wire renames landed, RboxBar CLI
+  install, fossils ON). Beta headings fold at assembly.
+- **Loose ends**: #824 (`rbox upgrade` dead-daemon noise + false "installed"
+  copy); desktop shows 132 chromium-ghost paused repos (stale records inside
+  ignored paths — cleanup candidate) + rbox-core partial-sync 2d; FM ssh
+  host-key changed (NOT auto-accepted — founder to confirm); founder ruling
+  pending on two-speed CI (draft=fast lane) + CF 90s assignment window + CF
+  perf-budget time headroom.
+- **TAG RUNWAY (all that's left for 2.0.0)**: assemble changelog (fold
+  betas, 2.0.0 heading) → #775 remedy copy → version bump both sites →
+  regress → tag on green SHA (founder's fresh yes) → fleet upgrade.
+  Friends' upgrade copy: "run `rbox upgrade` — that's it" (recorded in
+  session 08-25).
+
 ## 2026-08-22/23 — fleet v2 crossover DONE; chromium stress week; toward the tag
 
 - **All 3 machines crossed to the v2 store** (2026-08-21/22, playbook in
