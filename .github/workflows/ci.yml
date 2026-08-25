@@ -376,7 +376,10 @@ jobs:
   regress-flows:
     name: "ux · regress flows"
     needs: compiled-tui-build
-    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    # Pinned to a GitHub-hosted runner: on Namespace every flow fails with
+    # "refusing unowned container" (docker label/ownership mismatch in the
+    # fresh-machine harness — see the tracking issue). Move back when fixed.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

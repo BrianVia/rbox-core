@@ -31,7 +31,9 @@ const manifest = (version: string): Manifest => ({ version, keyId: "test", artif
 
 test.each([
   [RBOX_VERSION, `up to date (${RBOX_VERSION}, next channel)`, true],
-  ["2.0.0-beta.5", "update available (2.0.0-beta.5, next channel)", false],
+  // A version permanently newer than any real RBOX_VERSION — a concrete
+  // prerelease here once collided with the actual release bump (beta.5).
+  ["99.0.0", "update available (99.0.0, next channel)", false],
 ])("doctor reports the persisted next channel honestly for manifest %s", async (nextVersion, message, ok) => {
   const executable = path.join(sandbox, "rbox");
   await fs.writeFile(executable, "binary");
