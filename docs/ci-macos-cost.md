@@ -92,3 +92,22 @@ run-rate, it reuses existing self-hosted plumbing, and services only shave
 ~30% where the mini shaves ~100% of the recurring bill. Keep release signing
 on GitHub-hosted, and keep `macos-14` available as a fallback while the mini
 proves a few weeks of uptime.
+
+## Verdict addendum (2026-08-25) — mini purchase DEAD
+
+The premise changed twice in one day:
+1. The per-PR startup/size-budget job (the bulk of mac minutes — it rebuilt a
+   baseline mac binary every push) was retired by founder ruling; spot-check
+   manually with `bun run tui-budget`.
+2. The remaining mac PR jobs moved to Namespace pay-as-you-go Apple-silicon
+   runners (#825; macOS available on their $0 Developer plan — the plan cards
+   are misleading, the comparison table is authoritative). With the TUI binary
+   riding Namespace's same-DC Actions cache, the darwin smoke is 27s vs 2m22s
+   via artifact download.
+
+Projected mac CI spend: **~$15/mo** (≈500 full CI runs/mo × ~30s × ~$0.06/min,
+15s billing granularity) vs the ~$85–97/mo GitHub-era bill. A ~$350 used mini
+against a $15/mo line is a ~2-year payback plus ops burden: **do not buy**.
+Pay-per-use mac images: Namespace won on the same math that ruled out the
+$100/mo-floor providers. Real numbers replace these estimates at the Aug-27
+three-provider cost review (GitHub + Cloudflare + Namespace dashboards).
