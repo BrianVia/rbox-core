@@ -148,16 +148,17 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
       beforeBaseOid: branchProtocol.logicalBaseRefs[ref] ?? null,
       witness,
     };
-    branches[ref] = {
+    const lockedBranch: RepoBaseLockedProof["branches"][string] = {
       liveOid: witness.kind === "present" ? witness.nextOid : null,
       witness,
-      ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
       artifactsClear: true,
       ownershipStable: true,
       reflogStable: true,
       currentRef: false,
       siblingOwned: false,
     };
+    if (witness.kind === "present") lockedBranch.reflogEpisode = witness.episode;
+    branches[ref] = lockedBranch;
   }
   for (const [ref, terminal] of Object.entries(progress.manualBranchTerminals ?? {})) {
     branchDecisions[ref] = {
@@ -173,11 +174,14 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
     };
   }
   const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(
-    Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => [ref, {
-      liveOid: witness.afterOid,
-      witness,
-      ...(ref === "refs/stash" && witness.afterOid !== null ? { stashReflogReady: true } : {}),
-    }]),
+    Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => {
+      const safeRef: RepoBaseLockedProof["safeRefs"][string] = {
+        liveOid: witness.afterOid,
+        witness,
+      };
+      if (ref === "refs/stash" && witness.afterOid !== null) safeRef.stashReflogReady = true;
+      return [ref, safeRef];
+    }),
   );
   const baseProof: RepoBaseProof = {
     authority: {
@@ -213,9 +217,9 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
   const next: RepoRecordInput = {
     ...previousRecord,
     sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence),
-    ...(composed.base ? { base: composed.base } : {}),
-    ...(composed.branchBaseOrigins ? { branchBaseOrigins: composed.branchBaseOrigins } : {}),
   };
+  if (composed.base) next.base = composed.base;
+  if (composed.branchBaseOrigins) next.branchBaseOrigins = composed.branchBaseOrigins;
   delete next.pending;
   delete next.resolutionKey;
   delete next.partial;

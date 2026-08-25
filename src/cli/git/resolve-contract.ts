@@ -33,8 +33,8 @@ export interface ResolveEnvironment {
 }
 
 export interface ProgressScheduler {
-  setInterval(fn: () => void, ms: number): unknown;
-  clearInterval(handle: unknown): void;
+  setInterval(fn: () => void, ms: number): number | ReturnType<typeof setInterval>;
+  clearInterval(handle: number | ReturnType<typeof setInterval>): void;
 }
 
 export interface GitResolveDeps {
