@@ -248,16 +248,13 @@ export class RefPlaneTransaction {
     if (liveBefore.currentRef && liveBefore.currentRef !== this.checkoutBranchPlan?.ref) {
       const currentRef = liveBefore.currentRef;
       const candidate = effective.refs[currentRef];
-      if (incomingHeadRef === currentRef && candidate) {
+      const noOpTerminal = opts.manualResolution !== undefined && liveBefore.refs[currentRef] === candidate;
+      if (candidate && (incomingHeadRef === currentRef || noOpTerminal)) {
         postProgress.appliedRefs[currentRef] = { kind: "direct", oid: candidate };
       }
-      if (opts.manualResolution && candidate && liveBefore.refs[currentRef] === candidate) {
+      if (candidate && noOpTerminal) {
         reserveRef(currentRef, candidate);
-        postProgress.manualBranchTerminals![currentRef] = {
-          beforeBaseOid: opts.base?.refs[currentRef] ?? null,
-          afterOid: candidate,
-        };
-        postProgress.appliedRefs[currentRef] = { kind: "direct", oid: candidate };
+        postProgress.manualBranchTerminals![currentRef] = { beforeBaseOid: opts.base?.refs[currentRef] ?? null, afterOid: candidate };
       }
     }
 
