@@ -474,6 +474,15 @@ jobs:
           path: dist/
           retention-days: 1
           if-no-files-found: error
+      # The darwin smoke runs on a Namespace runner, whose local Actions-cache
+      # proxy makes cache restores fast while artifact downloads cross to
+      # GitHub's storage (~2 min for the full dist). Publish just the darwin
+      # binary as a run-scoped cache entry for that consumer.
+      - name: Publish darwin binary to the Actions cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist/rbox-darwin-arm64
+          key: tui-darwin-${{ github.run_id }}-${{ github.run_attempt }}
 
   compiled-tui:
     name: "compiled TUI · ${{ matrix.target }}"
@@ -502,7 +511,18 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "latest"
+      # darwin restores its single binary from the Actions cache (fast local
+      # proxy on Namespace runners); everyone else — and darwin on a cache
+      # miss — falls back to the full artifact download.
+      - name: Restore darwin binary from the Actions cache
+        if: matrix.target == 'darwin-arm64'
+        id: darwin-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist/rbox-darwin-arm64
+          key: tui-darwin-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Download exact candidate binaries
+        if: matrix.target != 'darwin-arm64' || steps.darwin-cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rbox-tui-dist
