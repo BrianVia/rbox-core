@@ -209,7 +209,7 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
     baseProof.authority,
     baseProof.lockedProof,
   );
-  if (composed.disposition !== "terminal") throw new ManualBaseProofIncompleteError();
+  if (composed.disposition !== "terminal") throw new ManualBaseProofIncompleteError(composed.holds);
   const next: RepoRecordInput = {
     ...previousRecord,
     sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence),

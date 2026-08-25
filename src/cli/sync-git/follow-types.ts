@@ -77,7 +77,7 @@ export interface FollowProgress {
   branchLockedProofs?: Record<string, LockedBranchProof>;
   safeRefWitnesses?: Record<string, SafeRefWitness>;
   /** Positive branch already at the confirmed candidate, with no ref mutation/P. */
-  manualBranchTerminals?: Record<string, { beforeBaseOid: string; afterOid: string }>;
+  manualBranchTerminals?: Record<string, { beforeBaseOid: string | null; afterOid: string }>;
   tombstonePrunedThisCycle?: boolean;
 }
 

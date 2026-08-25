@@ -109,7 +109,7 @@ export class ManualLineageProofUnavailableError extends Error {
 }
 
 export class ManualBaseProofIncompleteError extends Error {
-  constructor() {
+  constructor(readonly holds: readonly { ref: string; code: string }[]) {
     super("manual BASE proof is incomplete");
     this.name = "ManualBaseProofIncompleteError";
   }
@@ -121,7 +121,7 @@ export const RESOLVE_TYPED_REFUSAL = {
   "journal-recovery": "the published checkout journal could not be recovered; retry after Git state settles, or inspect the local recovery copy",
   artifact: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
   "manual-lineage-proof": "this repository's Git lineage proof is unavailable; retry after Git state settles",
-  "manual-base-proof": "the resolution may have partially applied and could not be fully proven — retry after Git state settles",
+  "manual-base-proof": "the resolution could not prove every branch safe to adopt",
 } as const;
 
 export type ResolveRefusalCode =

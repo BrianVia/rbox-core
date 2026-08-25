@@ -11,9 +11,11 @@ import { checkoutJournalBinding } from "./follow-journal.js";
 import { classifyCheckout } from "./follow-classify.js";
 import { readLive } from "./follow-live.js";
 import { effectiveRefs } from "./follow-ref-witness.js";
+import { checkoutJournalDir } from "./journal.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { RefPlaneTransaction } from "./ref-plane-transaction.js";
-import type { CheckoutClassification, FollowIntended, FollowOptions, StagedIncoming } from "./follow-types.js";
+import type { CheckoutClassification, FollowIntended, FollowOptions, FollowProgress, StagedIncoming } from "./follow-types.js";
+import { ManualBaseProofIncompleteError } from "../git/resolve-contract.js";
 
 const exec = promisify(execFile);
 const GIT_ENV = {
@@ -53,7 +55,7 @@ async function transactionOptions(overrides: Partial<FollowOptions> = {}) {
   const ctx = await repoCtx(repo);
   if (!ctx) throw new Error("test repository unavailable");
   const live = await readLive(ctx);
-  if (!live?.currentRef || !live.currentTip) throw new Error("test repository metadata unavailable");
+  if (!live?.currentRef) throw new Error("test repository metadata unavailable");
   const incoming: GitSection = {
     bundleSha: "bundle",
     bundleEncSha: "encrypted-bundle",
@@ -125,6 +127,60 @@ function branchProtocol(logicalBaseRefs: Record<string, string>): FollowerBranch
     unmaterializedAbsenceRefs: new Set(),
     absenceWitnesses: {},
   };
+}
+
+async function offHeadManualCheckout(beforeBaseOid: string | null) {
+  const base = await git("rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "candidate\n");
+  await git("add", "tracked.txt");
+  await git("commit", "-qm", "candidate");
+  const candidate = await git("rev-parse", "HEAD");
+  const currentRef = "refs/heads/side";
+  const incomingRef = "refs/heads/main";
+  await git("branch", "side");
+  await git("checkout", "-q", "side");
+  let intendedProgress: FollowProgress | undefined;
+  const intended = { record: {}, expectedRepoGen: 0, relPath: "repo" } as FollowIntended;
+  const { live, opts } = await transactionOptions({
+    makeIntended: (progress) => {
+      intendedProgress = progress;
+      return intended;
+    },
+  });
+  opts.incoming.head = `ref: ${incomingRef}\n`;
+  opts.base = {
+    ...opts.incoming,
+    refs: beforeBaseOid === null
+      ? { [incomingRef]: candidate }
+      : { [incomingRef]: candidate, [currentRef]: beforeBaseOid },
+  };
+  opts.branchProtocol = branchProtocol({ [incomingRef]: candidate, [currentRef]: base });
+  opts.manualResolution = {
+    snapshotId: "snapshot",
+    waivedReasons: [],
+    protectedOids: [],
+    secondProof: async () => true,
+  };
+  const candidateIndex = path.join(root, "candidate-index");
+  await fs.copyFile(path.join(opts.ctx.gitDir, "index"), candidateIndex);
+  const input = staged(candidateIndex, live.indexProjection);
+  const roots = [base, candidate];
+  const transaction = new RefPlaneTransaction(
+    opts,
+    live,
+    roots,
+    await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming),
+    incomingRef,
+  );
+  await transaction.publishIndependentRefs(input, live.indexProjection);
+  const first: CheckoutClassification = {
+    safe: true,
+    breadcrumbMismatches: [],
+    breadcrumbWaived: false,
+    blockers: [],
+  };
+  return { base, baseProjection: live.indexProjection, candidate, currentRef, input, first, intendedProgress: () => intendedProgress, opts, roots, transaction };
 }
 
 test("publication burns prepared-old authority before its first await", async () => {
@@ -249,6 +305,162 @@ test("checkout uses the ref candidate captured before the initial classifier awa
 
   expect(result.status).toBe("committed");
   expect(await git("rev-parse", "HEAD")).toBe(candidateA);
+});
+
+test("manual off-HEAD no-op mints the current-ref terminal", async () => {
+  const base = await git("rev-parse", "HEAD");
+  const setup = await offHeadManualCheckout(base);
+
+  const result = await setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  });
+
+  expect(result.status).toBe("committed");
+  expect(setup.intendedProgress()?.manualBranchTerminals?.[setup.currentRef]).toEqual({
+    beforeBaseOid: setup.base,
+    afterOid: setup.candidate,
+  });
+  expect(setup.intendedProgress()?.appliedRefs[setup.currentRef]).toEqual({ kind: "direct", oid: setup.candidate });
+});
+
+test("manual current-ref no-op carries a null record BASE predecessor", async () => {
+  const setup = await offHeadManualCheckout(null);
+
+  const result = await setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  });
+
+  expect(result.status).toBe("committed");
+  expect(setup.intendedProgress()?.manualBranchTerminals?.[setup.currentRef]).toEqual({
+    beforeBaseOid: null,
+    afterOid: setup.candidate,
+  });
+});
+
+test("manual unborn current ref builds a null-before install plan", async () => {
+  const candidate = await git("rev-parse", "HEAD");
+  const currentRef = "refs/heads/unborn";
+  await git("symbolic-ref", "HEAD", currentRef);
+  let planned: FollowProgress | undefined;
+  const stop = new Error("planned");
+  const { live, opts } = await transactionOptions({
+    makeIntended: (progress) => {
+      planned = progress;
+      throw stop;
+    },
+  });
+  opts.incoming.head = `ref: ${currentRef}\n`;
+  opts.incoming.refs[currentRef] = candidate;
+  opts.base = { ...opts.incoming, refs: { "refs/heads/main": candidate } };
+  opts.branchProtocol = branchProtocol({ "refs/heads/main": candidate });
+  opts.manualResolution = {
+    snapshotId: "snapshot",
+    waivedReasons: [],
+    protectedOids: [],
+    secondProof: async () => true,
+  };
+  const input = staged(path.join(opts.ctx.gitDir, "index"), live.indexProjection);
+  const transaction = new RefPlaneTransaction(
+    opts, live, [candidate], await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming), currentRef,
+  );
+  await transaction.publishIndependentRefs(input, live.indexProjection);
+
+  await expect(transaction.commitCheckout({
+    staged: input,
+    first: { safe: true, breadcrumbMismatches: [], breadcrumbWaived: false, blockers: [] },
+    checkoutRoots: [candidate],
+  })).rejects.toBe(stop);
+  const witness = planned?.branchWitnesses?.[currentRef];
+  expect(witness).toMatchObject({ kind: "present", ref: currentRef, priorOid: null, nextOid: candidate });
+  expect(planned?.manualBranchTerminals?.[currentRef]).toBeUndefined();
+});
+
+test("a reserved manual terminal cannot race to a stale ref value", async () => {
+  const base = await git("rev-parse", "HEAD");
+  const setup = await offHeadManualCheckout(base);
+  const tree = await git("rev-parse", `${setup.candidate}^{tree}`);
+  const racedOid = await git("commit-tree", tree, "-p", setup.candidate, "-m", "raced");
+  let raceRejected = false;
+  setup.opts.beforeCheckoutSecondProof = async () => {
+    try {
+      await git("update-ref", setup.currentRef, racedOid, setup.candidate);
+    } catch {
+      raceRejected = true;
+    }
+  };
+
+  const result = await setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  });
+
+  expect(raceRejected).toBe(true);
+  expect(result.status).toBe("committed");
+  expect(await git("rev-parse", setup.currentRef)).toBe(setup.candidate);
+  expect(setup.intendedProgress()?.manualBranchTerminals?.[setup.currentRef]?.afterOid).toBe(setup.candidate);
+});
+
+test("manual BASE hold escapes before the checkout journal write", async () => {
+  const setup = await offHeadManualCheckout(null);
+  const heldRef = "refs/heads/stale";
+  setup.opts.makeIntended = () => {
+    throw new ManualBaseProofIncompleteError([{ ref: heldRef, code: "missing-branch-proof" }]);
+  };
+
+  await expect(setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  })).rejects.toMatchObject({ holds: [{ ref: heldRef, code: "missing-branch-proof" }] });
+  await expect(fs.access(checkoutJournalDir(root, "repo"))).rejects.toThrow();
+});
+
+test("existing manual planned-path progress keeps its artifact shape", async () => {
+  const base = await git("rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "candidate\n");
+  await git("add", "tracked.txt");
+  await git("commit", "-qm", "candidate");
+  const candidate = await git("rev-parse", "HEAD");
+  const candidateIndex = path.join(root, "candidate-index");
+  await fs.copyFile(path.join(repo, ".git", "index"), candidateIndex);
+  await git("reset", "--hard", "-q", base);
+  await fs.rm(path.join(repo, ".git", "ORIG_HEAD"), { force: true });
+  let progress: FollowProgress | undefined;
+  const { live, opts } = await transactionOptions({
+    makeIntended: (value) => {
+      progress = value;
+      return { record: {}, expectedRepoGen: 0, relPath: "repo" } as FollowIntended;
+    },
+  });
+  const currentRef = live.currentRef!;
+  opts.incoming.refs[currentRef] = candidate;
+  opts.base = { ...opts.incoming, refs: { [currentRef]: base } };
+  opts.branchProtocol = branchProtocol({ [currentRef]: base });
+  opts.manualResolution = {
+    snapshotId: "snapshot", waivedReasons: [], protectedOids: [], secondProof: async () => true,
+  };
+  const input = staged(candidateIndex, live.indexProjection);
+  const transaction = new RefPlaneTransaction(
+    opts, live, [base, candidate], await ownershipProofContext(opts.ctx),
+    effectiveRefs(opts.ctx, opts.incoming), currentRef,
+  );
+  await transaction.publishIndependentRefs(input);
+
+  const result = await transaction.commitCheckout({
+    staged: input,
+    first: { safe: true, breadcrumbMismatches: [], breadcrumbWaived: false, blockers: [] },
+    checkoutRoots: [base, candidate],
+    baseProjection: live.indexProjection,
+  });
+
+  expect(result.status).toBe("committed");
+  const witness = progress?.branchWitnesses?.[currentRef];
+  expect(witness).toMatchObject({ kind: "present", ref: currentRef, priorOid: base, nextOid: candidate });
+  if (witness?.kind !== "present") throw new Error("planned present witness missing");
+  expect(progress?.appliedRefs[currentRef]).toEqual({
+    kind: "present", oid: candidate,
+    artifactOid: witness.artifactOid,
+    episode: witness.episode,
+  });
+  expect(progress?.manualBranchTerminals?.[currentRef]).toBeUndefined();
 });
 
 /**

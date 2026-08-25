@@ -286,6 +286,9 @@ export async function gitResolveCmd(
   return run.catch((error) => {
     const busy = error instanceof WorkspaceSyncBusyError;
     const timedOut = error instanceof WorkspaceSyncTimeoutError;
+    const manualBaseMessage = error instanceof ManualBaseProofIncompleteError && error.holds.length > 0
+      ? error.holds.map(({ ref, code }) => `rbox could not prove branch ${ref} safe to adopt (${code}); it already shared this repo's other branches, but did not touch ${ref} or your files — reconcile ${ref} with git, then retry`).join("\n")
+      : undefined;
     const classified: ResolveRefusalCode | undefined = error instanceof ManualLineageProofUnavailableError
       ? "manual-lineage-proof"
       : error instanceof ManualBaseProofIncompleteError ? "manual-base-proof" : undefined;
@@ -294,10 +297,10 @@ export async function gitResolveCmd(
       verb,
       repo: rel,
       code: classified ?? (busy || timedOut ? "sync-busy" : "operation-failed"),
-      message: classified ? RESOLVE_TYPED_REFUSAL[classified]
+      message: manualBaseMessage ?? (classified ? RESOLVE_TYPED_REFUSAL[classified]
         : timedOut ? "timed out waiting for the current sync cycle to finish; try again"
         : busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first"
-        : "the Git resolution could not complete safely; no confirmation can be reused",
+        : "the Git resolution could not complete safely; no confirmation can be reused"),
     }, json, deps, root);
     return 1;
   });

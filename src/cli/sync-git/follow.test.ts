@@ -1113,6 +1113,7 @@ test("design 126 pipeline: unrelated manual waivedReasons do not unlock a breadc
   expect(result.reason).toBe("local-operation");
   expect(result.detail).toContain("operation state differs at ORIG_HEAD");
   expect(logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+  expect(logs.some((line) => line.startsWith("git-sync: breadcrumb waiver vetoed"))).toBe(false);
 });
 
 test("manual take-theirs with a stale AUTO_MERGE still applies", async () => {

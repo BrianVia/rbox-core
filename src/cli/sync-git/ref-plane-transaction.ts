@@ -168,7 +168,10 @@ export class RefPlaneTransaction {
         pinLines = pins.transactionLines;
         checkoutBranchReflogFingerprint = pins.reflogFingerprint;
       }
-      if (oldOid && ((newOid && oldOid !== newOid) || (!newOid && effective.deleteAbsent))) {
+      const needsPlan = oldOid
+        ? (newOid !== undefined && oldOid !== newOid) || (newOid === undefined && effective.deleteAbsent)
+        : opts.manualResolution !== undefined && newOid !== undefined;
+      if (needsPlan) {
         if (!opts.branchProtocol) {
           return { status: "defer", result: deferResult(progress, "artifact", "checked-out branch transition lacks lineage authority") };
         }
@@ -178,7 +181,7 @@ export class RefPlaneTransaction {
               repoDir: opts.ctx.repoDir,
               binding: opts.branchProtocol!.binding,
               ref: currentRef,
-              physicalBeforeOid: oldOid,
+              physicalBeforeOid: oldOid ?? null,
               afterOid: newOid ?? null,
               logicalBaseOid: opts.branchProtocol!.logicalBaseRefs[currentRef] ?? null,
               extraTransactionLines: pinLines,
@@ -187,6 +190,7 @@ export class RefPlaneTransaction {
             if (checkoutBranchReflogFingerprint) planInput.expectedReflogFingerprint = checkoutBranchReflogFingerprint;
             return planManualBranchTransition(planInput);
           }
+          if (!oldOid) throw new Error("automatic branch transition requires a physical predecessor");
           const planInput: PlanBranchTransitionInput = {
             repoDir: opts.ctx.repoDir,
             binding: opts.branchProtocol!.binding,
@@ -241,15 +245,19 @@ export class RefPlaneTransaction {
     if (incomingHeadRef && effective.refs[incomingHeadRef] && incomingHeadRef !== this.checkoutBranchPlan?.ref) {
       postProgress.appliedRefs[incomingHeadRef] = { kind: "direct", oid: effective.refs[incomingHeadRef]! };
     }
-    if (liveBefore.currentRef && incomingHeadRef === liveBefore.currentRef && effective.refs[liveBefore.currentRef]
-      && liveBefore.currentRef !== this.checkoutBranchPlan?.ref) {
-      postProgress.appliedRefs[liveBefore.currentRef] = { kind: "direct", oid: effective.refs[liveBefore.currentRef]! };
-      const logicalBefore = opts.branchProtocol?.logicalBaseRefs[liveBefore.currentRef] ?? null;
-      if (opts.manualResolution && logicalBefore !== null && logicalBefore !== effective.refs[liveBefore.currentRef]) {
-        postProgress.manualBranchTerminals![liveBefore.currentRef] = {
-          beforeBaseOid: logicalBefore,
-          afterOid: effective.refs[liveBefore.currentRef]!,
+    if (liveBefore.currentRef && liveBefore.currentRef !== this.checkoutBranchPlan?.ref) {
+      const currentRef = liveBefore.currentRef;
+      const candidate = effective.refs[currentRef];
+      if (incomingHeadRef === currentRef && candidate) {
+        postProgress.appliedRefs[currentRef] = { kind: "direct", oid: candidate };
+      }
+      if (opts.manualResolution && candidate && liveBefore.refs[currentRef] === candidate) {
+        reserveRef(currentRef, candidate);
+        postProgress.manualBranchTerminals![currentRef] = {
+          beforeBaseOid: opts.base?.refs[currentRef] ?? null,
+          afterOid: candidate,
         };
+        postProgress.appliedRefs[currentRef] = { kind: "direct", oid: candidate };
       }
     }
 

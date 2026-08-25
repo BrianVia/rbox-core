@@ -300,6 +300,24 @@ describe("design 130 mandatory BASE composer", () => {
     expect(composeRepoBase({ base: section({}) }, { base: section({ [ref]: N }, "next") }, authority, proof).disposition).toBe("pending");
   });
 
+  test("manual no-P accepts a null predecessor only when the decision matches", () => {
+    const ref = "refs/heads/topic";
+    const episode = "6".repeat(32);
+    const proof = locked({
+      snapshotId: "snapshot", stateGeneration: 7, freshConfirmation: true,
+      branches: { [ref]: { liveOid: N, artifactsClear: true, ownershipStable: true, reflogStable: true, currentRef: false, siblingOwned: false } },
+    });
+    const authority = (beforeOid: string | null): ComposeRepoBaseAuthority => ({
+      kind: "manual", lineageHash: LIN, repositoryIdentityHash: REPO, incomingKey: "incoming",
+      episode, snapshotId: "snapshot", stateGeneration: 7,
+      branchDecisions: { [ref]: { kind: "no-p", beforeOid, afterOid: N, episode } }, safeRefWitnesses: {},
+    });
+
+    expect(composeRepoBase({ base: section({}) }, { base: section({ [ref]: N }, "next") }, authority(null), proof).disposition).toBe("terminal");
+    expect(composeRepoBase({ base: section({}) }, { base: section({ [ref]: N }, "next") }, authority(L), proof).disposition).toBe("pending");
+    expect(composeRepoBase({ base: section({ [ref]: L }) }, { base: section({ [ref]: N }, "next") }, authority(null), proof).disposition).toBe("pending");
+  });
+
   test("manual artifact binds protected BASE separately from the displaced physical P prior", () => {
     const ref = "refs/heads/topic";
     const witness = present(ref, U, N);

@@ -1410,7 +1410,10 @@ test("the two makeIntended error classes classify into their own resolve codes",
   await fixture();
   const cases = [
     { error: new ManualLineageProofUnavailableError(), code: "manual-lineage-proof" },
-    { error: new ManualBaseProofIncompleteError(), code: "manual-base-proof" },
+    {
+      error: new ManualBaseProofIncompleteError([{ ref: "refs/heads/stale", code: "missing-branch-proof" }]),
+      code: "manual-base-proof",
+    },
   ] as const;
   for (const { error, code } of cases) {
     const lines: string[] = [];
@@ -1421,9 +1424,38 @@ test("the two makeIntended error classes classify into their own resolve codes",
     const parsed = JSON.parse(output);
     expect(parsed.code).toBe(code);
     expect(parsed.status).toBe("refused");
-    expect(parsed.message).not.toContain("/");
+    if (code === "manual-lineage-proof") expect(parsed.message).not.toContain("/");
     expect(output).not.toMatch(/[\r\n\u001b]/);
   }
+});
+
+test("take-theirs names a stale-BASE side-ref hold before writing a checkout journal", async () => {
+  await fixture();
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = repoRecordsForState(state).repo!;
+  const staleRef = "refs/heads/stale";
+  const candidate = record.pending!.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, candidate);
+  await git(receiver, "update-ref", staleRef, candidate);
+  await saveStateUnsafeLegacyOrTest(root, {
+    ...state,
+    repoRecords: {
+      ...state.repoRecords,
+      repo: { ...record, pending: { ...record.pending!, refs: { ...record.pending!.refs, [staleRef]: candidate } } },
+    },
+  });
+  const current = await show([]);
+  const lines: string[] = [];
+
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(1);
+
+  expect(JSON.parse(lines.at(-1)!)).toEqual({
+    status: "refused", verb: "take-theirs", repo: "repo", code: "manual-base-proof",
+    message: `rbox could not prove branch ${staleRef} safe to adopt (missing-branch-proof); it already shared this repo's other branches, but did not touch ${staleRef} or your files — reconcile ${staleRef} with git, then retry`,
+  });
+  expect(await git(receiver, "rev-parse", staleRef)).toBe(candidate);
+  expect(await fs.readFile(path.join(receiver, "tracked.txt"), "utf8")).toBe("local\n");
+  await expect(fs.access(checkoutJournalDir(root, "repo"))).rejects.toThrow();
 });
 
 test("take-theirs and keep-mine report their steps on stderr, never on stdout", async () => {
