@@ -706,3 +706,12 @@ agent-output hygiene matters on a synced checkout.
 - 2026-08-21: `recovery kit > concurrent once-only offer claims` failed on CF shard 6 (PR #801), passes 5/5 locally at --cpus=2. THIRD CF-only anomaly tonight (umask→root-caused, watchdog timing, now this). If the flake rate stays >0 per few runs, bump shards to a 4vCPU custom label before blaming tests; tally feeds the Aug-27 verdict.
 
 - 2026-08-24: `scripts/bench/propagate.ts` silently requires daemons started with RBOX_TRACE_PROPAGATION=1 (all correlation events are gated on it, propagation-trace.ts:28) — three bench runs produced all-INVALID output with zero hint. The bench should detect missing trace lines and SAY SO in attempt 1, or the usage line should name the env.
+
+## 2026-08-25 — `rbox upgrade` exit 1 + 2,700 noise lines from dead rig daemons
+On the Linux dev host, no-op `rbox upgrade` (dev build newer than stable) printed
+"not restarted (runtime record unreadable)" for ~2,109 stale test-daemon records
+under `~/.rbox/daemons`, then exited 1 with "upgrade installed, but one or more
+live daemons could not be restarted" — nothing was installed and none of those
+daemons are alive. Two defects: dead/unreadable records counted as live restart
+failures, and the failure copy claims an install on the no-op path. Filed as an
+issue. Zero app-sync lines appeared (the #801 silent no-op posture held).
