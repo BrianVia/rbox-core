@@ -133,7 +133,15 @@ export async function preflightManualPresentArtifacts(args: {
         restart = true;
         break;
       }
-      if (exact.status === "hold" && exact.code === "base-absent") {
+      // Without a BASE family neither shape can settle here — CREATE holds
+      // (base-absent) and UPDATE reports moved(base-shape) into a repair
+      // that cannot commit until a BASE exists, which is a cycle. Both are
+      // the same situation and take the same door: an exact receipt the
+      // landing consumes (design 286; codex round 2 blessed the UPDATE
+      // extension explicitly), or a named refusal.
+      const baseAbsentReceipt = (exact.status === "hold" && exact.code === "base-absent")
+        || (exact.status === "moved" && exact.reason === "base-shape" && !record.base);
+      if (baseAbsentReceipt) {
         const mismatch = await receiptMismatch(args.ctx.repoDir, liveRefs, incoming, p);
         if (mismatch) refusals.push(mismatch); else receipts.push(p);
         continue;
