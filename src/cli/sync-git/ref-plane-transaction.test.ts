@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { type GitSection } from "../../engine/index.js";
+import { gitRaw } from "../../engine/git-spawn.js";
+import { prepareBasePresentArtifact } from "./base-artifacts.js";
 import { ownershipProofContext } from "./reachability.js";
 import { repoCtx } from "./git-state.js";
 import { checkoutJournalBinding } from "./follow-journal.js";
@@ -129,7 +131,7 @@ function branchProtocol(logicalBaseRefs: Record<string, string>): FollowerBranch
   };
 }
 
-async function offHeadManualCheckout(beforeBaseOid: string | null, extraSideBranch = false) {
+async function offHeadManualCheckout(beforeBaseOid: string | null, extraSideBranch = false, currentReceipt = false) {
   const base = await git("rev-parse", "HEAD");
   await fs.writeFile(path.join(repo, "tracked.txt"), "candidate\n");
   await git("add", "tracked.txt");
@@ -162,6 +164,14 @@ async function offHeadManualCheckout(beforeBaseOid: string | null, extraSideBran
     protectedOids: [],
     secondProof: async () => true,
   };
+  if (currentReceipt) {
+    const episode = "8".repeat(32);
+    const receipt = await prepareBasePresentArtifact(repo, opts.branchProtocol.binding, currentRef, episode, null, candidate);
+    await gitRaw(repo, ["update-ref", "--stdin"], {
+      stdin: ["start", ...receipt.transactionLines, "prepare", "commit", ""].join("\n"),
+    });
+    opts.manualResolution.receipts = [receipt];
+  }
   const candidateIndex = path.join(root, "candidate-index");
   await fs.copyFile(path.join(opts.ctx.gitDir, "index"), candidateIndex);
   const input = staged(candidateIndex, live.indexProjection);
@@ -324,7 +334,7 @@ test("manual off-HEAD no-op mints the current-ref terminal", async () => {
   expect(setup.intendedProgress()?.appliedRefs[setup.currentRef]).toEqual({ kind: "direct", oid: setup.candidate });
 });
 
-test("manual current-ref no-op carries a null record BASE predecessor", async () => {
+test("manual current-ref no-op without a receipt carries a null record BASE predecessor", async () => {
   const setup = await offHeadManualCheckout(null);
 
   const result = await setup.transaction.commitCheckout({
@@ -336,6 +346,21 @@ test("manual current-ref no-op carries a null record BASE predecessor", async ()
     beforeBaseOid: null,
     afterOid: setup.candidate,
   });
+  expect(setup.intendedProgress()?.branchWitnesses?.[setup.currentRef]).toBeUndefined();
+});
+
+test("manual current-ref receipt suppresses the no-op terminal", async () => {
+  const setup = await offHeadManualCheckout(null, false, true);
+
+  const result = await setup.transaction.commitCheckout({
+    staged: setup.input, first: setup.first, checkoutRoots: setup.roots, baseProjection: setup.baseProjection,
+  });
+
+  expect(result.status).toBe("committed");
+  expect(setup.intendedProgress()?.branchWitnesses?.[setup.currentRef]).toMatchObject({
+    kind: "present", ref: setup.currentRef, priorOid: null, nextOid: setup.candidate,
+  });
+  expect(setup.intendedProgress()?.manualBranchTerminals?.[setup.currentRef]).toBeUndefined();
 });
 
 test("publication mints a null-base terminal for a side branch already at the candidate (F6)", async () => {

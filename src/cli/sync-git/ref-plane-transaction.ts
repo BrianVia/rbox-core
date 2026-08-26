@@ -252,7 +252,7 @@ export class RefPlaneTransaction {
       if (candidate && (incomingHeadRef === currentRef || noOpTerminal)) {
         postProgress.appliedRefs[currentRef] = { kind: "direct", oid: candidate };
       }
-      if (candidate && noOpTerminal) {
+      if (candidate && noOpTerminal && !postProgress.branchWitnesses?.[currentRef]) {
         reserveRef(currentRef, candidate);
         postProgress.manualBranchTerminals![currentRef] = { beforeBaseOid: opts.base?.refs[currentRef] ?? null, afterOid: candidate };
       }
