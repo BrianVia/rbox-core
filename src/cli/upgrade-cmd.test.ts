@@ -260,7 +260,7 @@ test("persisted next follows a newer stable and clears the selection after insta
   expect(consoleLogs).toContain(
     `the latest channel now has 99.0.0 (newer than next ${RBOX_VERSION}) — following latest and clearing the next selection`,
   );
-  expect(consoleLogs).toContain(`upgraded  → 99.0.0`);
+  expect(consoleLogs).toContain(`upgraded ${RBOX_VERSION} → 99.0.0`);
 });
 
 test("check mode reports adopted stable without clearing persisted next", async () => {
