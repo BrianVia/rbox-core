@@ -55,7 +55,13 @@ export async function preflightManualPresentArtifacts(args: {
   incoming?: GitSection;
 }): Promise<ManualProtocolPreflight> {
   let state = args.state;
-  for (let pass = 0; pass < 8; pass++) {
+  // Progress-based bound: a legitimately settleable repo can hold MANY Ps
+  // (field: 15-18 after a republish landing), each consuming a pass. Eight
+  // fixed passes exhausted on real repos while every pass was succeeding.
+  // The bound is now no-progress (each arm below either returns, restarts
+  // the pass after a settle/compact/repair advanced state, or classifies) —
+  // with a generous absolute ceiling as the infinite-loop backstop.
+  for (let pass = 0; pass < 256; pass++) {
     const record = repoRecordsForState(state)[args.rel];
     const incoming = args.incoming ?? incomingFor(record);
     if (!record || !incoming) return { status: "hold", reason: "deferred incoming state disappeared during manual preflight" };
