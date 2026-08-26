@@ -55,16 +55,31 @@ export async function preflightManualPresentArtifacts(args: {
   incoming?: GitSection;
 }): Promise<ManualProtocolPreflight> {
   let state = args.state;
-  // Progress-based bound: a legitimately settleable repo can hold MANY Ps
-  // (field: 15-18 after a republish landing), each consuming a pass. Eight
-  // fixed passes exhausted on real repos while every pass was succeeding.
-  // The bound is now no-progress (each arm below either returns, restarts
-  // the pass after a settle/compact/repair advanced state, or classifies) —
-  // with a generous absolute ceiling as the infinite-loop backstop.
-  for (let pass = 0; pass < 256; pass++) {
+  // Progress-based bound: a pass that leaves the artifact/repair/record
+  // fingerprint unchanged proves the settle/repair machinery is cycling —
+  // one more pass would burn CPU to the same hold (field: a cycling repair
+  // spun a 195-file repo for 18 CPU-minutes under a fixed 256 ceiling).
+  // Many-P repos legitimately take many pases; each settles one P and moves
+  // the fingerprint, so the bound is no-progress, not a count.
+  let priorFingerprint: string | undefined;
+  // The ceiling stays as the second net: a cycling repair that happens to
+  // bump the record generation each attempt would defeat the fingerprint.
+  // 32 covers the deepest legitimate field shape (18 Ps, one settle per
+  // pass) with margin, while bounding any cycle to seconds, not minutes.
+  for (let pass = 0; pass < 32; pass++) {
     const record = repoRecordsForState(state)[args.rel];
     const incoming = args.incoming ?? incomingFor(record);
     if (!record || !incoming) return { status: "hold", reason: "deferred incoming state disappeared during manual preflight" };
+    const fingerprint = JSON.stringify([
+      record.repoGen,
+      record.sourceSeq,
+      Object.keys(record.partial?.pRepaired ?? {}).sort(),
+      record.base?.refs ?? null,
+    ]);
+    if (fingerprint === priorFingerprint) {
+      return { status: "hold", reason: "P settlement did not stabilize before confirmation" };
+    }
+    priorFingerprint = fingerprint;
     let compacted = false;
     for (const [ref, receipt] of Object.entries(record.partial?.pRepaired ?? {})) {
       const inspected = await inspectLockedPRepairReceipt(args.ctx.repoDir, receipt);
