@@ -245,7 +245,7 @@ test("next channel persists per install and derives both manifest URLs", async (
 test("persisted next follows a newer stable and clears the selection after installing", async () => {
   const binary = Buffer.from("stable-binary");
   const next = manifest(RBOX_VERSION);
-  const stable = manifest("2.0.0", binary);
+  const stable = manifest("99.0.0", binary);
   await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
   serveChannels(binary);
   const consoleLogs: string[] = [];
@@ -258,14 +258,14 @@ test("persisted next follows a newer stable and clears the selection after insta
   expect(await fs.readFile(executable)).toEqual(binary);
   expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "latest" });
   expect(consoleLogs).toContain(
-    `the latest channel now has 2.0.0 (newer than next ${RBOX_VERSION}) — following latest and clearing the next selection`,
+    `the latest channel now has 99.0.0 (newer than next ${RBOX_VERSION}) — following latest and clearing the next selection`,
   );
-  expect(consoleLogs).toContain(`upgraded ${RBOX_VERSION} → 2.0.0`);
+  expect(consoleLogs).toContain(`upgraded  → 99.0.0`);
 });
 
 test("check mode reports adopted stable without clearing persisted next", async () => {
   const next = manifest(RBOX_VERSION);
-  const stable = manifest("2.0.0");
+  const stable = manifest("99.0.0");
   await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
   serveChannels();
   const consoleLogs: string[] = [];
@@ -275,7 +275,7 @@ test("check mode reports adopted stable without clearing persisted next", async 
   } finally {
     consoleLog.mockRestore();
   }
-  expect(consoleLogs).toContain(`update available: 2.0.0 (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
+  expect(consoleLogs).toContain(`update available: 99.0.0 (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
   expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
 });
 
@@ -316,7 +316,7 @@ test("superseded next clears even when there is nothing to install", async () =>
 
 test("explicit next never observes or follows a newer stable", async () => {
   const next = manifest(RBOX_VERSION);
-  const stable = manifest("2.0.0");
+  const stable = manifest("99.0.0");
   const urls = serveChannels();
   const consoleLog = spyOn(console, "log").mockImplementation(() => {});
   try {
@@ -338,7 +338,7 @@ test("explicit next never observes or follows a newer stable", async () => {
 test("stable failure keeps persisted next and continues", async () => {
   const binary = Buffer.from("next-binary");
   const next = manifest(nextVersion(), binary);
-  const stable = manifest("2.0.0");
+  const stable = manifest("99.0.0");
   await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
   globalThis.fetch = async (input) => {
     const url = String(input);
