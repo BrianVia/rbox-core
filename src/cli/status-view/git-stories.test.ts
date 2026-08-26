@@ -814,17 +814,11 @@ test("280 field follow-up: ambient rows survive their own serialize/parse round 
   expect(rows).toHaveLength(1);
   const viaAmbient = gitPauseCounts(
     loudRows(projectGitDeferralRepos(
-      rows.map((row) => ({
-        repo: row.repo,
-        deferral: {
-          lane: "apply" as const,
-          reason: row.reason,
-          deferredSince: row.deferredSince,
-          reasonSince: row.reasonSince,
-          ...(row.lastSeen === undefined ? {} : { lastSeen: row.lastSeen }),
-        },
-        record,
-      })),
+      rows.map((row) => {
+        const base = { lane: "apply" as const, reason: row.reason, deferredSince: row.deferredSince, reasonSince: row.reasonSince };
+        const deferral = row.lastSeen === undefined ? base : { ...base, lastSeen: row.lastSeen };
+        return { repo: row.repo, deferral, record };
+      }),
       NOW,
     )),
     NOW,
