@@ -1,5 +1,36 @@
 # rbox status — living state snapshot
 
+## 2026-08-26 — **v2.0.0 SHIPPED** 🚀
+
+- **Tagged v2.0.0** (SHA 4cc6cee19, green CI) after the founder's "tag it";
+  stable release workflow GREEN on its first full exercise (binaries +
+  RboxBar.zip through the signed manifest + changelog publish + GH Release
+  + rbox.to rebuild). Fleet upgraded: Mac's single `rbox upgrade` moved
+  CLI+daemon+RboxBar to 2.0.0 (the whole #801 design paying off); FM clean;
+  desktop needed manual stop/start (#824 dead-record noise derailed the
+  managed restart — the issue's own repro). All 3 daemons on v2.0.0.
+- **The zero-wedge gate was MET first** (founder ruling drove a 36-hour
+  campaign): six resolve-plane fixes merged (#830 #833 #834 #835 #836 ×2
+  commits), the connectivity class root-caused to STALE COMMIT-GRAPH
+  CACHES (proof now runs core.commitGraph=false), stale-P classes closed
+  by receipts for both shapes, no-progress bound, boundary before+after
+  normalization, honest named refusals + republish remedy copy. rbox-admin
+  resolved; ~40 repos resolved fleet-wide; the final savvy pair landed via
+  the step-out primitive: .git moved aside + fresh adoption (5 minutes,
+  first try — the strongest #832/#837 evidence).
+- **#837 (P1, post-tag)**: the eight-round wedge-night investigation —
+  proof-plane cost accounting + fresh-adoption-as-fallback + the #832
+  ff-only candidate. Founder-requested.
+- **Version-bump time bombs** hit AGAIN at release (upgrade-cmd fixtures
+  hardcoding 2.0.0 as future; fixed to 99.0.0 like the beta.5 doctor
+  literal). Candidate lint rule: no future-version literals in fixtures.
+- **Remaining post-ship items**: pegasus #775 (one live instance),
+  desktop rbox-core stuck partial, 132 chromium ghost records (#828),
+  Mac's 3 uncommitted-work pauses (founder's own work), Aug-27
+  three-provider CI cost review, #824 upgrade noise, savvy .git backups
+  (~/rbox-831-gitbackup-*/, delete after a clean week), FM/desktop back
+  to dev builds when 2.x work resumes.
+
 ## 2026-08-25 — beta.5 shipped through the new pipeline; PROD PROMOTED; darwin sweep complete; CI on Namespace
 
 - **v2.0.0-beta.5 tagged + released (next channel)** — first tag to carry
