@@ -322,22 +322,27 @@ export async function defaultConnectivityProof(
   run: ConnectivityProofRun = (args) => exec("git", [...args], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 }),
 ): Promise<ConnectivityProofResult> {
   if (roots.length === 0) return "connected";
+  // A correctness proof must not trust a cache: a stale commit-graph naming
+  // pruned commits fails rev-list/fsck children while the real closure from
+  // the roots is complete (field: a month-old commit-graphs dir held a repo
+  // "connectivity-unproven" for weeks). The proof walks the object db itself.
+  const noGraph = ["-c", "core.commitGraph=false"];
   try {
-    await run(["-C", repoDir, "rev-list", "--quiet", ...roots, "--"]);
+    await run([...noGraph, "-C", repoDir, "rev-list", "--quiet", ...roots, "--"]);
     // fsck is deliberately pre-commit (r2 F4); there is no post-commit broad
     // rollback that could clobber a human commit.
     if (malformedOrigHeadPreserved) {
       // Keep ordinary refs/* validation exact. Only pseudo-ref parsing is
       // bypassed, and only after malformed ORIG_HEAD bytes were quarantined.
       try {
-        await run(["-C", repoDir, "show-ref"]);
+        await run([...noGraph, "-C", repoDir, "show-ref"]);
       } catch (error) {
         // show-ref uses 1 for a valid empty ref database; malformed refs are 128.
         if ((error as { code?: unknown }).code !== 1) throw error;
       }
-      await run(["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", "--no-references", ...roots]);
+      await run([...noGraph, "-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", "--no-references", ...roots]);
     } else {
-      await run(["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots]);
+      await run([...noGraph, "-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots]);
     }
     return "connected";
   } catch (error) {
