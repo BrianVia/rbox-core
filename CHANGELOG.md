@@ -6,148 +6,234 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
-### Removed
-- The retired `rbox migrate` command and the
-  `rbox doctor --retry-state-migration` /
-  `--abort-state-migration` options have been removed. New 2.0 workspaces
-  already use the current sync-record format, so there is no conversion job to
-  start, retry, or abandon.
+## [2.0.0] - 2026-08-26
+
+rbox 2.0 is the release where sync gets fast and honest. Everything rbox
+remembers about your folders now lives in a single SQLite database instead of a
+large JSON file it rewrote from scratch every few seconds — which is what made
+the old version slow. A typical "nothing changed" sync went from 7.4 to 1.5
+seconds on the Linux workstation and from 6.6 to 2.7 seconds on the MacBook;
+the busiest machine in the fleet, with more than a hundred Git repositories,
+went from 44 seconds to 8.2 seconds to pick up a change. The rest of 2.0 is
+about being understandable while it works: the Git side of sync now explains
+what it is waiting on in plain English, offers a real way to resolve it, and
+the file watcher recovers on its own instead of quietly giving up.
+
+### Breaking changes
+
+- **Upgrading from 1.x works, and rbox repairs itself along the way.** Run the
+  installer (or `rbox upgrade`), restart rbox, and it converts each folder's
+  bookkeeping on its own. It checks every folder BEFORE stopping anything, so
+  an upgrade never takes sync down; a folder it genuinely cannot work out is
+  left alone with sync still running elsewhere, and rbox prints
+  `rbox config regenerate` — the command that actually fixes it. Your files
+  are never part of this conversion: only rbox's own records change format.
+  (#688, PR #774, design 276.)
+  - There is no `rbox migrate` command and no conversion job to babysit —
+    the upgrade does it in place. Starting fresh also works, if you prefer:
+    install 2.0, run setup, point it at the same folder.
+  - The sync manifest schema is still 4, as it was in 1.11.4. A handful of
+    internal wire fields were renamed for clarity, and 2.0 accepts both the
+    old and new names during the transition, so your machines can upgrade in
+    any order. (PRs #804/#806.) What changed most is how each machine stores
+    its own local record of what it has seen.
+- **A 1.x machine that does get the new binary keeps syncing.** Earlier 2.0
+  betas could leave background sync switched off after an upgrade, because a
+  1.x machine has synced folders but no folder-configuration file and the new
+  binary refused to start without one. rbox now writes that file from the
+  folders it can already see, decides each folder on its own, and leaves sync
+  running if something genuinely cannot be worked out — printing
+  `rbox config regenerate`, the command that actually fixes it. (#688, PR #774,
+  design 276.)
+- **`~/.rbox/config.json` is now the authority for which local folders rbox may
+  sync**, and for their safe sync options. Existing local bindings are
+  preserved, but a machine that has bindings and no catalog must explicitly run
+  `rbox config regenerate` — rbox will not guess after a missing or damaged
+  catalog. Inspect with `rbox config`, admit a detached folder with
+  `rbox config add <path>`, and fix a proven local folder move with
+  `rbox config repair <path>`. (Design 231.)
+- **The `next` preview channel does not roll forward on its own.** If you
+  installed a 2.0 beta from `rbox.to/next/install.sh`, that choice persists
+  beside the installed binary; run `rbox upgrade --channel latest` (or the
+  stable installer) once 2.0.0 is out, or you will sit on the last beta.
+- The `v2.0.0-beta.1` through `v2.0.0-beta.4` prereleases went only to the
+  founder fleet's `next` channel. Their changes are folded into this section;
+  there is nothing separate to read.
 
 ### Added
-- `rbox upgrade` now installs and updates the rbox Bar macOS menu-bar app from
-  the same signed release manifest as the CLI, with `RBOX_NO_MENUBAR_APP=1` as
-  an opt-out.
-- `rbox status` now counts the conflict copies rbox saved for you and still
-  sitting in the workspace, so they are visible without hunting for
-  `*.conflict*` files by hand. The count is also in `rbox status --json` as
+
+- **Per-folder ignore paths in `~/.rbox/config.json`** (`options.ignorePaths`
+  on a folder entry) — machine-local excludes that never drive deletes on
+  your other computers, applied live without a restart. Useful for keeping a
+  giant build tree (say, a browser checkout) out of sync on one machine.
+
+- **Setup speaks "folders".** The guided flow offers three plain choices — sync
+  `~/rbox`, sync another folder on this computer, or sync a folder from another
+  machine — instead of asking about workspaces. (Design 230.)
+- **`rbox status` counts the conflict copies rbox saved for you** and that are
+  still sitting in the folder, so they are visible without hunting for
+  `*.conflict*` files by hand. Also in `rbox status --json` as
   `conflictCopies`. A moved-aside folder counts as one thing to deal with,
   however many files it holds.
-- New "conflict copies" hold reason for folders whose sync is paused. When the
-  only thing left to compare in a folder is copies rbox saved during an earlier
-  conflict, sync says so in plain language — "only conflict-copies remain here,
-  so the comparison was skipped" — instead of an unexplained pause.
+- **Paused Git repos now explain themselves in plain English and can be
+  resolved in bulk.** `rbox git resolve` gained a per-repo view, a `--dry-run`
+  that tells you honestly what it would and would not copy, and a batched
+  `--under <folder> keep-mine` that shows you the count and requires you to
+  confirm it (`--yes --expect-repos <n>` for scripts). Each paused repo is
+  grouped under a short story — "you have uncommitted work here" and twelve
+  others — rather than an internal reason code. (Design 273, #764.)
+- **A "conflict copies" reason for paused folders.** When the only thing left
+  to compare in a folder is copies rbox saved during an earlier conflict, sync
+  says so — "only conflict-copies remain here, so the comparison was skipped" —
+  instead of pausing without explanation.
+- **RboxBar ships with every release, and `rbox upgrade` manages it.** The
+  macOS menu bar app is published alongside the CLI binaries for each tag, and
+  on macOS `rbox upgrade` installs, updates, and restarts it automatically
+  (opt out with `RBOX_NO_MENUBAR_APP=1`). Installing through the CLI avoids
+  macOS's unsigned-app first-launch friction entirely; only a zip downloaded
+  in a browser still needs right-click → Open. (PR #801, design 282.)
+- Every release tag now also creates a GitHub Releases entry with that
+  version's changelog section. (#649.)
+
+### Changed
+
+- **rbox's local record of your folder now lives in SQLite** instead of a JSON
+  file. New folders are created that way from the first sync; the old
+  JSON-writing code, its conversion job, and the commands that supervised it
+  are gone. (Designs 262/266, ~19,000 lines deleted.)
+- **A machine that only receives (pull-only) now uses the live file watcher**
+  too, so it reacts to changes instead of waiting for the next scan. Pull-only
+  now means exactly one thing — this machine does not publish. (Design 277,
+  #477.)
+- **macOS folder scans use the native bulk directory walk by default**; no
+  environment opt-in. Capability, directory-probe, and per-directory fallback
+  guards remain. On Linux the equivalent walk is about 5× faster than before.
+- A degraded file watcher is now named outright by `rbox status`, rather than
+  showing up only as unexplained slowness.
+- `rbox doctor`'s `migration` check is now called `genesis`, matching what it
+  actually checks.
 
 ### Fixed
-- rbox no longer publishes an empty update after receiving a Git change from
-  another computer. Whenever a repository could only be carried along
-  unchanged, each incoming change was answered with an update that contained
-  nothing — waking every other device for no reason. rbox now compares against
-  what the server actually holds, so it only publishes when there is something
-  to say.
-- Devices following the `next` release channel now move back to stable once
-  stable is newer, so prerelease installs no longer get stranded after launch.
-- A Git repo whose local copy rbox cannot verify no longer re-downloads the
-  same history on every sync. Repos in that state were downloading, unpacking,
-  and re-checking the same unchanged history every few seconds, forever, which
-  slowed down every other repo waiting behind them. rbox now recognises that
-  nothing has changed since the last check and re-checks such a repo once an
-  hour instead — and it re-checks immediately, as before, the moment you commit
-  in it or the other computer sends something new. (Set
-  `RBOX_GIT_CONNECTIVITY_SKIP=0` to restore the old behaviour.)
-- The message for a paused Git repo no longer says rbox "couldn't finish
-  downloading the other computer's version" when the download in fact
-  succeeded. It now says rbox couldn't put that version in place here, which is
-  true for both reasons that pause can happen.
-- Conflict copies rbox saved no longer make a folder look permanently
-  out-of-sync. Previously a saved copy could keep a folder's comparison from
-  ever settling, so it stayed stuck even after everything else had synced.
-- Deleting the last conflict copy in a folder now clears the hold on the same
-  sync cycle. Previously that pull could pause for a cycle and tell you to
-  delete files it had just removed.
-- An ignore rule that happens to match conflict-copy names (e.g. `*.conflict*`)
-  no longer pauses every folder it applies to.
-- Upgrading from a 1.x install no longer leaves background sync switched off. A
-  1.x machine has folders but no folder configuration file, which the new
-  binary refused to start without; rbox now writes that file from the folders
-  it can already see. Autostart at login was stuck the same way and is fixed by
-  the same change.
-- If rbox genuinely cannot work out your folder configuration during an upgrade,
-  it now leaves the running sync alone instead of stopping it, and prints the
-  command that actually fixes it (`rbox config regenerate`) rather than
-  `rbox stop && rbox start`, which failed the same way.
-- Upgrades now decide each workspace's folder admission on its own, so one
-  folder rbox will not run (say, one it can no longer find) leaves that
-  workspace's sync running and untouched while every other workspace upgrades.
-  Rebuilding a missing folder configuration is still a whole-machine step: if
-  anything on the machine cannot be reproduced, no workspace is restarted until
-  you fix it.
 
-## [2.0.0-beta.4] - 2026-08-16
+- **`rbox git resolve` earned its stripes the hard way.** A resolve week on
+  the development fleet fixed six distinct refusals: repos whose sync
+  evidence predated their records now heal or explain themselves precisely
+  (naming the branch and the mismatch instead of "may have partially
+  applied"), a stale git commit-graph cache can no longer fail the
+  completeness check, the safety boundary now recognizes its own bookkeeping,
+  and a repo needing many housekeeping passes no longer gives up at eight —
+  or spins forever. When a repo's copy is missing history only another
+  computer can supply, status now says exactly that and names the one
+  command that fixes it.
 
-### Fixed
-- RboxBar builds again on the release toolchain (Swift 5.10 concurrency
-  compatibility); a path-filtered PR-time RboxBar build lane now guards it.
-
-_(v2.0.0-beta.3 was tagged but never published: its release run failed in
-the RboxBar build, fail-closed, before any channel mutation.)_
-
+- **Background sync no longer rings its own doorbell.** A no-op push loop on
+  Linux (roughly one cycle every 3 seconds, forever) came from the Git watcher
+  reacting to rbox's own bookkeeping writes.
+- **The publish/conflict storm is gone.** One machine publishing empty
+  sequences forever could make another machine lose every race and burn six
+  full Git plans per attempt, pinning a CPU core for the better part of an
+  hour. Permanent "pending" work is now distinguished from a transient unclear
+  state, and the internal retry loop surrenders after a bounded window. (#683,
+  #685, design 244.)
+- **The file watcher recovers on its own.** A burst of operating-system watch
+  events used to blow a one-way fuse and leave the daemon scanning forever;
+  overflow now counts 5-second episodes anchored at the first drop, and the
+  watcher re-arms under a supervised witness check. (Designs 237, 277.)
+- **A Git repo whose local copy rbox cannot verify no longer re-downloads the
+  same history every few seconds.** Repos in that state were downloading,
+  unpacking, and re-checking unchanged history forever, slowing every other
+  repo behind them. rbox now re-checks such a repo once an hour — and still
+  immediately when you commit in it or another machine sends something new.
+  (Design 278; `RBOX_GIT_CONNECTIVITY_SKIP=0` restores the old behaviour.)
+- **Conflict copies no longer make a folder look permanently out of sync**, and
+  deleting the last conflict copy clears the hold on the same sync cycle
+  instead of telling you to delete files rbox had just removed. An ignore rule
+  that happens to match conflict-copy names (e.g. `*.conflict*`) no longer
+  pauses every folder it applies to. (Design 272, #659.)
+- **Leftover files from finished Git operations no longer strand other
+  machines.** Concluded `AUTO_MERGE`, `MERGE_MSG`, `REBASE_HEAD`, and draft
+  merge messages are recognised as finished and cleaned up by the next
+  completed sync checkout; genuinely in-progress merges still wait, and
+  linked-worktree problems now name the responsible worktree. (Design 236,
+  #667 — enabled for everyone in 2.0.)
+- **The message for a paused Git repo is true.** It no longer says rbox
+  "couldn't finish downloading the other computer's version" when the download
+  succeeded — it says rbox couldn't put that version in place here.
+- A paused merge on another machine used to cost about 9 seconds of every sync
+  cycle on this one; rbox now remembers the stuck state instead of
+  re-discovering it from scratch.
+- Mismatch pauses now name the specific paths that differ, instead of reporting
+  that something, somewhere, disagreed.
+- `rbox status` no longer intermittently reports "sync halted" on a perfectly
+  healthy machine — a read-only health check was racing the live writer.
+  (#765, design 276.)
+- Files rbox had already been told to ignore no longer linger in the synced
+  set, and a bare `node_modules` ignore rule now matches at any depth, the same
+  way `.git` always did.
 
 ### Performance
-- Zero-change sync cycles no longer rewrite the whole state: a provably
-  no-op save composes a minimal packet (desktop zero-change pull
-  13.3s -> 3.6s; state-save 9.8s -> 0.8s). Kill switch RBOX_SAVE_NOOP_ELIDE.
-- Content-carrying saves are delta-staged: only changed entries are
-  written and verified (one-changed save ~2.8s -> ~60ms; Mac 1-blob
-  receive 20.4s -> 9.0s). Complete saves remain the genesis/repair
-  fallback. Kill switch RBOX_SAVE_DELTA.
-- Git state-CAS lock acquisition amortized (append-structured journal,
-  batched directory fsyncs, single-use release handle): large-pull
-  acquire 50.3s -> 16.4s at 2,292 locks, with per-span lock counts now
-  reported.
-- Held git repos with composer artifact holds join the held-skip fast
-  path (~3.5s -> ~53ms per repo per cycle). Kill switch
-  RBOX_GIT_HELD_SKIP_COMPOSER.
 
-### Fixed
-- Sync status spans now attribute lock counts (locks<N> blocked<M>) so
-  O(N) durability work is distinguishable from real contention.
-- Held-skip could survive a manual git resolution's artifact changes; the
-  artifact plane is now digested into skip eligibility.
+- **Sending a change is 4-5× faster.** A "nothing changed" push went from 7.4s
+  to a 1.5s median on the Linux workstation and 6.6s to 2.7s on the MacBook.
+  (#661, design 277.)
+  - The push cycle was materializing rbox's entire state five times per cycle;
+    it now does so at most once (`RBOX_STATE_LOAD_CACHE=0` restores the old
+    behaviour).
+  - A separate 51-second tail on content pushes was settlement waiting for the
+    next scan tick; settlement now happens at each operation boundary
+    (58.5s → 7.0s wall on the workstation).
+- **Receiving a change is dramatically faster on machines with many Git
+  repositories.** The 100+-repo host went from 44s to 8.2s per pull.
+  - Zero-change saves compose a minimal packet instead of rewriting the whole
+    state (zero-change pull 13.3s → 3.6s; `RBOX_SAVE_NOOP_ELIDE`).
+  - Content-carrying saves write and verify only the entries that changed
+    (one-changed save ~2.8s → ~60ms; MacBook 1-blob receive 20.4s → 9.0s;
+    `RBOX_SAVE_DELTA`).
+  - The internal Git lock ceremony was rewritten from an O(N²) journal to an
+    append-structured one with batched directory fsyncs (acquire 50.3s → 16.4s
+    at 2,292 locks), and then scoped to only the markers a given pull actually
+    authors — the busy host now takes zero locks on a steady pull, down from
+    1,882 (`RBOX_CAS_DELTA_LOCKS=0`). (Designs 268, 279.)
+  - Repos that are paused and unchanged skip their per-repo work entirely
+    (~3.5s → ~53ms per repo per cycle), including ones held by a base-composer
+    artifact (`RBOX_GIT_HELD_SKIP_COMPOSER`).
+  - Applying incoming Git work on the workstation went from 45.3s to 1.3s once
+    checkout blockers were properly typed, and a repeatedly re-probed wedged
+    repo went from ~2.5s to ~10ms per push.
+- Sync status lines now attribute lock counts (`locks<N> blocked<M>`) so
+  durability work is distinguishable from real contention, and per-hop
+  propagation timings can be traced end-to-end with exact sequence correlation.
 
+### Known limitations
 
-### Changed
-- macOS filesystem scans now use the native bulk directory walk by default
-  when supported; no environment opt-in is required. Runtime capability,
-  directory-probe, and per-directory fallback guards remain in place.
+Things we know about, judged safe to ship, and are telling you straight —
+each has an open issue:
 
-### Fixed
-- Leftover `AUTO_MERGE`, `MERGE_MSG`, and `REBASE_HEAD` files from concluded
-  Git operations no longer strand followers; real in-progress markers still
-  defer, and linked-worktree diagnostics name the responsible worktree.
-- Watcher overflow protection now counts first-drop-anchored 5-second episodes,
-  rather than counting every callback in an operating-system overflow burst;
-  `RBOX_WATCHER_RETRUST_M` therefore measures episodes, not callbacks.
+- A Git repo whose sync journal rbox cannot read re-checks itself on a slow
+  cycle and stays paused rather than guessing; `rbox status` names it.
+  Resolution work is queued. (#775)
+- If you stop rbox while it is mid-write on a very busy machine, the stop can
+  time out and force-quit after 60 seconds, occasionally leaving a stale lock
+  file that pauses one repo until the next sync cycle clears it. (#672)
+- A Git repo whose checkout is behind its synced branch can briefly show new
+  file contents before Git itself catches up; rbox pauses the Git side rather
+  than guess, and tells you. (#669)
+- Commands that restore old versions (`rbox versions`, `rbox trash restore`)
+  currently read paths relative to the synced folder's root, not your current
+  directory — run them from the folder root to be safe. (#516)
+- `rbox ignore` with a bare flag and no pattern currently does nothing useful
+  and does not say so. Give it the pattern explicitly. (#518)
+- A Git repo with an enormous configuration (over 512 keys) cannot sync its
+  config changes; everything else in that repo still syncs. (#702)
+- Extra local files that were never part of sync (including rbox's own saved
+  `*.conflict*` copies) can keep one repo's background self-check
+  permanently unsatisfied. It is a diagnostic annoyance, not a sync fault.
+  (#659)
 
-## [2.0.0-beta.2] - 2026-08-12
-
-### Fixed
-- Background sync no longer re-rings its own doorbell: the Linux git watcher
-  ignores rbox's own bookkeeping clicks, ending a no-op push loop (~3s cycle).
-- A folder with unfinished git work (e.g. a paused merge on another machine)
-  now costs milliseconds per sync instead of ~9 seconds — rbox remembers the
-  stuck state instead of re-checking it from scratch every time.
-- Unchanged git repos skip the per-repo work queues on both push and pull.
-
-### Added
-- Propagation measurement rig: per-hop timing with exact sequence
-  correlation; `rbox status` now names a degraded file-watcher outright.
-
-## [2.0.0-beta.1] - 2026-08-11
-
-### Changed
-- **Setup is folder-first (design 230):** the guided flow speaks "synced
-  folder" and offers three plain choices (sync `~/rbox`, sync another folder
-  here, sync a folder from another machine); workspace vocabulary remains in
-  internal records, flags, and JSON unchanged.
-- The 2.0 runtime line (U3 primitives, #623) ships from `main`; no wire or
-  storage format changed relative to v1.11.4.
-- **Breaking: `~/.rbox/config.json` is now the authority for which local folders
-  rbox may sync and for their safe sync options.** Existing local bindings are
-  preserved, but a machine that has bindings and no catalog must explicitly run
-  `rbox config regenerate`; rbox will not guess after a missing or damaged
-  catalog. Use `rbox config` to inspect the result, `rbox config add <path>` to
-  admit a detached binding, and `rbox config repair <path>` after a proven local
-  folder move.
+> The `v2.0.0-beta.1`–`v2.0.0-beta.4` prereleases shipped only to the
+> founder fleet's `next` channel; their changes are folded into 2.0.0 above.
+> `v2.0.0-beta.3` was tagged but never published. `v2.0.0-beta.5` was the
+> release-pipeline dress rehearsal.
 
 ## [1.11.4] - 2026-07-31
 
