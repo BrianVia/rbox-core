@@ -17,7 +17,8 @@ import { ManualBaseProofIncompleteError, ManualLineageProofUnavailableError } fr
 import { safeResolveText, type GitResolveShow } from "./git/resolve-presentation.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { settleCommittedBranchArtifacts } from "./sync-git/received-git-transition-commit.js";
-import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
+import { basePresentKeepRef } from "./sync-git/base-artifacts.js";
+import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition } from "./sync-git/branch-transition.js";
 import { prepareFollowerBranchProtocol } from "./sync-git/follower-protocol.js";
 import { resolutionBindingIdentity } from "./sync-git/resolution-intent.js";
 import { gitFollowEnabled } from "./sync-git/shared.js";
@@ -161,6 +162,36 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
   };
   await saveStateUnsafeLegacyOrTest(root, state);
   return { base, incoming, localTip };
+}
+
+async function seedStandingCreateReceipt(ref: string, nextOid: string) {
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = repoRecordsForState(state).repo;
+  const ctx = await repoCtx(receiver);
+  const liveRefs = Object.fromEntries((await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)"))
+    .split("\n").filter(Boolean).map((line) => line.split(" ") as [string, string]));
+  const prepared = await prepareFollowerBranchProtocol({
+    workspaceRoot: root, relPath: "repo", state, ctx, record,
+    base: record?.base, incoming: record!.pending!, liveRefs,
+  });
+  if (prepared.status !== "ready") throw new Error(prepared.reason);
+  const committed = await commitPlannedBranchTransition(await planManualBranchTransition({
+    repoDir: receiver,
+    binding: prepared.protocol.binding,
+    ref,
+    physicalBeforeOid: null,
+    afterOid: nextOid,
+    logicalBaseOid: null,
+  }));
+  if (committed.witness.kind !== "present") throw new Error("expected a present receipt");
+  return [
+    { ref, expectedOid: nextOid },
+    { ref: committed.witness.artifactRef, expectedOid: committed.witness.artifactOid },
+    {
+      ref: basePresentKeepRef(prepared.protocol.binding, ref, committed.witness.episode, "next"),
+      expectedOid: nextOid,
+    },
+  ];
 }
 
 function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) {
@@ -694,6 +725,79 @@ test("take-theirs composes a stable side branch with no P into a manual origin",
   expect(saved.branchBaseOrigins?.["refs/heads/topic"]).toMatchObject({ kind: "manual", oid: nextOid });
   expect(saved.branchBaseOrigins?.["refs/heads/topic"]?.kind === "manual"
     ? saved.branchBaseOrigins["refs/heads/topic"]!.episode : "").toMatch(/^[0-9a-f]{32}$/);
+});
+
+test("take-theirs consumes a current-branch CREATE receipt as reserved artifact proof", async () => {
+  const { incoming, localTip } = await fixture();
+  const nextOid = incoming.refs["refs/heads/main"]!;
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = state.repoRecords!.repo!;
+  delete record.base;
+  delete record.branchBaseOrigins;
+  await saveStateUnsafeLegacyOrTest(root, state);
+  await git(receiver, "fetch", "-q", sender, nextOid);
+  await git(receiver, "checkout", "-q", "--detach");
+  await git(receiver, "branch", "-D", "main");
+  await git(receiver, "symbolic-ref", "HEAD", "refs/heads/main");
+  const reservations = await seedStandingCreateReceipt("refs/heads/main", nextOid);
+  const rejected: string[] = [];
+  const current = await show([]);
+  const lines: string[] = [];
+
+  const code = await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines, {
+    beforeSecondProof: async () => {
+      for (const reservation of reservations) {
+        try {
+          await git(receiver, "update-ref", reservation.ref, localTip, reservation.expectedOid);
+        } catch {
+          rejected.push(reservation.ref);
+        }
+      }
+    },
+  }));
+
+  expect(code).toBe(0);
+  expect(JSON.parse(lines.at(-1)!).status).toBe("resolved");
+  expect(rejected).toEqual(reservations.map(({ ref }) => ref));
+  const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  expect(saved.branchBaseOrigins?.["refs/heads/main"]).toMatchObject({ kind: "pull-p", oid: nextOid });
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-local/base-present/v2", "refs/rbox-local/base-present-keep/v2")).toBe("");
+});
+
+test("take-theirs consumes a side-branch CREATE receipt as reserved artifact proof", async () => {
+  const { incoming, localTip } = await fixture();
+  const ref = "refs/heads/receipt-side";
+  const nextOid = incoming.refs["refs/heads/main"]!;
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = state.repoRecords!.repo!;
+  delete record.base;
+  delete record.branchBaseOrigins;
+  record.pending = { ...record.pending!, refs: { ...record.pending!.refs, [ref]: nextOid } };
+  await saveStateUnsafeLegacyOrTest(root, state);
+  await git(receiver, "fetch", "-q", sender, nextOid);
+  const reservations = await seedStandingCreateReceipt(ref, nextOid);
+  const rejected: string[] = [];
+  const current = await show([]);
+  const lines: string[] = [];
+
+  const code = await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines, {
+    beforeSecondProof: async () => {
+      for (const reservation of reservations) {
+        try {
+          await git(receiver, "update-ref", reservation.ref, localTip, reservation.expectedOid);
+        } catch {
+          rejected.push(reservation.ref);
+        }
+      }
+    },
+  }));
+
+  expect(code).toBe(0);
+  expect(JSON.parse(lines.at(-1)!).status).toBe("resolved");
+  expect(rejected).toEqual(reservations.map(({ ref: reservedRef }) => reservedRef));
+  const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  expect(saved.branchBaseOrigins?.[ref]).toMatchObject({ kind: "pull-p", oid: nextOid });
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-local/base-present/v2", "refs/rbox-local/base-present-keep/v2")).toBe("");
 });
 
 test("take-theirs verifies an already-absent branch and creates A before removing BASE", async () => {
@@ -1521,7 +1625,7 @@ test("the standing-artifact refusal replaces its raw hold reason with curated te
   const output = lines.at(-1)!;
   expect(JSON.parse(output)).toEqual({
     status: "refused", verb: "take-theirs", repo: "repo", code: "artifact",
-    message: "the incoming checkout was applied but its settlement could not finish; your prior state is preserved in the Git quarantine — retry after Git state settles",
+    message: "the incoming checkout was applied but artifact cleanup could not finish; your prior state is preserved in the Git quarantine — rerun take-theirs to complete cleanup",
   });
   // The raw hold reason names the namespace it refused; none of it may leak.
   expect(output).not.toContain("rbox-local/base-present");

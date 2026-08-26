@@ -19,6 +19,7 @@ import type { BranchTransitionWitness, LockedBranchProof, RepoBaseProof, SafeRef
 import type { BreadcrumbVetoGate } from "./breadcrumb-veto.js";
 import type { GitFingerprint } from "./fingerprint.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
+import type { BasePresentPayload, PreparedProtocolRef } from "./base-artifacts.js";
 
 export class WorktreeOwnershipUnreadableError extends Error {
   constructor(cause: unknown) {
@@ -148,6 +149,7 @@ export interface FollowOptions {
     waivedReasons: readonly Extract<GitDeferralReason,
       "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash">[];
     protectedOids: readonly string[];
+    receipts?: readonly PreparedProtocolRef<BasePresentPayload>[];
     secondProof: (authoredRefChanges: readonly { ref: string; before?: string; after?: string }[]) => Promise<boolean>;
   };
 }

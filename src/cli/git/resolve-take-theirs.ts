@@ -25,7 +25,7 @@ import { resolutionBindingIdentity } from "../sync-git/resolution-intent.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
 import { workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "../sync-mutex.js";
 import { inputRecord } from "../sync-state.js";
-import { settleCommittedManualPresentArtifacts } from "./resolve-artifacts.js";
+import { settleCommittedManualPresentArtifacts, type ManualLandingReceipt } from "./resolve-artifacts.js";
 import { ManualBaseProofIncompleteError, ManualLineageProofUnavailableError, RESOLVE_TYPED_REFUSAL, type GitResolveDeps, type ResolveEnvironment } from "./resolve-contract.js";
 import { buildSnapshot, incomingFor, type ResolveSnapshot, type SnapshotIdentity } from "./resolve-evidence.js";
 import { emit, refusalMessage } from "./resolve-presentation.js";
@@ -88,11 +88,12 @@ export interface TakeTheirsRun {
   incoming: GitSection;
   ctx: RepoCtx;
   branchProtocol: FollowerBranchProtocol | undefined;
+  receipts: readonly ManualLandingReceipt[];
   snapshot: ResolveSnapshot;
 }
 
 export async function runTakeTheirsResolve(run: TakeTheirsRun): Promise<number> {
-  const { root, rel, json, deps, env, mutex, options, now, step, state, record, incoming, ctx, branchProtocol } = run;
+  const { root, rel, json, deps, env, mutex, options, now, step, state, record, incoming, ctx, branchProtocol, receipts } = run;
   const verb = "take-theirs" as const;
   let snapshot = run.snapshot;
   const takeSnapshot = () => buildSnapshot({
@@ -142,6 +143,19 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
   if (!branchProtocol) throw new ManualLineageProofUnavailableError();
   const branchDecisions: Record<string, ManualBranchDecision> = {};
   const branches: Record<string, RepoBaseLockedProof["branches"][string]> = {};
+  for (const [ref, terminal] of Object.entries(progress.manualBranchTerminals ?? {})) {
+    branchDecisions[ref] = {
+      kind: "no-p", beforeOid: terminal.beforeBaseOid, afterOid: terminal.afterOid, episode: manualEpisode,
+    };
+    branches[ref] = {
+      liveOid: terminal.afterOid,
+      artifactsClear: true,
+      ownershipStable: true,
+      reflogStable: true,
+      currentRef: false,
+      siblingOwned: false,
+    };
+  }
   for (const [ref, witness] of Object.entries(progress.branchWitnesses ?? {})) {
     branchDecisions[ref] = {
       kind: "artifact",
@@ -159,19 +173,6 @@ const makeIntended = (progress: FollowProgress): FollowIntended => {
     };
     if (witness.kind === "present") lockedBranch.reflogEpisode = witness.episode;
     branches[ref] = lockedBranch;
-  }
-  for (const [ref, terminal] of Object.entries(progress.manualBranchTerminals ?? {})) {
-    branchDecisions[ref] = {
-      kind: "no-p", beforeOid: terminal.beforeBaseOid, afterOid: terminal.afterOid, episode: manualEpisode,
-    };
-    branches[ref] = {
-      liveOid: terminal.afterOid,
-      artifactsClear: true,
-      ownershipStable: true,
-      reflogStable: true,
-      currentRef: false,
-      siblingOwned: false,
-    };
   }
   const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(
     Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => {
@@ -253,6 +254,7 @@ const follow = await followDivergedRepo({
     snapshotId: snapshot.public.snapshot,
     waivedReasons: snapshot.waivedReasons,
     protectedOids: snapshot.protectedOids,
+    receipts,
     secondProof: async (authoredRefChanges) => {
       await deps.beforeSecondProof?.();
       const currentState = await loadState(root, syncStreamId(env.cfg));

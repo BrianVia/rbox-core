@@ -12,7 +12,7 @@ import {
 } from "./keep-pins.js";
 import { readAllRefs, readAllRefsStrict } from "./refs.js";
 import type { GitDeferralReason, GitPartialApply, TypedBlocker } from "../config.js";
-import type { BranchTransitionWitness, LockedBranchProof, SafeRefWitness } from "./base-composer.js";
+import { presentWitnessFromPreparedRef, type BranchTransitionWitness, type LockedBranchProof, type SafeRefWitness } from "./base-composer.js";
 import {
   commitPlannedBranchTransition,
   planBranchTransition,
@@ -307,6 +307,20 @@ export async function publishObservedRefPlane(state: RefPlaneObservation): Promi
   }
   if (checkoutRefReason && !checkoutRefReasonFromIndeterminate) {
     blockers.push(blockerForReason(checkoutRefReason, "checkout", checkoutRefDetail));
+  }
+  for (const receipt of opts.manualResolution?.receipts ?? []) {
+    const witness = presentWitnessFromPreparedRef(receipt);
+    branchWitnesses[witness.ref] = witness;
+    branchLockedProofs[witness.ref] = {
+      liveOid: witness.nextOid,
+      witness,
+      reflogEpisode: witness.episode,
+      artifactsClear: true,
+      ownershipStable: true,
+      reflogStable: true,
+      currentRef: witness.ref === incomingHeadRef,
+      siblingOwned: false,
+    };
   }
   const result: RefPlaneProgress = {
     appliedRefs,

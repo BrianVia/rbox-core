@@ -1,29 +1,52 @@
 /**
- * Settling the standing Git protocol artifacts (design 130 P records) before a
- * resolve is allowed to take a confirmation snapshot, and again after the
- * confirmed checkout lands.
+ * Settling or classifying standing Git protocol artifacts (design 130 P
+ * records) before a manual resolve, and settling them after the confirmed
+ * checkout lands.
  *
- * A confirmation snapshot taken while exact P authority still stands would
- * promise state the publisher can still move underneath it, so this module runs
- * the compact/repair/settle loop to a fixed point and otherwise holds with a
- * reason. It owns that loop; the orchestrator only learns "ready" or "hold".
+ * Exact CREATE receipts may survive the confirmation snapshot because the
+ * checkout transaction reserves their R/P/K refs. Everything else runs the
+ * compact/repair/settle loop to a fixed point or holds with a reason.
  */
 import type { GitSection } from "../../engine/index.js";
 import { loadState, repoRecordsForState, type RepoRecord, type SyncState } from "../config.js";
-import { readBasePresentArtifact, settleBaseAbsentArtifact } from "../sync-git/base-artifacts.js";
+import { readBasePresentArtifact, settleBaseAbsentArtifact, type BasePresentPayload, type PreparedProtocolRef } from "../sync-git/base-artifacts.js";
 import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "../sync-git/follower-protocol.js";
 import { type RepoCtx } from "../sync-git/git-state.js";
 import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "../sync-git/p-repair-state.js";
 import { inspectLockedPRepairReceipt, persistPRepairTerminal, refreshLockedAcceptedPRepair, resumeLockedAcceptedPRepair, runLockedPRepairAttempt } from "../sync-git/p-repair-transaction.js";
-import { settleExactPresentArtifact } from "../sync-git/p-settlement.js";
+import { exactPresentArtifactEpisodeTop, settleExactPresentArtifact } from "../sync-git/p-settlement.js";
+import { readRefReflogFingerprint } from "../sync-git/keep-pins.js";
 import { readAllRefs } from "../sync-git/refs.js";
 import { incomingFor } from "./resolve-evidence.js";
 
 export type ManualProtocolPreflight =
-  | { status: "ready"; state: SyncState; record: RepoRecord; incoming: GitSection; protocol: FollowerBranchProtocol }
+  | { status: "ready"; state: SyncState; record: RepoRecord; incoming: GitSection; protocol: FollowerBranchProtocol; receipts: ManualLandingReceipt[] }
   | { status: "hold"; reason: string };
 
-/** A confirmation snapshot is never taken while exact P authority stands. */
+export type ManualLandingReceipt = PreparedProtocolRef<BasePresentPayload>;
+
+async function receiptMismatch(
+  repoDir: string,
+  liveRefs: Readonly<Record<string, string>>,
+  incoming: GitSection,
+  receipt: ManualLandingReceipt,
+): Promise<string | undefined> {
+  const { ref, nextOid, episode } = receipt.payload;
+  const liveOid = liveRefs[ref];
+  const incomingOid = incoming.refs[ref];
+  const mismatches: string[] = [];
+  if (liveOid !== nextOid) mismatches.push(`live ${liveOid ?? "<absent>"} != nextOid ${nextOid}`);
+  if (incomingOid !== nextOid) mismatches.push(`incoming ${incomingOid ?? "<absent>"} != nextOid ${nextOid}`);
+  try {
+    const reflog = await readRefReflogFingerprint(repoDir, ref);
+    if (!exactPresentArtifactEpisodeTop(reflog.bytes, receipt.payload)) mismatches.push(`reflog top != episode ${episode}`);
+  } catch {
+    mismatches.push(`reflog top unreadable for episode ${episode}`);
+  }
+  return mismatches.length ? `standing P for ${ref} is not a manual landing receipt: ${mismatches.join(", ")}` : undefined;
+}
+
+/** A confirmed mutation is never started while exact P authority is unreserved. */
 export async function preflightManualPresentArtifacts(args: {
   root: string;
   rel: string;
@@ -74,50 +97,63 @@ export async function preflightManualPresentArtifacts(args: {
         return { status: "hold", reason: `foreign BASE artifact vetoes confirmed mutation of ${ref}` };
       }
     }
-    const p = prepared.protocol.presentArtifacts[0];
-    if (!p) return { status: "ready", state, record, incoming, protocol: prepared.protocol };
-    const exact = await settleExactPresentArtifact({
-      root: args.root, stream: state.stream, state, relPath: args.rel, ctx: args.ctx,
-      binding: prepared.protocol.binding, p,
-    });
-    if (exact.status === "settled") { state = exact.state; continue; }
-    if (exact.status === "absent") {
-      const reloaded = await loadState(args.root, state.stream);
-      state = reloaded;
-      continue;
-    }
-    if (exact.status === "moved") {
-      const port = createPRepairStatePort({
-        root: args.root, stream: state.stream, relPath: args.rel, repoKind: args.ctx.kind,
-        effectiveRefScope: record.base?.refScope ?? incoming.refScope, p,
+    const receipts: ManualLandingReceipt[] = [];
+    const refusals: string[] = [];
+    let restart = false;
+    const presentArtifacts = record.base ? prepared.protocol.presentArtifacts.slice(0, 1) : prepared.protocol.presentArtifacts;
+    for (const p of presentArtifacts) {
+      const exact = await settleExactPresentArtifact({
+        root: args.root, stream: state.stream, state, relPath: args.rel, ctx: args.ctx,
+        binding: prepared.protocol.binding, p,
       });
-      const disposition = prepared.protocol.artifacts[p.payload.ref];
-      const validateArtifacts = async (): Promise<boolean> => {
-        const fresh = await readBasePresentArtifact(args.ctx.repoDir, prepared.protocol.binding, p.payload.ref);
-        return fresh.status === "valid" && fresh.artifact.targetOid === p.targetOid
-          && disposition?.present === "valid-owning" && disposition.keeps === "exact"
-          && disposition.absence === "absent" && disposition.settledAbsence === "absent";
-      };
-      const accepted = record.partial?.pRepaired?.[p.payload.ref];
-      const repaired = accepted
-        ? await resumeLockedAcceptedPRepair({ repoDir: args.ctx.repoDir, receipt: accepted, validateArtifacts }).then(async (resumed) =>
-            resumed.status === "refresh-receipt"
-              ? refreshLockedAcceptedPRepair({
-                  repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(), acceptedReceipt: accepted,
-                  mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
-                  validateArtifacts,
-                })
-              : resumed.status === "restart" ? { status: "restart" as const } : { status: "hold" as const, reason: resumed.reason })
-        : await runLockedPRepairAttempt({
-            repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(),
-            mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
-            validateArtifacts,
-          });
-      if (repaired.status === "hold") return { status: "hold", reason: repaired.reason };
-      state = await loadState(args.root, state.stream);
-      continue;
+      if (exact.status === "settled") { state = exact.state; restart = true; break; }
+      if (exact.status === "absent") {
+        state = await loadState(args.root, state.stream);
+        restart = true;
+        break;
+      }
+      if (exact.status === "hold" && exact.code === "base-absent") {
+        const mismatch = await receiptMismatch(args.ctx.repoDir, liveRefs, incoming, p);
+        if (mismatch) refusals.push(mismatch); else receipts.push(p);
+        continue;
+      }
+      if (exact.status === "moved") {
+        const port = createPRepairStatePort({
+          root: args.root, stream: state.stream, relPath: args.rel, repoKind: args.ctx.kind,
+          effectiveRefScope: record.base?.refScope ?? incoming.refScope, p,
+        });
+        const disposition = prepared.protocol.artifacts[p.payload.ref];
+        const validateArtifacts = async (): Promise<boolean> => {
+          const fresh = await readBasePresentArtifact(args.ctx.repoDir, prepared.protocol.binding, p.payload.ref);
+          return fresh.status === "valid" && fresh.artifact.targetOid === p.targetOid
+            && disposition?.present === "valid-owning" && disposition.keeps === "exact"
+            && disposition.absence === "absent" && disposition.settledAbsence === "absent";
+        };
+        const accepted = record.partial?.pRepaired?.[p.payload.ref];
+        const repaired = accepted
+          ? await resumeLockedAcceptedPRepair({ repoDir: args.ctx.repoDir, receipt: accepted, validateArtifacts }).then(async (resumed) =>
+              resumed.status === "refresh-receipt"
+                ? refreshLockedAcceptedPRepair({
+                    repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(), acceptedReceipt: accepted,
+                    mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
+                    validateArtifacts,
+                  })
+                : resumed.status === "restart" ? { status: "restart" as const } : { status: "hold" as const, reason: resumed.reason })
+          : await runLockedPRepairAttempt({
+              repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(),
+              mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseRefs: exact.reason === "base-shape" },
+              validateArtifacts,
+            });
+        if (repaired.status === "hold") return { status: "hold", reason: repaired.reason };
+        state = await loadState(args.root, state.stream);
+        restart = true;
+        break;
+      }
+      return { status: "hold", reason: exact.reason };
     }
-    return { status: "hold", reason: exact.reason };
+    if (restart) continue;
+    if (refusals.length) return { status: "hold", reason: refusals.join("; ") };
+    return { status: "ready", state, record, incoming, protocol: prepared.protocol, receipts };
   }
   return { status: "hold", reason: "P settlement did not stabilize before confirmation" };
 }

@@ -36,7 +36,7 @@ class PSettlementMovementError extends Error {
   }
 }
 
-function exactEpisodeTop(bytes: Uint8Array, payload: BasePresentPayload): boolean {
+export function exactPresentArtifactEpisodeTop(bytes: Uint8Array, payload: BasePresentPayload): boolean {
   const lines = Buffer.from(bytes).toString("latin1").split("\n");
   if (lines.at(-1) === "") lines.pop();
   const top = lines.at(-1);
@@ -95,7 +95,7 @@ export async function settleExactPresentArtifact(input: {
         return first.status === "absent" ? { status: "absent" as const } : { status: "hold" as const, reason: "P/K changed before exact settlement" };
       }
       const initialReflog = await readRefReflogFingerprint(input.ctx.repoDir, payload.ref);
-      if (!exactEpisodeTop(initialReflog.bytes, payload)) return { status: "moved" as const, reason: "reflog" as const };
+      if (!exactPresentArtifactEpisodeTop(initialReflog.bytes, payload)) return { status: "moved" as const, reason: "reflog" as const };
       let stateAfter: SyncState | undefined;
       if (lease?.abortRequested) throw new MutationGateClosedError();
       await runPreparedUpdateRefTransaction(input.ctx.repoDir, retirementLines(input.p), async () => {
@@ -105,7 +105,7 @@ export async function settleExactPresentArtifact(input: {
           const locked = await readBasePresentArtifact(input.ctx.repoDir, input.binding, payload.ref);
           if (locked.status !== "valid" || locked.artifact.targetOid !== input.p.targetOid) throw new Error("P/K moved at exact settlement boundary");
           const reflog = await readRefReflogFingerprint(input.ctx.repoDir, payload.ref);
-          if (reflog.sha256 !== initialReflog.sha256 || !exactEpisodeTop(reflog.bytes, payload)) {
+          if (reflog.sha256 !== initialReflog.sha256 || !exactPresentArtifactEpisodeTop(reflog.bytes, payload)) {
             throw new PSettlementMovementError("reflog", "P reflog moved at exact settlement boundary");
           }
           const fresh = await loadRawState(input.root);

@@ -39,7 +39,7 @@ import type { FollowerBranchProtocol } from "../sync-git/follower-protocol.js";
 import { assertCommandAllowedOnScopedBinding, ScopedBindingRefusal } from "../scope/binding-scope.js";
 import { ensureFolderAuthority } from "../folder-authority.js";
 import { applyFolderPolicy, observeFolderAdmission, runtimeRefusal } from "../folder-inventory.js";
-import { preflightManualPresentArtifacts } from "./resolve-artifacts.js";
+import { preflightManualPresentArtifacts, type ManualLandingReceipt } from "./resolve-artifacts.js";
 import {
   ManualBaseProofIncompleteError,
   ManualLineageProofUnavailableError,
@@ -228,6 +228,7 @@ export async function gitResolveCmd(
       return 0;
     }
     let branchProtocol: FollowerBranchProtocol | undefined;
+    let manualLandingReceipts: ManualLandingReceipt[] = [];
     if (verb === "take-theirs") {
       step("settling standing Git protocol artifacts");
       const preflight = await preflightManualPresentArtifacts({ root, rel, ctx, state });
@@ -239,6 +240,7 @@ export async function gitResolveCmd(
       record = preflight.record;
       incoming = preflight.incoming;
       branchProtocol = preflight.protocol;
+      manualLandingReceipts = preflight.receipts;
     }
     const progressScheduler = deps.progressScheduler ?? {
       setInterval: (fn: () => void, ms: number) => setInterval(fn, ms),
@@ -287,7 +289,7 @@ export async function gitResolveCmd(
     }
     return await runTakeTheirsResolve({
       root, rel, json, deps, env, mutex, options, now, step,
-      state, record: record!, incoming: incoming!, ctx: ctx!, snapshot, branchProtocol,
+      state, record: record!, incoming: incoming!, ctx: ctx!, snapshot, branchProtocol, receipts: manualLandingReceipts,
     });
 
   }, mutexOptions);
