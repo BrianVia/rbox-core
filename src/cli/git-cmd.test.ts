@@ -1536,8 +1536,12 @@ test("the two makeIntended error classes classify into their own resolve codes",
 });
 
 test("authored reflog normalization explains before+after, refuses a third oid", () => {
-  const identity = (refs: [string, string][], reflogs: [string, string[]][]): SnapshotIdentity =>
-    ({ refs, reflogs, stash: [], head: "ref: refs/heads/main\n", index: { kind: "projected", value: "i" }, opState: [], oracle: "o", config: "c" }) as unknown as SnapshotIdentity;
+  const identity = (refs: Array<[string, string]>, reflogs: Array<[string, string[]]>): SnapshotIdentity => ({
+    stream: "s", stateNonce: "n", incomingKey: "k", repoGen: 1, refs, reflogs,
+    head: "ref: refs/heads/main\n", index: { kind: "projected", value: "i" }, opState: [], stash: [],
+    oracleReceipt: null, config: { ownership: "owned", read: "ok" }, effectiveRefScope: "all",
+    capturePolicy: { syncGit: true, respectGitignore: true }, repoKind: "dir", repositoryIdentity: "r",
+  });
   const confirmed = identity([["refs/heads/side", "aaa1"]], [["refs/heads/side", []]]);
   const change = { ref: "refs/heads/side", before: "aaa1", after: "bbb2" };
   // The authored append introduced BOTH oids into a previously-empty reflog.
