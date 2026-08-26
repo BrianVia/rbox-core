@@ -30,17 +30,29 @@ import { ManualBaseProofIncompleteError, ManualLineageProofUnavailableError, RES
 import { buildSnapshot, incomingFor, type ResolveSnapshot, type SnapshotIdentity } from "./resolve-evidence.js";
 import { emit, refusalMessage } from "./resolve-presentation.js";
 
-function reconcileLog(confirmed: readonly string[], actual: readonly string[], authored?: string): string[] | undefined {
+function reconcileLog(
+  confirmed: readonly string[],
+  actual: readonly string[],
+  authored?: { before?: string; after?: string },
+): string[] | undefined {
   const before = [...confirmed].sort();
   const live = [...actual].sort();
-  if (authored === undefined) return live.length === 0 ? before : undefined;
-  const withAuthored = [...new Set([...before, authored])].sort();
-  return JSON.stringify(live) === JSON.stringify(before) || JSON.stringify(live) === JSON.stringify(withAuthored)
-    ? before
-    : undefined;
+  if (authored?.after === undefined) return live.length === 0 ? before : undefined;
+  // Git's authored `before → after` append introduces BOTH oids when the
+  // prior reflog was absent/expired/lacked the live tip — a repo could
+  // deterministically reject its own confirmed transaction without the
+  // `before` member (field: FM savvy repos looped at the boundary). Any
+  // OTHER unexplained oid still refuses: an external A→C→B ABA that smuggled
+  // commit C past confirmation must never normalize away.
+  const explained = [before, [...new Set([...before, authored.after])], authored.before === undefined
+    ? undefined
+    : [...new Set([...before, authored.before, authored.after])]]
+    .filter((set): set is string[] => set !== undefined)
+    .map((set) => JSON.stringify([...set].sort()));
+  return explained.includes(JSON.stringify(live)) ? before : undefined;
 }
 
-function normalizedAfterAuthoredRefs(
+export function normalizedAfterAuthoredRefs(
   current: SnapshotIdentity,
   confirmed: SnapshotIdentity,
   changes: readonly { ref: string; before?: string; after?: string }[],
@@ -53,12 +65,12 @@ function normalizedAfterAuthoredRefs(
     if (refs.get(change.ref) !== change.after) return undefined;
     if (change.before) refs.set(change.ref, change.before); else refs.delete(change.ref);
     if (change.ref === "refs/stash") {
-      const reconciled = reconcileLog(confirmed.stash, stash, change.after);
+      const reconciled = reconcileLog(confirmed.stash, stash, change);
       if (!reconciled) return undefined;
       stash = reconciled;
       continue;
     }
-    const reconciled = reconcileLog(confirmedLogs.get(change.ref) ?? [], liveLogs.get(change.ref) ?? [], change.after);
+    const reconciled = reconcileLog(confirmedLogs.get(change.ref) ?? [], liveLogs.get(change.ref) ?? [], change);
     if (!reconciled) return undefined;
     if (reconciled.length) liveLogs.set(change.ref, reconciled); else liveLogs.delete(change.ref);
   }
