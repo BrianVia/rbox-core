@@ -38,6 +38,8 @@ test("every deferral reason resolves to a story, and unknown reasons fail safe",
 test("the artifact row is fail-closed: 'was saved first' needs a typed post-apply settle AND a backup path", () => {
   expect(gitStoryFor("artifact").code).toBe("sync-download-failed");
   expect(gitStoryFor("artifact", "bundle verify failed").code).toBe("sync-download-failed");
+  expect(gitStoryFor("artifact", "planned graph connectivity proof failed").code).toBe("sync-needs-republish");
+  expect(gitStoryFor("artifact", "planned graph connectivity proof failed").needsYou).toBe(true);
   // A backup path alone is not proof the apply settled.
   expect(gitStoryFor("artifact", "wrote .rbox/git-quarantine/1f3a/1.bundle").code).toBe("sync-download-failed");
   // Nor is the typed prefix alone, without a backup that exists to point at.
@@ -54,7 +56,8 @@ test("the artifact headline is true for a failed download AND for an unusable lo
   const headline = gitStoryFor("artifact").headline;
   expect(headline).toBe("rbox couldn't put the other computer's version in place here — nothing here changed");
   expect(headline).not.toContain("download");
-  expect(gitStoryFor("artifact", "planned graph connectivity proof failed").headline).toBe(headline);
+  // The connectivity cause split into its own truthful story (it can never
+  // self-heal locally): sync-needs-republish, asserted above.
   expect(gitStoryFor("artifact", "git artifact fetch/decrypt/import failed: bundle verify failed").headline).toBe(headline);
 });
 
@@ -811,17 +814,11 @@ test("280 field follow-up: ambient rows survive their own serialize/parse round 
   expect(rows).toHaveLength(1);
   const viaAmbient = gitPauseCounts(
     loudRows(projectGitDeferralRepos(
-      rows.map((row) => ({
-        repo: row.repo,
-        deferral: {
-          lane: "apply" as const,
-          reason: row.reason,
-          deferredSince: row.deferredSince,
-          reasonSince: row.reasonSince,
-          ...(row.lastSeen === undefined ? {} : { lastSeen: row.lastSeen }),
-        },
-        record,
-      })),
+      rows.map((row) => {
+        const base = { lane: "apply" as const, reason: row.reason, deferredSince: row.deferredSince, reasonSince: row.reasonSince };
+        const deferral = row.lastSeen === undefined ? base : { ...base, lastSeen: row.lastSeen };
+        return { repo: row.repo, deferral, record };
+      }),
       NOW,
     )),
     NOW,

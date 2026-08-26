@@ -28,6 +28,7 @@ export type GitStoryCode =
   | "conflict-copies"
   | "sync-interrupted"
   | "sync-download-failed"
+  | "sync-needs-republish"
   | "settle-failed"
   | "repo-unreadable"
   | "busy"
@@ -157,6 +158,16 @@ const SYNC_DOWNLOAD_FAILED = story("sync-download-failed", {
   needsYou: false,
   action: SELF_HEALING,
 });
+// Design 278's connectivity class can NEVER self-heal on this machine: the
+// incoming delta assumes history this repo's copy is missing, and only a
+// healthy publisher can send a complete copy. Labeling it self-healing left
+// repos "retrying" for a week (field, 2026-08-26).
+const SYNC_NEEDS_REPUBLISH = story("sync-needs-republish", {
+  headline: "this repo's copy here is missing history the sync needs — a fresh complete copy from another computer fixes it",
+  plural: "these repos' copies here are missing history the sync needs — fresh complete copies from another computer fix them",
+  needsYou: true,
+  action: { kind: "instruction", text: "On the computer where this repo works normally, run: rbox git republish <repo> — this machine then recovers on its own." },
+});
 const SETTLE_FAILED = story("settle-failed", {
   headline: "the last sync got most of the way and then stopped — your earlier state was saved first",
   needsYou: false,
@@ -209,7 +220,8 @@ const GIT_STORIES = {
   conflict: BOTH_CHANGED,
   "conflict-copies": CONFLICT_COPIES,
   "deletion-pending": SYNC_INTERRUPTED,
-  artifact: (detail?: string) => (detailProvesPostApplySettle(detail) ? SETTLE_FAILED : SYNC_DOWNLOAD_FAILED),
+  artifact: (detail?: string) => (detailProvesPostApplySettle(detail) ? SETTLE_FAILED
+    : detail?.includes("connectivity proof failed") ? SYNC_NEEDS_REPUBLISH : SYNC_DOWNLOAD_FAILED),
   unreadable: REPO_UNREADABLE,
   "ref-read-unreadable": REPO_UNREADABLE,
   config: REPO_UNREADABLE,
