@@ -82,6 +82,19 @@ export function normalizedAfterAuthoredRefs(
   };
 }
 
+/** RBOX_DEBUG_BOUNDARY=1 forensics: name the first identity field that differs. */
+export function boundaryIdentityDiff(normalized: SnapshotIdentity | undefined, confirmed: SnapshotIdentity): string {
+  if (normalized === undefined) return "normalization refused (authored-change mismatch)";
+  for (const key of Object.keys(confirmed) as (keyof SnapshotIdentity)[]) {
+    const live = JSON.stringify(normalized[key]);
+    const expected = JSON.stringify(confirmed[key]);
+    if (live !== expected) {
+      return `field ${key}: live=${live?.slice(0, 400)} confirmed=${expected?.slice(0, 400)}`;
+    }
+  }
+  return "identities equal (?)";
+}
+
 /** Everything take-theirs inherits from the orchestrator, already past the
  *  common preflight and the standing-artifact settlement whose protocol it
  *  needs to compose the new BASE. */
@@ -278,7 +291,13 @@ const follow = await followDivergedRepo({
       });
       const normalized = normalizedAfterAuthoredRefs(currentIdentity, snapshot.identity, authoredRefChanges);
       const same = normalized !== undefined && JSON.stringify(normalized) === confirmedIdentity;
-      if (!same) boundaryMismatch = true;
+      if (!same) {
+        boundaryMismatch = true;
+        if (process.env.RBOX_DEBUG_BOUNDARY === "1") {
+          console.error(`boundary-diff ${rel}: ${boundaryIdentityDiff(normalized, snapshot.identity)}`);
+          console.error(`boundary-diff authored: ${JSON.stringify(authoredRefChanges).slice(0, 600)}`);
+        }
+      }
       return same;
     },
   },
