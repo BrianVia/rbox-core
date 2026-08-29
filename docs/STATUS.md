@@ -1,5 +1,27 @@
 # rbox status — living state snapshot
 
+## 2026-08-28/29 — #836 merged; desktop chromium wedge root-caused → #838 filed + purged
+
+- **PR #836 MERGED** (squash, after rebase onto main + green CI; the shard-5
+  #816 perf red was stale-branch flake). Includes the RBOX_DEBUG_BOUNDARY=1
+  forensics hook for #837. Resolve-robustness series complete on main.
+- **Desktop wedge root-caused (#838, NEW BUG)**: chromium checkout (#828
+  ghosts) pushed the server manifest to 212,846 entries — over the client's
+  MAX_ENTRIES 200K — after which every pull failed validation and
+  `rbox ignore --purge` couldn't run either (purge pulls first). Surface
+  symptom was the misleading "too many conflicts" halt (1,064 failures).
+  Recovered via one-off 400K-cap build: `chromium/` added to
+  ~/Development/.rboxignore, purge succeeded (→ sequence 4523, manifest back
+  to ~25K), stock 2.0.0 daemon restored, throwaway build deleted.
+- Desktop healthy again (backlog 1.04M → ~1). Residuals: 132 paused ghost
+  repos under the now-ignored chromium tree (#828 state cleanup), 1 repo
+  ">1 day stuck" flag, and a lingering "retrying after conflict" probe to
+  re-check.
+- Max (mxcl): telemetry says NOT recovered — his account's last contact
+  Aug 3 on 1.11.4; no 2.0.0 device, no new workspace. Next step: his
+  `rbox status` / `rbox doctor --upload`. (Prod devices readable via
+  `devices.last_seen_version` in prod D1.)
+
 ## 2026-08-26 — **v2.0.0 SHIPPED** 🚀
 
 - **Tagged v2.0.0** (SHA 4cc6cee19, green CI) after the founder's "tag it";
