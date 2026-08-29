@@ -9,6 +9,8 @@ import { hashBytes } from "../engine/hash.js";
 import { captureGitState } from "./sync-git/capture.js";
 import { setGitSpawnObserver } from "../engine/git-spawn.js";
 import { checkoutJournalDir } from "../cli/sync-git/journal.js";
+import { normalizedAfterAuthoredRefs } from "../cli/git/resolve-take-theirs.js";
+import type { SnapshotIdentity } from "../cli/git/resolve-evidence.js";
 import { repoCtx } from "../cli/sync-git/git-state.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd } from "./git/deferrals-command.js";
@@ -1531,6 +1533,23 @@ test("the two makeIntended error classes classify into their own resolve codes",
     if (code === "manual-lineage-proof") expect(parsed.message).not.toContain("/");
     expect(output).not.toMatch(/[\r\n\u001b]/);
   }
+});
+
+test("authored reflog normalization explains before+after, refuses a third oid", () => {
+  const identity = (refs: Array<[string, string]>, reflogs: Array<[string, string[]]>): SnapshotIdentity => ({
+    stream: "s", stateNonce: "n", incomingKey: "k", repoGen: 1, refs, reflogs,
+    head: "ref: refs/heads/main\n", index: { kind: "projected", value: "i" }, opState: [], stash: [],
+    oracleReceipt: null, config: { ownership: "owned", read: "ok" }, effectiveRefScope: "all",
+    capturePolicy: { syncGit: true, respectGitignore: true }, repoKind: "dir", repositoryIdentity: "r",
+  });
+  const confirmed = identity([["refs/heads/side", "aaa1"]], [["refs/heads/side", []]]);
+  const change = { ref: "refs/heads/side", before: "aaa1", after: "bbb2" };
+  // The authored append introduced BOTH oids into a previously-empty reflog.
+  const own = identity([["refs/heads/side", "bbb2"]], [["refs/heads/side", ["aaa1", "bbb2"]]]);
+  expect(normalizedAfterAuthoredRefs(own, confirmed, [change])).toBeDefined();
+  // A third oid is an external ABA and must refuse.
+  const smuggled = identity([["refs/heads/side", "bbb2"]], [["refs/heads/side", ["aaa1", "ccc3", "bbb2"]]]);
+  expect(normalizedAfterAuthoredRefs(smuggled, confirmed, [change])).toBeUndefined();
 });
 
 test("take-theirs completes a null-base side ref already at the candidate (F6)", async () => {
