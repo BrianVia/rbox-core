@@ -1,5 +1,22 @@
 # rbox status — living state snapshot
 
+## 2026-08-30 — three-lane subagent sweep: #839/#840/#841 merged (9 issues closed)
+
+- **#839** (fixes #824): `rbox upgrade` — dead daemon records collapse to one
+  summary line, never exit-1; copy no longer claims an install on no-op.
+- **#840** (fixes #813+#810): manifest entry cap refuses at the shared
+  pre-upload boundary (`preparePublishCandidate`), names the dominating dir +
+  `rbox ignore` remedy, typed `too-many-entries` daemon halt (⛔ not spinner).
+  Would have prevented the #838 wedge. Side effect: doctor-triage.ts
+  decomposed (ratchet re-recorded tighter 473→435; new doctor-triage-halt.ts
+  + doctor-finding.ts). #810's proactive no-trip hint deferred (math exported).
+- **#841** (fixes #513 #514 #516 #517 #518 #519 #521): cli-audit seven-pack.
+  NOTE behavior change: `trash empty`/`key revoke`/`device revoke` need
+  `--yes` headless now; `untrack` needs `--force`. Scripts may need updating.
+- Process note: harness pins agents to their own launch worktrees (EnterWorktree
+  write-only, Bash refused) — agents commit on `worktree-agent-*` branches at
+  the same base; coordinator ff-merges into the named branch. Worked 3/3.
+
 ## 2026-08-28/29 — #836 merged; desktop chromium wedge root-caused → #838 filed + purged
 
 - **PR #836 MERGED** (squash, after rebase onto main + green CI; the shard-5
