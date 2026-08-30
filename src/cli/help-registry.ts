@@ -463,12 +463,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "versions", positionals: 1,
     group: "SYNCING",
     summary: "list version history (or a file's change history)",
-    usage: "rbox versions [file] [--limit <n>] [--json]",
+    usage: "rbox versions [path] [--limit <n>] [--json]",
     flags: [
       { flag: "--limit <n>", desc: "maximum versions to show", takesValue: true },
       { flag: "--json", desc: "print JSON" },
     ],
-    notes: ["[file] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
+    notes: ["[path] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
     examples: ["rbox versions", "rbox versions src/app.ts --limit 20"],
   },
   {
