@@ -133,7 +133,10 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/daemon/process-control.ts", { nonblank: 436, bytes: 21311 }],
   ["src/cli/daemon/watcher.ts", { nonblank: 424, bytes: 17809 }],
   ["src/cli/doctor-cmd.ts", { nonblank: 950, bytes: 44610 }],
-  ["src/cli/doctor-triage.ts", { nonblank: 473, bytes: 23025 }],
+  // Tightened 2026-08-30: the halt remedies moved to doctor-triage-halt.ts and
+  // the finding contract to doctor-finding.ts, so the ratchet records the
+  // smaller file rather than the ceiling the split retired.
+  ["src/cli/doctor-triage.ts", { nonblank: 435, bytes: 21803 }],
   ["src/cli/e2ee-client.ts", { nonblank: 765, bytes: 53107 }],
   ["src/cli/e2ee-remote.ts", { nonblank: 987, bytes: 55332 }],
   ["src/cli/genesis-durable.ts", { nonblank: 707, bytes: 53107 }],
