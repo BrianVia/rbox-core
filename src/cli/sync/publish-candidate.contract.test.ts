@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { CaseFoldCollisionGroup, FileEntry, IgnoreMatcher, Manifest } from "../../engine/index.js";
+import { MAX_ENTRIES, type CaseFoldCollisionGroup, type FileEntry, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import type { CaptureObservationReceipt } from "../sync-git/git-capture-observation.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
-import { MassDeleteGuardError } from "./policy.js";
+import { EntryCapGuardError, MassDeleteGuardError } from "./policy.js";
 import {
   preparePublishCandidate,
   PublishCandidateSealError,
@@ -22,7 +22,7 @@ function entry(path: string, sha = "a".repeat(64)): FileEntry {
 }
 
 function manifest(files: FileEntry[], gitRepos?: Manifest["gitRepos"]): Manifest {
-  return { generatedAt: OBSERVED_AT.toISOString(), files, ...(gitRepos ? { gitRepos } : {}) };
+  return { generatedAt: OBSERVED_AT.toISOString(), files, gitRepos };
 }
 
 function gitPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
@@ -446,6 +446,46 @@ describe("preparePublishCandidate refuses a mass delete before any upload", () =
     const base = manifest(Array.from({ length: 1200 }, (_, index) => entry(`f${index}.txt`)));
     const observation = localObservation(manifest([]));
     const sealed = await preparePublishCandidate(snapshot(base), observation.local, rig.capture, policy());
+    expect(sealed.admission).toBe("publish");
+  });
+});
+
+/** #813: the cap used to fire only in wire validation, after the whole runaway
+ *  tree had been scanned, encrypted and uploaded. Preparing a candidate is the
+ *  last point that costs nothing. */
+describe("preparePublishCandidate refuses an over-cap candidate before any spend", () => {
+  const overCap = (dir: string): Manifest =>
+    manifest(Array.from({ length: MAX_ENTRIES + 1 }, (_, index) => entry(`${dir}/f${index}.txt`)));
+
+  test("the refusal names the dominating directory and the ignore that fixes it", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const observation = localObservation(overCap("chromium/src"), { projected: true });
+    const sealed = preparePublishCandidate(snapshot(manifest([])), observation.local, rig.capture, policy());
+    await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
+    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 200,001 files/);
+    await expect(sealed).rejects.toThrow(/`rbox ignore chromium\/src\/` skips it \(files stay on disk\)/);
+    await expect(sealed).rejects.toThrow(/the limit is 200,000/);
+  });
+
+  test("it refuses at candidate time — no upload port is ever reached", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const observation = localObservation(overCap("build"), { projected: true });
+    await expect(preparePublishCandidate(
+      snapshot(manifest([])),
+      observation.local,
+      rig.capture,
+      policy(),
+    )).rejects.toBeInstanceOf(EntryCapGuardError);
+    // Same effect prefix the mass-delete breaker stops at: capture happened,
+    // nothing was encrypted, uploaded or committed.
+    expect(rig.effects).toEqual(["execute", "notifyBusyDeferred:", "observe", "reportCapturePlan"]);
+  });
+
+  test("a candidate at the cap still publishes", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const atCap = manifest(Array.from({ length: MAX_ENTRIES }, (_, index) => entry(`build/f${index}.txt`)));
+    const observation = localObservation(atCap, { projected: true });
+    const sealed = await preparePublishCandidate(snapshot(manifest([])), observation.local, rig.capture, policy());
     expect(sealed.admission).toBe("publish");
   });
 });

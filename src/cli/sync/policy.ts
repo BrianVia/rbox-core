@@ -49,6 +49,16 @@ export class MassDeleteGuardError extends Error {
   }
 }
 
+/** Producer-typed safety refusal (#813): the candidate carries more entries than
+ * a manifest may hold. Thrown at composition, before any encrypt/upload spend;
+ * the wire-side `validateManifest` bound remains the backstop. */
+export class EntryCapGuardError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EntryCapGuardError";
+  }
+}
+
 /** Design 202: the local view a pull's main line may consume INSTEAD of scanning
  *  the workspace. `manifest` is the daemon's watcher-maintained truth with every
  *  unsettled path already stripped (scan-omission semantics, design 108) and
@@ -71,10 +81,17 @@ export class TrustedViewRefusalError extends Error {
   }
 }
 
+/** Named owner for the deferral tally a scan hands its caller: one counter to
+ *  feed, one flush that emits the batched line. */
+export interface DeferErrnoReporter {
+  onErrno: (code: string) => void;
+  flush: () => void;
+}
+
 export function makeDeferErrnoReporter(
   sink: (line: string) => void = (l) => console.error(`rbox: ${l}`),
   onFault?: () => void,
-): { onErrno: (code: string) => void; flush: () => void } {
+): DeferErrnoReporter {
   const counts = new Map<string, number>();
   return {
     onErrno: (code) => counts.set(code, (counts.get(code) ?? 0) + 1),

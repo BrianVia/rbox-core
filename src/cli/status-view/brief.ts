@@ -43,6 +43,7 @@ export type BriefAccountSummary =
 export type BriefHaltReason =
   | { kind: "mass-delete"; op: "pull" | "push" }
   | { kind: "too-many-refs" }
+  | { kind: "too-many-entries" }
   | { kind: "body-too-large" }
   | { kind: "unknown" };
 
@@ -216,6 +217,7 @@ function briefHaltLine(halt: BriefHaltReason): string {
   switch (halt.kind) {
     case "mass-delete": return "⛔ sync paused to protect against a large deletion · rbox sync --allow-mass-delete";
     case "too-many-refs": return "⛔ workspace has too many files to upload · rbox ignore";
+    case "too-many-entries": return "⛔ workspace has too many files to sync · rbox doctor";
     case "body-too-large": return "⛔ workspace update is too large to upload · rbox ignore";
     case "unknown": return "⛔ sync halted — see rbox logs";
   }

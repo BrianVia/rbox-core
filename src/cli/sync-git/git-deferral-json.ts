@@ -13,12 +13,12 @@ export interface GitDeferralLaneJson {
 }
 
 /** The ONE JSON shape of a checkout classification, shared by every emitter so
- * two surfaces cannot describe the same repo's checkout differently. */
-export function checkoutJson(checkout: GitDeferral["checkout"]): { checkout: NonNullable<GitDeferralLaneJson["checkout"]> } | Record<string, never> {
-  if (checkout?.kind === "branch") {
-    return { checkout: { kind: "branch", ...(checkout.label === undefined ? {} : { label: checkout.label }) } };
-  }
-  return checkout?.kind === "detached" ? { checkout: { kind: "detached" } } : {};
+ * two surfaces cannot describe the same repo's checkout differently. Returns the
+ * VALUE, not a spreadable wrapper: every emitter assigns it to `checkout`, and
+ * an undefined value drops the key on serialization exactly as an absent one did. */
+export function checkoutValue(checkout: GitDeferral["checkout"]): GitDeferralLaneJson["checkout"] {
+  if (checkout?.kind === "branch") return { kind: "branch", label: checkout.label };
+  return checkout?.kind === "detached" ? { kind: "detached" } : undefined;
 }
 
 export function serializeGitDeferralLane(repo: string, deferral: GitDeferral, now: number): GitDeferralLaneJson {
@@ -34,7 +34,7 @@ export function serializeGitDeferralLane(repo: string, deferral: GitDeferral, no
     reasonSince: deferral.reasonSince,
     ageSeconds,
     bytesChanged: deferral.bytesChanged === true,
-    ...checkoutJson(deferral.checkout),
+    checkout: checkoutValue(deferral.checkout),
   };
 }
 

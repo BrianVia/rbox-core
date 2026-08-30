@@ -14,8 +14,10 @@
 import path from "node:path";
 import type { DaemonActivity } from "./activity.js";
 import type { AdoptFenceInspection } from "./adopt-journal.js";
-import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
+import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
+import { SAFE_LOCAL_FILES, SAFE_NOTHING_LOST, scoped, type TriageFinding, type TriageSeverity } from "./doctor-finding.js";
+import { haltFinding } from "./doctor-triage-halt.js";
 import { rowNeedsYou, rowStuck, type GitDeferralRepoProjection } from "./status-view/git-projection.js";
 import { storyInstruction } from "./status-view/git-stories.js";
 import { loudRows, renderGitPauseSummary } from "./status-view/git-story-render.js";
@@ -26,20 +28,7 @@ import type { DoctorChecks } from "./doctor-cmd.js";
 
 export { readTriageInputs, unverifiedChecks, type DaemonObservation, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
 
-export type TriageSeverity = "blocked" | "attention" | "info";
-
-export interface TriageFinding {
-  /** Stable machine id for `--json` consumers (agents, CI, the rig). */
-  id: string;
-  severity: TriageSeverity;
-  /** What is wrong, in the words a non-developer would use. */
-  problem: string;
-  /** Whether their data is safe. Always answered — never left implied. */
-  safety: string;
-  /** One copy-pasteable command, carrying its own workspace when the command is
-   * workspace-scoped. Omitted only when no command can honestly fix the state. */
-  command?: string;
-}
+export type { TriageFinding, TriageSeverity } from "./doctor-finding.js";
 
 export interface WorkspaceTriage {
   schemaVersion: 1;
@@ -50,8 +39,6 @@ export interface WorkspaceTriage {
   findings: TriageFinding[];
 }
 
-const SAFE_LOCAL_FILES = "Your files on this machine are untouched.";
-const SAFE_NOTHING_LOST = "Nothing is lost — changes are just waiting instead of syncing.";
 const SEVERITY_RANK = { blocked: 0, attention: 1, info: 2 } satisfies Record<TriageSeverity, number>;
 
 /** Deferral reasons where rbox has PROVEN the repository itself is fine and only
@@ -68,13 +55,6 @@ const REPOSITORY_PROVEN_HEALTHY = new Set([
   "ignored-target",
   "config",
 ]);
-
-/** A remedy is pasted from wherever the reader is standing — `rbox doctor <path>`
- * runs from anywhere, and the machine view hands out workspaces by path. Every
- * workspace-scoped command therefore carries its own workspace. */
-function scoped(root: string, command: string): string {
-  return `cd ${shQuoteIfNeeded(path.resolve(root))} && ${command}`;
-}
 
 /** The shared age buckets read as clipped exact times ("1h" for a 20-hour wait).
  * Say the bucket's real meaning instead: it is a floor, not a measurement. */
@@ -130,63 +110,6 @@ function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: num
   // predicate (273 P2): every offer-deciding surface reads that one, or diverges.
   if (repo.resolvable) finding.command = command;
   return finding;
-}
-
-function massDeleteCounts(reason: string): { deletes: number; tracked: number } | undefined {
-  const match = /(\d+) of (\d+) tracked files/.exec(reason);
-  return match ? { deletes: Number(match[1]), tracked: Number(match[2]) } : undefined;
-}
-
-/** The remedy is consent to a SPECIFIC deletion, so the copy names what is being
- * consented to and the scale of it. `rbox sync --allow-mass-delete` is never
- * offered: that waives the guard in both directions, including an unrelated one. */
-function massDeleteFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>, op: "pull" | "push"): TriageFinding {
-  const counts = massDeleteCounts(halt.reason);
-  const scale = counts ? `${counts.deletes} of your ${counts.tracked} synced files` : "an unusually large number of files";
-  const target = op === "pull" ? `delete ${scale} from this machine` : `delete ${scale} everywhere else you sync`;
-  const consent = op === "pull" ? "that local deletion" : "that deletion for your other machines";
-  return {
-    id: "halt:mass-delete",
-    severity: "blocked",
-    problem: `Syncing stopped because finishing it would ${target}, and rbox will not do that without your say-so.`,
-    safety: `Nothing has been deleted — rbox stopped before touching anything. The command below CONFIRMS ${consent}; check what is missing first.`,
-    command: scoped(root, `rbox ${op} --allow-mass-delete`),
-  };
-}
-
-function haltFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>): TriageFinding | undefined {
-  switch (halt.typedReason?.kind) {
-    case "mass-delete":
-      return massDeleteFinding(root, halt, halt.typedReason.op);
-    case "chain-repair":
-      return {
-        id: "halt:chain-repair",
-        severity: "blocked",
-        problem: "Syncing stopped because part of this workspace's sync history could not be read.",
-        safety: `${SAFE_LOCAL_FILES} Your uploaded versions are still on the server.`,
-        command: scoped(root, "rbox recover --repair-chain"),
-      };
-    case "too-many-refs":
-    case "body-too-large":
-      return {
-        id: `halt:${halt.typedReason.kind}`,
-        severity: "blocked",
-        problem: "Syncing stopped because one upload was larger than the service accepts.",
-        safety: SAFE_LOCAL_FILES,
-        command: scoped(root, "rbox doctor --report"),
-      };
-    case "push-conflict":
-      return undefined;
-    default:
-      if (!halt.terminal) return undefined;
-      return {
-        id: "halt:unknown",
-        severity: "blocked",
-        problem: "Syncing stopped and will not retry on its own.",
-        safety: SAFE_LOCAL_FILES,
-        command: scoped(root, "rbox logs"),
-      };
-  }
 }
 
 function plainList(items: string[]): string {

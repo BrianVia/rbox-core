@@ -29,7 +29,7 @@ import { statusStaleLockDetail } from "./status-maintenance.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
-import { checkoutJson, serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { checkoutValue, serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { StatusMode, StatusRenderOptions, WorkspaceStatusProjection } from "./status-contract.js";
 
@@ -163,27 +163,26 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
     remote: projection.remote ? { sequence: projection.remote.sequence, source: projection.remote.source } : null,
     // Design 224 §2.3: deliberately OUTSIDE the `local` block, which is emitted
     // only for a daemon snapshot — the count exists on both branches.
-    ...(projection.strandedIgnored === undefined ? {} : { strandedIgnored: projection.strandedIgnored }),
+    strandedIgnored: projection.strandedIgnored,
     conflictCopies: projection.conflictCopies,
-    ...(counts.source === "daemon"
+    local: counts.source === "daemon"
       ? {
-        local: {
-          added: counts.added,
-          changed: counts.changed,
-          deleted: counts.deleted,
-          gitChangedRepos: counts.gitChanged,
-          source: counts.source,
-          ageMs: counts.ageMs,
-        },
+        added: counts.added,
+        changed: counts.changed,
+        deleted: counts.deleted,
+        gitChangedRepos: counts.gitChanged,
+        source: counts.source,
+        ageMs: counts.ageMs,
       }
-      : {}),
+      : undefined,
     trash: projection.trash && projection.trash.files > 0 ? { bytes: projection.trash.bytes, count: projection.trash.files } : null,
     account: projection.probes.account,
     credential: credentialStatusJson(projection.credentials),
-    ...(projection.genesisPending ? { genesisPending: true, resumeInstruction: GENESIS_PENDING_MESSAGE } : {}),
+    genesisPending: projection.genesisPending ? true : undefined,
+    resumeInstruction: projection.genesisPending ? GENESIS_PENDING_MESSAGE : undefined,
     crypto: projection.crypto,
     git: {
-      ...(git.capability ? { capability: git.capability } : {}),
+      capability: git.capability ? git.capability : undefined,
       deferrals: serializeGitDeferralLanes(git.deferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
       // Design 273 S5: EVERY repo, quiet rows included and flagged.
       // `displayReason` stays the machine contract; `story` is additive.
@@ -200,20 +199,18 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
           ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
           : null,
         bytesChanged: repo.bytesChanged,
-        ...checkoutJson(repo.checkout),
+        checkout: checkoutValue(repo.checkout),
       })),
       conflictSnapshots: counts.conflictSnapshots,
     },
-    ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
+    gitConfig: counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
       ? {
-        gitConfig: {
-          state: counts.gitConfigChecking?.length ? "checking" : "disabled",
-          checking: counts.gitConfigChecking ?? [],
-          disabled: counts.gitConfigDisabled ?? [],
-        },
+        state: counts.gitConfigChecking?.length ? "checking" : "disabled",
+        checking: counts.gitConfigChecking ?? [],
+        disabled: counts.gitConfigDisabled ?? [],
       }
-      : {}),
-    ...(activity?.halt?.reason !== undefined ? { haltReason: activity.halt.reason } : {}),
+      : undefined,
+    haltReason: activity?.halt?.reason,
     pathWarnings: projection.pathWarnings ?? null,
   };
 }
@@ -247,9 +244,11 @@ export function renderStatusBrief(
       ? { kind: "mass-delete", op: typedHalt.op }
       : typedHalt?.kind === "too-many-refs"
         ? { kind: "too-many-refs" }
-        : typedHalt?.kind === "body-too-large"
-          ? { kind: "body-too-large" }
-          : { kind: "unknown" }
+        : typedHalt?.kind === "too-many-entries"
+          ? { kind: "too-many-entries" }
+          : typedHalt?.kind === "body-too-large"
+            ? { kind: "body-too-large" }
+            : { kind: "unknown" }
     : undefined;
   const active = freshBriefActive(activity, daemon.running, now);
   const nextVersion = updateAvailableVersion(projection.probes.update);
@@ -260,25 +259,25 @@ export function renderStatusBrief(
     daemonStale: daemon.stale,
     account,
     pendingChanges: projection.localChanges + counts.gitChanged,
-    ...(active ? { active } : {}),
-    ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
+    active,
+    populate: populate ? { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } : undefined,
     behindRemote: briefBehindRemote(projection.state.localSequence, projection.remote),
-    ...(halt ? { halt } : {}),
-    ...(retryArmed && activity?.halt?.nextProbeAt && daemon.mode !== "pull-only"
-      ? { recovery: { nextProbeAt: activity.halt.nextProbeAt } }
+    halt,
+    recovery: retryArmed && activity?.halt?.nextProbeAt && daemon.mode !== "pull-only"
+      ? { nextProbeAt: activity.halt.nextProbeAt }
       : retryRunning
-        ? { recovery: { running: true as const } }
-        : {}),
+        ? { running: true as const }
+        : undefined,
     planQuota,
-    ...(daemon.watcherTrust === undefined ? {} : { watcherTrust: daemon.watcherTrust }),
+    watcherTrust: daemon.watcherTrust,
     daemonVersion: daemon.version,
     cliVersion: RBOX_VERSION,
     daemonVersionSkew: daemon.versionSkew,
     locking: projection.locking,
-    ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
+    pathWarnings: projection.pathWarnings ? projection.pathWarnings : undefined,
     git: loudGitRepos.length > 0 ? { ...gitPauseCounts(loudGitRepos, now), listed: gitDetail } : undefined,
-    ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
-    ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
+    trash: projection.trash && projection.trash.files > 0 ? { files: projection.trash.files, bytes: projection.trash.bytes } : undefined,
+    update: nextVersion ? { current: RBOX_VERSION, next: nextVersion } : undefined,
     now,
   };
   const lines = [...renderBriefStatus(brief).lines];
@@ -326,8 +325,8 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
         phase: populate.operation.phase,
         filesDone: populate.operation.filesDone,
         filesTotal: populate.operation.filesTotal,
-        ...(populate.operation.bytesDone !== undefined ? { bytesDone: populate.operation.bytesDone } : {}),
-        ...(populate.operation.bytesTotal !== undefined ? { bytesTotal: populate.operation.bytesTotal } : {}),
+        bytesDone: populate.operation.bytesDone,
+        bytesTotal: populate.operation.bytesTotal,
       }
       : undefined,
     now,

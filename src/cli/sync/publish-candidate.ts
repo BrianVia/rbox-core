@@ -1,6 +1,10 @@
 /** Never: state reads, BASE advancement, wire effects, or Git mutation outside the capture executor. */
 import {
   diffManifests,
+  dominatingDir,
+  dominatingDirHint,
+  isDominant,
+  MAX_ENTRIES,
   type CaseFoldCollisionGroup,
   type IgnoreMatcher,
   type Manifest,
@@ -13,7 +17,7 @@ import type {
 } from "../sync-git/git-capture-observation.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
-import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
+import { assertNoUnevaluatedPurgeDeletes, EntryCapGuardError, MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
 import type { PublishedGitTransition } from "./publisher-ack-transition.js";
 
 /**
@@ -147,19 +151,19 @@ function sealedGitPublication(receipt: GitCaptureExecutionReceipt): SealedGitPub
   const plan = receipt.plan;
   return {
     capturePlanId: receipt.planId,
-    ...(plan.resolution ? { resolution: plan.resolution } : {}),
+    resolution: plan.resolution,
     filesFirstDeferred: plan.filesFirstDeferred === true,
     transition: {
       supersededPending: plan.supersededPending,
       resolvedPending: plan.resolvedPending ?? [],
-      ...(plan.supersessionIdentityKeys ? { supersessionIdentityKeys: plan.supersessionIdentityKeys } : {}),
+      supersessionIdentityKeys: plan.supersessionIdentityKeys,
       pending: plan.gitPendingRemote,
       removed: plan.gitReposRemoved,
       resolutions: plan.gitNeedsResolution,
       repoAbsent: plan.repoAbsent,
       packedRefsIdentity: plan.packedRefsIdentity,
-      ...(plan.publisherAckBindings ? { publisherAckBindings: plan.publisherAckBindings } : {}),
-      ...(plan.absentBranchProofs ? { absentBranchProofs: plan.absentBranchProofs } : {}),
+      publisherAckBindings: plan.publisherAckBindings,
+      absentBranchProofs: plan.absentBranchProofs,
       authoredCfgHashByRepo: plan.authoredCfgHashByRepo,
     },
   };
@@ -268,7 +272,7 @@ export async function preparePublishCandidate(
     planId: `capture-${++capturePlanCounter}`,
     forceGitRecapture: policy.forceGitRecapture,
     filesFirstDefer,
-    ...(policy.resolution ? { resolution: policy.resolution } : {}),
+    resolution: policy.resolution,
   };
   capture.reportProjectionSpans?.({
     projection_ignore_carry_ms: projectionSpans?.projection_ignore_carry_ms ?? 0,
@@ -349,6 +353,27 @@ export async function preparePublishCandidate(
   // §10 forensic line — only when git-sync did something beyond a steady carry.
   if (policy.syncGit && (plan.captured.length || plan.deferred.length || plan.removed.length)) {
     capture.logPublicationLine(captureReceipt);
+  }
+
+  // Entry-cap breaker (#813). The same bound `validateManifest` enforces on the
+  // wire, applied to the PRE-UPLOAD candidate: the late check only fires after a
+  // runaway checkout has already paid to scan, encrypt and upload itself. The
+  // refusal names the directory that caused it (#810) — a bare total tells the
+  // user nothing about what to exclude. Deferral only carries base entries
+  // forward, so this count is the count that would be committed.
+  if (candidate.files.length > MAX_ENTRIES) {
+    const fromAdded = dominatingDir(filesDiff.added);
+    // A tree that arrived in one scan is best explained by what it ADDED; one
+    // already carried in base is best explained by the manifest as a whole.
+    const dominant = fromAdded && isDominant(fromAdded, candidate.files.length)
+      ? fromAdded
+      : dominatingDir(candidate.files);
+    throw new EntryCapGuardError(
+      `workspace has ${candidate.files.length.toLocaleString("en-US")} files; the limit is ${MAX_ENTRIES.toLocaleString("en-US")} — ` +
+        `refusing before upload. ${dominant
+          ? dominatingDirHint(dominant)
+          : "Exclude large directories with `rbox ignore` (files stay on disk) or split the workspace"}.`
+    );
   }
 
   // Push-side mass-delete breaker (design 108): compute the intended deletions on
