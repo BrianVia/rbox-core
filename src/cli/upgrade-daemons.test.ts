@@ -52,8 +52,8 @@ async function runtime(name: string, pid: number, options: { state?: "running" |
       accountId: "acct",
       workspaceId: `ws-${name}`,
       at: "2026-07-15T00:00:00.000Z",
-      ...(options.pullOnly ? { pullOnly: true } : {}),
-      ...(options.pendingModeIntent === undefined ? {} : { pendingModeIntent: options.pendingModeIntent }),
+      pullOnly: options.pullOnly,
+      pendingModeIntent: options.pendingModeIntent,
     } as const;
     const desiredPath = path.join(dir, "desired.json");
     await fs.writeFile(desiredPath, `${JSON.stringify(desired, null, 2)}\n`);
@@ -65,7 +65,7 @@ async function runtime(name: string, pid: number, options: { state?: "running" |
 async function writeAmbient(key: string, daemonVersion?: string): Promise<void> {
   await fs.writeFile(path.join(home, ".rbox", "daemons", key, "daemon.status.json"), `${JSON.stringify({
     schemaVersion: 1,
-    ...(daemonVersion === undefined ? {} : { daemonVersion }),
+    daemonVersion,
     state: "synced",
     heartbeatAt: "2026-07-22T00:00:00.000Z",
     sequence: null,
@@ -156,7 +156,7 @@ test("stale-only restart failure prints the stale summary first and preserves th
     currentWorkspaceId: () => "ws-stale-failure",
     stopDaemon: async () => { throw new Error("private failure"); },
     log: (line) => logs.push(line),
-  })).rejects.toThrow("upgrade installed, but one or more live daemons could not be restarted");
+  })).rejects.toThrow("one or more running daemons could not be restarted");
   expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
   expect(logs[1]).toContain("restart failed: private failure");
   expect(logs.join("\n")).not.toContain("already up to date");
@@ -271,23 +271,25 @@ test("managed upgrade continues after a failure and leaves stopped desired rows 
   expect(actions).not.toContain(`start:${stopped.key}`);
 });
 
-test("managed upgrade reports malformed runtime discovery and continues", async () => {
+test("managed upgrade summarizes malformed runtime records without failing the run", async () => {
   const valid = await runtime("valid", 401);
-  const badDir = path.join(home, ".rbox", "daemons", "bad-runtime");
-  await fs.mkdir(badDir, { recursive: true });
-  await fs.writeFile(path.join(badDir, "daemon.pid"), "not-a-record\n");
+  for (const name of ["bad-runtime", "bad-runtime-2"]) {
+    const badDir = path.join(home, ".rbox", "daemons", name);
+    await fs.mkdir(badDir, { recursive: true });
+    await fs.writeFile(path.join(badDir, "daemon.pid"), "not-a-record\n");
+  }
   const actions: string[] = [];
   const logs: string[] = [];
-  await expect(restartDaemonsAfterUpgrade({
+  await restartDaemonsAfterUpgrade({
     readDesiredDaemonRows: async () => rows,
     isDaemonProcess: () => true,
     currentWorkspaceId: (root) => `ws-${path.basename(root)}`,
     stopDaemon: async (root) => void actions.push(`stop:${workspaceKey(root)}`),
     startDaemon: async () => "started",
     log: (line) => void logs.push(line),
-  })).rejects.toThrow("could not be restarted");
+  });
   expect(actions).toContain(`stop:${valid.key}`);
-  expect(logs.join("\n")).toContain("bad-runtime: not restarted (runtime record unreadable)");
+  expect(logs.filter((line) => line.startsWith("skipped "))).toEqual(["skipped 2 leftover daemon records (nothing running for them)"]);
 });
 
 /** A dangling desired row for a folder that is gone: generation would have to drop
