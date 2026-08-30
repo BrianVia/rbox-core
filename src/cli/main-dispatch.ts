@@ -575,6 +575,13 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "ignore": {
+      // The four operations are mutually exclusive; without this the if/else chain
+      // silently dropped whichever lost (`rbox ignore 'dist/**' --list` just listed).
+      const selectors = [flags["respect-gitignore"] !== undefined, flags.purge === "true", flags.list === "true", positional.length > 0];
+      if (selectors.filter(Boolean).length > 1) {
+        fail("usage: rbox ignore <glob> | --list | --respect-gitignore <on|off> | --purge — pick one");
+        return;
+      }
       const root = await resolvePathFlagRoot(flags.path);
       if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
       else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });

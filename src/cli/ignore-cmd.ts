@@ -168,9 +168,15 @@ async function computePurgeCandidate(
   return { local, purged, observationComplete: deferred.size === 0 };
 }
 
+/**
+ * Only the documented `on`/`off` spelling. `true` is deliberately NOT accepted: a bare
+ * `--respect-gitignore` (no value) parses to the literal "true", and silently enabling
+ * gitignore filtering from a valueless flag is indistinguishable from the user asking
+ * for it. Rejecting it sends both spellings to the `<on|off>` usage error.
+ */
 function parseOnOff(raw: string | undefined): boolean | undefined {
-  if (raw === "on" || raw === "true") return true;
-  if (raw === "off" || raw === "false") return false;
+  if (raw === "on") return true;
+  if (raw === "off") return false;
   return undefined;
 }
 

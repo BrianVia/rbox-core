@@ -259,3 +259,11 @@ test("a respect-gitignore edit survives losing and reinitializing the folder cat
     await fs.rm(rboxHome, { recursive: true, force: true });
   }
 });
+
+test("respect-gitignore takes only on|off — a bare flag (literal \"true\") is a usage error", async () => {
+  // A valueless `--respect-gitignore` parses to "true"; accepting it silently turned
+  // gitignore filtering ON with no value ever typed (#518).
+  for (const raw of ["true", "false", "", undefined]) {
+    await expect(setRespectGitignore("/nonexistent", raw)).rejects.toThrow("usage: rbox ignore --respect-gitignore <on|off>");
+  }
+});
