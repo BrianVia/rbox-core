@@ -72,8 +72,10 @@ const entry = (p: string): FileEntry => ({ path: p, sha256: "a".repeat(64), size
 const manifest = (files: FileEntry[]): Manifest => ({ generatedAt: "2026-07-29T00:00:00.000Z", files });
 
 function stubCapture(): GitCapturePort {
+  // Annotated, not asserted: the return type contextually types every method, so a
+  // drifted port signature fails here instead of being cast away.
   return {
-    async execute(plan: { planId: string }) {
+    async execute(plan) {
       return {
         planId: plan.planId,
         plan: {
@@ -85,12 +87,12 @@ function stubCapture(): GitCapturePort {
     },
     notifyBusyDeferred() {},
     async observe() {
-      return { kind: "no-change" as const, acceptedSequence: 0, observedRepos: [], deferralUpdates: {} };
+      return { kind: "no-change", acceptedSequence: 0, observedRepos: [], deferralUpdates: {} };
     },
     reportCapturePlan() {},
     async carryBaseOnNoOp() {},
     logPublicationLine() {},
-  } as unknown as GitCapturePort;
+  };
 }
 
 const PASSTHROUGH: IgnoreMatcher = { ignores: () => false };
@@ -129,8 +131,14 @@ const massDeletePurge = (policy: Partial<PublishPolicy> = {}): Promise<unknown> 
   policy,
 );
 
-const caught = async (p: Promise<unknown>): Promise<Error | undefined> =>
-  p.then(() => undefined, (e: unknown) => e as Error);
+const caught = async (p: Promise<unknown>): Promise<Error | undefined> => {
+  try {
+    await p;
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+};
 
 test("the purge-path mass-delete guard names the purge command, not `rbox push`", async () => {
   const err = await caught(massDeletePurge({ massDeleteHint: PURGE_HINT }));

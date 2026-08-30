@@ -164,8 +164,8 @@ test("registry guard: typed arity, repetition, and hidden syntax are explicit", 
       }
       if (flag.hidden) hidden.push(`${command.name} ${token}`);
       if (flag.short) {
-        const shape = `${token}:${flag.takesValue === true ? "value" : "boolean"}`;
-        short.set(flag.short, new Set([...(short.get(flag.short) ?? []), shape]));
+        const arity = `${token}:${flag.takesValue === true ? "value" : "boolean"}`;
+        short.set(flag.short, new Set([...(short.get(flag.short) ?? []), arity]));
       }
     }
   }
@@ -178,7 +178,7 @@ test("registry guard: typed arity, repetition, and hidden syntax are explicit", 
     "track --name",
     "track --device",
   ]);
-  expect(Object.fromEntries([...short].map(([spelling, shapes]) => [spelling, [...shapes]]))).toEqual({
+  expect(Object.fromEntries([...short].map(([spelling, arities]) => [spelling, [...arities]]))).toEqual({
     "-w": ["--workspace:value"],
     "-f": ["--follow:boolean"],
     "-n": ["--lines:value"],
