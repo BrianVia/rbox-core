@@ -144,6 +144,7 @@ test("registry guard: typed arity, repetition, and hidden syntax are explicit", 
   expect(GLOBAL_FLAGS.map(({ flag, takesValue }) => [flag, takesValue === true])).toEqual([
     ["--json", false],
     ["--help <ignored>", true],
+    ["--no-interactive", false],
   ]);
   const repeatable: string[] = [];
   const hidden: string[] = [];
@@ -163,25 +164,21 @@ test("registry guard: typed arity, repetition, and hidden syntax are explicit", 
       }
       if (flag.hidden) hidden.push(`${command.name} ${token}`);
       if (flag.short) {
-        const shape = `${token}:${flag.takesValue === true ? "value" : "boolean"}`;
-        short.set(flag.short, new Set([...(short.get(flag.short) ?? []), shape]));
+        const arity = `${token}:${flag.takesValue === true ? "value" : "boolean"}`;
+        short.set(flag.short, new Set([...(short.get(flag.short) ?? []), arity]));
       }
     }
   }
   expect(repeatable).toEqual(["track --include"]);
   expect(hidden).toEqual([
-    "setup --new",
-    "setup --name",
-    "setup --no-sync",
-    "setup --respect-gitignore",
     "init --name",
     "init --project",
+    "init --no-sync",
     "track --project",
     "track --name",
     "track --device",
-    "track --no-interactive",
   ]);
-  expect(Object.fromEntries([...short].map(([spelling, shapes]) => [spelling, [...shapes]]))).toEqual({
+  expect(Object.fromEntries([...short].map(([spelling, arities]) => [spelling, [...arities]]))).toEqual({
     "-w": ["--workspace:value"],
     "-f": ["--follow:boolean"],
     "-n": ["--lines:value"],
@@ -209,16 +206,12 @@ test("every declared short spelling executes its typed parser behavior", () => {
 
 test("every hidden accepted flag has independently pinned parser behavior", () => {
   const cases = [
-    { command: "setup", flag: "new", takesValue: false },
-    { command: "setup", flag: "name", takesValue: true },
-    { command: "setup", flag: "no-sync", takesValue: false },
-    { command: "setup", flag: "respect-gitignore", takesValue: false },
     { command: "init", flag: "name", takesValue: true },
     { command: "init", flag: "project", takesValue: true },
+    { command: "init", flag: "no-sync", takesValue: false },
     { command: "track", flag: "project", takesValue: true },
     { command: "track", flag: "name", takesValue: true },
     { command: "track", flag: "device", takesValue: true },
-    { command: "track", flag: "no-interactive", takesValue: false },
   ] as const;
 
   for (const { command, flag, takesValue } of cases) {
@@ -248,7 +241,7 @@ test("registry guard: flag names that collide ACROSS commands are resolved per c
 
   expect(colliding.map(([name, decls]) => `--${name}: ${decls.map((d) => `${d.command} ${arityWord(d.takesValue)}`).join("; ")}`).sort()).toEqual([
     "--git: status WITHOUT a value; init WITH a value; track WITH a value",
-    "--respect-gitignore: setup WITHOUT a value; init WITHOUT a value; track WITHOUT a value; ignore WITH a value",
+    "--respect-gitignore: init WITHOUT a value; track WITHOUT a value; ignore WITH a value",
   ]);
 
   for (const [name, decls] of colliding) {
@@ -290,4 +283,19 @@ test("unknown flags are rejected against command and subcommand help", () => {
 test("global and real undocumented flags remain allowed", () => {
   expect(unknownFlagError("track", [], { "no-interactive": "true" })).toBeUndefined();
   expect(unknownFlagError("status", [], { json: "true" })).toBeUndefined();
+});
+
+test("the allowlist matches what handlers actually read (#514)", () => {
+  // `--no-interactive` sets the interaction policy from raw argv for EVERY command,
+  // so no command may reject it.
+  for (const command of COMMAND_HELP) {
+    const head = command.name.split(" ")[0]!;
+    expect(unknownFlagError(head, command.name.split(" ").slice(1), { "no-interactive": "true" }), `rbox ${head}`).toBeUndefined();
+  }
+  // init implements --no-sync (init-plan maps it to populate "none").
+  expect(unknownFlagError("init", [], { "no-sync": "true" })).toBeUndefined();
+  // setup reads NONE of these from its own argv — they must not parse silently.
+  for (const flag of ["new", "name", "no-sync", "respect-gitignore"]) {
+    expect(unknownFlagError("setup", [], { [flag]: "true" }), `rbox setup --${flag}`).toContain(`--${flag}`);
+  }
 });

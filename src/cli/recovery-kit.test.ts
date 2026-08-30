@@ -112,6 +112,23 @@ describe("recovery kit", () => {
     expect(await recoveryKitFileState(ACCOUNT, record!.plaintextArtifacts[0])).toBe("present");
   });
 
+  test("the plaintext kit success line says PLAIN TEXT (help promises the Keychain)", async () => {
+    const { writeKitSuccess } = await import("./auth/recovery-kit-flow.js");
+    const file = path.join(tmp, "kit.txt");
+    const origWrite = process.stderr.write.bind(process.stderr);
+    let err = "";
+    process.stderr.write = ((s: string | Uint8Array) => { err += String(s); return true }) as typeof process.stderr.write;
+    try {
+      // --kit-path takes the plaintext branch on every platform, darwin included.
+      await writeKitSuccess(PHRASE, { accountId: ACCOUNT }, { kit: true, kitPath: file }, false);
+      await writeKitSuccess(PHRASE, { accountId: ACCOUNT }, { kit: true, kitPath: file }, true);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    expect(err).toContain("plain text");
+    expect(err).toContain("written in plain text to");
+  });
+
   test("status detects missing and replaced kit files", async () => {
     const file = path.join(tmp, "kit.txt");
     await writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE);

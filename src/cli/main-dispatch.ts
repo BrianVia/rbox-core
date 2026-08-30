@@ -16,7 +16,6 @@ import {
   commandSupportsFlag,
   helpFor,
   helpKeyFor,
-  isKnownTopLevel,
   renderCommand,
   renderEssentialHelp,
   renderGroupedHelp,
@@ -328,7 +327,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
           return confirmDestructive({
             message: `Stop syncing ${root}? Local files stay.`,
             default: false,
-            headless: "proceed",
+            // Was "proceed": every non-interactive run unbound silently while the help
+            // taught that --force was what skipped the prompt (#513).
+            headless: "require-yes",
+            headlessError: "refusing to untrack without --force in non-interactive mode",
           });
         },
       });
@@ -367,7 +369,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       const sub = positional[0];
       if (sub === "approve") await approveDevice(positional[1] ?? "");
       else if (sub === "list") await listDevices({ json: jsonMode });
-      else if (sub === "revoke") await revokeDevice(positional[1] ?? "");
+      else if (sub === "revoke") await revokeDevice(positional[1] ?? "", flags.yes === "true");
       else {
         fail("usage: rbox device <approve <user-code>|list|revoke <device-id>>");
       }
@@ -576,6 +578,13 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "ignore": {
+      // The four operations are mutually exclusive; without this the if/else chain
+      // silently dropped whichever lost (`rbox ignore 'dist/**' --list` just listed).
+      const selectors = [flags["respect-gitignore"] !== undefined, flags.purge === "true", flags.list === "true", positional.length > 0];
+      if (selectors.filter(Boolean).length > 1) {
+        fail("usage: rbox ignore <glob> | --list | --respect-gitignore <on|off> | --purge — pick one");
+        return;
+      }
       const root = await resolvePathFlagRoot(flags.path);
       if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
       else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
@@ -652,7 +661,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         if (sub === "create-ci") await createCiKey(flags);
         else if (sub === "materialize") await materializeCmd(flags);
         else if (sub === "list") await listKeys({ json: jsonMode });
-        else if (sub === "revoke") await revokeKey(positional[1] ?? "");
+        else if (sub === "revoke") await revokeKey(positional[1] ?? "", flags.yes === "true");
         else fail("usage: rbox key <status | save | backup | genesis --yes | recover | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
@@ -730,13 +739,15 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     default:
       // Bare `rbox` in a terminal → status/actions when already inside a workspace,
       // otherwise the guided `setup` front door (design 29).
-      // Non-interactive bare `rbox`, or an unknown command → the essential help
-      // screen (never hangs). An unknown command also exits non-zero.
+      // Non-interactive bare `rbox`, or an unhandled command → the essential help
+      // screen (never hangs). Reaching here with ANY command token means nothing ran
+      // — an unknown command, or a known alias with no route (`rbox daemon`, `rbox
+      // daemon bogus`) — so it exits non-zero.
       if (!cmd && process.stdin.isTTY) {
         await runGuidedFrontDoor(deps.frontDoorImport);
         break;
       }
       console.log(renderEssentialHelp());
-      if (cmd && !isKnownTopLevel(cmd)) process.exitCode = 1;
+      if (cmd) process.exitCode = 1;
   }
 }

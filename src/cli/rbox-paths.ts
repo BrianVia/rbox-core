@@ -9,6 +9,7 @@
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isSafeRelPath } from "../engine/index.js";
 
 /** The user's home directory. Prefers `process.env.HOME` (live) over `os.homedir()`:
  *  under Bun `os.homedir()` is resolved once at startup and IGNORES a later `HOME`
@@ -78,3 +79,23 @@ export const daemonCrashLogPath = (root: string): string => path.join(daemonRunt
 export const daemonDatedLogBasename = (date: Date): string => `daemon-${date.toISOString().slice(0, 10)}.log`;
 export const daemonDatedLogPath = (root: string, date: Date): string => path.join(daemonRuntimeDir(root), daemonDatedLogBasename(date));
 export const daemonBoundPath = (root: string): string => path.join(daemonRuntimeDir(root), "workspace.bound");
+
+/**
+ * A user-typed path argument (`rbox versions app.ts`, `rbox restore app.ts@3`,
+ * `rbox trash restore app.ts`) as the manifest's workspace-relative POSIX path.
+ *
+ * Resolved against the CWD first — the user means the file they can see (#516);
+ * these commands used to read the argument as root-relative, so the same name in a
+ * subdirectory silently addressed a DIFFERENT file at the workspace root. When the CWD
+ * is outside the workspace (a `--path <dir>` run from elsewhere) there is no
+ * cwd-relative reading to have, so the argument stays root-relative.
+ */
+export function workspaceRelPath(root: string, input: string): string {
+  const cwd = process.cwd();
+  const cwdInside = cwd === root || cwd.startsWith(root + path.sep);
+  const rel = cwdInside
+    ? path.relative(root, path.resolve(cwd, input))
+    : input.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!isSafeRelPath(rel)) throw new Error(`'${input}' is not a path inside the synced folder ${root}`);
+  return rel;
+}

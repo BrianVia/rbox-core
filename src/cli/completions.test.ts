@@ -46,6 +46,17 @@ test("known flags are completed from registry metadata", () => {
   expect(script).toContain("--yes[replace the configuration without prompting (alias: -y)]");
 });
 
+test("commands whose usage takes a path positional get file completion", () => {
+  const script = zshCompletions();
+  // File completion is granted by the metavar spelling: `versions` said `[file]` and
+  // silently lost `_files` (#521). Every path-taking usage must spell it `path`.
+  for (const name of ["versions", "status"]) {
+    const entry = COMMAND_HELP.find((c) => c.name === name);
+    expect(entry?.usage, `${name} usage should name its positional 'path'`).toMatch(/(?:^|[\s<[])path\b/);
+  }
+  expect(script).toContain("'*:path:_files'");
+});
+
 test("no hidden or internal tokens leak into the script", () => {
   const script = zshCompletions();
   expect(script).not.toContain("__daemon-run");

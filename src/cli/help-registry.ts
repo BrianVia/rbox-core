@@ -88,6 +88,10 @@ export interface ResolvedAlias {
 export const GLOBAL_FLAGS: readonly CommandFlag[] = [
   { flag: "--json", desc: "request JSON when the selected command supports it", hidden: true },
   { flag: "--help <ignored>", desc: "show command help", takesValue: true, hidden: true },
+  // `index.ts` derives the interaction policy from raw argv for EVERY command, so the
+  // unknown-flag gate must accept it everywhere (#514). `init` still declares it
+  // visibly, because its help is where CI users look for it.
+  { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing", hidden: true },
 ];
 
 /** Group render order for the grouped screen. */
@@ -114,10 +118,9 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--daemon", desc: "after the first pull, start background sync (keyed setup only)" },
       { flag: "--pull-only", desc: "with --daemon, never push local changes (keyed setup only)" },
       { flag: "--force", desc: "allow a non-empty target directory (keyed setup only)" },
-      { flag: "--new", desc: "internal guided-setup selection", hidden: true },
-      { flag: "--name <name>", desc: "internal guided-setup workspace name", takesValue: true, hidden: true },
-      { flag: "--no-sync", desc: "internal guided-setup first-sync selection", hidden: true },
-      { flag: "--respect-gitignore", desc: "internal guided-setup ignore selection", hidden: true },
+      // No --new/--name/--no-sync/--respect-gitignore here: the guided flow builds a
+      // FRESH flag object for runInit (`workspaceFlags`), so setup never read these
+      // from its own argv — declaring them only swallowed them silently (#514).
     ],
     examples: ["rbox setup"],
   },
@@ -179,6 +182,7 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)", takesValue: true },
       { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
       { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
+      { flag: "--no-sync", desc: "internal: initialize without the first sync", hidden: true },
     ],
   },
   {
@@ -398,7 +402,6 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
       { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
       { flag: "--device <id>", desc: "internal device identifier override", takesValue: true, hidden: true },
-      { flag: "--no-interactive", desc: "internal non-interactive mode", hidden: true },
     ],
     notes: ["[path] defaults to the current directory"],
     examples: ["rbox track ~/code/myapp", "rbox track ~/code/myapp --workspace ws_ab12cd34"],
@@ -408,7 +411,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "SYNCING",
     summary: "stop syncing a directory (local unbind; remote untouched)",
     usage: "rbox untrack [path] [--force]",
-    flags: [{ flag: "--force", desc: "skip the confirmation prompt and SIGKILL a stuck daemon" }],
+    flags: [{ flag: "--force", desc: "skip the confirmation prompt (required to untrack non-interactively) and SIGKILL a stuck daemon" }],
   },
   {
     name: "ignore", positionals: 1,
@@ -456,19 +459,22 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "trash empty", positionals: 1,
     group: "SYNCING",
     summary: "permanently delete trashed files (frees disk)",
-    usage: "rbox trash empty [--path <dir>]",
-    flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true }],
+    usage: "rbox trash empty [--yes] [--path <dir>]",
+    flags: [
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true },
+      { flag: "--yes", short: "-y", desc: "confirm the permanent delete without prompting (alias: -y)" },
+    ],
   },
   {
     name: "versions", positionals: 1,
     group: "SYNCING",
     summary: "list version history (or a file's change history)",
-    usage: "rbox versions [file] [--limit <n>] [--json]",
+    usage: "rbox versions [path] [--limit <n>] [--json]",
     flags: [
       { flag: "--limit <n>", desc: "maximum versions to show", takesValue: true },
       { flag: "--json", desc: "print JSON" },
     ],
-    notes: ["[file] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
+    notes: ["[path] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
     examples: ["rbox versions", "rbox versions src/app.ts --limit 20"],
   },
   {
@@ -557,8 +563,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "device", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "manage devices",
-    usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id>>",
-    flags: [{ flag: "--json", desc: "with `list`, print JSON" }],
+    usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id> [--yes]>",
+    flags: [
+      { flag: "--json", desc: "with `list`, print JSON" },
+      { flag: "--yes", short: "-y", desc: "with `revoke`, confirm without prompting (alias: -y)" },
+    ],
   },
   {
     name: "account", positionals: 2,
@@ -589,7 +598,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "key save", positionals: 1,
     group: "DEVICES & ACCOUNT",
-    summary: "save a validated recovery phrase to Keychain or an explicit file",
+    summary: "save a validated recovery phrase (macOS: Keychain; elsewhere: a plaintext file)",
     usage: "rbox key save [--kit-path <path>]",
     flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default", takesValue: true }],
   },
@@ -657,7 +666,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key revoke", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "revoke an agent/CI sync key",
-    usage: "rbox key revoke <id>",
+    usage: "rbox key revoke <id> [--yes]",
+    flags: [{ flag: "--yes", short: "-y", desc: "confirm the revoke without prompting (alias: -y)" }],
   },
 
   // ── BILLING & MAINTENANCE ────────────────────────────────────────────────
@@ -799,10 +809,6 @@ export const KNOWN_TOP_LEVEL: ReadonlySet<string> = new Set([
   "__daemon-run",
   "__boot-resume",
 ]);
-
-export function isKnownTopLevel(command: string | undefined): boolean {
-  return command !== undefined && KNOWN_TOP_LEVEL.has(command);
-}
 
 function aliasTarget(alias: DeprecatedAlias): string {
   return alias.kind === "rename" ? alias.target : alias.helpTarget;

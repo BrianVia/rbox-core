@@ -2,9 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { bootstrapAccount, toB64url, utf8 } from "../engine/e2ee/index.js";
+import { bootstrapAccount, toB64url } from "../engine/e2ee/index.js";
 import { createCiKey, materializeCmd } from "./key-cmd.js";
-import { materializeAgentKey, decodeAgentKeyBundle } from "./agent-key-bundle.js";
+import { encodeAgentKeyBundle, materializeAgentKey, decodeAgentKeyBundle } from "./agent-key-bundle.js";
 import { saveCredentials } from "./credentials.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 import { withInteractionPolicy } from "./prompt-policy.js";
@@ -14,10 +14,6 @@ const OLD_ENV = { ...process.env };
 afterEach(() => {
   process.env = { ...OLD_ENV };
 });
-
-function bundle(raw: object): string {
-  return toB64url(utf8(JSON.stringify(raw)));
-}
 
 describe("rbox key materialize", () => {
   test("rejects when no key input is provided", async () => {
@@ -33,7 +29,7 @@ describe("rbox key materialize", () => {
     process.env.HOME = home;
     const boot = await bootstrapAccount("acct_agentmat", "agent_devmat", 1_900_000_000_000);
     const mkB64 = toB64url(boot.secrets.mk);
-    const raw = bundle({
+    const raw = encodeAgentKeyBundle({
       v: 1,
       kind: "agent",
       bearer: "rbox_pat_testBearer",
@@ -63,7 +59,7 @@ describe("rbox key materialize", () => {
     process.env.RBOX_KEY = raw;
     const lines: string[] = [];
     const oldLog = console.log;
-    console.log = (line?: unknown) => void lines.push(String(line ?? ""));
+    console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
     try {
       await materializeCmd({ dir: tmp });
     } finally {
@@ -83,7 +79,7 @@ describe("rbox key materialize", () => {
   test("reads a bundle from --key-file", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-file-"));
     const boot = await bootstrapAccount("acct_agentfile", "agent_devfile", 1_900_000_000_000);
-    const raw = bundle({
+    const raw = encodeAgentKeyBundle({
       v: 1,
       kind: "agent",
       bearer: "rbox_pat_fileBearer",
@@ -133,6 +129,16 @@ test("whole rbox key create-ci command gates pending genesis before device or AP
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+test("revoke gates like create-ci: no destructive call without --yes (#513)", async () => {
+  const { revokeKey } = await import("./key-cmd.js");
+  const { revokeDevice } = await import("./auth/device-commands.js");
+  // Both refuse BEFORE loading credentials or reaching the API.
+  await expect(withInteractionPolicy({ enabled: false }, () => revokeKey("dev_agent_x")))
+    .rejects.toThrow("refusing to revoke an agent key without --yes in non-interactive mode");
+  await expect(withInteractionPolicy({ enabled: false }, () => revokeDevice("dev_x")))
+    .rejects.toThrow("refusing to revoke a device without --yes in non-interactive mode");
 });
 
 test("rbox key create-ci preserves the exact non-interactive root-key refusal", async () => {

@@ -151,7 +151,11 @@ export async function writeKitSuccess(phrase: string, creds: { accountId?: strin
   }
   const written = await writeRecoveryKit(phrase, creds, kitOpts.kitPath);
   const shown = displayPath(written.path);
-  process.stderr.write(suppressEcho ? `recovery phrase written to ${shown} — not echoed (--kit)\n` : `  ✓ recovery kit written: ${shown}\n`);
+  // Say PLAIN TEXT here. `rbox key save` promises the Keychain, but every non-darwin
+  // machine — and any --kit-path — lands on this line instead (#517).
+  process.stderr.write(suppressEcho
+    ? `recovery phrase written in plain text to ${shown} — not echoed (--kit)\n`
+    : `  ✓ recovery kit written (plain text — keep this file safe): ${shown}\n`);
   if (written.recordError) process.stderr.write(`  ! recovery kit status record failed: ${written.recordError.message}\n`);
 }
 

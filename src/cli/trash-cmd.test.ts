@@ -113,10 +113,34 @@ test("trash restore of an unknown path reports on stderr and exits non-zero", as
   expect(err).toMatch(/not found in trash/);
 });
 
+test("trash restore resolves its path against the CWD, not the workspace root (#516)", async () => {
+  // Same basename at the root and in a subdirectory: run from the subdirectory and the
+  // user means the one they can see. This used to restore the ROOT copy silently.
+  await seedTrash("2020-01-01T00:00:00.000Z", { "a.txt": "root copy", "src/a.txt": "src copy" });
+  const realRoot = await fs.realpath(root);
+  const cwd = process.cwd();
+  await fs.mkdir(path.join(realRoot, "src"), { recursive: true });
+  process.chdir(path.join(realRoot, "src"));
+  try {
+    const { code } = await capture(() => trashCmd(realRoot, ["restore", "a.txt"], {}));
+    expect(code).toBeUndefined();
+    expect(await fs.readFile(path.join(realRoot, "src", "a.txt"), "utf8")).toBe("src copy");
+    expect((await listTrash(realRoot)).map((e) => e.path)).toEqual(["a.txt"]);
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("trash empty refuses without --yes when it cannot prompt (#513)", async () => {
+  await seedTrash("2020-01-01T00:00:00.000Z", { "a.txt": "1234567890" });
+  await expect(capture(() => trashCmd(root, ["empty"], {}))).rejects.toThrow(/--yes/);
+  expect(await listTrash(root)).toHaveLength(1);
+});
+
 test("trash empty removes eligible batches and reports bytes freed", async () => {
   await seedTrash("2020-01-01T00:00:00.000Z", { "a.txt": "1234567890" });
   await seedTrash("2020-02-01T00:00:00.000Z", { "nested/b.txt": "xyz" });
-  const { out } = await capture(() => trashCmd(root, ["empty"], {}));
+  const { out } = await capture(() => trashCmd(root, ["empty"], { yes: "true" }));
   expect(out).toMatch(/emptied 2 batches/);
   expect(await listTrash(root)).toHaveLength(0);
 });
