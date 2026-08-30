@@ -53,6 +53,7 @@ export interface DaemonRecoveryHalt {
     | { kind: "push-conflict" }
     | { kind: "chain-repair" }
     | { kind: "too-many-refs" }
+    | { kind: "too-many-entries" }
     | { kind: "body-too-large" }
     | { kind: "folder-admission" };
   terminal?: { fingerprint: string };
@@ -245,6 +246,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       } else if (typedReason?.kind === "push-conflict") decoded.typedReason = { kind: "push-conflict" };
       else if (typedReason?.kind === "chain-repair") decoded.typedReason = { kind: "chain-repair" };
       else if (typedReason?.kind === "too-many-refs") decoded.typedReason = { kind: "too-many-refs" };
+      else if (typedReason?.kind === "too-many-entries") decoded.typedReason = { kind: "too-many-entries" };
       else if (typedReason?.kind === "body-too-large") decoded.typedReason = { kind: "body-too-large" };
       else if (typedReason?.kind === "folder-admission") decoded.typedReason = { kind: "folder-admission" };
       const terminal = halt.terminal;
@@ -297,6 +299,7 @@ export const isSafetyHaltReason = (kind: string | undefined): boolean =>
   kind === "mass-delete"
   || kind === "chain-repair"
   || kind === "too-many-refs"
+  || kind === "too-many-entries"
   || kind === "body-too-large"
   || kind === "folder-admission";
 

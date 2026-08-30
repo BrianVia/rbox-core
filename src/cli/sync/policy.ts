@@ -49,6 +49,16 @@ export class MassDeleteGuardError extends Error {
   }
 }
 
+/** Producer-typed safety refusal (#813): the candidate carries more entries than
+ * a manifest may hold. Thrown at composition, before any encrypt/upload spend;
+ * the wire-side `validateManifest` bound remains the backstop. */
+export class EntryCapGuardError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EntryCapGuardError";
+  }
+}
+
 /** Design 202: the local view a pull's main line may consume INSTEAD of scanning
  *  the workspace. `manifest` is the daemon's watcher-maintained truth with every
  *  unsettled path already stripped (scan-omission semantics, design 108) and

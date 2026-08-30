@@ -126,6 +126,14 @@ export {
   MAX_REF_TOMBSTONES_PER_REPO,
 } from "./manifest-validate.js";
 export {
+  dominatingDir,
+  dominatingDirHint,
+  isDominant,
+  DOMINANT_NEW_ENTRIES,
+  DOMINANT_SHARE,
+  type DominantDir,
+} from "./manifest-dominance.js";
+export {
   detectProjects,
   hydrateArgv,
   ECOSYSTEM_RULES,

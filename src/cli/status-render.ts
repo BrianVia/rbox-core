@@ -247,9 +247,11 @@ export function renderStatusBrief(
       ? { kind: "mass-delete", op: typedHalt.op }
       : typedHalt?.kind === "too-many-refs"
         ? { kind: "too-many-refs" }
-        : typedHalt?.kind === "body-too-large"
-          ? { kind: "body-too-large" }
-          : { kind: "unknown" }
+        : typedHalt?.kind === "too-many-entries"
+          ? { kind: "too-many-entries" }
+          : typedHalt?.kind === "body-too-large"
+            ? { kind: "body-too-large" }
+            : { kind: "unknown" }
     : undefined;
   const active = freshBriefActive(activity, daemon.running, now);
   const nextVersion = updateAvailableVersion(projection.probes.update);

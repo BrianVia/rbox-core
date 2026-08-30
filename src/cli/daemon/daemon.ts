@@ -29,7 +29,7 @@ import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, save
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
-import { MassDeleteGuardError, PushConflictExhaustedError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
+import { EntryCapGuardError, MassDeleteGuardError, PushConflictExhaustedError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
 import { ensureFolderAuthority } from "../folder-authority.js";
@@ -1529,7 +1529,9 @@ export class RboxDaemon {
           ? { kind: "mass-delete", op: actual.op }
           : actual instanceof ChainRepairHaltError
             ? { kind: "chain-repair" }
-            : undefined,
+            : actual instanceof EntryCapGuardError
+              ? { kind: "too-many-entries" }
+              : undefined,
       blocked: false,
     };
   }

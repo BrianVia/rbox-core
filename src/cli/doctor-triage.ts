@@ -166,6 +166,17 @@ function haltFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>): T
         safety: `${SAFE_LOCAL_FILES} Your uploaded versions are still on the server.`,
         command: scoped(root, "rbox recover --repair-chain"),
       };
+    // #813/#810: the halt reason is an authored sentence that already names the
+    // dominating directory and its `rbox ignore` command — the whole point of
+    // the refusal. Repeating a generic problem line here would bury it.
+    case "too-many-entries":
+      return {
+        id: "halt:too-many-entries",
+        severity: "blocked",
+        problem: `Syncing stopped because this workspace holds more files than rbox can sync. ${halt.reason}`,
+        safety: `${SAFE_LOCAL_FILES} Ignoring a directory only stops rbox syncing it; nothing is deleted.`,
+        command: scoped(root, "rbox ignore --list"),
+      };
     case "too-many-refs":
     case "body-too-large":
       return {
