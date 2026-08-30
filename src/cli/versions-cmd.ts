@@ -1,9 +1,10 @@
 import { Buffer } from "node:buffer";
-import { isSafeRelPath, restoreEntryToPath } from "../engine/index.js";
+import { restoreEntryToPath } from "../engine/index.js";
 import { openTrashBatch } from "../engine/trash.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { emitJson } from "./json.js";
+import { workspaceRelPath } from "./rbox-paths.js";
 import { assertBindingUsable, resolveBindingScope } from "./scope/binding-scope.js";
 import { ScopeProjection } from "./scope/projection.js";
 import { style } from "./style.js";
@@ -20,14 +21,6 @@ import { style } from "./style.js";
 const DEFAULT_LIMIT = 50;
 type BuildAuthedRemote = typeof buildAuthedRemote;
 
-/** Normalize a user-supplied restore/versions path to the manifest's POSIX-relative
- *  form and reject anything unsafe (absolute, traversal, NUL/backslash). */
-function toRelPath(input: string): string {
-  const rel = input.replace(/^\.\//, "").replace(/\/+$/, "");
-  if (!isSafeRelPath(rel)) throw new Error(`unsafe or absolute path: '${input}' — use a workspace-relative path`);
-  return rel;
-}
-
 /** Format an advisory server timestamp (ms) for display; em-dash when unknown. */
 function fmtTime(ms: number | undefined): string {
   if (!ms) return style.dim("—");
@@ -43,7 +36,7 @@ export async function versionsCmd(
   const { remote } = await (opts.buildAuthedRemote ?? buildAuthedRemote)(root);
 
   if (pathArg) {
-    const rel = toRelPath(pathArg);
+    const rel = workspaceRelPath(root, pathArg);
     const [changes, times] = await Promise.all([remote.pathHistory(rel, limit), remote.advisoryTimes(limit).catch(() => new Map<number, number>())]);
     if (opts.json) {
       emitJson({ versions: changes.map((c) => ({ sequence: c.seq, committedAt: times.get(c.seq) ?? null, path: rel })) });
@@ -84,7 +77,7 @@ export async function versionsCmd(
 export async function restoreCmd(root: string, spec: string): Promise<void> {
   const at = spec.lastIndexOf("@");
   if (at < 1) throw new Error("usage: rbox restore <path>@<seq>  (e.g. rbox restore src/app.ts@3)");
-  const rel = toRelPath(spec.slice(0, at));
+  const rel = workspaceRelPath(root, spec.slice(0, at));
   // Design 212 §3.2: refuse an out-of-scope restore BEFORE the blob is fetched —
   // otherwise `restore` quietly defeats the binding's disk and bandwidth boundary.
   const seal = await resolveBindingScope(root);

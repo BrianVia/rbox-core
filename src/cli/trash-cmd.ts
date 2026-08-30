@@ -9,6 +9,7 @@
 import { listTrash, pruneTrash, restoreFromTrash } from "../engine/trash.js";
 import { humanBytes } from "./status-view/text.js";
 import { emitJson } from "./json.js";
+import { workspaceRelPath } from "./rbox-paths.js";
 import { fail, style } from "./style.js";
 
 export async function trashCmd(root: string, positional: string[], flags: Record<string, string>): Promise<void> {
@@ -58,9 +59,11 @@ async function trashList(root: string, json = false): Promise<void> {
   console.log(style.dim(`restore with \`rbox trash restore <path>\``));
 }
 
-async function trashRestore(root: string, rel: string | undefined, batch: string | undefined): Promise<void> {
-  if (!rel) throw new Error("usage: rbox trash restore <path> [--batch <name>] [--path <dir>]");
+async function trashRestore(root: string, pathArg: string | undefined, batch: string | undefined): Promise<void> {
+  if (!pathArg) throw new Error("usage: rbox trash restore <path> [--batch <name>] [--path <dir>]");
   try {
+    // Resolved against the CWD, not silently read as workspace-root-relative (#516).
+    const rel = workspaceRelPath(root, pathArg);
     const { restoredTo } = await restoreFromTrash(root, rel, { batch });
     if (restoredTo === rel) {
       console.log(`restored ${style.cyan(rel)}`);
