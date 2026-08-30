@@ -16,7 +16,6 @@ import {
   commandSupportsFlag,
   helpFor,
   helpKeyFor,
-  isKnownTopLevel,
   renderCommand,
   renderEssentialHelp,
   renderGroupedHelp,
@@ -730,13 +729,15 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     default:
       // Bare `rbox` in a terminal → status/actions when already inside a workspace,
       // otherwise the guided `setup` front door (design 29).
-      // Non-interactive bare `rbox`, or an unknown command → the essential help
-      // screen (never hangs). An unknown command also exits non-zero.
+      // Non-interactive bare `rbox`, or an unhandled command → the essential help
+      // screen (never hangs). Reaching here with ANY command token means nothing ran
+      // — an unknown command, or a known alias with no route (`rbox daemon`, `rbox
+      // daemon bogus`) — so it exits non-zero.
       if (!cmd && process.stdin.isTTY) {
         await runGuidedFrontDoor(deps.frontDoorImport);
         break;
       }
       console.log(renderEssentialHelp());
-      if (cmd && !isKnownTopLevel(cmd)) process.exitCode = 1;
+      if (cmd) process.exitCode = 1;
   }
 }

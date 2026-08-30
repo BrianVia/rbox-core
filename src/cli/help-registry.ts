@@ -800,10 +800,6 @@ export const KNOWN_TOP_LEVEL: ReadonlySet<string> = new Set([
   "__boot-resume",
 ]);
 
-export function isKnownTopLevel(command: string | undefined): boolean {
-  return command !== undefined && KNOWN_TOP_LEVEL.has(command);
-}
-
 function aliasTarget(alias: DeprecatedAlias): string {
   return alias.kind === "rename" ? alias.target : alias.helpTarget;
 }

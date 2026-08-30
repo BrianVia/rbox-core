@@ -78,6 +78,16 @@ test("single-positional commands name the first surplus argument", async () => {
   }
 });
 
+test("a command token that routes nowhere exits non-zero (bare/unknown `daemon` alias)", async () => {
+  for (const argv of [["daemon"], ["daemon", "bogus"], ["not-a-command"]]) {
+    stderr = "";
+    process.exitCode = 0;
+    process.argv = [process.execPath, "rbox", ...argv];
+    await main(noHealthRefresh);
+    expect(process.exitCode, `rbox ${argv.join(" ")}`).toBe(1);
+  }
+});
+
 test("declared positional capacities preserve accepted forms", () => {
   for (const [command, positional] of [
     ["status", []],
