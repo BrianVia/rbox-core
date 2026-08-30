@@ -462,7 +462,7 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
     const observation = localObservation(overCap("chromium/src"), { projected: true });
     const sealed = preparePublishCandidate(snapshot(manifest([])), observation.local, rig.capture, policy());
     await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
-    await expect(sealed).rejects.toThrow(/chromium\/src just added 200,001 files/);
+    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 200,001 files/);
     await expect(sealed).rejects.toThrow(/`rbox ignore chromium\/src\/` skips it \(files stay on disk\)/);
     await expect(sealed).rejects.toThrow(/the limit is 200,000/);
   });

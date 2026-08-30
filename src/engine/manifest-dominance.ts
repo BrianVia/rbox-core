@@ -48,9 +48,11 @@ export function isDominant(dir: DominantDir, totalEntries: number): boolean {
   return dir.count >= DOMINANT_NEW_ENTRIES || (totalEntries > 0 && dir.count > totalEntries * DOMINANT_SHARE);
 }
 
-/** The remedy sentence: which directory, how much it added, and the one command
- *  that stops it — spelling out that ignoring is not deleting. */
+/** The remedy sentence: which directory, how much of the manifest it owns, and
+ *  the one command that stops it — spelling out that ignoring is not deleting.
+ *  Deliberately neutral about WHEN those files arrived: the same sentence
+ *  explains a tree that landed in this scan and one carried from base. */
 export function dominatingDirHint(dir: DominantDir): string {
-  return `${dir.dir} just added ${dir.count.toLocaleString("en-US")} files — looks like build output; ` +
+  return `${dir.dir} accounts for ${dir.count.toLocaleString("en-US")} files — looks like build output; ` +
     `\`rbox ignore ${dir.dir}/\` skips it (files stay on disk)`;
 }

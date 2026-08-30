@@ -49,8 +49,10 @@ describe("isDominant", () => {
   });
 });
 
+/** The same sentence is used for a tree that landed in this scan AND for one
+ *  carried from base, so it must not claim the files just arrived. */
 test("the hint names the directory, the count, and that files stay on disk", () => {
   expect(dominatingDirHint({ dir: "chromium/src", count: 180_000 })).toBe(
-    "chromium/src just added 180,000 files — looks like build output; `rbox ignore chromium/src/` skips it (files stay on disk)"
+    "chromium/src accounts for 180,000 files — looks like build output; `rbox ignore chromium/src/` skips it (files stay on disk)"
   );
 });
