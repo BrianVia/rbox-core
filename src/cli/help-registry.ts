@@ -592,7 +592,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "key save", positionals: 1,
     group: "DEVICES & ACCOUNT",
-    summary: "save a validated recovery phrase to Keychain or an explicit file",
+    summary: "save a validated recovery phrase (macOS: Keychain; elsewhere: a plaintext file)",
     usage: "rbox key save [--kit-path <path>]",
     flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default", takesValue: true }],
   },
