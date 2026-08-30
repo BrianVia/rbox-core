@@ -60,10 +60,12 @@ test("direct authenticated routes fail closed on invalid env before network acce
     ["device approve", () => approveDevice("CODE")],
     ["device list", () => listDevices()],
     ["device pair", () => pairCreate()],
-    ["device revoke", () => revokeDevice("dev")],
+    // --yes, like create-ci's --accept-root-key: the confirm gate is not what this
+    // test is about, the pre-network credential check is.
+    ["device revoke", () => revokeDevice("dev", true)],
     ["API-key create", () => createCiKey({ "accept-root-key": "true", expires: "90d" })],
     ["API-key list", () => listKeys()],
-    ["API-key revoke", () => revokeKey("key")],
+    ["API-key revoke", () => revokeKey("key", true)],
   ];
   for (const [name, route] of routes) {
     await expect(route(), name).rejects.toThrow(/invalid-environment.*RBOX_API/);

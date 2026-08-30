@@ -166,20 +166,28 @@ test("untrack honors an interactive 'no' (confirm returns false) and changes not
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
 });
 
-test("untrack proceeds through the real dispatcher confirm when interaction is disabled", async () => {
-  // End-to-end over main-dispatch's own `confirm` callback (headless: "proceed").
-  // A disabled interaction policy is exactly what `--no-interactive` installs;
-  // untrack must unbind instead of throwing PromptUnavailableError.
+test("untrack needs --force when interaction is disabled, and unbinds with it (#513)", async () => {
+  // End-to-end over main-dispatch's own `confirm` callback. A disabled interaction
+  // policy is exactly what `--no-interactive` installs. This used to be
+  // headless: "proceed" — an unconfirmed unbind was the DEFAULT scripted behavior
+  // while the help said `--force` was what skipped the prompt.
   const { root } = await track(dir, { workspace: "ws_x" }, "https://api.test");
   const argv = process.argv;
   const inDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
   Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
-  process.argv = [process.execPath, "rbox", "untrack", root];
-  try {
+  const headless = async (): Promise<void> => {
     await withInteractionPolicy(
       { enabled: false },
       () => main({ refreshSystemLockIdentityLedger: async () => {} }),
     );
+  };
+  try {
+    process.argv = [process.execPath, "rbox", "untrack", root];
+    await expect(headless()).rejects.toThrow(/--force/);
+    await fs.access(path.join(root, ".rbox")); // still bound
+
+    process.argv = [process.execPath, "rbox", "untrack", root, "--force"];
+    await headless();
   } finally {
     process.argv = argv;
     if (inDescriptor) Object.defineProperty(process.stdin, "isTTY", inDescriptor);

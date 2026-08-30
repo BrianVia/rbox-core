@@ -131,10 +131,16 @@ test("trash restore resolves its path against the CWD, not the workspace root (#
   }
 });
 
+test("trash empty refuses without --yes when it cannot prompt (#513)", async () => {
+  await seedTrash("2020-01-01T00:00:00.000Z", { "a.txt": "1234567890" });
+  await expect(capture(() => trashCmd(root, ["empty"], {}))).rejects.toThrow(/--yes/);
+  expect(await listTrash(root)).toHaveLength(1);
+});
+
 test("trash empty removes eligible batches and reports bytes freed", async () => {
   await seedTrash("2020-01-01T00:00:00.000Z", { "a.txt": "1234567890" });
   await seedTrash("2020-02-01T00:00:00.000Z", { "nested/b.txt": "xyz" });
-  const { out } = await capture(() => trashCmd(root, ["empty"], {}));
+  const { out } = await capture(() => trashCmd(root, ["empty"], { yes: "true" }));
   expect(out).toMatch(/emptied 2 batches/);
   expect(await listTrash(root)).toHaveLength(0);
 });

@@ -103,6 +103,20 @@ test("ignore refuses two operations instead of silently dropping one", async () 
   }
 });
 
+test("untrack refuses non-interactively instead of silently unbinding (#513)", async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-untrack-headless-"));
+  await fs.mkdir(path.join(ws, ".rbox"));
+  await fs.writeFile(path.join(ws, ".rbox", "workspace.json"), JSON.stringify({ remoteWorkspaceId: "ws_x", deviceId: "dev_x" }));
+  try {
+    process.argv = [process.execPath, "rbox", "untrack", ws];
+    await expect(main(noHealthRefresh)).rejects.toThrow(/--force/);
+    // The binding is still there: nothing was unbound.
+    expect(await fs.exists(path.join(ws, ".rbox", "workspace.json"))).toBe(true);
+  } finally {
+    await fs.rm(ws, { recursive: true, force: true });
+  }
+});
+
 test("declared positional capacities preserve accepted forms", () => {
   for (const [command, positional] of [
     ["status", []],

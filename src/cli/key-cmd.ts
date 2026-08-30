@@ -120,8 +120,16 @@ export async function listKeys(opts: { json?: boolean } = {}): Promise<void> {
   }
 }
 
-export async function revokeKey(deviceId: string): Promise<void> {
+export async function revokeKey(deviceId: string, yes = false): Promise<void> {
   if (!deviceId) throw new Error("usage: rbox key revoke <id>");
+  const ok = await confirmDestructive({
+    message: `Revoke agent key ${deviceId}? Anything using it stops syncing immediately.`,
+    yes,
+    default: false,
+    headless: "require-yes",
+    headlessError: "refusing to revoke an agent key without --yes in non-interactive mode",
+  });
+  if (!ok) throw new Error("cancelled");
   const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login`");
   await new RboxApi(creds.remoteUrl, creds.token, "", "").revokeApiKey(deviceId);

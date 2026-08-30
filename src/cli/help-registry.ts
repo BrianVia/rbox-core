@@ -411,7 +411,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "SYNCING",
     summary: "stop syncing a directory (local unbind; remote untouched)",
     usage: "rbox untrack [path] [--force]",
-    flags: [{ flag: "--force", desc: "skip the confirmation prompt and SIGKILL a stuck daemon" }],
+    flags: [{ flag: "--force", desc: "skip the confirmation prompt (required to untrack non-interactively) and SIGKILL a stuck daemon" }],
   },
   {
     name: "ignore", positionals: 1,
@@ -459,8 +459,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "trash empty", positionals: 1,
     group: "SYNCING",
     summary: "permanently delete trashed files (frees disk)",
-    usage: "rbox trash empty [--path <dir>]",
-    flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true }],
+    usage: "rbox trash empty [--yes] [--path <dir>]",
+    flags: [
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace", takesValue: true },
+      { flag: "--yes", short: "-y", desc: "confirm the permanent delete without prompting (alias: -y)" },
+    ],
   },
   {
     name: "versions", positionals: 1,
@@ -560,8 +563,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "device", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "manage devices",
-    usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id>>",
-    flags: [{ flag: "--json", desc: "with `list`, print JSON" }],
+    usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id> [--yes]>",
+    flags: [
+      { flag: "--json", desc: "with `list`, print JSON" },
+      { flag: "--yes", short: "-y", desc: "with `revoke`, confirm without prompting (alias: -y)" },
+    ],
   },
   {
     name: "account", positionals: 2,
@@ -660,7 +666,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key revoke", positionals: 2,
     group: "DEVICES & ACCOUNT",
     summary: "revoke an agent/CI sync key",
-    usage: "rbox key revoke <id>",
+    usage: "rbox key revoke <id> [--yes]",
+    flags: [{ flag: "--yes", short: "-y", desc: "confirm the revoke without prompting (alias: -y)" }],
   },
 
   // ── BILLING & MAINTENANCE ────────────────────────────────────────────────

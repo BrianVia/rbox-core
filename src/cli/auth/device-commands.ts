@@ -3,6 +3,7 @@ import { emitJson } from "../json.js";
 import { friendlyHttpError } from "../http-error.js";
 
 
+import { confirmDestructive } from "../prompt.js";
 import { requireCreds } from "./session.js";
 import { approveDeviceAuth, listDevicesAuth, revokeDeviceAuth } from "../remote/auth-command-wire.js";
 
@@ -37,7 +38,15 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
   }
 }
 
-export async function revokeDevice(deviceId: string): Promise<void> {
+export async function revokeDevice(deviceId: string, yes = false): Promise<void> {
+  const ok = await confirmDestructive({
+    message: `Revoke device ${deviceId}? It loses access to this account and stops syncing.`,
+    yes,
+    default: false,
+    headless: "require-yes",
+    headlessError: "refusing to revoke a device without --yes in non-interactive mode",
+  });
+  if (!ok) throw new Error("cancelled");
   const creds = await requireCreds();
   const res = await revokeDeviceAuth(creds.remoteUrl, deviceId, creds.token);
   if (!res.ok) throw await friendlyHttpError(res, "device revoke");

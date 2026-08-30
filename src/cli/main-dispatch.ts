@@ -327,7 +327,10 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
           return confirmDestructive({
             message: `Stop syncing ${root}? Local files stay.`,
             default: false,
-            headless: "proceed",
+            // Was "proceed": every non-interactive run unbound silently while the help
+            // taught that --force was what skipped the prompt (#513).
+            headless: "require-yes",
+            headlessError: "refusing to untrack without --force in non-interactive mode",
           });
         },
       });
@@ -366,7 +369,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       const sub = positional[0];
       if (sub === "approve") await approveDevice(positional[1] ?? "");
       else if (sub === "list") await listDevices({ json: jsonMode });
-      else if (sub === "revoke") await revokeDevice(positional[1] ?? "");
+      else if (sub === "revoke") await revokeDevice(positional[1] ?? "", flags.yes === "true");
       else {
         fail("usage: rbox device <approve <user-code>|list|revoke <device-id>>");
       }
@@ -658,7 +661,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         if (sub === "create-ci") await createCiKey(flags);
         else if (sub === "materialize") await materializeCmd(flags);
         else if (sub === "list") await listKeys({ json: jsonMode });
-        else if (sub === "revoke") await revokeKey(positional[1] ?? "");
+        else if (sub === "revoke") await revokeKey(positional[1] ?? "", flags.yes === "true");
         else fail("usage: rbox key <status | save | backup | genesis --yes | recover | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;

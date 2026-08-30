@@ -9,6 +9,7 @@
 import { listTrash, pruneTrash, restoreFromTrash } from "../engine/trash.js";
 import { humanBytes } from "./status-view/text.js";
 import { emitJson } from "./json.js";
+import { confirmDestructive } from "./prompt.js";
 import { workspaceRelPath } from "./rbox-paths.js";
 import { fail, style } from "./style.js";
 
@@ -19,7 +20,7 @@ export async function trashCmd(root: string, positional: string[], flags: Record
   } else if (sub === "restore") {
     await trashRestore(root, positional[1], flags.batch);
   } else if (sub === "empty") {
-    await trashEmpty(root);
+    await trashEmpty(root, flags.yes === "true");
   } else {
     fail("usage: rbox trash <list | restore <path> [--batch <name>] | empty> [--path <dir>]");
   }
@@ -77,7 +78,18 @@ async function trashRestore(root: string, pathArg: string | undefined, batch: st
   }
 }
 
-async function trashEmpty(root: string): Promise<void> {
+async function trashEmpty(root: string, yes: boolean): Promise<void> {
+  const ok = await confirmDestructive({
+    message: "Permanently delete every eligible trashed file? This cannot be undone.",
+    yes,
+    default: false,
+    headless: "require-yes",
+    headlessError: "refusing to empty the trash without --yes in non-interactive mode",
+  });
+  if (!ok) {
+    process.stderr.write("trash empty cancelled — nothing deleted.\n");
+    return;
+  }
   // {days:0, maxBytes:0} = evict every ELIGIBLE batch; the engine still protects an
   // in-progress `.active` batch and anything younger than its 15-minute floor by design.
   const { removedBatches, freedBytes } = await pruneTrash(root, { days: 0, maxBytes: 0 });

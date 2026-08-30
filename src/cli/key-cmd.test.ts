@@ -135,6 +135,16 @@ test("whole rbox key create-ci command gates pending genesis before device or AP
   }
 });
 
+test("revoke gates like create-ci: no destructive call without --yes (#513)", async () => {
+  const { revokeKey } = await import("./key-cmd.js");
+  const { revokeDevice } = await import("./auth/device-commands.js");
+  // Both refuse BEFORE loading credentials or reaching the API.
+  await expect(withInteractionPolicy({ enabled: false }, () => revokeKey("dev_agent_x")))
+    .rejects.toThrow("refusing to revoke an agent key without --yes in non-interactive mode");
+  await expect(withInteractionPolicy({ enabled: false }, () => revokeDevice("dev_x")))
+    .rejects.toThrow("refusing to revoke a device without --yes in non-interactive mode");
+});
+
 test("rbox key create-ci preserves the exact non-interactive root-key refusal", async () => {
   await expect(withInteractionPolicy(
     { enabled: false },
