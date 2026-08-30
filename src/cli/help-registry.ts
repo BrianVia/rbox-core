@@ -88,6 +88,10 @@ export interface ResolvedAlias {
 export const GLOBAL_FLAGS: readonly CommandFlag[] = [
   { flag: "--json", desc: "request JSON when the selected command supports it", hidden: true },
   { flag: "--help <ignored>", desc: "show command help", takesValue: true, hidden: true },
+  // `index.ts` derives the interaction policy from raw argv for EVERY command, so the
+  // unknown-flag gate must accept it everywhere (#514). `init` still declares it
+  // visibly, because its help is where CI users look for it.
+  { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing", hidden: true },
 ];
 
 /** Group render order for the grouped screen. */
@@ -114,10 +118,9 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--daemon", desc: "after the first pull, start background sync (keyed setup only)" },
       { flag: "--pull-only", desc: "with --daemon, never push local changes (keyed setup only)" },
       { flag: "--force", desc: "allow a non-empty target directory (keyed setup only)" },
-      { flag: "--new", desc: "internal guided-setup selection", hidden: true },
-      { flag: "--name <name>", desc: "internal guided-setup workspace name", takesValue: true, hidden: true },
-      { flag: "--no-sync", desc: "internal guided-setup first-sync selection", hidden: true },
-      { flag: "--respect-gitignore", desc: "internal guided-setup ignore selection", hidden: true },
+      // No --new/--name/--no-sync/--respect-gitignore here: the guided flow builds a
+      // FRESH flag object for runInit (`workspaceFlags`), so setup never read these
+      // from its own argv — declaring them only swallowed them silently (#514).
     ],
     examples: ["rbox setup"],
   },
@@ -179,6 +182,7 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)", takesValue: true },
       { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
       { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
+      { flag: "--no-sync", desc: "internal: initialize without the first sync", hidden: true },
     ],
   },
   {
@@ -398,7 +402,6 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--project <id>", desc: "internal project identifier", takesValue: true, hidden: true },
       { flag: "--name <name>", desc: "internal workspace name", takesValue: true, hidden: true },
       { flag: "--device <id>", desc: "internal device identifier override", takesValue: true, hidden: true },
-      { flag: "--no-interactive", desc: "internal non-interactive mode", hidden: true },
     ],
     notes: ["[path] defaults to the current directory"],
     examples: ["rbox track ~/code/myapp", "rbox track ~/code/myapp --workspace ws_ab12cd34"],
