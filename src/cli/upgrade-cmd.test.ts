@@ -528,6 +528,30 @@ test("daemon restart failure still syncs the menu-bar app before propagating", a
   expect(synced).toBe(true);
 });
 
+/** #824: a host that accumulated thousands of pid-less daemon records printed one
+ *  line each and exited 1 claiming an install that never happened. */
+test("already-current upgrade summarizes leftover daemon records in one line and stays successful", async () => {
+  for (const name of ["litter-a", "litter-b", "litter-c"]) {
+    const dir = path.join(home, ".rbox", "daemons", name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "daemon.pid"), "not-a-record\n");
+  }
+  serve();
+  const logs: string[] = [];
+  const consoleLogs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
+  try {
+    await upgradeCmd("https://releases.example", {
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), syncMenuBarApp: async () => {} },
+      daemonDeps: daemonDeps([], logs),
+    });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(logs).toEqual([`already up to date (${RBOX_VERSION})`, "skipped 3 leftover daemon records (nothing running for them)"]);
+  expect([...logs, ...consoleLogs].join("\n")).not.toContain("installed");
+});
+
 test("elevated equal-version upgrade never enters home-scoped daemon or release paths", async () => {
   serve();
   const actions: string[] = [];

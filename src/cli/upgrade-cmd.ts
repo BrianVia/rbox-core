@@ -95,7 +95,9 @@ export interface UpgradeCommandDeps {
 
 class UpgradeDaemonRestartError extends Error {
   constructor(readonly attempted: number) {
-    super("upgrade installed, but one or more live daemons could not be restarted");
+    // Thrown from the upgrade path AND the already-current path, so the copy
+    // must never claim an install happened (#824).
+    super("one or more running daemons could not be restarted");
   }
 }
 
@@ -117,6 +119,7 @@ export async function restartDaemonsAfterUpgrade(
   }
   let failed = false;
   let attempted = 0;
+  let litter = 0;
   for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
     const key = entry.name;
     let pid: number | undefined;
@@ -125,8 +128,11 @@ export async function restartDaemonsAfterUpgrade(
       pid = parsed.pid;
       if (!pid) throw new Error("invalid daemon record");
     } catch {
-      failed = true;
-      log(`daemon ${key}: not restarted (runtime record unreadable)`);
+      // A record with no readable pid names no process to restart: leftover
+      // litter from a removed workspace, not a live daemon we failed (#824).
+      // It is never GC'd here — the same directory holds the durable desired
+      // state, and deleting that on an unreadable pid would lose a workspace.
+      litter++;
       continue;
     }
     if (!pid || !owned(pid)) continue;
@@ -148,6 +154,7 @@ export async function restartDaemonsAfterUpgrade(
     attempted++;
     if (!await cycleOneDaemon({ root, key, row, stop, start, log })) failed = true;
   }
+  if (litter > 0) log(`skipped ${litter} leftover daemon record${litter === 1 ? "" : "s"} (nothing running for them)`);
   if (failed) throw new UpgradeDaemonRestartError(attempted);
   return attempted;
 }
