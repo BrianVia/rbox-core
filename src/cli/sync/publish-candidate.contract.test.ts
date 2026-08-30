@@ -22,7 +22,7 @@ function entry(path: string, sha = "a".repeat(64)): FileEntry {
 }
 
 function manifest(files: FileEntry[], gitRepos?: Manifest["gitRepos"]): Manifest {
-  return { generatedAt: OBSERVED_AT.toISOString(), files, ...(gitRepos ? { gitRepos } : {}) };
+  return { generatedAt: OBSERVED_AT.toISOString(), files, gitRepos };
 }
 
 function gitPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {

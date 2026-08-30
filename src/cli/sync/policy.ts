@@ -81,10 +81,17 @@ export class TrustedViewRefusalError extends Error {
   }
 }
 
+/** Named owner for the deferral tally a scan hands its caller: one counter to
+ *  feed, one flush that emits the batched line. */
+export interface DeferErrnoReporter {
+  onErrno: (code: string) => void;
+  flush: () => void;
+}
+
 export function makeDeferErrnoReporter(
   sink: (line: string) => void = (l) => console.error(`rbox: ${l}`),
   onFault?: () => void,
-): { onErrno: (code: string) => void; flush: () => void } {
+): DeferErrnoReporter {
   const counts = new Map<string, number>();
   return {
     onErrno: (code) => counts.set(code, (counts.get(code) ?? 0) + 1),

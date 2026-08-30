@@ -151,19 +151,19 @@ function sealedGitPublication(receipt: GitCaptureExecutionReceipt): SealedGitPub
   const plan = receipt.plan;
   return {
     capturePlanId: receipt.planId,
-    ...(plan.resolution ? { resolution: plan.resolution } : {}),
+    resolution: plan.resolution,
     filesFirstDeferred: plan.filesFirstDeferred === true,
     transition: {
       supersededPending: plan.supersededPending,
       resolvedPending: plan.resolvedPending ?? [],
-      ...(plan.supersessionIdentityKeys ? { supersessionIdentityKeys: plan.supersessionIdentityKeys } : {}),
+      supersessionIdentityKeys: plan.supersessionIdentityKeys,
       pending: plan.gitPendingRemote,
       removed: plan.gitReposRemoved,
       resolutions: plan.gitNeedsResolution,
       repoAbsent: plan.repoAbsent,
       packedRefsIdentity: plan.packedRefsIdentity,
-      ...(plan.publisherAckBindings ? { publisherAckBindings: plan.publisherAckBindings } : {}),
-      ...(plan.absentBranchProofs ? { absentBranchProofs: plan.absentBranchProofs } : {}),
+      publisherAckBindings: plan.publisherAckBindings,
+      absentBranchProofs: plan.absentBranchProofs,
       authoredCfgHashByRepo: plan.authoredCfgHashByRepo,
     },
   };
@@ -272,7 +272,7 @@ export async function preparePublishCandidate(
     planId: `capture-${++capturePlanCounter}`,
     forceGitRecapture: policy.forceGitRecapture,
     filesFirstDefer,
-    ...(policy.resolution ? { resolution: policy.resolution } : {}),
+    resolution: policy.resolution,
   };
   capture.reportProjectionSpans?.({
     projection_ignore_carry_ms: projectionSpans?.projection_ignore_carry_ms ?? 0,
