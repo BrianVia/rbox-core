@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { DEV_API, executionMode } from "./lib.js";
 import {
   assertGuestMachineHome, containerExecPrefix, containerRboxEnv, guestMachineHome,
-  uxContainerName, uxContainerPlan, uxCreateArgs, uxDestroyArgs, uxDestroyScope, uxImageHasLabel, uxListArgs, uxOwnership,
+  inspectedRow, uxContainerName, uxContainerPlan, uxCreateArgs, uxDestroyArgs, uxDestroyScope, uxImageHasLabel, uxListArgs, uxOwnership,
 } from "./container.js";
 import { UX_GUEST_RBOX } from "./binary.js";
 
@@ -66,26 +66,23 @@ test("list selects live UX-labelled containers", () => {
 
 describe("container ownership", () => {
   const plan = uxContainerPlan("walk", "hash", "/repo", undefined);
-  const matching = [{
+  const matching = {
     Config: { Image: plan.image, Env: [`RBOX_API=${DEV_API}`, "PATH=/bin"], Labels: { ux: "1", "ux.run": "walk", "ux.repo": plan.repoId, "ux.spec": plan.specHash } },
     HostConfig: { NetworkMode: "bridge" },
-    Mounts: plan.mounts.map((mount) => ({ Source: mount.source, Destination: mount.target, RW: false })),
-  }];
+    Mounts: plan.mounts.map((mount) => ({ Destination: mount.target })),
+  };
 
   test("accepts an exact owned container", () => expect(uxOwnership(matching, plan)).toBe("match"));
   test("permits scoped recreation only after ownership is proven", () => {
-    expect(uxOwnership([{ ...matching[0], Config: { ...matching[0]!.Config, Labels: { ux: "1", "ux.run": "walk", "ux.repo": plan.repoId, "ux.spec": "old" } } }], plan)).toBe("owned-stale");
+    expect(uxOwnership(({ ...matching, Config: { ...matching.Config, Labels: { ux: "1", "ux.run": "walk", "ux.repo": plan.repoId, "ux.spec": "old" } } }), plan)).toBe("owned-stale");
   });
   test("treats adding, removing, or replacing only the candidate mount as owned-stale", () => {
     const candidatePlan = uxContainerPlan("walk", "hash", "/repo", "/artifacts/new-rbox");
     expect(uxOwnership(matching, candidatePlan)).toBe("owned-stale");
-    const oldCandidate = [{
-      ...matching[0],
-      Mounts: [
-        ...matching[0]!.Mounts,
-        { Source: "/artifacts/old-rbox", Destination: UX_GUEST_RBOX, RW: false },
-      ],
-    }];
+    const oldCandidate = {
+      ...matching,
+      Mounts: [...matching.Mounts, { Destination: UX_GUEST_RBOX }],
+    };
     expect(uxOwnership(oldCandidate, plan)).toBe("owned-stale");
     expect(uxOwnership(oldCandidate, candidatePlan)).toBe("owned-stale");
   });
@@ -93,21 +90,28 @@ describe("container ownership", () => {
     // Namespace CI runners run the job inside a container while dockerd lives
     // outside it: Source comes back prefixed with the job's rootfs and the
     // readonly flag is not echoed back.
-    const namespaced = [{
-      ...matching[0],
+    const namespaced = {
+      ...matching,
       Mounts: plan.mounts.map((mount) => ({ Source: `/namespace/containers/rootfs/dr9bhcvv6sct8/root${mount.source}`, Destination: mount.target, RW: true })),
-    }];
+    };
     expect(uxOwnership(namespaced, plan)).toBe("match");
   });
-  test("rejects an unlabelled same-name collision", () => expect(uxOwnership([{ Config: { Labels: {} } }], plan)).toBe("collision"));
+  test("rejects an unlabelled same-name collision", () => expect(uxOwnership(({ Config: { Labels: {} } }), plan)).toBe("collision"));
   test("rejects another checkout and any unexpected extra mount", () => {
-    expect(uxOwnership([{ ...matching[0], Config: { ...matching[0]!.Config, Labels: { ...matching[0]!.Config.Labels, "ux.repo": "another" } } }], plan)).toBe("collision");
-    expect(uxOwnership([{ ...matching[0], Mounts: [...matching[0]!.Mounts, { Source: "/host", Destination: "/host", RW: true }] }], plan)).toBe("collision");
-    expect(uxOwnership([{ ...matching[0], Config: { ...matching[0]!.Config, Env: [...matching[0]!.Config.Env, "RBOX_TOKEN=ambient"] } }], plan)).toBe("collision");
+    expect(uxOwnership(({ ...matching, Config: { ...matching.Config, Labels: { ...matching.Config.Labels, "ux.repo": "another" } } }), plan)).toBe("collision");
+    expect(uxOwnership(({ ...matching, Mounts: [...matching.Mounts, { Destination: "/host" }] }), plan)).toBe("collision");
+    expect(uxOwnership(({ ...matching, Config: { ...matching.Config, Env: [...matching.Config.Env, "RBOX_TOKEN=ambient"] } }), plan)).toBe("collision");
   });
 });
 
+test("inspection decodes the first row and treats anything else as absent", () => {
+  expect(inspectedRow('[{"Config":{"Image":"rig-device"}}]')?.Config?.Image).toBe("rig-device");
+  expect(inspectedRow("[]")).toBeUndefined();
+  expect(inspectedRow("null")).toBeUndefined();
+  expect(() => inspectedRow("not json")).toThrow();
+});
+
 test("shared image attribution requires the UX label", () => {
-  expect(uxImageHasLabel([{ Config: { Labels: { rig: "1", ux: "1" } } }])).toBeTrue();
-  expect(uxImageHasLabel([{ Config: { Labels: { rig: "1" } } }])).toBeFalse();
+  expect(uxImageHasLabel({ Config: { Labels: { rig: "1", ux: "1" } } })).toBeTrue();
+  expect(uxImageHasLabel({ Config: { Labels: { rig: "1" } } })).toBeFalse();
 });

@@ -36,7 +36,7 @@ export function guestMachineHome(runId: string, name: string): string {
   return path.posix.join(UX_ROOT, safeId("run id", runId), safeId("machine name", name));
 }
 
-export function assertGuestMachineHome(home: string, runId?: string): { runId: string; name: string } {
+export function assertGuestMachineHome(home: string, runId?: string) {
   const relative = path.posix.relative(UX_ROOT, path.posix.resolve(home));
   const parts = relative.split("/");
   if (parts.length !== 2 || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
@@ -55,8 +55,11 @@ export function currentRigImageHash(): string {
   });
 }
 
-function specHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 24);
+/** The requested container spec, before it is fingerprinted into `ux.spec`. */
+export type UxContainerSpec = Omit<UxContainerPlan, "specHash">;
+
+function specHash(spec: UxContainerSpec): string {
+  return createHash("sha256").update(JSON.stringify(spec)).digest("hex").slice(0, 24);
 }
 
 export function uxContainerPlan(
@@ -88,7 +91,7 @@ export function uxCreateArgs(plan: UxContainerPlan): string[] {
   return args;
 }
 
-export function uxDestroyArgs(runId: string): { stop: string[]; remove: string[] } {
+export function uxDestroyArgs(runId: string) {
   const name = uxContainerName(runId);
   return { stop: ["stop", name], remove: ["rm", "--force", "--volumes", name] };
 }
@@ -99,7 +102,7 @@ export function uxListArgs(): string[] {
   return ["ps", "--filter", "label=ux=1", "--format", "{{.Names}}\t{{.Label \"ux.run\"}}"]; 
 }
 
-export function containerRboxEnv(home: string): Record<string, string> {
+export function containerRboxEnv(home: string) {
   assertGuestMachineHome(home);
   return { HOME: home, RBOX_HOME: home, RBOX_API: DEV_API, RBOX_API_QUIET: "1", RBOX_APP: "" };
 }
@@ -114,45 +117,31 @@ export function containerExecPrefix(runId: string, home: string): string {
   ].join(" ");
 }
 
-interface DockerInspect {
-  Config?: { Image?: unknown; Env?: unknown; Labels?: DockerLabels };
-  HostConfig?: { NetworkMode?: unknown };
-  Mounts?: unknown;
+/**
+ * What `docker inspect` reports about one container or image, decoded once in
+ * `inspectedRow` and passed as this type from there on. Every field is optional
+ * because it is the daemon's payload, not ours; a missing field simply fails
+ * the comparison that needs it.
+ */
+export interface InspectedRow {
+  Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
+  HostConfig?: { NetworkMode?: string };
+  Mounts?: { Destination?: string }[] | null;
 }
 
-interface DockerLabels {
-  ux?: unknown;
-  "ux.run"?: unknown;
-  "ux.repo"?: unknown;
-  "ux.spec"?: unknown;
-}
-
-interface DockerMountCandidate {
-  Destination?: unknown;
-}
-
-function inspectRow(value: unknown): DockerInspect | undefined {
-  if (!Array.isArray(value) || !value[0] || typeof value[0] !== "object") return undefined;
-  return value[0] as DockerInspect;
-}
-
-export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "owned-stale" | "collision" {
-  const row = inspectRow(value);
+export function uxOwnership(row: InspectedRow | undefined, plan: UxContainerPlan): "match" | "owned-stale" | "collision" {
   const labels = row?.Config?.Labels;
-  if (!labels || typeof labels !== "object" || Array.isArray(labels)) return "collision";
-  const map = labels;
-  if (map.ux !== "1" || map["ux.run"] !== plan.runId || map["ux.repo"] !== plan.repoId) return "collision";
+  if (labels?.ux !== "1" || labels["ux.run"] !== plan.runId || labels["ux.repo"] !== plan.repoId) return "collision";
   if (row?.Config?.Image !== plan.image || row.HostConfig?.NetworkMode !== plan.network) return "collision";
-  const env = Array.isArray(row.Config.Env) ? row.Config.Env : [];
+  const env = row.Config.Env ?? [];
   const forbidden = ["HOME", "RBOX_HOME", ...SCRUBBED_ENV].filter((key) => key !== "RBOX_API");
-  if (!env.includes(`RBOX_API=${DEV_API}`) || env.some((entry) => typeof entry === "string" && forbidden.some((key) => entry.startsWith(`${key}=`)))) return "collision";
+  if (!env.includes(`RBOX_API=${DEV_API}`) || env.some((entry) => forbidden.some((key) => entry.startsWith(`${key}=`)))) return "collision";
   // Only the guest-side Destination is comparable: a daemon that does not share
   // the client's mount namespace (Namespace CI runners run the job inside a
   // container while dockerd lives outside it) reports Source rewritten into its
   // own view and drops the client's readonly flag. What we asked for is recorded
   // by us in ux.spec, which already hashes every mount source below.
-  const mounts = Array.isArray(row.Mounts) ? row.Mounts : [];
-  const destinations = mounts.map((candidate) => (candidate && typeof candidate === "object" ? (candidate as DockerMountCandidate).Destination : undefined));
+  const destinations = (row.Mounts ?? []).map((mount) => mount.Destination);
   const coreActual = destinations.filter((destination) => destination !== UX_GUEST_RBOX);
   const coreDesired = plan.mounts.filter((want) => want.target !== UX_GUEST_RBOX);
   const coreMatches = coreActual.length === coreDesired.length &&
@@ -161,16 +150,15 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   const exactMounts = destinations.length === plan.mounts.length &&
     plan.mounts.every((want) => destinations.includes(want.target));
   if (!exactMounts) return "owned-stale";
-  return map["ux.spec"] === plan.specHash ? "match" : "owned-stale";
+  return labels["ux.spec"] === plan.specHash ? "match" : "owned-stale";
 }
 
 export function configureUxRuntime(): void {
   C.configureRunner("docker");
 }
 
-export function uxImageHasLabel(value: unknown): boolean {
-  const labels = inspectRow(value)?.Config?.Labels;
-  return Boolean(labels && typeof labels === "object" && !Array.isArray(labels) && labels.ux === "1");
+export function uxImageHasLabel(row: InspectedRow | undefined): boolean {
+  return row?.Config?.Labels?.ux === "1";
 }
 
 async function ensureImageCurrent(): Promise<string> {
@@ -178,7 +166,7 @@ async function ensureImageCurrent(): Promise<string> {
   const present = await C.imageExists(UX_IMAGE);
   const inspectedImage = present ? await C.run(["image", "inspect", UX_IMAGE], { allowFail: true }) : undefined;
   let labelled = false;
-  if (inspectedImage?.exitCode === 0) try { labelled = uxImageHasLabel(JSON.parse(inspectedImage.stdout)); } catch { /* rebuild */ }
+  if (inspectedImage?.exitCode === 0) try { labelled = uxImageHasLabel(inspectedRow(inspectedImage.stdout)); } catch { /* rebuild */ }
   if (!present || !labelled || readImageHashRecord(RIG_HASH_FILE, "docker") !== want) {
     await C.buildImage({ tag: UX_IMAGE, dockerfile: RIG_DOCKERFILE, contextDir: REPO_ROOT, labels: { ux: "1", "rig.hash": want } });
     writeImageHashRecord(RIG_HASH_FILE, "docker", want);
@@ -186,10 +174,17 @@ async function ensureImageCurrent(): Promise<string> {
   return want;
 }
 
-async function inspected(name: string): Promise<unknown | undefined> {
+/** The one place raw `docker inspect` JSON becomes a typed row. Anything but a
+ * populated array reads as "nothing inspected", the same as a failed inspect. */
+export function inspectedRow(json: string): InspectedRow | undefined {
+  const rows: InspectedRow[] = JSON.parse(json);
+  return Array.isArray(rows) ? rows[0] : undefined;
+}
+
+async function inspected(name: string): Promise<InspectedRow | undefined> {
   const result = await C.run(["inspect", name], { allowFail: true });
   if (result.exitCode !== 0) return undefined;
-  try { return JSON.parse(result.stdout); } catch { throw new Error(`cannot parse Docker inspection for ${name}`); }
+  try { return inspectedRow(result.stdout); } catch { throw new Error(`cannot parse Docker inspection for ${name}`); }
 }
 
 export async function ensureUxContainer(runId: string): Promise<UxContainerPlan> {
