@@ -19,6 +19,7 @@ import {
 } from "../engine/e2ee/index.js";
 import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitSectionBlobRefs } from "./sync-git/git-state.js";
+import { readEncryptCacheDb } from "./state-plane/encrypt-cache-rig.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, mdeWritePolicy, resetMdeWritePolicyWarnOnceForTests, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
@@ -234,10 +235,12 @@ test("push refreshes write context and encrypt cache after an epoch_stale commit
   const body = parseCommit(server.commits[0]!);
   expect(body.accountEpoch).toBe(1);
   expect(body.keyEpoch).toBe(7);
-  const raw = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+  // The seeded JSON cache is imported and moved aside on first open, so the refreshed
+  // context and re-encrypted address are read back from the live SQLite backing.
+  const raw = await readEncryptCacheDb(root);
   expect(raw.accountEpoch).toBe(1);
   expect(raw.keyEpoch).toBe(7);
-  expect(raw.entries[stale.plaintextSha].encSha).not.toBe(stale.encSha);
+  expect(raw.entries[stale.plaintextSha]!.encSha).not.toBe(stale.encSha);
 });
 
 const seedManifestRefs = (server: FakeServer, manifest: Manifest): void => {

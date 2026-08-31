@@ -1,5 +1,4 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +31,7 @@ import {
   type Manifest,
 } from "../../engine/index.js";
 import { setClassifyCacheHitObserverForTest } from "../publish-pipeline/shared.js";
+import { readEncryptCacheDb, type EncryptCacheReadback } from "../state-plane/encrypt-cache-rig.js";
 import { listTrash } from "../../engine/trash.js";
 import { projectLocalManifest } from "../local-file-projection.js";
 import { FakeRemote, KEK, deps, enc, noBackoff, shaBytes } from "./publication.test-helper.js";
@@ -357,24 +357,7 @@ async function writeEncryptCache(entries: Record<string, { encSha: string; ciphe
  *  end-to-end assertions keep describing addresses and their paths rather than a
  *  storage layout. `writeEncryptCache` still seeds the JSON file: the backing imports
  *  it on its first open, which is the migration these pushes exercise for free. */
-async function readEncryptCache(): Promise<{ entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> }> {
-  const file = path.join(root, ENCRYPT_ADDRESS_CACHE_DB_REL);
-  const entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> = {};
-  if (!(await fs.stat(file).catch(() => undefined))) return { entries };
-  const db = new Database(file, { create: false, readwrite: true });
-  const statement = db.prepare("SELECT path,plaintext_sha,enc_sha,cipher_size FROM addresses ORDER BY path");
-  try {
-    for (const row of statement.all() as Array<{ path: string; plaintext_sha: string; enc_sha: string; cipher_size: number }>) {
-      const entry = entries[row.plaintext_sha] ?? { encSha: row.enc_sha, cipherSize: row.cipher_size, paths: [] };
-      entry.paths.push(row.path);
-      entries[row.plaintext_sha] = entry;
-    }
-  } finally {
-    statement.finalize();
-    db.close();
-  }
-  return { entries };
-}
+const readEncryptCache = (): Promise<EncryptCacheReadback> => readEncryptCacheDb(root);
 
 function countingEncrypt() {
   let calls = 0;
