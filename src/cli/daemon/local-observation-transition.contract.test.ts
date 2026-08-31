@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { HashCache, buildIgnoreMatcher, type FileEntry, type Manifest, type WatchEvent } from "../../engine/index.js";
+import { DirCache, HashCache, buildIgnoreMatcher, type FileEntry, type Manifest, type WatchEvent } from "../../engine/index.js";
 import {
   LocalAuthority,
   sealLocalObservationIdentity,
@@ -277,10 +277,12 @@ function observerOverAuthority(options: {
     outcomes: [],
   };
   h.retries = new LocalRetryQueue({ requeue: () => {}, markUnsettled: (p) => h.authority.markUnsettled(p), stopped: () => true });
+  let sharedDircache: DirCache | undefined;
   const effects: LocalObservationEffects = {
     root: options.root,
     currentManifest: () => h.authority.manifest,
     currentMatcher: () => buildIgnoreMatcher(options.root),
+    dircache: () => (sharedDircache ??= new DirCache()),
     matcherGeneration: () => h.generation,
     scanMode: () => "unpruned",
     beginTopologySnapshot: (scanKind) => ({ scanKind }),

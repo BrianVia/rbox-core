@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 // top-level pull of an op when the trust predicate P holds, and refreshes it
 // afterwards with an O(applied) patch unless a fallback trigger fires.
 
-import { HashCache, nativePruneGlobs, scanManifest, type BlobStore, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
+import { DirCache, HashCache, nativePruneGlobs, scanManifest, type BlobStore, type DirCacheEntry, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { PENDING_EVENT_CAP, RboxDaemon, type ScanCadenceClock } from "./daemon.js";
 import type { WatcherAttemptWitness, WatcherRearmClock } from "./watcher-session-supervisor.js";
@@ -89,6 +89,7 @@ interface DaemonInternals {
   matcherGitReposKey: string;
   matcherGeneration: number;
   folderMatcherRebuildPending: boolean;
+  dircache?: DirCache;
   matcherFor(state: { lastSyncedManifest: Manifest }): IgnoreMatcher | undefined;
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
@@ -1185,6 +1186,46 @@ test("design 206 §1: a hygiene-installed base with a changed key set is re-base
   expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
   expect(d.local.observedGeneration).toBe(d.matcherGeneration);
   expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
+});
+
+// ── #818: one daemon-owned DirCache ─────────────────────────────────
+class CountingDirCache extends DirCache {
+  records = 0;
+  override record(dirRel: string, entry: DirCacheEntry): void {
+    this.records++;
+    super.record(dirRel, entry);
+  }
+}
+
+test("#818: ONE daemon-owned DirCache serves both the scan lane and the pull lane", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  expect(d.dircache).toBeDefined(); // loaded once at start, not per operation
+
+  const counting = new CountingDirCache();
+  d.dircache = counting;
+
+  await d.doFullScan();
+  const afterScan = counting.records;
+  expect(afterScan).toBeGreaterThan(0); // the observer walks through the daemon's instance
+
+  // A scanning pull (trusted view refused) must reach for the SAME object — before
+  // #818 it loaded and re-parsed its own copy, which then clobbered the scan lane's.
+  // A pull must reach for that SAME object. Before #818 it loaded and re-parsed
+  // its own copy every pull, which then clobbered the scan lane's listings.
+  const loadSpy = spyOn(DirCache, "load");
+  try {
+    stagePreOpTopologyChange(d);
+    remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")], {});
+    d.want.pull = true;
+    await d.pump();
+    expect(loadSpy).not.toHaveBeenCalled();
+  } finally {
+    loadSpy.mockRestore();
+  }
+  expect(counting.records).toBeGreaterThan(afterScan);
+  expect(d.dircache).toBe(counting);
 });
 
 // ── #818: the pull-side matcher provider ─────────────────────────────────────

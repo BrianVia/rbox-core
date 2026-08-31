@@ -5,7 +5,6 @@ import {
   coverageOf,
   DirCache,
   scanManifest,
-  scanPruneEnabled,
   type DiscoveredGitRepo,
   type HashCache,
   type IgnoreMatcher,
@@ -212,6 +211,9 @@ export interface LocalObservationEffects {
   readonly root: string;
   currentManifest(): Manifest;
   currentMatcher(): IgnoreMatcher;
+  /** #818: the caller-owned Layer A cache, shared with the pull lane. Undefined
+   * under the `RBOX_SCAN_PRUNE=0` kill switch. */
+  dircache(): DirCache | undefined;
   /** Design 206 §2: read synchronously with the matcher the walk uses. */
   matcherGeneration(): number;
   /** Layer A may prune only while a live watcher is trusted. */
@@ -283,7 +285,7 @@ export class LocalWorkspaceObserver {
     const scanStartMs = Date.now();
     const priorProbe = probeOn ? await loadScanProbe(root) : undefined;
     const probe = probeOn ? createScanProbe(priorProbe) : undefined;
-    const dircache = scanPruneEnabled() ? await DirCache.load(root) : undefined;
+    const dircache = this.effects.dircache();
     const deferErrnos = makeDeferErrnoReporter(this.effects.log, () => this.effects.recordScanFault());
     // Design 206 §2: the generation this observation STARTS under, captured with the
     // same synchronous read of the matcher the walk uses. Stamping at install time

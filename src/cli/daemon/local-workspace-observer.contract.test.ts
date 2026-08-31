@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, buildIgnoreMatcher, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
+import { DirCache, HashCache, buildIgnoreMatcher, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
 import type { ManifestUpdate } from "./manifest-update.js";
 import {
   LocalRetryQueue,
@@ -63,6 +63,7 @@ function harness(options: {
   scanMode?: "pruned" | "unpruned";
 }): Harness {
   let walkCall = 0;
+  let sharedDircache: DirCache | undefined;
   const h: Harness = {
     observer: undefined as unknown as LocalWorkspaceObserver,
     retries: undefined as unknown as LocalRetryQueue,
@@ -90,6 +91,7 @@ function harness(options: {
     root: options.root,
     currentManifest: () => h.manifest,
     currentMatcher: () => options.matcher ?? buildIgnoreMatcher(options.root),
+    dircache: () => (sharedDircache ??= new DirCache()),
     matcherGeneration: () => h.generation,
     scanMode: () => options.scanMode ?? "unpruned",
     beginTopologySnapshot: (scanKind): ScanTopologySnapshot => {
