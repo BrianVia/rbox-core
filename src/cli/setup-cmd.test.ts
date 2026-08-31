@@ -1,4 +1,13 @@
-import { test, expect } from "bun:test";
+import { test, expect, afterEach } from "bun:test";
+
+// Some tests drive paths that legitimately set process.exitCode = 1 (the
+// non-TTY runSetup guard, terminal failure renders); a leaked code fails the
+// whole bun test process (0 fail, exit 1). The reset must be an explicit 0:
+// in Bun, assigning undefined does NOT clear a previously-set exit code, so
+// the save/restore pattern used inside individual tests is a silent no-op.
+afterEach(() => {
+  process.exitCode = 0;
+});
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -1136,7 +1145,7 @@ test("declined rebind returns menu for ordinary and preselected create paths wit
     let selects = 0;
     const result = await stepWorkspace(
       { cwd: "/bound", defaultRemote: "https://api.test" },
-      { ...(preselectedKind ? { preselectedKind } : {}), header: "Workspace" },
+      preselectedKind ? { preselectedKind, header: "Workspace" } : { header: "Workspace" },
       baseCreateDeps("/bound", {
         promptSelect: async () => { selects++; return "new"; },
         loadConfigIfPresent: async () => ({ remoteWorkspaceId: "ws_old", projectId: "root" }),
