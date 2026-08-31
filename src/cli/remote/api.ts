@@ -49,6 +49,10 @@ export interface SyncRemote {
   ownsUploadLaneTiming?(size: number): boolean;
   closeUploader?(err: Error): Promise<void>;
   receiptPort?(): ReceiptPort | undefined;
+  /** #818: start the account-keys read the next `commit()` needs, so its round-trip
+   *  overlaps the upload lane instead of stalling in front of the signature. Purely
+   *  a timing hint — `commit()` behaves identically, errors included, without it. */
+  prefetchAccount?(): void;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;

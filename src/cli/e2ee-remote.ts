@@ -36,6 +36,11 @@ export type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence, Commit
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
 const HISTORY_DECRYPT_CONCURRENCY = 8;
 
+/** #818: how long a prefetched account refresh may sit before `commit()` refuses to
+ *  sign against it. C4 wants the epoch read immediately before signing; overlapping
+ *  one upload's round-trip is the whole point, an abandoned push's leftover is not. */
+const ACCOUNT_PREFETCH_MAX_AGE_MS = 60_000;
+
 /** §24: emit a sidecar (refs out of the signed body) once the unique ref set is large
  *  enough that the inline body would approach the server's 1 MB commit-body cap. At ~85 B
  *  JSON/ref, 4000 refs ≈ 340 KB — comfortably inline; above this we switch to the sidecar
@@ -151,7 +156,37 @@ export class E2eeRemote implements SyncRemote {
    *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
   private writeEpoch?: number;
 
+  /** #818: an account refresh started early so its round-trip overlaps the blob
+   *  upload instead of stalling in front of the signature. Consumed once, by the
+   *  next `commit()`, and only while still fresh enough to honor C4. */
+  private accountPrefetch?: { promise: Promise<VerifiedAccount>; at: number };
+
   constructor(private readonly api: E2eeApi, private readonly ctx: E2eeContext, private readonly pins: PinStore) {}
+
+  /**
+   * #818: issue the account-keys GET concurrently with the upload lane. Nothing
+   * before signing depends on the result, so a push paid its full round-trip
+   * serially in front of `commit()`.
+   *
+   * Not fire-and-forget: the promise is parked, `commit()` awaits it, and a
+   * rejection therefore fails the push with exactly the error it does today. The
+   * local `catch` only marks it handled so a push that never reaches `commit()`
+   * cannot raise an unhandled rejection.
+   */
+  prefetchAccount(): void {
+    const promise = this.refreshAccount();
+    promise.catch(() => {});
+    this.accountPrefetch = { promise, at: this.ctx.now() };
+  }
+
+  /** C4 wants a fresh epoch immediately before signing. A prefetch older than one
+   *  upload's worth of staleness is discarded rather than signed against. */
+  private freshAccount(): Promise<VerifiedAccount> {
+    const parked = this.accountPrefetch;
+    this.accountPrefetch = undefined;
+    if (parked && this.ctx.now() - parked.at < ACCOUNT_PREFETCH_MAX_AGE_MS) return parked.promise;
+    return this.refreshAccount();
+  }
 
   /** The current-epoch workspace KEK — also used by sync.ts to encrypt blobs.
    *  Snapshots the write epoch so `commit()` can reject a stale-KEK sign (D1). */
@@ -726,10 +761,10 @@ export class E2eeRemote implements SyncRemote {
     let account: VerifiedAccount;
     if (onCommitTimings) {
       const t0 = Date.now();
-      account = await this.refreshAccount(); // C4: refresh immediately before signing
+      account = await this.freshAccount(); // C4: refresh immediately before signing
       refreshMs = Date.now() - t0;
     } else {
-      account = await this.refreshAccount(); // C4: refresh immediately before signing
+      account = await this.freshAccount(); // C4: refresh immediately before signing
     }
     // D1: if the epoch rotated between blob encryption (currentKek) and now, the
     // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a

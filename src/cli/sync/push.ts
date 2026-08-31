@@ -707,6 +707,10 @@ async function runPushAttempt(
       forceFullAudit,
     };
     if (deps.warningSink) uploadOptions.warningSink = deps.warningSink;
+    // #818: the account-keys read `commit()` needs depends on nothing below, so
+    // issue it here and let it run under the upload rather than in front of the
+    // signature. `commit()` still awaits it and still fails the push on its error.
+    api.prefetchAccount?.();
     const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, uploadOptions);
 
     // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
