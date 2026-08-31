@@ -1145,7 +1145,7 @@ test("declined rebind returns menu for ordinary and preselected create paths wit
     let selects = 0;
     const result = await stepWorkspace(
       { cwd: "/bound", defaultRemote: "https://api.test" },
-      { ...(preselectedKind ? { preselectedKind } : {}), header: "Workspace" },
+      preselectedKind ? { preselectedKind, header: "Workspace" } : { header: "Workspace" },
       baseCreateDeps("/bound", {
         promptSelect: async () => { selects++; return "new"; },
         loadConfigIfPresent: async () => ({ remoteWorkspaceId: "ws_old", projectId: "root" }),
