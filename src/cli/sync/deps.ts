@@ -1,4 +1,4 @@
-import { DirCache, HashCache, PhaseReport, createScanStats, scanPruneEnabled, type Action, type CaseFoldCollisionGroup, type DiscoveredGitRepo, type ScanStats } from "../../engine/index.js";
+import { DirCache, HashCache, PhaseReport, createScanStats, scanPruneEnabled, type Action, type CaseFoldCollisionGroup, type DiscoveredGitRepo, type IgnoreMatcher, type Manifest, type ScanStats } from "../../engine/index.js";
 import { type OwnedRefMutationBoundary } from "../sync-git/pins.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
@@ -37,6 +37,14 @@ export interface SyncDeps {
   /** Optional caller-owned directory cache. Foreground scans load their own only
    * when Layer A is explicitly enabled. */
   dircache?: DirCache;
+  /** Optional caller-owned ignore matcher, consulted ONCE per pull for the state
+   * that pull actually loaded. Building one costs a git-repo discovery plus a
+   * `git ls-files` per repo, and the daemon already holds a live-reloaded matcher —
+   * so this is a PROVIDER, never a captured instance: the daemon replaces its
+   * matcher on ignore-config or git-topology change, and must be free to answer
+   * `undefined` (pull then builds its own) whenever its resident matcher does not
+   * describe this exact state. Foreground pulls omit it. */
+  matcherFor?: (state: { lastSyncedManifest: Manifest }) => IgnoreMatcher | undefined;
   /** Adoption completion/abort requires one uncached, unpruned scan before a
    * publisher/applier may trust any warm listing or hash identity. */
   forceFullScan?: boolean;
@@ -165,11 +173,11 @@ export async function withDircache(
 }
 
 export async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promise<void> {
-  const remote = deps.remote as WriteContextProvider | undefined;
-  if (typeof remote?.currentKek !== "function") {
+  const currentKek = (deps.remote as WriteContextProvider | undefined)?.currentKek;
+  if (currentKek === undefined) {
     throw new Error("push: account epoch changed, but this remote cannot refresh the E2EE write context");
   }
-  const writeContext = await remote.currentKek();
+  const writeContext = await currentKek.call(deps.remote);
   Object.assign(cfg, {
     kek: Buffer.from(writeContext.kek),
     accountId: writeContext.accountId,

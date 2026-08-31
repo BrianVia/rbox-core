@@ -88,6 +88,8 @@ interface DaemonInternals {
   matcher: IgnoreMatcher;
   matcherGitReposKey: string;
   matcherGeneration: number;
+  folderMatcherRebuildPending: boolean;
+  matcherFor(state: { lastSyncedManifest: Manifest }): IgnoreMatcher | undefined;
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -1183,6 +1185,32 @@ test("design 206 §1: a hygiene-installed base with a changed key set is re-base
   expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
   expect(d.local.observedGeneration).toBe(d.matcherGeneration);
   expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
+});
+
+// ── #818: the pull-side matcher provider ─────────────────────────────────────
+test("#818: matcherFor hands pull the LIVE resident matcher, and only for a state it describes", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const base = await d.loadSyncBase();
+
+  expect(d.matcherFor(base)).toBe(d.matcher); // aligned: pull reuses it
+
+  // Live reload REPLACES the matcher object. A provider that captured an instance
+  // would keep handing out the dead one — the #812 correctness point.
+  const stale = d.matcher;
+  d.rebuildMatcher(base);
+  expect(d.matcher).not.toBe(stale);
+  expect(d.matcherFor(base)).toBe(d.matcher);
+
+  // Topology drift: the resident matcher's knownGitRepos no longer describe the
+  // state pull loaded → decline, so pull builds its own.
+  expect(d.matcherFor(withRepos(base, { repo: REPO_SECTION }))).toBeUndefined();
+
+  // Ignore-config reload whose rebuild has not landed yet → decline.
+  d.folderMatcherRebuildPending = true;
+  expect(d.matcherFor(base)).toBeUndefined();
+  d.folderMatcherRebuildPending = false;
 });
 
 // ── 206 test 9: the founder's literal sequence ────────────────────────────────

@@ -2228,6 +2228,7 @@ export class RboxDaemon {
         const pullDeps: SyncDeps = {
           ...this.e2ee,
           cache: this.cache,
+          matcherFor: (state) => this.matcherFor(state),
           syncMutex,
           report,
           onGitLog: this.log,
@@ -2962,6 +2963,20 @@ export class RboxDaemon {
    */
   private ensureMatcherProvenance(base: SyncState): void {
     if (this.matcherGitReposKey !== gitReposMatcherKey(base)) this.rebuildMatcher(base);
+  }
+
+  /**
+   * #818: hand pull the resident matcher instead of making it rebuild one
+   * (a full sync-tree walk plus one `git ls-files` per repo, per pull). Read
+   * LIVE — never captured — so a folder-config reload that replaces
+   * `this.matcher` is picked up by the next pull. Answers `undefined` unless
+   * the resident matcher provably describes THIS state: a pending
+   * config-driven rebuild, or a `knownGitRepos` key that differs from the
+   * state pull loaded, means pull must build its own.
+   */
+  private matcherFor(state: { lastSyncedManifest: Manifest }): IgnoreMatcher | undefined {
+    if (this.folderMatcherRebuildPending) return undefined;
+    return this.matcherGitReposKey === gitReposMatcherKey(state) ? this.matcher : undefined;
   }
 
   /**
