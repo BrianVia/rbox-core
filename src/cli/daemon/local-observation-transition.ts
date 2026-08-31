@@ -128,6 +128,10 @@ export class LocalAuthority implements LocalAuthorityPort {
   get unsettledPaths(): ReadonlySet<string> { return this.unsettled; }
   get lastUpdate(): ManifestUpdate | undefined { return this.update; }
   get fullWorkspaceSinceSeed(): boolean { return this.fullWorkspace; }
+  /** How many observation ids the replay memory currently holds. Bounded by
+   *  REPLAY_MEMORY — a daemon that ran for weeks must not accumulate one per
+   *  observation. Observability only; nothing may branch on it. */
+  get replayMemorySize(): number { return this.seen.size; }
   get observedMatcherGeneration(): number { return this.observedGeneration; }
 
   snapshot(): LineageSnapshot {

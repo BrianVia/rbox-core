@@ -8,6 +8,7 @@ import {
   LocalRetryQueue,
   LocalWorkspaceObserver,
   type LocalObservationEffects,
+  type ScanGenerationPlan,
   type SealedLocalObservationReceipt,
 } from "./local-workspace-observer.js";
 import type { CurrentGitTopologyObservation, CurrentGitTopologyReceipt, GitScanKind, ScanTopologySnapshot } from "./git-discovery-continuity.js";
@@ -64,9 +65,11 @@ function harness(options: {
 }): Harness {
   let walkCall = 0;
   let sharedDircache: DirCache | undefined;
-  const h: Harness = {
-    observer: undefined as unknown as LocalWorkspaceObserver,
-    retries: undefined as unknown as LocalRetryQueue,
+  // `h` is late-bound: the effects/retry closures below read it, but none of them
+  // RUN until the observer they are handed to is driven by a test — well after the
+  // assignment at the bottom. That ordering is what lets every field be real.
+  let h: Harness;
+  const state = {
     installs: [],
     topology: [],
     snapshots: [],
@@ -135,18 +138,21 @@ function harness(options: {
       return manifestOf(...result.files);
     }) as LocalObservationEffects["patchEvents"],
   };
-  h.retries = retries;
-  h.observer = new LocalWorkspaceObserver(effects, retries);
+  h = { ...state, retries, observer: new LocalWorkspaceObserver(effects, retries) };
   return h;
 }
 
-const scanPlan = (h: Harness, over: { scanKind?: GitScanKind; mode?: "pruned" | "unpruned" } = {}) => ({
-  kind: "scan" as const,
-  cache: new HashCache(),
-  previous: h.manifest,
-  ...(over.scanKind ? { scanKind: over.scanKind } : {}),
-  mode: over.mode ?? ("unpruned" as const),
-});
+const scanPlan = (h: Harness, over: { scanKind?: GitScanKind; mode?: "pruned" | "unpruned" } = {}): ScanGenerationPlan => {
+  // `scanKind` must stay ABSENT when unset — its presence is what marks a plan as
+  // a git-observing scan — so it is assigned, not conditionally spread.
+  const plan: ScanGenerationPlan = {
+    kind: "scan",
+    cache: new HashCache(),
+    previous: h.manifest,
+    mode: over.mode ?? "unpruned",
+  };
+  return over.scanKind ? { ...plan, scanKind: over.scanKind } : plan;
+};
 
 test("a deferred scan cannot claim absence: completeness drops and the unread cursor survives install", async () => {
   const root = await tempRoot();

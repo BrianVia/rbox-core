@@ -378,16 +378,18 @@ export class LocalWorkspaceObserver {
       nested = await this.observeScan({ kind: "scan", cache: plan.cache, previous: this.effects.currentManifest(), mode: this.effects.scanMode() });
       for (const path of nested.deferredPaths) deferred.add(path);
     }
-    return {
+    const receipt: WatchBatchObservationReceipt = {
       kind: "watch-batch",
       observationId,
       scope: "named-paths",
       completeness: deferred.size === 0 ? "complete" : "deferred",
       deferredPaths: deferred,
       matcherGeneration: observedUnder,
-      ...(nested ? { collisionRescan: nested } : {}),
       retriesArmed: nested ? [...nested.retriesArmed] : [],
       retriesPending: events.filter((e) => !deferred.has(e.relPath)).map((e) => e.relPath),
     };
+    // `collisionRescan` stays ABSENT unless the rescan fired — the receipt's fields
+    // are readonly, so the present case is its own literal rather than a mutation.
+    return nested ? { ...receipt, collisionRescan: nested } : receipt;
   }
 }

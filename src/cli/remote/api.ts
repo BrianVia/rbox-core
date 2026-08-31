@@ -36,8 +36,16 @@ import {
  * (design 09 §1). `RboxApi` implements it for production; tests inject a stateful
  * simulator. Keep it minimal: only what pull/push actually call.
  */
+/** The verified head a reader resolves: its sequence, its manifest, and — when the
+ *  reader collected it — the wire identity design 204's delta writer needs. */
+export interface LatestManifest {
+  sequence: number;
+  manifest: Manifest;
+  manifestMeta?: GlobalManifestMeta;
+}
+
 export interface SyncRemote {
-  latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }>;
+  latest(options?: LatestOptions): Promise<LatestManifest>;
   missingBlobs(shas: string[]): Promise<string[]>;
   putBlobFile(
     sha256: string,

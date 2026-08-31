@@ -249,7 +249,7 @@ test("replay memory is bounded: a long-lived daemon does not retain every observ
   // The oldest id is no longer remembered — but the revision check still refuses it.
   const stale = intentOf(authority, first, fullScanPayload(manifestOf("a.txt"), new Set(), 7), { lineageToken: authority.snapshot().lineageToken, localRevision: 0 });
   expect(authority.commitObservation(stale).outcome).toBe("stale-revision");
-  expect((authority as unknown as { seen: Set<string> }).seen.size).toBeLessThanOrEqual(64);
+  expect(authority.replayMemorySize).toBeLessThanOrEqual(64);
 });
 
 // ── the observer seam: identity is sealed at observation start ───────────────
@@ -269,14 +269,15 @@ function observerOverAuthority(options: {
   patch?: (events: WatchEvent[]) => { files: string[]; defer?: string[] };
 }): ObserverHarness {
   let walkCall = 0;
-  const h: ObserverHarness = {
-    observer: undefined as unknown as LocalWorkspaceObserver,
-    retries: undefined as unknown as LocalRetryQueue,
+  // `h` is late-bound: the closures below capture it but none RUN until the observer
+  // is driven by a test, well after the assignment at the bottom.
+  let h: ObserverHarness;
+  const state = {
     authority: options.authority,
     generation: 7,
-    outcomes: [],
+    outcomes: [] as string[],
   };
-  h.retries = new LocalRetryQueue({ requeue: () => {}, markUnsettled: (p) => h.authority.markUnsettled(p), stopped: () => true });
+  const retries = new LocalRetryQueue({ requeue: () => {}, markUnsettled: (p) => h.authority.markUnsettled(p), stopped: () => true });
   let sharedDircache: DirCache | undefined;
   const effects: LocalObservationEffects = {
     root: options.root,
@@ -312,7 +313,7 @@ function observerOverAuthority(options: {
       return manifestOf(...result.files);
     }) as LocalObservationEffects["patchEvents"],
   };
-  h.observer = new LocalWorkspaceObserver(effects, h.retries);
+  h = { ...state, retries, observer: new LocalWorkspaceObserver(effects, retries) };
   return h;
 }
 
