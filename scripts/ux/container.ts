@@ -128,9 +128,7 @@ interface DockerLabels {
 }
 
 interface DockerMountCandidate {
-  Source?: unknown;
   Destination?: unknown;
-  RW?: unknown;
 }
 
 function inspectRow(value: unknown): DockerInspect | undefined {
@@ -148,22 +146,20 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   const env = Array.isArray(row.Config.Env) ? row.Config.Env : [];
   const forbidden = ["HOME", "RBOX_HOME", ...SCRUBBED_ENV].filter((key) => key !== "RBOX_API");
   if (!env.includes(`RBOX_API=${DEV_API}`) || env.some((entry) => typeof entry === "string" && forbidden.some((key) => entry.startsWith(`${key}=`)))) return "collision";
+  // Only the guest-side Destination is comparable: a daemon that does not share
+  // the client's mount namespace (Namespace CI runners run the job inside a
+  // container while dockerd lives outside it) reports Source rewritten into its
+  // own view and drops the client's readonly flag. What we asked for is recorded
+  // by us in ux.spec, which already hashes every mount source below.
   const mounts = Array.isArray(row.Mounts) ? row.Mounts : [];
-  const mountMatches = (want: C.Mount, candidate: unknown): boolean => {
-    if (!candidate || typeof candidate !== "object") return false;
-    const mount = candidate as DockerMountCandidate;
-    return mount.Source === want.source && mount.Destination === want.target && mount.RW === !want.readonly;
-  };
-  const actualCore = mounts.filter((candidate) =>
-    candidate && typeof candidate === "object" &&
-    (candidate as DockerMountCandidate).Destination !== UX_GUEST_RBOX
-  );
-  const desiredCore = plan.mounts.filter((want) => want.target !== UX_GUEST_RBOX);
-  const coreMatches = actualCore.length === desiredCore.length &&
-    desiredCore.every((want) => actualCore.some((candidate) => mountMatches(want, candidate)));
+  const destinations = mounts.map((candidate) => (candidate && typeof candidate === "object" ? (candidate as DockerMountCandidate).Destination : undefined));
+  const coreActual = destinations.filter((destination) => destination !== UX_GUEST_RBOX);
+  const coreDesired = plan.mounts.filter((want) => want.target !== UX_GUEST_RBOX);
+  const coreMatches = coreActual.length === coreDesired.length &&
+    coreDesired.every((want) => coreActual.includes(want.target));
   if (!coreMatches) return "collision";
-  const exactMounts = mounts.length === plan.mounts.length &&
-    plan.mounts.every((want) => mounts.some((candidate) => mountMatches(want, candidate)));
+  const exactMounts = destinations.length === plan.mounts.length &&
+    plan.mounts.every((want) => destinations.includes(want.target));
   if (!exactMounts) return "owned-stale";
   return map["ux.spec"] === plan.specHash ? "match" : "owned-stale";
 }

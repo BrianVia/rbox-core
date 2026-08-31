@@ -52,12 +52,17 @@ jobs:
           docker ps -a
           docker inspect ux-dbg1
 
-      - name: Regress one flow
-        continue-on-error: true
+      - name: Build the linux CLI the CI regress job would consume
+        run: bun scripts/release.ts --dev --targets=linux-x64
+
+      - name: Regress every flow (CI configuration)
         env:
           UX_DEBUG_OWNERSHIP: "1"
           RBOX_DEV_BOOTSTRAP: ${{ secrets.RBOX_DEV_BOOTSTRAP }}
-        run: bun scripts/ux/regress.ts --flow front-door --jobs 1
+          RBOX_UX_BINARY: ${{ github.workspace }}/dist/rbox-linux-x64
+        run: |
+          chmod +x "$RBOX_UX_BINARY"
+          bun scripts/ux/regress.ts
 
       - name: Flow artifacts
         continue-on-error: true

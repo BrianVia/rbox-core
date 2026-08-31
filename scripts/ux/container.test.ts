@@ -89,6 +89,16 @@ describe("container ownership", () => {
     expect(uxOwnership(oldCandidate, plan)).toBe("owned-stale");
     expect(uxOwnership(oldCandidate, candidatePlan)).toBe("owned-stale");
   });
+  test("owns a container a namespaced daemon reports with rewritten mount sources (#827)", () => {
+    // Namespace CI runners run the job inside a container while dockerd lives
+    // outside it: Source comes back prefixed with the job's rootfs and the
+    // readonly flag is not echoed back.
+    const namespaced = [{
+      ...matching[0],
+      Mounts: plan.mounts.map((mount) => ({ Source: `/namespace/containers/rootfs/dr9bhcvv6sct8/root${mount.source}`, Destination: mount.target, RW: true })),
+    }];
+    expect(uxOwnership(namespaced, plan)).toBe("match");
+  });
   test("rejects an unlabelled same-name collision", () => expect(uxOwnership([{ Config: { Labels: {} } }], plan)).toBe("collision"));
   test("rejects another checkout and any unexpected extra mount", () => {
     expect(uxOwnership([{ ...matching[0], Config: { ...matching[0]!.Config, Labels: { ...matching[0]!.Config.Labels, "ux.repo": "another" } } }], plan)).toBe("collision");
