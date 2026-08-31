@@ -17,6 +17,7 @@ import {
   canonicalManifestHashStreaming,
   decodeEnvelope,
   diffToOps,
+  ENCRYPT_ADDRESS_CACHE_DB_REL,
   ENCRYPT_ADDRESS_CACHE_REL,
   encodeDeltaEnvelope,
   encryptFileToTemp,
@@ -30,6 +31,7 @@ import {
   type Manifest,
 } from "../../engine/index.js";
 import { setClassifyCacheHitObserverForTest } from "../publish-pipeline/shared.js";
+import { readEncryptCacheDb, type EncryptCacheReadback } from "../state-plane/encrypt-cache-rig.js";
 import { listTrash } from "../../engine/trash.js";
 import { projectLocalManifest } from "../local-file-projection.js";
 import { FakeRemote, KEK, deps, enc, noBackoff, shaBytes } from "./publication.test-helper.js";
@@ -351,9 +353,11 @@ async function writeEncryptCache(entries: Record<string, { encSha: string; ciphe
   );
 }
 
-async function readEncryptCache(): Promise<{ entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> }> {
-  return JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
-}
+/** The live SQLite backing, projected back into the JSON cache's shape so these
+ *  end-to-end assertions keep describing addresses and their paths rather than a
+ *  storage layout. `writeEncryptCache` still seeds the JSON file: the backing imports
+ *  it on its first open, which is the migration these pushes exercise for free. */
+const readEncryptCache = (): Promise<EncryptCacheReadback> => readEncryptCacheDb(root);
 
 function countingEncrypt() {
   let calls = 0;
@@ -618,9 +622,9 @@ test("wrong cached encSha to a missing blob re-encrypts through the upload-time 
   expect(committed.encSha).not.toBe(wrongEncSha);
   expect(uploadProgress).toContain(actual.ciphertext.length);
 
-  const raw = JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
-  expect(raw.entries[actual.plaintextSha].encSha).toBe(actual.encSha);
-  expect(raw.entries[actual.plaintextSha].cipherSize).toBe(actual.ciphertext.length);
+  const raw = await readEncryptCache();
+  expect(raw.entries[actual.plaintextSha]!.encSha).toBe(actual.encSha);
+  expect(raw.entries[actual.plaintextSha]!.cipherSize).toBe(actual.ciphertext.length);
 });
 
 test("failed first-publish commit retry reuses flushed encrypt cache entries", async () => {
@@ -738,6 +742,7 @@ test("encryptAndUpload refuses to use the cache without an explicit keyEpoch", a
 
   await expect(push(root, badCfg, deps(remote))).rejects.toThrow(/missing keyEpoch/);
   await expect(fs.stat(path.join(root, ENCRYPT_ADDRESS_CACHE_REL))).rejects.toThrow();
+  await expect(fs.stat(path.join(root, ENCRYPT_ADDRESS_CACHE_DB_REL))).rejects.toThrow();
 });
 
 // ── 409 conflict-retry: the rescan is load-bearing ─────────────────────────

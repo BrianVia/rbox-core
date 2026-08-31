@@ -8,7 +8,7 @@ import { repoCtxFromDisk } from "./sync-git/git-state.js";
 import { scanBaseArtifacts } from "./sync-git/base-artifact-scan.js";
 import { withRepositoryRecoveryFence } from "./sync-git/protocol-locks.js";
 import { runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair } from "./sync-git/p-repair-transaction.js";
-import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
+import { ENCRYPT_ADDRESS_CACHE_DB_REL, ENCRYPT_ADDRESS_CACHE_MIGRATED_REL, ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { acquireLock, captureCommonDirIdentity, type OwnedLock } from "../engine/lockfile.js";
 import { errCode } from "../engine/fsutil.js";
 import { gitRaw } from "../engine/git-spawn.js";
@@ -471,6 +471,10 @@ export async function resetSyncState(
 
     for (const p of [
       path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
+      path.join(root, ENCRYPT_ADDRESS_CACHE_MIGRATED_REL),
+      // Sidecars too: a rebind must not leave the old binding's addresses behind, and
+      // the cache database is only ever closed at rest, so these are normally absent.
+      ...["", "-wal", "-shm", "-journal"].map((suffix) => path.join(root, `${ENCRYPT_ADDRESS_CACHE_DB_REL}${suffix}`)),
       path.join(root, RBOX_DIR, "state", "activity.json"),
       path.join(root, RBOX_DIR, "state", "shell.line"),
       path.join(root, RBOX_DIR, "state", "shell.deferrals"),

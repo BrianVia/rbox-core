@@ -17,7 +17,7 @@ import path from "node:path";
 import type {
   CryptoPool,
   EncryptedBlob,
-  EncryptAddressCache,
+  EncryptAddressCacheApi,
   EncryptAddressCacheWriter,
   EncryptFileOptions,
   FileEntry,
@@ -63,7 +63,7 @@ export interface PublishPipelineArgs {
   local: Manifest;
   /** Owns the entry containers; attaching a descriptor replaces the entry in all of them. */
   entries: CipherDescriptorWriter;
-  encryptCache: EncryptAddressCache;
+  encryptCache: EncryptAddressCacheApi;
   cacheWriter: EncryptAddressCacheWriter;
   encryptOpts: { compress: boolean };
   encryptFileToTemp: EncryptFn;

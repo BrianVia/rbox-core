@@ -31,7 +31,28 @@ interface StoredEncryptAddressCache {
   entries: Record<string, StoredEncryptAddressCacheEntry>;
 }
 
+/** The cache Interface. Two backings implement it: this file's whole-file JSON cache
+ *  (kept as 822's kill switch) and the SQLite store in
+ *  `src/cli/state-plane/encrypt-cache.ts`. SQLite cannot be named from `src/engine`,
+ *  so the shared shape and the on-disk names live here and the backing is chosen by
+ *  the CLI. */
+export interface EncryptAddressCacheApi {
+  lookup(plaintextSha: string): EncryptAddressCacheEntry | undefined;
+  record(plaintextSha: string, entry: EncryptAddressCacheEntry & { path: string }): void;
+  migratePath(plaintextSha: string, relPath: string): boolean;
+  prune(livePaths: ReadonlySet<string>): void;
+  /** True only while a backing still owes the disk a write; the SQLite backing
+   *  commits inside `record`, so it never does. */
+  readonly needsSave: boolean;
+  save(root: string): Promise<void>;
+  close(): void;
+}
+
 export const ENCRYPT_ADDRESS_CACHE_REL = ".rbox/state/encrypt-cache.json";
+export const ENCRYPT_ADDRESS_CACHE_DB_REL = ".rbox/state/encrypt-cache.db";
+/** Where the SQLite backing puts the JSON cache after importing it, so the import
+ *  runs exactly once and a later kill-switch run cannot read a stale snapshot. */
+export const ENCRYPT_ADDRESS_CACHE_MIGRATED_REL = `${ENCRYPT_ADDRESS_CACHE_REL}.migrated`;
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
@@ -69,7 +90,25 @@ function parseStoredEntry(value: JsonValue | undefined): StoredEncryptAddressCac
     : { encSha, cipherSize, paths: sorted };
 }
 
-function parseStored(raw: JsonValue, context: EncryptAddressCacheContext): Map<string, StoredEncryptAddressCacheEntry> | undefined {
+/** The admission rules for one recorded address, shared by both backings so a
+ *  malformed descriptor is refused identically whichever one is live. */
+export function assertRecordableAddress(plaintextSha: string, entry: EncryptAddressCacheEntry & { path: string }): void {
+  if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
+  if (!SHA256_HEX_RE.test(entry.encSha)) throw new Error(`invalid ciphertext sha for encrypt cache: ${entry.encSha}`);
+  if (!isNonNegativeInteger(entry.cipherSize)) throw new Error(`invalid ciphertext size for encrypt cache: ${entry.cipherSize}`);
+  if (!validCompressionFields(entry.comp, entry.payloadSha)) throw new Error("invalid compression descriptor for encrypt cache");
+  if (!isSafeRelPath(entry.path)) throw new Error(`invalid path for encrypt cache: ${entry.path}`);
+}
+
+/** Same for the two identifiers `migratePath` takes. */
+export function assertMigratableAddress(plaintextSha: string, relPath: string): void {
+  if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
+  if (!isSafeRelPath(relPath)) throw new Error(`invalid path for encrypt cache: ${relPath}`);
+}
+
+export const isEncryptAddressSha = (value: string): boolean => SHA256_HEX_RE.test(value);
+
+export function parseStoredEncryptAddressCache(raw: JsonValue, context: EncryptAddressCacheContext): Map<string, StoredEncryptAddressCacheEntry> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const accountId = raw["accountId"];
   const workspaceId = raw["workspaceId"];
@@ -92,7 +131,7 @@ function parseStored(raw: JsonValue, context: EncryptAddressCacheContext): Map<s
   return entries;
 }
 
-export class EncryptAddressCache {
+export class EncryptAddressCache implements EncryptAddressCacheApi {
   private readonly entries: Map<string, StoredEncryptAddressCacheEntry>;
   private readonly pathOwner = new Map<string, string>();
   private dirtyRevision = 0;
@@ -130,12 +169,7 @@ export class EncryptAddressCache {
   }
 
   record(plaintextSha: string, entry: EncryptAddressCacheEntry & { path: string }): void {
-    if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
-    if (!SHA256_HEX_RE.test(entry.encSha)) throw new Error(`invalid ciphertext sha for encrypt cache: ${entry.encSha}`);
-    if (!isNonNegativeInteger(entry.cipherSize)) throw new Error(`invalid ciphertext size for encrypt cache: ${entry.cipherSize}`);
-    if (!validCompressionFields(entry.comp, entry.payloadSha)) throw new Error("invalid compression descriptor for encrypt cache");
-    if (!isSafeRelPath(entry.path)) throw new Error(`invalid path for encrypt cache: ${entry.path}`);
-
+    assertRecordableAddress(plaintextSha, entry);
     this.migratePath(plaintextSha, entry.path);
     const prev = this.entries.get(plaintextSha);
     const nextBody = cacheEntryBody(entry);
@@ -155,10 +189,13 @@ export class EncryptAddressCache {
   }
 
   migratePath(plaintextSha: string, relPath: string): boolean {
-    if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
-    if (!isSafeRelPath(relPath)) throw new Error(`invalid path for encrypt cache: ${relPath}`);
+    assertMigratableAddress(plaintextSha, relPath);
     return this.removePathFromOtherEntries(relPath, plaintextSha);
   }
+
+  /** Nothing to release: this backing holds a file it already closed after each save.
+   *  The Interface carries `close` for the SQLite backing's connection. */
+  close(): void {}
 
   prune(livePaths: ReadonlySet<string>): void {
     for (const [plaintextSha, entry] of [...this.entries]) {
@@ -209,7 +246,7 @@ export class EncryptAddressCache {
     try {
       const raw = await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8");
       const parsed: JsonValue = JSON.parse(raw);
-      const entries = parseStored(parsed, context);
+      const entries = parseStoredEncryptAddressCache(parsed, context);
       return new EncryptAddressCache(context, entries);
     } catch {
       return new EncryptAddressCache(context);
@@ -232,7 +269,7 @@ export class EncryptAddressCacheWriter {
 
   constructor(
     private readonly root: string,
-    private readonly cache: EncryptAddressCache,
+    private readonly cache: EncryptAddressCacheApi,
     private readonly flushMs = 10_000
   ) {}
 
