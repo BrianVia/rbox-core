@@ -1,4 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ import {
   canonicalManifestHashStreaming,
   decodeEnvelope,
   diffToOps,
+  ENCRYPT_ADDRESS_CACHE_DB_REL,
   ENCRYPT_ADDRESS_CACHE_REL,
   encodeDeltaEnvelope,
   encryptFileToTemp,
@@ -351,8 +353,27 @@ async function writeEncryptCache(entries: Record<string, { encSha: string; ciphe
   );
 }
 
+/** The live SQLite backing, projected back into the JSON cache's shape so these
+ *  end-to-end assertions keep describing addresses and their paths rather than a
+ *  storage layout. `writeEncryptCache` still seeds the JSON file: the backing imports
+ *  it on its first open, which is the migration these pushes exercise for free. */
 async function readEncryptCache(): Promise<{ entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> }> {
-  return JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
+  const file = path.join(root, ENCRYPT_ADDRESS_CACHE_DB_REL);
+  const entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> = {};
+  if (!(await fs.stat(file).catch(() => undefined))) return { entries };
+  const db = new Database(file, { create: false, readwrite: true });
+  const statement = db.prepare("SELECT path,plaintext_sha,enc_sha,cipher_size FROM addresses ORDER BY path");
+  try {
+    for (const row of statement.all() as Array<{ path: string; plaintext_sha: string; enc_sha: string; cipher_size: number }>) {
+      const entry = entries[row.plaintext_sha] ?? { encSha: row.enc_sha, cipherSize: row.cipher_size, paths: [] };
+      entry.paths.push(row.path);
+      entries[row.plaintext_sha] = entry;
+    }
+  } finally {
+    statement.finalize();
+    db.close();
+  }
+  return { entries };
 }
 
 function countingEncrypt() {
@@ -618,9 +639,9 @@ test("wrong cached encSha to a missing blob re-encrypts through the upload-time 
   expect(committed.encSha).not.toBe(wrongEncSha);
   expect(uploadProgress).toContain(actual.ciphertext.length);
 
-  const raw = JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
-  expect(raw.entries[actual.plaintextSha].encSha).toBe(actual.encSha);
-  expect(raw.entries[actual.plaintextSha].cipherSize).toBe(actual.ciphertext.length);
+  const raw = await readEncryptCache();
+  expect(raw.entries[actual.plaintextSha]!.encSha).toBe(actual.encSha);
+  expect(raw.entries[actual.plaintextSha]!.cipherSize).toBe(actual.ciphertext.length);
 });
 
 test("failed first-publish commit retry reuses flushed encrypt cache entries", async () => {
@@ -738,6 +759,7 @@ test("encryptAndUpload refuses to use the cache without an explicit keyEpoch", a
 
   await expect(push(root, badCfg, deps(remote))).rejects.toThrow(/missing keyEpoch/);
   await expect(fs.stat(path.join(root, ENCRYPT_ADDRESS_CACHE_REL))).rejects.toThrow();
+  await expect(fs.stat(path.join(root, ENCRYPT_ADDRESS_CACHE_DB_REL))).rejects.toThrow();
 });
 
 // ── 409 conflict-retry: the rescan is load-bearing ─────────────────────────

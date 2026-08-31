@@ -100,6 +100,9 @@ export {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   ENCRYPT_ADDRESS_CACHE_REL,
+  ENCRYPT_ADDRESS_CACHE_DB_REL,
+  ENCRYPT_ADDRESS_CACHE_MIGRATED_REL,
+  type EncryptAddressCacheApi,
   type EncryptAddressCacheContext,
   type EncryptAddressCacheEntry,
 } from "./encrypt-address-cache.js";

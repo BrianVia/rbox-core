@@ -8,6 +8,7 @@ import {
   poolMap,
   withCryptoPool,
   type EncryptedBlob,
+  type EncryptAddressCacheApi,
   type EncryptAddressCacheContext,
   type EncryptFileOptions,
   type CryptoPool,
@@ -117,10 +118,26 @@ function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheCo
 }
 
 
+/** Open this workspace's encrypt-address cache on its live backing.
+ *
+ *  Kill switch: `RBOX_ENCRYPT_CACHE_SQLITE=0` restores the whole-file JSON cache that
+ *  822 replaced. Deletion condition: one clean fleet soak with the SQLite backing.
+ *  The import is dynamic because the SQLite backing may not enter the CLI's static
+ *  graph (`state-plane/schema/inventory.test.ts`). */
+export async function loadEncryptAddressCache(root: string, context: EncryptAddressCacheContext): Promise<EncryptAddressCacheApi> {
+  if (process.env.RBOX_ENCRYPT_CACHE_SQLITE === "0") return EncryptAddressCache.load(root, context);
+  const { openEncryptAddressCacheStore } = await import("./state-plane/encrypt-cache.js");
+  return openEncryptAddressCacheStore(root, context);
+}
+
 export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
-  const cache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
-  cache.prune(livePaths);
-  await cache.save(root);
+  const cache = await loadEncryptAddressCache(root, encryptAddressCacheContext(cfg));
+  try {
+    cache.prune(livePaths);
+    await cache.save(root);
+  } finally {
+    cache.close();
+  }
 }
 
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
@@ -153,7 +170,7 @@ export async function encryptAndUpload(
     return defaultEncryptFileToTemp(...args);
   });
   const encryptOpts = { compress: compressionEnabled() };
-  const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
+  const encryptCache = await loadEncryptAddressCache(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
   const baseEnc = new Map(base.files.map((f) => [f.sha256, descriptorFromEntry(f)]).filter((x): x is [string, CipherDescriptor] => x[1] !== undefined));
   let tmpDir = "";
@@ -531,6 +548,7 @@ export async function encryptAndUpload(
       cacheWriter.schedule();
       await cacheWriter.flush();
     } finally {
+      encryptCache.close();
       if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
