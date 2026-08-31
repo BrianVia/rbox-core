@@ -11,7 +11,9 @@ import {
   discoverGitReposUnder,
   diffManifests,
   isIgnoreRuleFile,
+  DirCache,
   HashCache,
+  scanPruneEnabled,
   createScanStats,
   type IgnoreMatcher,
   type Manifest,
@@ -395,6 +397,14 @@ export class RboxDaemon {
    *  Undefined until this daemon has projected once. */
   private strandedIgnored: number | undefined;
   private cache!: HashCache;
+  /** #818: THE workspace's Layer A directory cache for this daemon's lifetime.
+   * Both lanes that touch it — the observer's scan and the pull path — share this
+   * one instance, so neither re-parses the file per operation and neither can
+   * overwrite the other's listings with an older load.
+   * Created empty here and hydrated from disk once at start, so no code path can
+   * observe it missing. The `RBOX_SCAN_PRUNE=0` kill switch stays LIVE-read at each
+   * use — a test (and an operator) flips it mid-process. */
+  private dircache: DirCache = new DirCache();
   /** LOCAL authority — head, unread cursor, completeness, and the P5/P7 provenance
    *  trusted-pull reads (`CommitLocalObservation`). The daemon never assigns them. */
   private readonly local = new LocalAuthority();
@@ -592,6 +602,7 @@ export class RboxDaemon {
       root,
       currentManifest: () => this.local.manifest,
       currentMatcher: () => this.matcher,
+      dircache: () => (scanPruneEnabled() ? this.dircache : undefined),
       matcherGeneration: () => this.matcherGeneration,
       scanMode: () => this.watcherScanMode(),
       beginTopologySnapshot: (scanKind) => this.gitDiscovery.beginScanSnapshot(scanKind),
@@ -895,6 +906,7 @@ export class RboxDaemon {
     if (!(await this.writeStartupBinding())) return;
 
     this.cache = await HashCache.load(this.root, this.hashCachePolicy());
+    if (scanPruneEnabled()) this.dircache = await DirCache.load(this.root); // hydrate the constructor's empty instance
     const loadedMetrics = await loadMetrics(this.root);
     this.metrics.syncs = loadedMetrics.syncs;
     this.metrics.commitConflicts409 = loadedMetrics.commitConflicts409;
@@ -1180,6 +1192,7 @@ export class RboxDaemon {
       Promise.resolve().then(() => this.telemetry.flush(AbortSignal.timeout(1500))),
       Promise.resolve().then(() => this.activityWrite),
       Promise.resolve().then(() => this.cache?.save(this.root)),
+      Promise.resolve().then(() => this.dircache.save(this.root)),
     ]);
     await this.writePausedAmbientStatus().catch(() => {});
     // Design 277: the loaded-state memo is process-resident. A stopped daemon
@@ -1922,6 +1935,9 @@ export class RboxDaemon {
     const settleT0 = performance.now();
     try {
       await this.cache.save(this.root);
+      // The pull lane mutates the shared dircache too, and only the observer's
+      // scan used to persist it. Both lanes settle here (a no-op when not dirty).
+      await this.dircache.save(this.root);
       this.writeAmbientStatus();
       // Settle the sidecar: re-render if the state CHANGED from the last write —
       // the mid-pump write said `pending` (push still queued) and the no-op push
@@ -2228,6 +2244,8 @@ export class RboxDaemon {
         const pullDeps: SyncDeps = {
           ...this.e2ee,
           cache: this.cache,
+          matcherFor: (state) => this.matcherFor(state),
+          dircache: this.dircache, // withDircache re-checks the kill switch itself
           syncMutex,
           report,
           onGitLog: this.log,
@@ -2962,6 +2980,20 @@ export class RboxDaemon {
    */
   private ensureMatcherProvenance(base: SyncState): void {
     if (this.matcherGitReposKey !== gitReposMatcherKey(base)) this.rebuildMatcher(base);
+  }
+
+  /**
+   * #818: hand pull the resident matcher instead of making it rebuild one
+   * (a full sync-tree walk plus one `git ls-files` per repo, per pull). Read
+   * LIVE — never captured — so a folder-config reload that replaces
+   * `this.matcher` is picked up by the next pull. Answers `undefined` unless
+   * the resident matcher provably describes THIS state: a pending
+   * config-driven rebuild, or a `knownGitRepos` key that differs from the
+   * state pull loaded, means pull must build its own.
+   */
+  private matcherFor(state: { lastSyncedManifest: Manifest }): IgnoreMatcher | undefined {
+    if (this.folderMatcherRebuildPending) return undefined;
+    return this.matcherGitReposKey === gitReposMatcherKey(state) ? this.matcher : undefined;
   }
 
   /**

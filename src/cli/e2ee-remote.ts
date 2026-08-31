@@ -28,13 +28,18 @@ import { gitSectionBlobRefs } from "./sync-git/git-state.js";
 import type { GlobalManifestMeta } from "./config.js";
 import type { CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo } from "./e2ee-remote-types.js";
 import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";
-import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type LatestTimings, type SyncRemote } from "./remote.js";
+import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type CommitTimings, type LatestManifest, type LatestOptions, type LatestTimings, type SyncRemote } from "./remote.js";
 
 export type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence, CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo, WsKeyDTO } from "./e2ee-remote-types.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
 const HISTORY_DECRYPT_CONCURRENCY = 8;
+
+/** #818: how long a prefetched account refresh may sit before `commit()` refuses to
+ *  sign against it. C4 wants the epoch read immediately before signing; overlapping
+ *  one upload's round-trip is the whole point, an abandoned push's leftover is not. */
+const ACCOUNT_PREFETCH_MAX_AGE_MS = 60_000;
 
 /** §24: emit a sidecar (refs out of the signed body) once the unique ref set is large
  *  enough that the inline body would approach the server's 1 MB commit-body cap. At ~85 B
@@ -57,6 +62,14 @@ export const SIDECAR_THRESHOLD = 4000;
  */
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+
+/** A manifest read back off the chain, with the KEK it decrypted under and — when
+ *  the caller asked for it — the wire identity the delta writer needs. */
+interface DecodedManifest {
+  manifest: Manifest;
+  kek: Uint8Array;
+  manifestMeta?: GlobalManifestMeta;
+}
 
 /** Why a commit did NOT emit a delta (design 204 §7). The burn-in failure
  *  discriminator: a persistent `economic`/`no-base`/`integrity` wall is a bug
@@ -102,7 +115,13 @@ function deltaDisposition(
  *  ONE policy, consumed at BOTH write seams: here (the writer) and push's
  *  deltaBase selection. The push seam must never re-read the raw env vars —
  *  a seam divergence is invisible to any behavioral wire assertion. */
-export function mdeWritePolicy(): { delta: boolean; snapshot: boolean } {
+/** Which manifest-delta-encoding writes design 204 allows this process to make. */
+export interface MdeWritePolicy {
+  delta: boolean;
+  snapshot: boolean;
+}
+
+export function mdeWritePolicy(): MdeWritePolicy {
   const snapshot = process.env.RBOX_MDE_SNAPSHOT !== "0";
   const delta = snapshot && process.env.RBOX_MDE_DELTA !== "0";
   if (!snapshot && process.env.RBOX_MDE_DELTA === "1") warnDeltaIgnoredOnce();
@@ -151,7 +170,37 @@ export class E2eeRemote implements SyncRemote {
    *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
   private writeEpoch?: number;
 
+  /** #818: an account refresh started early so its round-trip overlaps the blob
+   *  upload instead of stalling in front of the signature. Consumed once, by the
+   *  next `commit()`, and only while still fresh enough to honor C4. */
+  private accountPrefetch?: { promise: Promise<VerifiedAccount>; at: number };
+
   constructor(private readonly api: E2eeApi, private readonly ctx: E2eeContext, private readonly pins: PinStore) {}
+
+  /**
+   * #818: issue the account-keys GET concurrently with the upload lane. Nothing
+   * before signing depends on the result, so a push paid its full round-trip
+   * serially in front of `commit()`.
+   *
+   * Not fire-and-forget: the promise is parked, `commit()` awaits it, and a
+   * rejection therefore fails the push with exactly the error it does today. The
+   * local `catch` only marks it handled so a push that never reaches `commit()`
+   * cannot raise an unhandled rejection.
+   */
+  prefetchAccount(): void {
+    const promise = this.refreshAccount();
+    promise.catch(() => {});
+    this.accountPrefetch = { promise, at: this.ctx.now() };
+  }
+
+  /** C4 wants a fresh epoch immediately before signing. A prefetch older than one
+   *  upload's worth of staleness is discarded rather than signed against. */
+  private freshAccount(): Promise<VerifiedAccount> {
+    const parked = this.accountPrefetch;
+    this.accountPrefetch = undefined;
+    if (parked && this.ctx.now() - parked.at < ACCOUNT_PREFETCH_MAX_AGE_MS) return parked.promise;
+    return this.refreshAccount();
+  }
 
   /** The current-epoch workspace KEK — also used by sync.ts to encrypt blobs.
    *  Snapshots the write epoch so `commit()` can reject a stale-KEK sign (D1). */
@@ -169,13 +218,15 @@ export class E2eeRemote implements SyncRemote {
 
   // ---- SyncRemote ----------------------------------------------------------
 
-  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }> {
+  async latest(options?: LatestOptions): Promise<LatestManifest> {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
     const collectMeta = mdeWritePolicy().snapshot || options?.recordEvidence === true || options?.fastFoldBase !== undefined;
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
-    return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
+    const latest: LatestManifest = { sequence: vh.sequence, manifest: decoded.manifest };
+    if (decoded.manifestMeta) latest.manifestMeta = decoded.manifestMeta;
+    return latest;
   }
 
   /** Doctor's authenticated chain report; decoding here is the same reader path as
@@ -204,7 +255,7 @@ export class E2eeRemote implements SyncRemote {
     onLatestTimings?: LatestOptions["onLatestTimings"],
     collectMeta = false,
     fastFoldBase?: LatestOptions["fastFoldBase"]
-  ): Promise<{ manifest: Manifest; kek: Uint8Array; manifestMeta?: GlobalManifestMeta }> {
+  ): Promise<DecodedManifest> {
     const body = parseCommit(commit);
     const signedChain = body.manifestChain ?? [];
     const kek = await this.kekFor(body.keyEpoch, account, false);
@@ -398,7 +449,9 @@ export class E2eeRemote implements SyncRemote {
         manifest!,
       );
     }
-    return { manifest: manifest!, kek, ...(manifestMeta ? { manifestMeta } : {}) };
+    const decoded: DecodedManifest = { manifest: manifest!, kek };
+    if (manifestMeta) decoded.manifestMeta = manifestMeta;
+    return decoded;
   }
 
   /** Consume already-fetched signed links serially. With no initial state link 0
@@ -726,10 +779,10 @@ export class E2eeRemote implements SyncRemote {
     let account: VerifiedAccount;
     if (onCommitTimings) {
       const t0 = Date.now();
-      account = await this.refreshAccount(); // C4: refresh immediately before signing
+      account = await this.freshAccount(); // C4: refresh immediately before signing
       refreshMs = Date.now() - t0;
     } else {
-      account = await this.refreshAccount(); // C4: refresh immediately before signing
+      account = await this.freshAccount(); // C4: refresh immediately before signing
     }
     // D1: if the epoch rotated between blob encryption (currentKek) and now, the
     // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a
@@ -799,11 +852,8 @@ export class E2eeRemote implements SyncRemote {
       blobRefset,
     };
     const buildEncoded = async (manifestJson: Uint8Array, manifestChain?: string[]) => {
-      const buildArgs: Parameters<typeof buildCommit>[0] = {
-        ...baseBuildArgs,
-        manifestJson,
-        ...(manifestChain?.length ? { manifestChain } : {}),
-      };
+      const buildArgs: Parameters<typeof buildCommit>[0] = { ...baseBuildArgs, manifestJson };
+      if (manifestChain?.length) buildArgs.manifestChain = manifestChain;
       if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs += ms);
       return buildCommit(buildArgs);
     };
@@ -883,30 +933,36 @@ export class E2eeRemote implements SyncRemote {
       if (e instanceof CommitRejectedError && blobRefset) e.fingerprint = blobRefset.sidecarSha;
       throw e;
     }
-    onCommitTimings?.({
-      refreshMs,
-      sidecarMs,
-      encodeMs,
-      encryptMs,
-      uploadMs,
-      postMs,
-      encBytes: built.encManifest.byteLength,
-      ...(res.serverTimings ? { serverTimings: res.serverTimings } : {}),
-    });
+    if (onCommitTimings) {
+      const timings: CommitTimings = {
+        refreshMs,
+        sidecarMs,
+        encodeMs,
+        encryptMs,
+        uploadMs,
+        postMs,
+        encBytes: built.encManifest.byteLength,
+      };
+      if (res.serverTimings) timings.serverTimings = res.serverTimings;
+      onCommitTimings(timings);
+    }
     if (res.conflict) return { conflict: true, head: res.head };
-    if (res.unsatisfiedBlobs) return {
-      unsatisfiedBlobs: res.unsatisfiedBlobs,
-      unsatisfiedTotal: res.unsatisfiedTotal,
-      ...(emittedChain ? { attemptedManifestChain: emittedChain } : {}),
-    };
+    if (res.unsatisfiedBlobs) {
+      const unsatisfied: CommitResult = {
+        unsatisfiedBlobs: res.unsatisfiedBlobs,
+        unsatisfiedTotal: res.unsatisfiedTotal,
+      };
+      if (emittedChain) unsatisfied.attemptedManifestChain = emittedChain;
+      return unsatisfied;
+    }
     if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry
     // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
     if (res.sequence !== parentSequence + 1) throw new Error("server returned a sequence that does not match the signed commit seq — refusing to pin");
     await this.pinFrom(built.commit, account);
-    return {
-      sequence: res.sequence,
-      ...(snapshotEnabled ? { manifestMeta: {
+    const committed: CommitResult = { sequence: res.sequence };
+    if (snapshotEnabled) {
+      committed.manifestMeta = {
         encManifestSha: built.encManifestSha,
         manifestHash: resultManifestHash ?? await canonicalManifestHash(manifest),
         accountEpoch: account.currentEpoch,
@@ -915,8 +971,9 @@ export class E2eeRemote implements SyncRemote {
         chainBytes: emittedDelta && disposition.ok ? disposition.base.meta.chainBytes + built.encManifest.byteLength : 0,
         snapshotBytes: emittedDelta && disposition.ok ? disposition.base.meta.snapshotBytes : built.encManifest.byteLength,
         gitRepos: manifest.gitRepos ?? {},
-      } } : {}),
-    };
+      };
+    }
+    return committed;
   }
 
   missingBlobs(shas: string[]): Promise<string[]> {
@@ -1024,6 +1081,7 @@ export class E2eeRemote implements SyncRemote {
 // Lives HERE, not in a test file: tsconfig excludes **/*.test.ts, so only a
 // production module puts this in front of `tsc`. closeUploader is deliberately
 // excluded — see the comment beside receiptPort above.
-const _e2eeForwardsAllOptionalSyncRemoteCaps: Required<Omit<SyncRemote, "closeUploader">> =
-  {} as unknown as E2eeRemote;
-void _e2eeForwardsAllOptionalSyncRemoteCaps;
+type AssertAssignable<T extends true> = T;
+type _E2eeForwardsAllOptionalSyncRemoteCaps = AssertAssignable<
+  E2eeRemote extends Required<Omit<SyncRemote, "closeUploader">> ? true : false
+>;

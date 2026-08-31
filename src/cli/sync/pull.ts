@@ -241,7 +241,7 @@ export async function applyPulledManifest(
   state = await ensureCapableStateLineage(root, state);
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
-  const matcher = matcherForState(root, cfg, state);
+  const matcher = deps.matcherFor?.(state) ?? matcherForState(root, cfg, state);
   const scanStats = report.enabled ? deps.scanStats : undefined;
   // Counting-only deferral sink: pull intentionally acts on no deferred set
   // (see sync-scan-defer.test.ts — apply's expectedLocal guard is the protection),

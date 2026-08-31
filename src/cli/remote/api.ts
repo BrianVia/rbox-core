@@ -36,8 +36,16 @@ import {
  * (design 09 §1). `RboxApi` implements it for production; tests inject a stateful
  * simulator. Keep it minimal: only what pull/push actually call.
  */
+/** The verified head a reader resolves: its sequence, its manifest, and — when the
+ *  reader collected it — the wire identity design 204's delta writer needs. */
+export interface LatestManifest {
+  sequence: number;
+  manifest: Manifest;
+  manifestMeta?: GlobalManifestMeta;
+}
+
 export interface SyncRemote {
-  latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }>;
+  latest(options?: LatestOptions): Promise<LatestManifest>;
   missingBlobs(shas: string[]): Promise<string[]>;
   putBlobFile(
     sha256: string,
@@ -49,6 +57,10 @@ export interface SyncRemote {
   ownsUploadLaneTiming?(size: number): boolean;
   closeUploader?(err: Error): Promise<void>;
   receiptPort?(): ReceiptPort | undefined;
+  /** #818: start the account-keys read the next `commit()` needs, so its round-trip
+   *  overlaps the upload lane instead of stalling in front of the signature. Purely
+   *  a timing hint — `commit()` behaves identically, errors included, without it. */
+  prefetchAccount?(): void;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
