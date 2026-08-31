@@ -168,6 +168,17 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   return map["ux.spec"] === plan.specHash ? "match" : "owned-stale";
 }
 
+/** UX_DEBUG_OWNERSHIP=1 dumps what the daemon reported next to what the plan
+ * wanted. Env is included, so it stays opt-in. */
+export function ownershipDebug(value: unknown, plan: UxContainerPlan): string {
+  if (!process.env.UX_DEBUG_OWNERSHIP) return "";
+  const row = inspectRow(value);
+  return `\n${JSON.stringify({
+    want: { image: plan.image, network: plan.network, run: plan.runId, repo: plan.repoId, spec: plan.specHash, mounts: plan.mounts, repoRoot: REPO_ROOT },
+    got: { labels: row?.Config?.Labels, image: row?.Config?.Image, network: row?.HostConfig?.NetworkMode, env: row?.Config?.Env, mounts: row?.Mounts },
+  }, null, 2)}`;
+}
+
 export function configureUxRuntime(): void {
   C.configureRunner("docker");
 }
@@ -202,7 +213,7 @@ export async function ensureUxContainer(runId: string): Promise<UxContainerPlan>
   const inspection = await inspected(plan.name);
   if (inspection !== undefined) {
     const ownership = uxOwnership(inspection, plan);
-    if (ownership === "collision") throw new Error(`refusing to reuse unowned container ${plan.name}`);
+    if (ownership === "collision") throw new Error(`refusing to reuse unowned container ${plan.name}${ownershipDebug(inspection, plan)}`);
     if (ownership === "owned-stale") throw new Error(`UX container specification is stale: destroy ${plan.name} with fresh-machine destroy before creating another machine`);
   }
   if (inspection === undefined) await C.run(uxCreateArgs(plan));
@@ -218,7 +229,7 @@ export async function uxContainerState(runId: string): Promise<{ plan: UxContain
   const inspection = await inspected(plan.name);
   if (inspection === undefined) return undefined;
   const ownership = uxOwnership(inspection, plan);
-  if (ownership === "collision") throw new Error(`refusing unowned container ${plan.name}`);
+  if (ownership === "collision") throw new Error(`refusing unowned container ${plan.name}${ownershipDebug(inspection, plan)}`);
   return { plan, ownership };
 }
 
