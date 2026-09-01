@@ -652,6 +652,8 @@ test("one-commit owned-config planner surface matches the pre-refactor golden", 
       captureDeferrals: {},
       configDeferrals: {},
       captureObserved: ["."],
+      // #828: nothing is under the ignore rules here, so nothing retires.
+      ignoreRetired: [],
       configObserved: ["."],
       skipped: [],
       removed: [],

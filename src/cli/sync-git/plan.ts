@@ -136,6 +136,8 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
     timings,
   } = accumulator;
   const startedAt = performance.now();
+  // One fold for the whole pass — it is O(all repos), and this loop runs per repo.
+  const stateRecords = repoRecordsForState(state);
   const fingerprintAtStart = timings.fingerprintMs;
   for (const rel of keys) accumulator.captureObserved.add(rel);
   stats.repos = keys.length;
@@ -161,7 +163,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
       pending: pending[rel],
       removedKey: removedMemory[rel],
       resolutionKey: needsResolution[rel],
-      recordExists: repoRecordsForState(state)[rel] !== undefined,
+      recordExists: stateRecords[rel] !== undefined,
       cfgSynced: state.repoRecords?.[rel]?.cfgSynced,
       forced: force.has(rel),
       mustCapture: mustCapture(rel),
@@ -267,6 +269,13 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
         if (dotGit && rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) {
           out[rel] = baseSection;
           skipped.push({ relPath: rel, reason: "gitignored by discovery pruning — carrying base" });
+          // #828: this is the one pass that joins known repos against the CURRENT
+          // ignore rules, so it is where a pause retires. The sync those lanes were
+          // protecting can never run again; carrying the record forever only buries
+          // live deferrals in `rbox status --git`. Bookkeeping only — the worktree
+          // and `.git` are left exactly as they are, and un-ignoring the path lets
+          // ordinary discovery mint a fresh record.
+          if (Object.keys(stateRecords[rel]?.deferrals ?? {}).length > 0) accumulator.ignoreRetired.add(rel);
         } else {
           deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
         }
@@ -356,6 +365,11 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
     toCapture = toCapture.filter((rel) => !skippedRelPaths.has(rel));
     carried = carried.filter((rel) => !skippedRelPaths.has(rel));
     accumulator.carried = carried;
+  }
+  // One line per pass, never silent: retirement is a state transition a reader
+  // must be able to see after the fact.
+  if (accumulator.ignoreRetired.size > 0) {
+    accumulator.log(`git-sync: retired ${accumulator.ignoreRetired.size} paused repos now under ignore rules`);
   }
   stage.clearPreCaptureCtx();
   await options.beforeCapturePool?.();
@@ -858,6 +872,9 @@ export interface GitPushPlan {
   captureDeferrals: Record<string, GitDeferralReason>;
   configDeferrals: Record<string, GitDeferralReason>;
   captureObserved: string[];
+  /** #828: observed repos whose whole deferral record retires — the path is now
+   *  under the effective ignore rules, so no sync it protected can happen. */
+  ignoreRetired: string[];
   configObserved: string[];
   /** Design 68 §3.3 — in-tree linked-worktree pointers whose full-store capture was
    *  policy-skipped because the owning main clone is captured in this same cycle (history

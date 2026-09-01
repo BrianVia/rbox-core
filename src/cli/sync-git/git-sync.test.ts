@@ -2628,6 +2628,65 @@ test("Step D never runs witness math on a carried pending omission (busy carry k
   }
 }, 20_000);
 
+// #828: 132 chromium-fork repos paused during a stress test, then added to
+// config.json `ignorePaths`. rbox can never sync them again, so the pause
+// records had nothing left to protect — yet they survived forever and buried
+// every live deferral in `rbox status --git`.
+test("a paused repository now under the ignore rules retires its record, and its files stay on disk", async () => {
+  const rel = "ignored-pause";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  // The pause this retirement must be able to reach: an apply-lane deferral, the
+  // one lane no ordinary capture observation clears.
+  state.repoRecords![rel] = {
+    ...state.repoRecords![rel]!,
+    deferrals: {
+      apply: {
+        lane: "apply",
+        deferredSince: "2026-08-22T12:00:00.000Z",
+        reasonSince: "2026-08-22T12:00:00.000Z",
+        lastSeen: "2026-08-22T12:00:00.000Z",
+        reason: "local-commits",
+      },
+    },
+  };
+
+  const ignored = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA, { ignorePaths: [rel] }),
+  );
+  expect(ignored.ignoreRetired).toEqual([rel]);
+  expect(ignored.skipped.map((item) => item.relPath)).toContain(rel);
+  // The safety property: retirement is bookkeeping only.
+  expect(await fs.readFile(path.join(repo, "f.txt"), "utf8")).toBe("one");
+  expect(await fs.stat(path.join(repo, ".git")).then(() => true)).toBeTrue();
+  // …and BASE is carried, not dropped, so nothing proposes deleting the peer's history.
+  expect(ignored.gitRepos?.[rel]).toEqual(repoRecordsForState(state)[rel]!.base!);
+
+  // Un-ignored again: ordinary discovery finds the repo, so nothing retires and
+  // a fresh deferral record is minted by the normal flow.
+  const unignored = await planGitSections(
+    rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA),
+  );
+  expect(unignored.ignoreRetired).toEqual([]);
+  expect(unignored.captureObserved).toContain(rel);
+}, 20_000);
+
+test("an ignored repository with no standing pause retires nothing", async () => {
+  const rel = "ignored-no-pause";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await push(rootA, cfgA, depsA);
+  const plan = await planGitSections(
+    rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA, { ignorePaths: [rel] }),
+  );
+  expect(plan.skipped.map((item) => item.relPath)).toContain(rel);
+  expect(plan.ignoreRetired).toEqual([]);
+}, 20_000);
+
 test("carried repositories refresh the packed-refs baseline even when absence capture is switched off", async () => {
   const repo = path.join(rootA, "carried-packed-baseline");
   await initRepo(repo);
