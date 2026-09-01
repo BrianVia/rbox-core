@@ -6,6 +6,35 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-09-01
+
+2.0.1 makes rbox honest and safe around very large folders. If a huge
+directory (a build tree, a browser checkout) is about to be synced, rbox now
+refuses *before* spending time encrypting and uploading, names the directory,
+and shows the one-line `rbox ignore` command that skips it — files stay on
+disk. The workspace size limit was raised from 200,000 to 1,000,000 files,
+and it now only applies when a machine tries to *add* past it: other machines
+always accept and apply what was already synced, so a workspace can never get
+stuck too big to repair itself.
+
+### Fixed
+- `rbox ignore --purge` now actually removes everything your ignore rules
+  cover, including files inside Git repositories, and its preview tells you
+  exactly how many files would be removed and from where.
+- A machine receiving a very large cleanup no longer freezes retrying forever;
+  sync history problems now show an honest ⛔ status naming `rbox recover`.
+- `rbox upgrade` no longer prints an error line for every leftover daemon
+  record from past test runs, and no longer claims an upgrade was installed
+  when nothing changed.
+- The one-time cache rewrite that made every sync pause (tens of MB written
+  for a one-file change) is gone — cache updates are now instant.
+- Faster syncs on busy machines: pulls reuse work the background daemon
+  already did instead of redoing it.
+- Several small CLI fixes: destructive commands (`trash empty`, `key revoke`,
+  `device revoke`) now ask before acting (use `--yes` in scripts), file paths
+  work from subdirectories, tab completion improvements, and honest wording
+  when a recovery phrase is saved as a plain file.
+
 ## [2.0.0] - 2026-08-26
 
 rbox 2.0 is the release where sync gets fast and honest. Everything rbox
