@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { canonicalString } from "./e2ee/jcs.js";
 import { buildSignedCommit, parseCommit } from "./e2ee/commit.js";
 import { generateSignKeyPair } from "./e2ee/asym.js";
-import { KNOWN_MANIFEST_SCHEMA, MAX_ENTRIES } from "./manifest-validate.js";
+import { KNOWN_MANIFEST_SCHEMA } from "./manifest-validate.js";
+// The push-side cap (cli/sync/policy.ts); the engine no longer knows it — these
+// fixtures only need "bigger than any cap a composer would allow".
+const MAX_ENTRIES = 200_000;
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import {
   MANIFEST_ENVELOPE_MAGIC,
@@ -273,9 +276,12 @@ describe("canonical form and pure folding", () => {
     const underCap = foldTo(massDelete, capped.slice(3).map((e) => ({ op: "del", path: e.path })));
     expect(underCap.files).toHaveLength(3);
 
+    // Receivers never size-judge — growth refusal is the COMPOSER's job
+    // (entryCapTrips in cli/sync/policy.ts, locked by the publish-candidate
+    // contract tests). A fold applies whatever a peer authored.
     const atCap = manifest("old", capped.slice(0, MAX_ENTRIES));
-    expect(() => foldTo([...atCap.files, entry("zz-new.txt")], [{ op: "set", entry: entry("zz-new.txt") }], atCap))
-      .toThrow(`too many entries (${MAX_ENTRIES + 1} > ${MAX_ENTRIES})`);
+    const grown = foldTo([...atCap.files, entry("zz-new.txt")], [{ op: "set", entry: entry("zz-new.txt") }], atCap);
+    expect(grown.files).toHaveLength(MAX_ENTRIES + 1);
   });
 });
 
