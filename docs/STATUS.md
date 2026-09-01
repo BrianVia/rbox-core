@@ -28,7 +28,7 @@
 - Perf close-out numbers recorded on #822/#818 (FM 2.0.0→2.0.1: no-op push
   2.8–5.7s → 2.3–2.8s; steady pull flat ~3.3s).
 - Owed: Mac `rbox upgrade` on wake (founder tonight) + runner-wizard rerun
-  (FLAKE-012); three MEDIUM design notes landing (docs only); #857 follow-up
+  (FLAKE-012); three MEDIUM design notes MERGED (#862: #823 sourceSeq split, #663 matcher memo key must include the gitignore flag, #775 = two working-tree proofs per follow + two per-ref git spawn loops → #863 filed SMALL); #857 follow-up
   measurement; held-skip.ts at 396/400 and help-registry.ts 8 bytes under
   ceiling — next toucher decomposes.
 
