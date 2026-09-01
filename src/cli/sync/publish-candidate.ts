@@ -299,6 +299,7 @@ export async function preparePublishCandidate(
     captureDeferrals: plan.captureDeferrals,
     configObserved: plan.configObserved,
     configDeferrals: plan.configDeferrals,
+    ignoreRetired: plan.ignoreRetired,
     protectedPending: plan.protectedPending,
     packedRefsIdentity: plan.packedRefsIdentity,
     ackLineageOf: (relPath) => plan.publisherAckBindings?.[relPath]?.lineageHash,

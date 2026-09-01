@@ -1,5 +1,5 @@
 /** Never: candidate planning, BASE minting/advancement, publication, or reading sync state directly. */
-import type { GitDeferralReason, GitDeferrals } from "../config.js";
+import { DEFERRAL_LANES, type GitDeferralReason, type GitDeferrals } from "../config.js";
 import { orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates, type RepoStateValues } from "../sync-state.js";
 import { carriedLineageProof, type RepoBaseProof } from "./base-composer.js";
 import { nextDeferral } from "./shared.js";
@@ -22,6 +22,12 @@ export interface GitCaptureObservation {
   captureDeferrals: Readonly<Record<string, GitDeferralReason>>;
   configObserved: readonly string[];
   configDeferrals: Readonly<Record<string, GitDeferralReason>>;
+  /** #828: repositories the planner found still on disk but now pruned by the
+   * CURRENT effective ignore rules. The sync every standing lane was protecting
+   * can no longer happen, so the whole record retires here — the same write that
+   * already retires an observed capture lane. Files and `.git` are untouched; an
+   * un-ignored path is rediscovered and re-deferred by the ordinary flow. */
+  ignoreRetired: readonly string[];
   /** Repositories whose entire record is immutable before an accepted ACK. */
   protectedPending: readonly string[];
   packedRefsIdentity: RepoStateValues["packedRefsIdentity"];
@@ -116,10 +122,18 @@ export async function recordGitCaptureObservation(
   observation: GitCaptureObservation,
 ): Promise<CaptureObservationReceipt> {
   const protectedPending = new Set(observation.protectedPending);
+  const ignoreRetired = new Set(observation.ignoreRetired);
   const deferrals: Record<string, OrderedGitDeferralUpdates> = {};
   for (const rel of observation.captureObserved) {
     if (protectedPending.has(rel)) continue;
     const current = port.records[rel]?.deferrals;
+    if (ignoreRetired.has(rel)) {
+      const cleared: GitDeferralUpdates = {};
+      for (const lane of DEFERRAL_LANES) if (current?.[lane]) cleared[lane] = null;
+      const retired = orderedDeferralUpdates(current, cleared);
+      if (retired !== undefined) deferrals[rel] = retired;
+      continue;
+    }
     const lanes: GitDeferralUpdates = {};
     const captureReason = observation.captureDeferrals[rel];
     if (captureReason) {
@@ -134,7 +148,9 @@ export async function recordGitCaptureObservation(
     const ordered = orderedDeferralUpdates(current, lanes);
     if (ordered !== undefined) deferrals[rel] = ordered;
   }
-  markBytesChanged(port, observation, protectedPending, deferrals);
+  // A retired record must not be resurrected by the byte-intersection marker in
+  // the same write, so it is excluded exactly like a protected pending repo.
+  markBytesChanged(port, observation, new Set([...protectedPending, ...ignoreRetired]), deferrals);
 
   const values: CaptureObservationSidecarValues = {
     bases: port.carried.bases,

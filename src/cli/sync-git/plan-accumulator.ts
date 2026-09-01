@@ -85,6 +85,9 @@ export class GitPlanAccumulator {
   readonly removed: string[] = [];
   readonly deferred: GitPlanDeferred[] = [];
   readonly captureObserved = new Set<string>();
+  /** #828: observed repos whose standing deferrals retire because the path is
+   * now under the effective ignore rules. Subset of `captureObserved`. */
+  readonly ignoreRetired = new Set<string>();
   readonly configObserved = new Set<string>();
   readonly skipped: Array<{ relPath: string; reason: string }> = [];
   readonly pendingSupersessionCandidates = new Set<string>();
@@ -341,6 +344,7 @@ export class GitPlanAccumulator {
       captureDeferrals,
       configDeferrals,
       captureObserved: [...this.captureObserved].sort(),
+      ignoreRetired: [...this.ignoreRetired].sort(),
       configObserved: [...this.configObserved].sort(),
       skipped: this.skipped,
       removed: this.removed,

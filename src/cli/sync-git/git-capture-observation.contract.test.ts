@@ -31,6 +31,7 @@ function observation(overrides: Partial<GitCaptureObservation> = {}): GitCapture
     captureDeferrals: {},
     configObserved: [],
     configDeferrals: {},
+    ignoreRetired: [],
     protectedPending: [],
     packedRefsIdentity: undefined,
     ackLineageOf: () => undefined,
@@ -193,6 +194,68 @@ describe("RecordGitCaptureObservation", () => {
     expect(updates["cleared"]).toEqual({ capture: { clear: true, ifLastSeenAtMost: EARLIER } });
     expect(updates["cfg"]).toEqual({ config: { clear: true, ifLastSeenAtMost: EARLIER } });
     expect(writes[0]!.values.deferrals).toEqual(updates as Record<string, never>);
+  });
+
+  // #828: three paused repos, one now under the effective ignore rules. Exactly
+  // that record retires — every lane, including the apply lane no other observed
+  // transition can clear — and the other two keep the pauses they earned.
+  test("retires every lane of a repository the plan reports as newly ignored", async () => {
+    const { port, writes } = harness({
+      records: {
+        "chromium": {
+          deferrals: {
+            apply: standingDeferral("apply", { reason: "local-commits" }),
+            config: standingDeferral("config", { reason: "config" }),
+          },
+        },
+        "keeps-apply": { deferrals: { apply: standingDeferral("apply", { reason: "local-commits" }) } },
+        "keeps-capture": { deferrals: { capture: standingDeferral("capture", { reason: "git-busy" }) } },
+      },
+      dirty: (values) => Object.keys(values.deferrals).sort(),
+    });
+    const receipt = await recordGitCaptureObservation(
+      port,
+      lineage(),
+      observation({
+        captureObserved: ["chromium", "keeps-apply", "keeps-capture"],
+        captureDeferrals: { "keeps-capture": "git-busy" },
+        ignoreRetired: ["chromium"],
+      }),
+    );
+
+    expect(receipt.deferralUpdates["chromium"]).toEqual({
+      apply: { clear: true, ifLastSeenAtMost: EARLIER },
+      config: { clear: true, ifLastSeenAtMost: EARLIER },
+    });
+    // The apply lane of an un-ignored sibling is never touched by this pass, and
+    // a live capture pause is refreshed rather than retired.
+    expect(receipt.deferralUpdates["keeps-apply"]).toBeUndefined();
+    expect(receipt.deferralUpdates["keeps-capture"]).toEqual({
+      capture: {
+        set: { lane: "capture", deferredSince: EARLIER, reasonSince: EARLIER, lastSeen: OBSERVED_AT, reason: "git-busy" },
+        ifLastSeenAtMost: EARLIER,
+      },
+    });
+    expect(Object.keys(writes[0]!.values.deferrals).sort()).toEqual(["chromium", "keeps-capture"]);
+  });
+
+  // The byte-intersection marker runs after retirement and must not resurrect the
+  // apply lane it just cleared.
+  test("a retired record is not re-marked by an intersecting file-plane change", async () => {
+    const { port } = harness({
+      records: { "chromium": { deferrals: { apply: standingDeferral("apply", { reason: "local-commits" }) } } },
+      dirty: (values) => Object.keys(values.deferrals).sort(),
+    });
+    const receipt = await recordGitCaptureObservation(
+      port,
+      lineage(),
+      observation({
+        captureObserved: ["chromium"],
+        ignoreRetired: ["chromium"],
+        changedFilePaths: () => ["chromium/src/main.cc"],
+      }),
+    );
+    expect(receipt.deferralUpdates["chromium"]).toEqual({ apply: { clear: true, ifLastSeenAtMost: EARLIER } });
   });
 
   test("never touches the config lane of a repository this plan did not observe for config", async () => {
