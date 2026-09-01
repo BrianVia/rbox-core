@@ -1466,6 +1466,92 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     expect(timings.encBytes).toBeGreaterThan(0);
   });
 
+  // #820: the ~5 MB refset sidecar is skipped when the server already holds it. Safe
+  // because /v1/blobs/check's "have it" predicate is strictly stronger than what the
+  // commit path needs for the sidecar carrier — no fresh receipt is required.
+  describe("#820 refset sidecar skip", () => {
+    test("(a) an unchanged refset re-commit issues zero sidecar PUT", async () => {
+      const server = new ObservedServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-skip", NOW);
+      const remote = await remoteFor(server, secrets);
+      const manifest = largeManifest();
+      const sidecarSha = sidecarShaOf(manifest);
+      seedManifestRefs(server, manifest);
+
+      await expect(remote.commit(0, secrets.deviceId, manifest)).resolves.toMatchObject({ sequence: 1 });
+      expect(server.putBlobBytesCalls).toContain(sidecarSha);
+
+      // Second commit, same ref set → same sidecarSha, already on the server.
+      server.putBlobBytesCalls = [];
+      await expect(remote.commit(1, secrets.deviceId, manifest)).resolves.toMatchObject({ sequence: 2 });
+      expect(server.putBlobBytesCalls).not.toContain(sidecarSha);
+    });
+
+    test("(b) a sidecar the server reports missing is uploaded", async () => {
+      const server = new ObservedServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-missing", NOW);
+      const remote = await remoteFor(server, secrets);
+      const manifest = largeManifest();
+      const sidecarSha = sidecarShaOf(manifest);
+      seedManifestRefs(server, manifest);
+
+      await expect(remote.commit(0, secrets.deviceId, manifest)).resolves.toMatchObject({ sequence: 1 });
+      // Server dropped it (GC / catalog repair) → the check reports missing again.
+      server.store.blobs.delete(sidecarSha);
+      server.putBlobBytesCalls = [];
+      await expect(remote.commit(1, secrets.deviceId, manifest)).resolves.toMatchObject({ sequence: 2 });
+      expect(server.putBlobBytesCalls).toContain(sidecarSha);
+    });
+
+    test("(c) a retry attempt re-PUTs the sidecar unconditionally", async () => {
+      const server = new ObservedServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-retry", NOW);
+      const remote = await remoteFor(server, secrets);
+      const manifest = largeManifest();
+      const sidecarSha = sidecarShaOf(manifest);
+      seedManifestRefs(server, manifest);
+
+      await expect(remote.commit(0, secrets.deviceId, manifest)).resolves.toMatchObject({ sequence: 1 });
+      server.putBlobBytesCalls = [];
+      // Present on the server, but this is a retry → PUT anyway (the only exit from a
+      // persistent check-says-present / commit-says-unsatisfied disagreement).
+      await expect(remote.commit(1, secrets.deviceId, manifest, { retryAttempt: true })).resolves.toMatchObject({ sequence: 2 });
+      expect(server.putBlobBytesCalls).toContain(sidecarSha);
+    });
+
+    test("(d) present-but-unentitled → 422 → the retry re-uploads and the commit succeeds", async () => {
+      const server = new ObservedServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-unentitled", NOW);
+      const remote = await remoteFor(server, secrets);
+      const manifest = largeManifest();
+      const sidecarSha = sidecarShaOf(manifest);
+      seedManifestRefs(server, manifest);
+
+      // The sidecar bytes exist (check says "have it") but the commit path refuses it —
+      // the D1-present / R2-or-entitlement-gone divergence the retry rule exists for.
+      server.store.blobs.set(sidecarSha, serializeRefset(
+        manifest.files.map((f) => ({ encSha: (f as { encSha: string }).encSha, size: f.size })),
+      ));
+      let entitled = false;
+      const baseCommitSigned = server.commitSigned;
+      server.commitSigned = async (parentSeq, commit, before) => {
+        if (!entitled) {
+          entitled = true; // the "upload" the 422 demands re-grants entitlement
+          return { unsatisfiedBlobs: [sidecarSha] };
+        }
+        return baseCommitSigned(parentSeq, commit, before);
+      };
+
+      server.putBlobBytesCalls = [];
+      // Attempt 0 skips the PUT (server says present) and gets the 422.
+      await expect(remote.commit(0, secrets.deviceId, manifest)).resolves.toMatchObject({ unsatisfiedBlobs: [sidecarSha] });
+      expect(server.putBlobBytesCalls).not.toContain(sidecarSha);
+      // The push loop's retry re-PUTs unconditionally, and the commit lands.
+      await expect(remote.commit(0, secrets.deviceId, manifest, { retryAttempt: true })).resolves.toMatchObject({ sequence: 1 });
+      expect(server.putBlobBytesCalls).toContain(sidecarSha);
+    });
+  });
+
   test("A pushes an encrypted tree; B pairs in and pulls it byte-identically; server sees no plaintext", async () => {
     const server = new FakeServer();
 
