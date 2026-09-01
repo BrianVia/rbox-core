@@ -264,12 +264,7 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   if (halt && halt.typedReason?.kind !== "push-conflict" && !halt.terminal && active && !out) {
     lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
   }
-  const stranded = strandedIgnoredLine(s.strandedIgnored);
-  if (stranded) lines.push(stranded);
-  const copies = conflictCopiesLine(s.conflictCopies);
-  if (copies) lines.push(copies);
-  const dominant = dominantDirLine(s.dominantDir);
-  if (dominant) lines.push(dominant);
+  lines.push(...advisoryLines(s));
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {
     lines.push(`${style.yellow("git deferral:")} oldest ${ageBucket(s.gitOldestDeferral.deferredSince, s.now)} · ${gitDeferralReasonText(s.gitOldestDeferral.reason)}`);
   }
@@ -286,6 +281,20 @@ export function strandedIgnoredLine(count: number | undefined): string | undefin
     ? "1 file matches your ignore rules but is still synced"
     : `${n(count)} files match your ignore rules but are still synced`;
   return `${style.yellow(`⚠ ${body}`)} · ${style.dim("rbox ignore --purge")}`;
+}
+
+/**
+ * The local advisory family, in one place: things the user may want to act on
+ * that never stop sync. Both surfaces that show them — the verdict details and
+ * the brief — render this list, so a fourth advisory is added once, not twice,
+ * and the two surfaces cannot drift.
+ */
+export function advisoryLines(s: Pick<StatusSnapshot, "strandedIgnored" | "conflictCopies" | "dominantDir">): string[] {
+  return [
+    strandedIgnoredLine(s.strandedIgnored),
+    conflictCopiesLine(s.conflictCopies),
+    dominantDirLine(s.dominantDir),
+  ].filter((line): line is string => line !== undefined);
 }
 
 /** #810: the proactive "one directory just exploded" advisory — the same sentence

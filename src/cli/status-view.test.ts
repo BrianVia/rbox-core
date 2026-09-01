@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
+import type { TransferPhase } from "./transfer-progress.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import {
   attributeDaemonForStatus,
@@ -271,9 +272,11 @@ test("progressLabel gitcap detail strips ANSI escapes and control chars", () => 
 });
 
 test("progressLabel unknown phase falls back to a sane verb, not garbage", () => {
-  // Simulates an older/other writer landing a phase this build's union doesn't name:
-  // it must not masquerade as "downloading".
-  expect(progressLabel("bogus" as unknown as Parameters<typeof progressLabel>[0], 1, 4)).toBe("syncing 1/4");
+  // An older/other writer's phase arrives the only way it can — parsed out of the
+  // activity sidecar — so read it at that boundary rather than asserting a literal
+  // into the union. It must not masquerade as "downloading".
+  const fromSidecar = JSON.parse('{"phase":"bogus"}') as { phase: TransferPhase };
+  expect(progressLabel(fromSidecar.phase, 1, 4)).toBe("syncing 1/4");
 });
 
 // ── healthLine priority order ────────────────────────────────────────────────

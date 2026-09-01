@@ -1,5 +1,4 @@
-import { PassThrough } from "node:stream";
-import { countConflictCopies, diffManifests, dominatingNewDir, type DiscoveredGitRepo, type DominantDir, type IgnoreMatcher } from "../engine/index.js";
+import { countConflictCopies, diffManifests, dominatingNewDir, type DominantDir, type IgnoreMatcher } from "../engine/index.js";
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
 import {
@@ -10,6 +9,7 @@ import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { unhandledResetInspection } from "./reset-halt-inspection.js";
 import { projectLocalManifest } from "./local-file-projection.js";
+import { createGitRepoFeed } from "./status-git-repo-feed.js";
 import { attributeDaemonForStatus, type StatusRemoteHead } from "./status-view.js";
 import { projectGitDeferralRepos } from "./status-view/git-projection.js";
 import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
@@ -77,29 +77,6 @@ function trustedLocalSnapshot(input: {
 function localBaseSequenceMismatched(activity: DaemonActivity | undefined, state: SyncState): boolean {
   const local = activity?.local;
   return local !== undefined && local.stream === state.stream && local.baseSequence !== state.lastSyncedSequence;
-}
-
-interface GitRepoFeed {
-  push: (repo: DiscoveredGitRepo) => void;
-  close: () => void;
-  iterable: AsyncIterable<DiscoveredGitRepo>;
-}
-
-function createGitRepoFeed(): GitRepoFeed {
-  const feed = new PassThrough({ objectMode: true });
-  let closed = false;
-  return {
-    push(repo) {
-      if (closed) return;
-      feed.write(repo);
-    },
-    close() {
-      if (closed) return;
-      closed = true;
-      feed.end();
-    },
-    iterable: feed.iterator({ destroyOnReturn: false }) as AsyncIterable<DiscoveredGitRepo>,
-  };
 }
 
 function projectHealth(input: {
@@ -285,12 +262,14 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   let strandedIgnored: number | undefined;
   let conflictCopies: number | undefined;
   let dominantDir: DominantDir | undefined;
+  // One definition of a status matcher; the branches differ only in gitignore.
+  const statusMatcher = (respectGitignore: boolean) => port.buildMatcher(root, {
+    respectGitignore,
+    ignorePaths: cfg.ignorePaths ?? [],
+    knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+  });
   if (trusted) {
-    const matcher = port.buildMatcher(root, {
-      respectGitignore: false,
-      ignorePaths: cfg.ignorePaths ?? [],
-      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    });
+    const matcher = statusMatcher(false);
     const repoHints = cfg.syncGit ? await port.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
     const gitStatus = await evaluateGit(undefined, repoHints, false);
     strandedIgnored = trusted.local.strandedIgnored;
@@ -344,11 +323,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       source: "computed",
     };
   } else {
-    const matcher = port.buildMatcher(root, {
-      respectGitignore: cfg.respectGitignore === true,
-      ignorePaths: cfg.ignorePaths ?? [],
-      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    });
+    const matcher = statusMatcher(cfg.respectGitignore === true);
     const hashCache = await port.loadHashCache(root);
     const gitRepoFeed = createGitRepoFeed();
     const gitChangedP = evaluateGit(matcher, gitRepoFeed.iterable);
@@ -368,8 +343,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     // It never mutates the durable sidecar; the passive loop remains its writer.
     pathWarnings = buildPathWarnings(projected.caseCollisions);
     const manifestDiff = diffManifests(scopedBaseManifest, localManifest);
-    // #810: the daemonless branch owns the same derivation the daemon does —
-    // one rule, two callers, from a diff each already computed.
+    // #810: same rule the daemon applies, from a diff this branch already has.
     dominantDir = dominatingNewDir(manifestDiff.added, localManifest.files.length, state.lastSyncedSequence > 0);
     const gitStatus = await gitChangedP;
     counts = {
