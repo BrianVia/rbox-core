@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { countConflictCopies, diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
+import { countConflictCopies, diffManifests, dominatingNewDir, type DiscoveredGitRepo, type DominantDir, type IgnoreMatcher } from "../engine/index.js";
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
 import {
@@ -284,6 +284,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   let cacheHint: StatusCacheHint | undefined;
   let strandedIgnored: number | undefined;
   let conflictCopies: number | undefined;
+  let dominantDir: DominantDir | undefined;
   if (trusted) {
     const matcher = port.buildMatcher(root, {
       respectGitignore: false,
@@ -294,6 +295,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     const gitStatus = await evaluateGit(undefined, repoHints, false);
     strandedIgnored = trusted.local.strandedIgnored;
     conflictCopies = trusted.local.conflictCopies;
+    dominantDir = trusted.local.dominantDir;
     counts = {
       added: trusted.local.added,
       changed: trusted.local.changed,
@@ -366,6 +368,9 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     // It never mutates the durable sidecar; the passive loop remains its writer.
     pathWarnings = buildPathWarnings(projected.caseCollisions);
     const manifestDiff = diffManifests(scopedBaseManifest, localManifest);
+    // #810: the daemonless branch owns the same derivation the daemon does —
+    // one rule, two callers, from a diff each already computed.
+    dominantDir = dominatingNewDir(manifestDiff.added, localManifest.files.length, state.lastSyncedSequence > 0);
     const gitStatus = await gitChangedP;
     counts = {
       added: manifestDiff.added.length,
@@ -458,5 +463,6 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   };
   if (strandedIgnored !== undefined) detail.strandedIgnored = strandedIgnored;
   if (conflictCopies !== undefined) detail.conflictCopies = conflictCopies;
+  if (dominantDir !== undefined) detail.dominantDir = dominantDir;
   return detail as WorkspaceStatusProjection<M>;
 }

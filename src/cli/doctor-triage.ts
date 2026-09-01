@@ -15,6 +15,7 @@ import path from "node:path";
 import type { DaemonActivity } from "./activity.js";
 import type { AdoptFenceInspection } from "./adopt-journal.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
+import { dominatingDirHint } from "../engine/index.js";
 import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { SAFE_LOCAL_FILES, SAFE_NOTHING_LOST, scoped, type TriageFinding, type TriageSeverity } from "./doctor-finding.js";
 import { haltFinding } from "./doctor-triage-halt.js";
@@ -384,6 +385,25 @@ function quotaFinding(activity: DaemonActivity | undefined): TriageFinding | und
   };
 }
 
+/**
+ * #810: one directory is most of what this workspace just picked up. Said while
+ * it is still cheap to act — the entry cap says the same sentence, but only
+ * after a runaway tree has already been scanned. Advisory by construction: rbox
+ * never ignores anything on its own, and the finding is re-derived from the
+ * daemon's latest projection, so it is simply absent once the shape changes.
+ */
+function dominantDirFinding(root: string, activity: DaemonActivity | undefined): TriageFinding | undefined {
+  const dir = activity?.local?.dominantDir;
+  if (!dir) return undefined;
+  return {
+    id: "dominant-directory",
+    severity: "info",
+    problem: `One directory is most of what rbox just picked up here: ${dominatingDirHint(dir)}.`,
+    safety: "Nothing is wrong and nothing is deleted — ignoring a directory only stops rbox syncing it, and the files stay where they are.",
+    command: scoped(root, `rbox ignore ${shQuoteIfNeeded(`${dir.dir}/`)}`),
+  };
+}
+
 /** Order the findings the way a stuck user should work through them: things that
  * stop sync entirely, then things that slow it down, then advisories. */
 export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
@@ -396,6 +416,8 @@ export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
   if (quota) findings.push(quota);
   const halt = owned && input.activity?.halt ? haltFinding(input.root, input.activity.halt) : undefined;
   if (halt) findings.push(halt);
+  const dominant = owned ? dominantDirFinding(input.root, input.activity) : undefined;
+  if (dominant) findings.push(dominant);
   findings.push(...environmentFindings(input));
   for (const repo of input.deferrals) findings.push(deferralFinding(input.root, repo, input.observedAt));
   findings.push(...daemonFindings(input));

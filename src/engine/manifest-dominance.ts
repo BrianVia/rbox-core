@@ -48,6 +48,25 @@ export function isDominant(dir: DominantDir, totalEntries: number): boolean {
   return dir.count >= DOMINANT_NEW_ENTRIES || (totalEntries > 0 && dir.count > totalEntries * DOMINANT_SHARE);
 }
 
+/**
+ * The proactive hint's whole rule (#810): the directory that dominates a scan's
+ * NEW entries, once a prior base exists. Derived on every scan and never
+ * recorded as a decision, so it appears when the condition holds and is simply
+ * absent once it stops — there is nothing sticky to clear or dismiss.
+ *
+ * `hasPriorBase` is load-bearing: without one every entry is new, so a first
+ * adoption would always accuse whichever directory happens to be the biggest.
+ */
+export function dominatingNewDir(
+  added: readonly FileEntry[],
+  totalEntries: number,
+  hasPriorBase: boolean,
+): DominantDir | undefined {
+  if (!hasPriorBase) return undefined;
+  const top = dominatingDir(added);
+  return top && isDominant(top, totalEntries) ? top : undefined;
+}
+
 /** The remedy sentence: which directory, how much of the manifest it owns, and
  *  the one command that stops it — spelling out that ignoring is not deleting.
  *  Deliberately neutral about WHEN those files arrived: the same sentence

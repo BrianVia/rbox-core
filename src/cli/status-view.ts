@@ -19,6 +19,7 @@
  * transfer wording, and `status-view/text.ts` the shared display primitives.
  */
 import { ACTIVE_STALE_MS, isSafetyHaltReason, type DaemonActivity } from "./activity.js";
+import { dominatingDirHint, type DominantDir } from "../engine/index.js";
 import type { DaemonObservation } from "./daemon/observation.js";
 import { quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
@@ -57,6 +58,9 @@ export interface StatusSnapshot {
   strandedIgnored?: number;
   /** Design 272 §4: rbox-minted conflict copies on this device; the user owns deletion. */
   conflictCopies?: number;
+  /** #810: the directory dominating this scan's new entries; the user owns the
+   *  decision to ignore it. Absent whenever none does. */
+  dominantDir?: DominantDir;
   populate?: {
     phase: TransferPhase;
     filesDone: number;
@@ -264,6 +268,8 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   if (stranded) lines.push(stranded);
   const copies = conflictCopiesLine(s.conflictCopies);
   if (copies) lines.push(copies);
+  const dominant = dominantDirLine(s.dominantDir);
+  if (dominant) lines.push(dominant);
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {
     lines.push(`${style.yellow("git deferral:")} oldest ${ageBucket(s.gitOldestDeferral.deferredSince, s.now)} · ${gitDeferralReasonText(s.gitOldestDeferral.reason)}`);
   }
@@ -280,6 +286,16 @@ export function strandedIgnoredLine(count: number | undefined): string | undefin
     ? "1 file matches your ignore rules but is still synced"
     : `${n(count)} files match your ignore rules but are still synced`;
   return `${style.yellow(`⚠ ${body}`)} · ${style.dim("rbox ignore --purge")}`;
+}
+
+/** #810: the proactive "one directory just exploded" advisory — the same sentence
+ *  the entry-cap refusal uses, said BEFORE any cap trips, while ignoring the
+ *  directory is still a cheap choice. Advisory, never a halt: the user decides,
+ *  rbox ignores nothing on its own. `undefined` whenever no directory dominates,
+ *  which is how the line clears itself once one no longer does. */
+export function dominantDirLine(dir: DominantDir | undefined): string | undefined {
+  if (!dir) return undefined;
+  return style.yellow(`⚠ ${dominatingDirHint(dir)}`);
 }
 
 /** Design 272 §4: rbox-minted conflict copies still on this device. Deliberately NOT

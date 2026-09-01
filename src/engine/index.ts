@@ -130,6 +130,7 @@ export {
 export {
   dominatingDir,
   dominatingDirHint,
+  dominatingNewDir,
   isDominant,
   DOMINANT_NEW_ENTRIES,
   DOMINANT_SHARE,

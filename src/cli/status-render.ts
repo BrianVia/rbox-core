@@ -5,6 +5,7 @@ import { formatAccountSummary } from "./account-cmd.js";
 import type { CredentialLoadResult } from "./credentials.js";
 import {
   conflictCopiesLine,
+  dominantDirLine,
   healthDetailLines,
   healthLine,
   lastSyncLines,
@@ -165,6 +166,7 @@ export function renderStatusJson(projection: DetailProjection<"json">) {
     // only for a daemon snapshot — the count exists on both branches.
     strandedIgnored: projection.strandedIgnored,
     conflictCopies: projection.conflictCopies,
+    dominantDir: projection.dominantDir,
     local: counts.source === "daemon"
       ? {
         added: counts.added,
@@ -291,6 +293,8 @@ export function renderStatusBrief(
   if (strandedLine) lines.push(`  ${strandedLine}`);
   const copiesLine = conflictCopiesLine(projection.conflictCopies);
   if (copiesLine) lines.push(`  ${copiesLine}`);
+  const dominantLine = dominantDirLine(projection.dominantDir);
+  if (dominantLine) lines.push(`  ${dominantLine}`);
   // Design 273 S2: the grouped full-path listing replaces the per-repo
   // record/companion pair. That record grammar is untouched — it is the daemon
   // LOG line, whose redaction classifier is byte-frozen against it.
@@ -322,6 +326,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     pathWarnings: projection.pathWarnings,
     strandedIgnored: projection.strandedIgnored,
     conflictCopies: projection.conflictCopies,
+    dominantDir: projection.dominantDir,
     populate: populate
       ? {
         phase: populate.operation.phase,

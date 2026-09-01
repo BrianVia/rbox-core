@@ -7,6 +7,7 @@ import {
   healthLine,
   lastSyncLines,
   strandedIgnoredLine,
+  dominantDirLine,
   type StatusSnapshot,
 } from "./status-view.js";
 import { gitDeferralReasonPresentation, projectGitDeferralRepos } from "./status-view/git-projection.js";
@@ -642,6 +643,19 @@ test("healthDetailLines surfaces the stranded line only when non-zero", () => {
   expect(healthDetailLines({ ...snapshot }).join("\n")).not.toContain("ignore rules");
   expect(healthDetailLines({ ...snapshot, strandedIgnored: 4 }).join("\n"))
     .toContain("4 files match your ignore rules but are still synced");
+});
+
+/** #810: the proactive hint is an advisory line, and it is DERIVED — a scan
+ *  that no longer sees a dominating directory simply stops printing it. */
+test("healthDetailLines surfaces the dominating-directory hint, and drops it when absent", () => {
+  const snapshot = {
+    added: 0, changed: 0, deleted: 0, trackedFiles: 150000, daemonRunning: true, localSequence: 3, now: NOW,
+  };
+  const line = healthDetailLines({ ...snapshot, dominantDir: { dir: "build", count: 120_000 } }).join("\n");
+  expect(line).toContain("build accounts for 120,000 files — looks like build output");
+  expect(line).toContain("`rbox ignore build/` skips it (files stay on disk)");
+  expect(healthDetailLines(snapshot).join("\n")).not.toContain("build output");
+  expect(dominantDirLine(undefined)).toBeUndefined();
 });
 
 /** Design 271 §2.7.5: the curated detail rides the display lane into the row

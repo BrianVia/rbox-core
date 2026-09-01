@@ -798,6 +798,40 @@ test("a state file from another workspace gets its own finding, also without rbo
   expect(finding?.command).not.toContain("rbox recover");
 });
 
+// ------------------------------------ #810: proactive dominating-directory hint
+
+test("doctor names the directory that just exploded, and says nothing once it has not", () => {
+  const local = {
+    at: new Date(NOW).toISOString(),
+    stream: "s",
+    baseSequence: 4,
+    trackedFiles: 150_000,
+    added: 120_000,
+    changed: 0,
+    deleted: 0,
+    settled: true,
+    sourceVersion: 1 as const,
+  };
+  const withHint = findingById(
+    triageWorkspace(inputs({
+      activity: { at: new Date(NOW).toISOString(), local: { ...local, dominantDir: { dir: "build", count: 120_000 } } },
+    })).findings,
+    "dominant-directory",
+  );
+  expect(withHint?.severity).toBe("info");
+  expect(withHint?.problem).toContain("build accounts for 120,000 files");
+  expect(withHint?.command).toContain("rbox ignore build/");
+  // An advisory never blocks: an info finding leaves the workspace healthy.
+  expect(triageWorkspace(inputs({
+    activity: { at: new Date(NOW).toISOString(), local: { ...local, dominantDir: { dir: "build", count: 120_000 } } },
+  })).healthy).toBe(true);
+  // Derived, not sticky: the next projection without one prints nothing.
+  expect(findingById(
+    triageWorkspace(inputs({ activity: { at: new Date(NOW).toISOString(), local } })).findings,
+    "dominant-directory",
+  )).toBeUndefined();
+});
+
 // -------------------------------------------------- MEDIUM 9: quota remedies
 
 test("quota remedies name a real plan, and no_plan is distinguished from out-of-storage", () => {
