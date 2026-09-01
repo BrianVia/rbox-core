@@ -95,10 +95,7 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     console.log("purge dry-run: nothing to delete.");
     return;
   }
-  const topLevelDirs = new Set(preview.purged.map((p) => p.split("/")[0] ?? p));
-  const dirs = [...topLevelDirs].slice(0, 12);
-  console.log(`purge dry-run: ${preview.purged.length} path${preview.purged.length === 1 ? "" : "s"} would be deleted from other machines.`);
-  console.log(`top-level: ${dirs.join(", ")}${dirs.length < topLevelDirs.size ? ", ..." : ""}`);
+  for (const line of purgeSummaryLines(preview.purged)) console.log(line);
   const ok = await confirmDestructive({
     message: "Purge these ignored paths from synced state?",
     yes: opts.yes,
@@ -134,11 +131,34 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     });
     console.log(
       res.committed
-        ? `purged ${final.purged.length} ignored path${final.purged.length === 1 ? "" : "s"} -> sequence ${res.sequence}`
+        ? `purged ${final.purged.length.toLocaleString("en-US")} ignored entr${final.purged.length === 1 ? "y" : "ies"} -> sequence ${res.sequence}`
         : `purge made no remote change (sequence ${res.sequence})`
     );
     summarizeCaseCollisions(res.caseCollisions);
   });
+}
+
+const TOP_LEVEL_SHOWN = 12;
+
+/**
+ * The consent line. It must state the number of MANIFEST ENTRIES leaving every
+ * other machine, broken down per top-level name — "5 paths, top-level: chromium"
+ * hid 187,000 entries behind two words (#838), and a count nobody can size is not
+ * informed consent.
+ */
+export function purgeSummaryLines(purged: readonly string[]): string[] {
+  const byTop = new Map<string, number>();
+  for (const p of purged) {
+    const top = p.split("/")[0] ?? p;
+    byTop.set(top, (byTop.get(top) ?? 0) + 1);
+  }
+  const ranked = [...byTop].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const shown = ranked.slice(0, TOP_LEVEL_SHOWN).map(([top, n]) => `${top} (${n.toLocaleString("en-US")})`);
+  const rest = ranked.length - shown.length;
+  return [
+    `purge dry-run: ${purged.length.toLocaleString("en-US")} entr${purged.length === 1 ? "y" : "ies"} would be deleted from other machines.`,
+    `top-level: ${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""}`,
+  ];
 }
 
 async function computePurgeCandidate(

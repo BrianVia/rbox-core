@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry, IgnoreMatcher, Manifest } from "../engine/index.js";
-import { listIgnoreRules, setRespectGitignore } from "./ignore-cmd.js";
+import { listIgnoreRules, purgeSummaryLines, setRespectGitignore } from "./ignore-cmd.js";
 import { folderCatalogPath } from "./rbox-paths.js";
 import { ensureFolderAuthority } from "./folder-authority.js";
 import { serializeFolderCatalog, setFolderOptions } from "./folder-config.js";
@@ -266,6 +266,25 @@ test("a respect-gitignore edit survives losing and reinitializing the folder cat
     await fs.rm(root, { recursive: true, force: true });
     await fs.rm(rboxHome, { recursive: true, force: true });
   }
+});
+
+// #838: "5 paths would be deleted ... top-level: Personal, chromium" was the whole
+// consent surface for a purge that should have removed 187,000 entries. The line has
+// to size what leaves, per top-level name, before anyone types y.
+test("the purge dry-run sizes the deletion per top-level name", async () => {
+  const purged = [
+    ...Array.from({ length: 1200 }, (_unused, i) => `chromium/src/f${i}.cc`),
+    "Personal/a.txt",
+    "Personal/b.txt",
+    "loose.txt",
+  ];
+  expect(purgeSummaryLines(purged)).toEqual([
+    "purge dry-run: 1,203 entries would be deleted from other machines.",
+    "top-level: chromium (1,200), Personal (2), loose.txt (1)",
+  ]);
+  expect(purgeSummaryLines(["only.txt"])[0]).toBe("purge dry-run: 1 entry would be deleted from other machines.");
+  const wide = Array.from({ length: 15 }, (_unused, i) => `d${i}/f.txt`);
+  expect(purgeSummaryLines(wide)[1]).toEndWith(", and 3 more");
 });
 
 test("respect-gitignore takes only on|off — a bare flag (literal \"true\") is a usage error", async () => {
