@@ -8,7 +8,16 @@ export interface SuffixInfo { seq: number; deviceId: string; reason: string }
 export type RepairOutcome =
   | { kind: "repaired"; sequence: number; suffix: SuffixInfo[]; actions: Action[] }
   | { kind: "converged"; sequence: number; suffix: SuffixInfo[]; actions: Action[] }
-  | { kind: "declined"; suffix: SuffixInfo[]; actions: Action[] };
+  /** `peers` is non-empty exactly when the authorship rule refused; empty when a
+   * caller's own consent declined a self-authored supersession. */
+  | { kind: "declined"; suffix: SuffixInfo[]; peers: SuffixInfo[]; actions: Action[] };
+
+/** SOLE owner of "may this repair supersede suffix S?" (#847). A repair may only
+ * ever supersede commits THIS device authored; superseding a peer's commit
+ * silently discards it. Callers layer consent on top of this rule, never around
+ * it — there is deliberately no override. Returns the offending peer items. */
+export const peerAuthored = (suffix: SuffixInfo[], deviceId: string): SuffixInfo[] =>
+  suffix.filter((item) => item.deviceId !== deviceId);
 
 const REPAIR_MAX_ATTEMPTS = 5;
 
@@ -66,7 +75,17 @@ export async function repairChain(
   }
   const applied = (await loadState(root, syncStreamId(cfg), deps.warningSink)).lastSyncedSequence;
   let suffix = await describeSuffix(remote, applied, error);
-  if (!(await opts.confirmSupersede(suffix))) return { kind: "declined", suffix, actions };
+  /** Authorship rule first, caller consent second: no consent can authorize
+   * superseding a peer's commit. Returns the outcome to return, or undefined to
+   * proceed with publication. */
+  const refuse = async (candidate: SuffixInfo[]): Promise<RepairOutcome | undefined> => {
+    const peers = peerAuthored(candidate, cfg.deviceId);
+    if (peers.length > 0) return { kind: "declined", suffix: candidate, peers, actions };
+    if (!(await opts.confirmSupersede(candidate))) return { kind: "declined", suffix: candidate, peers, actions };
+    return undefined;
+  };
+  const refused = await refuse(suffix);
+  if (refused) return refused;
 
   // Each publication has its own bounded 422/epoch retry budget in pushManifest;
   // repair 409s return immediately, so this outer budget is the sole 409-race bound.
@@ -83,7 +102,8 @@ export async function repairChain(
     } catch (nextError) {
       if (!(nextError instanceof ManifestChainError)) throw nextError;
       suffix = await describeSuffix(remote, applied, nextError);
-      if (!(await opts.confirmSupersede(suffix))) return { kind: "declined", suffix, actions };
+      const nextRefusal = await refuse(suffix);
+      if (nextRefusal) return nextRefusal;
     }
   }
   throw new Error("repair: exhausted retry budget");

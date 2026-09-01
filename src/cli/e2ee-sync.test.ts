@@ -604,6 +604,39 @@ test("repairChain applies the newest foldable ancestor before publishing at brok
   });
 });
 
+test("#847 repairChain refuses a peer-authored suffix outright and publishes nothing", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-peer-refusal", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairRemote = await remoteFor(server, secrets);
+    const root = await tmp();
+    // The unreadable head carries an author device id that is NOT this workspace's
+    // — exactly what the rule sees when a peer published it (the flat-meadow 4523
+    // incident). The harness signs every commit with the one bootstrapped device,
+    // so the peer relationship is expressed on the local side instead.
+    const cfg = { ...await cfgFor(root, secrets, repairRemote), deviceId: "dev_local_flat_meadow" };
+    const base = repairFixtureManifest("base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairRemote });
+    const broken: Manifest = { ...base, generatedAt: "peer-broken", files: base.files.map((f, i) => i === 20 ? { ...f, mode: 0o700 } : f) };
+    await writer.commit(1, secrets.deviceId, broken, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.blobs.delete(parseSignedCommit(server.commits[1]!).encManifestSha);
+    const failure = await expectBrokenPull(root, cfg, repairRemote);
+
+    const commitsBefore = server.commits.length;
+    let consented = 0;
+    const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, {
+      confirmSupersede: async () => { consented++; return true; },
+    });
+
+    expect(outcome.kind).toBe("declined");
+    expect(outcome.kind === "declined" && outcome.peers.map((p) => `${p.seq}:${p.deviceId}`)).toEqual([`2:${secrets.deviceId}`]);
+    expect(consented).toBe(0); // the authorship rule refuses BEFORE any consent hook
+    expect(server.commits.length).toBe(commitsBefore); // nothing published
+  });
+});
+
 test("repairChain converges on a readable racing head and re-confirms an unreadable racing suffix", async () => {
   await withManifestEncodingFlags("1", "1", async () => {
     for (const raceKind of ["readable", "unreadable"] as const) {

@@ -4,6 +4,7 @@ import type { WorkspaceConfig } from "./config.js";
 import type { SyncDeps } from "./sync.js";
 import type { HeadPin } from "./e2ee-keystore.js";
 import { ManifestChainError } from "../engine/index.js";
+import { peerAuthored, type SuffixInfo } from "./chain-repair.js";
 import { resolveFolderPolicy, snapshotPreCatalogPolicy } from "./folder-config.js";
 
 const cfg: WorkspaceConfig = {
@@ -103,6 +104,62 @@ describe("recover workspace command", () => {
       default: false,
     }]);
     expect(currentPin?.commitSeq).toBe(3);
+  });
+
+  test("#847: a peer-authored suffix is refused by name, and no flag overrides it", async () => {
+    const calls: string[] = [];
+    const logs: string[] = [];
+    let currentPin: HeadPin | undefined = pin(4);
+    const broken = new ManifestChainError("corrupt delta", { head: { seq: 6, hash: "b".repeat(64) }, failingLink: "c".repeat(64) });
+    // Both consent flags are on: neither may authorize discarding a peer's commit.
+    await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true, repairChain: true }, {
+      findRoot: async () => "/tmp/ws",
+      loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
+      loadCredentials: validCredentials,
+      pinStore: () => ({ load: async () => currentPin, save: async (next) => { currentPin = next; }, clear: async () => { currentPin = undefined; } }),
+      buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      beginReport: () => ({ logSummaryTo: () => {} } as never),
+      pull: async () => { currentPin = pin(6, "b".repeat(64)); throw broken; },
+      push: async () => { calls.push("push"); return { sequence: 7, committed: true }; },
+      // Mixed suffix, self first: the real rule decides, and any peer item taints it.
+      repair: async (_root, repairCfg) => {
+        const suffix: SuffixInfo[] = [
+          { seq: 5, deviceId: "dev_1", reason: "corrupt delta" },
+          { seq: 6, deviceId: "dev_peer", reason: "corrupt delta" },
+        ];
+        return { kind: "declined", suffix, peers: peerAuthored(suffix, repairCfg.deviceId), actions: [] };
+      },
+      log: (line) => logs.push(line),
+    })).rejects.toThrow(/recover refused: the unreadable commit\(s\) were authored by another device/);
+    expect(calls).toEqual([]); // nothing published
+    expect(logs.join("\n")).not.toContain("recover cancelled");
+    expect(currentPin?.commitSeq).toBe(6); // local state untouched by the refusal
+  });
+
+  test("#847 refusal names each peer sequence, its device, and the honest remedy", async () => {
+    const message = await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
+      findRoot: async () => "/tmp/ws",
+      loadConfig: async () => cfg,
+      folderPolicy: async () => resolveFolderPolicy({}, snapshotPreCatalogPolicy(cfg)),
+      loadCredentials: validCredentials,
+      pinStore: () => ({ load: async () => pin(4523, "e".repeat(64)), save: async () => {}, clear: async () => {} }),
+      buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      beginReport: () => ({ logSummaryTo: () => {} } as never),
+      pull: async () => { throw new ManifestChainError("manifest delta fold failed", { head: { seq: 4523, hash: "e".repeat(64) } }); },
+      repair: async () => ({
+        kind: "declined",
+        suffix: [{ seq: 4523, deviceId: "dev_3225c3", reason: "manifest delta fold failed" }],
+        peers: [{ seq: 4523, deviceId: "dev_3225c3", reason: "manifest delta fold failed" }],
+        actions: [],
+      }),
+      log: () => {},
+    }).then(() => "", (error: Error) => error.message);
+
+    expect(message).toContain("sequence 4523 authored by dev_3225c3");
+    expect(message).toContain("Nothing has been changed or discarded");
+    expect(message).toContain("`--repair-chain` cannot override this");
+    expect(message).toContain("rbox doctor --report --diagnostics");
   });
 
   test("normal recover pulls with the retained pin and never clears it", async () => {

@@ -39,6 +39,21 @@ export interface RecoverDeps {
   folderPolicy?: (root: string) => Promise<ResolvedFolderPolicy>;
 }
 
+function peerAuthoredRefusal(peers: SuffixInfo[]): Error {
+  const named = peers.map((item) => `  sequence ${item.seq} authored by ${item.deviceId}`).join("\n");
+  return new Error(
+    "recover refused: the unreadable commit(s) were authored by another device, not this one.\n"
+    + `${named}\n`
+    + "Repairing here would republish this machine's older history in their place, discarding those\n"
+    + "commits and every change they carry.\n"
+    + "This machine could not read them — that is a defect in this copy's receiving side, not damage\n"
+    + "to your workspace. Nothing has been changed or discarded: your files, your local history and\n"
+    + "the server's head all stay exactly as they are.\n"
+    + "`--repair-chain` cannot override this; it only confirms superseding commits this machine authored.\n"
+    + "Please report it with `rbox doctor --report --diagnostics`."
+  );
+}
+
 function count(actions: Action[], kind: Action["kind"]): number {
   return actions.filter((a) => a.kind === kind).length;
 }
@@ -123,6 +138,10 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
       };
       const outcome = await (deps.repair ?? repairChain)(root, built.cfg, built.deps, error, { confirmSupersede });
       if (outcome.kind === "declined") {
+        // #847: peer-authored suffix is a refusal, not a cancellation. There is
+        // deliberately no flag to override it — repairing here would republish
+        // this machine's older history over a commit another device authored.
+        if (outcome.peers.length > 0) throw peerAuthoredRefusal(outcome.peers);
         (deps.log ?? console.log)("recover cancelled");
         return;
       }

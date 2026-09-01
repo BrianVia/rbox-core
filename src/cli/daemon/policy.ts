@@ -1,6 +1,6 @@
 /** Never: class state, I/O. */
 import { UNPRUNED_DEADLINE_MS, ManifestChainError } from "../../engine/index.js";
-import type { SuffixInfo } from "../chain-repair.js";
+import { peerAuthored, type SuffixInfo } from "../chain-repair.js";
 import { envInt } from "../remote/resilient.js";
 import type { DaemonMutexResult } from "../sync-mutex.js";
 
@@ -33,8 +33,8 @@ export const ACTIVITY_HEARTBEAT_MS = 30_000;
 export const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
 /** Stateful daemon policy for automatic chain repair. Exported as a narrow test
- * seam: the recovery mechanics live in repairChain; this owns only authorship
- * consent and terminal-head suppression. */
+ * seam: the recovery mechanics and the authorship rule (`peerAuthored`) both
+ * live in chain-repair; this owns only terminal-head suppression. */
 export class DaemonChainRepairPolicy {
   private terminalHeadFingerprint = "";
   private terminalHaltMessage = "";
@@ -42,7 +42,7 @@ export class DaemonChainRepairPolicy {
   constructor(private readonly deviceId: string) {}
 
   confirmSupersede(suffix: SuffixInfo[]): boolean {
-    return suffix.every((item) => item.deviceId === this.deviceId);
+    return peerAuthored(suffix, this.deviceId).length === 0;
   }
 
   assertHeadAllowed(pin: { commitSeq: number; commitHash: string } | undefined): void {
@@ -77,7 +77,7 @@ export class ChainRepairHaltError extends Error {
 
 export type TrustState = "trusted" | "suspect" | "fused";
 export const worseTrust = (a: TrustState, b: TrustState): TrustState => {
-  const rank: Record<TrustState, number> = { trusted: 0, suspect: 1, fused: 2 };
+  const rank = { trusted: 0, suspect: 1, fused: 2 } satisfies Record<TrustState, number>;
   return rank[a] >= rank[b] ? a : b;
 };
 
