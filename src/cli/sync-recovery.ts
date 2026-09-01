@@ -65,7 +65,7 @@ import {
 // win lived before design 80. With upload batching enabled, this pool becomes supply for the
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
-const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
+export const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
 export const preflightDeltaEnabled = () => process.env.RBOX_PREFLIGHT_DELTA !== "0";
 export const fullAuditEnabled = (forceFullAudit?: boolean) =>
   process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDeltaEnabled() && forceFullAudit === true);

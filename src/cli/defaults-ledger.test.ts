@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { packUploadConfig } from "./remote/blob-batch/config.js";
 import { fillVersion } from "./remote/blob-batch/config.js";
-import { preflightDeltaEnabled } from "./sync-recovery.js";
+import { pipelineEnabled, preflightDeltaEnabled } from "./sync-recovery.js";
 import { mdeWritePolicy } from "./e2ee-remote.js";
 import { fuseEnabled } from "./publish-pipeline/shared.js";
 import { noopElisionEnabled } from "./sync-state-elision.js";
@@ -23,6 +23,7 @@ const FLAGS = [
   "RBOX_BLOB_PACK", "RBOX_PACK_STREAMS", "RBOX_BATCH_FILL", "RBOX_CRYPTO_FUSE",
   "RBOX_CRYPTO_WORKERS", "RBOX_GIT_PLAN_LAZY", "RBOX_GIT_APPLY_LAZY",
   "RBOX_SAVE_NOOP_ELIDE", "RBOX_SAVE_DELTA", "RBOX_GIT_HELD_SKIP_COMPOSER",
+  "RBOX_PUBLISH_PIPELINE",
 ] as const;
 const saved = new Map<string, string | undefined>();
 
@@ -63,6 +64,32 @@ describe("defaults ledger — the shipped default of every perf/behavior flag", 
     expect(workers).toBeLessThanOrEqual(4);
     expect(workers).toBeGreaterThanOrEqual(1);
     resetConfiguredWorkersCacheForTests();
+  });
+  /**
+   * RBOX_PUBLISH_PIPELINE — VERDICT: **OFF**, deliberately, not by neglect (#508).
+   *
+   * The design-98 overlapped encrypt/upload pipeline (`publish-pipeline/pipeline.ts`)
+   * is fully built. It exists to hide the encrypt wall behind the upload wall. That
+   * wall is not there to hide: measured 2026-09-01 on flat-meadow (the gigabit bench
+   * host, `~/code` testbed, cold add of 5000 files / 143 MB, RBOX_LANE_TIMING=1),
+   * the shipped serialized arm spends **encrypt 0.7s vs upload 34.7s** — encryption
+   * is 2% of the push, so perfect overlap could win at most 2%. Design 115's
+   * activation trigger (encrypt wall > upload wall on a >200 Mbps pipe) is NOT met
+   * by a factor of ~48. The same-session pipeline arm did overlap the lanes
+   * (enc 24.3s / up 24.1s, ~8.8s overlapped) but re-encrypted 497 blobs on resume,
+   * and the earlier field pair on the real corpus measured it 71% SLOWER
+   * (2026-07-13, 315s → 540s). Off is the reviewed answer, not archaeology.
+   *
+   * DELETION CONDITION: when a measured push shows the encrypt wall exceeding the
+   * upload wall on a >200 Mbps pipe AND the pipeline arm beats the serialized arm
+   * on the same corpus, flip this default. If instead the uploader ceiling rises
+   * without the encrypt wall following, delete the flag and `pipeline.ts` with it —
+   * a second upload implementation that can never win is cost with no owner.
+   */
+  test("the overlapped publish pipeline is OFF by default", () => {
+    expect(pipelineEnabled()).toBe(false);
+    process.env.RBOX_PUBLISH_PIPELINE = "1";
+    expect(pipelineEnabled()).toBe(true);
   });
   test("kill switches select the legacy arms", () => {
     process.env.RBOX_PREFLIGHT_DELTA = "0";
