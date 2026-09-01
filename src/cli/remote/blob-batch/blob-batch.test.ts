@@ -343,7 +343,9 @@ describe("BlobBatchDownloader fallback behavior", () => {
     process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
     const payload = bytes("eventually single");
     const s = seed(payload);
-    batchHandler = () => stallingBodyResponse(50);
+    // #849: the watchdog (10ms) must observably beat this error on a starved
+    // 2vCPU CI runner — 50ms lost the race there; 1500ms cannot.
+    batchHandler = () => stallingBodyResponse(1500);
 
     const out = dest("watchdog-retry");
     await api().getBlobToFile(s, out, payload.byteLength);
@@ -372,12 +374,16 @@ describe("BlobBatchDownloader fallback behavior", () => {
 
   test("stream progress keeps the pull liveness watchdog from retrying moving batches", async () => {
     process.env.RBOX_BATCH_RECORDS = "1";
-    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "10";
+    // #849: a 10ms watchdog against 6ms chunks flaked on starved CI runners —
+    // a late chunk looked like zero progress. 250ms vs 2ms keeps the same
+    // contract (progress suppresses the retry) with a margin starvation
+    // cannot erase.
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "250";
     process.env.RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS = "2";
     process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
     const payload = bytes("slow moving batch");
     const s = seed(payload);
-    batchHandler = () => chunkedFramesResponse([frameData(s, payload)], 6);
+    batchHandler = () => chunkedFramesResponse([frameData(s, payload)], 2);
 
     const out = dest("watchdog-stream-progress");
     await api().getBlobToFile(s, out, payload.byteLength);
