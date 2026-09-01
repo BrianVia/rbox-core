@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_ENTRIES, type CaseFoldCollisionGroup, type FileEntry, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
+import type { CaseFoldCollisionGroup, FileEntry, IgnoreMatcher, Manifest } from "../../engine/index.js";
 import type { CaptureObservationReceipt } from "../sync-git/git-capture-observation.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
-import { EntryCapGuardError, MassDeleteGuardError } from "./policy.js";
+import { EntryCapGuardError, MassDeleteGuardError, MAX_ENTRIES } from "./policy.js";
 import {
   preparePublishCandidate,
   PublishCandidateSealError,
@@ -452,10 +452,12 @@ describe("preparePublishCandidate refuses a mass delete before any upload", () =
 
 /** #813: the cap used to fire only in wire validation, after the whole runaway
  *  tree had been scanned, encrypted and uploaded. Preparing a candidate is the
- *  last point that costs nothing. */
+ *  last point that costs nothing. #838: and it fires only on GROWTH — an
+ *  over-cap workspace must be able to publish its own shrink. */
 describe("preparePublishCandidate refuses an over-cap candidate before any spend", () => {
-  const overCap = (dir: string): Manifest =>
-    manifest(Array.from({ length: MAX_ENTRIES + 1 }, (_, index) => entry(`${dir}/f${index}.txt`)));
+  const sized = (dir: string, count: number): Manifest =>
+    manifest(Array.from({ length: count }, (_, index) => entry(`${dir}/f${index}.txt`)));
+  const overCap = (dir: string): Manifest => sized(dir, MAX_ENTRIES + 1);
 
   test("the refusal names the dominating directory and the ignore that fixes it", async () => {
     const rig = harness({ plan: gitPlan({ changed: true }) });
@@ -486,6 +488,42 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
     const atCap = manifest(Array.from({ length: MAX_ENTRIES }, (_, index) => entry(`build/f${index}.txt`)));
     const observation = localObservation(atCap, { projected: true });
     const sealed = await preparePublishCandidate(snapshot(manifest([])), observation.local, rig.capture, policy());
+    expect(sealed.admission).toBe("publish");
+  });
+
+  // #838: the workspace that motivated the growth-only rule — 212,846 entries
+  // already committed. Every push that shrinks it (or holds it steady) is the
+  // cure; only one that grows it further is the runaway #813 refuses.
+  const STRANDED = 212_846;
+
+  test("an over-cap base that grows by one entry is still refused", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const base = sized("chromium/src", STRANDED);
+    const observation = localObservation(sized("chromium/src", STRANDED + 1), { projected: true });
+    const sealed = preparePublishCandidate(snapshot(base), observation.local, rig.capture, policy());
+    await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
+    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 212,847 files/);
+  });
+
+  test("an over-cap base publishing its shrink passes the cap", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const base = sized("chromium/src", STRANDED);
+    const observation = localObservation(sized("chromium/src", 25_000), { projected: true });
+    const sealed = await preparePublishCandidate(
+      snapshot(base),
+      observation.local,
+      rig.capture,
+      policy({ allowMassDelete: true }),
+    );
+    expect(sealed.admission).toBe("publish");
+  });
+
+  test("an over-cap candidate equal to its over-cap base passes the cap", async () => {
+    const rig = harness({ plan: gitPlan({ changed: true }) });
+    const base = sized("chromium/src", STRANDED);
+    const candidate = manifest([...sized("chromium/src", STRANDED - 1).files, entry("chromium/src/moved.txt")]);
+    const observation = localObservation(candidate, { projected: true });
+    const sealed = await preparePublishCandidate(snapshot(base), observation.local, rig.capture, policy());
     expect(sealed.admission).toBe("publish");
   });
 });

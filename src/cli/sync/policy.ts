@@ -49,9 +49,29 @@ export class MassDeleteGuardError extends Error {
   }
 }
 
+/** Monorepo headroom; plan-tied caps come in M7b. */
+export const MAX_ENTRIES = 200_000;
+
+/** THE entry-cap rule, and its only owner. #813 refuses a runaway workspace
+ * before any spend; #838 makes that refusal growth-only, because the cap was
+ * also blocking the only cure. A candidate trips only when it is over the cap
+ * AND larger than the base it supersedes: shrinking or holding steady above the
+ * cap is the workspace moving in the right direction (`rbox ignore --purge`,
+ * a repair push) and always passes.
+ *
+ * Readers never apply this, and `validateManifest` therefore no longer bounds
+ * entry count at all: a reader cannot see the base a manifest supersedes, so it
+ * cannot tell a runaway from the shrink that cures one, and refusing to READ an
+ * over-cap manifest makes recovery impossible from the client — the 212,846-entry
+ * workspace in #838 could neither pull its own head nor run `rbox ignore --purge`.
+ * The wire's own ceiling stays MAX_MANIFEST_PLAINTEXT at the envelope boundary. */
+export function entryCapTrips(candidateEntries: number, baseEntries: number): boolean {
+  return candidateEntries > MAX_ENTRIES && candidateEntries > baseEntries;
+}
+
 /** Producer-typed safety refusal (#813): the candidate carries more entries than
- * a manifest may hold. Thrown at composition, before any encrypt/upload spend;
- * the wire-side `validateManifest` bound remains the backstop. */
+ * a manifest may hold, and more than the base it supersedes. Thrown at
+ * composition, before any encrypt/upload spend. */
 export class EntryCapGuardError extends Error {
   constructor(message: string) {
     super(message);

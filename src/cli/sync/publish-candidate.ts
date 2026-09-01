@@ -4,7 +4,6 @@ import {
   dominatingDir,
   dominatingDirHint,
   isDominant,
-  MAX_ENTRIES,
   type CaseFoldCollisionGroup,
   type IgnoreMatcher,
   type Manifest,
@@ -17,7 +16,7 @@ import type {
 } from "../sync-git/git-capture-observation.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
-import { assertNoUnevaluatedPurgeDeletes, EntryCapGuardError, MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
+import { assertNoUnevaluatedPurgeDeletes, entryCapTrips, EntryCapGuardError, MassDeleteGuardError, MAX_ENTRIES, pushMassDeleteTrips } from "./policy.js";
 import type { PublishedGitTransition } from "./publisher-ack-transition.js";
 
 /**
@@ -355,13 +354,14 @@ export async function preparePublishCandidate(
     capture.logPublicationLine(captureReceipt);
   }
 
-  // Entry-cap breaker (#813). The same bound `validateManifest` enforces on the
-  // wire, applied to the PRE-UPLOAD candidate: the late check only fires after a
-  // runaway checkout has already paid to scan, encrypt and upload itself. The
-  // refusal names the directory that caused it (#810) — a bare total tells the
-  // user nothing about what to exclude. Deferral only carries base entries
-  // forward, so this count is the count that would be committed.
-  if (candidate.files.length > MAX_ENTRIES) {
+  // Entry-cap breaker (#813), the growth-only rule's only application point
+  // (`entryCapTrips` owns the rule; #838). It runs on the PRE-UPLOAD candidate:
+  // a wire-side check would only fire after a runaway checkout had already paid
+  // to scan, encrypt and upload itself. The refusal names the directory that
+  // caused it (#810) — a bare total tells the user nothing about what to
+  // exclude. Deferral only carries base entries forward, so this count and the
+  // base's are the counts that would be committed.
+  if (entryCapTrips(candidate.files.length, appliedBase.files.length)) {
     const fromAdded = dominatingDir(filesDiff.added);
     // A tree that arrived in one scan is best explained by what it ADDED; one
     // already carried in base is best explained by the manifest as a whole.

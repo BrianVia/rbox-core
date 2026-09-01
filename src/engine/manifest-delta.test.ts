@@ -45,6 +45,16 @@ function deltaHeader(baseHash: string, resultHash: string, generatedAt: string):
 }
 
 describe("manifest delta envelope", () => {
+  // #838: the envelope seams are RECEIVE paths too. A terminal snapshot link
+  // carrying an over-cap workspace must decode, or the workspace that grew past
+  // the cap can never read its own head to publish the shrink that cures it.
+  test("an over-cap snapshot round-trips through encode and decode", async () => {
+    const huge = manifest("now", Array.from({ length: 200_001 }, (_, i) => entry(`f${i}`)));
+    const decoded = await decodeEnvelope((await encodeSnapshotEnvelope(huge, { compress: false })).bytes);
+    expect(decoded.kind).toBe("snapshot");
+    expect(decoded.manifest?.files).toHaveLength(200_001);
+  });
+
   test("raw-v0 and snapshot raw/zstd round-trip", async () => {
     const m = manifest("now", [entry("a")]);
     const raw = utf8.encode(JSON.stringify(m));

@@ -119,7 +119,6 @@ export {
   type ValidationResult,
   type CaseFoldCollisionGroup,
   MAX_PATH_BYTES,
-  MAX_ENTRIES,
   MAX_MANIFEST_BYTES,
   MAX_SYMLINK_TARGET_BYTES,
   KNOWN_MANIFEST_SCHEMA,
