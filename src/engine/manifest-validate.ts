@@ -176,12 +176,17 @@ export function validateGitRepos(
  * Enforces: safe relative paths, no duplicate or file/descendant paths (incl.
  * case-insensitive, for APFS/NTFS collisions), known types, well-formed
  * shas/modes, bounded size.
+ *
+ * `maxEntries` raises ONLY the entry cap, for the growth-only rule of #838: a
+ * receiver folding a delta whose base is already over the cap must accept any
+ * result that does not grow past that base, or the chain wedges with no path
+ * back under the cap. Every other rule is unconditional.
  */
-export function validateManifest(m: WireCandidate<Partial<Manifest>>): ValidationResult {
+export function validateManifest(m: WireCandidate<Partial<Manifest>>, maxEntries: number = MAX_ENTRIES): ValidationResult {
   if (m == null || typeof m !== "object") return { ok: false, error: "manifest is not an object" };
   const files: unknown = (m as { files?: unknown }).files;
   if (!Array.isArray(files)) return { ok: false, error: "manifest.files is not an array" };
-  if (files.length > MAX_ENTRIES) return { ok: false, error: `too many entries (${files.length} > ${MAX_ENTRIES})` };
+  if (files.length > maxEntries) return { ok: false, error: `too many entries (${files.length} > ${MAX_ENTRIES})` };
   const mm = m as Partial<Manifest> & { git?: unknown };
   const schema = mm.manifestSchema;
 

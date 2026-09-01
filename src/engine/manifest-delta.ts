@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { zstdCompress, zstdDecompressCapped } from "./crypto.js";
-import { KNOWN_MANIFEST_SCHEMA, validateManifest } from "./manifest-validate.js";
+import { KNOWN_MANIFEST_SCHEMA, MAX_ENTRIES, validateManifest } from "./manifest-validate.js";
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import { parseStrict } from "./e2ee/jcs.js";
 import { utf8 } from "./e2ee/primitives.js";
@@ -322,8 +322,8 @@ export function diffToOps(base: Manifest, target: Manifest): ManifestDeltaOp[] {
   return ops.sort(compareOps);
 }
 
-function assertManifest(manifest: Manifest): void {
-  const validation = validateManifest(manifest);
+function assertManifest(manifest: Manifest, maxEntries?: number): void {
+  const validation = validateManifest(manifest, maxEntries);
   // Same message surface as today's decode boundary (e2ee-remote decode threw
   // `validation.error` verbatim pre-84) — schema/shape reasons are load-bearing
   // for callers and tests. Chain contexts wrap this in ManifestChainError.
@@ -567,6 +567,10 @@ export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], heade
     ...(Object.keys(gitRepos).length === 0 ? {} : { gitRepos }),
   };
   if (canonicalManifestHashStreaming(result) !== header.resultHash) throw new Error("manifest delta resultHash mismatch");
-  assertManifest(result);
+  // #838: growth-only cap. A peer on a raised-cap build can publish an over-cap
+  // manifest; refusing to fold the deltas that shrink it wedges every other
+  // machine's chain permanently, with `rbox recover` the only exit (and its exit
+  // supersedes the peer's commit). Folding never grows past the base.
+  assertManifest(result, Math.max(base.files.length, MAX_ENTRIES));
   return result;
 }

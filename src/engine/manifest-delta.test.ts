@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { canonicalString } from "./e2ee/jcs.js";
 import { buildSignedCommit, parseCommit } from "./e2ee/commit.js";
 import { generateSignKeyPair } from "./e2ee/asym.js";
-import { KNOWN_MANIFEST_SCHEMA } from "./manifest-validate.js";
+import { KNOWN_MANIFEST_SCHEMA, MAX_ENTRIES } from "./manifest-validate.js";
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import {
   MANIFEST_ENVELOPE_MAGIC,
@@ -17,6 +17,7 @@ import {
   encodeSnapshotEnvelope,
   foldDelta,
   type ManifestDeltaHeader,
+  type ManifestDeltaOp,
 } from "./manifest-delta.js";
 import { hashBytes } from "./hash.js";
 
@@ -241,6 +242,30 @@ describe("canonical form and pure folding", () => {
     expect(JSON.stringify(base)).toBe(before);
     expect(() => foldDelta(base, diffToOps(base, target), { ...header, resultHash: SHA_C })).toThrow("resultHash");
     expect(JSON.stringify(base)).toBe(before);
+  });
+
+  // #838: the entry cap is GROWTH-only. A raised-cap peer can publish an
+  // over-cap manifest; every other machine must still be able to fold the
+  // delta that shrinks it, or the chain wedges with no path back under the cap.
+  test("folding tolerates an over-cap base and any shrinking result", () => {
+    const capped = Array.from({ length: MAX_ENTRIES + 10 }, (_, i) => entry(`f${i.toString().padStart(7, "0")}.txt`));
+    const overCap = manifest("old", capped);
+    const foldTo = (files: FileEntry[], ops: ManifestDeltaOp[], base = overCap): Manifest => {
+      const result = manifest("new", files);
+      const header = deltaHeader(SHA_B, canonicalManifestHashStreaming(result), "new");
+      return foldDelta(base, ops, header, SHA_B);
+    };
+    const shrunk = capped.slice(0, MAX_ENTRIES + 2);
+    const stillOverCap = foldTo(shrunk, capped.slice(MAX_ENTRIES + 2).map((e) => ({ op: "del", path: e.path })));
+    expect(stillOverCap.files).toHaveLength(MAX_ENTRIES + 2);
+
+    const massDelete = capped.slice(0, 3);
+    const underCap = foldTo(massDelete, capped.slice(3).map((e) => ({ op: "del", path: e.path })));
+    expect(underCap.files).toHaveLength(3);
+
+    const atCap = manifest("old", capped.slice(0, MAX_ENTRIES));
+    expect(() => foldTo([...atCap.files, entry("zz-new.txt")], [{ op: "set", entry: entry("zz-new.txt") }], atCap))
+      .toThrow(`too many entries (${MAX_ENTRIES + 1} > ${MAX_ENTRIES})`);
   });
 });
 
