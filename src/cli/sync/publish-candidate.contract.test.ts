@@ -503,7 +503,7 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
     const observation = localObservation(sized("chromium/src", STRANDED + 1), { projected: true });
     const sealed = preparePublishCandidate(snapshot(base), observation.local, rig.capture, policy());
     await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
-    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 212,847 files/);
+    await expect(sealed).rejects.toThrow(`chromium/src accounts for ${(STRANDED + 1).toLocaleString("en-US")} files`);
   });
 
   test("an over-cap base publishing its shrink passes the cap", async () => {
