@@ -248,7 +248,9 @@ export function renderStatusBrief(
           ? { kind: "too-many-entries" }
           : typedHalt?.kind === "body-too-large"
             ? { kind: "body-too-large" }
-            : { kind: "unknown" }
+            : typedHalt?.kind === "chain-repair"
+              ? { kind: "chain-repair" }
+              : { kind: "unknown" }
     : undefined;
   const active = freshBriefActive(activity, daemon.running, now);
   const nextVersion = updateAvailableVersion(projection.probes.update);

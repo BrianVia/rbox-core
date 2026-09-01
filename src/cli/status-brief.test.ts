@@ -122,7 +122,9 @@ test("all halt discriminants use plain known copy and opaque unknown fallback", 
     [{ kind: "mass-delete", op: "pull" }, "⛔ sync paused to protect against a large deletion · rbox sync --allow-mass-delete"],
     [{ kind: "mass-delete", op: "push" }, "⛔ sync paused to protect against a large deletion · rbox sync --allow-mass-delete"],
     [{ kind: "too-many-refs" }, "⛔ workspace has too many files to upload · rbox ignore"],
+    [{ kind: "too-many-entries" }, "⛔ workspace has too many files to sync · rbox doctor"],
     [{ kind: "body-too-large" }, "⛔ workspace update is too large to upload · rbox ignore"],
+    [{ kind: "chain-repair" }, "⛔ part of this workspace's sync history could not be read · rbox recover"],
     [{ kind: "unknown" }, "⛔ sync halted — see rbox logs"],
   ] as const;
   for (const [halt, copy] of cases) {

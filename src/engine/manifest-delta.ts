@@ -567,6 +567,10 @@ export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], heade
     ...(Object.keys(gitRepos).length === 0 ? {} : { gitRepos }),
   };
   if (canonicalManifestHashStreaming(result) !== header.resultHash) throw new Error("manifest delta resultHash mismatch");
+  // #838: growth-only cap. A peer on a raised-cap build can publish an over-cap
+  // manifest; refusing to fold the deltas that shrink it wedges every other
+  // machine's chain permanently, with `rbox recover` the only exit (and its exit
+  // supersedes the peer's commit). Folding never grows past the base.
   assertManifest(result);
   return result;
 }
