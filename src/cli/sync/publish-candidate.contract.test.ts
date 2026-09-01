@@ -464,9 +464,9 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
     const observation = localObservation(overCap("chromium/src"), { projected: true });
     const sealed = preparePublishCandidate(snapshot(manifest([])), observation.local, rig.capture, policy());
     await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
-    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 200,001 files/);
+    await expect(sealed).rejects.toThrow(`chromium/src accounts for ${(MAX_ENTRIES + 1).toLocaleString("en-US")} files`);
     await expect(sealed).rejects.toThrow(/`rbox ignore chromium\/src\/` skips it \(files stay on disk\)/);
-    await expect(sealed).rejects.toThrow(/the limit is 200,000/);
+    await expect(sealed).rejects.toThrow(`the limit is ${MAX_ENTRIES.toLocaleString("en-US")}`);
   });
 
   test("it refuses at candidate time — no upload port is ever reached", async () => {
@@ -494,7 +494,8 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
   // #838: the workspace that motivated the growth-only rule — 212,846 entries
   // already committed. Every push that shrinks it (or holds it steady) is the
   // cure; only one that grows it further is the runaway #813 refuses.
-  const STRANDED = 212_846;
+  // The 2026-08 field shape: a base already past the cap (then 212,846 vs 200K).
+  const STRANDED = MAX_ENTRIES + 12_846;
 
   test("an over-cap base that grows by one entry is still refused", async () => {
     const rig = harness({ plan: gitPlan({ changed: true }) });
@@ -502,7 +503,7 @@ describe("preparePublishCandidate refuses an over-cap candidate before any spend
     const observation = localObservation(sized("chromium/src", STRANDED + 1), { projected: true });
     const sealed = preparePublishCandidate(snapshot(base), observation.local, rig.capture, policy());
     await expect(sealed).rejects.toBeInstanceOf(EntryCapGuardError);
-    await expect(sealed).rejects.toThrow(/chromium\/src accounts for 212,847 files/);
+    await expect(sealed).rejects.toThrow(`chromium/src accounts for ${(STRANDED + 1).toLocaleString("en-US")} files`);
   });
 
   test("an over-cap base publishing its shrink passes the cap", async () => {
