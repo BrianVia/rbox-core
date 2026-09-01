@@ -543,7 +543,11 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
     const decision = fullDecision(clean + (isDir ? "/" : ""), nested);
     if (!isDir && decision?.ignored === true) {
       const tracked = isTracked(clean);
-      if (opts.protectTrackedPaths && tracked) return false;
+      // Purge protects tracked paths from rules rbox INFERRED (builtin, .gitignore),
+      // never from `.rboxignore` — the human's own synced instruction. Protecting
+      // those made every tracked file permanently unpurgeable (#838). An UNREADABLE
+      // repo still fails closed, via `unevaluatedGitRepoForPath`, not here.
+      if (opts.protectTrackedPaths && tracked && decision.source !== ".rboxignore") return false;
       if (opts.respectGitignore && decision.source === ".gitignore" && tracked) return false;
     }
     return decision?.ignored === true;
@@ -655,7 +659,7 @@ function dirIntersectsRepo(dirRel: string, repoRel: string): boolean {
   return dirRel === repoRel || dirRel.startsWith(`${repoRel}/`) || repoRel.startsWith(`${dirRel}/`);
 }
 
-function normalizeRel(relPath: string): { clean: string; isDir: boolean } {
+function normalizeRel(relPath: string) {
   const isDir = relPath.endsWith("/");
   const clean = relPath.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
   return { clean, isDir };

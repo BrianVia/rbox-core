@@ -517,6 +517,62 @@ describe("design 72 nested gitignore semantics", () => {
     }
   });
 
+  // #838. `rbox ignore 'big/' && rbox ignore --purge` removed 3 of 187,000 entries
+  // on the founder desktop: `big/` was a git checkout, and purge protected every
+  // TRACKED path from its own `.rboxignore` rule. Those files stop syncing forward
+  // (the live matcher has no such protection) yet could never leave the manifest.
+  test("an .rboxignore rule purges tracked paths; inferred rules still protect them", async () => {
+    const d = await mkroot();
+    try {
+      await git(d, "init", "-qb", "main");
+      await fs.mkdir(path.join(d, "big", "node_modules"), { recursive: true });
+      await fs.mkdir(path.join(d, "big", "a", "b"), { recursive: true });
+      await fs.writeFile(path.join(d, "big", "tracked.c"), "src");
+      await fs.writeFile(path.join(d, "big", "a", "b", "nested.c"), "src");
+      await fs.writeFile(path.join(d, "big", "node_modules", "dep.js"), "dep");
+      await fs.writeFile(path.join(d, "elsewhere.txt"), "other");
+      await fs.writeFile(path.join(d, "drop.env"), "secret");
+      await fs.writeFile(path.join(d, "keep.env"), "wanted");
+      await git(d, "add", "-f", "big", "elsewhere.txt", "drop.env", "keep.env");
+      await fs.writeFile(path.join(d, ".rboxignore"), "big/\n*.env\n!keep.env\n");
+
+      const purge = buildIgnoreMatcher(d, { forceTrackedEvaluation: true, protectTrackedPaths: true });
+      // Tracked, but the human wrote the rule: purgeable.
+      expect(purge.tracked?.("big/tracked.c")).toBe(true);
+      expect(purge.ignores("big/tracked.c")).toBe(true);
+      expect(purge.ignores("big/a/b/nested.c")).toBe(true);
+      expect(purge.ignores("big/node_modules/dep.js")).toBe(true);
+      // A negation still rescues its entry from the purge set.
+      expect(purge.ignores("drop.env")).toBe(true);
+      expect(purge.ignores("keep.env")).toBe(false);
+      // Nothing outside the rules is touched.
+      expect(purge.ignores("elsewhere.txt")).toBe(false);
+      // A nested rule purges only its own subtree.
+      await fs.writeFile(path.join(d, ".rboxignore"), "big/a/b/\n");
+      const nested = buildIgnoreMatcher(d, { forceTrackedEvaluation: true, protectTrackedPaths: true });
+      expect(nested.ignores("big/a/b/nested.c")).toBe(true);
+      expect(nested.ignores("big/tracked.c")).toBe(false);
+
+      // Only a rule rbox INFERRED protects a tracked path: a repo that deliberately
+      // commits under node_modules keeps those files through a purge.
+      const noRule = await mkroot();
+      try {
+        await git(noRule, "init", "-qb", "main");
+        await fs.mkdir(path.join(noRule, "node_modules"), { recursive: true });
+        await fs.writeFile(path.join(noRule, "node_modules", "vendored.js"), "v");
+        await fs.writeFile(path.join(noRule, "node_modules", "untracked.js"), "u");
+        await git(noRule, "add", "-f", "node_modules/vendored.js");
+        const builtin = buildIgnoreMatcher(noRule, { forceTrackedEvaluation: true, protectTrackedPaths: true });
+        expect(builtin.ignores("node_modules/vendored.js")).toBe(false);
+        expect(builtin.ignores("node_modules/untracked.js")).toBe(true);
+      } finally {
+        await cleanup(noRule);
+      }
+    } finally {
+      await cleanup(d);
+    }
+  });
+
   test("index-less repo no longer defeats the builtin ignore list (design 224 §3.1)", async () => {
     const d = await mkroot();
     try {
