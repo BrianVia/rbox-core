@@ -3,6 +3,9 @@ import { canonicalString } from "./e2ee/jcs.js";
 import { buildSignedCommit, parseCommit } from "./e2ee/commit.js";
 import { generateSignKeyPair } from "./e2ee/asym.js";
 import { KNOWN_MANIFEST_SCHEMA } from "./manifest-validate.js";
+// The push-side cap (cli/sync/policy.ts); the engine no longer knows it — these
+// fixtures only need "bigger than any cap a composer would allow".
+const MAX_ENTRIES = 200_000;
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import {
   MANIFEST_ENVELOPE_MAGIC,
@@ -17,6 +20,7 @@ import {
   encodeSnapshotEnvelope,
   foldDelta,
   type ManifestDeltaHeader,
+  type ManifestDeltaOp,
 } from "./manifest-delta.js";
 import { hashBytes } from "./hash.js";
 
@@ -45,6 +49,16 @@ function deltaHeader(baseHash: string, resultHash: string, generatedAt: string):
 }
 
 describe("manifest delta envelope", () => {
+  // #838: the envelope seams are RECEIVE paths too. A terminal snapshot link
+  // carrying an over-cap workspace must decode, or the workspace that grew past
+  // the cap can never read its own head to publish the shrink that cures it.
+  test("an over-cap snapshot round-trips through encode and decode", async () => {
+    const huge = manifest("now", Array.from({ length: 200_001 }, (_, i) => entry(`f${i}`)));
+    const decoded = await decodeEnvelope((await encodeSnapshotEnvelope(huge, { compress: false })).bytes);
+    expect(decoded.kind).toBe("snapshot");
+    expect(decoded.manifest?.files).toHaveLength(200_001);
+  });
+
   test("raw-v0 and snapshot raw/zstd round-trip", async () => {
     const m = manifest("now", [entry("a")]);
     const raw = utf8.encode(JSON.stringify(m));
@@ -241,6 +255,33 @@ describe("canonical form and pure folding", () => {
     expect(JSON.stringify(base)).toBe(before);
     expect(() => foldDelta(base, diffToOps(base, target), { ...header, resultHash: SHA_C })).toThrow("resultHash");
     expect(JSON.stringify(base)).toBe(before);
+  });
+
+  // #838: the entry cap is GROWTH-only. A raised-cap peer can publish an
+  // over-cap manifest; every other machine must still be able to fold the
+  // delta that shrinks it, or the chain wedges with no path back under the cap.
+  test("folding tolerates an over-cap base and any shrinking result", () => {
+    const capped = Array.from({ length: MAX_ENTRIES + 10 }, (_, i) => entry(`f${i.toString().padStart(7, "0")}.txt`));
+    const overCap = manifest("old", capped);
+    const foldTo = (files: FileEntry[], ops: ManifestDeltaOp[], base = overCap): Manifest => {
+      const result = manifest("new", files);
+      const header = deltaHeader(SHA_B, canonicalManifestHashStreaming(result), "new");
+      return foldDelta(base, ops, header, SHA_B);
+    };
+    const shrunk = capped.slice(0, MAX_ENTRIES + 2);
+    const stillOverCap = foldTo(shrunk, capped.slice(MAX_ENTRIES + 2).map((e) => ({ op: "del", path: e.path })));
+    expect(stillOverCap.files).toHaveLength(MAX_ENTRIES + 2);
+
+    const massDelete = capped.slice(0, 3);
+    const underCap = foldTo(massDelete, capped.slice(3).map((e) => ({ op: "del", path: e.path })));
+    expect(underCap.files).toHaveLength(3);
+
+    // Receivers never size-judge — growth refusal is the COMPOSER's job
+    // (entryCapTrips in cli/sync/policy.ts, locked by the publish-candidate
+    // contract tests). A fold applies whatever a peer authored.
+    const atCap = manifest("old", capped.slice(0, MAX_ENTRIES));
+    const grown = foldTo([...atCap.files, entry("zz-new.txt")], [{ op: "set", entry: entry("zz-new.txt") }], atCap);
+    expect(grown.files).toHaveLength(MAX_ENTRIES + 1);
   });
 });
 

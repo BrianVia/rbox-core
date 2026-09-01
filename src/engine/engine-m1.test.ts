@@ -60,6 +60,16 @@ test("validateManifest rejects path traversal and unsafe paths", () => {
   expect(isSafeRelPath("/x")).toBe(false);
 });
 
+// #838: a reader must admit an over-cap manifest, or a workspace that grew past
+// the cap can never pull its own head to publish the shrink that cures it. Every
+// OTHER check still runs on the same oversized input.
+test("validateManifest admits an over-cap manifest but still rejects a duplicate path in one", () => {
+  const files = Array.from({ length: 200_001 }, (_, i) => goodEntry({ path: `src/f${i}.ts` }));
+  expect(validateManifest({ generatedAt: "", files }).ok).toBe(true);
+  const withDuplicate = [...files, goodEntry({ path: "src/f0.ts" })];
+  expect(validateManifest({ generatedAt: "", files: withDuplicate })).toEqual({ ok: false, error: "duplicate path: src/f0.ts" });
+});
+
 test("validateManifest rejects exact and case-insensitive duplicate paths", () => {
   expect(validateManifest({ files: [goodEntry({ path: "a.ts" }), goodEntry({ path: "a.ts" })] }).ok).toBe(false);
   expect(validateManifest({ files: [goodEntry({ path: "Foo.ts" }), goodEntry({ path: "foo.ts" })] }).ok).toBe(false);

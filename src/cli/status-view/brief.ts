@@ -45,6 +45,7 @@ export type BriefHaltReason =
   | { kind: "too-many-refs" }
   | { kind: "too-many-entries" }
   | { kind: "body-too-large" }
+  | { kind: "chain-repair" }
   | { kind: "unknown" };
 
 /** Design 273 S1: the split every glance surface shows — literally the
@@ -219,6 +220,9 @@ function briefHaltLine(halt: BriefHaltReason): string {
     case "too-many-refs": return "⛔ workspace has too many files to upload · rbox ignore";
     case "too-many-entries": return "⛔ workspace has too many files to sync · rbox doctor";
     case "body-too-large": return "⛔ workspace update is too large to upload · rbox ignore";
+    // #838: a chain the daemon cannot read retries forever with nothing said —
+    // the #813 silent-loop class. It needs an operator, so it gets a named one.
+    case "chain-repair": return "⛔ part of this workspace's sync history could not be read · rbox recover";
     case "unknown": return "⛔ sync halted — see rbox logs";
   }
 }

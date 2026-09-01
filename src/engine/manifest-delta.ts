@@ -567,6 +567,7 @@ export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], heade
     ...(Object.keys(gitRepos).length === 0 ? {} : { gitRepos }),
   };
   if (canonicalManifestHashStreaming(result) !== header.resultHash) throw new Error("manifest delta resultHash mismatch");
+  // #838: receivers never size-judge — the composer owns the entry cap.
   assertManifest(result);
   return result;
 }

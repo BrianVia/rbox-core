@@ -16,7 +16,6 @@ import type { FileEntry, GitArtifactRef, GitPackLink, GitRefTombstone, GitSectio
 export type WireCandidate<T> = T | JsonValue;
 
 export const MAX_PATH_BYTES = 1024;
-export const MAX_ENTRIES = 200_000; // monorepo headroom; plan-tied caps come in M7b
 export const MAX_MANIFEST_BYTES = 64 * 1024 * 1024; // hard ceiling on serialized manifest
 export const MAX_SYMLINK_TARGET_BYTES = 4096;
 
@@ -175,13 +174,14 @@ export function validateGitRepos(
  * Validate a parsed manifest object. Returns the first problem found, or ok.
  * Enforces: safe relative paths, no duplicate or file/descendant paths (incl.
  * case-insensitive, for APFS/NTFS collisions), known types, well-formed
- * shas/modes, bounded size.
+ * shas/modes, bounded size. Deliberately NOT the workspace entry cap (#838):
+ * that lives with its only owner, `entryCapTrips` in cli/sync/policy.ts —
+ * receivers must accept any size or an over-cap chain wedges forever.
  */
 export function validateManifest(m: WireCandidate<Partial<Manifest>>): ValidationResult {
   if (m == null || typeof m !== "object") return { ok: false, error: "manifest is not an object" };
   const files: unknown = (m as { files?: unknown }).files;
   if (!Array.isArray(files)) return { ok: false, error: "manifest.files is not an array" };
-  if (files.length > MAX_ENTRIES) return { ok: false, error: `too many entries (${files.length} > ${MAX_ENTRIES})` };
   const mm = m as Partial<Manifest> & { git?: unknown };
   const schema = mm.manifestSchema;
 

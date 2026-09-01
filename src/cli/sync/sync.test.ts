@@ -1642,7 +1642,14 @@ test("design 72: purge push refuses if a known repo becomes unevaluable after th
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(0);
 });
 
-test("design 72: purge with respectGitignore off still preserves tracked files under a .rboxignore repo dir", async () => {
+// #838. Design 72's "tracked files are never excluded" was written about
+// GITIGNORE-derived exclusion — deleting a tracked-but-gitignored file from every
+// checkout. Applying it to `.rboxignore` too made a purge unable to remove ANY
+// tracked path the user had explicitly ignored: 187,000 entries under a `chromium/`
+// checkout stopped syncing forward yet could never leave the manifest. An
+// `.rboxignore` line is the human's own synced instruction, and its content stays
+// recoverable from the repo's git-sync snapshot.
+test("design 72 / #838: an explicit .rboxignore repo dir purges tracked files too", async () => {
   const remote = new FakeRemote();
   const repo = path.join(root, "repo");
   await fs.mkdir(repo, { recursive: true });
@@ -1651,6 +1658,7 @@ test("design 72: purge with respectGitignore off still preserves tracked files u
   await fs.writeFile(path.join(repo, "drop.txt"), "untracked");
   await exec("git", ["-C", repo, "add", "-f", "keep.txt"]);
   await push(root, cfg, deps(remote));
+  expect((await remote.latest()).manifest.files.map((f) => f.path)).toContain("repo/keep.txt");
 
   const st = await loadState(root, syncStreamId(cfg));
   await saveStateUnsafeLegacyOrTest(root, {
@@ -1662,7 +1670,7 @@ test("design 72: purge with respectGitignore off still preserves tracked files u
   await push(root, cfg, deps(remote), true);
   const paths = (await remote.latest()).manifest.files.map((f) => f.path).sort();
   expect(paths).toContain(".rboxignore");
-  expect(paths).toContain("repo/keep.txt");
+  expect(paths).not.toContain("repo/keep.txt");
   expect(paths).not.toContain("repo/drop.txt");
 });
 
