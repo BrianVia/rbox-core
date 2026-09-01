@@ -49,8 +49,11 @@ export class MassDeleteGuardError extends Error {
   }
 }
 
-/** Monorepo headroom; plan-tied caps come in M7b. */
-export const MAX_ENTRIES = 200_000;
+/** Founder ruling 2026-09-01: the flagship workspace measured 198K LEGIT
+ * entries — 99.2% of the old 200K bound. Growth-only + one owner (#838/#848)
+ * makes raising safe: this only gates what a push may AUTHOR; receivers never
+ * size-judge. Plan-tied caps come in M7b. */
+export const MAX_ENTRIES = 1_000_000;
 
 /** THE entry-cap rule, and its only owner. #813 refuses a runaway workspace
  * before any spend; #838 makes that refusal growth-only, because the cap was
