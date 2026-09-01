@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
+import type { TransferPhase } from "./transfer-progress.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import {
   attributeDaemonForStatus,
@@ -7,6 +8,7 @@ import {
   healthLine,
   lastSyncLines,
   strandedIgnoredLine,
+  dominantDirLine,
   type StatusSnapshot,
 } from "./status-view.js";
 import { gitDeferralReasonPresentation, projectGitDeferralRepos } from "./status-view/git-projection.js";
@@ -270,9 +272,11 @@ test("progressLabel gitcap detail strips ANSI escapes and control chars", () => 
 });
 
 test("progressLabel unknown phase falls back to a sane verb, not garbage", () => {
-  // Simulates an older/other writer landing a phase this build's union doesn't name:
-  // it must not masquerade as "downloading".
-  expect(progressLabel("bogus" as unknown as Parameters<typeof progressLabel>[0], 1, 4)).toBe("syncing 1/4");
+  // An older/other writer's phase arrives the only way it can — parsed out of the
+  // activity sidecar — so read it at that boundary rather than asserting a literal
+  // into the union. It must not masquerade as "downloading".
+  const fromSidecar = JSON.parse('{"phase":"bogus"}') as { phase: TransferPhase };
+  expect(progressLabel(fromSidecar.phase, 1, 4)).toBe("syncing 1/4");
 });
 
 // ── healthLine priority order ────────────────────────────────────────────────
@@ -642,6 +646,19 @@ test("healthDetailLines surfaces the stranded line only when non-zero", () => {
   expect(healthDetailLines({ ...snapshot }).join("\n")).not.toContain("ignore rules");
   expect(healthDetailLines({ ...snapshot, strandedIgnored: 4 }).join("\n"))
     .toContain("4 files match your ignore rules but are still synced");
+});
+
+/** #810: the proactive hint is an advisory line, and it is DERIVED — a scan
+ *  that no longer sees a dominating directory simply stops printing it. */
+test("healthDetailLines surfaces the dominating-directory hint, and drops it when absent", () => {
+  const snapshot = {
+    added: 0, changed: 0, deleted: 0, trackedFiles: 150000, daemonRunning: true, localSequence: 3, now: NOW,
+  };
+  const line = healthDetailLines({ ...snapshot, dominantDir: { dir: "build", count: 120_000 } }).join("\n");
+  expect(line).toContain("build accounts for 120,000 files — looks like build output");
+  expect(line).toContain("`rbox ignore build/` skips it (files stay on disk)");
+  expect(healthDetailLines(snapshot).join("\n")).not.toContain("build output");
+  expect(dominantDirLine(undefined)).toBeUndefined();
 });
 
 /** Design 271 §2.7.5: the curated detail rides the display lane into the row

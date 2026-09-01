@@ -10,6 +10,7 @@ import {
   discoverGitRepos,
   discoverGitReposUnder,
   diffManifests,
+  dominatingNewDir,
   isIgnoreRuleFile,
   DirCache,
   HashCache,
@@ -2416,6 +2417,14 @@ export class RboxDaemon {
     const base = this.syncBase;
     if (!base) return undefined;
     const manifestDiff = diffManifests(base.lastSyncedManifest, this.local.manifest);
+    // #810: the proactive half of the cap breaker's hint. Same math, same
+    // window — computed from the diff this snapshot already has, so no scan
+    // pays for it, and re-derived every snapshot so it clears itself.
+    const dominantDir = dominatingNewDir(
+      manifestDiff.added,
+      this.local.manifest.files.length,
+      base.lastSyncedSequence > 0,
+    );
     return {
       at: new Date(now).toISOString(),
       stream: base.stream,
@@ -2427,6 +2436,7 @@ export class RboxDaemon {
       deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,
       settled,
       strandedIgnored: this.strandedIgnored,
+      dominantDir,
       sourceVersion: 1,
     };
   }

@@ -1,4 +1,4 @@
-import type { HashCache, IgnoreMatcher, scanManifest } from "../engine/index.js";
+import type { DominantDir, HashCache, IgnoreMatcher, scanManifest } from "../engine/index.js";
 import type { CheckoutTransactionCapability } from "./sync-git/checkout-txn.js";
 import type { CryptoPoolStatus } from "../engine/crypto-pool/pool.js";
 import type { TrashStats } from "../engine/trash.js";
@@ -255,6 +255,10 @@ export interface StatusDetailProjection extends StatusProjectionCommon {
   /** Design 272 §4: rbox-minted conflict copies on this device. Top-level for the
    *  same reason `strandedIgnored` is — `counts` is entangled with `counts.source`. */
   conflictCopies?: number;
+  /** #810: the directory dominating this scan's NEW entries, when one does.
+   *  Top-level for the same reason the two above are. Absent is the normal
+   *  case and the way the advisory clears. */
+  dominantDir?: DominantDir;
   localChanges: number;
   health: "halt" | "outofstorage" | "active" | "pending" | "ok";
   populate?: PopulateStatusV1;

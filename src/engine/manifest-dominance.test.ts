@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { FileEntry } from "./types.js";
-import { dominatingDir, dominatingDirHint, isDominant, DOMINANT_NEW_ENTRIES } from "./manifest-dominance.js";
+import { dominatingDir, dominatingDirHint, dominatingNewDir, isDominant, DOMINANT_NEW_ENTRIES } from "./manifest-dominance.js";
 
 const entry = (path: string): FileEntry => ({ path, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 0, type: "file" });
 const under = (dir: string, count: number): FileEntry[] =>
@@ -46,6 +46,27 @@ describe("isDominant", () => {
     const files = [...under("src", 30), ...under("docs", 30), ...under("tests", 30)];
     const top = dominatingDir(files)!;
     expect(isDominant(top, files.length)).toBe(false);
+  });
+});
+
+/** #810 proactive half: the acceptance cases the hint has to get right. */
+describe("dominatingNewDir", () => {
+  test("a build tree that lands in one scan is named", () => {
+    const added = under("build", 120_000);
+    expect(dominatingNewDir(added, 150_000, true)).toEqual({ dir: "build", count: 120_000 });
+  });
+
+  test("a balanced add across many directories volunteers nothing", () => {
+    const added = Array.from({ length: 40 }, (_, index) => under(`pkg${index}`, 125)).flat();
+    expect(dominatingNewDir(added, 35_000, true)).toBeUndefined();
+  });
+
+  test("a first scan with no prior base accuses nobody — everything is new then", () => {
+    expect(dominatingNewDir(under("build", 120_000), 120_000, false)).toBeUndefined();
+  });
+
+  test("nothing added means nothing to say, so a later scan clears the hint", () => {
+    expect(dominatingNewDir([], 150_000, true)).toBeUndefined();
   });
 });
 

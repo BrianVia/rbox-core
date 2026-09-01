@@ -12,7 +12,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic } from "../engine/index.js";
+import { writeFileAtomic, type DominantDir } from "../engine/index.js";
 import {
   type RepoRecord, type SyncState,
 } from "./sync-state-model.js";
@@ -79,6 +79,11 @@ export interface DaemonActivity {
     /** Design 272 §4: locally observed entries carrying an rbox conflict-copy
      *  path component. Optional — an older daemon omits it; `sourceVersion` stays 1. */
     conflictCopies?: number;
+    /** #810: the directory dominating the NEW entries of this projection, when
+     *  one does. Derived per snapshot — absent means the condition does not
+     *  hold right now, which is how the advisory clears itself. Optional: an
+     *  older daemon omits it; `sourceVersion` stays 1. */
+    dominantDir?: DominantDir;
     sourceVersion: 1;
   };
   /** Workspace-DO WebSocket currency evidence. `at` is refreshed only by WS-layer
@@ -155,6 +160,8 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       flag(local.settled) &&
       (local.strandedIgnored === undefined || uint(local.strandedIgnored)) &&
       (local.conflictCopies === undefined || uint(local.conflictCopies)) &&
+      (local.dominantDir === undefined
+        || (jsonText(local.dominantDir.dir) && local.dominantDir.dir.length > 0 && uint(local.dominantDir.count))) &&
       local.sourceVersion === 1
     ) {
       const decoded: NonNullable<DaemonActivity["local"]> = {
@@ -170,6 +177,9 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       };
       if (local.strandedIgnored !== undefined) decoded.strandedIgnored = local.strandedIgnored;
       if (local.conflictCopies !== undefined) decoded.conflictCopies = local.conflictCopies;
+      if (local.dominantDir !== undefined) {
+        decoded.dominantDir = { dir: local.dominantDir.dir, count: local.dominantDir.count };
+      }
       a.local = decoded;
     }
     const ws = raw.ws;
