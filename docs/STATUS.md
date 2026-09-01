@@ -1,5 +1,25 @@
 # rbox status — living state snapshot
 
+## 2026-09-01 — **v2.0.1 SHIPPED** (tag 87261788c) + cap → 1M
+
+- **v2.0.1 released**: rolls up #839 #840 #841 #843 #844 #845 #846 #848 #850.
+  Headline: growth-only 1M entry cap (was 200K; founder "1M is fine"),
+  pre-upload refusal naming the directory + ignore hint, purge that purges,
+  folds that never wedge, honest ⛔ halts, SQLite encrypt cache, pull perf
+  plumbing, cli-audit seven-pack (NOTE: destructive commands need --yes
+  headless now). Release pipeline green; api.rbox.to/version serves 2.0.1.
+- **Fleet**: desktop + FM on stable 2.0.1, syncing normally. Mac still
+  offline (~Aug 28); on wake: `rbox upgrade` then it folds the backlog fine
+  (or shows the honest ⛔ + recover if it races the upgrade). External users
+  get 2.0.1 via `rbox upgrade`.
+- #849 watchdog flakers hardened on main (margins starvation can't erase) —
+  they cost 5 reruns in 3 days and the release gate runs through main CI.
+- Watch items: desktop's recurring "retrying after conflict" tick under live
+  contention (benign so far, unexplained); FLAKE-012 still pending the
+  founder's runner-wizard rerun (`npx -y cloudflare-github-actions-runner@latest`
+  → upstream 1.0.10 tolerates transient assignment statuses); #847 recover
+  supersede product decision; perf differential formal close-out owed.
+
 ## 2026-08-31/09-01 — #838 CLASS FIX SHIPPED (#848) + the week's story corrected
 
 - **PR #848 merged** (3 opus lanes, integrated): (A) entry cap is GROWTH-only
