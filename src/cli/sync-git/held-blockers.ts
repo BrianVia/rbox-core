@@ -74,6 +74,35 @@ export function connectivityHoldAllowsSkip(blocker: TypedBlocker): boolean {
 }
 
 /**
+ * Issue #775 audited the remaining `GitDeferralReason` members against the skip
+ * bracket and admitted NONE. Recorded here so the next reader does not re-run it.
+ *
+ * `config` is NOT a blocker class at all. The config lane is a separate deferral
+ * lane (`setDeferral(rel, "config", …)`, apply.ts:607/:1194) whose refusal never
+ * becomes a `TypedBlocker`: the only producers of the `checkout`/`boundary` arm
+ * are follow-classify.ts:231 (a closed reason set of the local-* family plus
+ * unreadable, unsupported, conflict-copies, ownership and `checkoutRefReason`),
+ * follow.ts (unsupported/artifact/unreadable/ref-read-unreadable/conflict) and
+ * ref-plane-{publication,transaction,boundary} (`checkoutRefReason` ∈
+ * local-commits/local-stash/worktree-ownership/deletion-pending/unreadable/
+ * git-busy/other). Admitting `config` would be unreachable code, and a repo
+ * held on the config lane is already skip-eligible whenever its APPLY-lane
+ * blockers are — which is what FM's field state actually shows.
+ *
+ * `git-busy` / `stale-unattributed` are refused on the merits: they are
+ * TRANSIENT — a lock another process holds, or a ref transaction that "became
+ * busy" (ref-plane-publication.ts:42, plan-accumulator.ts:39). What clears them
+ * is that process exiting, which leaves NO trace in the bracket, so an eligible
+ * repo would hold its stale lane until the safety floor fired. A skip needs a
+ * witness of the FIX, not of the fault, and these have only the latter.
+ *
+ * The remaining composer artifact codes stay refused for the reason
+ * `composerHoldAllowsSkip` already states: each contradicts an existing proof or
+ * structurally refuses the request, an independent veto rather than "the follow
+ * minted nothing".
+ */
+
+/**
  * The one eligibility line. Every reason listed here has its evidence INSIDE
  * the attempt's `gitFingerprint` bracket, so the user resolving it voids the
  * attempt and forces a full follow on the very next pull.
@@ -86,7 +115,9 @@ export function connectivityHoldAllowsSkip(blocker: TypedBlocker): boolean {
  * it out, #641 added it unaudited, and design 241 removed it again against a
  * red rig scenario and an FM field twin. Re-admitting it is a product call
  * about convergence latency (issue #814), not a perf cleanup — it needs a
- * working-tree witness the cheap Git-only key does not have.
+ * working-tree witness the cheap Git-only key does not have. That witness is
+ * the MEDIUM remainder of issue #775; this SMALL slice deliberately stops at
+ * the classes the existing bracket already witnesses.
  */
 export function heldBlockersAllowSkip(
   blockers: readonly TypedBlocker[],

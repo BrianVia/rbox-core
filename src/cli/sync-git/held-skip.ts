@@ -27,7 +27,18 @@ import {
   type GitFingerprint,
 } from "./fingerprint.js";
 import { gitIncomingKey } from "./shared.js";
+import { jsonText } from "../../json.js";
 
+/**
+ * Liveness bound on every held skip: however well the bracket matches, an older
+ * attempt is refused and the repo pays one full follow. It backstops what the
+ * bracket cannot enumerate — a change resolving a hold while leaving every
+ * observed input byte-identical. Each class in `held-blockers.ts` must still
+ * carry its OWN witness; this bounds the damage when one is wrong. One hour is
+ * the trade: a stale skip costs at most an hour of convergence latency, an
+ * eligible repo re-pays fetch/decrypt/import hourly not per pull. Issue #775
+ * audited the allowlist and deliberately did NOT move this.
+ */
 const HELD_SKIP_SAFETY_FLOOR_MS = 60 * 60 * 1000;
 
 export const gitHeldSkipEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
@@ -183,6 +194,25 @@ function attemptInputs(attempt: GitHeldAttempt) {
   return inputs;
 }
 
+/**
+ * A stored attempt's compatibility generation, decoded ONCE so neither matcher
+ * re-narrows the durable record field by field. The row arrives as parsed cjson,
+ * so both markers are validated with the shared `jsonText` guard rather than
+ * trusted: `worktreeRegistryDigest` predates design 200 P2, `classifierInputKey`
+ * predates the cheap pre-fetch gate, and a marker that is absent OR not text
+ * lands in a generation its gate refuses.
+ */
+export type HeldAttemptGeneration =
+  | { eligibility: "registryless" | "late-only" }
+  | { eligibility: "early-capable"; classifierInputKey: string };
+
+export function heldAttemptGeneration(attempt: GitHeldAttempt): HeldAttemptGeneration {
+  const { worktreeRegistryDigest, classifierInputKey } = attempt;
+  if (!jsonText(worktreeRegistryDigest)) return { eligibility: "registryless" };
+  if (!jsonText(classifierInputKey)) return { eligibility: "late-only" };
+  return { eligibility: "early-capable", classifierInputKey };
+}
+
 export function heldAttemptMatches(
   attempt: GitHeldAttempt,
   observation: HeldInputObservation,
@@ -198,8 +228,9 @@ export function heldAttemptMismatchField(
   observation: HeldInputObservation,
   nowMs = Date.now(),
 ): string | undefined {
+  const generation = heldAttemptGeneration(attempt);
   if (attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION) return "fingerprintVersion";
-  if (typeof attempt.worktreeRegistryDigest !== "string") return "worktreeRegistryDigest";
+  if (generation.eligibility === "registryless") return "worktreeRegistryDigest";
   const writtenAt = Date.parse(attempt.at);
   if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return "at";
   if (observation.maxFingerprintTimestampMs >= nowMs - GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS) return "maxFingerprintTimestampMs";
@@ -207,7 +238,7 @@ export function heldAttemptMismatchField(
   // Attempts written before the cheap pre-fetch gate have no explicit format
   // marker. The authoritative late matcher remains their compatibility path;
   // a successful match upgrades the durable attempt for the next pull.
-  const comparableObserved = typeof attempt.classifierInputKey === "string"
+  const comparableObserved = generation.eligibility === "early-capable"
     ? observedInputs
     : (({ classifierInputKey: _classifierInputKey, ...legacyInputs }) => legacyInputs)(observedInputs);
   const storedInputs = attemptInputs(attempt);
@@ -265,12 +296,13 @@ export async function earlyHeldAttemptDecision(input: {
 }): Promise<EarlyHeldAttemptDecision> {
   const nowMs = input.nowMs ?? Date.now();
   const writtenAt = Date.parse(input.attempt.at);
+  const generation = heldAttemptGeneration(input.attempt);
   if (input.attempt.fingerprintVersion !== GIT_FINGERPRINT_VERSION) return { matches: false, reason: "fingerprint-version" };
-  if (typeof input.attempt.worktreeRegistryDigest !== "string") return { matches: false, reason: "worktree-registry" };
+  if (generation.eligibility === "registryless") return { matches: false, reason: "worktree-registry" };
   if (!Number.isFinite(writtenAt) || writtenAt > nowMs) return { matches: false, reason: "attempt-time" };
   if (heldAttemptFloorElapsed(input.attempt, nowMs)) return { matches: false, reason: "safety-floor" };
-  if (typeof input.attempt.classifierInputKey !== "string") return { matches: false, reason: "legacy-classifier-key" };
-  if (heldClassifierInputKey(input.incoming) !== input.attempt.classifierInputKey) {
+  if (generation.eligibility !== "early-capable") return { matches: false, reason: "legacy-classifier-key" };
+  if (heldClassifierInputKey(input.incoming) !== generation.classifierInputKey) {
     return { matches: false, reason: "classifier-key" };
   }
   // Unflagged: the early gate runs before the attempt shredder, so a pRepaired
