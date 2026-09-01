@@ -127,32 +127,23 @@ export async function executeManifestCommit(
   let timings: CommitTimings | undefined;
   let armed: GitResolutionPublicationReceipt | undefined;
 
+  // Each option key is SET ONLY WHEN IT APPLIES — absent, never present-and-undefined
+  // — and `options` itself stays undefined unless at least one key was set. `opt()`
+  // materializes it on first use, so that stays true without a separate predicate
+  // duplicating the six conditions below.
   let options: CommitOptions | undefined;
-  if (
-    plan.blockedFingerprint !== undefined ||
-    plan.retryAttempt ||
-    plan.reportTimings ||
-    plan.deltaBase ||
-    plan.deltaBaseRejection ||
-    plan.forceSnapshot
-  ) {
-    options = {
-      ...(plan.blockedFingerprint !== undefined ? { blockedFingerprint: plan.blockedFingerprint } : {}),
-      ...(plan.retryAttempt ? { retryAttempt: true as const } : {}),
-      ...(plan.reportTimings ? { onCommitTimings: (value: CommitTimings) => (timings = value) } : {}),
-      ...(plan.deltaBase ? { deltaBase: plan.deltaBase } : {}),
-      ...(plan.deltaBaseRejection ? { deltaBaseRejection: plan.deltaBaseRejection } : {}),
-      ...(plan.forceSnapshot ? { forceSnapshot: true } : {}),
-    };
-  }
+  const opt = (): CommitOptions => (options ??= {});
+  if (plan.blockedFingerprint !== undefined) opt().blockedFingerprint = plan.blockedFingerprint;
+  if (plan.retryAttempt) opt().retryAttempt = true;
+  if (plan.reportTimings) opt().onCommitTimings = (value: CommitTimings) => (timings = value);
+  if (plan.deltaBase) opt().deltaBase = plan.deltaBase;
+  if (plan.deltaBaseRejection) opt().deltaBaseRejection = plan.deltaBaseRejection;
+  if (plan.forceSnapshot) opt().forceSnapshot = true;
   const keepMineArm = plan.keepMineArm;
   if (keepMineArm) {
-    options = {
-      ...(options ?? {}),
-      beforeCommitSend: async () => {
-        await port.armKeepMine(keepMineArm);
-        armed = keepMineArm;
-      },
+    opt().beforeCommitSend = async () => {
+      await port.armKeepMine(keepMineArm);
+      armed = keepMineArm;
     };
   }
 
@@ -161,7 +152,7 @@ export async function executeManifestCommit(
     result = await port.commit({
       parentSequence: plan.parentSequence,
       manifest: plan.manifest,
-      ...(options ? { options } : {}),
+      options,
     });
   } catch (error) {
     if (armed) return { kind: "ack-uncertain", identity, reason: LOST_ACK_REASON };
@@ -226,15 +217,15 @@ export async function executeManifestCommit(
       kind: "unsatisfied",
       identity,
       unsatisfiedBlobs: result.unsatisfiedBlobs,
-      ...(result.unsatisfiedTotal !== undefined ? { unsatisfiedTotal: result.unsatisfiedTotal } : {}),
-      ...(result.attemptedManifestChain ? { attemptedManifestChain: result.attemptedManifestChain } : {}),
+      unsatisfiedTotal: result.unsatisfiedTotal,
+      attemptedManifestChain: result.attemptedManifestChain,
     };
   }
   return {
     kind: "accepted",
     identity,
     sequence: result.sequence!,
-    ...(result.manifestMeta ? { manifestMeta: result.manifestMeta } : {}),
-    ...(armed ? { armed } : {}),
+    manifestMeta: result.manifestMeta,
+    armed,
   };
 }

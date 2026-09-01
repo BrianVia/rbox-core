@@ -22,10 +22,7 @@ export function initialReceiptSendCap(): number {
   return Math.min(15_000, parsed);
 }
 
-function sliceReceiptBatch(
-  receipts: ReadonlyMap<string, string>,
-  sendCap: number,
-): { batch: Array<[string, string]>; maxEntryBytes: number } {
+function sliceReceiptBatch(receipts: ReadonlyMap<string, string>, sendCap: number) {
   const batch: Array<[string, string]> = [];
   let requestBytes = RECEIPT_REDEEM_BODY_PREFIX_BYTES + RECEIPT_REDEEM_BODY_SUFFIX_BYTES;
   let maxEntryBytes = 0;
@@ -252,8 +249,12 @@ export async function redeemReceipts(ctx: RemoteContext, recordCommitTail = fals
         void body.error;
       }
       if (errorCode(text) === "too_many_receipts") {
-        const max = body!.max;
-        if (typeof max !== "number" || !Number.isInteger(max) || max <= 0 || max >= batch.length) {
+        // Decoded through the boundary reader (finite, non-negative number or
+        // nothing) rather than a raw typeof narrowing; the integer + shrink bounds
+        // below are the domain contract on top of that.
+        const cap = readNumericFields(body as JsonValue | undefined, ["max"]);
+        const max = cap?.max;
+        if (max === undefined || !Number.isInteger(max) || max <= 0 || max >= batch.length) {
           throw new Error("receipt redeem failed: server returned an invalid non-shrinking too_many_receipts cap");
         }
         ctx.receiptSendCapShrinkCount++;
@@ -354,8 +355,8 @@ export async function commitSigned(
   if (r.status === 409) {
     const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number; serverTimings?: JsonValue };
     const serverTimings = readServerTimings(b.serverTimings);
-    if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0, ...(serverTimings ? { serverTimings } : {}) };
-    return { conflict: true, head: b.head, ...(serverTimings ? { serverTimings } : {}) };
+    if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0, serverTimings };
+    return { conflict: true, head: b.head, serverTimings };
   }
   if (r.status === 422) {
     const b = (await r.json()) as { missing?: string[]; missingTotal?: number };
@@ -369,11 +370,14 @@ export async function commitSigned(
   if (!r.ok) {
     const text = await r.text();
     if (errorCode(text) === "body_too_large") {
-      const body = JSON.parse(text) as { count?: unknown; max?: unknown };
+      // Read each field independently through the boundary reader, so a payload
+      // carrying only one of them still reports that one (a combined read would
+      // drop both).
+      const body = JSON.parse(text) as JsonValue;
       throw new CommitRejectedError(
         "body_too_large",
-        typeof body.count === "number" ? body.count : undefined,
-        typeof body.max === "number" ? body.max : undefined,
+        readNumericFields(body, ["count"])?.count,
+        readNumericFields(body, ["max"])?.max,
       );
     }
     const consumed = new Response(text, { status: r.status, headers: r.headers });
@@ -385,7 +389,7 @@ export async function commitSigned(
   const seq = body.sequence;
   const serverTimings = readServerTimings(body.serverTimings);
   ctx.receipts.clear(); // published → receipts consumed
-  return { sequence: seq, ...(serverTimings ? { serverTimings } : {}) };
+  return { sequence: seq, serverTimings };
 }
 
 export async function latest(ctx: RemoteContext): Promise<{ sequence: number; manifest: Manifest }> {
