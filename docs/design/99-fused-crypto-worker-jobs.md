@@ -1,8 +1,10 @@
 # 99 — Fused byte-bounded crypto worker jobs + fewer encrypt temp passes
 
-Status: Design draft v6 (revised after REVIEW-99 rounds 1–5; 5-round cap
-reached, all raised items incorporated — see REVIEW-99.md). Measurement-first
-(Phase 0 gate precedes any behaviour change). Client-only. Owns the crypto
+Status: **Shipped** — landed flag-gated in `3b94125f9` ("feat: design 99 — fused
+crypto worker jobs (flag-gated, default off) (#224)") and made default-on in
+`6a33b0c9d` ("perf(crypto): fused encrypt default-on + 4-worker cap + defaults
+ledger (#508)"). The text below is the as-designed record (draft v6, revised after
+REVIEW-99 rounds 1–5 — see REVIEW-99.md), kept for the rationale. Client-only. Owns the crypto
 worker pool's job granularity and the first-publish encrypt temp-file lifecycle.
 Interfaces with **design 98** (first-publish overlapping encrypt→upload
 pipeline, drafted in parallel): §10 states the per-file readiness contract 98

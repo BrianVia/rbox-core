@@ -1,6 +1,9 @@
 # Design 75 - First-publish encryption address cache
 
-**Status:** v2 proposed, urgent performance fix. **Summary:** cache plaintext-to-ciphertext addresses per E2EE write context so warm first-publish retries skip deterministic encryption for blobs the server already has.
+**Status:** **Shipped** — landed in `28601264f` ("design 75: first-publish
+encrypt-address cache — warm retries stop re-encrypting the world (#127)"); the
+backing store later moved to SQLite in `4c11fcda1` (#822). The text below is the
+as-designed (v2) record, kept for the rationale. **Summary:** cache plaintext-to-ciphertext addresses per E2EE write context so warm first-publish retries skip deterministic encryption for blobs the server already has.
 
 **Driver:** measured live on 2026-07-07: a first publish of a 129k-file / about 17 GB workspace re-encrypted every file on every push attempt. Five failed walls meant about five full AES-GCM passes, about 85 GB of churn, and 15-30 minutes of CPU per attempt.
 

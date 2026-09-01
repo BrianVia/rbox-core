@@ -831,7 +831,20 @@ export class E2eeRemote implements SyncRemote {
       if (sidecarSha === options?.blockedFingerprint) {
         throw new CommitRejectedError("too_many_refs", undefined, undefined, sidecarSha, true);
       }
-      await this.api.putBlobBytes(sidecarSha, sidecarBytes);
+      // #820: the sidecar is ~5 MB at fleet scale and re-serializes to the SAME bytes
+      // whenever the ref set didn't change, so an unconditional PUT was 99.94% of push
+      // uplink. Skipping it is safe because the server never needs a FRESH receipt for
+      // the sidecar carrier: `/v1/blobs/check`'s "have it" predicate (entitled AND
+      // present=1 AND not prune/GC-marked — apps/api/src/blobs.ts) is STRICTLY STRONGER
+      // than what the commit path asks for it (resolveSidecarRaw's receipt-OR-entitled
+      // gate, apps/api/src/sidecar.ts; validateCommitRefs' identical have-set,
+      // apps/api/src/commit-accounting.ts). So "present" here means the commit resolves
+      // and charges the sidecar with no receipt in hand.
+      // A retry ALWAYS re-PUTs: it is the only exit from a persistent
+      // check-says-present / commit-says-unsatisfied disagreement (D1 present=1 while
+      // the R2 object is gone), which the 422 repair path cannot otherwise heal.
+      const alreadyOnServer = !options?.retryAttempt && (await this.api.missingBlobs([sidecarSha])).length === 0;
+      if (!alreadyOnServer) await this.api.putBlobBytes(sidecarSha, sidecarBytes);
       if (onCommitTimings) sidecarMs = Date.now() - t0;
     }
     let encodeMs = 0;

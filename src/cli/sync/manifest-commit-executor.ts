@@ -24,6 +24,8 @@ export interface ManifestCommitEffectPlan {
   readonly deltaBaseRejection?: "no-base" | "integrity";
   readonly forceSnapshot: boolean;
   readonly blockedFingerprint?: string;
+  /** #820: a retry re-uploads the refset sidecar unconditionally. */
+  readonly retryAttempt?: true;
   /** Whether the surrounding push report wants per-commit timings. */
   readonly reportTimings: boolean;
   /** Keep-mine publication authority to durably arm at the last boundary before
@@ -128,6 +130,7 @@ export async function executeManifestCommit(
   let options: CommitOptions | undefined;
   if (
     plan.blockedFingerprint !== undefined ||
+    plan.retryAttempt ||
     plan.reportTimings ||
     plan.deltaBase ||
     plan.deltaBaseRejection ||
@@ -135,6 +138,7 @@ export async function executeManifestCommit(
   ) {
     options = {
       ...(plan.blockedFingerprint !== undefined ? { blockedFingerprint: plan.blockedFingerprint } : {}),
+      ...(plan.retryAttempt ? { retryAttempt: true as const } : {}),
       ...(plan.reportTimings ? { onCommitTimings: (value: CommitTimings) => (timings = value) } : {}),
       ...(plan.deltaBase ? { deltaBase: plan.deltaBase } : {}),
       ...(plan.deltaBaseRejection ? { deltaBaseRejection: plan.deltaBaseRejection } : {}),

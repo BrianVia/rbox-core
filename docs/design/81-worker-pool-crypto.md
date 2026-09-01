@@ -1,8 +1,8 @@
 # 81 - Worker-pool crypto: make blob crypto use real cores
 
-Status: Design accepted 2026-07-08 on the v0.9.7 capstone evidence.
-Client-only. Target release: v0.9.9, after the compiled dev-build Linux gate in
-section 5 passes.
+Status: **Shipped** — landed in `3d26d6e9d` ("engine/cli: design 81 — worker-pool
+crypto (#150)"). Accepted 2026-07-08 on the v0.9.7 capstone evidence; client-only.
+The text below is the as-designed record, kept for the rationale.
 Origin: 2026-07-08 full-corpus publish/join measurements on the 32-core Linux
 host, after designs 79 and 80 exposed the next local CPU floor.
 Priority framing, founder decision 2026-07-08: Linux perf > macOS perf. The

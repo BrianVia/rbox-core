@@ -337,6 +337,7 @@ async function pushManifestInner(
     forceSnapshot: repair !== undefined,
     filesFirstAborted: false,
     filesFirstFallbackUsed: false,
+    retryAttempt: false,
   };
   if (repair) state.repair = repair;
   if (resolution) state.resolution = resolution;
@@ -369,6 +370,9 @@ async function pushManifestInner(
       throw new PushConflictExhaustedError("push: too many conflicts, remote is moving faster than we can reconcile");
     }
     const outcome = await runPushAttempt(root, cfg, deps, backoff, state, baseIntegrityByMeta, spans);
+    // #820: every attempt after this one re-uploads the refset sidecar unconditionally.
+    // Latched (never cleared by rescanReset) — a 409 retry must re-PUT just like a 422.
+    state.retryAttempt = true;
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
@@ -452,6 +456,9 @@ interface PushAttemptState {
   filesFirstAborted: boolean;
   /** Design 108 §3.2: independent cap (=1) for the files-first-fallback RecoveryAction. */
   filesFirstFallbackUsed: boolean;
+  /** #820: latched once the first attempt finished — later attempts re-PUT the refset
+   *  sidecar instead of taking the "server already has it" skip. */
+  retryAttempt: boolean;
   repair?: RepairPushMode;
   resolution?: GitResolutionRider;
 }
@@ -869,6 +876,7 @@ async function runPushAttempt(
     if (deltaBase) Object.assign(commitPlan, { deltaBase });
     if (deltaBaseRejection) Object.assign(commitPlan, { deltaBaseRejection });
     if (deps.blockedFingerprint !== undefined) Object.assign(commitPlan, { blockedFingerprint: deps.blockedFingerprint });
+    if (attemptState.retryAttempt) Object.assign(commitPlan, { retryAttempt: true });
     if (keepMineArm) Object.assign(commitPlan, { keepMineArm });
     const commitReceipt = await executeManifestCommit(commitPlan, commitPort);
     spans.note("delta_base_ms");

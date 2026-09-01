@@ -72,6 +72,10 @@ export interface CommitOptions {
   /** Design 84 repair: do not emit a delta. Subordinate to the RBOX_MDE_SNAPSHOT
    *  master kill (design 204 §4.2) — under it, repair emits raw-v0, not a snapshot. */
   forceSnapshot?: boolean;
+  /** #820: this is a RETRY of a push attempt, so the refset sidecar is re-uploaded
+   *  unconditionally instead of taking the "server already has it" skip. Bounds a
+   *  persistent check-says-present / commit-says-unsatisfied disagreement. */
+  retryAttempt?: true;
   /** Awaited at the last client-side boundary before the manifest POST. A
    * synchronous keep-mine uses this to durably arm uncertain-ACK recovery. */
   beforeCommitSend?: () => Promise<void>;
