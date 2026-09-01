@@ -1,5 +1,38 @@
 # rbox status — living state snapshot
 
+## 2026-08-31/09-01 — #838 CLASS FIX SHIPPED (#848) + the week's story corrected
+
+- **PR #848 merged** (3 opus lanes, integrated): (A) entry cap is GROWTH-only
+  with one owner `entryCapTrips` (cli/sync/policy.ts) — readers/folds/decodes
+  never size-refuse; (B) `rbox ignore --purge` root-cause: the purge matcher
+  un-ignored every git-tracked path, so it could never remove a checked-out
+  tree — explicit .rboxignore rules now win on purge (deliberate behavior
+  change, test inverted with reasoning); (C) foldDelta validated its RESULT
+  against the absolute cap — FM's 2-day CHAIN HALT loop; fixed + chain-repair
+  halts render ⛔ naming `rbox recover`.
+- **Field-proven on dev build 2.0.0-dev+4f7e49a** (desktop + FM): #840's
+  breaker fired honestly (refused a 1.24M-file candidate pre-upload, named
+  chromium/src, offered the ignore line); purge reported "5 ignored entries →
+  seq 4527" truthfully; FM FOLDED the deltas clean (no recover); probe file
+  roundtripped desktop→FM. Fleet: desktop+FM on dev build; Mac offline since
+  ~Aug 28 — on wake it needs the dev build (or the fold halt shows the new ⛔).
+- **Story corrections (important):** the workspace legitimately holds ~198K
+  entries (savvy-core 101K) — Friday's "manifest 212K→25K purge" claim was
+  wrong (it deleted 3 entries; chromium never fully landed). **We are at 99.2%
+  of MAX_ENTRIES with legit files — cap raise (founder floated 1M) is now safe
+  (growth-only, one owner) and URGENT-ish.** Also: FM's stale republish
+  REVERTED the .rboxignore chromium line (ignore rules are synced files — a
+  peer commit can undo an eviction; #847 evidence).
+- Issues: #847 (recover supersedes peer commits — data-loss-shaped, P2),
+  #849 (BlobBatchDownloader watchdog CI flake family — rerun policy).
+- Earlier same day: #843 (Namespace regress ownership fix, un-pinned),
+  #844 (encrypt cache → SQLite), #845 (perf plumbing), #846 (setup-cmd
+  exitCode leak — Bun quirk: `process.exitCode = undefined` does NOT clear).
+- Owed: cap-raise PR (needs founder yes on the number); perf differential
+  close-out for #844/#845 (steady FM pulls ~3.4s observed, formal both-lane
+  numbers owed); 2.0.1 release decision; Mac dev build on wake; desktop
+  "retrying after conflict" tick recurs under live contention — watch.
+
 ## 2026-08-30 — three-lane subagent sweep: #839/#840/#841 merged (9 issues closed)
 
 - **#839** (fixes #824): `rbox upgrade` — dead daemon records collapse to one
