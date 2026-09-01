@@ -174,10 +174,9 @@ export function validateGitRepos(
  * Validate a parsed manifest object. Returns the first problem found, or ok.
  * Enforces: safe relative paths, no duplicate or file/descendant paths (incl.
  * case-insensitive, for APFS/NTFS collisions), known types, well-formed
- * shas/modes, bounded size. Deliberately NOT the workspace entry cap: #838
- * moved it to its only owner, `entryCapTrips` in cli/sync/policy.ts — a
- * receiver must accept any size it is handed, or an over-cap chain wedges
- * with no path back under the cap.
+ * shas/modes, bounded size. Deliberately NOT the workspace entry cap (#838):
+ * that lives with its only owner, `entryCapTrips` in cli/sync/policy.ts —
+ * receivers must accept any size or an over-cap chain wedges forever.
  */
 export function validateManifest(m: WireCandidate<Partial<Manifest>>): ValidationResult {
   if (m == null || typeof m !== "object") return { ok: false, error: "manifest is not an object" };
