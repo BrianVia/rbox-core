@@ -1,5 +1,37 @@
 # rbox status — living state snapshot
 
+## 2026-09-01 (afternoon, founder at the beach) — post-2.0.1 batch: 7 PRs, perf roadmap re-validated
+
+- **Merged:** #855 (#828 ghost pause records retire when their path is ignored —
+  the APPLY lane was the one stuck forever; no new verb), #856 (#810 proactive
+  "one directory just exploded" status/doctor hint, self-clearing, no built-in
+  ignore), #858 (RBOX_PUBLISH_PIPELINE in the defaults ledger, OFF verdict +
+  deletion condition), #859 (#847 `rbox recover` REFUSES peer-authored
+  supersede — rule lives inside repairChain, no override; founder ruling),
+  #860 (#775 held-skip audit pinned: zero classes admittable; legacy attempt
+  decoded once). **#861 (sidecar PUT skip, #820 interim: push bytes −85% at
+  test size / ~99.5% fleet scale, entitlement proven server-side) merging on
+  its last shard.**
+- **Perf roadmap re-validated on main (opus read-only pass):** #508 CLOSED
+  superseded (encrypt = 2% of push on FM; design 115 trigger missed ~48x) →
+  successor #857 (uploader ~33 Mbps effective on 632 Mbps host); #670 invalid
+  as written (no multi-binding scheduler exists; re-scope proposed); #823
+  re-classed MEDIUM (sourceSeq stamping defeats per-record elision — note in
+  flight); #663 MEDIUM (matcher memo; negation-rescue safety — note in
+  flight); #775 re-scoped (fetch skip already works; classify+cleanup 13s on a
+  real section change is the cost — note in flight); #821 trimmed (keys-GET
+  shipped in #845; two claims overstated); #820/#821 stay LARGE design-cycle.
+  Filed from the audit: #851 S4 debounce (parked), #852 Merkle manifest hash,
+  #853 LAN peer transfer, #854 connection-warmth measurement.
+- Bench junk from the #508 run purged from prod (ws_d163d05f…, 8 commits) via
+  scripts/ws-purge.ts; FM bench-ws removed, rig kept at ~/code/bench508-rig.
+- Perf close-out numbers recorded on #822/#818 (FM 2.0.0→2.0.1: no-op push
+  2.8–5.7s → 2.3–2.8s; steady pull flat ~3.3s).
+- Owed: Mac `rbox upgrade` on wake (founder tonight) + runner-wizard rerun
+  (FLAKE-012); three MEDIUM design notes landing (docs only); #857 follow-up
+  measurement; held-skip.ts at 396/400 and help-registry.ts 8 bytes under
+  ceiling — next toucher decomposes.
+
 ## 2026-09-01 — **v2.0.1 SHIPPED** (tag 87261788c) + cap → 1M
 
 - **v2.0.1 released**: rolls up #839 #840 #841 #843 #844 #845 #846 #848 #850.
