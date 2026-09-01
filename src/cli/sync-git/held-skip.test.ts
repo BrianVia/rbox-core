@@ -104,6 +104,16 @@ test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([connectivityHold, { provenance: "protocol", reason: "artifact", detail: "hold" }])).toBe(false);
   // The uncoded producers of the same reason, and a code on the wrong provenance.
   expect(heldBlockersAllowSkip([{ provenance: "checkout", reason: "artifact", code: "connectivity-unproven" }])).toBe(false);
+  // Issue #775 audited these and admitted neither; pinned so a future admission
+  // is a deliberate edit with its own witness, not an accident. `git-busy` and
+  // `stale-unattributed` are transient — what clears them is another process
+  // exiting, which leaves no trace in the skip bracket. `config` is refused on
+  // reachability: the config lane never mints a TypedBlocker, so this can only
+  // ever be a hand-built value.
+  for (const reason of ["git-busy", "stale-unattributed", "config"] as const) {
+    expect(heldBlockersAllowSkip([{ provenance: "checkout", reason }]), reason).toBe(false);
+    expect(heldBlockersAllowSkip([localCommit, { provenance: "boundary", reason }]), `mixed ${reason}`).toBe(false);
+  }
   expect(gitConnectivitySkipEnabled({})).toBe(true);
   expect(gitConnectivitySkipEnabled({ RBOX_GIT_CONNECTIVITY_SKIP: "0" })).toBe(false);
   expect(gitConnectivitySkipEnabled({ RBOX_GIT_CONNECTIVITY_SKIP: "false" })).toBe(true);
