@@ -555,7 +555,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox recover [path] [--yes] [--repair-chain] [--allow-mass-delete]",
     flags: [
       { flag: "--yes", short: "-y", desc: "skip the confirmation prompt (alias: -y)" },
-      { flag: "--repair-chain", desc: "confirm superseding an authenticated unreadable manifest suffix" },
+      { flag: "--repair-chain", desc: "confirm superseding an authenticated unreadable manifest suffix — only one THIS machine authored" },
       { flag: "--allow-mass-delete", desc: "consent to both pull-side and push-side mass-delete guards" },
     ],
   },

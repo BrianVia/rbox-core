@@ -104,7 +104,7 @@ import {
   type LockStarvationReason,
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
-import { repairChain, type SuffixInfo } from "../chain-repair.js";
+import { repairChain } from "../chain-repair.js";
 import { resolveBindingScope, ScopedBindingRefusal, type BindingScope } from "../scope/binding-scope.js";
 import {
   ACTIVITY_HEARTBEAT_MS,
@@ -2189,18 +2189,12 @@ export class RboxDaemon {
         );
       }
       noteChainRepair();
-      let refusal: SuffixInfo[] | undefined;
+      // repairChain itself enforces the self-authored rule (#847), so this
+      // consent hook only ever sees suffixes the rule already allowed.
       const outcome = await repairChain(this.root, this.cfg, deps, error, {
-        confirmSupersede: async (suffix) => {
-          const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
-          if (!selfOnly) refusal = suffix;
-          return selfOnly;
-        },
+        confirmSupersede: async (suffix) => this.chainRepairPolicy.confirmSupersede(suffix),
       });
-      if (outcome.kind === "declined") {
-        const suffix = refusal ?? outcome.suffix;
-        throw this.chainRepairPolicy.halt(error, suffix);
-      }
+      if (outcome.kind === "declined") throw this.chainRepairPolicy.halt(error, outcome.suffix);
       return outcome.kind === "converged"
         ? [...outcome.actions, ...await pull(this.root, this.cfg, deps)]
         : outcome.actions;
