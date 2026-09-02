@@ -25,8 +25,13 @@
 - Recipes + traps in memory `git-plane-unwedge-recipes` (incl. keep-mine's
   flag re-print misread as rotation; never `pkill -f` a pattern that matches
   your own ssh command).
-- Owed: savvy-core FM confirm result; #828 whole-tree retirement fix; the
-  desktop's 134 ghosts; #832 "shadow it" decision; runner-wizard rerun
+- **#874 MERGED (#828 for real):** retirement now folds over the KNOWN record
+  set (the planned set never contained base-less/pending-less ghosts). Field:
+  desktop `retired 131 paused repos` on the first push — 134 → 3. Desktop on
+  dev 71fff25. **#875 filed:** fresh adoption of the 256-branch rbox-core on
+  FM ran P-settlement silently 30+ min at 80% CPU while status claimed 'WAL
+  replay' (it wasn't).
+- Owed: savvy-core FM confirm (queued behind FM's settlement); #832 "shadow it" decision; runner-wizard rerun
   (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
 
 ## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
