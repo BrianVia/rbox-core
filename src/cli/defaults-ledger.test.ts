@@ -8,6 +8,7 @@ import { noopElisionEnabled } from "./sync-state-elision.js";
 import { saveDeltaEnabled } from "./sync-state-delta.js";
 import { configuredWorkers, resetConfiguredWorkersCacheForTests } from "../engine/crypto-pool/config.js";
 import { gitHeldSkipComposerEnabled } from "./sync-git/held-blockers.js";
+import { gitShadowEnabled } from "./sync-git/git-shadow.js";
 
 /**
  * The defaults ledger: every performance/behavior flag's SHIPPED default,
@@ -23,7 +24,7 @@ const FLAGS = [
   "RBOX_BLOB_PACK", "RBOX_PACK_STREAMS", "RBOX_BATCH_FILL", "RBOX_CRYPTO_FUSE",
   "RBOX_CRYPTO_WORKERS", "RBOX_GIT_PLAN_LAZY", "RBOX_GIT_APPLY_LAZY",
   "RBOX_SAVE_NOOP_ELIDE", "RBOX_SAVE_DELTA", "RBOX_GIT_HELD_SKIP_COMPOSER",
-  "RBOX_PUBLISH_PIPELINE",
+  "RBOX_PUBLISH_PIPELINE", "RBOX_GIT_SHADOW",
 ] as const;
 const saved = new Map<string, string | undefined>();
 
@@ -91,7 +92,36 @@ describe("defaults ledger — the shipped default of every perf/behavior flag", 
     process.env.RBOX_PUBLISH_PIPELINE = "1";
     expect(pipelineEnabled()).toBe(true);
   });
+  /**
+   * RBOX_GIT_SHADOW — VERDICT: **ON**, because the lane cannot change anything.
+   *
+   * #832 shadow mode (`docs/design/notes/2026-09-01-832-git-plane-evaluation.md`
+   * §10) computes the boring `merge-base --is-ancestor` verdict beside the proof
+   * plane's, records the cross-tab in `.rbox/state/git-shadow.json`, and logs
+   * only disagreements. It mutates no ref, no index, no working tree — the one
+   * write is the counter file — so the usual reason to ship a new lane dark does
+   * not apply, and shipping it dark would produce the one thing the founder
+   * ruling asked for less of: no data.
+   *
+   * The kill switch exists for cost, not for safety: the lane spends one
+   * `merge-base` per moved branch plus, when the checked-out branch actually
+   * fast-forwards, one `diff-index`. `shadowMs` (chain-timings.ts) is the leaf
+   * that will say so, and §10's bound is <5% of pull wall.
+   *
+   * DELETION CONDITION: delete the flag, `git-shadow.ts`, its `shadowMs` leaf
+   * and the doctor line after the one-week comparison table is produced and the
+   * #832 decision is recorded — whichever way it goes. §10 names both endings
+   * (promote ff-only to the ref plane's executor, or close #832 with this data
+   * as the recorded negative result); neither ending keeps this lane. A shadow
+   * that outlives its question is a second plane nobody owns.
+   */
+  test("git shadow mode is ON by default", () => {
+    expect(gitShadowEnabled({})).toBe(true);
+    expect(gitShadowEnabled({ RBOX_GIT_SHADOW: "0" })).toBe(false);
+  });
   test("kill switches select the legacy arms", () => {
+    process.env.RBOX_GIT_SHADOW = "0";
+    expect(gitShadowEnabled()).toBe(false);
     process.env.RBOX_PREFLIGHT_DELTA = "0";
     process.env.RBOX_MDE_DELTA = "0";
     process.env.RBOX_BLOB_PACK = "0";

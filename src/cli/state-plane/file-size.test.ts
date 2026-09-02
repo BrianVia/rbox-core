@@ -132,7 +132,10 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/daemon/key-delivery-fulfill.ts", { nonblank: 1006, bytes: 39721 }],
   ["src/cli/daemon/process-control.ts", { nonblank: 436, bytes: 21311 }],
   ["src/cli/daemon/watcher.ts", { nonblank: 424, bytes: 17809 }],
-  ["src/cli/doctor-cmd.ts", { nonblank: 950, bytes: 44610 }],
+  // Tightened 2026-09-02 (#832): the daemon-log redaction grammar moved to
+  // doctor-git-redaction.ts, so the ratchet records the smaller file rather
+  // than the ceiling the split retired.
+  ["src/cli/doctor-cmd.ts", { nonblank: 926, bytes: 42627 }],
   // Tightened 2026-08-30: the halt remedies moved to doctor-triage-halt.ts and
   // the finding contract to doctor-finding.ts, so the ratchet records the
   // smaller file rather than the ceiling the split retired.
