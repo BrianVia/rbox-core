@@ -9,7 +9,7 @@ import { gitRaw } from "../../engine/git-spawn.js";
 import { loadRawState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState } from "../config.js";
 import { prepareBasePresentArtifact, readBasePresentArtifact } from "../sync-git/base-artifacts.js";
 import { repoCtxFromDisk, type RepoCtx } from "../sync-git/git-state.js";
-import { artifactBinding, readRepoIdentityV1, readStateLineageV1, type ArtifactBinding } from "../sync-git/repo-lineage.js";
+import { artifactBinding, readRepoIdentityV1, readStateLineageV1, type ArtifactBinding, type RepoIdentityV1 } from "../sync-git/repo-lineage.js";
 import { preflightManualPresentArtifacts } from "./resolve-artifacts.js";
 
 const exec = promisify(execFile);
@@ -27,6 +27,7 @@ let root = "";
 let repo = "";
 let ctx: RepoCtx;
 let binding: ArtifactBinding;
+let identity: RepoIdentityV1;
 let candidate = "";
 let alternate = "";
 
@@ -80,7 +81,7 @@ beforeEach(async () => {
   const found = await repoCtxFromDisk(repo);
   if (!found) throw new Error("fixture repository unavailable");
   ctx = found;
-  const identity = await readRepoIdentityV1("repo", ctx.kind, {
+  identity = await readRepoIdentityV1("repo", ctx.kind, {
     worktreeId: await fs.realpath(repo),
     gitDirReal: await fs.realpath(ctx.gitDir),
     commonDirReal: await fs.realpath(ctx.commonDir),
@@ -167,4 +168,58 @@ test("WITH-BASE CREATE P keeps the existing exact-settlement path", async () => 
   expect(result.receipts).toEqual([]);
   expect(result.state.repoRecords?.repo?.base?.refs[ref]).toBe(candidate);
   expect((await readBasePresentArtifact(repo, binding, ref)).status).toBe("absent");
+});
+
+/** A standing P from a SUPERSEDED lineage of this same device — the only way a
+ * "foreign" artifact can exist. Every lineageHash input (workspace root, stream,
+ * stateNonce, local common-dir inode identity) is local, so foreign never means
+ * "another device"; it means this device's own state regenesis rotated the nonce
+ * and orphaned the artifacts the old lineage minted (design 130:159-167). */
+async function createForeignP(ref: string, digit: string, nextOid: string): Promise<void> {
+  const foreign = artifactBinding(await readStateLineageV1(root, "stream", "9".repeat(32), identity));
+  const prepared = await prepareBasePresentArtifact(repo, foreign, ref, digit.repeat(32), null, nextOid);
+  await gitRaw(repo, ["update-ref", "--stdin"], {
+    stdin: ["start", ...prepared.transactionLines, "prepare", "commit", ""].join("\n"),
+  });
+}
+
+test("base-absent receiver lands first BASE past a superseded lineage's standing P", async () => {
+  const ref = "refs/heads/foreign-landing";
+  await git("update-ref", ref, candidate);
+  const incoming = section({ "refs/heads/main": candidate, [ref]: candidate });
+  const state = await stateFor(incoming);
+  await createForeignP(ref, "8", candidate);
+
+  const result = await preflightManualPresentArtifacts({ root, rel: "repo", ctx, state, incoming });
+
+  expect(result.status).toBe("ready");
+});
+
+test("a foreign artifact still vetoes a physical ref mutation", async () => {
+  const ref = "refs/heads/foreign-moving";
+  await git("update-ref", ref, candidate);
+  const incoming = section({ "refs/heads/main": candidate, [ref]: alternate });
+  const state = await stateFor(incoming);
+  await createForeignP(ref, "8", candidate);
+
+  const result = await preflightManualPresentArtifacts({ root, rel: "repo", ctx, state, incoming });
+
+  expect(result).toMatchObject({ status: "hold" });
+  if (result.status !== "hold") return;
+  expect(result.reason).toBe(`foreign BASE artifact vetoes confirmed mutation of ${ref}`);
+});
+
+test("present-base receiver keeps the foreign veto on a BASE-only advance", async () => {
+  const ref = "refs/heads/foreign-base-advance";
+  await git("update-ref", ref, candidate);
+  const incoming = section({ "refs/heads/main": candidate, [ref]: candidate });
+  const base = section({ "refs/heads/main": candidate, [ref]: alternate });
+  const state = await stateFor(incoming, base);
+  await createForeignP(ref, "8", candidate);
+
+  const result = await preflightManualPresentArtifacts({ root, rel: "repo", ctx, state, incoming });
+
+  expect(result).toMatchObject({ status: "hold" });
+  if (result.status !== "hold") return;
+  expect(result.reason).toBe(`foreign BASE artifact vetoes confirmed mutation of ${ref}`);
 });
