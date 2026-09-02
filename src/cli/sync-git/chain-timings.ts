@@ -9,6 +9,13 @@ export interface GitChainTimings {
   reflogMs: number;
   connectivityProofMs: number;
   indexOpStateMs: number;
+  /** Deleting the scratch/incoming ref namespaces the follow staged: the
+   * enumeration plus the deletes, at every cleanup site on the follow path. */
+  refCleanupMs: number;
+  /** How many refs those deletes covered — the width `refCleanupMs` bought.
+   * A count, never a duration: excluded from the timed fields and from the
+   * leaf partition, exactly like `chainLength`. */
+  refCleanupRefs: number;
   /** Checkout ownership-journal durable writes, marker observations, and fsyncs. */
   journalMs: number;
   /** Nested parent: reported separately and never added to exclusive leaves. */
@@ -39,6 +46,8 @@ export function zeroGitChainTimings(): GitChainTimings {
     reflogMs: 0,
     connectivityProofMs: 0,
     indexOpStateMs: 0,
+    refCleanupMs: 0,
+    refCleanupRefs: 0,
     journalMs: 0,
     classifyMs: 0,
     classifyExclusiveMs: 0,
@@ -50,7 +59,7 @@ export function zeroGitChainTimings(): GitChainTimings {
 }
 
 type GitTimedField = Exclude<keyof GitChainTimings,
-  "chainLength" | "classifyMs" | "classifyExclusiveMs" | "followMs" | "residualMs">;
+  "chainLength" | "refCleanupRefs" | "classifyMs" | "classifyExclusiveMs" | "followMs" | "residualMs">;
 
 /** The exclusive leaf partition, in one place: what `residualMs` closes
  * against, and what an exclusive parent bucket must subtract. */
@@ -58,7 +67,16 @@ const LEAF_FIELDS = [
   "fetchDecryptMs", "bundleVerifyMs", "gitImportMs", "refTxnExclusiveMs",
   "ownershipMs", "reflogMs", "connectivityProofMs", "indexOpStateMs",
   "journalMs", "classifyExclusiveMs", "heldInputMs", "standingProofMs",
+  "refCleanupMs",
 ] as const satisfies ReadonlyArray<keyof GitChainTimings>;
+
+/** The leaves the classifier parents, in one place. `classifyExclusiveMs`
+ * subtracts these BY NAME, so a leaf that can accrue inside the classifier and
+ * is missing from this list is billed twice — once to itself and once to the
+ * exclusive figure. `refCleanupMs` is here because cleanup is reachable from
+ * the classifier's call graph, not because the classifier owns it. */
+const CLASSIFY_CHILD_FIELDS = ["ownershipMs", "reflogMs", "refCleanupMs"] as const satisfies
+  ReadonlyArray<(typeof LEAF_FIELDS)[number]>;
 
 const leafMs = (timings: GitChainTimings): number =>
   LEAF_FIELDS.reduce((sum, field) => sum + timings[field], 0);
@@ -73,23 +91,32 @@ export async function addTimedMs<T>(timings: GitChainTimings | undefined, field:
   }
 }
 
+/** Record the ref width behind `refCleanupMs`. A tally, not a duration, so it
+ * has no `addTimedMs` form — but it lives here because the field's owner does. */
+export function countRefCleanup(timings: GitChainTimings | undefined, refs: number): void {
+  if (timings) timings.refCleanupRefs += refs;
+}
+
 /** Report the classifier parent while billing only its non-child wall time to
- * the exclusive partition. Classifier-owned Git leaves are deliberately
- * limited to ownership and reflog; keep this subtraction beside that contract. */
+ * the exclusive partition. The children are named in `CLASSIFY_CHILD_FIELDS` —
+ * keep the subtraction there, not inlined here, so a new leaf has one place to
+ * be declared instead of a silent double count. */
 export async function addClassifyTimedMs<T>(timings: GitChainTimings | undefined, fn: () => T | Promise<T>): Promise<T> {
   if (!timings) return fn();
   const t0 = performance.now();
-  const ownershipBefore = timings.ownershipMs;
-  const reflogBefore = timings.reflogMs;
+  const childrenBefore = classifyChildMs(timings);
   try {
     return await fn();
   } finally {
     const elapsed = performance.now() - t0;
-    const childMs = (timings.ownershipMs - ownershipBefore) + (timings.reflogMs - reflogBefore);
+    const childMs = classifyChildMs(timings) - childrenBefore;
     timings.classifyMs += elapsed;
     timings.classifyExclusiveMs += Math.max(0, elapsed - childMs);
   }
 }
+
+const classifyChildMs = (timings: GitChainTimings): number =>
+  CLASSIFY_CHILD_FIELDS.reduce((sum, field) => sum + timings[field], 0);
 
 /** Bill the full follow's own cost — everything it spends outside the named
  * leaves it parents. Design 573/814: without this the dominant term of a

@@ -5,13 +5,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { probeReceiverEquivalence, receiverEquivalentCollisionNames, receiverEquivalentPath, type GitSection } from "../../engine/index.js";
+import { probeReceiverEquivalence, receiverEquivalentCollisionNames, receiverEquivalentPath, type GitArtifactRef, type GitSection } from "../../engine/index.js";
 import { indexIdentityV2 } from "./index-identity.js";
-import { pruneStaleScratchRefs } from "./pins.js";
+import { deleteRefsBatch, pruneStaleScratchRefs } from "./pins.js";
 import { listRefs } from "./refs.js";
-import { addTimedMs } from "./chain-timings.js";
+import { addTimedMs, countRefCleanup } from "./chain-timings.js";
 import { clearIndexResolveUndo, getGitArtifact, importGitPackChain } from "./git-state.js";
-import { git, gitWithIndexFile } from "../../engine/git-spawn.js";
+import { gitWithIndexFile } from "../../engine/git-spawn.js";
 import type { FollowOptions, StagedIncoming, StageIncomingOptions } from "./follow-types.js";
 
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
@@ -42,13 +42,14 @@ export function indexArtifact(section: GitSection | undefined, options: { strict
     if (options.strict) throw new Error("incomplete index lane");
     return undefined;
   }
-  return {
+  const artifact: GitArtifactRef = {
     sha: section.indexSha,
     encSha: section.indexEncSha,
     cipherSize: section.indexCipherSize,
-    ...(section.indexComp ? { comp: section.indexComp } : {}),
-    ...(section.indexPayloadSha ? { payloadSha: section.indexPayloadSha } : {}),
   };
+  if (section.indexComp) artifact.comp = section.indexComp;
+  if (section.indexPayloadSha) artifact.payloadSha = section.indexPayloadSha;
+  return artifact;
 }
 
 export async function normalizedIndexProjection(repoDir: string, source: string, dest: string): Promise<string | undefined> {
@@ -66,9 +67,14 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
   await fs.mkdir(path.join(ctx.repoDir, ".rbox"), { recursive: true });
   const tmpDir = await fs.mkdtemp(path.join(ctx.repoDir, ".rbox", "git-follow-"));
   const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const cleanupRefs = async () => {
-    for (const ref of await listRefs(ctx.repoDir, incomingNs).catch(() => [])) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
-  };
+  const cleanupRefs = () => addTimedMs(opts.chainTimings, "refCleanupMs", async () => {
+    // Exactly the refs `listRefs` reports under this follow's own
+    // `refs/rbox-incoming/<id>` namespace — batching changes the spawn count,
+    // never the ref set.
+    const refs = await listRefs(ctx.repoDir, incomingNs).catch(() => []);
+    await deleteRefsBatch(ctx.repoDir, refs);
+    countRefCleanup(opts.chainTimings, refs.length);
+  });
   const cleanup = async () => {
     await cleanupRefs();
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -95,7 +101,8 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
         opBytes[rel] = await fs.readFile(tmp);
       });
     }
-    await pruneStaleScratchRefs(ctx.repoDir, "refs/rbox-incoming");
+    countRefCleanup(opts.chainTimings, await addTimedMs(opts.chainTimings, "refCleanupMs", () =>
+      pruneStaleScratchRefs(ctx.repoDir, "refs/rbox-incoming")));
     await importGitPackChain(ctx.repoDir, incoming, store, kek, tmpDir, incomingNs, opts.chainTimings);
     return { tmpDir, incomingNs, candidateIndex, incomingIndexProjection, opState, opBytes, cleanupRefs, cleanup };
   } catch (error) {

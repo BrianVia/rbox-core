@@ -3088,8 +3088,13 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
     + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
     + chain.connectivityProofMs + chain.indexOpStateMs + chain.journalMs
     + chain.classifyExclusiveMs + chain.heldInputMs + chain.standingProofMs
+    // #863: scratch/incoming ref cleanup is a named leaf, not residual.
+    + chain.refCleanupMs
     // #814: the full follow's own cost is a named term, not residual.
     + chain.followMs;
+  // #863: this follow stages 40 branches, so cleanup has real width to report.
+  expect(chain.refCleanupMs).toBeGreaterThan(0);
+  expect(chain.refCleanupRefs).toBeGreaterThanOrEqual(40);
   expect(chain.followMs).toBeGreaterThan(0);
   expect(chain.classifyMs).toBeGreaterThan(0);
   expect(chain.classifyExclusiveMs).toBeGreaterThan(0);

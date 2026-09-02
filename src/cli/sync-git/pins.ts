@@ -55,6 +55,43 @@ async function ownedUpdateRef(
   }
 }
 
+/** Delete a set of rbox-owned refs in ONE `git update-ref --stdin` spawn instead of
+ *  one spawn per ref (#863: 41 refs cost 64ms of pure spawn latency on the follow
+ *  path, and a real FM pull spent 6.9s there).
+ *
+ *  Two properties of the old `for (…) update-ref -d <ref>` loop are preserved
+ *  deliberately:
+ *
+ *  - A ref that VANISHED between enumeration and delete is not an error. Each
+ *    `delete` line carries NO old-value, so git does not verify the ref exists —
+ *    identical to `update-ref -d <ref>` without an old value, which exits 0 on a
+ *    missing ref (verified, git 2.54).
+ *  - A ref that genuinely FAILS (a concurrent `.lock`) must not take the others
+ *    down with it. `--stdin` is a single transaction, so one locked ref aborts
+ *    the whole batch and deletes nothing — where the old loop deleted everything
+ *    it still could. The per-ref fallback restores exactly that tolerance; it
+ *    costs one extra spawn only on the failing path, and deletes are idempotent,
+ *    so re-running them over a partially applied transaction is safe.
+ *
+ *  `-z` so no refname can be misread as a quoted line. Ref-lock semantics are
+ *  unchanged: update-ref honors them either way. */
+export async function deleteRefsBatch(repoDir: string, refs: string[], boundary?: OwnedRefMutationBoundary): Promise<void> {
+  if (refs.length === 0) return;
+  const lease = await boundary?.enterOwnedRefMutation(repoDir).catch(() => undefined);
+  try {
+    // -z delete record: `delete SP <ref> NUL <old-value> NUL`, old-value empty = unverified.
+    await git(repoDir, ["update-ref", "-z", "--stdin"], { stdin: refs.map((ref) => `delete ${ref}\0\0`).join("") })
+      .catch(async () => {
+        // Through `ownedUpdateRef`, not a third raw `update-ref` site (design 130).
+        // No boundary: the lease above already covers the whole mutation, and
+        // passing it here would re-enter one observation per ref.
+        for (const ref of refs) await ownedUpdateRef(repoDir, ["-d", ref]).catch(() => {});
+      });
+  } finally {
+    await lease?.finish().catch(() => {});
+  }
+}
+
 /** Pin every commit the section will reference under a CAPTURE-UNIQUE namespace
  *  `refs/rbox-wip/<epochMs>-<rand>/<n>`: linked worktrees share one ref store, so a
  *  single global scratch ref would race under concurrent sibling captures [v2, B2]. */
@@ -76,27 +113,29 @@ export async function createScratchPins(repoDir: string, shas: string[], boundar
 }
 
 export async function deleteScratchPins(repoDir: string, pins: ScratchPins, boundary?: OwnedRefMutationBoundary): Promise<void> {
-  for (const ref of pins.refs) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
+  await deleteRefsBatch(repoDir, pins.refs, boundary);
 }
 
 /** Prune stale scratch refs left by CRASHED runs — AGE-GUARDED [v3]: only entries whose
  *  `<epochMs>-<rand>` id is older than 1h are deleted. A blind prune in a SHARED gitdir
- *  would delete a concurrent sibling capture's live pins. */
-export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundary?: OwnedRefMutationBoundary): Promise<void> {
+ *  would delete a concurrent sibling capture's live pins.
+ *
+ *  Returns how many refs it deleted, so a caller that times the prune can report
+ *  the width behind that time (`refCleanupRefs`). */
+export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundary?: OwnedRefMutationBoundary): Promise<number> {
   const out = await git(repoDir, ["for-each-ref", "--format=%(refname)", ns]).catch(() => "");
   const cutoff = Date.now() - SCRATCH_MAX_AGE_MS;
-  for (const ref of out.split("\n").filter(Boolean)) {
-    if (ref === ns) {
-      // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
-      // the namespaced refs below and old clients only ever ran on unshared root repos, so
-      // deleting it blindly is safe (and matches the old cleanup).
-      await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
-      continue;
-    }
+  const stale = out.split("\n").filter(Boolean).filter((ref) => {
+    // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
+    // the namespaced refs below and old clients only ever ran on unshared root repos, so
+    // deleting it blindly is safe (and matches the old cleanup).
+    if (ref === ns) return true;
     const id = ref.slice(ns.length + 1).split("/")[0] ?? "";
     const epoch = Number.parseInt(id, 10);
-    if (Number.isFinite(epoch) && epoch < cutoff) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
-  }
+    return Number.isFinite(epoch) && epoch < cutoff;
+  });
+  await deleteRefsBatch(repoDir, stale, boundary);
+  return stale.length;
 }
 
 /** Objects the section references that a scoped bundle might not reach: the detached-HEAD
