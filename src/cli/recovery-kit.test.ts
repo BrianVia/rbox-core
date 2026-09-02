@@ -329,6 +329,21 @@ describe("recovery kit", () => {
     expect(record?.offer?.outcome).toBe("claimed");
   });
 
+  test("a crowd of concurrent claimants still yields exactly one winner", async () => {
+    // #878: the record lock published its holder pid AFTER claiming the lock
+    // name, so a claimant that read the still-empty lock file judged the holder
+    // dead, reclaimed the lock, and both sides wrote an offer. Twenty claimants
+    // over twenty rounds widen that window enough to catch a regression without
+    // depending on runner starvation.
+    for (let round = 0; round < 20; round++) {
+      const account = `acct_${round.toString(16).padStart(16, "0")}`;
+      const results = await Promise.all(Array.from({ length: 20 }, () =>
+        claimRecoveryKitOffer(account, "status", "cached-rk", async () => true, DATE)));
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect((await readRecoveryKitRecord(account))?.offer?.outcome).toBe("claimed");
+    }
+  });
+
   test("a concurrent claim waits beyond the former short retry window", async () => {
     let releasePreflight!: () => void;
     const preflightGate = new Promise<void>((resolve) => { releasePreflight = resolve });

@@ -325,27 +325,65 @@ async function hardenedWrite(file: string, data: string | Uint8Array): Promise<v
   await recoveryKitWriteTestHook?.("after-directory-fsync", file);
 }
 
+let lockTempCounter = 0;
+
+/** Is the pid recorded in `lock` a live process? An unreadable or unparsable
+ *  lock is treated as held: the name exists, and only a lock whose holder we can
+ *  positively prove dead may be reclaimed. */
+async function lockHolderAlive(lock: string): Promise<boolean> {
+  let holder = 0;
+  try { holder = Number((await fs.readFile(lock, "utf8")).trim()) } catch { return true }
+  if (!Number.isInteger(holder) || holder <= 0) return true;
+  try { process.kill(holder, 0) } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM" }
+  return true;
+}
+
+/** Claim the lock NAME with the holder pid already inside it: stage the pid in a
+ *  sibling temp, then hardlink that temp into place. `link` is atomic and fails
+ *  EEXIST, so the lock is never observable as an empty file. Creating the name
+ *  first and writing the pid after (#878) left exactly that window: a concurrent
+ *  claimant read the empty lock, judged the holder dead, reclaimed the name, and
+ *  every racer went on to write a once-only offer. Same primitive as the
+ *  ORIG_HEAD.lock claim in sync-git/checkout-txn.ts. */
+async function claimRecordLock(lock: string, dir: string): Promise<void> {
+  const tmp = `${lock}.tmp-${process.pid}-${lockTempCounter++}`;
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(tmp, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY | (fsSync.constants.O_NOFOLLOW ?? 0), FILE_MODE);
+    await handle.writeFile(String(process.pid));
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    try { await fs.link(tmp, lock) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await lockHolderAlive(lock)) throw new Error(OFFER_LOCK_MESSAGE);
+      await fs.unlink(lock).catch((e) => { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e });
+      await fsyncDirectory(dir);
+      // One reclaimer wins the re-link; the rest see the winner's live pid.
+      try { await fs.link(tmp, lock) }
+      catch (retry) {
+        if ((retry as NodeJS.ErrnoException).code !== "EEXIST") throw retry;
+        throw new Error(OFFER_LOCK_MESSAGE);
+      }
+    }
+    await fsyncDirectory(dir);
+  } finally {
+    await handle?.close().catch(() => {});
+    await fs.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
 async function withRecordLock<T>(accountId: string, operation: () => Promise<T>): Promise<T> {
   const lock = `${recordPath(accountId)}.lock`;
   const dir = path.dirname(lock);
   const created = await ensureDirectoryChain(dir, "recovery-kit record directory");
   await fsyncCreatedDirectoryAncestors(dir, created);
-  let handle: fs.FileHandle;
-  try { handle = await fs.open(lock, "wx", FILE_MODE) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    let holder = 0;
-    try { holder = Number((await fs.readFile(lock, "utf8")).trim()) } catch {}
-    let alive = Number.isInteger(holder) && holder > 0;
-    if (alive) try { process.kill(holder, 0) } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM" }
-    if (alive) throw new Error(OFFER_LOCK_MESSAGE);
-    await fs.unlink(lock); await fsyncDirectory(dir); handle = await fs.open(lock, "wx", FILE_MODE);
-  }
+  await claimRecordLock(lock, dir);
   try {
-    await handle.writeFile(String(process.pid)); await handle.sync(); await handle.close(); await fsyncDirectory(dir);
     return await operation();
   } finally {
-    await handle.close().catch(() => {}); await fs.unlink(lock).catch(() => {}); await fsyncDirectory(dir).catch(() => {});
+    await fs.unlink(lock).catch(() => {}); await fsyncDirectory(dir).catch(() => {});
   }
 }
 
