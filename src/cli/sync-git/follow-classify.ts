@@ -23,6 +23,7 @@ import {
 } from "./breadcrumb-veto.js";
 import { sectionOpState } from "./shared.js";
 import { indexArtifact } from "./follow-staging.js";
+import { plainIndexIdentity } from "./index-identity.js";
 import {
   blockerForReason,
   opStateRootOf,
@@ -114,6 +115,29 @@ export async function classifyCheckoutOwnership(
   return { reasons, details };
 }
 
+/**
+ * #659: base and incoming are not the only indexes that hold no receiver work.
+ * A receiver rbox has never fully applied (no base at all) — or one whose
+ * publisher staged something — has an index matching NEITHER, and today latches
+ * `local-index` forever: the checkout can never land, so base never advances,
+ * so the mismatch never resolves. But a pristine `read-tree` of the receiver's
+ * OWN tip is by construction empty of staged work, so an index equal to it has
+ * nothing to preserve.
+ *
+ * Every real staging still differs from that projection and still defers:
+ * content, mode, conflict stages, skip-worktree, assume-unchanged,
+ * intent-to-add, sparse and resolve-undo all move `indexIdentityV2`. Receiver
+ * commits, edits, stashes and operation state are other reasons' business.
+ * An unreadable tip or an indeterminate projection fails closed.
+ */
+async function indexIsPristineAtTip(opts: FollowOptions, live: LiveMetadata, liveValue: string | null | undefined): Promise<boolean> {
+  const tip = live.currentTip;
+  if (tip === undefined || liveValue === null || liveValue === undefined) return false;
+  const plain = await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
+    plainIndexIdentity(opts.ctx.repoDir, tip, opts.ctx.gitDir));
+  return plain !== undefined && plain === liveValue;
+}
+
 export async function classifyCheckout(args: {
   opts: FollowOptions;
   live: LiveMetadata | undefined;
@@ -159,7 +183,8 @@ export async function classifyCheckout(args: {
       const liveValue = live.indexPresent ? live.indexProjection : null;
       const baseValue = baseHasIndex ? args.baseProjection : null;
       const incomingValue = incomingHasIndex ? args.incomingProjection : null;
-      if (liveValue !== baseValue && liveValue !== incomingValue) {
+      if (liveValue !== baseValue && liveValue !== incomingValue
+        && !await indexIsPristineAtTip(args.opts, live, liveValue)) {
         reasons.add("local-index");
         details.push("index differs from both base and incoming");
       }

@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { validateGitSection, type GitSection } from "../../engine/index.js";
 import { gitIdentity, gitIdentityKey } from "./identity.js";
 import { gitPreflight, isGitBusy } from "./preflight.js";
-import { indexIdentityV2 } from "./index-identity.js";
+import { indexIdentityV2, plainIndexIdentity } from "./index-identity.js";
 import { type GitRepoKind } from "./git-state.js";
 import { type JournalRecoveryResult } from "./journal.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
@@ -47,7 +47,7 @@ export function pendingSupersessionAckConverges(input: {
       incomingKey: gitIncomingKey(input.candidate),
       sourceSeq: DRY_RUN_SOURCE_SEQ,
       advertisedRefs: input.candidate.refs,
-      ...(input.absentBranchProofs ? { absentBranchProofs: input.absentBranchProofs } : {}),
+      absentBranchProofs: input.absentBranchProofs,
     },
     {
       repoKind: input.binding.repoKind,
@@ -188,7 +188,7 @@ export async function pendingSupersessionPreProbe(
           identityKey: gitIdentityKey(identity),
           identityRefs: identity.refs,
         },
-        ...(preflight.kind ? { kind: preflight.kind } : {}),
+        kind: preflight.kind,
       },
     };
   } catch {
@@ -224,18 +224,9 @@ async function pendingIndexIsCleanAndPlain(
     const indexEnv = { ...graphEnv, GIT_INDEX_FILE: path.resolve(indexPath) };
     await git(ctx.repoDir, ["diff-index", "--cached", "--quiet", peeledPendingHead, "--"], { env: indexEnv });
 
-    const plainIndexPath = path.join(tmpDir, "plain-index");
-    await git(ctx.repoDir, [
-      "-c", "core.sparseCheckout=false",
-      "-c", "core.sparseCheckoutCone=false",
-      "-c", "index.sparse=false",
-      "read-tree", peeledPendingHead,
-    ], {
-      env: { ...graphEnv, GIT_INDEX_FILE: path.resolve(plainIndexPath) },
-    });
     const [pendingProjection, plainProjection] = await Promise.all([
       indexIdentityV2(ctx.repoDir, indexPath),
-      indexIdentityV2(ctx.repoDir, plainIndexPath),
+      plainIndexIdentity(ctx.repoDir, peeledPendingHead, tmpDir),
     ]);
     return pendingProjection !== undefined && pendingProjection === plainProjection;
   } finally {
