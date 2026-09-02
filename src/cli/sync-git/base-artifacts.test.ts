@@ -64,7 +64,7 @@ async function runGit(...args: string[]): Promise<string> {
 }
 
 async function writeBlob(bytes: Uint8Array | string): Promise<string> {
-  return (await gitRaw(repo, ["hash-object", "-w", "--stdin"], { stdin: typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("utf8") })).trim();
+  return (await gitRaw(repo, ["hash-object", "-w", "--stdin"], { stdin: bytes instanceof Uint8Array ? Buffer.from(bytes).toString("utf8") : bytes })).trim();
 }
 
 async function writeTree(lines: string[]): Promise<string> {
