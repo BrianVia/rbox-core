@@ -1760,6 +1760,50 @@ test("disposition: staged index changes defer local-index", async () => {
   expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
 });
 
+// #659 (flat-meadow, weeks stuck): three repos whose repo_records carried
+// `base_cjson NULL` and `deferrals.apply.reason = "local-index"` since the day
+// the host joined. Their live indexes were provably pristine — `diff-index
+// --cached HEAD` empty, no `ls-files -v` flag, no sparse dir, no resolve-undo —
+// so there was no receiver staging to protect, but the rule only ever compared
+// against base (absent) and incoming (a different tip). The checkout could
+// never land, so base could never advance, so the reason could never clear, so
+// the push side carried the pending section verbatim forever.
+test("#659: a receiver with no base and a pristine index is not classified local-index", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const baseless: SyncState = {
+    ...state,
+    lastSyncedManifest: { generatedAt: "", files: [], manifestSchema: 2, gitRepos: {} },
+    repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
+  };
+  const { outcome, logs } = await applyIncoming(baseless, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).not.toBe("local-index");
+  expect(logs.some((line) => line.includes("index differs from both base and incoming"))).toBe(false);
+  // The repository still needs an operator: with no BASE at all, establishing
+  // one over an existing local branch is `rbox git resolve`'s business, not the
+  // automatic pipeline's. What must never happen again is the pipeline blaming
+  // a pristine index for it and silently carrying pending forever.
+  expect(logs).toContain("git-sync deferred repo: branch transition does not match logical BASE pre-state");
+});
+
+// The safety property the carry exists for: with no base to compare against,
+// genuine receiver-only staging must STILL defer and still be preserved.
+test("#659 control: staged receiver work with no base still defers local-index", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const baseless: SyncState = {
+    ...state,
+    lastSyncedManifest: { generatedAt: "", files: [], manifestSchema: 2, gitRepos: {} },
+    repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
+  };
+  const tip = await git(receiver, "rev-parse", "HEAD");
+  await fs.writeFile(path.join(receiver, "staged.txt"), "human\n");
+  await git(receiver, "add", "staged.txt");
+  const { outcome } = await applyIncoming(baseless, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-index");
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(tip);
+  expect(await git(receiver, "ls-files", "staged.txt")).toBe("staged.txt");
+});
+
 for (const semanticEdit of ["skip-worktree", "assume-unchanged", "intent-to-add"] as const) {
   test(`clean production arm preserves ${semanticEdit} and defers local-index`, async () => {
     const { state, incoming } = await baseAndIncoming();

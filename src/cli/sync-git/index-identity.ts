@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { hashBytes } from "../../engine/hash.js";
-import { gitWithIndexFile } from "../../engine/git-spawn.js";
+import { git, gitWithIndexFile } from "../../engine/git-spawn.js";
+import { graphEnv } from "./reachability.js";
 
 function records(raw: string): string[] {
   return raw.split("\0").filter((record) => record.length > 0);
@@ -83,5 +84,32 @@ export async function indexIdentityV2(repoDir: string, indexFilePath: string): P
     return undefined;
   } finally {
     await fs.rm(privateIndex, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * The identity a PRISTINE index at `commitish` projects to: `read-tree` with
+ * every sparse setting forced off, run through the oracle above. An index equal
+ * to it carries no receiver work at all — nothing staged, no
+ * skip-worktree/assume-unchanged/intent-to-add bit, no sparse or resolve-undo
+ * extension. `undefined` is indeterminate and must fail closed at every caller.
+ *
+ * `dir` must sit inside the repository's git dir so split-index sharedindex
+ * lookup keeps working, exactly as the private copy above relies on.
+ */
+export async function plainIndexIdentity(repoDir: string, commitish: string, dir: string): Promise<string | undefined> {
+  const plainIndex = path.join(dir, `.rbox-plain-index-${process.pid}-${crypto.randomBytes(8).toString("hex")}`);
+  try {
+    await git(repoDir, [
+      "-c", "core.sparseCheckout=false",
+      "-c", "core.sparseCheckoutCone=false",
+      "-c", "index.sparse=false",
+      "read-tree", commitish,
+    ], { env: { ...graphEnv, GIT_INDEX_FILE: path.resolve(plainIndex) } });
+    return await indexIdentityV2(repoDir, plainIndex);
+  } catch {
+    return undefined;
+  } finally {
+    await fs.rm(plainIndex, { force: true }).catch(() => {});
   }
 }
