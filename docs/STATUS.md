@@ -33,9 +33,10 @@
   replay' (it wasn't).
 - **#647 root-caused with the forensics hook** (savvy-core FM take-theirs): after
   #873 the confirm reaches the locked boundary and refuses — `boundary-diff
-  field reflogs … authored: []` = rbox's OWN protocol ref writes appended
-  reflog entries the boundary treats as user changes (the #836 class one
-  layer down). Fix agent dispatched. FM's rbox-core settlement took 45 min
+  field reflogs … authored: []` = same refs/oids in a different SORT ORDER
+  (identity code-point vs #836 normalizer localeCompare; differ on case →
+  mixed-case branch names could never pass; also LANG-dependent hashing).
+  Fix: one code-point comparator (PR pending). FM's rbox-core settlement took 45 min
   (artifacts 358 → 0), then FM pulled clean.
 - Owed: savvy-core FM confirm (blocked on #647 fix); #832 "shadow it" decision; runner-wizard rerun
   (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
