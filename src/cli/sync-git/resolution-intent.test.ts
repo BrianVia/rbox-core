@@ -81,7 +81,6 @@ test("design 176 preliminary report projects full live evidence onto scoped capt
     stream: "stream",
     stateNonce: "a".repeat(32),
     incomingKey: "incoming",
-    repoGen: 1,
     // Full show-me binding still observes the shared store's side branch/tag.
     refs: [
       ["refs/heads/main", b],

@@ -287,7 +287,7 @@ const follow = await followDivergedRepo({
       const currentIncoming = incomingFor(currentRecord);
       if (!currentRecord || !currentIncoming) { boundaryMismatch = true; return false; }
       const currentIdentity = await resolutionBindingIdentity({
-        root, rel, ctx, state: currentState, record: currentRecord, incoming: currentIncoming, oracle: snapshot.oracle, cfg: env.cfg, boundary: true,
+        root, rel, ctx, state: currentState, incoming: currentIncoming, oracle: snapshot.oracle, cfg: env.cfg, boundary: true,
       });
       const normalized = normalizedAfterAuthoredRefs(currentIdentity, snapshot.identity, authoredRefChanges);
       const same = normalized !== undefined && JSON.stringify(normalized) === confirmedIdentity;

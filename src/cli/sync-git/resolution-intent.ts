@@ -16,7 +16,6 @@ import {
   expectedStateNonce,
   type GitResolutionBinding,
   type GitResolutionLaneDisposition,
-  type RepoRecord,
   type SyncState,
   type WorkspaceConfig,
 } from "../config.js";
@@ -68,13 +67,28 @@ async function configBinding(root: string, rel: string, ctx: RepoCtx): Promise<G
   return { ownership: "owned", read: "failed", detail: `${local.fault.disposition}:${local.fault.reason}`, storeIdentity };
 }
 
-/** Recompute the complete show-me/intent binding. No mutation is permitted here. */
+/** Recompute the complete show-me/intent binding. No mutation is permitted here.
+ *
+ * The binding is exactly the CONSENT surface: the local state a resolve would
+ * set aside (refs, reflogs, HEAD, index, op-state, stash, the oracle receipt
+ * over the tracked working tree, owned config) and the incoming state it would
+ * adopt (`incomingKey`), inside one workspace lineage (`stream`/`stateNonce`).
+ *
+ * `record.repoGen` is deliberately NOT bound. It is a per-record write counter
+ * (state-plane cas-steps.ts bumps it on every transition), so ANY bookkeeping
+ * write — a deferral's `lastSeen` refresh on a routine daemon cycle, the
+ * resolve's own standing-P settlement in its take-theirs preflight — minted a
+ * fresh token while nothing a human consented to had changed. Field: FM's
+ * savvy-core rotated its token on six consecutive show→confirm pairs ~10s
+ * apart (2026-09-02), and design 177 already deleted this same "repoGen +1
+ * fence" from keep-mine's intent for the same reason. Concurrency safety at
+ * the write is the record CAS (`expectedRepoGen`) plus the follow's second
+ * proof — never token visibility (design 286). */
 export async function resolutionBindingIdentity(args: {
   root: string;
   rel: string;
   ctx: RepoCtx;
   state: SyncState;
-  record: RepoRecord;
   incoming: GitSection;
   oracle: AppliedManifestOracle;
   cfg: WorkspaceConfig;
@@ -106,7 +120,6 @@ export async function resolutionBindingIdentity(args: {
     stream: args.state.stream,
     stateNonce: expectedStateNonce(args.state),
     incomingKey: gitIncomingKey(args.incoming),
-    repoGen: args.record.repoGen,
     refs: sortedEntries(refs),
     reflogs,
     head,
