@@ -109,7 +109,15 @@ export async function preflightManualPresentArtifacts(args: {
     if (prepared.status === "hold") return prepared;
     for (const ref of new Set([...Object.keys(record.base?.refs ?? {}), ...Object.keys(incoming.refs), ...Object.keys(liveRefs)])) {
       if (!ref.startsWith("refs/heads/")) continue;
-      const changesProtectedBase = (record.base?.refs[ref] ?? null) !== (incoming.refs[ref] ?? null);
+      // Design 130 scopes a valid foreign artifact to a PHYSICAL-mutation veto
+      // ("Any other active foreign A/Z/P/K for R remains a physical-mutation
+      // veto", 130:1092-1094). A base-absent record protects no BASE yet, so
+      // `?? null` made every ref it carries read as a protected-BASE change and
+      // turned that veto into a blanket refusal of first-BASE landing — the
+      // field wedge on flat-meadow, where live == incoming == P.nextOid on all
+      // three vetoed refs and nothing was being mutated at all. Only a record
+      // that HAS a BASE can have it changed.
+      const changesProtectedBase = record.base ? (record.base.refs[ref] ?? null) !== (incoming.refs[ref] ?? null) : false;
       const changesPhysicalRef = (liveRefs[ref] ?? null) !== (incoming.refs[ref] ?? null);
       const disposition = prepared.protocol.artifacts[ref];
       const foreign = disposition?.absence === "active-foreign" || disposition?.present === "active-foreign"
