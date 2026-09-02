@@ -1,5 +1,45 @@
 # rbox status — living state snapshot
 
+## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
+
+- **#866 MERGED — the #832/#837 decision doc** (docs/design/notes/2026-09-01-832-git-plane-evaluation.md).
+  Verdict: field is PROOF-limited not divergence-limited (6 days of FM logs:
+  ZERO true ref divergences vs 1,851–4,629 proof-plane deferral lines/day);
+  proof machinery = 21 modules / 6,387 LOC; a 29-line ff-only rig makes #837's
+  classes 1–7 unrepresentable; BUT ff-only was rejected IN CODE for a real
+  reason (reachability.ts three-valued: shallow/missing-object must HOLD) and
+  the naive candidate corrupts linked worktrees. **Recommendation: one-week
+  SHADOW MODE** (ff-only verdict beside the existing one, log disagreement
+  only, ~1 day) — founder decides after reading.
+- **#864 MERGED (#863)**: ref cleanup batched to one `update-ref --stdin` per
+  loop (3 loops incl. deleteScratchPins), 64→8 ms/41 refs; design-130
+  allowlist updated honestly (fallback re-enters ownedUpdateRef).
+- **#868 in CI (#659 P1)**: theory refuted — not conflict copies. FM's 4 stuck
+  repos are the 4 of 125 with `base_cjson NULL`; classifier compared a PRISTINE
+  index against base(null)/incoming and screamed local-index for 6 days. Fix:
+  pristine-read-tree probe before blaming the receiver. Fleet still needs one
+  `rbox git resolve <repo>` per repo to establish BASE: rbox-home-page +
+  pegasus → take-theirs (clean); rbox-core + savvy-core carry FM-authored
+  commits → FOUNDER'S CALL (keep-mine/merge); rbox-core also has a .git/config
+  parse error. Product decision filed **#867** (base-absent repos dragged
+  into the follow pipeline; was legacyConflict pre-116).
+- **FM bench (dev e2d1faf vs stable 2.0.1, prod, purged after):** #861 skip =
+  −99.6% on ref-set-identical pushes (2.07 MB → 8.9 KB) but does NOT fire on
+  git-commit pushes (§28 git blobs enter blobRefs → sidecar sha changes) —
+  #820's value is exactly the commit case. **#857 hypothesis disproved:** pack
+  lane engages (36 packs), upload goodput 97 Mbps > #504's 75–82; the "33
+  Mbps" was a misread of `+=` lane counters (SUMS not walls — memory note
+  lane-counters-are-sums). Real waste: **4.8 s upload→commit gap (23%)** →
+  #857 retitled; packs close at half target (fill timers) → **#865**. #854
+  warmth ≈ 0.33 s/push, Bun already reuses connections → P3.
+- Fleet: Mac upgraded 2.0.1 tonight from the beach — folded the week's backlog,
+  zero halts (third machine proving #848); 17,927 chromium copies in its trash
+  (393 MB, harmless). Whole fleet on stable 2.0.1. Desktop = WiFi (not wired;
+  memory corrected) — never a bench host.
+- Owed: founder reads #866 → "shadow it" or close #832; founder's call on the
+  two FM repos with local commits; runner-wizard rerun (FLAKE-012 hit 3 more
+  times tonight); #823/#663 implementations after note skim.
+
 ## 2026-09-01 (afternoon, founder at the beach) — post-2.0.1 batch: 7 PRs, perf roadmap re-validated
 
 - **Merged:** #855 (#828 ghost pause records retire when their path is ignored —
