@@ -243,7 +243,7 @@ describe("A and P/K artifacts", () => {
   });
 
   test("caps refuse before another proof ref is created", async () => {
-    expect([MAX_UNSETTLED_BASE_ABSENT, MAX_BASE_PRESENT, MAX_BASE_PRESENT_KEEP]).toEqual([4096, 256, 512]);
+    expect([MAX_UNSETTLED_BASE_ABSENT, MAX_BASE_PRESENT, MAX_BASE_PRESENT_KEEP]).toEqual([4096, 2048, 4096]);
     const settleable = await prepareBaseAbsentArtifact(repo, binding, "refs/heads/settleable", commit);
     const lines = Array.from({ length: MAX_UNSETTLED_BASE_ABSENT - 1 }, (_, index) =>
       `create ${BASE_ABSENT_PREFIX}/${binding.lineageHash}/${index.toString(16).padStart(64, "0")} ${commit}`);
