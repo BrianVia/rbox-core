@@ -1,5 +1,34 @@
 # rbox status — living state snapshot
 
+## 2026-09-02 (early) — FM landing night: 3 of 4 repos converged, 3 fixes merged, the proof plane peeled six layers on one repo
+
+- **Merged:** #869 (base-absent record is a first-BASE landing, not a
+  protected-base change — the blanket "foreign BASE artifact" veto; "foreign"
+  = THIS host's own superseded lineage, never a peer), #872 (base artifact
+  capacity 256/512 → 2048/4096: one artifact per branch, rbox-core has 283),
+  #873 (consent token no longer binds `repoGen` — take-theirs stopped
+  self-invalidating; design 177 had already removed it from keep-mine).
+- **Filed:** #870 (orphaned foreign artifacts never retire; 88 on FM), #871
+  (a deletion without branchBaseOrigins provenance is refused forever and
+  silences the WHOLE repo section — desktop rbox-core unpublished 9 days;
+  "origin-mismatch" means provenance, not GitHub). #828 REOPENED (whole-tree
+  ignore never reaches the retirement branch; agent on it).
+- **FM landed at desktop tips** (founder: "desktop copies win — at least in
+  this case", NOT a general rule): rbox-home-page 671bb5b, pegasus 4808a8da
+  (fresh adoption), rbox-core add8a7e (fresh adoption ×2 after six sequential
+  refusals: veto → missing-branch-proof → capacity → op-state breadcrumb →
+  BASE pre-state → standing-P receipt; ledger on #837). savvy-core: desktop
+  keep-mine PUBLISHED (seq 4798, needed `--force-discard-incoming`; FM's
+  only-here commit "fix(studio): vendor-export scope counts" set aside); FM
+  take-theirs confirm queued for the next quiet moment (token now stable).
+- Both hosts on dev 2.0.1-dev+add8a7e (desktop + FM); Mac on stable 2.0.1.
+- Recipes + traps in memory `git-plane-unwedge-recipes` (incl. keep-mine's
+  flag re-print misread as rotation; never `pkill -f` a pattern that matches
+  your own ssh command).
+- Owed: savvy-core FM confirm result; #828 whole-tree retirement fix; the
+  desktop's 134 ghosts; #832 "shadow it" decision; runner-wizard rerun
+  (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
+
 ## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
 
 - **#866 MERGED — the #832/#837 decision doc** (docs/design/notes/2026-09-01-832-git-plane-evaluation.md).
