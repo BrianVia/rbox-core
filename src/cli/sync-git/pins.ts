@@ -82,7 +82,10 @@ export async function deleteRefsBatch(repoDir: string, refs: string[], boundary?
     // -z delete record: `delete SP <ref> NUL <old-value> NUL`, old-value empty = unverified.
     await git(repoDir, ["update-ref", "-z", "--stdin"], { stdin: refs.map((ref) => `delete ${ref}\0\0`).join("") })
       .catch(async () => {
-        for (const ref of refs) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+        // Through `ownedUpdateRef`, not a third raw `update-ref` site (design 130).
+        // No boundary: the lease above already covers the whole mutation, and
+        // passing it here would re-enter one observation per ref.
+        for (const ref of refs) await ownedUpdateRef(repoDir, ["-d", ref]).catch(() => {});
       });
   } finally {
     await lease?.finish().catch(() => {});

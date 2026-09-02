@@ -179,15 +179,25 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     "src/cli/adopt-git.ts": 1,
     "src/cli/reset-z-runtime.ts": 3,
     "src/cli/state-plane/reset/crash-rig-child.ts": 1,
-    // Was sync-git/follow.ts; the same single site moved with stageIncoming
-    // when follow.ts was split into domain modules. Count unchanged.
-    "src/cli/sync-git/follow-staging.ts": 1,
     "src/cli/sync-git/orig-head.ts": 1,
     "src/cli/sync-git/git-state-apply.ts": 3,
     "src/cli/sync-git/base-artifacts.ts": 1,
     "src/cli/sync-git/checkout-txn.ts": 1,
     "src/cli/sync-git/keep-pins.ts": 2,
-    "src/cli/sync-git/pins.ts": 1,
+    // #863: TWO sites, both confined to the rbox-OWNED scratch namespaces
+    // (`refs/rbox-wip/*`, `refs/rbox-incoming/*`) and never a user ref.
+    //   1. `ownedUpdateRef` — the owned helper every single-ref mutation routes
+    //      through, which is why this file may hold a raw site at all.
+    //   2. `deleteRefsBatch` — batch DELETION only, one `update-ref -z --stdin`
+    //      transaction in place of one spawn per ref. It bypasses the owned
+    //      helper because that helper is single-ref by construction; it still
+    //      takes the same observation lease, once around the whole mutation.
+    //      Its partial-failure fallback deliberately re-enters `ownedUpdateRef`
+    //      per ref rather than opening a third raw site.
+    // The follow path's former raw site (was sync-git/follow.ts, then
+    // follow-staging.ts) is GONE, not moved: `cleanupRefs` now calls
+    // `deleteRefsBatch`, so that file no longer names `update-ref` at all.
+    "src/cli/sync-git/pins.ts": 2,
     // Design 273 P3: the ONE ref mutation for `refs/rbox-pending/*`, batched
     // through a single `update-ref --stdin` for both the write and the sweep.
     // Deliberately not routed through pins.ts, whose refs are capture-scoped and
