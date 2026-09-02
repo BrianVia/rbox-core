@@ -14,7 +14,7 @@
 - **#864 MERGED (#863)**: ref cleanup batched to one `update-ref --stdin` per
   loop (3 loops incl. deleteScratchPins), 64→8 ms/41 refs; design-130
   allowlist updated honestly (fallback re-enters ownedUpdateRef).
-- **#868 in CI (#659 P1)**: theory refuted — not conflict copies. FM's 4 stuck
+- **#868 MERGED (#659 P1)**: theory refuted — not conflict copies. FM's 4 stuck
   repos are the 4 of 125 with `base_cjson NULL`; classifier compared a PRISTINE
   index against base(null)/incoming and screamed local-index for 6 days. Fix:
   pristine-read-tree probe before blaming the receiver. Fleet still needs one
