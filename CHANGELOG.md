@@ -6,6 +6,35 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-09-02
+
+2.0.2 is the "adopt the other machine's checkout without a fight" release.
+Every fix here was found and proven overnight on the founder fleet while
+landing four real repositories from one machine onto another.
+
+### Fixed
+- `rbox git resolve <repo> take-theirs` works again on real repositories:
+  the confirmation token no longer changes under you while the background
+  sync is running, a repository with mixed-case branch names no longer
+  refuses its own unchanged confirmation, and a repository that had never
+  established a sync baseline is no longer blocked by stale bookkeeping from
+  an earlier state of the same machine.
+- A repository with more than 256 branches can sync again (the per-branch
+  bookkeeping limit is now 2,048).
+- `rbox recover` refuses to overwrite commits made on another machine —
+  it only repairs history this machine authored, and says so.
+- Receivers no longer pause a repository as "local changes" when its index
+  is simply pristine; the paused-repo list now shows real work only.
+- "Repos waiting on you" entries for directories you have since ignored
+  retire automatically (131 stale entries cleared on the founder desktop),
+  including whole ignored trees.
+- `rbox status` and `rbox doctor` warn when one directory suddenly dominates
+  what rbox is about to sync, and name the one-line ignore that skips it.
+- Pushes skip re-uploading the multi-megabyte ref index when the server
+  already has it (up to 99% fewer bytes on edits and renames).
+- Git ref cleanup after a sync runs as one git call per repository instead
+  of one per branch (8× faster on branch-heavy repositories).
+
 ## [2.0.1] - 2026-09-01
 
 2.0.1 makes rbox honest and safe around very large folders. If a huge
