@@ -2,6 +2,14 @@
 
 ## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
 
+- **Perf snapshot 2026-09-02 evening**: FM pull of 188K files/125 repos
+  unchanged = ~3s, git-apply 0.1s, shadow cost invisible. Desktop churns:
+  17 empty pushes/hour at ~7s each (git-plan 3s + state-save 2.4s for
+  ZERO changes) + 2s safety scan/min; daemon ~70% of a core, RSS 3.6–4GB.
+  Trigger: `Personal/home-dashboard/build.log` arrives from a peer every
+  10 min. Proposed (awaiting founder yes): add `build.log` to
+  home-dashboard's `.rboxignore`. Follow-up candidate: empty push should
+  not cost 7s.
 - **#881 MERGED (#832 shadow mode)**: read-only ff-only verdict beside the
   proof plane, default ON (`RBOX_GIT_SHADOW=0` kills), logs only
   disagreements, cross-tab in `.rbox/state/git-shadow.json` + one doctor
