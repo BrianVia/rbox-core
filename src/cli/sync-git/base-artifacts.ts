@@ -15,8 +15,8 @@ export const BASE_PRESENT_PREFIX = "refs/rbox-local/base-present/v2";
 export const BASE_PRESENT_KEEP_PREFIX = "refs/rbox-local/base-present-keep/v2";
 export const SETTLED_ABSENCE_PREFIX = "refs/rbox-local/base-absent-settled/v1";
 export const MAX_UNSETTLED_BASE_ABSENT = 4_096;
-export const MAX_BASE_PRESENT = 256;
-export const MAX_BASE_PRESENT_KEEP = 512;
+export const MAX_BASE_PRESENT = 2_048;
+export const MAX_BASE_PRESENT_KEEP = 4_096;
 
 export interface BaseAbsentPayload extends ArtifactBinding {
   v: 2;
