@@ -2,7 +2,13 @@
 
 ## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
 
-- **v2.0.2 release commit a8b47654a** on main (changelog: 'adopt the other
+- **v2.0.2 TAGGED on a8b47654a** (release run green after two FLAKE-012
+  reruns; a docs push had cancelled the first run — lesson in memory: no
+  main pushes while the release SHA is under test). Release workflow →
+  fleet back to stable next. **#880 MERGED (#878)**: recovery-kit lock
+  claimed atomically (temp+link) — the once-only 'two winners' was a real
+  race, not a flake.
+- v2.0.2 release commit a8b47654a (changelog: 'adopt the other
   machine's checkout without a fight' — rolls up #855 #856 #858 #859 #860
   #861 #864 #868 #869 #872 #873 #874 #877). Tag fires on exact-SHA main CI
   green; then fleet back to stable (desktop, FM, Mac if reachable).
