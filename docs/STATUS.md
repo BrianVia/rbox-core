@@ -38,7 +38,17 @@
   mixed-case branch names could never pass; also LANG-dependent hashing).
   Fix: one code-point comparator (PR pending). FM's rbox-core settlement took 45 min
   (artifacts 358 → 0), then FM pulled clean.
-- Owed: savvy-core FM confirm (blocked on #647 fix); #832 "shadow it" decision; runner-wizard rerun
+- **#877 MERGED (#647)**: the boundary's #836 normalizer sorted with
+  localeCompare vs the identity's code-point sort — mixed-case branch names
+  could never confirm. First confirm ever got through set-aside + publish,
+  then failed at LANDING: `journal-recovery` → daemon deferred 'unreadable
+  or corrupt journal' forever (journal parses fine; CAS/validation — **#879**,
+  it also blocks fresh adoption until the entry is moved out of
+  git-journal/). savvy-core on FM: journal moved aside, fresh adoption in
+  flight (desktop HEAD 4452fc6a is the target). #878 filed (recovery-kit
+  once-only claim produced two winners under starvation — atomicity, not
+  flake). Both hosts on dev cf9afd0.
+- Owed: savvy-core FM adoption result; #832 "shadow it" decision; runner-wizard rerun
   (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
 
 ## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
