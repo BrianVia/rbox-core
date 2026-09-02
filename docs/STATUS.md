@@ -48,7 +48,12 @@
   flight (desktop HEAD 4452fc6a is the target). #878 filed (recovery-kit
   once-only claim produced two winners under starvation — atomicity, not
   flake). Both hosts on dev cf9afd0.
-- Owed: savvy-core FM adoption result; #832 "shadow it" decision; runner-wizard rerun
+- **ALL FOUR FM repos converged on desktop tips** (savvy-core landed 06:27Z
+  via fresh adoption after the stale landing journal was moved aside). FM
+  daemon restarted once unnecessarily (I misjudged wall time — lesson in
+  memory). #877 field-proven: the confirm crossed the boundary for the first
+  time ever.
+- Owed: #832 "shadow it" decision; runner-wizard rerun
   (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
 
 ## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
