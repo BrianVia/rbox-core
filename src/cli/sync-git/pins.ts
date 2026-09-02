@@ -81,22 +81,24 @@ export async function deleteScratchPins(repoDir: string, pins: ScratchPins, boun
 
 /** Prune stale scratch refs left by CRASHED runs — AGE-GUARDED [v3]: only entries whose
  *  `<epochMs>-<rand>` id is older than 1h are deleted. A blind prune in a SHARED gitdir
- *  would delete a concurrent sibling capture's live pins. */
-export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundary?: OwnedRefMutationBoundary): Promise<void> {
+ *  would delete a concurrent sibling capture's live pins.
+ *
+ *  Returns how many refs it deleted, so a caller that times the prune can report
+ *  the width behind that time (`refCleanupRefs`). */
+export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundary?: OwnedRefMutationBoundary): Promise<number> {
   const out = await git(repoDir, ["for-each-ref", "--format=%(refname)", ns]).catch(() => "");
   const cutoff = Date.now() - SCRATCH_MAX_AGE_MS;
-  for (const ref of out.split("\n").filter(Boolean)) {
-    if (ref === ns) {
-      // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
-      // the namespaced refs below and old clients only ever ran on unshared root repos, so
-      // deleting it blindly is safe (and matches the old cleanup).
-      await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
-      continue;
-    }
+  const stale = out.split("\n").filter(Boolean).filter((ref) => {
+    // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
+    // the namespaced refs below and old clients only ever ran on unshared root repos, so
+    // deleting it blindly is safe (and matches the old cleanup).
+    if (ref === ns) return true;
     const id = ref.slice(ns.length + 1).split("/")[0] ?? "";
     const epoch = Number.parseInt(id, 10);
-    if (Number.isFinite(epoch) && epoch < cutoff) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
-  }
+    return Number.isFinite(epoch) && epoch < cutoff;
+  });
+  for (const ref of stale) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
+  return stale.length;
 }
 
 /** Objects the section references that a scoped bundle might not reach: the detached-HEAD

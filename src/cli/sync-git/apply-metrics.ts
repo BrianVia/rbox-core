@@ -75,7 +75,9 @@ const GIT_APPLY_RESULT_ABBR = {
 const GIT_APPLY_REPO_EXEMPLAR_CAP = 8;
 
 const GIT_CHAIN_TIMING_FIELDS = {
-  chainLength: { abbr: "L", label: "chainLength" },
+  /** `count: true` marks a field that is a tally, not a duration: it still
+   * appears per repo, but a p50/p95/max over it would be meaningless. */
+  chainLength: { abbr: "L", label: "chainLength", count: true },
   fetchDecryptMs: { abbr: "fd", label: "fetchDecryptMs" },
   bundleVerifyMs: { abbr: "bv", label: "bundleVerifyMs" },
   gitImportMs: { abbr: "gi", label: "gitImportMs" },
@@ -85,13 +87,18 @@ const GIT_CHAIN_TIMING_FIELDS = {
   ownershipMs: { abbr: "ow", label: "ownershipMs" },
   reflogMs: { abbr: "rl", label: "reflogMs" },
   connectivityProofMs: { abbr: "cp", label: "connectivityProofMs" },
+  refCleanupMs: { abbr: "rc", label: "refCleanupMs" },
   classifyExclusiveMs: { abbr: "cx", label: "classifyExclusiveMs" },
   heldInputMs: { abbr: "hi", label: "heldInputMs" },
   standingProofMs: { abbr: "sp", label: "standingProofMs" },
   followMs: { abbr: "fw", label: "followMs" },
   classifyMs: { abbr: "cl", label: "classifyMs" },
   residualMs: { abbr: "rs", label: "residualMs" },
-} as const satisfies Record<keyof GitChainTimings, { abbr: string; label: string }>;
+  // Appended, not slotted beside `chainLength`: the legacy line's leading bytes
+  // (`L<n>fd…io…`) are pinned byte-for-byte, and a count inserted after `L`
+  // would rewrite them.
+  refCleanupRefs: { abbr: "rn", label: "refCleanupRefs", count: true },
+} as const satisfies Record<keyof GitChainTimings, { abbr: string; label: string; count?: true }>;
 
 const GIT_CHAIN_TIMING_FIELD_ROWS = Object.values(GIT_CHAIN_TIMING_FIELDS);
 const GIT_CHAIN_LEGACY_REQUIRED_DISTRIBUTION_FIELDS = 4;
@@ -217,7 +224,7 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
     .map((timing) => timing.chain)
     .filter((chain): chain is GitChainTimings => chain !== undefined && hasGitChainTiming(chain));
   if (chainTimings.length > 0) {
-    const distributionFields = GIT_CHAIN_TIMING_FIELD_ROWS.filter((field) => field.label !== "chainLength");
+    const distributionFields = GIT_CHAIN_TIMING_FIELD_ROWS.filter((field) => !("count" in field));
     for (const [index, field] of distributionFields.entries()) {
       distributions.push(formatGitApplyDistribution(
         field.label,
