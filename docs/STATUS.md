@@ -2,6 +2,11 @@
 
 ## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
 
+- **v2.0.2 RELEASED + fleet on stable** (api.rbox.to/version = 2.0.2;
+  desktop pid 3214381, flat-meadow pid 3993057, both `syncing normally`;
+  FM 'No git repos are paused'; desktop shows the 3 known residual ghosts).
+  Mac still owed `rbox upgrade` when online. Dev builds retired
+  (`~/.local/bin/rbox-dev`, FM `~/rbox-dev-647` stopped).
 - **v2.0.2 TAGGED on a8b47654a** (release run green after two FLAKE-012
   reruns; a docs push had cancelled the first run — lesson in memory: no
   main pushes while the release SHA is under test). Release workflow →
