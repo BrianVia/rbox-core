@@ -31,7 +31,13 @@
   dev 71fff25. **#875 filed:** fresh adoption of the 256-branch rbox-core on
   FM ran P-settlement silently 30+ min at 80% CPU while status claimed 'WAL
   replay' (it wasn't).
-- Owed: savvy-core FM confirm (queued behind FM's settlement); #832 "shadow it" decision; runner-wizard rerun
+- **#647 root-caused with the forensics hook** (savvy-core FM take-theirs): after
+  #873 the confirm reaches the locked boundary and refuses — `boundary-diff
+  field reflogs … authored: []` = rbox's OWN protocol ref writes appended
+  reflog entries the boundary treats as user changes (the #836 class one
+  layer down). Fix agent dispatched. FM's rbox-core settlement took 45 min
+  (artifacts 358 → 0), then FM pulled clean.
+- Owed: savvy-core FM confirm (blocked on #647 fix); #832 "shadow it" decision; runner-wizard rerun
   (FLAKE-012 hit 5× tonight); fleet back to stable when 2.0.2 ships.
 
 ## 2026-09-01 (night) — overnight lanes: #832 decision doc, #659 root-caused, bench truths
