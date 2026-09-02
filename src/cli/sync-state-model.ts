@@ -281,7 +281,6 @@ export interface GitResolutionBinding {
   stream: string;
   stateNonce: string;
   incomingKey: string;
-  repoGen: number;
   refs: Array<[string, string]>;
   reflogs: Array<[string, string[]]>;
   head: string;

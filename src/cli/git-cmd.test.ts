@@ -821,7 +821,7 @@ test("take-theirs verifies an already-absent branch and creates A before removin
   expect(activeA).toBe("");
 });
 
-test("take-theirs P-repairs a moved standing episode, invalidates the old confirmation, then resnapshots", async () => {
+test("take-theirs P-repairs a moved standing episode without voiding the confirmation it was given", async () => {
   const { base, incoming } = await fixture();
   const prior = base.refs["refs/heads/main"]!;
   const next = incoming.refs["refs/heads/main"]!;
@@ -848,13 +848,16 @@ test("take-theirs P-repairs a moved standing episode, invalidates the old confir
   await commitPlannedBranchTransition(plan);
   await git(receiver, "update-ref", "-m", "user moved topic", "refs/heads/topic", prior, next);
 
-  const stale = await show([]);
-  const first: string[] = [];
-  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: stale.snapshot }, deps(first))).toBe(1);
-  expect(JSON.parse(first.at(-1)!)).toMatchObject({ status: "snapshot-mismatch" });
-  const fresh = await show([]);
-  expect(fresh.snapshot).not.toBe(stale.snapshot);
-  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: fresh.snapshot }, deps([]))).toBe(0);
+  // The repair the confirm's OWN preflight performs rewrites the RepoRecord,
+  // and this used to void the token the user had just been handed: the second
+  // invocation invalidated itself, so on a repo that re-mints a standing P the
+  // loop never terminated (issue #647). The repair touches rbox's protocol
+  // artifacts, not the local state the human consented to lose, so the
+  // confirmation now stands and the repair still happens.
+  const shown = await show([]);
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: shown.snapshot }, deps(lines))).toBe(0);
+  expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "resolved", verb: "take-theirs" });
   expect(await git(receiver, "rev-parse", "refs/heads/topic")).toBe(next);
   const remainingP = await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)", "refs/rbox-local/base-present/v2");
   const remainingPayloads = await Promise.all(remainingP.split("\n").filter(Boolean)
@@ -1537,7 +1540,7 @@ test("the two makeIntended error classes classify into their own resolve codes",
 
 test("authored reflog normalization explains before+after, refuses a third oid", () => {
   const identity = (refs: Array<[string, string]>, reflogs: Array<[string, string[]]>): SnapshotIdentity => ({
-    stream: "s", stateNonce: "n", incomingKey: "k", repoGen: 1, refs, reflogs,
+    stream: "s", stateNonce: "n", incomingKey: "k", refs, reflogs,
     head: "ref: refs/heads/main\n", index: { kind: "projected", value: "i" }, opState: [], stash: [],
     oracleReceipt: null, config: { ownership: "owned", read: "ok" }, effectiveRefScope: "all",
     capturePolicy: { syncGit: true, respectGitignore: true }, repoKind: "dir", repositoryIdentity: "r",
@@ -2061,4 +2064,52 @@ test("the batch total never presents an unread repo's zero as a fact", async () 
   // The unread repo contributes 0; presenting that sum unqualified is the same
   // defect as the dry run's "nothing to save".
   expect(oneUnread).toContain("Total: 2 repos · 4 files you changed here get published across the 1 of them rbox could read");
+});
+
+// A routine daemon cycle that re-touches this repo's deferral bookkeeping
+// writes the RepoRecord, and every record write bumps `repoGen`
+// (state-plane/store/cas-steps.ts). Binding the confirmation token to that
+// counter is what made FM's savvy-core rotate its token on six consecutive
+// show→confirm pairs ~10s apart (2026-09-02) with nothing consent-relevant
+// changing — confirm-by-copy-paste could never win the race.
+test("a routine daemon record write does not rotate the confirmation token", async () => {
+  const { incoming } = await fixture();
+  const shown = await show([]);
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = repoRecordsForState(state).repo!;
+  state.repoRecords!.repo = {
+    ...record,
+    repoGen: record.repoGen + 1,
+    deferrals: { apply: { ...record.deferrals!.apply!, lastSeen: "2026-07-13T02:00:00.000Z" } },
+  };
+  await saveStateUnsafeLegacyOrTest(root, state);
+
+  expect((await show([])).snapshot).toBe(shown.snapshot);
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: shown.snapshot }, deps(lines))).toBe(0);
+  expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "resolved", verb: "take-theirs", snapshot: shown.snapshot });
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+});
+
+// The safety property the token exists for: it must refuse whenever the LOCAL
+// state this resolve would set aside has changed since it was shown. The ref
+// lane is covered above ("rejects a stale confirmation before quarantine when
+// a ref moves"); index and stash are the other two lanes a human is consenting
+// to lose.
+test("the confirmation token invalidates when the local index or stash changes", async () => {
+  await fixture();
+  const beforeIndex = await show([]);
+  await fs.writeFile(path.join(receiver, "staged.txt"), "staged\n");
+  await git(receiver, "add", "staged.txt");
+  const indexLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: beforeIndex.snapshot }, deps(indexLines))).toBe(1);
+  expect(JSON.parse(indexLines.at(-1)!)).toMatchObject({ status: "snapshot-mismatch" });
+
+  const beforeStash = await show([]);
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "stashed edit\n");
+  await git(receiver, "stash", "push", "-q", "-m", "local work");
+  const stashLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: beforeStash.snapshot }, deps(stashLines))).toBe(1);
+  expect(JSON.parse(stashLines.at(-1)!)).toMatchObject({ status: "snapshot-mismatch" });
+  await expect(fs.access(path.join(root, ".rbox", "git-quarantine"))).rejects.toThrow();
 });
