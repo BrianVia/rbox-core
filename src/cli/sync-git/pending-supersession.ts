@@ -47,7 +47,7 @@ export function pendingSupersessionAckConverges(input: {
       incomingKey: gitIncomingKey(input.candidate),
       sourceSeq: DRY_RUN_SOURCE_SEQ,
       advertisedRefs: input.candidate.refs,
-      ...(input.absentBranchProofs ? { absentBranchProofs: input.absentBranchProofs } : {}),
+      absentBranchProofs: input.absentBranchProofs,
     },
     {
       repoKind: input.binding.repoKind,
@@ -188,7 +188,7 @@ export async function pendingSupersessionPreProbe(
           identityKey: gitIdentityKey(identity),
           identityRefs: identity.refs,
         },
-        ...(preflight.kind ? { kind: preflight.kind } : {}),
+        kind: preflight.kind,
       },
     };
   } catch {
