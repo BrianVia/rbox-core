@@ -139,9 +139,11 @@ test("an indeterminate lane passes only when the confirmed intent covers that ex
 });
 
 test("indeterminate index and op-state lanes refuse even when authorized — their preservation set cannot be enumerated", () => {
-  const base = { detail: "could not be proven" };
   for (const lane of ["index", "op-state"]) {
-    const report = { forceRequired: true, lanes: [{ lane, disposition: "indeterminate", ...base }] } as unknown as ResolutionDiscardReport;
+    const report: ResolutionDiscardReport = {
+      forceRequired: true,
+      lanes: [{ lane, disposition: "indeterminate", detail: "could not be proven" }],
+    };
     expect(reportAuthorized([lane], report)).toBe(false);
   }
 });

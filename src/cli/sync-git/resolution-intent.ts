@@ -116,6 +116,11 @@ export async function resolutionBindingIdentity(args: {
     gitDirReal: args.ctx.gitDir,
     commonDirReal: args.ctx.commonDir,
   });
+  const capturePolicy: GitResolutionBinding["capturePolicy"] = {
+    syncGit: args.cfg.syncGit === true,
+    respectGitignore: args.cfg.respectGitignore === true,
+  };
+  if (args.cfg.git?.incremental !== undefined) capturePolicy.incremental = args.cfg.git.incremental;
   return {
     stream: args.state.stream,
     stateNonce: expectedStateNonce(args.state),
@@ -129,11 +134,7 @@ export async function resolutionBindingIdentity(args: {
     oracleReceipt: args.oracle.receiptHash(args.rel) ?? null,
     config: await configBinding(args.root, args.rel, args.ctx),
     effectiveRefScope: identity.refScope,
-    capturePolicy: {
-      syncGit: args.cfg.syncGit === true,
-      respectGitignore: args.cfg.respectGitignore === true,
-      ...(args.cfg.git?.incremental === undefined ? {} : { incremental: args.cfg.git.incremental }),
-    },
+    capturePolicy,
     repoKind: args.ctx.kind,
     repositoryIdentity: repositoryIdentityHash(repoIdentity),
   };
@@ -203,12 +204,15 @@ function exactLane(lane: string, pending: ExactLaneValue | undefined, candidate:
   const pendingCanonical = canonicalString(pending === undefined ? null : pending);
   const candidateCanonical = canonicalString(candidate === undefined ? null : candidate);
   const equal = pendingCanonical === candidateCanonical;
-  return {
+  // `incomingOids` stays absent rather than undefined: the report is hashed
+  // through canonicalString for the confirmed rider.
+  const report: ResolutionLaneReport = {
     lane,
     disposition: equal ? "subsumed" : "not-subsumed",
     detail: equal ? "incoming value is retained" : "incoming value would be replaced",
-    ...(incomingOids?.length ? { incomingOids } : {}),
   };
+  if (incomingOids?.length) report.incomingOids = incomingOids;
+  return report;
 }
 
 function indexLaneValue(index: { kind: "absent" | "indeterminate" | "projected"; value?: string }): { kind: string; value?: string } {
