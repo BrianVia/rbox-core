@@ -2695,6 +2695,49 @@ test("an ignored repository with no standing pause retires nothing", async () =>
   expect(plan.ignoreRetired).toEqual([]);
 }, 20_000);
 
+// #828 field shape (2026-09-02, founder desktop): the 132 surviving chromium
+// pauses are capture-lane records with NO base and NO pending section — the
+// capture that would have minted one was deferred ("unsupported") before it ever
+// ran. Such a record is in none of the planner's key sources (discovery is pruned
+// by the whole-tree `chromium/` rule, and there is no base/pending entry), so no
+// per-repo branch ever meets it. Retirement must join the RECORD set against the
+// current ignore rules, not the planned set.
+test("a paused record with no base and no pending still retires under a whole-tree ignore rule", async () => {
+  const parent = "ghost-parent";
+  const rel = `${parent}/nested`;
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  const state = await st(rootA);
+  // Exactly the field record: a standing capture pause, nothing else.
+  state.repoRecords = {
+    ...state.repoRecords,
+    [rel]: {
+      repoGen: 1,
+      sourceSeq: 1,
+      deferrals: {
+        capture: {
+          lane: "capture",
+          deferredSince: "2026-08-23T16:25:52.377Z",
+          reasonSince: "2026-08-23T16:25:52.377Z",
+          lastSeen: "2026-09-01T01:53:08.484Z",
+          reason: "unsupported",
+        },
+      },
+    },
+  };
+
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA, { ignorePaths: [parent] }),
+  );
+  expect(plan.ignoreRetired).toEqual([rel]);
+  // The observation write only visits observed repos, so retirement must land there too.
+  expect(plan.captureObserved).toContain(rel);
+  // Bookkeeping only: files and `.git` are untouched.
+  expect(await fs.readFile(path.join(repo, "f.txt"), "utf8")).toBe("one");
+  expect(await fs.stat(path.join(repo, ".git")).then(() => true)).toBeTrue();
+}, 20_000);
+
 test("carried repositories refresh the packed-refs baseline even when absence capture is switched off", async () => {
   const repo = path.join(rootA, "carried-packed-baseline");
   await initRepo(repo);

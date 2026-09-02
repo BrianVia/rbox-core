@@ -1,6 +1,7 @@
 /** Never: probe/capture Git, retain/upload artifacts, authorize branch absence, or persist state. */
 import path from "node:path";
-import { gitSectionsDiffer, type GitSection } from "../../engine/index.js";
+import { gitSectionsDiffer, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import type { RepoRecordsByPath } from "../sync-state-model.js";
 import type { GitDeferralReason, SyncState } from "../config.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { repoRecordsForState, validManifestMeta } from "../config.js";
@@ -151,6 +152,30 @@ export class GitPlanAccumulator {
     if (seen.has(key)) return;
     seen.add(key);
     this.glog(line);
+  }
+
+  /** #828: the one join of the KNOWN RECORD set against the CURRENT ignore rules.
+   * It must be the record set, not the planned set: a paused record can have no
+   * BASE and no pending section — the capture that would mint one was deferred
+   * before it ever ran — so it reaches none of the planner's key sources once
+   * discovery prunes its path, and no per-repo branch ever meets it (the field
+   * shape behind all 132 surviving chromium pauses). The sync those lanes were
+   * protecting can never run again, so the record retires: observed here, cleared
+   * by the capture-observation write that already owns durable lane transitions.
+   * Bookkeeping only — the worktree and `.git` are untouched, and un-ignoring the
+   * path lets ordinary discovery mint a fresh record. */
+  retireIgnoredRecords(records: RepoRecordsByPath, matcher: IgnoreMatcher): void {
+    for (const [rel, record] of Object.entries(records)) {
+      if (rel === "." || Object.keys(record.deferrals ?? {}).length === 0) continue;
+      if (!(matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) continue;
+      this.captureObserved.add(rel);
+      this.ignoreRetired.add(rel);
+    }
+    // One line per pass, never silent: retirement is a state transition a reader
+    // must be able to see after the fact.
+    if (this.ignoreRetired.size > 0) {
+      this.log(`git-sync: retired ${this.ignoreRetired.size} paused repos now under ignore rules`);
+    }
   }
 
   carry(rel: string, section: GitSection): void {

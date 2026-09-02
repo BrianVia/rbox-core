@@ -269,13 +269,6 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
         if (dotGit && rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) {
           out[rel] = baseSection;
           skipped.push({ relPath: rel, reason: "gitignored by discovery pruning — carrying base" });
-          // #828: this is the one pass that joins known repos against the CURRENT
-          // ignore rules, so it is where a pause retires. The sync those lanes were
-          // protecting can never run again; carrying the record forever only buries
-          // live deferrals in `rbox status --git`. Bookkeeping only — the worktree
-          // and `.git` are left exactly as they are, and un-ignoring the path lets
-          // ordinary discovery mint a fresh record.
-          if (Object.keys(stateRecords[rel]?.deferrals ?? {}).length > 0) accumulator.ignoreRetired.add(rel);
         } else {
           deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
         }
@@ -366,11 +359,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
     carried = carried.filter((rel) => !skippedRelPaths.has(rel));
     accumulator.carried = carried;
   }
-  // One line per pass, never silent: retirement is a state transition a reader
-  // must be able to see after the fact.
-  if (accumulator.ignoreRetired.size > 0) {
-    accumulator.log(`git-sync: retired ${accumulator.ignoreRetired.size} paused repos now under ignore rules`);
-  }
+  accumulator.retireIgnoredRecords(stateRecords, matcher);
   stage.clearPreCaptureCtx();
   await options.beforeCapturePool?.();
   timings.carryMs += performance.now() - startedAt - (timings.fingerprintMs - fingerprintAtStart);
