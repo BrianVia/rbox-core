@@ -7,11 +7,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { probeReceiverEquivalence, receiverEquivalentCollisionNames, receiverEquivalentPath, type GitArtifactRef, type GitSection } from "../../engine/index.js";
 import { indexIdentityV2 } from "./index-identity.js";
-import { pruneStaleScratchRefs } from "./pins.js";
+import { deleteRefsBatch, pruneStaleScratchRefs } from "./pins.js";
 import { listRefs } from "./refs.js";
 import { addTimedMs, countRefCleanup } from "./chain-timings.js";
 import { clearIndexResolveUndo, getGitArtifact, importGitPackChain } from "./git-state.js";
-import { git, gitWithIndexFile } from "../../engine/git-spawn.js";
+import { gitWithIndexFile } from "../../engine/git-spawn.js";
 import type { FollowOptions, StagedIncoming, StageIncomingOptions } from "./follow-types.js";
 
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
@@ -68,8 +68,11 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
   const tmpDir = await fs.mkdtemp(path.join(ctx.repoDir, ".rbox", "git-follow-"));
   const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const cleanupRefs = () => addTimedMs(opts.chainTimings, "refCleanupMs", async () => {
+    // Exactly the refs `listRefs` reports under this follow's own
+    // `refs/rbox-incoming/<id>` namespace — batching changes the spawn count,
+    // never the ref set.
     const refs = await listRefs(ctx.repoDir, incomingNs).catch(() => []);
-    for (const ref of refs) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    await deleteRefsBatch(ctx.repoDir, refs);
     countRefCleanup(opts.chainTimings, refs.length);
   });
   const cleanup = async () => {

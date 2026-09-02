@@ -55,6 +55,40 @@ async function ownedUpdateRef(
   }
 }
 
+/** Delete a set of rbox-owned refs in ONE `git update-ref --stdin` spawn instead of
+ *  one spawn per ref (#863: 41 refs cost 64ms of pure spawn latency on the follow
+ *  path, and a real FM pull spent 6.9s there).
+ *
+ *  Two properties of the old `for (…) update-ref -d <ref>` loop are preserved
+ *  deliberately:
+ *
+ *  - A ref that VANISHED between enumeration and delete is not an error. Each
+ *    `delete` line carries NO old-value, so git does not verify the ref exists —
+ *    identical to `update-ref -d <ref>` without an old value, which exits 0 on a
+ *    missing ref (verified, git 2.54).
+ *  - A ref that genuinely FAILS (a concurrent `.lock`) must not take the others
+ *    down with it. `--stdin` is a single transaction, so one locked ref aborts
+ *    the whole batch and deletes nothing — where the old loop deleted everything
+ *    it still could. The per-ref fallback restores exactly that tolerance; it
+ *    costs one extra spawn only on the failing path, and deletes are idempotent,
+ *    so re-running them over a partially applied transaction is safe.
+ *
+ *  `-z` so no refname can be misread as a quoted line. Ref-lock semantics are
+ *  unchanged: update-ref honors them either way. */
+export async function deleteRefsBatch(repoDir: string, refs: string[], boundary?: OwnedRefMutationBoundary): Promise<void> {
+  if (refs.length === 0) return;
+  const lease = await boundary?.enterOwnedRefMutation(repoDir).catch(() => undefined);
+  try {
+    // -z delete record: `delete SP <ref> NUL <old-value> NUL`, old-value empty = unverified.
+    await git(repoDir, ["update-ref", "-z", "--stdin"], { stdin: refs.map((ref) => `delete ${ref}\0\0`).join("") })
+      .catch(async () => {
+        for (const ref of refs) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      });
+  } finally {
+    await lease?.finish().catch(() => {});
+  }
+}
+
 /** Pin every commit the section will reference under a CAPTURE-UNIQUE namespace
  *  `refs/rbox-wip/<epochMs>-<rand>/<n>`: linked worktrees share one ref store, so a
  *  single global scratch ref would race under concurrent sibling captures [v2, B2]. */
@@ -76,7 +110,7 @@ export async function createScratchPins(repoDir: string, shas: string[], boundar
 }
 
 export async function deleteScratchPins(repoDir: string, pins: ScratchPins, boundary?: OwnedRefMutationBoundary): Promise<void> {
-  for (const ref of pins.refs) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
+  await deleteRefsBatch(repoDir, pins.refs, boundary);
 }
 
 /** Prune stale scratch refs left by CRASHED runs — AGE-GUARDED [v3]: only entries whose
@@ -97,7 +131,7 @@ export async function pruneStaleScratchRefs(repoDir: string, ns: string, boundar
     const epoch = Number.parseInt(id, 10);
     return Number.isFinite(epoch) && epoch < cutoff;
   });
-  for (const ref of stale) await ownedUpdateRef(repoDir, ["-d", ref], boundary).catch(() => {});
+  await deleteRefsBatch(repoDir, stale, boundary);
   return stale.length;
 }
 
