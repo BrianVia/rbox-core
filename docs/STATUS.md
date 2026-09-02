@@ -1,5 +1,17 @@
 # rbox status — living state snapshot
 
+## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
+
+- **v2.0.2 release commit a8b47654a** on main (changelog: 'adopt the other
+  machine's checkout without a fight' — rolls up #855 #856 #858 #859 #860
+  #861 #864 #868 #869 #872 #873 #874 #877). Tag fires on exact-SHA main CI
+  green; then fleet back to stable (desktop, FM, Mac if reachable).
+- **#832 shadow-mode lane dispatched** (spec scratchpad/SPEC-832-shadow.md):
+  ff-only verdict computed beside the plane per pull, default ON, kill switch
+  RBOX_GIT_SHADOW=0 in the ledger, log only disagreements, counter file
+  .rbox/state/git-shadow.json + one doctor line. Ships in the release AFTER
+  its own week of fleet dogfood; the week's table decides #832.
+
 ## 2026-09-02 (early) — FM landing night: 3 of 4 repos converged, 3 fixes merged, the proof plane peeled six layers on one repo
 
 - **Merged:** #869 (base-absent record is a first-BASE landing, not a
