@@ -17,6 +17,7 @@ import { checkoutJournalBinding } from "./follow-journal.js";
 import { candidateIndexCollision, deriveBaseIndexProjection, indexArtifact, stageIncoming } from "./follow-staging.js";
 import { readLive } from "./follow-live.js";
 import { classifyCheckout } from "./follow-classify.js";
+import { gitShadowEnabled, planeVerdictClass, recordShadow, shadowVerdict } from "./git-shadow.js";
 import { appliedTerminalOid, effectiveRefs, selectCheckoutSelfRootWitness } from "./follow-ref-witness.js";
 import { RefPlaneTransaction, type CheckoutCommitInput } from "./ref-plane-transaction.js";
 import {
@@ -178,6 +179,43 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       heldRefs: progress.heldRefs,
       ownershipContext: initialOwnershipContext,
     }));
+    // #832 shadow mode. Computed HERE and nowhere else, for three reasons: this
+    // is the last moment the receiver's PRE-checkout refs are still on disk;
+    // `classifyCheckout` runs a SECOND time after the checkout (below), where
+    // recording again would double-count; and the plane's own verdict is not
+    // final until `commitCheckout` has spoken, so the pair is settled at the
+    // exits rather than here.
+    //
+    // The deferrals ABOVE this point — invalid section, artifact fetch failure,
+    // unreadable refs, missing capability — record nothing, because the shadow
+    // has no refs to compare and an invented verdict would be worse than a gap.
+    // Read the week's table as "of the repos that reached classification".
+    //
+    // `manualResolution` is excluded: a human resolving by hand is not the
+    // automatic disposition this lane is measuring.
+    const shadow = gitShadowEnabled() && !opts.manualResolution
+      ? await addTimedMs(opts.chainTimings, "shadowMs", () => shadowVerdict({
+        ctx: opts.ctx,
+        live: liveBefore,
+        incomingRefs: effective.refs,
+        ownershipContext: initialOwnershipContext,
+      // A shadow that cannot compute records nothing. It must never be able to
+      // turn a pull into a failure — that is the whole "changes nothing" claim.
+      }).catch(() => undefined))
+      : undefined;
+    const settle = async (result: FollowResult): Promise<FollowResult> => {
+      if (shadow) {
+        await addTimedMs(opts.chainTimings, "shadowMs", () => recordShadow({
+          workspaceRoot: opts.workspaceRoot,
+          relPath: opts.relPath,
+          planeClass: planeVerdictClass(result),
+          snapshot: shadow,
+          log: opts.log,
+        }).catch(() => {}));
+      }
+      return result;
+    };
+
     if (!first.safe) {
       const blockers = [...progress.blockers, ...first.blockers];
       await opts.afterHeldClassification?.({
@@ -189,7 +227,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         reflogPaths: progress.consultedReflogPaths ?? [],
         progress: { ...progress, blockers },
       });
-      return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress, blockers };
+      return settle({ status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress, blockers });
     }
 
     const checkoutInput: CheckoutCommitInput = { staged, first, checkoutRoots };
@@ -214,7 +252,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         reflogPaths: checkout.result.consultedReflogPaths ?? [],
         progress: checkout.result,
       });
-      return checkout.result;
+      return settle(checkout.result);
     }
     const { progress: postProgress, origHeadPreservation } = checkout;
     if (origHeadPreservation) {
@@ -277,7 +315,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         });
       }
     }
-    return { status: "followed", ...postProgress };
+    return settle({ status: "followed", ...postProgress });
   } finally {
     await staged.cleanup();
   }

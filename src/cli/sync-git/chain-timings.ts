@@ -26,6 +26,13 @@ export interface GitChainTimings {
   heldInputMs: number;
   /** Standing branch-artifact proof and settlement. */
   standingProofMs: number;
+  /** #832 shadow mode: the ff-only verdict computed beside the proof plane,
+   * plus its counter-file write. A leaf of the follow, NOT of the classifier —
+   * the shadow runs after `classifyCheckout` returns, so it must stay out of
+   * `CLASSIFY_CHILD_FIELDS` or `classifyExclusiveMs` would subtract time it
+   * never spent. It is the whole cost of the lane: if the shadow is not free,
+   * this field says so. */
+  shadowMs: number;
   /** Full-follow wall time after subtracting every named leaf accrued inside
    * it. `followDivergedRepo` is the parent of nearly every leaf above, so a
    * gross bucket would double-count; this is `classifyExclusiveMs`'s
@@ -53,6 +60,7 @@ export function zeroGitChainTimings(): GitChainTimings {
     classifyExclusiveMs: 0,
     heldInputMs: 0,
     standingProofMs: 0,
+    shadowMs: 0,
     followMs: 0,
     residualMs: 0,
   };
@@ -67,7 +75,7 @@ const LEAF_FIELDS = [
   "fetchDecryptMs", "bundleVerifyMs", "gitImportMs", "refTxnExclusiveMs",
   "ownershipMs", "reflogMs", "connectivityProofMs", "indexOpStateMs",
   "journalMs", "classifyExclusiveMs", "heldInputMs", "standingProofMs",
-  "refCleanupMs",
+  "refCleanupMs", "shadowMs",
 ] as const satisfies ReadonlyArray<keyof GitChainTimings>;
 
 /** The leaves the classifier parents, in one place. `classifyExclusiveMs`

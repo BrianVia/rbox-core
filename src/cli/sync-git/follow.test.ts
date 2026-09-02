@@ -26,6 +26,7 @@ import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from
 import { CONFLICT_COPY_POPULATION_WHY } from "../../engine/apply-receipt.js";
 import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { opStateDetailToken } from "./follow-classify.js";
+import { readShadowCounters } from "./git-shadow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { heldBlockersAllowSkip } from "./held-blockers.js";
 import { planGitSections } from "./plan.js";
@@ -62,12 +63,14 @@ let store: LocalBlobStore;
 let cfg: WorkspaceConfig;
 let priorGitFollow: string | undefined;
 let priorTraceHeld: string | undefined;
+let priorGitShadow: string | undefined;
 let materializedSection: GitSection | undefined;
 let materializedState: SyncState | undefined;
 
 beforeEach(async () => {
   priorGitFollow = process.env.RBOX_GIT_FOLLOW;
   priorTraceHeld = process.env.RBOX_TRACE_HELD;
+  priorGitShadow = process.env.RBOX_GIT_SHADOW;
   materializedSection = undefined;
   materializedState = undefined;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-"));
@@ -101,6 +104,8 @@ afterEach(async () => {
   else process.env.RBOX_GIT_FOLLOW = priorGitFollow;
   if (priorTraceHeld === undefined) delete process.env.RBOX_TRACE_HELD;
   else process.env.RBOX_TRACE_HELD = priorTraceHeld;
+  if (priorGitShadow === undefined) delete process.env.RBOX_GIT_SHADOW;
+  else process.env.RBOX_GIT_SHADOW = priorGitShadow;
   resetCheckoutCapabilityProbeCacheForTests();
   setReceiverEquivalenceProbeForTests(undefined);
   setGitSpawnObserver(undefined);
@@ -3134,6 +3139,9 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
     + chain.classifyExclusiveMs + chain.heldInputMs + chain.standingProofMs
     // #863: scratch/incoming ref cleanup is a named leaf, not residual.
     + chain.refCleanupMs
+    // #832: the shadow lane is a named leaf of the follow (never of the
+    // classifier), so its cost is visible instead of hiding in the residual.
+    + chain.shadowMs
     // #814: the full follow's own cost is a named term, not residual.
     + chain.followMs;
   // #863: this follow stages 40 branches, so cleanup has real width to report.
@@ -3148,6 +3156,118 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
   expect(chain.residualMs).toBeCloseTo(Math.max(0, timing.wallMs - leafSum), 5);
   expect(Math.abs(leafSum + chain.residualMs - timing.wallMs)).toBeLessThan(2);
   expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
+}, 30_000);
+
+/** #832 shadow mode's whole promise is that it changes nothing. The only way to
+ * believe that is to run the SAME fixture twice — once with the lane on, once
+ * with it off — in two identical-but-separate workspaces, and compare the
+ * plane's durable outcome and the receiver's repository byte-for-byte.
+ *
+ * Two scenarios, because the two arms are different code paths: a clean
+ * fast-forward the plane applies, and a local-index deferral (FM's entire live
+ * deferral set, per the design note §5) where the plane defers and the shadow
+ * would adopt — i.e. the case that actually logs and records. */
+async function shadowDifferentialRun(
+  label: string,
+  shadow: "0" | "1",
+  fixture: { base: GitSection; incoming: GitSection; next: GitSection },
+) {
+  // One sender, one set of captured sections, two receivers: the two arms must
+  // differ in the flag and in nothing else, or "byte-identical" is vacuous.
+  process.env.RBOX_GIT_SHADOW = shadow;
+  workspace = path.join(tmp, `${label}-ws`);
+  receiver = path.join(workspace, "repo");
+  materializedSection = undefined;
+  materializedState = undefined;
+  cfg = { ...cfg, rootPath: workspace };
+  await fs.mkdir(path.join(workspace, ".rbox", "state"), { recursive: true });
+  await materialize(fixture.base);
+
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  const applied = await applyIncoming(stateWith(fixture.base), fixture.incoming);
+  const landed = await landOutcome(stateWith(fixture.base), applied.outcome, 2);
+
+  // Stage something, so the index matches neither base nor incoming: FM's
+  // entire live deferral set is this shape (design note §5).
+  await fs.writeFile(path.join(receiver, "staged.txt"), "mine\n");
+  await git(receiver, "add", "staged.txt");
+  const deferred = await applyIncoming(landed, fixture.next);
+
+  return {
+    applied: { outcome: applied.outcome, logs: applied.logs },
+    deferred: { outcome: deferred.outcome, logs: deferred.logs },
+    refs: await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)"),
+    head: await fs.readFile(path.join(receiver, ".git", "HEAD"), "utf8"),
+    tracked: await fs.readFile(path.join(receiver, "tracked.txt"), "utf8"),
+    index: await git(receiver, "ls-files", "--stage"),
+  };
+}
+
+async function shadowDifferentialFixture(): Promise<{ base: GitSection; incoming: GitSection; next: GitSection }> {
+  await commit("one\n", "c1");
+  await commit("two\n", "c2");
+  const base = await capture();
+  await commit("three\n", "c3");
+  const incoming = await capture();
+  await commit("four\n", "c4");
+  const next = await capture();
+  return { base, incoming, next };
+}
+
+/** Two independently created receivers have different repository identities by
+ * construction — the lineage/identity hashes, the artifact oids derived from
+ * them, and the per-checkout episode nonce all differ whether or not the shadow
+ * runs. Wall clocks likewise. Everything else — refs, heads, index projection,
+ * partial, attempt, deferral reasons, bundle digests, witness kinds and their
+ * prior/next oids — must be identical, and is. */
+const withoutClocks = (value: Awaited<ReturnType<typeof applyGitSections>>): string =>
+  JSON.stringify(value, (key, inner) =>
+    [
+      "at", "lastSeen", "deferredSince", "reasonSince", "generatedAt",
+      "lineageHash", "repositoryIdentityHash", "artifactRef", "artifactOid", "episode", "reflogEpisode",
+      "repoIdentity", "baseOriginsHash", "localFingerprint", "worktreeRegistryDigest",
+    ].includes(key) ? "normalized" : inner);
+
+test("design 832: the plane's outcome is byte-identical with shadow mode off and on", async () => {
+  const fixture = await shadowDifferentialFixture();
+  const off = await shadowDifferentialRun("shadow-off", "0", fixture);
+  const on = await shadowDifferentialRun("shadow-on", "1", fixture);
+
+  // The plane's durable outcome, both arms.
+  expect(withoutClocks(on.applied.outcome)).toBe(withoutClocks(off.applied.outcome));
+  expect(withoutClocks(on.deferred.outcome)).toBe(withoutClocks(off.deferred.outcome));
+  // And the repository the plane left behind.
+  expect(on.refs).toBe(off.refs);
+  expect(on.head).toBe(off.head);
+  expect(on.tracked).toBe(off.tracked);
+  expect(on.index).toBe(off.index);
+  expect(on.applied.tracked).toBe(off.applied.tracked);
+
+  // Every daemon line the plane emits is identical too; the shadow's own line
+  // is the ONLY difference, and it appears only in the `on` run.
+  const planeLines = (logs: string[]) => logs.filter((line) => !line.startsWith("git-shadow "));
+  expect(planeLines(on.applied.logs)).toEqual(planeLines(off.applied.logs));
+  expect(planeLines(on.deferred.logs)).toEqual(planeLines(off.deferred.logs));
+  expect(off.applied.logs.concat(off.deferred.logs).filter((l) => l.startsWith("git-shadow "))).toEqual([]);
+
+  // The lane really ran in the `on` arm — otherwise this test proves nothing.
+  const counters = await readShadowCounters(path.join(tmp, "shadow-on-ws"));
+  expect((counters?.agree ?? 0) + (counters?.disagree ?? 0)).toBe(2);
+  expect(await readShadowCounters(path.join(tmp, "shadow-off-ws"))).toBeUndefined();
+}, 60_000);
+
+test("design 832: the deferral the shadow disagrees with is logged exactly once", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await applyIncoming(state, incoming);
+  await fs.writeFile(path.join(receiver, "staged.txt"), "mine\n");
+  await git(receiver, "add", "staged.txt");
+  await commit("four\n", "c4");
+  const next = await capture();
+  process.env.RBOX_GIT_SHADOW = "1";
+  const { logs } = await applyIncoming(stateWith(materializedSection), next);
+  const shadowLines = logs.filter((line) => line.startsWith("git-shadow "));
+  expect(shadowLines).toHaveLength(1);
+  expect(shadowLines[0]).toMatch(/^git-shadow disagree repo: plane=deferred:local-index shadow=adopt refs=\d+$/);
 }, 30_000);
 
 // Design 270: the artifact-plane digest and the early partial identity are new

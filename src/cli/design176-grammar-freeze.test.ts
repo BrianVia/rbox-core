@@ -17,7 +17,12 @@ const CONSUMER_FREEZE = [
   ["git-sync scheduling/concurrency parser", "src/cli/sync-git/git-sync.test.ts", ["^git-sync applied (.+)$"]],
   ["sync-cmd routing", "src/cli/sync-cmd.ts", ['line.startsWith("git-sync CONFLICT")', 'line.startsWith("git-sync WARNING")']],
   ["status parser/rendering", "src/cli/status-view.test.ts", ['toBe("git deferred 1h: local commits on detached checkout (repo)")']],
-  ["doctor redaction", "src/cli/doctor-cmd.ts", ["^git-sync deferred", "^git-sync CONFLICT", "^git-sync config skipped", "^git-sync applied"]],
+  // 2026-09-02 (#832): the redaction grammar moved out of doctor-cmd.ts into
+  // its own module, unchanged. A re-pin at the new address, not a relaxation —
+  // every marker below is still required, plus the shadow line's, which must
+  // stay recognized or it would be emitted VERBATIM (with the repo path) into
+  // the diagnostics bundle instead of redacted.
+  ["doctor redaction", "src/cli/doctor-git-redaction.ts", ["^git-sync deferred", "^git-sync CONFLICT", "^git-sync config skipped", "^git-sync applied", "^git-shadow disagree"]],
   ["shared rig fixtures", "scripts/rig/lib/git-fixtures.ts", ['`git-sync applied ${rel}`', '`git-sync followed ${rel}`', "return `git-sync: captured"]],
   ["git-held-livelock", "scripts/rig/scenarios/git-held-livelock.ts", ["git-sync superseded pending ${REPO}: local history subsumes the unapplied remote section"]],
   ["git-commit-propagation", "scripts/rig/scenarios/git-commit-propagation.ts", ["git-sync: captured [1-9]", "git-sync (followed|applied) ${repo}"]],

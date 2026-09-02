@@ -145,7 +145,11 @@ async function pull(state: SyncState, incoming: GitSection, sourceGlobalSeq: num
   try {
     const outcome = await applyGitSections(
       workspace, cfg, state, manifest(incoming), counting,
-      buildIgnoreMatcher(workspace), (line) => logs.push(line),
+      // #832: these tests assert the daemon's PLANE lines exactly. Shadow mode
+      // is a measurement running beside the plane and emits its own
+      // disagreement line — recorded and asserted in `git-shadow.test.ts`, and
+      // deliberately not part of any plane assertion here.
+      buildIgnoreMatcher(workspace), (line) => { if (!line.startsWith("git-shadow ")) logs.push(line); },
       {
         oracle: matchingOracle,
         sourceGlobalSeq,

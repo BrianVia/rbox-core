@@ -52,11 +52,15 @@ export interface OwnershipProofContext {
 // apparently complete local proof.
 export const graphEnv: NodeJS.ProcessEnv = { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" };
 
-interface GitProcessFailure {
+export interface GitProcessFailure {
   code?: number;
 }
 
-function errorCode(error: GitProcessFailure): number | undefined {
+/** A Git child's exit code, when it had one. Exported because #832's shadow
+ * lane must map a failed ancestry walk to the SAME three-valued answer this
+ * module does — a second, subtly different mapping is how "indeterminate"
+ * quietly becomes "diverged". */
+export function gitProcessExitCode(error: GitProcessFailure): number | undefined {
   return Number.isFinite(error.code) ? error.code : undefined;
 }
 
@@ -132,7 +136,7 @@ async function peelAndVerify(repoDir: string, roots: readonly string[]): Promise
     if (commits.length > 0) await git(repoDir, ["rev-list", "--quiet", ...commits, "--"], { env: graphEnv });
     return { commits };
   } catch (error) {
-    return { marker: errorCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" };
+    return { marker: gitProcessExitCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" };
   }
 }
 
@@ -148,7 +152,7 @@ async function tipOwnedByIncomingLegacyDetailed(repoDir: string, tip: string, ro
       await git(repoDir, ["merge-base", "--is-ancestor", tipCommit, root!], { env: graphEnv });
       return { tip, commit: tipCommit, proof: { status: "owned" } };
     } catch (error) {
-      if (errorCode(error as GitProcessFailure) !== 1) return { tip, proof: { status: "indeterminate", marker: errorCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" } };
+      if (gitProcessExitCode(error as GitProcessFailure) !== 1) return { tip, proof: { status: "indeterminate", marker: gitProcessExitCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" } };
     }
   }
   return { tip, commit: tipCommit, proof: { status: "unowned" } };
@@ -288,7 +292,7 @@ export async function noDropProof(
         reachable = true;
         break;
       } catch (error) {
-        if (errorCode(error as GitProcessFailure) !== 1) return { status: "indeterminate", marker: errorCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" };
+        if (gitProcessExitCode(error as GitProcessFailure) !== 1) return { status: "indeterminate", marker: gitProcessExitCode(error as GitProcessFailure) === 128 ? "missing-object" : "walk-error" };
       }
     }
     if (!reachable) {

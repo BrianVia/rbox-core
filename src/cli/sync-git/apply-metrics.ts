@@ -98,6 +98,9 @@ const GIT_CHAIN_TIMING_FIELDS = {
   // (`L<n>fd…io…`) are pinned byte-for-byte, and a count inserted after `L`
   // would rewrite them.
   refCleanupRefs: { abbr: "rn", label: "refCleanupRefs", count: true },
+  // #832: appended for the same reason `refCleanupRefs` was — the legacy line's
+  // existing bytes stay where they are.
+  shadowMs: { abbr: "sh", label: "shadowMs" },
 } as const satisfies Record<keyof GitChainTimings, { abbr: string; label: string; count?: true }>;
 
 const GIT_CHAIN_TIMING_FIELD_ROWS = Object.values(GIT_CHAIN_TIMING_FIELDS);
