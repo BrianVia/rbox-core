@@ -52,6 +52,15 @@ function reconcileLog(
   return explained.includes(JSON.stringify(live)) ? before : undefined;
 }
 
+/** The identity's own order: a bare code-point `.sort()` over ref names
+ *  (resolution-intent.ts). Re-sorting the normalized copy any OTHER way — this
+ *  code used `localeCompare`, which orders `refs/heads/brext-…` before
+ *  `refs/heads/BrianVia/…` where code-point order puts it after — made a repo
+ *  with mixed-case branches refuse its own unchanged confirmation forever,
+ *  re-offering the very token it had just rejected (issue #647). Normalization
+ *  with no authored change must be the identity function. */
+const byRefName = ([a]: [string, unknown], [b]: [string, unknown]): number => (a < b ? -1 : a > b ? 1 : 0);
+
 export function normalizedAfterAuthoredRefs(
   current: SnapshotIdentity,
   confirmed: SnapshotIdentity,
@@ -76,8 +85,8 @@ export function normalizedAfterAuthoredRefs(
   }
   return {
     ...current,
-    refs: [...refs].sort(([a], [b]) => a.localeCompare(b)),
-    reflogs: [...liveLogs].sort(([a], [b]) => a.localeCompare(b)),
+    refs: [...refs].sort(byRefName),
+    reflogs: [...liveLogs].sort(byRefName),
     stash,
   };
 }

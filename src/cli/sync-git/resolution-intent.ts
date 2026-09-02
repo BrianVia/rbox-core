@@ -49,8 +49,13 @@ export function resolutionReportHash(report: ResolutionDiscardReport): string {
   return hashBytes(Buffer.from(canonicalString(report)));
 }
 
+/** Code-point order, the same bare `.sort()` the reflog walk below uses. NOT
+ *  `localeCompare`: it is ICU/locale-dependent (a daemon and a shell with
+ *  different LANG would order mixed-case refs differently and mint different
+ *  tokens for identical state), and mixing the two orders inside one identity
+ *  is what made a repo refuse its own unchanged confirmation forever (#647). */
 const sortedEntries = (value: Record<string, string>): Array<[string, string]> =>
-  Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
+  Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 
 async function configBinding(root: string, rel: string, ctx: RepoCtx): Promise<GitResolutionBinding["config"]> {
   let receiver: Awaited<ReturnType<typeof configReceiver>>;
