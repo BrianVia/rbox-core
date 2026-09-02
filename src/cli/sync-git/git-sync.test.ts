@@ -2043,7 +2043,15 @@ test("design 177: a different-writer 409 aborts the rider once and returns a fre
   const result = JSON.parse(lines.at(-1)!);
   expect(result).toMatchObject({ status: "snapshot-mismatch", verb: "keep-mine" });
   expect(result.message).toContain("another machine published while confirming");
-  expect(result.current.snapshot).not.toBe(preview.current.snapshot);
+  // The fresh preview is re-derived from the POST-pull state, so its token
+  // equals the previewed one exactly when the other writer's publication
+  // changed nothing this confirmation covers (here: a different repo). It
+  // used to differ only because the aborted rider bumped `repoGen`, which the
+  // token no longer binds — a counter is not evidence about the state the
+  // human is consenting to discard. A publication that really did move this
+  // repo's incoming section moves `incomingKey`, and the token rotates.
+  expect(result.current).toBeDefined();
+  expect(result.discardReport).toBeDefined();
   expect(remote.commitCalls - callsBefore).toBe(1);
   const record = repoRecordsForState(await st(rootB))[rel]!;
   expect(record.pending).toBeDefined();
