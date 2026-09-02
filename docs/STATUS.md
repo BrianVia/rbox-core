@@ -2,6 +2,12 @@
 
 ## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
 
+- **#881 MERGED (#832 shadow mode)**: read-only ff-only verdict beside the
+  proof plane, default ON (`RBOX_GIT_SHADOW=0` kills), logs only
+  disagreements, cross-tab in `.rbox/state/git-shadow.json` + one doctor
+  line. Desktop (pid 3221728) and FM (pid 4000569, `~/rbox-dev-shadow`)
+  dogfood `2.0.2-dev+e3881c3`; Mac stays stable 2.0.2. One week of data
+  → §10 decision, then it rides 2.0.3.
 - **v2.0.2 RELEASED + fleet on stable** (api.rbox.to/version = 2.0.2;
   desktop pid 3214381, flat-meadow pid 3993057, both `syncing normally`;
   FM 'No git repos are paused'; desktop shows the 3 known residual ghosts).
