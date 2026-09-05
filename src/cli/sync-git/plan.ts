@@ -146,6 +146,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
   let toCapture: string[] = [];
   let carried = accumulator.carried;
   const attempts = new Map<string, RepoCaptureAttempt>();
+  const repoCost = (rel: string): GitPlanRepoCost => stats.repoCosts.find((cost) => cost.rel === rel)!;
   const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
   const noteCredentialSkip = (rel: string): void => accumulator.logOnce(
     configCredentialSkipLogged,
@@ -186,6 +187,10 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
     fastLookup?: FingerprintHitProbeResult,
     options: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolution?: boolean } = {},
   ): Promise<void> => {
+    const cost = repoCost(rel);
+    if (cost.fingerprint === "untrusted" && fastLookup !== undefined) {
+      cost.fingerprint = fastLookup.status === "hit" ? "hit" : fastLookup.status;
+    }
     stats.spawnedRepos++;
     const attempt = attemptFor(rel, kind);
     const result = await attempt.classify(fastLookup, { ...options, admissionAvailable: admitted < cap });
@@ -199,6 +204,8 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
   const pointerPreSkips: Array<{ relPath: string; parentRel: string; admissionAlreadyCounted: boolean }> = [];
 
   for (const rel of keys) {
+    const repoStartedAt = performance.now();
+    try {
     const kind = kindByPath.get(rel);
     const baseSection = base[rel];
     const protectedSection = pending[rel];
@@ -280,6 +287,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
         "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
       );
+      repoCost(rel).fingerprint = fastLookup.status === "hit" ? "hit" : fastLookup.status;
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
@@ -298,6 +306,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
           continue;
         }
         stats.fpMisses++;
+        repoCost(rel).fingerprint = "miss";
       } else {
         stats.fpMisses++;
       }
@@ -308,6 +317,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
         "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
       );
+      repoCost(rel).fingerprint = fastLookup.status === "hit" ? "hit" : fastLookup.status;
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
@@ -319,11 +329,15 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
           continue;
         }
         stats.fpMisses++;
+        repoCost(rel).fingerprint = "miss";
       } else {
         stats.fpMisses++;
       }
     }
     await processSlow(rel, kind, fastLookup);
+    } finally {
+      repoCost(rel).discoverMs += performance.now() - repoStartedAt;
+    }
   }
 
   const sectioned = new Set([...Object.keys(out), ...toCapture]);
@@ -338,6 +352,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
       stats.pointerPreSkips++;
     } else {
       stats.fpMisses++;
+      repoCost(pointer.relPath).fingerprint = "miss";
       await processSlow(pointer.relPath, kindByPath.get(pointer.relPath), undefined, {
         admissionAlreadyCounted: pointer.admissionAlreadyCounted,
       });
@@ -392,6 +407,7 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   const retainDir = await artifacts.startIfNeeded(toCapture.length > 0);
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
+    const repoStartedAt = performance.now();
     options.onCaptureQueued?.(rel);
     try {
       const attempt = attempts.get(rel);
@@ -429,6 +445,8 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
         reason.startsWith("ref-read-unreadable:") ? "ref-read-unreadable" : undefined,
       );
     } finally {
+      const cost = accumulator.stats.repoCosts.find((item) => item.rel === rel);
+      if (cost) cost.captureMs += performance.now() - repoStartedAt;
       accumulator.settleCapture(rel);
     }
   });
@@ -896,6 +914,14 @@ export interface GitPlanStats {
   hygieneMs: number;
   divergenceCacheMs: number;
   otherMs: number;
+  repoCosts: GitPlanRepoCost[];
+}
+
+export interface GitPlanRepoCost {
+  rel: string;
+  fingerprint: "hit" | "miss" | "untrusted";
+  captureMs: number;
+  discoverMs: number;
 }
 
 export interface GitPlanOptions {
@@ -943,6 +969,22 @@ export interface GitPlanOptions {
 }
 
 const SUPERSESSION_REFUSED_REASON = "final candidate did not supersede pending section — carrying pending verbatim";
+const GIT_PLAN_SLOW_MS = 500;
+
+function finishGitPlan(accumulator: GitPlanAccumulator): GitPushPlan {
+  const plan = accumulator.plan();
+  const stats = plan.gitPlanStats!;
+  if (stats.captureMs + stats.discoverMs > GIT_PLAN_SLOW_MS && stats.repoCosts.length > 0) {
+    const slowest = [...stats.repoCosts]
+      .sort((a, b) => b.captureMs + b.discoverMs - a.captureMs - a.discoverMs)
+      .slice(0, 3)
+      .map(({ rel, fingerprint, captureMs, discoverMs }) =>
+        `${rel} fp=${fingerprint} cp=${Math.round(captureMs)} d=${Math.round(discoverMs)}`)
+      .join("; ");
+    accumulator.log(`git-plan slowest: ${slowest}`);
+  }
+  return plan;
+}
 
 /**
  * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
@@ -1029,6 +1071,7 @@ async function planGitSectionsWithRetention(
     needsResolution: needsRes,
     pending,
     publisherAckBindings,
+    stats,
     timings,
   } = accumulator;
   const cache = await loadGitDivergenceCache(root);
@@ -1048,7 +1091,7 @@ async function planGitSectionsWithRetention(
       () => discoverGitRepos(root, matcher),
     );
     try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
-    const plan = accumulator.plan();
+    const plan = finishGitPlan(accumulator);
     if (discovered.length > 0) plan.filesFirstDeferred = true;
     return plan;
   }
@@ -1067,7 +1110,7 @@ async function planGitSectionsWithRetention(
     for (const k of Object.keys(needsRes)) delete needsRes[k];
     for (const k of Object.keys(removedMem)) delete removedMem[k];
     timings.carryMs += performance.now() - carryStartedAt;
-    return accumulator.plan();
+    return finishGitPlan(accumulator);
   }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
   const kek = cfg.kek;
@@ -1091,6 +1134,9 @@ async function planGitSectionsWithRetention(
   });
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
+  stats.repoCosts.push(...keys.map((rel) => ({
+    rel, fingerprint: "untrusted" as const, captureMs: 0, discoverMs: 0,
+  })));
   const recoveryBlocked = new Map<string, string>();
   const recoveryAllowsSupersession = new Map<string, boolean>();
   const workspaceRootReal = asyncMemo(() => fs.realpath(root));
@@ -1199,7 +1245,7 @@ async function planGitSectionsWithRetention(
 
   await cleanAndRefreshPlan({ accumulator, root, cache, fingerprintRun, kindByPath, keys, options });
 
-  return accumulator.plan();
+  return finishGitPlan(accumulator);
 }
 
 /** Format the §10 forensic push line:

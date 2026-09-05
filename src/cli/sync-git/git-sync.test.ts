@@ -3747,6 +3747,38 @@ test("design 243: timing buckets are an exclusive partition and are summarized",
   }
 }, 60_000);
 
+test("design 298 attributes a slow git plan to at most three repositories and stays quiet when fast", async () => {
+  for (const rel of ["attrib-a", "attrib-b", "attrib-c", "attrib-d"]) {
+    await initRepo(path.join(rootA, rel));
+    await commitFile(path.join(rootA, rel), "f.txt", rel, "c1");
+  }
+  const logs: string[] = [];
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+    onGitLog: (line) => logs.push(line),
+    onCaptureQueued: (rel) => {
+      if (rel !== "attrib-a") return;
+      const until = performance.now() + 525;
+      while (performance.now() < until) { /* existing synchronous test seam */ }
+    },
+  });
+  const line = logs.find((entry) => entry.startsWith("git-plan slowest: "));
+  expect(line).toBeDefined();
+  const entries = line!.slice("git-plan slowest: ".length).split("; ");
+  expect(entries.length).toBeLessThanOrEqual(3);
+  expect(entries[0]).toMatch(/^attrib-a fp=untrusted cp=\d+ d=\d+$/);
+  const totals = entries.map((entry) => {
+    const [, capture, discover] = entry.match(/ cp=(\d+) d=(\d+)$/)!;
+    return Number(capture) + Number(discover);
+  });
+  expect(totals).toEqual([...totals].sort((a, b) => b - a));
+
+  const fastLogs: string[] = [];
+  await planGitSections(rootB, cfgB, await st(rootB), remote, new Set(), buildIgnoreMatcher(rootB), undefined, noBackoff, {
+    onGitLog: (entry) => fastLogs.push(entry),
+  });
+  expect(fastLogs.some((entry) => entry.startsWith("git-plan slowest: "))).toBe(false);
+}, 60_000);
+
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
 
 test("steady-state all-hit git plan has no sidecar changes", async () => {
