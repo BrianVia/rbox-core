@@ -9,6 +9,32 @@ const exec = promisify(execFile);
 
 let gitSpawnObserver: ((root: string, args: readonly string[]) => void) | undefined;
 
+const GIT_ENV_REMOVED_BY_DEFAULT = [
+  "GIT_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_PAGER",
+  "GIT_NO_LAZY_FETCH",
+  "GIT_NO_REPLACE_OBJECTS",
+] as const;
+
 /** Test seam for status-performance assertions: counts git subprocesses without
  *  changing production behavior. */
 export function setGitSpawnObserver(observer: ((root: string, args: readonly string[]) => void) | undefined): void {
@@ -17,7 +43,7 @@ export function setGitSpawnObserver(observer: ((root: string, args: readonly str
 
 /** Remove repository-routing variables inherited from hooks/wrappers. */
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     // Reflog writes require an identity even on fresh receivers. This fallback
     // is local forensic text only; rbox never authors user commits with it.
@@ -25,13 +51,12 @@ export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "rbox@local",
     GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "rbox",
     GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "rbox@local",
-    GIT_DIR: undefined,
-    GIT_OBJECT_DIRECTORY: undefined,
-    GIT_COMMON_DIR: undefined,
-    GIT_WORK_TREE: undefined,
-    GIT_INDEX_FILE: undefined,
-    ...extra,
-  } as NodeJS.ProcessEnv;
+  };
+  for (const name of GIT_ENV_REMOVED_BY_DEFAULT) delete env[name];
+  for (const name of Object.keys(env)) {
+    if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) delete env[name];
+  }
+  return { ...env, ...extra };
 }
 
 /** Run Git without altering stdout bytes. Required for NUL-delimited config reads,
