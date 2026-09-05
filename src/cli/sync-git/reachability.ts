@@ -26,6 +26,16 @@ export interface PartitionedOwnership {
   proof: OwnershipProof;
 }
 
+interface OwnershipObservation {
+  partitions: PartitionedOwnership[];
+  /** Repository/root-wide failure evidence exists even when there are no tips. */
+  marker?: "shallow-store" | "missing-object" | "walk-error";
+  /** Positional peeled roots from this exact successful batch observation. */
+  rootCommits?: string[];
+  /** False only when public partition semantics came from the legacy anomaly fallback. */
+  complete: boolean;
+}
+
 export type NoDropProof =
   | { status: "proven"; marker?: "content-equivalent" }
   | { status: "would-drop"; tip: string }
@@ -187,10 +197,19 @@ export async function partitionOwnedByIncoming(
   roots: readonly string[],
   context?: OwnershipProofContext,
 ): Promise<PartitionedOwnership[]> {
+  return (await observePartitionOwnedByIncoming(repoDir, tips, roots, context)).partitions;
+}
+
+async function observePartitionOwnedByIncoming(
+  repoDir: string,
+  tips: readonly string[],
+  roots: readonly string[],
+  context?: OwnershipProofContext,
+): Promise<OwnershipObservation> {
   const isShallow = context ? context.shallow : await batchedShallow(repoDir);
   if (isShallow !== false) {
     const marker = isShallow ? "shallow-store" : "walk-error";
-    return tips.map((tip) => ({ tip, proof: { status: "indeterminate", marker } }));
+    return { partitions: tips.map((tip) => ({ tip, proof: { status: "indeterminate", marker } })), marker, complete: true };
   }
 
   const inputs = [...tips, ...roots];
@@ -202,23 +221,30 @@ export async function partitionOwnedByIncoming(
     });
     const lines = raw.split("\n");
     if (lines.at(-1) === "") lines.pop();
-    if (lines.length !== inputs.length) return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
+    if (lines.length !== inputs.length) return {
+      partitions: await legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots),
+      complete: false,
+    };
     // Duplicate raw OIDs and distinct tags peeling to one commit make any OID-keyed map wrong; position is the only correct key.
     records = lines.map((line) => {
       const match = /^([0-9a-f]{40}) commit$/.exec(line);
       return match ? { commit: match[1]! } : {};
     });
   } catch {
-    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
+    return { partitions: await legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots), complete: false };
   }
 
   const tipRecords = records.slice(0, tips.length);
   const rootRecords = records.slice(tips.length);
   if (rootRecords.some((record) => !record?.commit)) {
-    return tips.map((tip) => ({
-      tip,
-      proof: { status: "indeterminate", marker: "missing-object" },
-    }));
+    return {
+      partitions: tips.map((tip) => ({
+        tip,
+        proof: { status: "indeterminate", marker: "missing-object" },
+      })),
+      marker: "missing-object",
+      complete: true,
+    };
   }
 
   const commits = records.flatMap((record) => record.commit ? [record.commit] : []);
@@ -229,7 +255,7 @@ export async function partitionOwnedByIncoming(
     });
   } catch {
     // Recover exact per-tip markers and preserve independence after any corrupt walk.
-    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
+    return { partitions: await legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots), complete: false };
   }
 
   const candidateCommits = new Set(tipRecords.flatMap((record) => record?.commit ? [record.commit] : []));
@@ -248,14 +274,18 @@ export async function partitionOwnedByIncoming(
     });
     if (pending && candidateCommits.has(pending)) ownedCommits.add(pending);
   } catch {
-    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
+    return { partitions: await legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots), complete: false };
   }
 
-  return tips.map((tip, index) => {
-    const commit = tipRecords[index]?.commit;
-    if (!commit) return { tip, proof: { status: "indeterminate", marker: "missing-object" } };
-    return { tip, commit, proof: { status: ownedCommits.has(commit) ? "owned" : "unowned" } };
-  });
+  return {
+    partitions: tips.map((tip, index) => {
+      const commit = tipRecords[index]?.commit;
+      if (!commit) return { tip, proof: { status: "indeterminate", marker: "missing-object" } };
+      return { tip, commit, proof: { status: ownedCommits.has(commit) ? "owned" : "unowned" } };
+    }),
+    rootCommits: rootRecords.map((record) => record.commit!),
+    complete: true,
+  };
 }
 
 export async function noDropProof(
@@ -266,10 +296,37 @@ export async function noDropProof(
   protectedTips: readonly string[],
   options: NoDropProofOptions = {},
 ): Promise<NoDropProof> {
-  return legacyNoDropProofForTest(repoDir, plannedRefs, heldRefs, recoveryPins, protectedTips, options);
+  const values = (v: Readonly<Record<string, string>> | readonly string[]) => Array.isArray(v) ? [...v] : Object.values(v);
+  const durableRoots = [...values(plannedRefs), ...values(heldRefs), ...values(recoveryPins)];
+  const observation = await observePartitionOwnedByIncoming(
+    repoDir,
+    protectedTips,
+    durableRoots,
+    options.ownershipContext,
+  );
+  if (!observation.complete) {
+    return legacyNoDropProofForTest(repoDir, plannedRefs, heldRefs, recoveryPins, protectedTips, options);
+  }
+  if (observation.marker) return { status: "indeterminate", marker: observation.marker };
+  for (const entry of observation.partitions) {
+    if (entry.proof.status === "indeterminate") return { status: "indeterminate", marker: entry.proof.marker };
+  }
+  const durable = observation.rootCommits;
+  if (!durable) return { status: "indeterminate", marker: "walk-error" };
+  let contentEquivalent = false;
+  for (let i = 0; i < observation.partitions.length; i++) {
+    const entry = observation.partitions[i]!;
+    if (entry.proof.status === "unowned") {
+      if (process.env.RBOX_GIT_CONTENT_EQUIV === "0") return { status: "would-drop", tip: protectedTips[i]! };
+      const equivalent = await contentEquivalenceProbe(repoDir, entry.commit!, durable, options);
+      if (!equivalent) return { status: "would-drop", tip: protectedTips[i]! };
+      contentEquivalent = true;
+    }
+  }
+  return contentEquivalent ? { status: "proven", marker: "content-equivalent" } : { status: "proven" };
 }
 
-/** Test-only semantic oracle for the pre-design-293 no-drop proof (G5a). */
+/** Test-only semantic oracle for the pre-design-293 no-drop proof. Production reaches it only through noDropProof's exact anomaly fallback. */
 export async function legacyNoDropProofForTest(
   repoDir: string,
   plannedRefs: Readonly<Record<string, string>> | readonly string[],
