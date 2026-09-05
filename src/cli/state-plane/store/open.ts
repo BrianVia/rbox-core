@@ -1,14 +1,11 @@
+/** Never: mutate foreign or read-only observations, or redefine frozen schema compatibility. */
 import { constants, Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { StateStoreOpenError } from "../errors.js";
 import {
-  applySchemaV1,
-  installGenesisLineage,
-  STATE_STORE_SQLITE_APPLICATION_ID,
-  STATE_STORE_SQLITE_USER_VERSION,
-  type GenesisLineage,
+  applySchemaV1, installGenesisLineage, maintainWriterSchema, STATE_STORE_SQLITE_APPLICATION_ID, STATE_STORE_SQLITE_USER_VERSION, type GenesisLineage,
 } from "../schema/application.js";
 import { validateOpen, type StoreHeader } from "../schema/validate-open.js";
 import { selectRow } from "./statements.js";
@@ -254,6 +251,7 @@ function initializeClaimedStateStore(
     db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${STATE_STORE_SQLITE_APPLICATION_ID}; PRAGMA user_version=${STATE_STORE_SQLITE_USER_VERSION}`);
     configureWriter(db);
     applySchemaV1(db);
+    maintainWriterSchema(db);
     install(db);
     const header = validateOpen(db, file);
     const pragmas = readPragmas(db);
@@ -370,7 +368,8 @@ export function openStateStore(file: string, options: { readonly?: boolean } = {
     // Validate before configuring: `validateOpen` is what types a SQLite
     // failure as `corrupt`, so nothing may touch the database ahead of it.
     const header = validateOpen(db, file);
-    if (readonly) configureReader(db); else configureWriter(db);
+    if (readonly) configureReader(db);
+    else { configureWriter(db); maintainWriterSchema(db); }
     const pragmas = readPragmas(db);
     assertPragmas(pragmas, readonly, file);
     return new StateStoreHandle(file, readonly, header, pragmas, db);
@@ -420,6 +419,7 @@ export function openStateStoreForWalTakeover(file: string): StateStoreHandle {
     db = new Database(file, { create: false, readwrite: true });
     configureWriter(db);
     const header = validateOpen(db, file);
+    maintainWriterSchema(db);
     const pragmas = readPragmas(db);
     assertPragmas(pragmas, false, file);
     return new StateStoreHandle(file, false, header, pragmas, db);

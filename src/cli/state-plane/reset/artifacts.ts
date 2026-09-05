@@ -7,7 +7,7 @@ import { boundedHash, boundedRead } from "../../reset-io.js";
 export { sqliteResetPaths } from "../paths.js";
 
 export const RESET_NEXT_DB_SEED_LIMIT = 256 * 1024;
-export const RESET_SCHEMA_V1_EMPTY_SEED_BYTES = 126_976;
+export const RESET_SCHEMA_V1_EMPTY_SEED_BYTES = 131_072;
 export const SQLITE_RESET_SIDECARS = ["-wal", "-shm", "-journal"] as const;
 export type SqliteResetSidecar = typeof SQLITE_RESET_SIDECARS[number];
 export type SidecarVector = "S0" | "SW" | "other";
