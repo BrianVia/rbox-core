@@ -37,10 +37,16 @@
   has no global section AND the CAS token is exactly one revision past the
   snapshot's; records/meta/git projections still read back (a whole-state
   projection was tried and withdrawn: `applyTransitions` recomposes bases).
-  Copied-store profile 2.4s → 83ms. **Desktop now dogfoods
-  `2.0.2-dev+ddc93f2`** (pid 1468774, restarted ~19:15Z); watch the push
-  line's `state-save` drop from ~2.4s. FM stays on `2.0.2-dev+e3881c3`
-  (shadow), Mac on stable 2.0.2.
+  Copied-store profile 2.4s → 83ms — but on the desktop the guard refused
+  (a push snapshot is usually one revision behind a pull), so **#892 MERGED
+  (design 302, `7f867192e`)** re-homed the reuse in the design-277 memo,
+  keyed by the store's own `active_base_generation` (only a global section
+  advances it); `loadRawState` stays fresh so the 269 drift audit still sees
+  corruption (that test caught an earlier draft). **Desktop now dogfoods
+  `2.0.2-dev+7f86719`** (pid 1496033, restarted ~19:40Z); watch
+  `state-save` on the push line fall from ~2.4s to <0.2s except when the
+  elision audit rehashes (~0.95s compose). FM stays on
+  `2.0.2-dev+e3881c3` (shadow), Mac on stable 2.0.2.
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
