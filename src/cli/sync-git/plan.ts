@@ -37,11 +37,13 @@ function applyRepoAttemptCommands(
   accumulator: GitPlanAccumulator,
   rel: string,
   commands: readonly RepoAttemptCommand[],
+  trustedCarryRepoCtx?: Map<string, RepoCtx>,
 ): void {
   for (const command of commands) {
     switch (command.kind) {
       case "carry":
         accumulator.carry(rel, command.section);
+        if (command.diskCtx && trustedCarryRepoCtx) trustedCarryRepoCtx.set(rel, command.diskCtx);
         break;
       case "defer":
         accumulator.deferRepo(rel, command.reason, command.forced, command.typedReason);
@@ -196,7 +198,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
     stats.spawnedRepos++;
     const attempt = attemptFor(rel, kind);
     const result = await attempt.classify(fastLookup, { ...options, admissionAvailable: admitted < cap });
-    applyRepoAttemptCommands(accumulator, rel, attempt.drainCommands());
+    applyRepoAttemptCommands(accumulator, rel, attempt.drainCommands(), trustedCarryRepoCtx);
     if (result.parentRelKnown) fastPathParentRel.set(rel, result.parentRel);
     if (result.stableCarry) stableCarryHygiene.add(rel);
     if (result.admissionUsed) admitted++;

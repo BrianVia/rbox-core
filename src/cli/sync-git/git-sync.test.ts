@@ -2738,6 +2738,38 @@ test("a paused record with no base and no pending still retires under a whole-tr
   expect(await fs.stat(path.join(repo, ".git")).then(() => true)).toBeTrue();
 }, 20_000);
 
+test("design 306b: slow-path (untrusted-cache) carries reuse the identity probe's context too", async () => {
+  const rels = ["slow-carry-a", "slow-carry-b"];
+  for (const rel of rels) {
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", "one", "c1");
+  }
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  // No markDivergenceCacheTrusted: every repo takes the slow classify path and
+  // carries through RepoCaptureAttempt's identity match, not the fast-path branch.
+  let captureStage = false;
+  let captureRevParseSpawns = 0;
+  const freshContextReads: string[] = [];
+  setGitSpawnObserver((_spawnRoot, args) => {
+    if (captureStage && args[0] === "rev-parse") captureRevParseSpawns++;
+  });
+  try {
+    const plan = await planGitSections(
+      rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+        beforeCapturePool: () => { captureStage = true; },
+        onPostCaptureRepoCtxRead: (rel) => freshContextReads.push(rel),
+      },
+    );
+    expect(plan.carried).toEqual(expect.arrayContaining(rels));
+    expect(freshContextReads.filter((rel) => rels.includes(rel))).toEqual([]);
+    expect(captureRevParseSpawns).toBe(0);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+}, 20_000);
+
 test("design 306: carried repos reuse classify contexts and still refresh packed-refs", async () => {
   const rels = ["carried-context-a", "carried-context-b", "carried-context-c"];
   for (const rel of rels) {
