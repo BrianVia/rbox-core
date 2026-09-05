@@ -11,12 +11,18 @@ import {
   scanManifest,
   validateGitSection,
   type BlobStore,
-  type GitSection,
+  type GitSection
 } from "../../engine/index.js";
 import { decryptFileToPath } from "../../engine/crypto.js";
 import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import { applyGitState } from "./git-state-apply.js";
-import { captureGitState, GitCaptureDeferredError, gitCaptureScratchRoot, normalizeSymbolicHeadCasing, sweepStaleGitCaptureDirs } from "./capture.js";
+import {
+  captureGitState,
+  GitCaptureDeferredError,
+  gitCaptureScratchRoot,
+  normalizeSymbolicHeadCasing,
+  sweepStaleGitCaptureDirs
+} from "./capture.js";
 import { gitIdentity, gitIdentityKey, indexTreeOf } from "./identity.js";
 import { gitPreflight } from "./preflight.js";
 import { preserveGitConflict } from "./quarantine.js";
@@ -24,28 +30,51 @@ import { gitSectionNewestLink, gitSectionTips, repoCtx } from "./git-state.js";
 import type { GitArtifactRef } from "../../engine/types.js";
 
 const exec = promisify(execFile);
+const isolatedGitEnv: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_DIR: undefined,
+  GIT_COMMON_DIR: undefined,
+  GIT_WORK_TREE: undefined,
+  GIT_INDEX_FILE: undefined,
+  GIT_OBJECT_DIRECTORY: undefined,
+  GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+  GIT_TEST_SPLIT_INDEX: undefined
+};
 const cleanGitEnv = (extra: NodeJS.ProcessEnv = {}) =>
   ({
     ...process.env,
-    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
-    GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
-    GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
-    GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined,
-    GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined,
-    ...extra,
+    ...isolatedGitEnv,
+    GIT_AUTHOR_NAME: "rbox test",
+    GIT_AUTHOR_EMAIL: "rbox-test@local",
+    GIT_COMMITTER_NAME: "rbox test",
+    GIT_COMMITTER_EMAIL: "rbox-test@local",
+    ...extra
   }) as NodeJS.ProcessEnv;
-const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: cleanGitEnv() }).then((r) => r.stdout.toString().trim());
+const git = (root: string, ...args: string[]) =>
+  exec("git", ["-C", root, ...args], { env: cleanGitEnv() }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
-test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
-  cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
+test.if =
+  (cond: boolean) =>
+  (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
+    cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
 
 let tmp: string;
 let A: string;
 let B: string;
 let store: LocalBlobStore;
+let inheritedGitEnv: NodeJS.ProcessEnv;
 
 beforeEach(async () => {
+  // Capture/apply also spawn Git directly: isolate their object lookup, not
+  // only the fixture runner's environment, then restore it after the test.
+  inheritedGitEnv = {};
+  for (const [key, value] of Object.entries(isolatedGitEnv)) {
+    inheritedGitEnv[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gs-"));
   A = path.join(tmp, "A");
   B = path.join(tmp, "B");
@@ -54,7 +83,14 @@ beforeEach(async () => {
   store = new LocalBlobStore(path.join(tmp, "store"));
 });
 afterEach(async () => {
-  await fs.rm(tmp, { recursive: true, force: true });
+  try {
+    await fs.rm(tmp, { recursive: true, force: true });
+  } finally {
+    for (const [key, value] of Object.entries(inheritedGitEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 async function initRepo(dir: string) {
@@ -105,12 +141,17 @@ async function resolvedIndexPath(dir: string): Promise<string> {
   expect(ctx).toBeDefined();
   return path.join(ctx!.gitDir, "index");
 }
-async function indexSnapshot(dir: string): Promise<{ path: string; ino: number; mtimeMs: number; ctimeMs: number; size: number; bytes: Buffer }> {
+async function indexSnapshot(
+  dir: string
+): Promise<{ path: string; ino: number; mtimeMs: number; ctimeMs: number; size: number; bytes: Buffer }> {
   const indexPath = await resolvedIndexPath(dir);
   const [st, bytes] = await Promise.all([fs.stat(indexPath), fs.readFile(indexPath)]);
   return { path: indexPath, ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, bytes };
 }
-function expectSameIndexSnapshot(actual: Awaited<ReturnType<typeof indexSnapshot>>, expected: Awaited<ReturnType<typeof indexSnapshot>>): void {
+function expectSameIndexSnapshot(
+  actual: Awaited<ReturnType<typeof indexSnapshot>>,
+  expected: Awaited<ReturnType<typeof indexSnapshot>>
+): void {
   expect(actual.path).toBe(expected.path);
   expect(actual.ino).toBe(expected.ino);
   expect(actual.mtimeMs).toBe(expected.mtimeMs);
@@ -151,7 +192,7 @@ async function createSyntheticResolveUndoRepo(repo: string): Promise<{ base: str
       `100644 ${base} 1\tf.txt`,
       `100644 ${ours} 2\tf.txt`,
       `100644 ${theirs} 3\tf.txt`,
-      "",
+      ""
     ].join("\n")
   );
   await fs.writeFile(path.join(repo, "f.txt"), "resolved\n");
@@ -184,6 +225,48 @@ async function decryptIndexArtifact(section: GitSection, destPath: string): Prom
   }
 }
 
+test("design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver", async () => {
+  await initRepo(A);
+  await commitFile(A, "tracked.txt", "committed\n", "base");
+  const base = await writeLooseBlob(A, "stage-base", "stage-only base\n");
+  const ours = await writeLooseBlob(A, "stage-ours", "stage-only ours\n");
+  const theirs = await writeLooseBlob(A, "stage-theirs", "stage-only theirs\n");
+  await gitWithStdin(
+    A,
+    ["update-index", "--index-info"],
+    [`100644 ${base} 1\tconflict.txt`, `100644 ${ours} 2\tconflict.txt`, `100644 ${theirs} 3\tconflict.txt`, ""].join("\n")
+  );
+  const reachable = await git(A, "rev-list", "--objects", "--all", "--reflog");
+  for (const oid of [base, ours, theirs]) {
+    expect(await git(A, "cat-file", "-t", oid)).toBe("blob");
+    expect(reachable).not.toContain(oid);
+  }
+  await initRepo(B);
+  expect(await fs.readdir(path.join(B, ".git", "objects", "info"))).not.toContain("alternates");
+  for (const oid of [base, ours, theirs]) {
+    await expect(git(B, "cat-file", "-e", oid)).rejects.toHaveProperty("code", 1);
+  }
+  const entries = await git(A, "ls-files", "--stage", "-z");
+  expect(await git(A, "ls-files", "--unmerged", "-z")).toBe(
+    [`100644 ${base} 1\tconflict.txt`, `100644 ${ours} 2\tconflict.txt`, `100644 ${theirs} 3\tconflict.txt`, ""].join("\0")
+  );
+  const before = await indexSnapshot(A);
+
+  // This is ordinary background capture, not the keep-mine resolution path.
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  const result = await applyGitState(B, section!, store, KEK);
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await fs.readdir(path.join(B, ".git", "objects", "info"))).not.toContain("alternates");
+  expect(result).toEqual(expect.objectContaining({ applied: true }));
+  expect(await git(B, "ls-files", "--stage", "-z")).toBe(entries);
+  expect(await git(B, "cat-file", "-p", base)).toBe("stage-only base");
+  expect(await git(B, "cat-file", "-p", ours)).toBe("stage-only ours");
+  expect(await git(B, "cat-file", "-p", theirs)).toBe("stage-only theirs");
+  await git(B, "fsck", "--connectivity-only", "--no-dangling");
+});
+
 test("preflight accepts an ordinary repo, rejects non-repo and bare", async () => {
   await initRepo(A);
   await fs.writeFile(path.join(A, "f.txt"), "x");
@@ -196,7 +279,6 @@ test("preflight accepts an ordinary repo, rejects non-repo and bare", async () =
   expect((await gitPreflight(plain)).ok).toBe(false);
 });
 
-
 /** True when the tmp filesystem is case-INSENSITIVE (macOS/APFS default). The
  *  case-drift repro (HEAD casing != packed-refs casing while HEAD still
  *  resolves) can only exist there; on case-sensitive FS the same setup reads
@@ -206,7 +288,10 @@ const fsCaseInsensitive = await (async () => {
   const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-case-probe-"));
   try {
     await fs.writeFile(path.join(d, "CaseProbe"), "");
-    return await fs.access(path.join(d, "caseprobe")).then(() => true, () => false);
+    return await fs.access(path.join(d, "caseprobe")).then(
+      () => true,
+      () => false
+    );
   } finally {
     await fs.rm(d, { recursive: true, force: true });
   }
@@ -351,7 +436,7 @@ test("resolve-undo entries with unreachable blobs are stripped on capture and he
     ...section!,
     indexSha: unstripped.sha,
     indexEncSha: unstripped.encSha,
-    indexCipherSize: unstripped.cipherSize,
+    indexCipherSize: unstripped.cipherSize
   };
   const C = path.join(tmp, "C");
   await fs.mkdir(C, { recursive: true });
@@ -382,7 +467,7 @@ test("applyGitState threads compressed index descriptors into artifact decrypt",
     indexEncSha: compressedIndex.encSha,
     indexCipherSize: compressedIndex.cipherSize,
     indexComp: compressedIndex.comp,
-    indexPayloadSha: compressedIndex.payloadSha,
+    indexPayloadSha: compressedIndex.payloadSha
   };
 
   const res = await applyGitState(B, compressedSection, store, KEK);
@@ -584,7 +669,7 @@ test("capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpd
     async putFile(s, src) {
       uploadPaths.push(src);
       blobs.set(s, await fs.readFile(src));
-    },
+    }
   };
 
   const section = await captureGitState(repo, recordingStore, KEK, { workspaceRoot: workspace });
@@ -774,3 +859,40 @@ test("indexTreeOf temp-index write-tree matches direct write-tree for staged dir
     expect(viaTempIndex).toBe(direct);
   }
 }, 30_000);
+
+test("design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks", async () => {
+  await initRepo(A);
+  await commitFile(A, "tracked", "committed", "base");
+  const stage = await writeLooseBlob(A, "conflict", "stage only");
+  const foreign = "1234567890123456789012345678901234567890";
+  await gitWithStdin(
+    A,
+    ["update-index", "-z", "--index-info"],
+    [`100644 ${stage} 1\tconflict\nwith\ttabs`, `100644 ${stage} 2\tconflict\nwith\ttabs`, `160000 ${foreign} 0\tsubmodule`, ""].join("\0")
+  );
+  await fs.writeFile(path.join(A, "intent"), "unstaged content");
+  await git(A, "add", "-N", "intent");
+  const empty = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+  expect(await git(A, "cat-file", "-t", empty)).toBe("blob");
+  await expect(git(A, "cat-file", "-e", foreign)).rejects.toHaveProperty("code", 1);
+  const before = await indexSnapshot(A);
+  const section = (await captureGitState(A, store, KEK))!;
+  expect(section.indexTree).toStartWith("raw:");
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await applyGitState(B, section, store, KEK)).toEqual(expect.objectContaining({ applied: true }));
+  expect(await git(B, "cat-file", "-t", empty)).toBe("blob");
+  expect(await git(B, "ls-files", "--stage", "--debug", "-z", "intent")).toContain("flags: 20004000");
+  expect(await git(B, "ls-files", "--stage", "-z")).toBe(await git(A, "ls-files", "--stage", "-z"));
+  await git(B, "fsck", "--connectivity-only", "--no-dangling");
+});
+
+test("design 289: missing ordinary stage root rejects capture and cleans scratch pins", async () => {
+  await initRepo(A);
+  await commitFile(A, "tracked", "committed", "base");
+  const missing = "1234567890123456789012345678901234567890";
+  await gitWithStdin(A, ["update-index", "--index-info"], `100644 ${missing} 1\tconflict\n`);
+  const before = await indexSnapshot(A);
+  await expect(captureGitState(A, store, KEK)).rejects.toThrow();
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await git(A, "for-each-ref", "--format=%(refname)", "refs/rbox/")).toBe("");
+});
