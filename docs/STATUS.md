@@ -19,11 +19,20 @@
   293; 68→4 spawns @30 tips, 1008→4 @500; a preceding refactor moved the
   content-equivalence probe to `sync-git/content-equivalence.ts` to stay
   under the 400-line module gate); #885 G2 NUL-safe worktree parsing (design
-  295, `worktree list --porcelain -z`). **Open:** #883 S1a maintenance re-arm
-  (design 294) and #887 G3a SHA-256 admission + fingerprint schema 9→10
-  (design 296) — both green locally, repeatedly hit FLAKE-012 runner
-  assignment in CI (5 parallel PRs starved the CF runner pool; rerun with
-  `gh run rerun <id> --failed`).
+  295, `worktree list --porcelain -z`). #883 S1a maintenance re-arm (design 294,
+  rebased over S3a) and #887 G3a SHA-256 admission + fingerprint schema 9→10
+  (design 296) also MERGED. Every one of the five hit FLAKE-012 runner
+  assignment at least once (5 parallel PRs starve the CF runner pool; rerun
+  with `gh run rerun <id> --failed`; #883 needed four reruns). DEV API
+  auto-deployed and answers `/version`.
+- **Second wave OPEN (evening):** #888 G4a Git env allowlist (design 299),
+  #889 B0b push-cost attribution lines `git-plan slowest:` /
+  `state-save slow:` (design 298; measured: empty desktop push = git-plan
+  3.8s with cp2376 d1065 + state-save 2.3s and ZERO captures — after merge,
+  dev-build the desktop and read those two lines, then scope the real fix),
+  #890 S2a optional `plane_entries_entry` index (design 300; 200k/3k orphan
+  collector >180s → ~65ms). Merge each on green; then remove worktrees
+  `b0b-attrib`, `g4a-gitenv`, `s2a-index`.
 - **Codex sandbox cannot write `.git/worktrees/*`** (index.lock EROFS): every
   Codex run leaves the diff uncommitted; commit from this session. Also:
   `SPEC.md` at repo root is a TRACKED leftover from #833 — never `cp` a spec
