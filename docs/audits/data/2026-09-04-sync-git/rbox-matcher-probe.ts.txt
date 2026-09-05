@@ -1,0 +1,5 @@
+import fs from 'node:fs/promises';import path from 'node:path';import {spawnSync} from 'node:child_process';import {buildIgnoreMatcher} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/ignore.ts';
+const root=await fs.mkdtemp('/private/tmp/rbox-matcher-probe-');
+try{for(let i=0;i<100;i++){const dir=path.join(root,`repo-${i}`);await fs.mkdir(dir);const p=spawnSync('git',['init','-q'],{cwd:dir});if(p.status!==0)throw Error(p.stderr.toString());await fs.writeFile(path.join(dir,'tracked.txt'),'x');const a=spawnSync('git',['add','tracked.txt'],{cwd:dir});if(a.status!==0)throw Error(a.stderr.toString());for(let j=0;j<10;j++)await fs.mkdir(path.join(dir,`dir-${j}`));}
+for(const respectGitignore of [false,true]){const times=[];for(let i=0;i<5;i++){const t=performance.now();buildIgnoreMatcher(root,{respectGitignore});times.push(performance.now()-t);}console.log(JSON.stringify({repos:100,dirs:1100,respectGitignore,times,warmMedianMs:times.slice(1).sort((a,b)=>a-b)[2]}));}
+}finally{await fs.rm(root,{recursive:true,force:true});}

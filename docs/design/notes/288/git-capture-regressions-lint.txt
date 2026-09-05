@@ -1,0 +1,4 @@
+$ bun scripts/lint-affected.ts --base HEAD
+lint-affected: 1 changed file(s) vs c4aa22bbb8
+error: bun is unable to write files to tempdir: PermissionDenied
+error: script "lint:affected" exited with code 1

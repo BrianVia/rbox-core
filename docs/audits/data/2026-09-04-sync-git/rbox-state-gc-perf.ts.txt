@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import {createStateStore,stateStoreDatabase} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/state-plane/store/open.ts';
+import {applySavePacketToStore} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/state-plane/adapters/sqlite-state-save.ts';
+import {casOwnerTokenFromLock} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/state-plane/store/owner-token.ts';
+import {collectUnreferencedEntryValues} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/state-plane/store/plane-promotion.ts';
+const root=fs.mkdtempSync('/private/tmp/rbox-state-audit-');
+const store=createStateStore(root+'/state.db',{authorityId:'a'.repeat(32),lineageId:'b'.repeat(32),stream:'bench://state-plane',createdBy:'audit',stateNonce:'c'.repeat(32),stateRevision:0});
+const owner=casOwnerTokenFromLock({isOwnerSync:()=>true} as any);
+try {
+for(let i=1;i<=2;i++) {const result=await applySavePacketToStore(store,{expectedStream:'bench://state-plane',expectedNonce:'c'.repeat(32),sourceGlobalSeq:i,global:{manifest:{generatedAt:new Date().toISOString(),manifestSchema:2,files:Array.from({length:3000},(_,j)=>({path:String(j).padStart(5,'0')+'.txt',sha256:'a'.repeat(64),size:1,mode:420,mtimeMs:i,type:'file'}))}},repos:[]},owner);if(result.status!=='accepted')throw new Error(result.status);}
+const db=stateStoreDatabase(store);
+console.log('after_50_mtime_only_versions',db.query('SELECT (SELECT count(*) FROM entry_values) AS values_count,(SELECT count(*) FROM plane_entries) AS live_entries').get());
+console.log('collector_plan',db.query('EXPLAIN QUERY PLAN DELETE FROM entry_values WHERE NOT EXISTS(SELECT 1 FROM plane_entries p WHERE p.entry_id=entry_values.entry_id)').all());
+db.exec('BEGIN');let t=performance.now();console.log('unindexed_collect',collectUnreferencedEntryValues(db),'ms',performance.now()-t);db.exec('ROLLBACK');db.exec('CREATE INDEX audit_plane_entry_ref ON plane_entries(entry_id,path,path_order)');t=performance.now();console.log('indexed_collect',collectUnreferencedEntryValues(db),'ms',performance.now()-t);
+}finally{store.close();fs.rmSync(root,{recursive:true,force:true});}

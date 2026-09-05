@@ -1,0 +1,20 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {execFileSync} from 'node:child_process';
+import {listWorktreesStrict,repoCtx} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/git-state.ts';
+import {branchesCheckedOutElsewhereStrict} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/git-state-apply.ts';
+import {gitPreflight} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/preflight.ts';
+import {captureGitState} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/capture.ts';
+import {LocalBlobStore} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/blobstore.ts';
+const temp=await fs.mkdtemp('/private/tmp/rbox-git-probes-');
+const env={...process.env,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1',GIT_AUTHOR_NAME:'test',GIT_AUTHOR_EMAIL:'test@example.invalid',GIT_COMMITTER_NAME:'test',GIT_COMMITTER_EMAIL:'test@example.invalid'};
+Object.assign(process.env,env);
+const git=(root:string,...args:string[])=>execFileSync('git',['-C',root,...args],{env,encoding:'utf8'}).trim();
+const root=path.join(temp,'main');await fs.mkdir(root);git(root,'init','-qb','main');await fs.writeFile(path.join(root,'a'),'a');git(root,'add','.');git(root,'commit','-qm','initial');
+const wt=path.join(temp,'work\ntree');git(root,'worktree','add','-qb','topic',wt);
+console.log('WORKTREE_RAW',JSON.stringify(git(wt,'worktree','list','--porcelain')));
+console.log('WORKTREE_PARSED',JSON.stringify(await listWorktreesStrict(wt)));
+const owned=await branchesCheckedOutElsewhereStrict((await repoCtx(wt))!);console.log('OWNERSHIP_FROM_SELF',owned.status==='ok'?JSON.stringify([...owned.owned]):owned);
+git(root,'update-index','--split-index');console.log('SPLIT_PREFLIGHT',await gitPreflight(root));try {const s=await captureGitState(root,new LocalBlobStore(path.join(temp,'store')),Buffer.alloc(32,7));console.log('SPLIT_CAPTURE_OK',!!s);} catch(e){console.log('SPLIT_CAPTURE_ERROR',String(e));}
+const sha=path.join(temp,'sha256');await fs.mkdir(sha);git(sha,'init','-qb','main','--object-format=sha256');git(sha,'commit','--allow-empty','-qm','initial');console.log('SHA256_PREFLIGHT',await gitPreflight(sha));try{console.log('SHA256_CAPTURE',await captureGitState(sha,new LocalBlobStore(path.join(temp,'store2')),Buffer.alloc(32,7)));}catch(e){console.log('SHA256_CAPTURE_ERROR',String(e));}
+console.log('PROBE_ROOT',temp);

@@ -1,0 +1,110 @@
+bun test v1.3.14 (0d9b296a)
+
+src/cli/sync-git/capture-identity.test.ts:
+993 |   if (!isURLInstance(fileURLOrPath))
+994 |     return fileURLOrPath;
+995 |   return Bun.fileURLToPath(fileURLOrPath);
+996 | }
+997 | var { Error, TypeError } = globalThis;
+998 |   let err = new Error(message);
+                  ^
+error: Command failed: git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-TDNzid/B ls-files --stage -z
+fatal: .git/sharedindex.09e697f0723ef119d45056f96a651595bb39f1e7: index file open failed: No such file or directory
+
+   code: 128,
+ killed: false,
+ signal: null,
+    cmd: "git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-TDNzid/B ls-files --stage -z",
+ stdout: "",
+ stderr: "fatal: .git/sharedindex.09e697f0723ef119d45056f96a651595bb39f1e7: index file open failed: No such file or directory\n",
+
+      at genericNodeError (node:child_process:998:13)
+      at exitHandler (node:child_process:103:28)
+      at emit (node:events:98:22)
+      at #maybeClose (node:child_process:766:16)
+      at #handleOnExit (node:child_process:520:72)
+(fail) design 288: captured split index is self-contained in an independent repository [1161.55ms]
+271 |   expect(await splitIndexDependencies()).toEqual(dependencies);
+272 |   // B starts without .git or any source objects/index dependencies.
+273 |   const result = await applyGitState(B, section!, store, KEK);
+274 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+275 |   expect(await splitIndexDependencies()).toEqual(dependencies);
+276 |   expect(result).toEqual(expect.objectContaining({ applied: true }));
+                       ^
+error: expect(received).toEqual(expected)
+
+- ObjectContaining
+  {
+-   "applied": true,
++   "applied": false,
++   "conflictBundle": undefined,
++   "filteredRefs": undefined,
++   "reason":
++ "apply failed — rolled back: Command failed: git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-QEi55P/B update-index --clear-resolve-undo
++ fatal: /private/var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-QEi55P/B/.git/sharedindex.4e9383ec488fc5633590fcc4fd24f3354efb6ad4: index file open failed: No such file or directory
++ "
++ ,
+  }
+
+- Expected  - 2
++ Received  + 8
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/capture-identity.test.ts:276:18)
+(fail) design 288: split-index capture applies to a fresh receiver without changing source staging [1412.72ms]
+315 |   expect(section).toBeDefined();
+316 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+317 |   const result = await applyGitState(B, section!, store, KEK);
+318 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+319 |   expect(await fs.readdir(path.join(B, ".git", "objects", "info"))).not.toContain("alternates");
+320 |   expect(result).toEqual(expect.objectContaining({ applied: true }));
+                       ^
+error: expect(received).toEqual(expected)
+
+- ObjectContaining
+  {
+-   "applied": true,
++   "applied": false,
++   "conflictBundle": undefined,
++   "filteredRefs": undefined,
++   "reason": "post-apply fsck failed — rolled back",
+  }
+
+- Expected  - 2
++ Received  + 4
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/capture-identity.test.ts:320:18)
+(fail) design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver [1160.47ms]
+(pass) preflight accepts an ordinary repo, rejects non-repo and bare [231.78ms]
+(pass) normalizeSymbolicHeadCasing: pure semantics (FS-independent) [0.71ms]
+(pass) capture normalizes symbolic HEAD casing to the ref store casing [336.60ms]
+(pass) capture refuses ambiguous case-insensitive HEAD ref matches with validation reason [360.56ms]
+(pass) capture names its early bails: empty repo throws a reasoned defer, not undefined [151.91ms]
+(pass) capture→apply reproduces branches, staged state, and stash across repos [1444.29ms]
+(pass) resolve-undo entries with unreachable blobs are stripped on capture and healed before apply fsck [1697.95ms]
+(pass) applyGitState threads compressed index descriptors into artifact decrypt [4563.95ms]
+(pass) incremental dir/all capture uses basis negations and a chained section round-trips [1220.81ms]
+(pass) rewritten refs between increment links import with forced scratch refs, and second apply skips only historical links [2366.46ms]
+(pass) current incremental link is imported even when recorded commit tips are already present [1605.06ms]
+(pass) unchained full-bundle sections do not use presence probes [1149.50ms]
+(pass) preserveGitConflict imports the current WIP link even when commit tips are present [1158.56ms]
+(pass) detached pointer captures use detached HEAD as basis for scoped chains [1152.58ms]
+(pass) capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpdir scratch [296.20ms]
+(pass) stale git capture sweep removes orphan rbox-gitcap directories and preserves live owners [3.60ms]
+(pass) second git capture sweep preserves an aged live staging dir and sweeps a dead owner promptly [311.50ms]
+(pass) scanManifest never includes staged git capture bytes under .rbox [14.11ms]
+(pass) apply with the WRONG key fails closed — no .git mutation (§28 decrypt-before-mutate) [586.07ms]
+(pass) gitIdentity is stable across captures when nothing changed (no echo) [402.36ms]
+(pass) capture stash construction never refreshes the live staged index [473.13ms]
+(pass) capture with an absent index never creates the live index [357.83ms]
+(pass) gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers [929.00ms]
+(pass) indexTreeOf temp-index write-tree matches direct write-tree for staged dir and pointer repos [536.13ms]
+
+3 tests failed:
+(fail) design 288: captured split index is self-contained in an independent repository [1161.55ms]
+(fail) design 288: split-index capture applies to a fresh receiver without changing source staging [1412.72ms]
+(fail) design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver [1160.47ms]
+
+ 24 pass
+ 3 fail
+ 248 expect() calls
+Ran 27 tests across 1 file. [25.26s]

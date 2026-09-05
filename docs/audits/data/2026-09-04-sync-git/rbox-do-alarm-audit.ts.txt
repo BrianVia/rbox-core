@@ -1,0 +1,15 @@
+import {WorkspaceSync} from '/Users/via/.codex/worktrees/a53f/rbox-core/apps/api/src/workspace-sync.ts';
+(globalThis as any).WebSocketRequestResponsePair=class{constructor(..._args:any[]){}};
+const kv=new Map<string,any>();let fanout=0,mirrors=0,failAlarm=true;
+const ctx:any={storage:{kv:{get:(k:string)=>kv.get(k),put:(k:string,v:any)=>kv.set(k,v),delete:(k:string)=>kv.delete(k),list:()=>new Map()},sql:{exec:()=>({toArray:()=>[]})},transactionSync:(f:any)=>f(),getAlarm:async()=>null,setAlarm:async()=>{if(failAlarm)throw new Error('injected alarm failure')}},getWebSockets:()=>[{readyState:WebSocket.OPEN,send:()=>fanout++}],setWebSocketAutoResponse:()=>{}};
+const db:any={prepare:(sql:string)=>{const stmt:any={sql,args:[],bind:(...args:any[])=>{stmt.args=args;return stmt},first:async()=>null,run:async()=>{mirrors++;return {success:true}}};return stmt},batch:async(stmts:any[])=>stmts.map(s=>({results:s.sql.includes('FROM blob_refs')?s.args.slice(1).map((sha256:string)=>({sha256})):[]}))};
+const env:any={rbox_dev_db:db};
+const sync=new WorkspaceSync(ctx,env);
+const cb={type:'rbox/commit/v1',seq:1,parentSeq:0,accountEpoch:0,encManifestSha:'a'.repeat(64),deviceId:'dev-a',blobRefs:[],parentCommitHash:'0'.repeat(64),rosterVersion:0,keyEpoch:0,workspaceId:'ws_1'};
+const req=()=>new Request('https://api.test/v1/ws/ws_1/proj/root/manifests',{method:'POST',headers:{'x-rbox-account':'acct_1','x-rbox-account-epoch':'0'},body:JSON.stringify({parentSequence:0,commit:{body:JSON.stringify(cb),commitHash:'b'.repeat(64),sig:'sig'}})});
+try{console.log('first',(await sync.fetch(req())).status)}catch(e){console.log('first_threw',(e as Error).message)}
+console.log('after_failure',{head:kv.get('head'),index:kv.get('index_state'),fanout,mirrors});
+failAlarm=false;
+const retry=await sync.fetch(req());console.log('retry',retry.status,await retry.json());
+const rehydrated=new WorkspaceSync(ctx,env);
+const latest=await rehydrated.fetch(new Request('https://api.test/v1/ws/ws_1/proj/root/latest'));console.log('rehydrated_latest',latest.status,'fanout',fanout,'index',kv.get('index_state'));

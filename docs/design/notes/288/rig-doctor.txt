@@ -1,0 +1,16 @@
+$ bun scripts/rig/rig.ts doctor
+✓ macOS >= 26: 26.6.2
+✓ arch arm64: arm64
+✓ container CLI present: container CLI version 1.0.0 (build: release, commit: unspeci)
+✗ container system running: Error: The operation couldn’t be completed. Operation not permitted
+    fix: container system start
+✓ runs/cache disk headroom: 105 GiB · 105 GiB
+✓ bun present: 1.3.14
+✗ bootstrap secret resolvable: rig: no dev bootstrap secret. Set RBOX_DEV_BOOTSTRAP=<secret>, or add a line RBOX_DEV_BOOTSTRAP_SECRET=<secret> to dev-keys.local.secret at the repo root.
+    fix: set RBOX_DEV_BOOTSTRAP or add RBOX_DEV_BOOTSTRAP_SECRET= to dev-keys.local.secret
+✗ platform secret resolvable: rig: no dev platform secret. Set RBOX_DEV_PLATFORM_SECRET=<secret>, or add a line RBOX_DEV_PLATFORM_SECRET=<secret> to dev-keys.local.secret at the repo root.
+    fix: set RBOX_DEV_PLATFORM_SECRET or add RBOX_DEV_PLATFORM_SECRET= to dev-keys.local.secret
+✗ dev API reachable: https://rbox-dev-api.brian-via.workers.dev/health → Unable to connect. Is the computer able to access the url?
+○ CLOUDFLARE_ACCOUNT_ID (optional, AE query): present
+○ CLOUDFLARE_API_TOKEN (optional, AE query): present
+error: script "rig" exited with code 1
