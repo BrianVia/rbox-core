@@ -1,6 +1,6 @@
 # 292 — Bind statistics test contexts to their callbacks
 
-Status: implemented and tested on Bun 1.4.0 and 1.4.2; GPT review aligned; Claude review pending. The prototype helper was written before this document, before any test migration. This is a separate test compatibility slice, not another design 291 review round. No production behavior, runtime pin or CI assertion bypass is proposed. The source is published for host handoff, not certified merge-ready: automatic approval review twice rejected sending this newly scoped packet to external Claude, and no Claude verdict exists. The receiving Claude agent must inspect this design and evidence directly and complete the remaining review/CI gates before merge.
+Status: implemented and tested on Bun 1.4.0 and 1.4.2; GPT review aligned; Claude Fable 5.1 round-1 review aligned (`notes/292/review1-claude.md`). The prototype helper was written before this document, before any test migration. This is a separate test compatibility slice, not another design 291 review round. No production behavior, runtime pin or CI assertion bypass is proposed.
 
 ## Verified cause
 
@@ -24,4 +24,4 @@ Root supplies independent GPT review; Claude Fable 5.1 medium receives the scope
 
 ## Implemented and locally verified
 
-The six suites now bind their native Bun registrar through `pushSpanTests`; the final helper imports no Bun test globals and requires no type configuration change. All existing test assertions, names, timeouts and negative controls remain. Root's independent GPT review accepts both the original scoped-callback design and the final explicit registration seam. Final verification is **93 pass / 1 existing skip / 0 fail / 15,307 assertions** on both Bun 1.4.0 and 1.4.2; typecheck passes. Affected lint exits 0 with only documented pre-existing warnings. See `docs/design/notes/292/runtime-comparison.md`. Claude round-1 review remains pending; no final alignment is claimed before its response.
+The six suites now bind their native Bun registrar through `pushSpanTests`; the final helper imports no Bun test globals and requires no type configuration change. All existing test assertions, names, timeouts and negative controls remain. Root's independent GPT review accepts both the original scoped-callback design and the final explicit registration seam. Final verification is **93 pass / 1 existing skip / 0 fail / 15,307 assertions** on both Bun 1.4.0 and 1.4.2; typecheck passes. Affected lint exits 0 with only documented pre-existing warnings. See `docs/design/notes/292/runtime-comparison.md`. Claude round-1 review aligned directly in-repo (`notes/292/review1-claude.md`); GPT and Claude are aligned.
