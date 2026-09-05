@@ -1,6 +1,31 @@
 # rbox status — living state snapshot
 
-## 2026-09-05 — Astra sync/Git handoff: four fixes implemented, PR #882 not yet merged
+## 2026-09-05 (afternoon) — #882 MERGED; roadmap 287 execution continues
+
+- **#882 MERGED (rebase, commits preserved)** onto main at `bc1e618bd`: deletion
+  batching `39b7b5cec`, staged-object closure `f91a13f82`, portable private
+  indexes `20b705009`, tracked-index cache freshness `3d2cbd1d0`, roadmap docs
+  `ab7a55112`, Bun-1.4.2 fixture repair `f2b83aaee` (design 292), handoff
+  `876b0e8cd`, Claude 292 review record `bc1e618bd`. Design 292 was reviewed
+  directly in-repo by Claude (`docs/design/notes/292/review1-claude.md`): the
+  helper wraps the existing `PushSpans.run` owner, one owner per test, no
+  production change; 93/1/0 locally, exact-head CI fully green. The P/K cap
+  timeout stays "suspected environmental" (one occurrence, later head green).
+- **Fleet:** still on 2.0.2 (Mac) / `2.0.2-dev+e3881c3` (desktop, FM). The
+  four #882 fixes are NOT yet in any fleet binary. No production promotion, no
+  CLI release. Next release candidate = 2.0.3 (carries #880, #881, #882).
+- **In flight (Codex, worktrees):** design 293 = G5b batch no-drop ancestry via
+  `partitionOwnedByIncoming` + G5a oracle/differential/benchmark
+  (`.claude/worktrees/g5b-nodrop`, `perf/293-nodrop-batch`); design 294 = S1a
+  `ensureMaintenanceScheduled` on bootstrap + alarm-failure reproducer
+  (`.claude/worktrees/s1a-alarm`, `fix/294-maintenance-bootstrap`). Specs live
+  as `SPEC.md` in each worktree. Then: historical split-artifact repair
+  (needs its own design; see 289 §"historical repair is separate").
+- **Local hygiene:** all 46 stale worktrees and 285 local branches were purged
+  this morning; backup bundle + dirty patches at
+  `~/rbox-core-branch-backup-20260905/` (delete when confident).
+
+## 2026-09-05 — Astra sync/Git handoff: four fixes implemented (historical; #882 now merged)
 
 - **PR #882 OPEN, merge pending:** https://github.com/BrianVia/rbox-core/pull/882,
   branch `codex/astra-sync-git`. Four atomic commits: directory-deletion batching
