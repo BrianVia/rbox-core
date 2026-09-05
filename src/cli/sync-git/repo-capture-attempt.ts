@@ -22,7 +22,9 @@ import { gitFingerprint, type GitFingerprint, type GitFingerprintRun } from "./f
 import { capturePlannedGitSection, carryMatrixMatches, errMsg, repoDirOf, type ResolutionCaptureTestHooks } from "./shared.js";
 
 export type RepoAttemptCommand =
-  | { kind: "carry"; section: GitSection }
+  /** `diskCtx`: the repository context the identity probe resolved (design 306b) — a
+   *  carry proven by that probe may reuse it instead of re-reading. */
+  | { kind: "carry"; section: GitSection; diskCtx?: RepoCtx }
   | { kind: "defer"; reason: string; typedReason?: GitDeferralReason; forced: boolean }
   | { kind: "clear-removal" }
   | { kind: "clear-resolution" }
@@ -200,7 +202,7 @@ export class RepoCaptureAttempt {
       }
       if (carryMatrixMatches(baseSection, liveKind, built.probe.identityKey)) {
         const section = await this.withConfig("carry", baseSection, cacheWrite.localCfg, built.diskCtx);
-        this.commands.push({ kind: "carry", section });
+        this.commands.push(built.diskCtx ? { kind: "carry", section, diskCtx: built.diskCtx } : { kind: "carry", section });
         return {
           ...this.settled(built),
           stableCarry: cacheWrite.stable,
