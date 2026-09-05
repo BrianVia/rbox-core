@@ -116,9 +116,12 @@
   standing CREATE-P receipts ("no deferred incoming Git state"), so the user
   cannot land (take-theirs) or discard them; (2) with 309 the witness now
   pays the full artifact scan every push again (`carried≈1.4s`), so
-  **#904 OPEN (design 311)** remembers an `(artifacts-standing)` refusal per
-  repo under a token of the `refs/rbox-local` plane + missing set and skips
-  the scan while it is unchanged. **CI runner degradation (evening):** every
+  **#904 MERGED (design 311, `d234b58f3`)** remembers an
+  `(artifacts-standing)` refusal per repo under a token of the
+  `refs/rbox-local` plane + missing set and skips the scan while it is
+  unchanged. **Desktop now dogfoods `2.0.2-dev+d234b58`** (pid 2478074,
+  ~23:07Z); expect `carried` to fall from ~1.4s to tens of ms once the
+  watcher is trusted again. **CI runner degradation (evening):** every
   PR today hit FLAKE-012 at least once; #904's shard 2/6 failed three reruns
   in a row, twice with a new variant `The Worker returned HTTP 401 while
   waiting for GitHub's runner assignment`. Founder owes the runner wizard
