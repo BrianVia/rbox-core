@@ -24,6 +24,9 @@ export interface BranchDeletionWitnessInput {
   packedObservation: PackedRefsObservation;
   packedRegressed: boolean;
   binding: { lineageHash: string; repositoryIdentityHash: string } | undefined;
+  /** This device's id (design 309): a BASE section this device captured is origin
+   *  evidence for every branch in it, because the branch existed here at capture. */
+  selfDeviceId: string | undefined;
   /** Tests only: runs before the authorization reads. */
   beforeAbsencePreflight?: (relPath: string) => void | Promise<void>;
 }
@@ -41,7 +44,16 @@ export type BranchDeletionWitness =
  * the revert and the deferral bookkeeping.
  */
 export async function witnessBranchDeletions(input: BranchDeletionWitnessInput): Promise<BranchDeletionWitness> {
-  const { root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed, binding, beforeAbsencePreflight } = input;
+  const { root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed, binding, beforeAbsencePreflight, selfDeviceId } = input;
+  // Design 309: origin evidence is either the per-branch ledger entry (designs
+  // 273/274) or, for a branch with NO ledger entry, the fact that this device
+  // captured the BASE section that lists it — the branch existed locally at that
+  // capture, so this device's later deletion of it is authoritative. Sections
+  // captured elsewhere, or by an old writer that stamped no author, still refuse.
+  const selfAuthored = (ref: string): boolean => record?.branchBaseOrigins?.[ref] === undefined
+    && selfDeviceId !== undefined && baseSection?.deviceId === selfDeviceId;
+  const originProven = (ref: string, priorOid: string): boolean =>
+    branchBaseOriginMatches(record?.branchBaseOrigins?.[ref], priorOid) || selfAuthored(ref);
 
   let refusal: string | undefined = packedObservation.status === "unreadable"
     ? `packed-refs baseline could not be read: ${errMsg(packedObservation.error)}`
@@ -62,7 +74,7 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
     for (const [ref, priorOid] of missing) {
       const cheapRefusals = [
         ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
-        ...(!branchBaseOriginMatches(record?.branchBaseOrigins?.[ref], priorOid) ? ["origin-mismatch"] : []),
+        ...(!originProven(ref, priorOid) ? ["origin-mismatch"] : []),
       ];
       if (cheapRefusals.length > 0) {
         refusal = `branch deletion witness refused ${ref} (${cheapRefusals.join("+")})`;
@@ -123,7 +135,9 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
       && artifacts.settledAbsence === "absent");
     const witnessRefusals = [
       ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
-      ...(!branchBaseOriginMatches(origin, priorOid) ? ["origin-mismatch"] : []),
+      ...(!originProven(ref, priorOid) ? ["origin-mismatch"] : []),
+      // A self-authored BASE has no ledger lineage to compare; the publisher
+      // binding check above already proved this repository's lineage is unchanged.
       ...(branchBaseOriginMatches(origin, priorOid) && origin.lineageHash !== readyProtocol!.lineageHash ? ["lineage-changed"] : []),
       ...(!artifactsClear ? ["artifacts-standing"] : []),
       ...(owned.has(ref) ? ["worktree-owned"] : []),
