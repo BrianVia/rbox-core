@@ -258,7 +258,11 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan-accumulator.ts": 1,
-    "src/cli/sync-git/plan.ts": 3,
+    // Design 308 moved the branch-deletion witness (and its read-only
+    // `branchBaseOrigins` lookup) out of plan.ts into its own owner; the
+    // remaining plan.ts sites are the capture-stage BASE reads. Total unchanged.
+    "src/cli/sync-git/branch-deletion-witness.ts": 1,
+    "src/cli/sync-git/plan.ts": 2,
     // Persistence sanitation only: the one owner that rewrites a record's stored
     // BASE/pending into their sanitized form. It composes no authority and moves
     // no lineage — it replaces the section it was handed with its canonical
