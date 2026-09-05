@@ -54,7 +54,13 @@ interface FakeDurableObjectState {
   setWebSocketAutoResponse(): void;
 }
 
-function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: () => boolean, writes?: StorageWrites): DurableObjectState {
+function fakeCtx(
+  kv: Map<string, unknown>,
+  sql = fakeDoSql(),
+  failTransaction?: () => boolean,
+  writes?: StorageWrites,
+  failAlarm?: () => boolean,
+): DurableObjectState {
   let alarm: number | null = null;
   const state: FakeDurableObjectState = {
     storage: {
@@ -79,7 +85,11 @@ function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: 
         }
       },
       getAlarm: async () => alarm,
-      setAlarm: (at: number) => { if (writes) writes.alarms++; alarm = at; },
+      setAlarm: (at: number) => {
+        if (writes) writes.alarms++;
+        if (failAlarm?.()) throw new Error("injected alarm failure");
+        alarm = at;
+      },
     },
     getWebSockets: () => [],
     setWebSocketAutoResponse: () => {},
@@ -155,6 +165,105 @@ async function foldFixture(previous: string[], current: string[], failTransactio
   await new WorkspaceSync(fakeCtx(kv, sql, failTransaction), {} as never).alarm();
   return { kv, sql };
 }
+function commitRequest(): Request {
+  return new Request("https://do/v1/ws/ws_1/proj/root/manifests", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-rbox-account": "acct_1", "x-rbox-account-epoch": "0" },
+    body: JSON.stringify({
+      parentSequence: 0,
+      commit: {
+        body: JSON.stringify({
+          type: "rbox/commit/v1",
+          seq: 1,
+          parentSeq: 0,
+          accountEpoch: 0,
+          encManifestSha: sha("a"),
+          deviceId: "dev-a",
+          blobRefs: [],
+        }),
+        commitHash: sha("c"),
+        sig: "sig",
+      },
+    }),
+  });
+}
+
+function entitledDb() {
+  const prepare = (sql: string) => {
+    const statement = {
+      args: [] as unknown[],
+      bind(...args: unknown[]) { this.args = args; return this; },
+      async run() { return { success: true }; },
+    };
+    return Object.assign(statement, { sql });
+  };
+  return {
+    prepare,
+    batch: async (statements: Array<{ sql: string; args: unknown[] }>) => statements.map((statement) => ({
+      results: statement.sql.includes("FROM blob_refs")
+        ? statement.args.slice(1).map((sha256) => ({ sha256 }))
+        : [],
+    })),
+  };
+}
+
+describe("WorkspaceSync maintenance bootstrap recovery", () => {
+  test("re-arms lagging maintenance on restart after commit alarm failure", async () => {
+    const kv = new Map<string, unknown>();
+    const failedWrites: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const failedCtx = fakeCtx(kv, fakeDoSql(), undefined, failedWrites, () => true);
+    const failed = new WorkspaceSync(failedCtx, { rbox_dev_db: entitledDb() } as never);
+
+    await expect(failed.fetch(commitRequest())).rejects.toThrow("injected alarm failure");
+    expect(kv.get("head")).toMatchObject({ sequence: 1 });
+    expect(kv.get("index_state")).toBe("lagging");
+    expect(await failedCtx.storage.getAlarm()).toBeNull();
+
+    const recoveredWrites: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const recoveredCtx = fakeCtx(kv, fakeDoSql(), undefined, recoveredWrites);
+    const latest = await new WorkspaceSync(recoveredCtx, {} as never).fetch(
+      new Request("https://do/v1/ws/ws_1/proj/root/latest"),
+    );
+
+    expect(latest.status).toBe(200);
+    expect(recoveredWrites.alarms).toBe(1);
+    expect(await recoveredCtx.storage.getAlarm()).not.toBeNull();
+  });
+
+  test("does not arm maintenance when the ready index is caught up", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("c") }],
+      ["index_state", "ready"],
+      ["index_synced_seq", 1],
+      ["seq:1", signed(1, { inline: [] })],
+    ]);
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+
+    const latest = await new WorkspaceSync(fakeCtx(kv, fakeDoSql(), undefined, writes), {} as never).fetch(
+      new Request("https://do/v1/ws/ws_1/proj/root/latest"),
+    );
+
+    expect(latest.status).toBe(200);
+    expect(writes.alarms).toBe(0);
+  });
+
+  test("arms maintenance once when the index is building", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("c") }],
+      ["index_state", "building"],
+      ["index_synced_seq", 1],
+      ["seq:1", signed(1, { inline: [] })],
+    ]);
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+
+    const latest = await new WorkspaceSync(fakeCtx(kv, fakeDoSql(), undefined, writes), {} as never).fetch(
+      new Request("https://do/v1/ws/ws_1/proj/root/latest"),
+    );
+
+    expect(latest.status).toBe(200);
+    expect(writes.alarms).toBe(1);
+  });
+});
 
 describe("WorkspaceSync retained-roots index", () => {
   test("foldSequence visits 20k disjoint refs at most once per phase", async () => {

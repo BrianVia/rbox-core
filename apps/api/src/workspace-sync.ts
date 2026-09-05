@@ -249,13 +249,17 @@ export class WorkspaceSync {
     const rawHead = this.ctx.storage.kv.get<StoredHead | number>("head");
     if (typeof rawHead === "number") {
       await this.migrateNumericHead(ws, proj, rawHead);
-      if (!this.repairRequired) await this.initializeIndex(rawHead, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
+      if (!this.repairRequired) {
+        await this.initializeIndex(rawHead, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
+        await this.ensureMaintenanceScheduled();
+      }
       this.bootstrapped = true;
       return;
     }
     if (isStoredHead(rawHead)) {
       this.ensureWatermarkAtLeast(rawHead.sequence);
       await this.initializeIndex(rawHead.sequence, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
+      await this.ensureMaintenanceScheduled();
       this.bootstrapped = true;
       return;
     }
@@ -294,7 +298,14 @@ export class WorkspaceSync {
         this.ctx.storage.kv.put("backfill_cursor", floor + 1);
       }
     });
-    if (head > floor) await this.armAlarm(Date.now());
+  }
+
+  private async ensureMaintenanceScheduled(): Promise<void> {
+    const head = this.storedHead().sequence;
+    const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
+    const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
+    const state = this.ctx.storage.kv.get("index_state") as IndexState | undefined;
+    if (synced < head || state === "building" || state === "lagging") await this.armAlarm(Date.now());
   }
 
   private async migrateNumericHead(_ws: string, _proj: string, seq: number): Promise<void> {
@@ -1323,6 +1334,7 @@ export class WorkspaceSync {
     });
     this.repairRequired = false;
     await this.initializeIndex(target, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
+    await this.ensureMaintenanceScheduled();
     return json({ ok: true, head: target, watermark: Math.max(target, watermark), commitHash });
   }
 
