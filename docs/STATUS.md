@@ -30,14 +30,27 @@
   `state-save slow:` (design 298, `6cb988cba`), #890 S2a optional
   `plane_entries_entry` index (design 300, `d23c49558`; 200k/3k orphan
   collector >180s → ~65ms). Zero open PRs. All worktrees removed.
-- **Desktop now dogfoods `2.0.2-dev+6cb988c`** (restarted 2026-09-05 ~19:00Z)
-  to read the two attribution lines for the empty-push cost (git-plan 3.8s
-  with cp2376 d1065 + state-save 2.3s, zero captures). FM stays on
-  `2.0.2-dev+e3881c3` (shadow), Mac on stable 2.0.2. **Next:** read
-  `rbox logs | grep -E "git-plan slowest|state-save slow"`, then scope the
-  fix as its own design (candidates: the one fingerprint-miss repo
-  recapturing every tick; state-save composing a full manifest when nothing
-  changed).
+- **#891 MERGED (design 301, `ddc93f299`):** the attribution lines showed
+  `state-save slow: apply=2.4s` for ANY packet (even 3 repo transitions, no
+  global) — `translateCasResult` re-materialized all 198K entries after every
+  accepted save. Fix: reuse only the untouched base file rows when the packet
+  has no global section AND the CAS token is exactly one revision past the
+  snapshot's; records/meta/git projections still read back (a whole-state
+  projection was tried and withdrawn: `applyTransitions` recomposes bases).
+  Copied-store profile 2.4s → 83ms. **Desktop now dogfoods
+  `2.0.2-dev+ddc93f2`** (pid 1468774, restarted ~19:15Z); watch the push
+  line's `state-save` drop from ~2.4s. FM stays on `2.0.2-dev+e3881c3`
+  (shadow), Mac on stable 2.0.2.
+- **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
+  on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
+  git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
+  git-plan capture ≈1.6s unattributed (post-capture loop over all carried
+  repos recomputes `repoRecordsForState` per repo + Git reads; plan.ts) and
+  `Personal/rbox-core` fingerprint-misses every tick while being edited.
+  The `state-save slow:` line lands in the pointer `daemon.log` (stderr),
+  not the dated log `rbox logs` reads; `git-plan slowest:` is in the dated
+  log. Copied desktop store for profiling lives in this session's scratchpad
+  (`state-root/`, 1.1G; delete when done).
 - **Roadmap 287 disposition so far:** DONE G2, G3a(+G3b discharged), G4a,
   G5a/G5b, F1, F2a, S1a, S2a, S3a, B0b(partial: push attribution). OPEN:
   G1 historical repair (founder decision, recommend defer), G4b/c
