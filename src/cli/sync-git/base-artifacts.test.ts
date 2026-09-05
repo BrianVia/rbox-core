@@ -265,7 +265,10 @@ describe("A and P/K artifacts", () => {
       `${BASE_PRESENT_KEEP_PREFIX}/${binding.lineageHash}/${index.toString(16).padStart(64, "0")}/${"56".repeat(16)}/next`);
     await commitProtocolRefTransaction(repo, kRefs.map((ref) => `create ${ref} ${commit}`));
     await expect(prepareBasePresentArtifact(repo, binding, "refs/heads/k-overflow", "78".repeat(16), null, commit)).rejects.toThrow("capacity");
-  });
+  // 6,144 native ref transactions take ~15s on the CI runners (0.7s locally): this is a
+  // capacity test, not a latency one. Explicit budget; assertions unchanged (docs/flaky-tests.md,
+  // #882 CI-validation, #900 same-SHA reruns at 15,250ms and 15,348ms).
+  }, 60_000);
 });
 
 describe("settled absence Z", () => {
