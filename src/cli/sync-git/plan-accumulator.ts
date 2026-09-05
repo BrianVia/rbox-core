@@ -69,6 +69,7 @@ export class GitPlanAccumulator {
     spawnedRepos: 0,
     pointerPreSkips: 0,
     parentRelCached: 0,
+    repoCosts: [],
   };
   readonly base: Record<string, GitSection>;
   readonly durablePending: Record<string, GitSection>;

@@ -405,6 +405,8 @@ function legacyState(projected: SyncState): SyncState {
  * rejection. Stream/nonce rejection is an incarnation change and never retries.
  * An elision receipt is SINGLE-ATTEMPT: drift discards it, so the retry composes
  * the standing full packet and can never re-send a stale proof. */
+const STATE_SAVE_SLOW_MS = 500;
+
 export async function saveStateSource(
   root: string,
   initialSnapshot: SyncState,
@@ -413,9 +415,29 @@ export async function saveStateSource(
 ): Promise<SyncState> {
   const apply = options.apply ?? applyStateSavePacket;
   let snapshot = initialSnapshot;
+  let slowLogged = false;
   for (let attempt = 0; attempt < 3; attempt++) {
+    const composeStartedAt = performance.now();
     const packet = composeStateSavePacket(snapshot, source);
-    const result = await apply(root, packet, fullyElidedPacket(packet) ? { acceptedProjection: snapshot } : {});
+    const composeMs = performance.now() - composeStartedAt;
+    const applyStartedAt = performance.now();
+    let applyMs = 0;
+    let result: Awaited<ReturnType<typeof apply>>;
+    try {
+      result = await apply(root, packet, fullyElidedPacket(packet) ? { acceptedProjection: snapshot } : {});
+    } finally {
+      applyMs = performance.now() - applyStartedAt;
+      if (!slowLogged && composeMs + applyMs > STATE_SAVE_SLOW_MS) {
+        slowLogged = true;
+        const global = packet.globalDelta !== undefined ? "delta"
+          : packet.global !== undefined ? "full"
+            : packet.elisionExpectation !== undefined ? "elided" : "none";
+        console.error(
+          `state-save slow: compose=${Math.round(composeMs)} apply=${Math.round(applyMs)}`
+          + ` repos=${packet.repos.length} global=${global} ops=${packet.globalDelta?.ops.length ?? 0} attempt=${attempt + 1}`,
+        );
+      }
+    }
     if (result.status === "accepted") {
       // A whole-manifest global that landed rewrote the base outright, which is
       // the heal §2.4 waits for.

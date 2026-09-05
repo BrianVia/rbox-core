@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { GitSection, Manifest } from "../engine/index.js";
+import { canonicalManifestHashStreaming, type GitSection, type Manifest } from "../engine/index.js";
 import type { LockIdentitySource } from "../engine/lockfile.js";
 import {
   applyStateSavePacket,
@@ -91,6 +91,65 @@ beforeEach(async () => {
   tokenCounter = 0;
 });
 afterEach(async () => fs.rm(root, { recursive: true, force: true }));
+
+test("design 298 attributes slow state saves across full, delta, and elided globals", async () => {
+  const consoleError = spyOn(console, "error").mockImplementation(() => {});
+  const file = {
+    path: "slow.txt", type: "file" as const, sha256: "1".repeat(64), encSha: "2".repeat(64),
+    size: 1, mode: 0o644, mtimeMs: 1,
+  };
+  const elidedSnapshot = baseState();
+  const meta = {
+    encManifestSha: "3".repeat(64),
+    manifestHash: canonicalManifestHashStreaming(elidedSnapshot.lastSyncedManifest),
+    accountEpoch: 0, keyEpoch: 0, chain: [], chainBytes: 0, snapshotBytes: 1, gitRepos: {},
+  };
+  elidedSnapshot.manifestMeta = meta;
+  const cases: Array<{ snapshot: SyncState; source: StateSource; expected: string }> = [
+    {
+      snapshot: baseState(),
+      source: { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("full"), observedRepos: ["r"], values: {} },
+      expected: "repos=1 global=full ops=0 attempt=1",
+    },
+    {
+      snapshot: baseState(),
+      source: {
+        expectedStream: stream, sourceGlobalSeq: 1,
+        globalManifest: { generatedAt: "delta", files: [file] }, baseIsUnscopedRemote: true,
+        observedRepos: ["r"], values: {},
+      },
+      expected: "repos=1 global=delta ops=1 attempt=1",
+    },
+    {
+      snapshot: elidedSnapshot,
+      source: {
+        expectedStream: stream, sourceGlobalSeq: 0, observedRepos: [], values: {},
+        elisionReceipt: {
+          noActions: true, storedBaseIsRemote: true, manifestMeta: meta,
+          nonce, stateRevision: 0,
+        },
+      },
+      expected: "repos=0 global=elided ops=0 attempt=1",
+    },
+  ];
+
+  for (const { snapshot, source, expected } of cases) {
+    await saveStateSource(root, snapshot, source, {
+      apply: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 525));
+        return { status: "accepted", state: snapshot };
+      },
+    });
+  }
+
+  expect(consoleError).toHaveBeenCalledTimes(3);
+  for (const [index, { expected }] of cases.entries()) {
+    expect(String(consoleError.mock.calls[index]?.[0])).toMatch(
+      new RegExp(`^state-save slow: compose=\\d+ apply=\\d+ ${expected}$`),
+    );
+  }
+  consoleError.mockRestore();
+}, 10_000);
 
 describe("design 93 §6 sync-point truth table", () => {
   const postToken = { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" };
