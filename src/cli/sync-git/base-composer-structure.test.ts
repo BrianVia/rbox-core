@@ -194,10 +194,15 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     //      takes the same observation lease, once around the whole mutation.
     //      Its partial-failure fallback deliberately re-enters `ownedUpdateRef`
     //      per ref rather than opening a third raw site.
+    //   3. `createScratchPins` (design 305) — batch CREATION only, one
+    //      `update-ref -z --stdin` transaction of `create` records under the
+    //      capture-unique `refs/rbox-wip/<ns>/` namespace, one lease around the
+    //      whole mutation; atomic failure creates nothing and cleanup reuses
+    //      `deleteScratchPins`. Same reason as (2) for bypassing the helper.
     // The follow path's former raw site (was sync-git/follow.ts, then
     // follow-staging.ts) is GONE, not moved: `cleanupRefs` now calls
     // `deleteRefsBatch`, so that file no longer names `update-ref` at all.
-    "src/cli/sync-git/pins.ts": 2,
+    "src/cli/sync-git/pins.ts": 3,
     // Design 273 P3: the ONE ref mutation for `refs/rbox-pending/*`, batched
     // through a single `update-ref --stdin` for both the write and the sweep.
     // Deliberately not routed through pins.ts, whose refs are capture-scoped and
