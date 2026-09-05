@@ -13,8 +13,11 @@ import {
   type BlobStore,
   type GitSection
 } from "../../engine/index.js";
+import { hashFile } from "../../engine/hash.js";
+import { copyPortableIndex } from "./private-index.js";
 import { decryptFileToPath } from "../../engine/crypto.js";
 import { setGitSpawnObserver } from "../../engine/git-spawn.js";
+import { applyGitSections } from "./apply.js";
 import { applyGitState } from "./git-state-apply.js";
 import {
   captureGitState,
@@ -224,6 +227,81 @@ async function decryptIndexArtifact(section: GitSection, destPath: string): Prom
     await fs.rm(ctPath, { force: true });
   }
 }
+
+async function createSplitIndexRepo(): Promise<void> {
+  await initRepo(A);
+  await commitFile(A, "assume.txt", "assume\n", "base");
+  await commitFile(A, "skip.txt", "skip\n", "second file");
+  await commitFile(A, "modified.txt", "original\n", "modified base");
+  await commitFile(A, "deleted.txt", "delete me\n", "deleted base");
+  await git(A, "update-index", "--assume-unchanged", "assume.txt");
+  await git(A, "update-index", "--skip-worktree", "skip.txt");
+  // Keep the established shared base while exercising its add/delete/replace
+  // delta; the default rewrite threshold can otherwise fold this tiny fixture.
+  await git(A, "config", "splitIndex.maxPercentChange", "100");
+  await git(A, "update-index", "--split-index");
+  const sharedIndex = await git(A, "rev-parse", "--shared-index-path");
+  expect(sharedIndex).not.toBe("");
+  const sharedBytes = await fs.readFile(path.resolve(A, sharedIndex));
+  await stageIdentityChange(A, "staged.txt");
+  await stageIdentityChange(A, "modified.txt");
+  await git(A, "rm", "deleted.txt");
+  expect(await git(A, "rev-parse", "--shared-index-path")).toBe(sharedIndex);
+  expect(await fs.readFile(path.resolve(A, sharedIndex))).toEqual(sharedBytes);
+  expect(await git(A, "diff", "--cached", "--name-status")).toBe("D\tdeleted.txt\nM\tmodified.txt\nA\tstaged.txt");
+}
+
+async function splitIndexDependencies(): Promise<Array<{ name: string; bytes: Buffer }>> {
+  const gitDir = path.dirname(await resolvedIndexPath(A));
+  const names = (await fs.readdir(gitDir)).filter((name) => name.startsWith("sharedindex.") || name === "index.lock").sort();
+  expect(names).not.toContain("index.lock");
+  return Promise.all(names.map(async (name) => ({ name, bytes: await fs.readFile(path.join(gitDir, name)) })));
+}
+
+test("design 288: captured split index is self-contained in an independent repository", async () => {
+  await createSplitIndexRepo();
+  const entries = await git(A, "ls-files", "--stage", "-z");
+  const flags = await git(A, "ls-files", "-v", "-z");
+  const before = await indexSnapshot(A);
+  const dependencies = await splitIndexDependencies();
+
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await splitIndexDependencies()).toEqual(dependencies);
+
+  // Decode the actual transported index in a separate Git directory. Reading
+  // it through A would accidentally satisfy its shared-index dependency.
+  await initRepo(B);
+  const receivedIndex = path.join(B, ".git", "index");
+  await decryptIndexArtifact(section!, receivedIndex);
+  const sharedIndexName = path.basename(await git(A, "rev-parse", "--shared-index-path"));
+  expect(await fs.readdir(path.join(B, ".git"))).not.toContain(sharedIndexName);
+  expect(await git(B, "ls-files", "--stage", "-z")).toBe(entries);
+  expect(await git(B, "ls-files", "-v", "-z")).toBe(flags);
+  expect(await git(B, "rev-parse", "--shared-index-path")).toBe("");
+});
+
+test("design 288: split-index capture applies to a fresh receiver without changing source staging", async () => {
+  await createSplitIndexRepo();
+  const entries = await git(A, "ls-files", "--stage", "-z");
+  const flags = await git(A, "ls-files", "-v", "-z");
+  const before = await indexSnapshot(A);
+  const dependencies = await splitIndexDependencies();
+
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await splitIndexDependencies()).toEqual(dependencies);
+  // B starts without .git or any source objects/index dependencies.
+  const result = await applyGitState(B, section!, store, KEK);
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await splitIndexDependencies()).toEqual(dependencies);
+  expect(result).toEqual(expect.objectContaining({ applied: true }));
+  expect(await git(B, "ls-files", "--stage", "-z")).toBe(entries);
+  expect(await git(B, "ls-files", "-v", "-z")).toBe(flags);
+  await git(B, "fsck", "--connectivity-only", "--no-dangling");
+});
 
 test("design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver", async () => {
   await initRepo(A);
@@ -860,6 +938,57 @@ test("indexTreeOf temp-index write-tree matches direct write-tree for staged dir
   }
 }, 30_000);
 
+for (const split of [false, true]) {
+  test(`design 289: ${split ? "split" : "ordinary"} partial conflict with REUC and monitor config stays stable`, async () => {
+    const { base, ours, theirs } = await createSyntheticResolveUndoRepo(A);
+    await gitWithStdin(
+      A,
+      ["update-index", "--index-info"],
+      [`100644 ${base} 1\tconflict.txt`, `100644 ${ours} 2\tconflict.txt`, `100644 ${theirs} 3\tconflict.txt`, ""].join("\n")
+    );
+    if (split) await git(A, "update-index", "--split-index");
+    const marker = path.join(tmp, "monitor-invocations");
+    const hook = path.join(tmp, "monitor-hook");
+    await fs.writeFile(hook, `#!/bin/sh\nprintf invoked >> '${marker}'\nprintf 'token-%s\\000' "$$"\n`, { mode: 0o700 });
+    await git(A, "config", "core.fsmonitor", hook);
+    await git(A, "config", "core.untrackedCache", "true");
+    await git(A, "status", "--porcelain");
+    expect(await fs.readFile(marker, "utf8")).toContain("invoked");
+    expect(await git(A, "ls-files", "--resolve-undo", "-z")).not.toBe("");
+    // Also exercise configured split on a physically ordinary index: native
+    // detection must recognize the all-zero dependency sentinel without rewriting.
+    await git(A, "config", "core.splitIndex", "true");
+    const before = await indexSnapshot(A);
+    const dependencies = await splitIndexDependencies(A);
+    const config = await fs.readFile(path.join(A, ".git", "config"));
+    await fs.rm(marker);
+    const ctx = (await repoCtx(A))!;
+    const copied = path.join(tmp, "portable-index");
+    expect(await copyPortableIndex(A, before.path, copied)).toBe(split);
+    if (!split) expect(await fs.readFile(copied)).toEqual(before.bytes);
+    const identities = [];
+    for (let attempt = 0; attempt < 3; attempt++) identities.push(await indexTreeOf(ctx));
+    expect(new Set(identities).size).toBe(1);
+    if (!split) expect(identities[0]).toBe(`raw:${await hashFile(before.path)}`);
+    const section = (await captureGitState(A, store, KEK, { resolution: true }))!;
+    expect(section.indexTree).toStartWith("raw:");
+    if (split) expect(section.indexTree).toBe(identities[0]);
+    // Plain identity intentionally preserves legacy REUC bytes, whereas capture
+    // has always removed REUC from its portable artifact.
+    expectSameIndexSnapshot(await indexSnapshot(A), before);
+    expect(await splitIndexDependencies(A)).toEqual(dependencies);
+    expect(await fs.readFile(path.join(A, ".git", "config"))).toEqual(config);
+    await expect(fs.stat(marker)).rejects.toHaveProperty("code", "ENOENT");
+    const result = await applyGitState(B, section, store, KEK);
+    expect(result).toEqual(expect.objectContaining({ applied: true }));
+    expect((await gitIdentity(B))!.indexTree).toBe(section.indexTree);
+    expect(await git(B, "ls-files", "--resolve-undo", "-z")).toBe("");
+    expect(await git(B, "ls-files", "--stage", "-z")).toBe(
+      await gitWithIndex(A, copied, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z")
+    );
+  });
+}
+
 test("design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks", async () => {
   await initRepo(A);
   await commitFile(A, "tracked", "committed", "base");
@@ -894,5 +1023,53 @@ test("design 289: missing ordinary stage root rejects capture and cleans scratch
   const before = await indexSnapshot(A);
   await expect(captureGitState(A, store, KEK)).rejects.toThrow();
   expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await git(A, "for-each-ref", "--format=%(refname)", "refs/rbox/")).toBe("");
+});
+
+test("design 289: missing shared dependency rejects identity and capture without source mutation", async () => {
+  await createSplitIndexRepo();
+  const base = (await captureGitState(A, store, KEK))!;
+  const incoming = { ...base, refs: { ...base.refs, "refs/tags/incoming": await git(A, "rev-parse", "HEAD") } };
+  const refsBefore = await git(A, "show-ref");
+  const dependency = await git(A, "rev-parse", "--shared-index-path");
+  expect(dependency).not.toBe("");
+  await fs.rm(path.resolve(A, dependency));
+  const before = await indexSnapshot(A);
+  const ctx = (await repoCtx(A))!;
+  await expect(indexTreeOf(ctx)).rejects.toThrow();
+  await expect(captureGitState(A, store, KEK)).rejects.toThrow();
+  const outcome = await applyGitSections(
+    A,
+    {
+      schema: "e2ee/v1",
+      remoteWorkspaceId: "ws-test",
+      projectId: "test",
+      deviceId: "test",
+      rootPath: A,
+      remoteUrl: "https://api.test",
+      token: "",
+      syncGit: true,
+      encrypted: true,
+      kek: KEK
+    },
+    {
+      stream: "test",
+      stateNonce: "a".repeat(32),
+      lastSyncedSequence: 1,
+      lastSyncedManifest: { generatedAt: "base", files: [], manifestSchema: 2, gitRepos: { ".": base } },
+      repoRecords: { ".": { repoGen: 1, sourceSeq: 1, base } }
+    },
+    { generatedAt: "incoming", files: [], manifestSchema: 2, gitRepos: { ".": incoming } },
+    store,
+    buildIgnoreMatcher(A, { respectGitignore: false }),
+    () => {}
+  );
+  expect(outcome.gitRepos?.["."]).toEqual(base);
+  expect(outcome.gitPendingRemote?.["."]).toEqual(incoming);
+  expect(outcome.deferrals?.["."]?.apply?.reason).toBe("other");
+  expect(outcome.publishedJournals).toBeUndefined();
+  expect(await git(A, "show-ref")).toBe(refsBefore);
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+  expect(await splitIndexDependencies(A)).toEqual([]);
   expect(await git(A, "for-each-ref", "--format=%(refname)", "refs/rbox/")).toBe("");
 });

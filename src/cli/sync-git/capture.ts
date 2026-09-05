@@ -4,12 +4,23 @@ import type { BlobStore, ByteProgressCallback } from "../../engine/blobstore.js"
 import { validateGitSection } from "../../engine/manifest-validate.js";
 import { gitSectionDeviceId } from "../../engine/git-device-stamp.js";
 import type { GitArtifactRef, GitSection } from "../../engine/types.js";
-import { clearIndexResolveUndo, encryptGitArtifact, exists, headBranchOf, listWorktrees, putGitArtifact, readHead, type PendingGitUpload, type RepoCtx, repoCtx } from "./git-state.js";
+import {
+  encryptGitArtifact,
+  exists,
+  headBranchOf,
+  listWorktrees,
+  putGitArtifact,
+  readHead,
+  type PendingGitUpload,
+  type RepoCtx,
+  repoCtx
+} from "./git-state.js";
 import { git, gitOk } from "../../engine/git-spawn.js";
 import { hasInProgressOpState, readAllRefsStrict, readOpStateSnapshot, readScopedRefs } from "./refs.js";
 import { type OwnedRefMutationBoundary, type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOfPath } from "./identity.js";
 import { hashFile } from "../../engine/hash.js";
+import { copyPortableIndex, gitWithPrivateIndex } from "./private-index.js";
 
 /**
  * Git-native repo-state sync (M2 v3, generalized per design 43 §§4-5). History rides
@@ -126,7 +137,7 @@ export interface GitCaptureOptions {
 /** Complete object roots for a raw/unmerged staged index. Paths are NUL framed;
  * filenames containing newlines must never corrupt object enumeration. */
 export async function stagedIndexObjectOids(repoDir: string, stagedIndex: string): Promise<string[]> {
-  const stagedEntries = await git(repoDir, ["ls-files", "-z", "--stage", "--sparse"], { env: { GIT_INDEX_FILE: stagedIndex } });
+  const stagedEntries = await gitWithPrivateIndex(repoDir, stagedIndex, ["ls-files", "-z", "--stage", "--sparse"]);
   const oids = new Set<string>();
   for (const entry of stagedEntries.split("\0")) {
     if (!entry) continue;
@@ -281,8 +292,8 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     let stagedIndex: string | undefined;
     if (await exists(path.join(ctx.gitDir, "index"))) {
       stagedIndex = path.join(tmpDir, "index");
-      await fs.copyFile(path.join(ctx.gitDir, "index"), stagedIndex);
-      await clearIndexResolveUndo(repoDir, stagedIndex);
+      await copyPortableIndex(repoDir, path.join(ctx.gitDir, "index"), stagedIndex);
+      await gitWithPrivateIndex(repoDir, stagedIndex, ["update-index", "--clear-resolve-undo"]);
     }
     const stagedOp: Array<{ rel: string; staged: string }> = [];
     const sampledOp = await readOpStateSnapshot(ctx.gitDir, hashFile);
@@ -310,11 +321,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     //    while creating the synthetic commit; the live index must remain outside
     //    capture's write set.
     const privateStashIndex = path.resolve(stagedIndex ?? path.join(tmpDir, "absent-index"));
-    const wip = (await git(
-      repoDir,
-      ["stash", "create"],
-      { env: { GIT_INDEX_FILE: privateStashIndex } },
-    ).catch(() => "")).trim();
+    const wip = (await gitWithPrivateIndex(repoDir, privateStashIndex, ["stash", "create"]).catch(() => "")).trim();
     await opts.testHooks?.afterStashCreated?.();
     const pinShas = new Set(await collectPinShas(ctx, head, path.join(tmpDir, "op")));
     if (wip) pinShas.add(wip);
@@ -421,8 +428,8 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
         let liveIndexTree: string | undefined;
         if (liveIndex) {
           const normalizedLiveIndex = path.join(tmpDir, "live-index");
-          await fs.copyFile(liveIndexPath, normalizedLiveIndex);
-          await clearIndexResolveUndo(repoDir, normalizedLiveIndex);
+          await copyPortableIndex(repoDir, liveIndexPath, normalizedLiveIndex);
+          await gitWithPrivateIndex(repoDir, normalizedLiveIndex, ["update-index", "--clear-resolve-undo"]);
           liveIndexTree = await indexTreeOfPath(ctx, normalizedLiveIndex);
         }
         const liveOpSnapshot = await readOpStateSnapshot(ctx.gitDir, hashFile);

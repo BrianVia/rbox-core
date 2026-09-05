@@ -1,0 +1,223 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/daemon/watcher.test.ts:
+342 |     get: async (sha) => blobs.get(sha) ?? Promise.reject(new Error(`missing ${sha}`)),
+343 |     putFile: async (sha, src) => void blobs.set(sha, fs.readFileSync(src)),
+344 |   };
+345 |   expect(await captureGitState(root, store, Buffer.alloc(32, 7))).toBeDefined();
+346 |   await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 5));
+347 |   expect(gitSignals).toEqual([]);
+                           ^
+error: expect(received).toEqual(expected)
+
+- []
++ [
++   1788623109932,
++ ]
+
+- Expected  - 1
++ Received  + 3
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/daemon/watcher.test.ts:347:22)
+(fail) design 172: capture scratch-pin creation/deletion produces no signal or file event [815.51ms]
+
+src/cli/sync-git/lazy-apply-probes.test.ts:
+668 |   delete process.env.RBOX_PULL_TRUST_WATCHER;
+669 |   const legacy = await observe(() => applyGitSections(
+670 |     root, cfg(), stateWith({ r: section }), manifest({ r: section }), store,
+671 |     buildIgnoreMatcher(root), () => {}, { disableConfigLane: true },
+672 |   ));
+673 |   expect(legacy.commands).toEqual(expectedLegacy);
+                                ^
+error: expect(received).toEqual(expected)
+
+  [
+    [
+      "rev-parse",
+      "--absolute-git-dir",
+    ],
+    [
+      "rev-parse",
+      "--git-common-dir",
+    ],
+    [
+      "rev-parse",
+      "--absolute-git-dir",
+    ],
+    [
+      "rev-parse",
+      "--git-common-dir",
+    ],
+    [
+      "rev-parse",
+      "--verify",
+      "HEAD",
+    ],
+    [
+      "show-ref",
+    ],
+    [
++     "-c",
++     "core.splitIndex=false",
++     "-c",
++     "core.fsmonitor=false",
++     "-c",
++     "core.untrackedCache=keep",
++     "-c",
++     "core.splitIndex=true",
++     "rev-parse",
++     "--shared-index-path",
++   ],
++   [
++     "-c",
++     "core.splitIndex=false",
++     "-c",
++     "core.fsmonitor=false",
++     "-c",
++     "core.untrackedCache=keep",
+      "write-tree",
+    ],
+  ]
+
+- Expected  - 0
++ Received  + 18
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/lazy-apply-probes.test.ts:673:27)
+(fail) 203.11: lazy kill switch restores the legacy probe command order [466.22ms]
+
+src/cli/sync-git/follow.test.ts:
+1071 |   if (!isURLInstance(fileURLOrPath))
+1072 |     return fileURLOrPath;
+1073 |   return Bun.fileURLToPath(fileURLOrPath);
+1074 | }
+1075 | var { Error, TypeError } = globalThis;
+1076 |   let err = new Error(message);
+                   ^
+error: Command failed: git -C /private/tmp/rbox-follow-Q3bnzm/rebase-edit rebase -i main
+sed: 2: "/private/tmp/rbox-follo ...": undefined label 'mp/rbox-follow-Q3bnzm/rebase-edit/.git/rebase-merge/git-rebase-todo'
+error: there was a problem with the editor 'sed -i '1s/^pick /edit /''
+
+   code: 1,
+ killed: false,
+ signal: null,
+    cmd: "git -C /private/tmp/rbox-follow-Q3bnzm/rebase-edit rebase -i main",
+ stdout: "",
+ stderr: "sed: 2: \"/private/tmp/rbox-follo ...\": undefined label 'mp/rbox-follow-Q3bnzm/rebase-edit/.git/rebase-merge/git-rebase-todo'\nerror: there was a problem with the editor 'sed -i '1s/^pick /edit /''\n",
+
+      at genericNodeError (node:child_process:1076:13)
+      at exitHandler (node:child_process:111:28)
+      at emit (node:events:103:22)
+      at #maybeClose (node:child_process:822:16)
+      at #handleOnExit (node:child_process:565:72)
+(fail) real-git REBASE_HEAD lifecycle follows Git resumability [970.10ms]
+killed 1 dangling process
+(fail) design 200 P2 kill switches independently restore legacy ownership behavior [5067.09ms]
+  ^ this test timed out after 5000ms.
+
+# Unhandled error between tests
+-------------------------------
+1677 |       collectMetrics: true,
+1678 |       heldNow: heldNowAfterRacyWindow,
+1679 |       capabilityProbe: async () => { capabilityCalls++; return true; },
+1680 |     });
+1681 |     expect(fullFollow.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+1682 |     expect(fullFollow.outcome.attempt?.repo?.blockers).toEqual([{
+                                                              ^
+error: expect(received).toEqual(expected)
+
+- [
+-   {
+-     "provenance": "ref-plane",
+-     "reason": "worktree-ownership",
+-     "ref": "refs/heads/side",
+-   },
+- ]
++ undefined
+
+- Expected  - 7
++ Received  + 1
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/follow.test.ts:1682:56)
+-------------------------------
+
+3048 |   const incoming = await captureWithLiteralIndexTwins("é.txt", "e\u0301.txt");
+3049 |   setReceiverEquivalenceProbeForTests(async () => ({ caseAliases: false, unicodeAliases: true }));
+3050 |
+3051 |   const { outcome, logs } = await applyIncoming(stateWith(base), incoming);
+3052 |
+3053 |   expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+                                                ^
+error: expect(received).toEqual(expected)
+
+- {
+-   "bundleCipherSize": 916,
+-   "bundleEncSha": "d97de24c69de61b0210e4343ad3a4459b2c690f1c95fd222515e867c88071e04",
+-   "bundleSha": "dc5183b5e5c7f9ec32fd9200b5d03a8aabad804190aa26a7aa46f2ab996566f0",
+-   "generatedAt": "2026-09-05T15:45:18.763Z",
+-   "head": "ref: refs/heads/main",
+-   "indexCipherSize": 153,
+-   "indexEncSha": "67a8782d8371581086304144664703b82aeb165e96b8ad41fe13858244f60149",
+-   "indexSha": "04761683a61c59161277a15812348bbbf631f7b7626f38ee11e385c29aede746",
+-   "indexTree": "137f403229c168ea729e9ecffcd536c6dd106802",
+-   "refScope": "all",
+-   "refs": {
+-     "refs/heads/main": "5893c77a733d99e966e339f199c01f88606d5ee3",
+-   },
+- }
++ undefined
+
+- Expected  - 15
++ Received  + 1
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/follow.test.ts:3053:42)
+(fail) R2-9: injected NFC receiver equivalence rejects an incoming index with NFC/NFD literal twins [3579.49ms]
+(pass) R2-9: actual case-aliasing receiver rejects a case-colliding incoming index [2314.66ms]
+1071 |   if (!isURLInstance(fileURLOrPath))
+1072 |     return fileURLOrPath;
+1073 |   return Bun.fileURLToPath(fileURLOrPath);
+1074 | }
+1075 | var { Error, TypeError } = globalThis;
+1076 |   let err = new Error(message);
+                   ^
+error: Command failed: git -C /private/tmp/rbox-follow-x9ewwD/sender branch foo
+fatal: a branch named 'foo' already exists
+
+   code: 128,
+ killed: false,
+ signal: null,
+    cmd: "git -C /private/tmp/rbox-follow-x9ewwD/sender branch foo",
+ stdout: "",
+ stderr: "fatal: a branch named 'foo' already exists\n",
+
+      at genericNodeError (node:child_process:1076:13)
+      at exitHandler (node:child_process:111:28)
+      at emit (node:events:103:22)
+      at #maybeClose (node:child_process:822:16)
+      at #handleOnExit (node:child_process:565:72)
+(fail) R2-11: refname alias group is held while an unrelated checkout follows [1949.78ms]
+killed 1 dangling process
+(fail) design 174 C: many-ref follow has exclusive leaf coverage and an explicit residual [30082.74ms]
+  ^ this test timed out after 30000ms.
+
+src/cli/sync-git/git-sync.test.ts:
+3580 |     mutated = true;
+3581 |     fsSync.writeFileSync(path.join(repo, "late.txt"), "late");
+3582 |     execFileSync("git", ["-C", repo, "add", "late.txt"], { env: TEST_GIT_ENV });
+3583 |   });
+3584 |   try {
+3585 |     expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
+                                                                                   ^
+error: expect(received).toBe(expected)
+
+Expected: 1
+Received: 0
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/git-sync.test.ts:3585:77)
+(fail) gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mutation [997.72ms]
+
+ 1 pass
+ 317 filtered out
+ 8 fail
+ 1 error
+ 25 expect() calls
+Ran 9 tests across 4 files. [46.49s]

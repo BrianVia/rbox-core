@@ -1,0 +1,44 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/daemon/watcher.test.ts: (run #1)
+parcel-event delete .git/AUTO_MERGE.lock candidate undefined signal false
+parcel-event delete .git/HEAD.lock candidate undefined signal false
+parcel-event delete .git/packed-refs.lock candidate undefined signal false
+parcel-event create .git/refs/heads/main candidate undefined signal true
+parcel-event delete .git/refs/heads/main.lock candidate undefined signal false
+capture-main-ref-unchanged true true true true
+346 |   const beforeRefBytes = fs.readFileSync(path.join(root, ".git/refs/heads/main"));
+347 |   expect(await captureGitState(root, store, Buffer.alloc(32, 7))).toBeDefined();
+348 |   const afterRef = fs.statSync(path.join(root, ".git/refs/heads/main"));
+349 |   console.log("capture-main-ref-unchanged", beforeRef.ino === afterRef.ino, beforeRef.mtimeMs === afterRef.mtimeMs, beforeRef.ctimeMs === afterRef.ctimeMs, beforeRefBytes.equals(fs.readFileSync(path.join(root, ".git/refs/heads/main"))));
+350 |   await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 5));
+351 |   expect(gitSignals).toEqual([]);
+                           ^
+error: expect(received).toEqual(expected)
+
+- []
++ [
++   1788623598904,
++ ]
+
+- Expected  - 1
++ Received  + 3
+
+      at <anonymous> (/private/tmp/rbox-289-git-candidate-probes/src/cli/daemon/watcher.test.ts:351:22)
+(fail) design 172: capture scratch-pin creation/deletion produces no signal or file event [697.88ms]
+
+src/cli/daemon/watcher.test.ts: (run #2)
+capture-main-ref-unchanged true true true true
+(pass) design 172: capture scratch-pin creation/deletion produces no signal or file event [664.30ms]
+
+src/cli/daemon/watcher.test.ts: (run #3)
+parcel-event delete .git/AUTO_MERGE.lock candidate undefined signal false
+parcel-event delete .git/packed-refs.lock candidate undefined signal false
+capture-main-ref-unchanged true true true true
+(pass) design 172: capture scratch-pin creation/deletion produces no signal or file event [668.09ms]
+
+ 2 pass
+ 66 filtered out
+ 1 fail
+ 10 expect() calls
+Ran 3 tests across 1 file. [2.08s]

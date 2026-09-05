@@ -1,0 +1,24 @@
+bun test v1.4.0 (34cbb9a40)
+
+../../../../../../../../../private/tmp/rbox-289-adopt-baseline/src/cli/adopt-git.test.ts:
+baseline parked detail [{"path":"repo","source":{"path":"repo","sourceKind":"dir","worktreeReal":"/private/tmp/rbox-adopt-git-0UiIqK/.rbox/adopt/stash/repo","gitDirReal":"/private/tmp/rbox-adopt-git-0UiIqK/.rbox/adopt/stash/repo/.git","commonDirReal":"/private/tmp/rbox-adopt-git-0UiIqK/.rbox/adopt/stash/repo/.git","objectStoreReal":"/private/tmp/rbox-adopt-git-0UiIqK/.rbox/adopt/stash/repo/.git/objects"},"branches":[],"retainedRefs":[],"state":"parked","reason":"ENOENT: no such file or directory, open '/dev/fd/36/repo'"}]
+78 |     const calls: string[][] = [];
+79 |     await runGitAdoption(f.journal, async () => {}, { runGit: async (repo, args) => { calls.push(args); return git(repo, args); } });
+80 |
+81 |     console.log("baseline parked detail", JSON.stringify(f.journal.gitRepos));
+82 |     const branch = f.journal.gitRepos[0]?.branches.find((candidate) => candidate.ref === "refs/heads/main");
+83 |     expect(branch?.state).toBe("index-complete");
+                               ^
+error: expect(received).toBe(expected)
+
+Expected: "index-complete"
+Received: undefined
+
+      at <anonymous> (/private/tmp/rbox-289-adopt-baseline/src/cli/adopt-git.test.ts:83:27)
+(fail) design 166 exact-OID Git fetch-union > eligible checked-out ahead branch uses literal selective fetch, CAS, saved index, and no worktree write [347.69ms]
+
+ 0 pass
+ 11 filtered out
+ 1 fail
+ 1 expect() calls
+Ran 1 test across 1 file. [373.00ms]
