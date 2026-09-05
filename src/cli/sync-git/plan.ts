@@ -405,7 +405,10 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
   const captureStartedAt = performance.now();
   accumulator.beginCaptureProgress(toCapture.length);
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
+  const stages = accumulator.stats.captureStages;
   const retainDir = await artifacts.startIfNeeded(toCapture.length > 0);
+  stages.startMs += performance.now() - captureStartedAt;
+  const poolStartedAt = performance.now();
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     const repoStartedAt = performance.now();
     options.onCaptureQueued?.(rel);
@@ -456,6 +459,8 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
   // a BASE-positive branch into an omission only after the full witness and a
   // prepared verify-only lock.
   const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
+  stages.poolMs += performance.now() - poolStartedAt;
+  const carriedStartedAt = performance.now();
   for (const rel of [...new Set([...captured, ...carried])].sort()) {
       const candidate = out[rel];
       if (!candidate) continue;
@@ -601,6 +606,7 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       refuseBranchDeletion(reason, refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"));
   }
 
+  stages.carriedMs += performance.now() - carriedStartedAt;
   timings.captureMs += performance.now() - captureStartedAt;
 }
 interface CandidateFinalizeStage {
@@ -915,6 +921,8 @@ export interface GitPlanStats {
   divergenceCacheMs: number;
   otherMs: number;
   repoCosts: GitPlanRepoCost[];
+  /** Design 304: where the capture stage's wall goes besides per-repo work. */
+  captureStages: { startMs: number; poolMs: number; carriedMs: number };
 }
 
 export interface GitPlanRepoCost {
