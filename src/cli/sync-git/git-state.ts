@@ -193,34 +193,39 @@ export type WorktreeListResult =
   | { status: "unreadable"; cause: unknown };
 
 function parseWorktrees(out: string): WorktreeEntry[] {
+  const fields = out.split("\0");
+  if (fields.pop() !== "") throw new Error("malformed worktree list: unterminated field");
   const entries: WorktreeEntry[] = [];
-  let cur: (Partial<WorktreeEntry> & { path?: string }) | undefined;
-  const flush = () => {
-    if (cur?.path) entries.push({ path: cur.path, branch: cur.branch, prunable: cur.prunable ?? false });
-    cur = undefined;
-  };
-  for (const line of out.split("\n")) {
-    if (line.startsWith("worktree ")) {
-      flush();
-      cur = { path: line.slice("worktree ".length), prunable: false };
-    } else if (!cur) {
-      continue;
-    } else if (line.startsWith("branch ")) {
-      cur.branch = line.slice("branch ".length);
-    } else if (line.startsWith("prunable")) {
+  let cur: WorktreeEntry | undefined;
+  for (const field of fields) {
+    if (field === "") {
+      if (cur) entries.push(cur);
+      cur = undefined;
+    } else if (field.startsWith("worktree ")) {
+      if (cur || field.length === "worktree ".length) throw new Error("malformed worktree list: invalid worktree field");
+      cur = { path: field.slice("worktree ".length), prunable: false };
+    } else if (field.startsWith("branch ")) {
+      if (!cur) throw new Error("malformed worktree list: branch before worktree");
+      cur.branch = field.slice("branch ".length);
+    } else if (field.startsWith("prunable")) {
+      if (!cur) throw new Error("malformed worktree list: prunable before worktree");
       cur.prunable = true;
     }
   }
-  flush();
+  if (cur) throw new Error("malformed worktree list: unterminated record");
   return entries;
 }
 
 /** Evidence-sensitive worktree enumeration. A failed Git read is not an empty
  * ownership map: callers using this to authorize ref mutation must refuse. */
 export async function listWorktreesStrict(repoDir: string): Promise<WorktreeListResult> {
-  const result = await gitStatus(repoDir, ["worktree", "list", "--porcelain"]);
+  const result = await gitStatus(repoDir, ["worktree", "list", "--porcelain", "-z"]);
   if (result.status === "failed") return { status: "unreadable", cause: result.cause };
-  return { status: "ok", entries: parseWorktrees(result.stdout) };
+  try {
+    return { status: "ok", entries: parseWorktrees(result.stdout) };
+  } catch (cause) {
+    return { status: "unreadable", cause };
+  }
 }
 
 /** Lossy worktree enumeration for diagnostics and non-authorizing callers. */

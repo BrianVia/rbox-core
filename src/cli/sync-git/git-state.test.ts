@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { gitBusy, listWorktrees, listWorktreesStrict, readLocalGitConfigEntries, repoCtx, type RepoCtx } from "./git-state.js";
+import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
 import { cleanGitEnv, gitRaw, gitStatus, setGitSpawnObserver } from "../../engine/git-spawn.js";
 import { gitPreflight, gitRefStorage } from "./preflight.js";
 
@@ -63,6 +64,14 @@ case "$mode" in
   stderr-overflow) printf '0123456789abcdef' >&2; exit 9 ;;
   stream) printf 'stream-output' ;;
   incomplete) printf '\\342\\202' ;;
+  worktree)
+    case "$RBOX_WORKTREE_FIXTURE" in
+      truncated) printf 'worktree /complete\\000branch refs/heads/complete\\000\\000worktree /partial\\000branch refs/heads/partial' ;;
+      branch-first) printf 'branch refs/heads/forged\\000\\000' ;;
+      prunable-first) printf 'prunable gitdir file points to non-existent location\\000\\000' ;;
+      failure) printf 'worktree /complete\\000branch refs/heads/complete\\000\\000'; exit 7 ;;
+    esac
+    ;;
 esac
 `);
   await fs.chmod(executable, 0o755);
@@ -264,4 +273,86 @@ test("strict worktree enumeration distinguishes unreadable evidence from an empt
     status: "ok",
     entries: expect.arrayContaining([expect.objectContaining({ path: repo })]),
   }));
+});
+
+test("NUL-framed worktree ownership preserves odd paths and canonical self exclusion", async () => {
+  const root = await tempDir();
+  const main = path.join(root, "main");
+  await fs.mkdir(main);
+  await exec("git", ["-C", main, "init", "-q", "-b", "main"], { env: TEST_GIT_ENV });
+  await exec("git", ["-C", main, "commit", "--allow-empty", "-qm", "root"], { env: TEST_GIT_ENV });
+
+  const names = ["line\nbreak", "tab\tname", 'double"quote', "back\\slash", "with space", "Unicode-雪"];
+  const worktrees: string[] = [];
+  for (const [index, name] of names.entries()) {
+    const worktree = path.join(root, name);
+    await exec("git", ["-C", main, "worktree", "add", "-q", "-b", `odd-${index}`, worktree], { env: TEST_GIT_ENV });
+    worktrees.push(worktree);
+  }
+  const checkouts = [main, ...worktrees];
+  const refs = ["refs/heads/main", ...worktrees.map((_, index) => `refs/heads/odd-${index}`)];
+
+  for (const [index, checkout] of checkouts.entries()) {
+    const ctx = await repoCtx(checkout);
+    expect(ctx).toBeDefined();
+    const result = await branchesCheckedOutElsewhereStrict(ctx!);
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect([...result.owned.keys()].sort()).toEqual(refs.filter((_, refIndex) => refIndex !== index).sort());
+    }
+  }
+
+  const alias = path.join(root, "main-alias");
+  await fs.symlink(main, alias, "dir");
+  const aliasCtx = await repoCtx(alias);
+  expect(aliasCtx).toBeDefined();
+  const aliasResult = await branchesCheckedOutElsewhereStrict(aliasCtx!);
+  expect(aliasResult.status).toBe("ok");
+  if (aliasResult.status === "ok") expect(aliasResult.owned.has("refs/heads/main")).toBe(false);
+});
+
+test("NUL-framed worktree metadata keeps detached, prunable, and locked entries distinct", async () => {
+  const root = await tempDir();
+  const main = path.join(root, "main");
+  await fs.mkdir(main);
+  await exec("git", ["-C", main, "init", "-q", "-b", "main"], { env: TEST_GIT_ENV });
+  await exec("git", ["-C", main, "commit", "--allow-empty", "-qm", "root"], { env: TEST_GIT_ENV });
+  const detached = path.join(root, "detached");
+  const prunable = path.join(root, "prunable");
+  const locked = path.join(root, "locked");
+  await exec("git", ["-C", main, "worktree", "add", "-q", "--detach", detached], { env: TEST_GIT_ENV });
+  await exec("git", ["-C", main, "worktree", "add", "-q", "-b", "stale", prunable], { env: TEST_GIT_ENV });
+  await exec("git", ["-C", main, "worktree", "add", "-q", "-b", "locked", locked], { env: TEST_GIT_ENV });
+  await exec("git", ["-C", main, "worktree", "lock", locked], { env: TEST_GIT_ENV });
+  await fs.rm(prunable, { recursive: true });
+
+  const result = await listWorktreesStrict(main);
+  expect(result.status).toBe("ok");
+  if (result.status === "ok") {
+    expect(result.entries).toEqual(expect.arrayContaining([
+      { path: detached, branch: undefined, prunable: false },
+      { path: prunable, branch: "refs/heads/stale", prunable: true },
+      { path: locked, branch: "refs/heads/locked", prunable: false },
+    ]));
+  }
+});
+
+test("malformed or failed NUL worktree reads never expose a partial list", async () => {
+  const fake = await fakeGitPath();
+  const originalPath = process.env.PATH;
+  const observed: string[][] = [];
+  process.env.PATH = fake.bin;
+  setGitSpawnObserver((_root, args) => observed.push([...args]));
+  try {
+    for (const fixture of ["truncated", "branch-first", "prunable-first", "failure"]) {
+      process.env.RBOX_WORKTREE_FIXTURE = fixture;
+      expect(await listWorktreesStrict(".")).toEqual(expect.objectContaining({ status: "unreadable" }));
+      expect(await listWorktrees(".")).toEqual([]);
+    }
+  } finally {
+    delete process.env.RBOX_WORKTREE_FIXTURE;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+  expect(observed).toEqual(Array.from({ length: 8 }, () => ["worktree", "list", "--porcelain", "-z"]));
 });
