@@ -1,3 +1,4 @@
+/** Never: validate opens, choose reader/writer policy, or change frozen v1 identity. */
 import type { Database } from "bun:sqlite";
 import { canonicalJson } from "../digest/codecs.js";
 import { genesisSourcePresenceFlags, sourcePresenceFlagsCjson } from "../digest/source-shape.js";
@@ -22,6 +23,10 @@ export interface GenesisLineage {
 
 export function applySchemaV1(db: Database): void {
   db.exec(SCHEMA_V1_DDL);
+}
+
+export function maintainWriterSchema(db: Database): void {
+  db.exec("CREATE INDEX IF NOT EXISTS plane_entries_entry ON plane_entries(entry_id,path,path_order)");
 }
 
 export function installGenesisLineage(db: Database, genesis: GenesisLineage): void {

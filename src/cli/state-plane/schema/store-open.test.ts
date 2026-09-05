@@ -11,7 +11,9 @@ import {
   createStateStore,
   openStateStore,
   readImmutableStoreLineage,
+  stateStoreDatabase,
 } from "../store/open.js";
+import { validateOpen } from "./validate-open.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -56,6 +58,49 @@ test("fresh create, writer reopen, and read-only reopen pin their own pragmas", 
     expect(reader.pragmas).toMatchObject({ fullfsync: 1, checkpointFullfsync: 1, walAutocheckpoint: 1000 });
   }
   reader.close();
+});
+
+test("the optional plane-entry index is writer-maintained and v1-compatible", () => {
+  const target = file();
+  const created = createStateStore(target, genesis);
+  const indexedHeader = validateOpen(stateStoreDatabase(created), target);
+  created.close();
+
+  const old = new Database(target);
+  old.exec("DROP INDEX plane_entries_entry");
+  const oldHeader = validateOpen(old, target);
+  expect(oldHeader).toEqual(indexedHeader);
+  old.close();
+
+  openStateStore(target, { readonly: true }).close();
+  const afterReader = new Database(target);
+  expect(afterReader.query("SELECT name FROM sqlite_schema WHERE name='plane_entries_entry'").get()).toBeNull();
+  expect(validateOpen(afterReader, target)).toEqual(indexedHeader);
+  afterReader.close();
+
+  openStateStore(target).close();
+  openStateStore(target).close();
+  const afterWriters = new Database(target);
+  expect(afterWriters.query("SELECT sql FROM sqlite_schema WHERE name='plane_entries_entry'").get()).toEqual({
+    sql: "CREATE INDEX plane_entries_entry ON plane_entries(entry_id,path,path_order)",
+  });
+  expect(validateOpen(afterWriters, target)).toEqual(indexedHeader);
+  afterWriters.close();
+});
+
+test("the orphan delete uses the plane-entry index for its anti-join and foreign key", () => {
+  const target = file();
+  const store = createStateStore(target, genesis);
+  const plan = stateStoreDatabase(store).query(`EXPLAIN QUERY PLAN
+    DELETE FROM entry_values WHERE NOT EXISTS(
+      SELECT 1 FROM plane_entries p WHERE p.entry_id=entry_values.entry_id)`).all() as { detail: string }[];
+  expect(plan.map(({ detail }) => detail)).toContain(
+    "SEARCH p USING COVERING INDEX plane_entries_entry (entry_id=?)",
+  );
+  expect(plan.map(({ detail }) => detail)).toContain(
+    "SEARCH plane_entries USING COVERING INDEX plane_entries_entry (entry_id=? AND path=? AND path_order=?)",
+  );
+  store.close();
 });
 
 test("foreign SQLite refusal decides from header bytes and never converts the journal", () => {
