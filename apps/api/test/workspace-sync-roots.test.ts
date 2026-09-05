@@ -106,7 +106,123 @@ function signed(seq: number, refs: { inline: string[] } | { sidecarSha: string; 
 
 const rootsRequest = new Request("https://do/roots?ws=ws_1&proj=root");
 
+function legacyDiffChunk(left: Set<string>, right: Set<string>, after: string): string[] {
+  const chunk: string[] = [];
+  for (const value of left) {
+    if (value <= after || right.has(value)) continue;
+    chunk.push(value);
+    if (chunk.length === 5_000) break;
+  }
+  return chunk;
+}
+
+function legacyFold(previous: string[], current: string[]) {
+  const before = new Set(previous.sort());
+  const after = new Set(current.sort());
+  const dropped = new Map(
+    current.filter((value) => !before.has(value)).map((sha256) => [sha256, { sha256, last_seq: 99 }]),
+  );
+  for (const [left, right, remove] of [[before, after, false], [after, before, true]] as const) {
+    let cursor = "";
+    for (let chunk = legacyDiffChunk(left, right, cursor); chunk.length; chunk = legacyDiffChunk(left, right, cursor)) {
+      for (const sha256 of chunk) {
+        if (remove) dropped.delete(sha256);
+        else dropped.set(sha256, { sha256, last_seq: 1 });
+      }
+      cursor = chunk[chunk.length - 1]!;
+    }
+  }
+  return {
+    dropped: [...dropped].sort(([a], [b]) => a.localeCompare(b)),
+    seqRoots: [
+      [1, { seq: 1, manifest_sha: sha("1"), carrier_sha: null }],
+      [2, { seq: 2, manifest_sha: sha("2"), carrier_sha: null }],
+    ],
+  };
+}
+
+async function foldFixture(previous: string[], current: string[], failTransaction?: () => boolean) {
+  const kv = new Map<string, unknown>([
+    ["head", { sequence: 2, commitHash: sha("c") }], ["pruneFloor", 0],
+    ["index_state", "building"], ["index_synced_seq", 0], ["index_generation", 0], ["backfill_cursor", 1],
+    ["seq:1", signed(1, { inline: previous })], ["seq:2", signed(2, { inline: current })],
+  ]);
+  const before = new Set(previous);
+  const sql = fakeDoSql({
+    dropped: current.filter((value) => !before.has(value)).map((sha256) => ({ sha256, last_seq: 99 })),
+  });
+  await new WorkspaceSync(fakeCtx(kv, sql), {} as never).alarm();
+  await new WorkspaceSync(fakeCtx(kv, sql, failTransaction), {} as never).alarm();
+  return { kv, sql };
+}
+
 describe("WorkspaceSync retained-roots index", () => {
+  test("foldSequence visits 20k disjoint refs at most once per phase", async () => {
+    class CountingSet extends Set<string> {
+      visits = 0;
+      override *values() {
+        for (const value of super.values()) {
+          this.visits++;
+          yield value;
+        }
+      }
+    }
+    const count = 20_000;
+    const previous = new CountingSet(Array.from({ length: count }, (_, i) => (i + 100_000).toString(16).padStart(64, "0")));
+    const current = new CountingSet(Array.from({ length: count }, (_, i) => (i + 200_000).toString(16).padStart(64, "0")));
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 2, commitHash: sha("c") }], ["pruneFloor", 0],
+      ["index_state", "building"], ["index_synced_seq", 0], ["index_generation", 0], ["backfill_cursor", 1],
+    ]);
+    const sync = new WorkspaceSync(fakeCtx(kv, fakeDoSql(), undefined, writes), {} as never);
+    sync["refSetAt"] = async (seq: number) => ({
+      refs: seq === 1 ? previous : current,
+      manifestSha: sha(String(seq)),
+      carrierSha: null,
+    });
+    await sync.alarm();
+    await sync.alarm();
+    expect(writes.transactions).toBe(11); // seed + four chunks per phase + phase/final commits
+    expect(previous.visits + current.visits).toBeLessThanOrEqual(2 * count);
+  });
+
+  test.each([
+    ["disjoint", [sha("a"), sha("b")], [sha("c"), sha("d")]],
+    ["sparse overlap", [sha("a"), sha("c"), sha("e")], [sha("a"), sha("b"), sha("e")]],
+    ["equal", [sha("a"), sha("b")], [sha("a"), sha("b")]],
+    ["empty previous", [], [sha("a"), sha("b")]],
+    ["empty current", [sha("a"), sha("b")], []],
+  ])("matches legacy fold results for %s sets", async (_name, previous, current) => {
+    const { sql } = await foldFixture(previous, current);
+    const expected = legacyFold(previous, current);
+    expect([...sql.__dropped].sort(([a], [b]) => a.localeCompare(b))).toEqual(expected.dropped);
+    expect([...sql.__seqRoots]).toEqual(expected.seqRoots);
+  });
+
+  test("every multi-chunk data transaction resumes without duplicate or missing rows", async () => {
+    const count = 10_001;
+    const previous = Array.from({ length: count }, (_, i) => (i + 100_000).toString(16).padStart(64, "0"));
+    const current = Array.from({ length: count }, (_, i) => (i + 200_000).toString(16).padStart(64, "0"));
+    const baseline = await foldFixture(previous, current);
+    const expectedDropped = [...baseline.sql.__dropped];
+    const expectedRoots = [...baseline.sql.__seqRoots];
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const failedTransaction of [1, 2, 3, 5, 6, 7]) {
+        let transaction = 0;
+        const crashed = await foldFixture(previous, current, () => ++transaction === failedTransaction);
+        expect(crashed.kv.get("index_synced_seq")).toBe(1);
+        await new WorkspaceSync(fakeCtx(crashed.kv, crashed.sql), {} as never).alarm();
+        expect([...crashed.sql.__dropped]).toEqual(expectedDropped);
+        expect([...crashed.sql.__seqRoots]).toEqual(expectedRoots);
+        expect(crashed.kv.has("fold_subcursor")).toBe(false);
+      }
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   test("serves the inclusive-base gap and independently paginates both SQL streams", async () => {
     const kv = new Map<string, unknown>([
       ["head", { sequence: 2, commitHash: sha("c") }],
