@@ -11,6 +11,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { canonicalManifestHashStreaming } from "../engine/index.js";
+import type { FileEntry, Manifest } from "../engine/index.js";
 import {
   manifestFromMeta, validManifestMeta, type GlobalManifestMeta, type RepoRecordInput, type StateSavePacket, type SyncState,
 } from "./sync-state-model.js";
@@ -110,8 +111,29 @@ export function globalElisionAudit(
   const incoming = validManifestMeta(receipt.manifestMeta);
   const persisted = validManifestMeta(snapshot.manifestMeta);
   if (!incoming || !persisted || !isDeepStrictEqual(incoming, persisted)) return "not-audited";
-  return canonicalManifestHashStreaming(manifestFromMeta(snapshot.lastSyncedManifest, persisted))
-    === incoming.manifestHash ? "unchanged" : "content-drift";
+  return auditHash(snapshot.lastSyncedManifest, persisted) === incoming.manifestHash ? "unchanged" : "content-drift";
+}
+
+/**
+ * Design 303: the audit's hash over 198K entries (~1s at fleet scale) is memoized
+ * per files ARRAY. Loaded states are never mutated in place (design 277, freeze-
+ * swept) and design 302 hands the same array back while the base generation is
+ * unchanged, so array identity is content identity; everything else the hash
+ * consumes rides in the key. A fresh array — a new base generation, or the raw
+ * load path — always hashes. Never a second source of truth for drift: the
+ * first audit of any array still hashes the real rows.
+ */
+const AUDIT_HASHES = new WeakMap<readonly FileEntry[], Map<string, string>>();
+
+export function auditHash(lastSyncedManifest: Manifest, persisted: GlobalManifestMeta): string {
+  const key = JSON.stringify([lastSyncedManifest.generatedAt, lastSyncedManifest.manifestSchema ?? null, persisted]);
+  let byKey = AUDIT_HASHES.get(lastSyncedManifest.files);
+  const cached = byKey?.get(key);
+  if (cached !== undefined) return cached;
+  const hash = canonicalManifestHashStreaming(manifestFromMeta(lastSyncedManifest, persisted));
+  if (!byKey) { byKey = new Map(); AUDIT_HASHES.set(lastSyncedManifest.files, byKey); }
+  byKey.set(key, hash);
+  return hash;
 }
 
 /** §3.3. `applyTransitions` is a pure upsert with no absence semantics, so a
