@@ -70,7 +70,7 @@ export class GitPlanAccumulator {
     pointerPreSkips: 0,
     parentRelCached: 0,
     repoCosts: [],
-    captureStages: { startMs: 0, poolMs: 0, carriedMs: 0 },
+    captureStages: { startMs: 0, poolMs: 0, carriedMs: 0, carriedCtxMs: 0, carriedPackedMs: 0, carriedRepos: 0, carriedFreshCtx: 0 },
   };
   readonly base: Record<string, GitSection>;
   readonly durablePending: Record<string, GitSection>;

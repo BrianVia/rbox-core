@@ -3820,7 +3820,7 @@ test("design 298 attributes a slow git plan to at most three repositories and st
   const line = logs.find((entry) => entry.startsWith("git-plan slowest: "));
   expect(line).toBeDefined();
   const [repoPart, stagePart] = line!.slice("git-plan slowest: ".length).split(" | ");
-  expect(stagePart).toMatch(/^stages start=\d+ pool=\d+ carried=\d+ discover=\d+$/);
+  expect(stagePart).toMatch(/^stages start=\d+ pool=\d+ carried=\d+\[ctx=\d+ packed=\d+ repos=\d+ freshCtx=\d+\] discover=\d+$/);
   const entries = repoPart!.split("; ");
   expect(entries.length).toBeLessThanOrEqual(3);
   expect(entries[0]).toMatch(/^attrib-a fp=untrusted cp=\d+ d=\d+$/);
