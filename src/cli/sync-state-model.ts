@@ -385,9 +385,11 @@ export type StateSaveResult =
 
 export interface StateSaveOptions {
   lock?: AcquireLockOptions;
-  /** Design 267 §4: the accepted state a fully-elided save already holds. The
-   * adapter overlays the CAS token fields onto it instead of reading the whole
-   * store back. Every other save shape, and every rejection, still reads back. */
+  /** Design 267 §4 / 301: the accepted state a global-free save leaves behind.
+   * A fully elided save takes it whole (token fields overlaid); a repo-only
+   * save reuses only its base file rows, provably untouched, and still reads
+   * the repo records back. A save that carried a global section, and every
+   * rejection, still reads everything back. */
   acceptedProjection?: SyncState;
   /** Complete-reset fence already owns both the protocol state class and the
    * physical state lock. The writer must assert and reuse it, never re-enter. */

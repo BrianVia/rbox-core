@@ -325,3 +325,63 @@ test("the two-read safety argument: state_revision is strictly monotonic per lin
   const writer = fs.readFileSync(path.resolve(import.meta.dir, "../store/write-packet.ts"), "utf8");
   expect(writer).toContain("frozen.expected.stateRevision + 1");
 });
+
+/** Design 301: a global-free save reuses the snapshot's untouched base file
+ * rows and reads the repo records back — the result must equal a fresh
+ * read-back exactly, and a stale snapshot must never be trusted. */
+test("a repo-only save returns exactly the read-back while reusing the untouched files", async () => {
+  const root = await sqliteWorkspace("repo-only");
+  const before = await loadState(root, STREAM);
+  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
+  let saved: SyncState | undefined;
+  try {
+    saved = await saveStateSource(root, before, {
+      expectedStream: STREAM, sourceGlobalSeq: before.lastSyncedSequence,
+      observedRepos: ["r"], values: { partial: { r: null } },
+    });
+    // The one read-back was told which rows it may skip.
+    expect(filesSpy).toHaveBeenCalledTimes(1);
+    expect(filesSpy.mock.calls[0]?.[1]).toEqual({ baseFiles: before.lastSyncedManifest.files });
+  } finally {
+    filesSpy.mockRestore();
+  }
+  expect(saved).toEqual((await loadRawState(root))!);
+  expect(saved!.stateRevision).toBe(before.stateRevision! + 1);
+});
+
+test("a stale snapshot never gets its files reused", async () => {
+  const root = await sqliteWorkspace("stale-snapshot");
+  const stale = await loadState(root, STREAM);
+  mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET state_revision=state_revision+1");
+  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
+  try {
+    const saved = await saveStateSource(root, stale, {
+      expectedStream: STREAM, sourceGlobalSeq: stale.lastSyncedSequence,
+      observedRepos: ["r"], values: { partial: { r: null } },
+    });
+    // The accepted read-back had no reuse: the CAS token is two past the snapshot.
+    expect(filesSpy.mock.calls.every((call) => call[1] === undefined)).toBe(true);
+    expect(saved).toEqual((await loadRawState(root))!);
+  } finally {
+    filesSpy.mockRestore();
+  }
+});
+
+test("a save that carries a global section reads everything back", async () => {
+  const root = await sqliteWorkspace("global-readback");
+  const before = await loadState(root, STREAM);
+  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
+  let saved: SyncState | undefined;
+  try {
+    saved = await saveStateSource(root, before, {
+      expectedStream: STREAM, sourceGlobalSeq: before.lastSyncedSequence + 1,
+      globalManifest: { generatedAt: "2026-09-05T00:00:00.000Z", files: [] },
+      observedRepos: [], values: {},
+    });
+    expect(filesSpy).toHaveBeenCalledTimes(1);
+    expect(filesSpy.mock.calls[0]?.[1]).toBeUndefined();
+  } finally {
+    filesSpy.mockRestore();
+  }
+  expect(saved).toEqual((await loadRawState(root))!);
+});

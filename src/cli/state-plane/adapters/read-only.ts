@@ -1,5 +1,5 @@
 /** Never: expected-stream checking, whole-state writes, or JSON/SQLite authority selection. */
-import type { Manifest } from "../../../engine/index.js";
+import type { FileEntry, Manifest } from "../../../engine/index.js";
 import {
   type GlobalManifestMeta, type RepoRecord, type SyncState,
 } from "../../sync-state-model.js";
@@ -29,10 +29,10 @@ function collectGit(snapshot: ReadSnapshot, role: "meta-wire" | "manifest-projec
   return result;
 }
 
-function materializeManifest(snapshot: ReadSnapshot, plane: Plane): Manifest {
-  const files = [];
+function materializeManifest(snapshot: ReadSnapshot, plane: Plane, reuseFiles?: readonly FileEntry[]): Manifest {
+  const files: FileEntry[] = reuseFiles ? [...reuseFiles] : [];
   let after: string | undefined;
-  for (;;) {
+  while (!reuseFiles) {
     const page = snapshot.files(plane, after, 512);
     files.push(...page.rows);
     if (page.done) break;
@@ -78,7 +78,11 @@ function withoutUndefinedMembers<T extends object>(record: T): T {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)) as T;
 }
 
-export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
+/** `reuse.baseFiles` (design 301): the caller proves the base plane's files did
+ * not move (a global-free CAS whose token is exactly one revision past the
+ * snapshot's), so only the file rows are skipped — repo records, manifest meta,
+ * git projections and every token still come from the store. */
+export function loadRawStateFromStore(store: StateStoreHandle, reuse?: { baseFiles: readonly FileEntry[] }): SyncState {
   const guard = openReadSnapshot(store);
   const token = guard.token;
   const records: Record<string, RepoRecord> = {};
@@ -96,7 +100,7 @@ export function loadRawStateFromStore(store: StateStoreHandle): SyncState {
     ...token.lineageExtras,
     stream: token.stream,
     lastSyncedSequence: token.lastSyncedSequence,
-    lastSyncedManifest: materializeManifest(guard, "base"),
+    lastSyncedManifest: materializeManifest(guard, "base", reuse?.baseFiles),
   };
   if (meta) base.manifestMeta = meta;
   if (token.nonce !== undefined) base.stateNonce = token.nonce;
