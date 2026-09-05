@@ -831,27 +831,23 @@ export class WorkspaceSync {
     if (!previous) throw new Error(`unreadable fold base ${seq - 1}`);
     if (previous.refs.size > FOLD_MAX_REFS) throw new Error(`fold refs exceed ${FOLD_MAX_REFS}`);
     let cursor = (this.ctx.storage.kv.get("fold_subcursor") as FoldCursor | undefined) ?? { phase: "removed", lastSha: "" };
-    while (cursor.phase === "removed") {
-      const chunk = diffChunk(previous.refs, current.refs, cursor.lastSha);
-      if (!chunk.length) {
-        cursor = { phase: "added", lastSha: "" };
-        this.ctx.storage.transactionSync(() => this.ctx.storage.kv.put("fold_subcursor", cursor));
-        break;
+    if (cursor.phase === "removed") {
+      const removed = diff(previous.refs, current.refs, cursor.lastSha);
+      for (let chunk = takeChunk(removed); chunk.length; chunk = takeChunk(removed)) {
+        this.ctx.storage.transactionSync(() => {
+          for (const sha of chunk) this.sql().exec("INSERT INTO dropped_index(sha256,last_seq) VALUES(?,?) ON CONFLICT(sha256) DO UPDATE SET last_seq=excluded.last_seq", sha, seq - 1);
+          this.ctx.storage.kv.put("fold_subcursor", { phase: "removed", lastSha: chunk[chunk.length - 1]! } satisfies FoldCursor);
+        });
       }
-      this.ctx.storage.transactionSync(() => {
-        for (const sha of chunk) this.sql().exec("INSERT INTO dropped_index(sha256,last_seq) VALUES(?,?) ON CONFLICT(sha256) DO UPDATE SET last_seq=excluded.last_seq", sha, seq - 1);
-        this.ctx.storage.kv.put("fold_subcursor", { phase: "removed", lastSha: chunk[chunk.length - 1]! } satisfies FoldCursor);
-      });
-      cursor = { phase: "removed", lastSha: chunk[chunk.length - 1]! };
+      cursor = { phase: "added", lastSha: "" };
+      this.ctx.storage.transactionSync(() => this.ctx.storage.kv.put("fold_subcursor", cursor));
     }
-    while (cursor.phase === "added") {
-      const chunk = diffChunk(current.refs, previous.refs, cursor.lastSha);
-      if (!chunk.length) break;
+    const added = diff(current.refs, previous.refs, cursor.lastSha);
+    for (let chunk = takeChunk(added); chunk.length; chunk = takeChunk(added)) {
       this.ctx.storage.transactionSync(() => {
         for (const sha of chunk) this.sql().exec("DELETE FROM dropped_index WHERE sha256 = ?", sha);
         this.ctx.storage.kv.put("fold_subcursor", { phase: "added", lastSha: chunk[chunk.length - 1]! } satisfies FoldCursor);
       });
-      cursor = { phase: "added", lastSha: chunk[chunk.length - 1]! };
     }
     this.ctx.storage.transactionSync(() => {
       this.sql().exec("INSERT OR REPLACE INTO seq_roots(seq,manifest_sha,carrier_sha) VALUES(?,?,?)", seq, current.manifestSha, current.carrierSha);
@@ -879,7 +875,7 @@ export class WorkspaceSync {
     if (mode.kind === "inline") return { refs: new Set([...mode.refShas, ...chainShas].sort()), manifestSha: cb.encManifestSha, carrierSha: null };
     const loaded = await loadSidecarShaSet(this.env, mode.sidecarSha, mode.count);
     if (!loaded.ok) return null;
-    // Sorted insertion order is load-bearing: diffChunk paginates the fold by
+    // Sorted insertion order is load-bearing: diff resumes the fold by
     // iterating this Set in order with a `> lastSha` cursor — an out-of-order
     // chain sha appended after the sorted sidecar refs would be skipped on a
     // chunk resume and its dropped_index entry silently lost (GC stranding).
@@ -1476,14 +1472,23 @@ function readHead(v: StoredHead | number | undefined): StoredHead {
   return { sequence: 0, commitHash: GENESIS_HASH };
 }
 
-/** Bounded iterator diff. Canonical sidecars and the sorted inline fallback make
- * Set iteration stable; only the returned SQL chunk is materialized. */
-function diffChunk(left: Set<string>, right: Set<string>, after: string): string[] {
+/** Canonical sidecars and the sorted inline fallback make Set iteration stable. */
+function* diff(left: Set<string>, right: Set<string>, after: string): Generator<string> {
+  const shas = left.values();
+  let next = shas.next();
+  while (!next.done && next.value <= after) next = shas.next();
+  while (!next.done) {
+    if (!right.has(next.value)) yield next.value;
+    next = shas.next();
+  }
+}
+
+function takeChunk(shas: Iterator<string>): string[] {
   const out: string[] = [];
-  for (const sha of left) {
-    if (sha <= after || right.has(sha)) continue;
-    out.push(sha);
-    if (out.length === FOLD_CHUNK) break;
+  while (out.length < FOLD_CHUNK) {
+    const next = shas.next();
+    if (next.done) break;
+    out.push(next.value);
   }
   return out;
 }
