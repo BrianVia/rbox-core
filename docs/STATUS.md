@@ -14,13 +14,28 @@
 - **Fleet:** still on 2.0.2 (Mac) / `2.0.2-dev+e3881c3` (desktop, FM). The
   four #882 fixes are NOT yet in any fleet binary. No production promotion, no
   CLI release. Next release candidate = 2.0.3 (carries #880, #881, #882).
-- **In flight (Codex, worktrees):** design 293 = G5b batch no-drop ancestry via
-  `partitionOwnedByIncoming` + G5a oracle/differential/benchmark
-  (`.claude/worktrees/g5b-nodrop`, `perf/293-nodrop-batch`); design 294 = S1a
-  `ensureMaintenanceScheduled` on bootstrap + alarm-failure reproducer
-  (`.claude/worktrees/s1a-alarm`, `fix/294-maintenance-bootstrap`). Specs live
-  as `SPEC.md` in each worktree. Then: historical split-artifact repair
-  (needs its own design; see 289 §"historical repair is separate").
+- **Roadmap 287 wave landed (evening):** #886 S3a fold live iterator
+  (design 297, `15b448a75`); #884 G5a+G5b batched no-drop ancestry (design
+  293; 68→4 spawns @30 tips, 1008→4 @500; a preceding refactor moved the
+  content-equivalence probe to `sync-git/content-equivalence.ts` to stay
+  under the 400-line module gate); #885 G2 NUL-safe worktree parsing (design
+  295, `worktree list --porcelain -z`). **Open:** #883 S1a maintenance re-arm
+  (design 294) and #887 G3a SHA-256 admission + fingerprint schema 9→10
+  (design 296) — both green locally, repeatedly hit FLAKE-012 runner
+  assignment in CI (5 parallel PRs starved the CF runner pool; rerun with
+  `gh run rerun <id> --failed`).
+- **Codex sandbox cannot write `.git/worktrees/*`** (index.lock EROFS): every
+  Codex run leaves the diff uncommitted; commit from this session. Also:
+  `SPEC.md` at repo root is a TRACKED leftover from #833 — never `cp` a spec
+  over it and stage it; use `git checkout -- SPEC.md` before committing.
+- **Decision for founder — historical split-artifact repair:** both fleet
+  hosts have 0 split-index repos; the only detector has a known hole
+  (repos that turned split index off after a bad capture). Recommendation:
+  DEFER as a measured no-go; note in scratch
+  `NOTE-historical-split-repair.md`. Say "build it" to override.
+- **Next bounded candidates (not started):** F2b small-batch manifest merge,
+  G4a Git env inventory (allowlist routing vars), S2a extra-index
+  compatibility fixture, G3b is discharged by the 296 schema bump.
 - **Local hygiene:** all 46 stale worktrees and 285 local branches were purged
   this morning; backup bundle + dirty patches at
   `~/rbox-core-branch-backup-20260905/` (delete when confident).
