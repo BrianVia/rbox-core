@@ -2605,6 +2605,43 @@ test("design 200 kill switch restores pre-200 omission publication without proof
   expect(switchedOffRecord.packedRefsIdentity!.mtimeMs).toBeGreaterThanOrEqual(initialPackedMtime);
 }, 20_000);
 
+test("design 308: a missing BASE branch with no recorded origin is refused before any artifact scan", async () => {
+  const rel = "cheap-witness-refusal";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  // A legacy BASE: the branch exists in BASE but carries no origin evidence, so
+  // its deletion can never be proven this cycle.
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await git(repo, "branch", "-D", "topic");
+  let witnessStage = false;
+  const scanSpawns: string[][] = [];
+  const logs: string[] = [];
+  setGitSpawnObserver((_spawnRoot, args) => {
+    if (witnessStage) scanSpawns.push([...args]);
+  });
+  try {
+    const plan = await planGitSections(
+      rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+        beforeAbsenceWitness: () => { witnessStage = true; },
+        onGitLog: (line) => logs.push(line),
+      },
+    );
+    expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+    expect(plan.absentBranchProofs?.[rel]).toBeUndefined();
+    expect(plan.gitRepos?.[rel]?.refs["refs/heads/topic"]).toBeDefined(); // BASE carried, deletion not published
+    expect(logs.some((line) => line.includes(`deferred ${rel}: finishing branch deletion: branch deletion witness refused refs/heads/topic (origin-mismatch)`))).toBe(true);
+    expect(scanSpawns).toEqual([]);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+}, 20_000);
+
 test("Step D never runs witness math on a carried pending omission (busy carry keeps one deferral, no proofs)", async () => {
   const rel = "carried-pending-omission";
   const repo = path.join(rootA, rel);
