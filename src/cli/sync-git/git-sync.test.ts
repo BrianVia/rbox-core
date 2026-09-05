@@ -3038,6 +3038,9 @@ test("design 200 a standing missing-origin refusal remains a typed whole-reposit
   const base = record.base!;
   const topicOid = base.refs["refs/heads/topic"]!;
   delete record.branchBaseOrigins?.["refs/heads/topic"];
+  // Design 309: a section this device captured would now count as origin
+  // evidence, so the standing refusal under test needs a foreign author stamp.
+  state.repoRecords!["standing-refusal"] = { ...state.repoRecords!["standing-refusal"]!, base: { ...base, deviceId: "dev_00000000" } };
   await saveStateUnsafeLegacyOrTest(rootA, state);
   await git(repo, "branch", "-D", "topic");
 
