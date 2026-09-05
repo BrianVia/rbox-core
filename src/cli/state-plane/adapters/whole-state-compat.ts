@@ -32,7 +32,7 @@ import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
 import { LEGACY_REJECTION_REASON, translateCasResult } from "./cas-translation.js";
 import { fencedAuthorityUnderHeldLock, openAuthorityStore, selectAuthority, sqliteAuthority, translateStoreOpenError } from "./authority-open.js";
-import { forgetState, memoizedState, rememberState } from "./state-memo.js";
+import { forgetState, memoizedBaseFiles, memoizedState, rememberState } from "./state-memo.js";
 import type { StateFreshnessToken } from "./read-only.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
@@ -116,7 +116,7 @@ export async function loadState(
     // never make a superseded state look current.
     token = facade.readStateFreshnessFromStore(store);
     retained = memoizedState(root, token);
-    state = retained ?? facade.loadRawStateFromStore(store);
+    state = retained ?? facade.loadRawStateFromStore(store, memoizedBaseFiles(root, token));
   } finally {
     store.close();
   }
@@ -254,10 +254,13 @@ async function saveThroughStore(
     const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
-      const result = translateCasResult(
-        await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock)),
-        store, facade, packet, options.acceptedProjection,
-      );
+      const applied = await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock));
+      // Design 302: a global-free packet left the base generation alone, so the
+      // retained rows (if this root has any) are still the store's rows.
+      const reuse = packet.global === undefined && applied.status === "accepted"
+        ? memoizedBaseFiles(root, facade.readStateFreshnessFromStore(store))
+        : undefined;
+      const result = translateCasResult(applied, store, facade, packet, options.acceptedProjection, reuse);
       // An accepted save already holds the exact state the store now carries;
       // retaining it under the post-write token is what makes the loads that
       // follow a publication free. Every other status leaves the retention

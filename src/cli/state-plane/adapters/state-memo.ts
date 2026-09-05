@@ -24,6 +24,7 @@
  * Kill switch: `RBOX_STATE_LOAD_CACHE=0` restores a materialization per load.
  * Deletion condition: two clean fleet weeks (docs/diagnostics.md).
  */
+import type { FileEntry } from "../../../engine/index.js";
 import type { SyncState } from "../../sync-state-model.js";
 import { stateWasStreamMismatch } from "../reset-lineage.js";
 import type { StateFreshnessToken } from "./read-only.js";
@@ -40,6 +41,7 @@ function sameToken(left: StateFreshnessToken, right: StateFreshnessToken): boole
     && left.stream === right.stream
     && left.stateNonce === right.stateNonce
     && left.stateRevision === right.stateRevision
+    && left.baseGeneration === right.baseGeneration
     && left.telemetryBindingId === right.telemetryBindingId;
 }
 
@@ -98,6 +100,23 @@ function freezeForSweep(state: SyncState): void {
     Object.freeze(node);
     for (const member of Object.values(node)) pending.push(member);
   }
+}
+
+/**
+ * Design 302: the retained state's base file rows, reusable while the store's
+ * lineage and base generation still match even though `state_revision` moved.
+ * Only a global section advances `active_base_generation` (write-packet.ts), so
+ * after a global-free save (every unchanged-workspace push) the rows are the
+ * ones the store still holds; the caller re-reads everything else. Same skip-
+ * rule discipline as the state memo: keyed by a token read from the live
+ * lineage row, never a second source of truth, same kill switch.
+ */
+export function memoizedBaseFiles(root: string, token: StateFreshnessToken): { baseFiles: readonly FileEntry[] } | undefined {
+  if (!stateMemoEnabled()) return undefined;
+  const entry = MEMO.get(root);
+  if (!entry || entry.token.lineageId !== token.lineageId || entry.token.stream !== token.stream
+    || entry.token.baseGeneration !== token.baseGeneration) return undefined;
+  return { baseFiles: entry.state.lastSyncedManifest.files };
 }
 
 /** Drop this root's retention — used where the lineage itself is replaced. */

@@ -1,6 +1,6 @@
 # 301 — Empty push: project the accepted state instead of reading it back
 
-Status: slice A implemented (this design); B, C, D measured and deferred to their owners.
+Status: slice A shipped in #891 and then re-homed by design 302 (the `stateRevision + 1` caller-claim binding failed in the daemon because a push snapshot is usually one revision behind a pull). B, C, D measured and deferred to their owners.
 
 ## Measured problem (design 298 lines, via-desktop, 188K files / 125 repos, zero changes)
 
