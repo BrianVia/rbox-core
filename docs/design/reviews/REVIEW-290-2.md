@@ -1,0 +1,18 @@
+# Design 290 review 2 — ALIGNED
+
+Claude Fable 5.1 at medium effort returned **ALIGNED** for the bounded F2 cohesion and ratchet review. Full session result: `/private/tmp/rbox-290-round2-result.json`; packet: `/private/tmp/rbox-290-round2-cohesion-packet.md`. No blocking findings and no additional review round requested.
+
+The reviewer accepted the existing observation ownership, consecutive-confirmed-absence restriction, exact map/cache/deferred effects, restoration proof and minimal allowance arithmetic. A flush-only extraction would introduce parameter passing without removing a decision; the allowance remains a measured one-off rather than precedent. Further growth requires a fresh cohesion review or a meaningful complete-observer/walker extraction design. The review excludes the parallel F1 guard entry, unrelated fingerprint warnings and baseline broad-suite failures.
+
+## Nonblocking confirmations checked against code and existing fixtures
+
+- **Non-ENOENT observation after a pending run:** `manifest-absent-delete.test.ts` has `unreadable unlinkDir preserves its subtree and adds deferral after an absent run`. It creates a mode-000 parent, observes the missing `gone` subtree first, then receives EACCES from the protected child's lstat. It asserts only the earlier absent subtree is deleted, the unreadable subtree survives and deferred entries are retained/added. This fixture ran successfully in the reported non-root macOS test run; it deliberately skips uid 0.
+- **Propagation after pending deletions:** `a later hash failure still leaves prior absent cache invalidations applied` injects EMFILE while processing a subsequent change event, asserts rejection with EMFILE and verifies the earlier deleted cache identity is absent. All non-unlinkDir events flush before this work. The two typed walk-fault catches retain their prior classification and rethrow behavior; entering their directory scan follows an already-flushed boundary.
+- **Clarification of reviewer wording:** there is no baseline `unlinkDir` lstat rethrow branch. Non-absence errors first flush; EACCES/EPERM/EIO defer, and other errors retain the original `st = undefined` handling. Inventing a new unexpected-error throw would change baseline behavior and is not part of F2. No missing production fix or additional test is required to satisfy this confirmation.
+- **Literal spellings:** `noncanonical event spellings retain the old literal prefix semantics` includes `gone/`, `./gone`, a backslash-containing root and an empty root. It deletes literal `gone//child` and exact `gone/` while preserving canonical `gone/child`. This is equivalent to the previous exact-root / `startsWith(rel + '/')` comparison. Input immutability and sibling-prefix protection are separately asserted.
+
+## Timing wording correction
+
+The review response called 32.98 ms an “independent-root timing” and inferred order independence. That reading is incorrect: **root means the parent agent**, which independently reran the **same consecutive-absent-directory fixture**. The first candidate median was 26.95 ms; the parent rerun median was 32.98 ms. These corroborate the speedup under run-to-run timing variation; they do not establish order independence or performance on another workload. Event ordering is supported by the implementation boundaries and focused fixtures. Interleaved watcher-stream and end-to-end sync speedups remain unclaimed.
+
+Post-polish evidence remains 68 focused tests passing and six module-size tests passing. Exact formatter roundtrip preceded the ownership-header addition. No source changes were made for these confirmations; the review cap remains respected at two rounds.

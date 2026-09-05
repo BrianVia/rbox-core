@@ -106,7 +106,7 @@ const ALLOWED: ReadonlyMap<string, string> = new Map([
   ["src/cli/sync-git/git-state.ts", "528 nonblank lines after Git subprocess execution moved to engine/git-spawn.ts"],
   ["src/engine/ignore.ts", "pending split — 714 nonblank lines and 31.3 KiB when the gate landed"],
   ["src/engine/manifest-delta.ts", "pending split — 486 nonblank lines when the gate landed"],
-  ["src/engine/manifest.ts", "pending split — 665 nonblank lines and 29.7 KiB when the gate landed"],
+  ["src/engine/manifest.ts", "audited cohesive (design 290) — local file observation owns ordered events, the working manifest and disposable cache effects; absent-run batching adds no separate authority"],
 ]);
 
 
@@ -189,7 +189,7 @@ const RATCHET: ReadonlyMap<string, { nonblank: number; bytes: number }> = new Ma
   ["src/cli/sync-git/git-state.ts", { nonblank: 528, bytes: 24345 }],
   ["src/engine/ignore.ts", { nonblank: 734, bytes: 33445 }],
   ["src/engine/manifest-delta.ts", { nonblank: 486, bytes: 24400 }],
-  ["src/engine/manifest.ts", { nonblank: 685, bytes: 31668 }],
+  ["src/engine/manifest.ts", { nonblank: 687, bytes: 32603 }],
 ]);
 
 function sourceFiles(): string[] {

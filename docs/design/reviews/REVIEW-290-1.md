@@ -1,0 +1,7 @@
+# 290 review 1 — conditional alignment fulfilled
+
+Claude Fable 5.1, medium, reviewed design 290 on 2026-09-05. Full local result: `/private/tmp/rbox-290-review-result.json`. Verdict: changes required for three specification gaps; with those clarifications, ALIGNED and no further round needed. The reviewer explicitly accepted grouping/deduplicating idempotent invalidations inside absent-only runs.
+
+All three were verified against baseline `src/engine/manifest.ts` and documented before completing implementation: enumerate map deletion/cache invalidation and no deferred removal; preserve absent unlinkDir's short-circuit before any ignore check; preserve exact literal path-prefix comparisons, including unusual event spellings. New focused fixtures cover each. The input map remains the existing independent `indexByPath(base)` working copy. Dropped unnecessary exception machinery because pending runs flush before subsequent throwing branches. Benchmark claims explicitly exclude interleaved streams.
+
+Executed pre-implementation evidence: Bun 1.4.0 isolated 124k-entry/1k-delete complexity probe, correct 123k survivors but 123,500,500 map-key visits against a <=248,000 ceiling (red). Uninstrumented baseline median 1,401.45 ms after one warmup/three measured runs. Implementation validation is recorded in design 290 after completion. Root approved implementation after these source-verified clarifications; no second design round was required.
