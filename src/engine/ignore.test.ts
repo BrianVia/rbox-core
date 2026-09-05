@@ -1,11 +1,23 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import childProcess, { execFile } from "node:child_process";
+import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BUILTIN_IGNORE, buildIgnoreMatcher, effectiveIgnoreRules, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneCoverageComplete, nativePruneGlobs, normalizeIgnorePath } from "./ignore.js";
+import {
+  BUILTIN_IGNORE,
+  buildIgnoreMatcher,
+  effectiveIgnoreRules,
+  HARD_PRUNE_DIRS,
+  isGitRefSignal,
+  isHardExcluded,
+  nativePruneCoverageComplete,
+  nativePruneGlobs,
+  normalizeIgnorePath
+} from "./ignore.js";
 import { applyWatchEvents, scanManifest } from "./manifest.js";
+import { jsonObject, type JsonObject, type JsonValue } from "../json.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -83,10 +95,28 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
 
 describe("machine-local ignorePaths", () => {
   test("normalizes only literal workspace-relative prefixes", () => {
-    for (const value of ["", " x", "x ", "a//b", "a/./b", "a/../b", "/x", "~x", "!x", "x*", "x?", "x[y]", "x{y}", "a\\b", "a\0b", "a\nb", "a\rb"]) {
+    for (const value of [
+      "",
+      " x",
+      "x ",
+      "a//b",
+      "a/./b",
+      "a/../b",
+      "/x",
+      "~x",
+      "!x",
+      "x*",
+      "x?",
+      "x[y]",
+      "x{y}",
+      "a\\b",
+      "a\0b",
+      "a\nb",
+      "a\rb"
+    ]) {
       expect(normalizeIgnorePath(value)).toBeUndefined();
     }
-    expect(normalizeIgnorePath("dir/" )).toBe("/dir");
+    expect(normalizeIgnorePath("dir/")).toBe("/dir");
     expect(normalizeIgnorePath("notes/big.bin")).toBe("/notes/big.bin");
   });
 
@@ -129,7 +159,7 @@ describe("design 172 — Git ref signals stay outside the sync plane", () => {
       ".git/worktrees/w/refs/heads/x",
       ".git/modules/m/refs/heads/x",
       ".git/modules/a/modules/b/HEAD",
-      "nested/repo/.git/refs/tags/v1",
+      "nested/repo/.git/refs/tags/v1"
     ];
     const nonSignals = [
       ".git/refs/heads/x.lock",
@@ -144,7 +174,7 @@ describe("design 172 — Git ref signals stay outside the sync plane", () => {
       ".git/modules/m/logs/refs/heads/x",
       "HEAD",
       "refs/heads/x",
-      "src/.git-state/refs/heads/x",
+      "src/.git-state/refs/heads/x"
     ];
     for (const rel of signals) expect(isGitRefSignal(rel), rel).toBe(true);
     for (const rel of nonSignals) expect(isGitRefSignal(rel), rel).toBe(false);
@@ -276,7 +306,7 @@ describe("builtin ignores — regenerable build/cache dirs (multi-ecosystem)", (
       "site/.output/server/index.mjs",
       "native/cmake-build-debug/CMakeCache.txt",
       "lib/zig-out/bin/tool",
-      "ml/.ipynb_checkpoints/nb-checkpoint.ipynb",
+      "ml/.ipynb_checkpoints/nb-checkpoint.ipynb"
     ]) {
       expect(m.ignores(p)).toBe(true);
     }
@@ -296,7 +326,7 @@ describe("builtin ignores — regenerable build/cache dirs (multi-ecosystem)", (
       "wandb/run-1/summary.json", // experiment data
       "mlruns/0/meta.yaml", // experiment data
       ".yarn/cache/pkg.zip", // Yarn PnP is committed on purpose by some projects
-      "terraform.tfstate", // state FILES sync (E2EE backup is a feature)
+      "terraform.tfstate" // state FILES sync (E2EE backup is a feature)
     ]) {
       expect(m.ignores(p)).toBe(false);
     }
@@ -439,6 +469,83 @@ describe("design 72 nested gitignore semantics", () => {
     }
   });
 
+  test("tracked cache rejects a same-size index replacement with restored mtime", async () => {
+    const d = await mkroot();
+    try {
+      await git(d, "init", "-qb", "main");
+      await git(d, "config", "core.splitIndex", "false");
+      await fs.writeFile(path.join(d, ".gitignore"), "*.secret\n");
+      await fs.writeFile(path.join(d, "a.secret"), "same content\n");
+      await fs.writeFile(path.join(d, "b.secret"), "same content\n");
+      await git(d, "add", "-f", "a.secret");
+      const index = path.join(d, ".git", "index");
+      const stamp = new Date("2020-01-01T00:00:00.000Z");
+      await fs.utimes(index, stamp, stamp);
+      const before = await fs.stat(index, { bigint: true });
+      const first = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(first.ignores("a.secret")).toBe(false);
+      expect(first.ignores("b.secret")).toBe(true);
+
+      // Keep the original inode alive so the replacement cannot reuse its id.
+      await fs.rename(index, path.join(d, ".rbox", "original-test-index"));
+      await git(d, "add", "-f", "b.secret");
+      await fs.utimes(index, stamp, stamp);
+      const after = await fs.stat(index, { bigint: true });
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeNs).toBe(before.mtimeNs);
+      expect(after.dev).toBe(before.dev);
+      expect(after.ino).not.toBe(before.ino);
+      expect(after.ctimeNs).not.toBe(before.ctimeNs);
+      expect(await git(d, "ls-files", "--cached")).toBe("b.secret");
+
+      const second = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(second.ignores("b.secret")).toBe(false);
+      expect(second.ignores("a.secret")).toBe(true);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("tracked cache rejects an in-place index rewrite with restored nanosecond mtime", async () => {
+    const d = await mkroot();
+    try {
+      await git(d, "init", "-qb", "main");
+      await git(d, "config", "core.splitIndex", "false");
+      await fs.writeFile(path.join(d, ".gitignore"), "*.secret\n");
+      await fs.writeFile(path.join(d, "a.secret"), "same content\n");
+      await fs.writeFile(path.join(d, "b.secret"), "same content\n");
+      await git(d, "add", "-f", "a.secret");
+      const index = path.join(d, ".git", "index");
+      const stamp = new Date("2020-01-01T00:00:00.000Z");
+      await fs.utimes(index, stamp, stamp);
+      const before = await fs.stat(index, { bigint: true });
+      const first = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(first.ignores("a.secret")).toBe(false);
+      expect(first.ignores("b.secret")).toBe(true);
+
+      const replacement = path.join(d, ".rbox", "replacement-test-index");
+      await exec("git", ["-C", d, "add", "-f", "b.secret"], {
+        env: { ...process.env, GIT_INDEX_FILE: replacement }
+      });
+      // Overwrite bytes without replacing the live inode; only ctime can detect it.
+      await fs.writeFile(index, await fs.readFile(replacement));
+      await fs.utimes(index, stamp, stamp);
+      const after = await fs.stat(index, { bigint: true });
+      expect(after.dev).toBe(before.dev);
+      expect(after.ino).toBe(before.ino);
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeNs).toBe(before.mtimeNs);
+      expect(after.ctimeNs).not.toBe(before.ctimeNs);
+      expect(await git(d, "ls-files", "--cached")).toBe("b.secret");
+
+      const second = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(second.ignores("b.secret")).toBe(false);
+      expect(second.ignores("a.secret")).toBe(true);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
   // Design 224 §3.1 test 4: this fixture (git init, nothing ever added) is exactly
   // the `indexAbsent` case, and its contract INVERTS. An index-less repo with no
   // commits tracks ZERO files, so it no longer un-ignores its own subtree. The
@@ -460,7 +567,12 @@ describe("design 72 nested gitignore semantics", () => {
 
       // Purge protection reads the same empty set: nothing is tracked, so nothing
       // is protected, and no repo blocks the purge refusal.
-      const purge = buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["repo"], forceTrackedEvaluation: true, protectTrackedPaths: true });
+      const purge = buildIgnoreMatcher(d, {
+        respectGitignore: true,
+        knownGitRepos: ["repo"],
+        forceTrackedEvaluation: true,
+        protectTrackedPaths: true
+      });
       expect(purge.unevaluatedGitRepoForPath?.("repo/file.txt")).toBeUndefined();
       expect(purge.ignores("repo/file.txt")).toBe(true);
     } finally {
@@ -725,7 +837,13 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
       await fs.mkdir(path.join(d, "outer"), { recursive: true });
       await fs.writeFile(path.join(d, "real.txt"), "real");
       await fs.writeFile(path.join(d, "target.txt"), "t");
-      for (const [dir, name] of [["", "node_modules"], ["", "dist"], ["", ".venv"], ["pkg", "node_modules"], ["pkg", "dist"]] as const) {
+      for (const [dir, name] of [
+        ["", "node_modules"],
+        ["", "dist"],
+        ["", ".venv"],
+        ["pkg", "node_modules"],
+        ["pkg", "dist"]
+      ] as const) {
         await fs.symlink("../target.txt", path.join(d, dir, name));
       }
       // Nested inside another ignored tree (the parent prune already hides it; this
@@ -747,11 +865,7 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
         await fs.writeFile(path.join(d, name), "content");
         await fs.writeFile(path.join(d, "pkg", name), "content");
       }
-      expect(await paths(d)).toEqual([
-        "build", "coverage", "dist",
-        "pkg/build", "pkg/coverage", "pkg/dist", "pkg/target",
-        "target",
-      ]);
+      expect(await paths(d)).toEqual(["build", "coverage", "dist", "pkg/build", "pkg/coverage", "pkg/dist", "pkg/target", "target"]);
     } finally {
       await cleanup(d);
     }
@@ -798,7 +912,7 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
         { relPath: "target.txt", kind: "add" },
         { relPath: "keep.txt", kind: "add" },
         { relPath: "node_modules", kind: "add" },
-        { relPath: "link.txt", kind: "add" },
+        { relPath: "link.txt", kind: "add" }
       ]);
       expect(incremental.files.map((f) => f.path).sort()).toEqual(["keep.txt", "link.txt", "target.txt"]);
       expect(await paths(d, m)).toEqual(incremental.files.map((f) => f.path).sort());
@@ -815,7 +929,17 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
       const m = buildIgnoreMatcher(d);
       const base = {
         generatedAt: "",
-        files: [{ path: "node_modules", type: "symlink" as const, symlinkTarget: "target.txt", sha256: "0".repeat(64), size: 10, mode: 0o777, mtimeMs: 0 }],
+        files: [
+          {
+            path: "node_modules",
+            type: "symlink" as const,
+            symlinkTarget: "target.txt",
+            sha256: "0".repeat(64),
+            size: 10,
+            mode: 0o777,
+            mtimeMs: 0
+          }
+        ]
       };
       const next = await applyWatchEvents(base, d, m, [{ relPath: "node_modules", kind: "change" }]);
       expect(next.files.map((f) => f.path)).toEqual([]);
@@ -848,8 +972,9 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
 
   test("HARD_PRUNE_DIRS stays a bare-name subset of BUILTIN_IGNORE, and vendor/bundle survives", () => {
     const bareDirNames = new Set(
-      BUILTIN_IGNORE.filter((p) => p.endsWith("/") && !p.startsWith("!") && !p.slice(0, -1).includes("/") && !/[*?[\]]/.test(p))
-        .map((p) => p.slice(0, -1))
+      BUILTIN_IGNORE.filter((p) => p.endsWith("/") && !p.startsWith("!") && !p.slice(0, -1).includes("/") && !/[*?[\]]/.test(p)).map((p) =>
+        p.slice(0, -1)
+      )
     );
     // Slashless builtins that are also prune dirs: they match ANY entry type
     // (`.git` pointer files; `node_modules` symlinks — issue #659), so they
@@ -861,5 +986,389 @@ describe("design 224 §2.2 — a symlink is ignored iff the same-named directory
     }
     expect(BUILTIN_IGNORE).toContain("vendor/bundle/");
     expect(buildIgnoreMatcher(root).ignores("vendor/bundle/gems/x.rb")).toBe(true);
+  });
+});
+
+describe("design 291 tracked-cache admission", () => {
+  async function fixture(): Promise<string> {
+    const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ign291-"));
+    await git(d, "init", "-qb", "main");
+    await git(d, "config", "core.splitIndex", "false");
+    await fs.writeFile(path.join(d, ".gitignore"), "*.secret\n");
+    await fs.writeFile(path.join(d, "a.secret"), "same content\n");
+    await fs.writeFile(path.join(d, "b.secret"), "same content\n");
+    await git(d, "add", "-f", "a.secret");
+    return d;
+  }
+
+  const readArgs = ["-c", "core.splitIndex=true", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=keep"];
+  const matcher = (d: string) => buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["."] });
+  const cacheDirectory = (d: string) => path.join(d, ".rbox", "state", "git-tracked");
+  async function cacheFile(d: string): Promise<string> {
+    const names = await fs.readdir(cacheDirectory(d));
+    expect(names).toHaveLength(1);
+    return path.join(cacheDirectory(d), names[0]!);
+  }
+  async function cacheRecord(file: string): Promise<JsonObject> {
+    const value: JsonValue = JSON.parse(await fs.readFile(file, "utf8"));
+    if (!jsonObject(value)) throw new Error("fixture cache is not an object");
+    return value;
+  }
+
+  test("ordinary warm hit is one resolver and identity comparison ignores JSON key order", async () => {
+    const d = await fixture();
+    try {
+      const cold = spyOn(childProcess, "spawnSync");
+      try {
+        expect(matcher(d).ignores("a.secret")).toBe(false);
+        expect(cold.mock.calls.map((call) => call[1]?.slice(6))).toEqual([
+          ["rev-parse", "--git-path", "index"],
+          ["rev-parse", "--shared-index-path"],
+          ["ls-files", "-z", "--cached"]
+        ]);
+      } finally {
+        cold.mockRestore();
+      }
+      const file = await cacheFile(d);
+      const record = await cacheRecord(file);
+      if (!jsonObject(record.identity)) throw new Error("fixture identity is not an object");
+      const stat = await fs.stat(path.join(d, ".git", "index"), { bigint: true });
+      expect(record.identity).toEqual({
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+        size: String(stat.size),
+        mtimeNs: String(stat.mtimeNs),
+        ctimeNs: String(stat.ctimeNs)
+      });
+      record.identity = Object.fromEntries(Object.entries(record.identity).reverse());
+      await fs.writeFile(file, JSON.stringify(record));
+      const warm = spyOn(childProcess, "spawnSync");
+      try {
+        expect(matcher(d).ignores("a.secret")).toBe(false);
+        expect(warm.mock.calls.map((call) => call[1]?.slice(6))).toEqual([["rev-parse", "--git-path", "index"]]);
+      } finally {
+        warm.mockRestore();
+      }
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("valid v1 is freshly enumerated and replaced with v2", async () => {
+    const d = await fixture();
+    try {
+      matcher(d);
+      const file = await cacheFile(d);
+      const index = path.join(d, ".git", "index");
+      const stat = await fs.stat(index);
+      await fs.writeFile(
+        file,
+        JSON.stringify({ version: 1, indexPath: index, mtimeMs: stat.mtimeMs, size: stat.size, paths: ["b.secret"] })
+      );
+      const result = matcher(d);
+      expect(result.ignores("a.secret")).toBe(false);
+      expect(result.ignores("b.secret")).toBe(true);
+      expect((await cacheRecord(file)).version).toBe(2);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  const malformed: Array<[string, (record: JsonObject) => JsonObject]> = [
+    ["malformed v1 is not a migration miss", (r) => ({ ...r, version: 1, paths: [9] })],
+    ["v1 missing timestamps is not a migration miss", (r) => ({ ...r, version: 1 })],
+    ["bad paths cannot hide behind a changed indexPath", (r) => ({ ...r, indexPath: "/different/index", paths: [false] })],
+    ["missing identity is corrupt rather than stale", (r) => ({ ...r, identity: null })],
+    [
+      "numeric identity cannot be coerced into text",
+      (r) => ({ ...r, identity: { dev: 1, ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" } })
+    ],
+    [
+      "noncanonical identity cannot be coerced into a match",
+      (r) => ({ ...r, identity: { dev: "01", ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" } })
+    ],
+    ["unknown dependency is corrupt rather than a miss", (r) => ({ ...r, dependency: "shared" })],
+    ["future version remains unavailable and is not overwritten", (r) => ({ ...r, version: 99 })]
+  ];
+  test.each(malformed)("%s", async (_name, change) => {
+    const d = await fixture();
+    try {
+      matcher(d);
+      const file = await cacheFile(d);
+      const bytes = JSON.stringify(change(await cacheRecord(file)));
+      await fs.writeFile(file, bytes);
+      const calls = spyOn(childProcess, "spawnSync");
+      try {
+        const result = matcher(d);
+        expect(result.unevaluatedGitRepoForPath?.("b.secret")).toBe(".");
+        expect(result.ignores("a.secret")).toBe(false);
+        expect(result.ignores("b.secret")).toBe(false);
+        expect(calls.mock.calls.map((call) => call[1]?.slice(6))).toEqual([["rev-parse", "--git-path", "index"]]);
+      } finally {
+        calls.mockRestore();
+      }
+      expect(await fs.readFile(file, "utf8")).toBe(bytes);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("unreadable cache and nonregular main index preserve unavailable trackedness", async () => {
+    const d = await fixture();
+    try {
+      matcher(d);
+      const file = await cacheFile(d);
+      await fs.rm(file);
+      await fs.mkdir(file);
+      expect(matcher(d).unevaluatedGitRepoForPath?.("b.secret")).toBe(".");
+      await fs.rm(path.join(d, ".git", "index"));
+      await fs.mkdir(path.join(d, ".git", "index"));
+      expect(matcher(d).unevaluatedGitRepoForPath?.("b.secret")).toBe(".");
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("split evaluations stay fresh and uncached, including split-to-ordinary transition", async () => {
+    const d = await fixture();
+    try {
+      await git(d, "update-index", "--split-index");
+      const calls = spyOn(childProcess, "spawnSync");
+      try {
+        expect(matcher(d).ignores("a.secret")).toBe(false);
+        expect(matcher(d).ignores("a.secret")).toBe(false);
+        expect(calls.mock.calls.filter((call) => call[1]?.[6] === "ls-files")).toHaveLength(2);
+      } finally {
+        calls.mockRestore();
+      }
+      expect(
+        await fs.access(cacheDirectory(d)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+      await git(d, "-c", "core.splitIndex=true", "add", "-f", "b.secret");
+      expect(matcher(d).ignores("b.secret")).toBe(false);
+      expect(
+        await fs.access(cacheDirectory(d)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+      await git(d, "update-index", "--no-split-index");
+      expect(matcher(d).ignores("b.secret")).toBe(false);
+      expect((await cacheRecord(await cacheFile(d))).dependency).toBe("none");
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("configured split=false cannot hide an actual split dependency or invoke a monitor hook", async () => {
+    const d = await fixture();
+    try {
+      await git(d, "update-index", "--split-index");
+      const shared = path.resolve(d, await git(d, ...readArgs, "rev-parse", "--shared-index-path"));
+      expect(path.basename(shared)).toMatch(/^sharedindex\.[0-9a-f]{40}$/);
+      expect(path.basename(shared)).not.toMatch(/\.0{40}$/);
+      expect((await fs.stat(shared)).isFile()).toBe(true);
+      const invoked = path.join(d, "monitor-invoked");
+      const hook = path.join(d, "monitor-hook");
+      await fs.writeFile(hook, '#!/bin/sh\ntouch "$(dirname "$0")/monitor-invoked"\n');
+      await fs.chmod(hook, 0o755);
+      await git(d, "config", "core.fsmonitor", hook);
+      expect(await git(d, "config", "core.splitIndex")).toBe("false");
+      const index = path.join(d, ".git", "index");
+      const before = await fs.readFile(index);
+      const result = matcher(d);
+      expect(result.ignores("a.secret")).toBe(false);
+      expect(result.ignores("b.secret")).toBe(true);
+      expect(await fs.readFile(index)).toEqual(before);
+      expect(
+        await fs.access(invoked).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+      expect(
+        await fs.access(cacheDirectory(d)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("unexpected shared-index output cannot authorize trackedness or a cache write", async () => {
+    const d = await fixture();
+    try {
+      const run = childProcess.spawnSync;
+      const calls = spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+        const result = run(command, args, options);
+        return args?.[7] === "--shared-index-path" ? { ...result, stdout: ".git/unexpected\n" } : result;
+      });
+      try {
+        const result = matcher(d);
+        expect(result.unevaluatedGitRepoForPath?.("a.secret")).toBe(".");
+        expect(result.ignores("a.secret")).toBe(false);
+        expect(calls.mock.calls.filter((call) => call[1]?.[6] === "ls-files")).toHaveLength(0);
+        expect(
+          await fs.access(cacheDirectory(d)).then(
+            () => true,
+            () => false
+          )
+        ).toBe(false);
+      } finally {
+        calls.mockRestore();
+      }
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("ordinary-to-split bypass leaves the old cache unused and missing dependency unavailable", async () => {
+    const d = await fixture();
+    try {
+      matcher(d);
+      const file = await cacheFile(d);
+      const original = await fs.readFile(file, "utf8");
+      await git(d, "update-index", "--split-index");
+      await git(d, "-c", "core.splitIndex=true", "add", "-f", "b.secret");
+      expect(matcher(d).ignores("b.secret")).toBe(false);
+      expect(await fs.readFile(file, "utf8")).toBe(original);
+      const shared = path.resolve(d, await git(d, ...readArgs, "rev-parse", "--shared-index-path"));
+      await fs.rm(shared);
+      expect(matcher(d).unevaluatedGitRepoForPath?.("b.secret")).toBe(".");
+      expect(await fs.readFile(file, "utf8")).toBe(original);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test.each([false, true])("source churn gets one bounded retry (continuous=%s)", async (continuous) => {
+    const d = await fixture();
+    try {
+      const index = path.join(d, ".git", "index");
+      const replacement = path.join(d, "replacement-index");
+      await exec("git", ["-C", d, "add", "-f", "b.secret"], { env: { ...process.env, GIT_INDEX_FILE: replacement } });
+      const bytes = await fs.readFile(replacement);
+      const run = childProcess.spawnSync;
+      let enumerations = 0;
+      const calls = spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+        const result = run(command, args, options);
+        if (args?.[6] === "ls-files") {
+          enumerations++;
+          if (continuous || enumerations === 1) {
+            syncFs.writeFileSync(index, bytes);
+            syncFs.utimesSync(index, 1577836800, 1577836800 + enumerations);
+          }
+        }
+        return result;
+      });
+      try {
+        const result = matcher(d);
+        expect(enumerations).toBe(2);
+        expect(calls.mock.calls.filter((call) => call[1]?.[7] === "--git-path")).toHaveLength(2);
+        if (continuous) {
+          expect(result.unevaluatedGitRepoForPath?.("b.secret")).toBe(".");
+          expect(result.ignores("b.secret")).toBe(false);
+          expect(
+            await fs.access(cacheDirectory(d)).then(
+              () => true,
+              () => false
+            )
+          ).toBe(false);
+        } else {
+          expect(result.ignores("a.secret")).toBe(true);
+          expect(result.ignores("b.secret")).toBe(false);
+          expect((await cacheRecord(await cacheFile(d))).paths).toEqual(["b.secret"]);
+        }
+      } finally {
+        calls.mockRestore();
+      }
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("an index replacement during a warm cache read retries before returning names", async () => {
+    const d = await fixture();
+    try {
+      matcher(d);
+      const file = await cacheFile(d);
+      const index = path.join(d, ".git", "index");
+      const replacement = path.join(d, "replacement-index");
+      await exec("git", ["-C", d, "add", "-f", "b.secret"], { env: { ...process.env, GIT_INDEX_FILE: replacement } });
+      const bytes = await fs.readFile(replacement);
+      const read = syncFs.readFileSync;
+      let injected = false;
+      const cacheRead = spyOn(syncFs, "readFileSync").mockImplementation((name, options) => {
+        const result = read(name, options);
+        if (name === file && !injected) {
+          injected = true;
+          syncFs.writeFileSync(index, bytes);
+          syncFs.utimesSync(index, 1577836800, 1577836800);
+        }
+        return result;
+      });
+      const calls = spyOn(childProcess, "spawnSync");
+      try {
+        const result = matcher(d);
+        expect(injected).toBe(true);
+        expect(result.ignores("a.secret")).toBe(true);
+        expect(result.ignores("b.secret")).toBe(false);
+        expect(calls.mock.calls.filter((call) => call[1]?.[7] === "--git-path")).toHaveLength(2);
+        expect(calls.mock.calls.filter((call) => call[1]?.[6] === "ls-files")).toHaveLength(1);
+      } finally {
+        cacheRead.mockRestore();
+        calls.mockRestore();
+      }
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("failed cache rename cleans the owned temp and keeps fresh trackedness", async () => {
+    const d = await fixture();
+    try {
+      const rename = spyOn(syncFs, "renameSync").mockImplementation(() => {
+        throw new Error("injected cache rename failure");
+      });
+      try {
+        expect(matcher(d).ignores("a.secret")).toBe(false);
+        expect(matcher(d).ignores("b.secret")).toBe(true);
+      } finally {
+        rename.mockRestore();
+      }
+      expect(await fs.readdir(cacheDirectory(d))).toEqual([]);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("split trackedness needs no writable Git directory", async () => {
+    const d = await fixture();
+    const gitDir = path.join(d, ".git");
+    try {
+      await git(d, "update-index", "--split-index");
+      const shared = path.resolve(d, await git(d, ...readArgs, "rev-parse", "--shared-index-path"));
+      const names = (await fs.readdir(gitDir)).sort();
+      await fs.chmod(path.join(gitDir, "index"), 0o444);
+      await fs.chmod(shared, 0o444);
+      await fs.chmod(gitDir, 0o555);
+      expect(matcher(d).ignores("a.secret")).toBe(false);
+      expect(matcher(d).ignores("b.secret")).toBe(true);
+      expect((await fs.readdir(gitDir)).sort()).toEqual(names);
+      expect(
+        await fs.access(cacheDirectory(d)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await fs.chmod(gitDir, 0o755);
+      await fs.rm(d, { recursive: true, force: true });
+    }
   });
 });

@@ -1,0 +1,18 @@
+{
+  "model": "claude-fable-5-1",
+  "review_scope": "Supplied source and execution-evidence text only; parent separately reviewed actual source movement",
+  "formal_round": 3,
+  "result": {
+    "verdict": "ALIGNED",
+    "findings": [
+      "Ownership boundary correct: tracked-repo.ts imports only Node primitives and ../json.js; never imports ignore.ts, matcher, or CLI modules. ignore.ts imports exactly loadTrackedRepoSet and type TrackedRepoSet; dropped crypto/spawnSync imports with clean typecheck/oxlint.",
+      "Only the existing operation and result type are exported; safeStat, gitOutput, cache path/read/write, prefix construction, and identity types remain module-private. No new public phases, flags, modes, or state files.",
+      "Contract preserved: loadTrackedRepoSet(root, relPath, known) signature, TrackedRepoSet fields, mutable Set representation, and synchronous call boundary unchanged.",
+      "Round-2 invariants present in extracted body: warm=1 git call, cold/split=3, split never cached, fsmonitor pinned off, single complete retry with post-observation identity recheck, v1 well-formed -> miss (migration), malformed/future -> corrupt -> unavailable with no overwrite, wx temp with ownedTemp-gated cleanup, unborn-HEAD empty-set vs deleted-index unreadable classification.",
+      "Size gate satisfied: tracked-repo.ts 188 lines / 8,918 bytes under unexcepted 400/25KiB; ignore ratchet tightened 734/33,445 -> 676/31,292 (10% tolerance explains prior 807/36,789 effective limit); no new exception or ceiling raise. Evidence: 70/0 focused suite, 6/0 module-size gate, git diff --check clean.",
+      "Non-blocking: supplied ignore.ts diff is against the pre-291 (v1) baseline, so byte-level preservation of the round-2 body is evidenced by the passing invariant tests and the parent's independent source-movement review rather than by the diff itself.",
+      "Non-blocking cosmetic: removing the TrackedRepoSet interface leaves two consecutive blank lines before `type RuleDecision` in ignore.ts; acceptable given the explicit decision not to reformat the old file.",
+      "Non-blocking: gitOutput now calls childProcess.spawnSync via the default-import namespace, which is what keeps existing child-process spies effective at call time; do not later 'simplify' back to a bound named import."
+    ]
+  }
+}
