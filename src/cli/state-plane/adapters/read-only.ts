@@ -30,11 +30,15 @@ function collectGit(snapshot: ReadSnapshot, role: "meta-wire" | "manifest-projec
 }
 
 function materializeManifest(snapshot: ReadSnapshot, plane: Plane, reuseFiles?: readonly FileEntry[]): Manifest {
-  const files: FileEntry[] = reuseFiles ? [...reuseFiles] : [];
+  // Reused by IDENTITY, not copied: loaded states are never mutated in place
+  // (design 277's precondition, freeze-swept), and the shared array is what
+  // lets the elision audit (design 303) recognise an unchanged manifest.
+  const paged: FileEntry[] = [];
+  const files: readonly FileEntry[] = reuseFiles ?? paged;
   let after: string | undefined;
   while (!reuseFiles) {
     const page = snapshot.files(plane, after, 512);
-    files.push(...page.rows);
+    paged.push(...page.rows);
     if (page.done) break;
     after = page.after;
   }
