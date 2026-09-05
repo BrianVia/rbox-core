@@ -7,6 +7,7 @@
  * deciding elision.
  */
 import { fullyElidedPacket } from "../../sync-state-elision.js";
+import type { FileEntry } from "../../../engine/types.js";
 import type { StateSavePacket, StateSaveResult, SyncState } from "../../sync-state-model.js";
 import type { CasRejectionReason, CasResult } from "../ports.js";
 import type { StateStoreHandle } from "../store/open.js";
@@ -39,6 +40,13 @@ export const LEGACY_REJECTION_REASON = {
  * holds, so the adapter re-derives its precondition from the packet it just
  * applied rather than trusting that the caller only offers one when it may: a
  * packet that carried any section wrote something the projection cannot know.
+ *
+ * Design 301 narrows what a global-free packet may reuse to the ONE thing it
+ * provably did not touch: the base plane's file rows. Repo records are still
+ * read back (the store recomposes bases against prior provenance, so a
+ * projection of them is not trustworthy), and the reuse is bound to the CAS
+ * token being exactly one revision past the snapshot's — every accepted CAS
+ * bumps `state_revision` by one, so anything else means the snapshot was stale.
  */
 export function translateCasResult(
   result: CasResult,
@@ -53,7 +61,7 @@ export function translateCasResult(
         status: "accepted",
         state: acceptedProjection !== undefined && fullyElidedPacket(packet)
           ? facade.projectAcceptedSavePacket(acceptedProjection, result.token)
-          : facade.loadRawStateFromStore(store),
+          : facade.loadRawStateFromStore(store, untouchedBaseFiles(packet, result.token, acceptedProjection)),
       };
     case "rejected":
       try {
@@ -73,4 +81,14 @@ export function translateCasResult(
     case "unsupported":
       return result;
   }
+}
+
+function untouchedBaseFiles(
+  packet: StateSavePacket,
+  token: { stateRevision?: number },
+  projection?: SyncState,
+): { baseFiles: readonly FileEntry[] } | undefined {
+  if (projection === undefined || packet.global !== undefined) return undefined;
+  if (projection.stateRevision === undefined || token.stateRevision !== projection.stateRevision + 1) return undefined;
+  return { baseFiles: projection.lastSyncedManifest.files };
 }

@@ -424,7 +424,10 @@ export async function saveStateSource(
     let applyMs = 0;
     let result: Awaited<ReturnType<typeof apply>>;
     try {
-      result = await apply(root, packet, fullyElidedPacket(packet) ? { acceptedProjection: snapshot } : {});
+      // Design 301: a global-free packet left the manifest untouched, so the
+      // adapter may reuse the snapshot's files instead of re-materializing
+      // 198K entries; repo records are still read back from the store.
+      result = await apply(root, packet, packet.global === undefined ? { acceptedProjection: snapshot } : {});
     } finally {
       applyMs = performance.now() - applyStartedAt;
       if (!slowLogged && composeMs + applyMs > STATE_SAVE_SLOW_MS) {
