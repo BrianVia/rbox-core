@@ -115,9 +115,10 @@
   delete the peer's branch). Gaps: (1) `rbox git resolve` does not surface
   standing CREATE-P receipts ("no deferred incoming Git state"), so the user
   cannot land (take-theirs) or discard them; (2) with 309 the witness now
-  pays the full artifact scan every push again (`carried≈1.4s`), so a
-  standing-artifacts backoff keyed on the ref-plane fingerprint is the next
-  perf slice (design 311). **Founder decision needed (design 310):** a manual
+  pays the full artifact scan every push again (`carried≈1.4s`), so
+  **#904 OPEN (design 311)** remembers an `(artifacts-standing)` refusal per
+  repo under a token of the `refs/rbox-local` plane + missing set and skips
+  the scan while it is unchanged. **Founder decision needed (design 310):** a manual
   verb to discard standing CREATE-P receipts (`rbox git resolve <repo>
   discard-incoming --confirm`) vs landing them (take-theirs, which re-creates
   the 206 branches locally so a second local delete records pull-p origins). Then the other
