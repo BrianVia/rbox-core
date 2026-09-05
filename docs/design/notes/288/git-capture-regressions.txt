@@ -1,0 +1,82 @@
+bun test v1.3.14 (0d9b296a)
+
+src/cli/sync-git/capture-identity.test.ts:
+993 |   if (!isURLInstance(fileURLOrPath))
+994 |     return fileURLOrPath;
+995 |   return Bun.fileURLToPath(fileURLOrPath);
+996 | }
+997 | var { Error, TypeError } = globalThis;
+998 |   let err = new Error(message);
+                  ^
+error: Command failed: git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-g7TF41/B ls-files --stage -z
+fatal: .git/sharedindex.76d244ae5089bdf428c795b58c71263f5a15729e: index file open failed: No such file or directory
+
+   code: 128,
+ killed: false,
+ signal: null,
+    cmd: "git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-g7TF41/B ls-files --stage -z",
+ stdout: "",
+ stderr: "fatal: .git/sharedindex.76d244ae5089bdf428c795b58c71263f5a15729e: index file open failed: No such file or directory\n",
+
+      at genericNodeError (node:child_process:998:13)
+      at exitHandler (node:child_process:103:28)
+      at emit (node:events:98:22)
+      at #maybeClose (node:child_process:766:16)
+      at #handleOnExit (node:child_process:520:72)
+(fail) design 288: captured split index is self-contained in an independent repository [749.49ms]
+237 |   expect(section).toBeDefined();
+238 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+239 |   // B starts without .git or any source objects/index dependencies.
+240 |   const result = await applyGitState(B, section!, store, KEK);
+241 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+242 |   expect(result).toEqual(expect.objectContaining({ applied: true }));
+                       ^
+error: expect(received).toEqual(expected)
+
+- ObjectContaining
+  {
+-   "applied": true,
++   "applied": false,
++   "conflictBundle": undefined,
++   "filteredRefs": undefined,
++   "reason":
++ "apply failed — rolled back: Command failed: git -C /var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-fTBRV6/B update-index --clear-resolve-undo
++ fatal: /private/var/folders/_h/s7l5pld53tvc9y1gfbcp68_w0000gn/T/rbox-gs-fTBRV6/B/.git/sharedindex.6050bad1032c4a1d6f5fc1060aa7020f1c3e6b44: index file open failed: No such file or directory
++ "
++ ,
+  }
+
+- Expected  - 2
++ Received  + 8
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/capture-identity.test.ts:242:18)
+(fail) design 288: split-index capture applies to a fresh receiver without changing source staging [933.30ms]
+267 |   const section = await captureGitState(A, store, KEK);
+268 |   expect(section).toBeDefined();
+269 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+270 |   const result = await applyGitState(B, section!, store, KEK);
+271 |   expectSameIndexSnapshot(await indexSnapshot(A), before);
+272 |   expect(result).toEqual(expect.objectContaining({ applied: true }));
+                       ^
+error: expect(received).toEqual(expected)
+
+- ObjectContaining
+  {
+-   "applied": true,
++   "applied": false,
++   "conflictBundle": undefined,
++   "filteredRefs": undefined,
++   "reason": "post-apply fsck failed — rolled back",
+  }
+
+- Expected  - 2
++ Received  + 4
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/sync-git/capture-identity.test.ts:272:18)
+(fail) design 288: ordinary capture carries every unmerged stage-only blob to a fresh receiver [854.06ms]
+
+ 0 pass
+ 24 filtered out
+ 3 fail
+ 50 expect() calls
+Ran 3 tests across 1 file. [2.58s]

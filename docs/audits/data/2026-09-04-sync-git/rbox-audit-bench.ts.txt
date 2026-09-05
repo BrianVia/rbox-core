@@ -1,0 +1,22 @@
+import { serializeRefset, parseRefset } from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/refset.ts';
+import { canonicalManifestHashStreaming, encodeDeltaEnvelope, decodeEnvelope, foldDelta } from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/manifest-delta.ts';
+import type { Manifest } from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/types.ts';
+const hex=(n:number)=>n.toString(16).padStart(64,'0');
+const med=(v:number[])=>v.sort((a,b)=>a-b)[Math.floor(v.length/2)];
+for(const n of [1000,10000,124000]){
+ const base:Manifest={generatedAt:'base', manifestSchema:4, files:Array.from({length:n},(_,i)=>({path:`f${String(i).padStart(7,'0')}`,type:'file',size:100,mode:420,mtimeMs:1900000000000,sha256:hex(i+1),encSha:hex(i+200000),payloadSha:hex(i+400000),comp:'zstd',cipherSize:128}))};
+ const target={...base,generatedAt:'target',files:base.files.map((f,i)=>i===Math.floor(n/2)?{...f,sha256:hex(900000),encSha:hex(900001)}:f)};
+ const refs=base.files.map(f=>({encSha:f.encSha!,size:f.cipherSize!}));
+ const results=[];
+ for(let trial=0;trial<4;trial++){
+  let start=performance.now();const h=canonicalManifestHashStreaming(base);const hashMs=performance.now()-start;
+  start=performance.now();const bytes=serializeRefset(refs);const serializeMs=performance.now()-start;
+  start=performance.now();parseRefset(bytes);const parseMs=performance.now()-start;
+  start=performance.now();const e=await encodeDeltaEnvelope(base,target,{baseEncSha:'a'.repeat(64),baseManifestHash:h,compress:false});const encodeMs=performance.now()-start;
+  const d=await decodeEnvelope(e.bytes);if(d.kind!=='delta')throw Error('not delta');
+  start=performance.now();const folded=foldDelta(base,d.ops,d.header,h);const foldMs=performance.now()-start;
+  if(folded.files[Math.floor(n/2)].sha256!==hex(900000))throw Error('wrong');
+  if(trial>0)results.push({hashMs,serializeMs,parseMs,encodeMs,foldMs});
+  if(trial===3)console.log(JSON.stringify({n,refsetBytes:bytes.length,deltaBytes:e.bytes.length,median:Object.fromEntries(Object.keys(results[0]).map(k=>[k,Math.round(med(results.map(r=>r[k]))*10)/10]))}));
+ }
+}

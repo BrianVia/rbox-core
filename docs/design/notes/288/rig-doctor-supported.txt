@@ -1,0 +1,12 @@
+$ bun scripts/rig/rig.ts doctor
+✓ macOS >= 26: 26.6.2
+✓ arch arm64: arm64
+✓ container CLI present: container CLI version 1.0.0 (build: release, commit: unspeci)
+✓ container system running: healthy
+✓ runs/cache disk headroom: 105 GiB · 105 GiB
+✓ bun present: 1.4.0
+✓ bootstrap secret resolvable: found (redacted)
+✓ platform secret resolvable: found (redacted)
+✓ dev API reachable: https://rbox-dev-api.brian-via.workers.dev/health → 200
+○ CLOUDFLARE_ACCOUNT_ID (optional, AE query): present
+○ CLOUDFLARE_API_TOKEN (optional, AE query): present

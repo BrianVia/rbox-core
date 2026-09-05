@@ -1,0 +1,9 @@
+# Design 288 — regression-slice review round 1
+
+GPT/local review: the new tests use actual encrypted capture artifacts and independent repository directories. They assert desired staging preservation and successful apply rather than the observed defect. The initial executed run reproduced missing shared-index dependencies in both direct artifact reading and fresh-receiver apply, and missing conflict-stage object closure in post-apply fsck. Source index immutability checks passed before those failures. No product algorithm changed.
+
+Fixture review requested explicit alternate-object environment isolation; that correction is complete. The final targeted rerun reproduced the same three intended failures in 2.58 seconds with 50 assertions and no setup/lock failure. Exact commands/results and lint limitations are recorded under `docs/design/notes/288/`. These are intentionally red tests awaiting the subsequent fix, not green implementation validation. Bun 1.3.14 remains below the supported version.
+
+Cross-model review: Claude Fable5.1 completed with `--effort medium` after the user reauthenticated. The CLI confirmed `claude-fable-5-1` model usage. Round1 verdict: CHANGES REQUIRED on the regression specification. Full feedback: `docs/design/notes/288/fable51-medium-round1.md`. Several requested fixture properties already existed in the unseen test source; the design now states them explicitly. Remaining useful improvements are nontrivial split deltas, shared-index immutability, and stronger isolation/preconditions. These remain regression-only changes. Round2 will review the clarified design and executed evidence; no product implementation agreement is claimed.
+
+The globally installed `codex` CLI also failed its help invocation because its optional Darwin-arm64 executable dependency is missing. The repository's later `codex exec` implementation step needs a functioning executable; no global installation was changed during this worktree setup.

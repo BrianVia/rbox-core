@@ -1,0 +1,540 @@
+# 287 — Change-proportional sync and complete Git worktree state
+
+Status: **FIRST WAVE AUTHORIZED; G1 REGRESSION WORK STARTED.** Original audit basis: `3c78a055a`. Execution baseline: freshly fetched `origin/main` at `c4aa22bbb81c8754230735a73c5a58a28a64b4f7`, tagged `pre-astra-changes` on September 5. Design renumbered 281→287 because latest main already uses 281. Previously shipped work must be reconciled before each package starts. No production changes, feature retirement, new wire format activation, or blanket approval of experiments is implied by this document. The source is `plans/sync-git-improvements/plan.mdx`; Markdown and HTML review copies are generated from it. Package IDs remain stable across revisions.
+
+A representative outcome: create a new agent worktree, stage part of a change, enter a merge conflict, and continue on another device. The receiver obtains a complete checkout snapshot, reuses available file/history bytes, and preserves each sibling's independent staging. Later removing a thousand generated files does one affected-path pass, while an unrelated single-file edit transfers small metadata instead of a full-workspace refset.
+
+The program has two goals: **portable, recoverable Git state** and **cost proportional to the actual change**. It preserves the current supported file/Git behavior, encryption, state authority, and recovery paths. It improves the existing modules; it does not introduce a second sync engine.
+
+## How to execute this plan
+
+- **Fix** means a source-grounded bounded change with a proposed algorithm and regression matrix. Its focused specification must settle any named uncertainty before implementation; this roadmap alone does not certify every slice ready.
+- **Design gate** means the package identifies a proposed shape and migration strategy, but a focused state-machine/wire specification and the named product decision must be closed before durable format changes.
+- **Experiment** means implement an isolated prototype/harness only; no default behavior or production protocol changes until its explicit success criterion is met.
+- Acceptance targets below are proposed release gates, not measurements already achieved. Historical/local measurements remain labeled as such in the audit.
+- Each sub-PR uses a worktree, the package's scoped design supplement if needed, at most three review rounds, and one executed-code/test review round. If round three leaves a substantive conflict, reframe or request a product decision; do not add a fourth review round.
+- Historical planning probes used Bun 1.3.14. Implementation validation uses the supported Bun 1.4.0 runtime; compiled CLI/rig acceptance remains a separate gate.
+
+Read `docs/audits/2026-09-04-sync-git-performance-review.md` for reproductions and measured evidence, `CONTEXT.md` for authority terminology, and `docs/DEPLOYMENTS.md` before any API deployment. Earlier proposals are useful evidence but do not override current source. State memoization, delta saves, trusted pulls, incremental Git bundles, small-blob packing, and held-defer skipping already exist and remain protected.
+
+## Current-main reconciliation and execution status
+
+September 5 baseline `c4aa22bbb` already includes F3 matcher-provider/daemon-dircache plumbing, F4 encryption-address SQLite migration, G5 ref-deletion batching and sender account-refresh prefetch. Those portions are complete in main and must not be reimplemented. Their historical package descriptions below remain design context; the current-source reconciliation in `docs/design/notes/288/baseline-reconciliation.md` takes precedence for execution scope. F1 cache freshness, F2 deletion amplification, G5 ancestry batching and S1 scheduling recovery remain open.
+
+Design288 began with three failing regression tests on this baseline: split-index artifact isolation, split-index fresh-receiver apply, and ordinary unmerged stage-only object closure. Claude Fable5.1 at medium effort aligned on the regression specification in round2. Local implementations now exist in designs289 (portable capture),290 (deletion batching), and291 (tracked-index cache freshness). Their focused tests and configured-index, corruption and compatibility checks pass under Bun1.4.0; final scoped reviews are ALIGNED, and the final compiled DEV Git-entanglement rig passed 111 assertions. Broad local-suite failures and baseline comparisons are documented separately; GitHub CI remains the merge gate. Design290 also passed DEV source-mode type-flip and mass-delete-guard scenarios. Its consecutive-absence benchmark improved42–52×; that is not an end-to-end sync speed claim. Current review and validation results belong in the numbered design notes, not this historical roadmap.
+
+## Package map and order
+
+| Wave | Packages | Outcome | Dependency / release boundary |
+|---|---|---|---|
+| 0 | B0 | Frozen regressions, corpus and measurements | All packages reuse this evidence; no live changes |
+| 1 | G1, G2, G3, G4 local-env portion, F1 | Complete Git snapshots and reliable observation | Correctness before extending cache lifetime or worktree semantics |
+| 2 | F2, G5, S1, S2, S3 | Measured local speed and bounded recovery/maintenance | Separate Git/file/API/state PRs; S2 migration gate independent |
+| 3 | F3, F4, F5, F6 | Remove repeated scans/cache writes/transfers and bound preparation | F3 after F1; F5 through existing apply guard; F6 streaming/cancellation gates |
+| 4 | G6, scoped G7 decisions | Shared repository plus independent checkout state | G6 observation can start now; publication requires complete roots, safe parsing/environment and exact topology/conflict design; G5 is a performance input |
+| 5 | S4, S5 | Fewer serialized requests and small refset changes | S1 recovery; S3 where replay is involved; S4/S5 can progress independently; authenticated freshness and root/GC gates remain mandatory |
+| 6 | F7, X1, X2, X3, X4, S6 | Workload-specific scale experiments | Run only when B0 shows corresponding bottleneck and prerequisite gates pass |
+
+Waves describe default priority, not a single serial dependency chain: safe independent fixes can ship before the larger architecture is agreed. Never combine a wire migration, SQLite migration, and worktree reconstruction in one PR. Shared-file changes are rebased/integrated sequentially even when their analysis was parallel.
+
+**Recommended first implementation cut:** G1 complete index snapshots/object closure with identity convergence, F1 index-cache identity, F2 deletion batching, and G5 ancestry batching as independently reviewable changes. S1 is an independent server reliability cut. G1's normalization writer cannot activate before matching identity derivation and compatibility are proven. These produce useful progress without waiting for new wire or topology semantics.
+
+**Readiness by slice:** B0 is a harness; G2/G3/G4/G5/F1/F2a-b/F3/F5/F6/S3 and S4a-b are bounded Fix candidates. G1's raw-unmerged identity and normalization release, F2c ownership, F4 cache schema/location, S1 alarm recovery primitive, S2 schema/index installation, and S4c-d authentication/freshness require focused design closure. G6/S5 are Design gates. G7/F7/S6/X2/X3/X4 are Experiments followed by conditional Design gates; X1a-b are current-format optimizations and X1c is a protocol experiment. No item is already implemented by this document.
+
+**Dependency vocabulary:** a hard dependency is required for correctness or an experiment's admission; a measurement input informs priority without blocking independent work; rollout coordination prevents incompatible publication across packages. Default hard dependency is B0 plus the package's own red fixtures. F3 needs F1 freshness; cross-checkout deployment needs G6, but read-only store observations do not. S5 does not need rich WS delivery; X1a-b do not need the SQLite cache migration; standalone X3 inventory/compaction experiments do not need portable topology. Detailed package gates override wave order.
+
+## Protected contract and ownership
+
+| Owner | Complete operations / responsibility | Must never own | Reuse / consolidation |
+|---|---|---|---|
+| LocalWorkspaceObserver | Observe changes, return trusted view and matcher from one observation generation | Network publication or Git mutations | Existing daemon watcher/matcher/trust logic; absorb duplicate pull observation work |
+| Git capture/graph owner | Capture complete artifacts and object roots; classify a batch against one graph observation | Local state CAS or arbitrary network policy | `capture.ts`, `reachability.ts`, native Git batches, fingerprint memo |
+| Git checkout/ref transaction owner | Apply/recover physical effects with expected-old evidence | Independent logical BASE authority | Existing checkout/ref journals, keep pins, quarantine and locks |
+| State plane | Lineage/nonce/generation, atomic checkpoint, indexed maintenance | Git effect orchestration or another remote head | Existing SQLite CAS, sealed artifacts, memo and delta save |
+| Verified byte staging | Obtain, decrypt/hash and stage bytes under bounded resources | Decide overwrite, conflicts, or sequence acceptance | Existing crypto/remote/apply staging and final apply guard |
+| WorkspaceSync | Accept the single remote sequence, retained roots, resumable maintenance | Plaintext interpretation or client merging | Existing DO head/transaction, admission fences, root index, wakeup channel |
+
+These are ownership directions, not mandates to create six new classes. Change a module's `Never:` header only when its responsibility changes. Narrow existing interfaces before adding wrappers; keep physical Git recovery and logical SQLite commit authority separate.
+
+Protect: supported commands/output semantics; full/scoped refs; independent checkout staging and in-progress states; E2EE/account-key scoping; signatures/rollback/fork checks; exact expected-local/expected-old guards; quarantine, recovery refs, trash/conflict retention; unreadable versus absent distinction; watcher distrust and full-scan recovery; mass-deletion guard; entitlement/quota/GC fences; current/old supported formats; bounded memory/FD/disk; active migrations and rollback switches.
+
+**Deletion policy:** this plan proves no production module dead. An old implementation can be removed after all callers are routed, differential gates pass, package/build/dynamic import/automation/docs inventories are checked, the deployed support window is closed, and an owner records the decision. An unused collector is incomplete maintenance, not dead functionality. Do not delete legacy journals or the optional pipeline because their names or old performance results look inconvenient.
+
+
+
+## B0 — Characterization, reproducible benchmarks and program acceptance
+
+**Type:** prerequisite/harness. **Owner:** existing rig and benchmark infrastructure. **Files reused:** `scripts/bench/state-plane.ts`, `scripts/bench-scan.ts`, `scripts/bench-bulk-scan.ts`, `scripts/rig/scenarios/{git-layouts,git-entanglement,worktree-squash-lifecycle,git-held-livelock,git-rebuild-settlement,git-commit-propagation}.ts`, `src/engine/phase-report.ts`, existing Git spawn observer, audit evidence under `docs/audits/data/2026-09-04-sync-git/`.
+
+1. Verify toolchain/runtime, clean baseline SHA and machine filesystem. Copy audit probes into proper regression/benchmark fixtures, replacing absolute imports and nonhermetic config assumptions. Do not install global runtime replacements as part of a test.
+2. Freeze four main corpora: 124k mixed developer files; one repo with 100 linked checkouts; 1k/10k deletion bursts with overlapping directories and recreation; large incompressible files with small overwrites/inserts. Add long commit history, cold receiver, damaged/missing Git objects, and 100 distinct repos for matcher tests.
+3. Establish correctness fixtures before optimizing: split and unmerged index roundtrip, same-size/restamped index replacement, newline worktree paths, post-accept alarm failure, and long local state churn. Use distinct source/receiver object stores and clean HOME-equivalent Git configuration in child processes.
+4. Count work as well as time: Git launches, traversed entries/refs, filesystem probes, serialized bytes, HTTP/WS request counts, fsyncs, live/orphan DB rows, temporary bytes, subprocess lifetimes. Instrument through existing metrics/test seams first; add a metric only with a named owner and bounded cardinality. Never export paths, object names, credentials or plaintext content.
+5. For microbenchmarks use five warmups and at least twenty samples, report median/p95 and sample variance. For end-to-end use repeated compiled-binary rig runs and correlate write-settled → accepted sequence → receiver applied sequence on monotonic clocks where possible. Report sender/receiver clocks separately; do not subtract unsynchronized clocks.
+6. Record historical numbers only as context. Compare candidate and baseline on the same runtime/host/corpus, and separate cold/warm, full/delta, transferred/changed bytes, total/phase time. A >10× phase result is never an automatic >10× sync result.
+
+**Acceptance:** every Fix package names an executable red regression or complexity bound, a preserved-behavior differential fixture and a relevant rig path. Missing compatible lock runtime is a blocked environment check, never grounds to weaken the lock or mark a test passing. Functional acceptance is exact; performance gates use a recorded tolerance and repeated-run decision. Default unrelated-path budget: no reproducible >10% p95 regression after noise investigation, no new unbounded memory/FD/disk term.
+
+**Delivery:** B0a fixture/source conversion; B0b phase/work counters; B0c baseline results. Harness changes should not alter default product behavior. Revert instrumented counters independently if they regress workload behavior; retain regression fixtures.
+
+
+## G1 — Portable index snapshots and complete captured object closure
+
+**Current owners.** `capture.ts:captureGitState`, `stagedIndexObjectOids`; `identity.ts:indexTreeOfPath`; `index-identity.ts:indexIdentityV2`; `pins.ts:collectPinShas/createScratchPins`; `git-state.ts:clearIndexResolveUndo`; `git-state-apply.ts:applyGitState`. Capture copies a split index without its shared dependency; stage-only roots are pinned only for resolution captures.
+
+**Algorithm and slices.**
+
+1. PR G1a adds failing cold-receiver fixtures for split indexes and ordinary unmerged stage-only blobs; assertions include actual encrypted/decrypted artifact, source index bytes, receiver index readability, repeated no-change convergence and rollback.
+2. Before any normalization writer ships, PR G1b characterizes the raw-unmerged identity path and ratifies the exact compatibility mechanism below. The private-index snapshot operation owns dependency materialization in existing capture-owned scratch, without requiring write access to the live Git directory. Copy an ordinary index into owned scratch; for a split index, stage its referenced shared-index dependencies there and prove that Git resolves those staged copies under the retained repository context. Bracket live index/dependency identities across capture and defer on instability. Normalize only the private copy with Git `update-index --no-split-index`, clear resolve-undo according to existing policy, then retain the standalone artifact under the existing scratch lifetime. Never alter live index/config or relax filesystem permissions. A sibling temporary copy is an optional optimization only where authorized and writable, not a prerequisite for reading a healthy index.
+3. Derive captured closure from that exact snapshot on every capture. For a merged index, include its tree; for an unmerged index, enumerate NUL-framed mode/OID/stage records, deduplicate nonzero OIDs and batch-verify appropriate object types. Sparse directory entries require tree closure; gitlinks refer to submodule commits and must not be mistaken for blobs that the superproject owns. Pin roots with the existing scratch namespace and include them in the bundle. Stash remains useful for existing dirty-state behavior, but is no longer staging completeness authority.
+4. PR G1c implements normalization and its compatible identity derivation as one activation unit. This is load-bearing: `indexTreeOfPath` currently uses a raw-index hash for unmerged state, so normalizing only the outgoing bytes can create endless recapture/divergence. Apply the same private normalization when deriving that fallback, or ratify a compatible semantic comparison using the existing V2 projection. Do not silently change the wire identity grammar. Disabled helper code may land earlier, but no normalized writer is enabled before deterministic capture/receiver identity, repeated no-change convergence and existing raw-index compatibility pass together. Object-root closure may ship separately only when it does not depend on the new normalization/identity behavior.
+
+**Protected semantics / gates.** Preserve staged content, executable modes, all conflict stages, ITA, assume-unchanged, skip-worktree, sparse-index behavior, detached/pseudo refs, source immutability, E2EE and rollback. Differential fixtures cover index v2/v3/v4, split+unmerged, changing shared dependency, ordinary/sparse tree closure, absent index, readable non-writable Git directories and owned-scratch failure. Prove the scratch index uses the intended staged split dependencies, not a source dependency accidentally still reachable. Crash after normalization, pin creation, bundling and artifact retention; none may publish an incomplete section. Old readers must consume normalized artifacts without new schema; old artifacts remain supported. Roll back the normalization writer and its paired identity behavior together only after old-reader convergence against emitted artifacts is proven; otherwise stop affected publication conservatively. Retain emitted standalone artifacts as valid inputs; no destructive data migration.
+
+**Acceptance.** Both reproductions sync to an empty separate receiver, run Git connectivity checks and converge on a second push/pull. No live index bytes change. Stage object verification/pinning is bounded in subprocess count, with no material regression for clean ordinary captures.
+
+**Unsolved choices.** Exact raw-unmerged identity compatibility mechanism and gitlink/submodule behavior require characterization, not an assumed new format.
+
+## G2 — NUL-safe worktree ownership parsing
+
+**Current owners.** `git-state.ts:parseWorktrees/listWorktreesStrict/listWorktrees`; `git-state-apply.ts:branchesCheckedOutElsewhereStrict`; `capture.ts:hasLiveLinkedWorktrees`.
+
+**Algorithm / PR.** G2a requests `git worktree list --porcelain -z`, parses NUL-framed fields and empty-record separators, preserves path bytes representable by the current string API, and validates required fields before producing authorizing evidence. Keep optional detached/bare/locked/prunable metadata distinct; unknown additive fields may be ignored, malformed structural records return unreadable. Consumers continue canonical self-path comparison and skip prunable ownership exactly as today. Reuse one parser in lossy and strict APIs; do not add a second path decoder. If the supported Git minimum lacks `-z`, choose an explicit version/capability refusal or a proven quoting parser; never silently reuse the broken newline path.
+
+**Tests / acceptance.** Real worktrees with newline, tab, quote, backslash, Unicode, spaces, canonical aliases, detached HEAD and prunable/locked entries; from every checkout, its own branch is absent from the sibling-owned map and other active sibling branches remain protected. Inject truncated output and subprocess failure: zero authorization from partial parsing. Regression test the known `/var` versus `/private/var` fixture by comparing realpaths, not relaxing product ownership checks. Parser fuzzing needs bounded records and malformed terminators. Current wire remains unchanged; no migration or crash journal change. Ship as one small fix with existing ownership safety tests; revert only with a fail-closed fallback for unusual paths.
+
+**Product question.** Decide whether non-UTF-8 filesystem names are supported end-to-end. This fix must not claim full arbitrary-byte path support while `gitRaw` decodes UTF-8 strings.
+
+## G3 — Admit supported Git object formats before capture
+
+**Current owners.** `preflight.ts:gitPreflight/gitRefStorage`; `git-state.ts:HEX40/ZERO_OID`; `engine/manifest-validate.ts:validateGitSection`; capture self-validation; `repo-capture-attempt.ts:RepoCaptureAttempt.classify`.
+
+**Algorithm / slices.** G3a resolves authoritative storage object format using Git's capability-supported plumbing and refuses non-SHA-1 with a concrete structural reason before stash, packing or upload. Distinguish unreadable/unsupported probe from a positive SHA-1 result. G3b carries the format/capability observation through the existing preflight/fingerprint cache; include its underlying config dependency/schema version so converting a repository invalidates previous admission. Reuse preflight refusal presentation rather than inventing another error channel.
+
+**Protected semantics.** Do not infer absence means SHA-1 after arbitrary probe failure. Keep SHA-1 and current old-Git compatibility intact. Structural refusal already has base-drop behavior: explicitly test how changing an existing synced repository's format affects base/pending/refusal state, and preserve remote/local recovery semantics. Never auto-convert the user's repository.
+
+**Gates / acceptance.** SHA-1 passes; SHA-256 emits actionable refusal with zero bundle/encryption/upload calls; unreadable config defers; a supported format restoration self-heals; cache transitions are tested. No new manifest field or reader gate is needed for early refusal. Old-client behavior remains unchanged, so mixed fleet documentation must acknowledge that only upgraded publishers improve admission. Roll back the admission change without deleting existing state. Broader SHA-256 support is G7, not part of this fix.
+
+**Product question.** Confirm the documented supported Git minimum and SHA-256 roadmap; do not prematurely freeze a new OID type/wire format.
+
+## G4 — Explicit Git environment policy and cancellable subprocesses
+
+**Current owners.** `engine/git-spawn.ts:cleanGitEnv/GitRunOptions/gitStatus/gitWithIndexFile`; `reachability.ts:graphEnv`; capture call sites; `keep-pins.ts:runUpdateRefTransaction` and its special stdin runner.
+
+**Algorithm / slices.**
+
+1. G4a inventory every Git spawn, repository-routing variable, trusted explicit override, and inherited configuration requirement. Remove inherited `GIT_ALTERNATE_OBJECT_DIRECTORIES` by default; characterize namespace, shallow/replace routing and injected config variables separately. Preserve ordinary user config, Git identity, executable selection, credential integration and intentional `GIT_INDEX_FILE` overrides. All spawn lanes use one base policy. An allowlist for routing overrides is preferable to globally dropping all `GIT_*` variables.
+2. G4b add AbortSignal/deadline support to the existing runner, including buffered, streamed, stdin and private-index lanes. On cancellation stop accepting work, signal the actual child, escalate after bounded grace, await exit and pipe drain, then release stdin/temp resources. Preserve exact failure causes and output bounds; distinguish cancellation from authoritative Git absence. Test helper/descendant behavior on supported platforms before claiming process-tree cancellation.
+3. G4c wire cancellation through operation owners. Read/proof work cancels immediately; mutation transactions honor cancellation before entering the protected boundary and complete/rollback through their existing owner once entered. Do not interrupt between durable journal proof and physical effect without a recovery rule. Native hydration/fetch gets explicit progress/inactivity limits; proof paths retain `GIT_NO_LAZY_FETCH` and literal graph semantics.
+
+**Validation / rollout.** Fake Git children cover pre-spawn abort, hung stdout/stderr, EPIPE, helper descendants, cancellation during stdin staging and cleanup. Crash tests ensure no lock/pin removal before child reap and correct existing journal recovery. Real offline partial clone/credential-helper fixture proves one hung repo does not monopolize all capture slots. Run supported-platform CI and rig. Roll out read-only cancellation first, then capture; thresholds remain operation policy, with tuning only where evidenced. Reverting deadlines does not revert environment safety. No wire changes.
+
+**Acceptance / choices.** Bounded cancellation-to-reap latency for the declared process model, no leaked children/temps, unchanged success output and proof markers, successful large legitimate bundles. Decide hydration policy and user-facing timeout behavior; no arbitrary universal short timeout. Config injection was not reproduced, so treat further variable changes as characterized hardening.
+
+## G5 — Batch no-drop proofs, index projections and scratch pins
+
+**Current owners.** `reachability.ts:noDropProof/partitionOwnedByIncoming/peelAndVerify`; `ref-plane-observation.ts:observeRefPlane` proof loop; `index-identity.ts:indexIdentityV2`; `pins.ts:createScratchPins/deleteScratchPins`; `capture.ts:stagedIndexObjectOids`; existing `keep-pins.ts:runUpdateRefTransaction`.
+
+**Ordered slices.** G5a establishes checked-in process-count, latency and memory benchmarks plus a callable old no-drop oracle. G5b batches ancestry classification through `partitionOwnedByIncoming`, preserving the original protected-tip order and exact missing/shallow/walk-error precedence. Only unowned tips enter the existing content-equivalence path. Reuse one immutable root/object observation per decision; when the ref-plane fixed-point loop adds holds, invalidate proofs whose durable roots changed rather than memoizing a stale outcome. Never skip connectivity verification solely because an OID previously existed.
+
+G5c batches stage checks and scratch ref creation/deletion using native update-ref stdin transactions, reusing compatible runner mechanics without importing unnecessary protocol-lock policy. Expected-old cleanup cannot delete another actor's replacement pin; capture-unique namespace and observation lease encompass the transaction. Atomic-batch failure must clean exactly owned artifacts. G5d measures compatible combinations of ls-files outputs, then reduces five private-index traversals only where output equivalence is proven; otherwise reuse one projection per exact index/dependency observation. Stream large outputs/canonical hashing where needed; do not parallelize commands against the same private index because Git refresh can contend on its lock.
+
+**Gates.** Differential proofs include tags, duplicate tips, missing roots versus missing individual tips, malformed objects, replacement refs, shallow/partial clones, empty sets and every content-equivalence case. Benchmark 30/500/5000 refs, long histories, 1/100k/1M index entries, shared stores and simultaneous captures. Crash/ref-lock tests cover pin batches and interrupted cleanup. Preserve canonical identity bytes or explicitly invalidate local caches; no wire identity change hidden in optimization. Old binaries remain interoperable.
+
+**Acceptance / rollout.** Synthetic ancestry baseline was 60 spawns/1141 ms versus existing batch 3/73 ms; target ≥10× on that fixture, constant process count as candidates grow, unchanged semantic outputs. Require separate real rig p50/p95 and memory evidence; no promised end-to-end 10×. Ship each slice independently with benchmark gates and keep the old oracle for tests/fallback only where truly needed. Revert performance behavior without removing recovery pins or persisted compatibility.
+
+**Unsolved choices.** Whether combined Git output suffices for all index flags is experimental; native parsing/library migration requires its own evidence and is not prerequisite.
+
+## G6 — Shared repository stores with independent checkout state
+
+**Design gate, not implementation-ready protocol. Current files.** `engine/types.ts:GitSection`; `manifest-validate.ts`; `git-state.ts:RepoCtx/inTreeWorktreeParentRelFromCtx`; `plan.ts` pointer-skipping loop; `plan-accumulator.ts:skipLinkedPointer`; capture/apply; `repo-lineage.ts`; checkout/ref journals; config ownership.
+
+**Proposed invariant.** One common store owns object closure/shared refs/common config; each checkout owns HEAD/private index/op-state and its portable relation to that store. Paths, remote URLs and object overlap are insufficient proof that two independent clones are the same store. IDs, schema version and feature negotiation remain proposals until design review.
+
+**Dependencies.** G6a observation/design needs B0 topology fixtures and current admission policy; it need not wait for G5 launch-count optimizations. New capture/materialization requires G1 complete roots, G2/G3 supported-shape admission, G4 effect/cancellation policy and preserved graph-proof semantics. G5 measurements inform performance, not portable identity.
+
+**PR sequence and algorithm.**
+
+1. G6a adds read-only topology observation grouped by canonical common-dir identity, with diagnostics/fixtures for ordinary, linked, external-parent, detached, relocated, locked/prunable and separated-git-dir layouts. This grouping is operation-local evidence, not portable store identity. No capture policy changes.
+2. G6b writes executable schema/compatibility and conflict-policy designs. Model store snapshots plus checkout snapshots, workspace-relative paths, object-format declaration and generation/binding evidence. Carry shared store object roots unioned from every supported checkout; preserve per-checkout divergence. Specify resource limits and receiver handling of unavailable external parents.
+
+   Before implementation, define store/checkout birth and installation binding, relocation/removal/tombstone semantics, copied-directory identity handling and retention. Distinguish the same store relocated, a copied identity, and a new checkout at an old path; ambiguous evidence holds without attaching or pruning. A unique ID alone is not proof of continuity. Define the shared ref/config effects and every checkout observation they affect, including the exact physical journal and logical CAS boundary for one store transition with multiple checkout outcomes.
+3. G6c implements reader/import support without publishing new manifests. Stage one verified object import per store, then prepare independent checkout materialization using existing rollback/journal owners. Represent topology crash effects in one existing physical-effect authority rather than a second competing journal.
+4. G6d materializes through native Git worktree operations where supported, using no-checkout/detached preparation, safe destination checks and validated index/op-state restoration. Never copy sender absolute gitfiles. Native Git refusal when a branch is owned elsewhere is a conflict, not a reason to force checkout. Existing directories and unrelated clones are preserved/quarantined according to explicit policy.
+5. G6e upgrades writers only after old-client behavior is proven. A new essential topology payload must not be sent as an ignorable additive field if old writers can erase it. Choose fleet capability gating, schema refusal, or a proven compatibility projection with one checkpoint authority. Remove pointer-skip policy only after equivalent shared-history dedup and full checkout-state roundtrips pass.
+
+**Conflict decisions.** Simultaneous different HEAD/index changes on the same logical checkout; same branch requested by two receiver checkouts; path occupied by another repo; external parent missing; remote prune versus local work; linked-to-standalone conversion. Default safety is preserve local state and hold affected checkout. A hold also blocks shared ref/config effects that would invalidate that checkout's expected-local proof: applying a sibling's shared branch movement can change the held checkout's resolved HEAD. Independent object import and stores/checkouts whose shared-state dependencies are proven unaffected may progress. Product must decide automatic alternate checkout creation versus explicit resolution and retention duration; no silent auto-merge of indexes.
+
+**Validation / acceptance.** Two-device and old/new fleet matrices; 100 siblings share one history upload/import while each unique HEAD/index/op-state roundtrips; detached-only commits survive; relocation reconnects only the same bound store. Crash every directory creation, native worktree registration, HEAD/index install and checkpoint publication; replay cannot attach to foreign state or prune live work. Measure wire bytes, pack subprocesses, p95 incremental checkout updates and idle observations against current standalone behavior. Include active Git/sibling races.
+
+Add dirty held sibling plus incoming shared-branch/config movement; no HEAD/index mismatch or hidden BASE advance. Exercise copied registries, backup restore, cross-volume move, root rename, delete/recreate at one path, duplicate identities, remote tombstone versus local recreation and an offline old writer reconnecting after activation.
+
+**Rollout/revert.** Readers first, test stream next, capability-gated writers last. After activation, the authoritative per-stream acceptance path or an equivalently proven mechanism must reject incompatible writers that could erase topology; a snapshot of currently online client versions is insufficient. Keep original manifests/artifacts, tombstones and recovery mappings through the approved retention window. A downgrade must refuse unsupported state or use an explicitly tested projection, never silently flatten/delete topology. No protocol ID or support retirement is approved by this plan.
+
+## G7 — Broader Git shapes and content-equivalence policy
+
+**Separate design/experiment tracks. Current owners.** Preflight/capture/manifest validation; `received-git-config.ts` and config ownership; `reachability.ts:contentEquivalenceProbe`; `reachability.test.ts` known squash-then-revert case; `ref-plane-observation.ts` recovery-pin decisions.
+
+G7a produces a capability matrix with actual fixtures: SHA-256, shallow/partial, reftable, bare/separated stores, sparse worktree config, submodule gitlinks and LFS. Each row states local Git capability, captured semantic state, necessary external objects/config, offline behavior and old-client gate. Avoid one giant compatibility flag.
+
+G7b prototypes each selected shape independently. SHA-256 needs algorithm-aware OIDs, bundle compatibility and correct fresh init, not widened regexes. Reftable needs native transactions/observations replacing assumptions about loose refs/HEAD locks. Partial/shallow support needs explicit completeness/required-object semantics and bounded hydration from G4. Submodules need store relationships and gitlink closure from G6. Sparse config must be restored with index semantics; LFS needs a product choice between plain materialized file transport and portable LFS object availability.
+
+G7c separates “patch appeared in retained history” from “current branch contains the work.” Current tests intentionally accept squash-then-revert as content-equivalent. Before changing authorization, record actual recovery pin retention and UI meaning; compare ancestry-only, historical equivalence with explicit recovery, and stronger final-state evidence. No general final-tree test proves arbitrary semantic equivalence. If a narrower policy is selected, migrate only policy/caches, retain recovery material and explain new holds.
+
+**Tests / rollout / acceptance.** Every shape needs offline/fresh receiver, crash, corruption, old-reader refusal and mixed-writer convergence tests before admission changes. Unsupported shapes remain actionable refusals until selected. Policy tests include squash, rebase, apply/revert, whitespace, merges and missing objects; no weaker no-drop guarantees, no recovery loss. Ship one capability at a time behind proven admission/version gates; old clients refuse rather than misinterpret new state. Revert by stopping new publication while retaining readers/recovery support. Product must prioritize shapes and choose content-equivalence semantics; performance alone cannot approve a safety-policy change.
+
+
+
+## F1 — Stable tracked-index cache identity
+
+**Evidence and target.** `engine/ignore.ts:754-798` keys tracked paths by index path, size and mtime. Audit reproduces a 104-byte a.secret→b.secret index replacement with restored mtime yielding stale trackedness. Fix this before F3 extends matcher lifetime.
+
+**Reuse-first design.** Index-content semantics already have an owner in `cli/sync-git/index-identity.ts:indexIdentityV2`; its private-copy discipline and split-index handling are useful, but its five sequential Git commands are intentionally comprehensive and too expensive to call on every matcher hit. Do not introduce five subprocesses into the ignore hot path. Reuse or internalize the existing stable index observation primitives where dependency direction permits; engine ignore must not grow an upward dependency on CLI orchestration.
+
+1. Resolve the actual index for each working directory exactly as today, including linked worktrees. Capture `{absoluteIndexPath,dev,ino,size,mtime,ctime}` using sufficient runtime timestamp precision. A missing index still requires the existing unborn-HEAD distinction.
+2. Accept cached tracked names only against a stable matching identity and valid cache version. Old v1 tracked-cache entries become misses, never authority. Changed index or unverified split-index dependency becomes a miss.
+3. On miss, stage an ordinary index in owned cache/temp storage and have Git derive tracked names from it under the resolved repository context; check live identity before/after capture. For split indexes, either stage and verify the referenced shared-index dependencies in that owned scratch location, or use a read-only Git enumeration bracketed by the complete index/dependency identities. The exact split resolution must be proven, not inferred from the source path. A healthy readable index must not become unavailable solely because its live Git directory is non-writable. If owned staging is unavailable, use the stable read-only enumeration when its complete dependencies can be proven; otherwise return the existing unavailable result. Retry one unstable observation, then preserve fail-open protection. Never relax permissions or require new writes inside a user's Git directory.
+4. Persist the names and exact observed identity only after stable completion. Clean temporary copies on all exits. Use direct exec arguments/GIT_INDEX_FILE handling already established in git-spawn; no shell interpolation.
+
+**PRs.** F1a regression tests plus stable identity/cache-version fix for ordinary and linked indexes; conservative cache miss for unsupported split state. F1b split-index dependency coverage and private-snapshot observation, if not safely covered in F1a. Do not advertise universal identity correctness after only adding ctime.
+
+**Tests/gates.** Audit reproduction, inode replacement with same metadata, in-place write with restored mtime, deletion/recreation, index versions2/3/4, split/sparse index, unmerged stages, unborn/committed missing index, permission failures, readable index under a non-writable Git directory, unavailable cache/scratch directory, worktree private indexes sharing common Git dir, mutation during each observation boundary. The review probe demonstrated that current fresh Git/matcher reads succeed under `.git` mode0555 while a sibling copy fails EACCES; preserve those correct answers without adding live-directory writes. Current-versus-candidate tracked/ignored answers must match fresh Git truth for stable fixtures. Crash after copy/after enumeration/before cache publish leaves only disposable owned temps and never updates sync base. Warm hit must avoid Git enumeration; no more subprocesses than current baseline.
+
+**Rollback.** Disable tracked-cache reads entirely and derive fresh names; do not restore weak identity. Decision: use existing primitive or a narrow engine-level stable observation helper, with one owner and no parallel identity rules.
+
+## F2 — Deletion batching and change-proportional local observation
+
+**Evidence.** Parcel maps every delete to `unlinkDir` (`daemon/watcher.ts:380-385`); `engine/manifest.ts:341` traverses all entries per absent delete. 124k entries×1000 deletes measured1.17–1.24s; same sequential lstat plus one narrow filter measured15.7–16.9ms, identical output,70–77× faster. This proves the absent-delete opportunity, not equivalence for arbitrary mixed events.
+
+**Algorithm.** Keep `applyWatchEvents` as the physical observation entry point. Classify each event against live disk as today. Accumulate verified-absent exact paths/subtree prefixes. Normalize overlapping prefixes. Apply a run of these removals in one ancestor-aware ordered traversal, invalidating only actually removed cache entries. Flush the pending removal run before any event whose recreation, addDir scan, type flip or unreadability interacts with it; this preserves current event order. Start conservatively with consecutive absent-delete runs. Never trust event type alone to decide absence.
+
+**PRs.** F2a measured run-batching and exhaustive differential fixtures. F2b reduce unnecessary full-map construction/sorting for a small ordinary change batch using the existing canonical array order and a sorted merge; reuse `daemon/manifest-update.ts` ordering helpers. F2c only after profiling, move persistent path/prefix indexing inside `LocalAuthority`/`LocalWorkspaceObserver` so snapshot arrays become boundary materializations. Preserve immutable snapshots or copy-on-write revisions so in-flight pulls cannot observe later updates. This last slice is architectural, not required for the70× improvement.
+
+**Tests.** Differential compare complete manifest, deferred paths, hash-cache state and observed errors: parent+child removals; stale unlink after pull rewrite; file→directory→file; removal/recreation in one batch; deep paths, Unicode/case collisions, symlinks, ignored paths, unreadable subtrees, reordered unrelated events, directory rescans with churning children. Crash/abort mid-observation cannot install partial absence authority; retain the existing sealed observation transition.
+
+**Gates/rollback.** Fixed1k/10k/124k/1m entries and1/10/100/1000/10000 deletions, watch queue age, event-loop lag, allocations, p50/p95. Require>10× in1000-delete fixture and no single-change regression; real checkout/worktree-removal rig must improve. Keep old path as a temporary test oracle/rollout escape, with removal only after compatibility and mixed-event gates pass. No whole-sync70× claim.
+
+## F3 — Reuse a certified matcher and load dircache only for scans
+
+**Evidence.** Trusted pull still calls `matcherForState` unconditionally (`sync/pull.ts:244`) and loads dircache before choosing trusted view.100-repo warm matcher builds cost1.7–2.0s; daemon already guards its matcher (`daemon.ts:2878-2894`).
+
+**Prerequisite:** F1, plus an explicit freshness inventory covering rule files, repo topology, private index and incoming Git changes. Threading today's cached object without this proof is insufficient.
+
+**Implementation.** Let the existing local observation owner return a matcher valid for its captured generation. The current P7 generation and Git signal surface do not cover index-only changes: the signal table watches HEAD/refs, and matcher provenance rebuilds for rule/topology changes. Initially retain resolved index/dependency locations from F1 and perform bounded stable identity probes at the pull observation boundary. Rebuild changed tracked sets and advance matcher generation before granting reuse; unresolved or unstable dependencies force the established fresh-observation path. Repeat the relevant identity check across the existing pre-drain/post-drain boundary rather than treating P7 alone as proof. This eliminates unchanged-index Git subprocesses while honestly retaining per-repository stat work. Replacing these probes with index events is a later optimization requiring explicit coverage, overflow and fallback evidence. Pass the certified matcher through the daemon's SyncDeps composition only when applicable; standalone/recovery calls continue to build fresh. After rule-file writes, preserve pull's two-phase rebuild before remaining action filtering. Imported indexes, repo additions/removals and reset/lineage changes invalidate the observation. Avoid a second pull-specific cache. Move `withDircache` acquisition into the scan branch, including cleanup ownership; a trusted pull has no reason to parse it. Later let `LocalWorkspaceObserver.observeScan` reuse its owned dircache with explicit refresh/reset, if measurements justify it.
+
+**PRs.** F3a lazy dircache with read-count contract. F3b certified matcher reuse and invalidation; F3c optional scan cache ownership consolidation. Tests cover pull-only daemon, standalone, recovery inner pull, ignore relaxation/stricter rules, tracked ignored files, newly created worktrees, external git add/checkout, incoming index, watcher overflow, reset and rebind. Explicit index-only fixtures run `git add -f` or `git rm --cached`, replace an index, or change a split dependency without a file/ref event or topology change; reuse must still detect changed trackedness. Inject change between trust check and apply; mismatch forces rebuild/scan. No new wire/state format.
+
+**Gate/rollback.** Zero matcher Git subprocesses and zero dircache reads on unchanged trusted pulls, exact action equality versus fresh matcher. Report matcher wall/spawn/read counts and per-repository index/dependency stat probes separately; do not claim O(changed repositories) from this first slice. Rollback stops reuse and restores fresh construction, preserving F1.
+
+## F4 — Transactional disposable caches
+
+**Evidence.** `EncryptAddressCache` (`engine/encrypt-address-cache.ts:200-225`) rewrites all22.8MB for one changed124k-row cache;~320ms load+83ms save. `sync-recovery.ts:156,526-532` and no-op `sync/push.ts:683` repeatedly load/prune it. HashCache has similar JSON persistence.
+
+**Design.** Use existing Bun SQLite/runtime conventions, not a new storage framework. Separate disposable cache tables from authoritative sync-base/receipt transactions. Key encryption descriptors by account/workspace/account epoch/key epoch/plaintext SHA; maintain path ownership with a unique indexed path table and foreign-key cleanup. Row updates and path migration occur in one transaction. Retain cache objects' lookup/record/prune interfaces initially, then batch changed rows at operation boundaries. Deletes follow verified removed-path sets; a periodic bounded sweep handles lost pruning hints. Do not let an operation load every row merely to reclaim one path.
+
+**PRs.** F4a schema+one-time best-effort import of encrypt-cache JSON with provenance checks; F4b producer integration and incremental persistence; F4c HashCache migration; F4d DirCache/tracked-cache migration only if measured useful. Keep cache corruption recoverable through rebuild, never silently reset authoritative state. Schema migration/version collision follows repo policy.
+
+**Tests/crashes.** Duplicate plaintext across paths, path moving to different content, context/epoch change, cache corruption, missing blob422 repair, interrupted publish resume, disk-full/read-only DB, concurrent daemon/foreground access, SIGKILL before/inside/after transaction, index ownership constraints. Reader sees old or new consistent rows. Old binaries may ignore SQLite and build their JSON cache; new binaries must not repeatedly reimport stale JSON after initialized SQLite. Rebuild hints on downgrade is acceptable; losing sync state is not.
+
+**Gates/rollback.** Cache reads/writes scale with changed rows, transaction count bounded per batch, no-op persistence zero. Compare p95 startup, one-file sync CPU/RSS/write bytes and cold-publish resume. Rollback safely discards/rebuilds disposable caches; keep legacy import only for a declared support window. Decide DB location/connection ownership once, not a connection per file.
+
+## F5 — Verified sibling-file and Git-object reuse
+
+**Evidence/design status.** Design52 already proposes local blob source; `engine/apply.ts:stageEntryToTemp` still downloads every encrypted entry. Sibling worktrees often share content, but hit ratio and end-to-end gain require measurement.
+
+**Algorithm.** From the trusted/scanned local view, derive bounded candidate paths for wanted plaintext SHA values. Stage a candidate into the ordinary sibling temp using copy-on-write copy where supported, ordinary copy otherwise. Verify full expected SHA256+length, apply intended mode, then reuse existing expectedLocal/conflict/typeflip/atomic publication. Never hardlink mutable files. If candidate changed/disappeared/is unsafe, clean temp and try at most one other candidate before remote fallback. Source must satisfy containment/type checks; a stale local view is a hint, never evidence of correct bytes. Preserve the existing KEK/account authorization boundary even if network transfer is skipped.
+
+**PRs.** F5a sibling files only, no persistent new content index; F5b existing Git object fallback using a bounded `git cat-file --batch` process per object-store family if actual hit data warrants it. Git OIDs are not plaintext SHA256. Hash extracted bytes before use and do not execute smudge filters. Candidate association can come from existing capture/index inventory; do not scan every Git object to avoid one fetch.
+
+**Bounded probe executed now.** `/private/tmp/rbox-git-reuse-probe.ts`: repo attribute `*.txt text eol=crlf`,10-byte CRLF working file, staged blob8-byte LF. Git blob SHA256 differs from working-file SHA256. Therefore raw Git object reuse must be opportunistic and byte-verified; Git identity/path alone cannot satisfy a manifest. LFS pointers and clean/smudge filters add analogous misses.
+
+**Tests/gates.** Source edited during copy, source also deleted by this pull, source=target, cross-device copy, reflink unavailable, modes, symlinks, CRLF, LFS, filters, SHA1/SHA256 Git repositories, split worktree object stores and alternates. Stage eagerly before conflicting removal or just fall back. Crash before verification/rename leaves target unchanged; crash afterward uses existing apply recovery. Measure hit ratio, bytes avoided, hash/copy wall, disk I/O, cold new-worktree completion. Require meaningful end-to-end benefit; rollback is always verified remote fetch.
+
+## F6 — Bounded transfer parallelism, verified streaming and preparation
+
+Ship three separately measured changes; no universal scheduler rewrite.
+
+**F6a multipart.** `remote/multipart.ts:117-140` serializes parts. Route missing part numbers through existing bounded pool with a modest measured per-object limit and one aggregate byte/FD budget shared across simultaneous objects. Preserve immutable ciphertext source, retry reopening streams, server-authoritative resume parts, unique progress accounting, cancellation and one complete call. A failed part prevents completion; resumable successes remain. Tests inject reordered responses, partial failures, process death, expired upload, source mismatch, quota/fence responses. Benchmark2GiB compressible/incompressible,1/2/4/8 parts; distinguish transfer from server finalization. Default only after physical throughput improves without memory/deadline regressions. Rollback concurrency1.
+
+**F6b staging.** Evolve `stageEntryToTemp`, existing crypto streaming and BlobStore/remote adapter together behind one operation that returns verified plaintext temp. Stream ciphertext through ciphertext hash+AEAD, decompression with output cap, plaintext hash and staging write. AEAD output remains unpublished until final tag/digests/size pass. Retain batch transport; do not replace efficient batching with per-file HTTP. Small buffered lane can stay if faster. Fuse hashes with already-required writes, eliminate duplicate mkdir only after same-filesystem staging/obstruction contract is explicit. Corrupt tag, truncated/extra body, zstd bomb, disk-full, cancellation and crash at each stage must preserve target. Use bounded temp cleanup and original path fallback.
+
+**F6c preparation.** Once staging owns verification/lifetime, prefetch remote blobs outside mutation lock and optionally encrypt/upload during watcher debounce. Pin work to authenticated context+content hash; consume only if final plan still matches. Bounded bytes/items/age and cancellation, one owner, no durable second publication queue. Never advance pins/base or overwrite files during preparation. Old/superseded work is discarded. Measure useful-prefetch ratio, wasted bytes, queue wait, CPU interference and full write→apply latency. Rollback disables prefetch without affecting apply.
+
+Historical constraints: an earlier overlapped-pipeline benchmark regressed 315→540s; an earlier packing benchmark regressed ~16%. Packing is already default-on in the audited checkout. Preserve current behavior and remeasure candidate changes; do not infer a new speedup from these historical experiments. Inspect and reuse their budget/lifetime primitives where coherent. FIFO oversized-object head-of-line blocking needs measurement before design changes.
+
+## F7 — Content-defined chunking experiment and possible protocol
+
+**Hypothesis only.** Whole-file FileEntry encryption makes tiny edits to huge artifacts expensive. First collect size/change/rewrite distributions locally without content/path telemetry; evaluate fixed cohorts containing archives, model files, SQLite snapshots, logs and shifted binary content. Stop if addressable bytes or wall savings are small. Live database consistency is a separate snapshot requirement; chunking does not make a torn file safe.
+
+**Experiment PR.** Offline prototype uses a vetted content-defined chunker with fixed versioned min/target/max sizes, plus whole-file baseline. On immutable captured bytes derive chunk hashes; benchmark random overwrite, insertion, append, repetitive/incompressible files. Record reread/hash CPU, changed bytes, chunk count, compression ratio and memory. Test collision-independent full SHA verification. This experiment changes no wire format.
+
+**Candidate protocol PRs, conditional.** Add versioned encrypted manifest descriptor containing ordered chunk plaintext identity/size and ciphertext reference/size, plus whole-file plaintext SHA and size. Derive E2EE material per chunk using domain separation and existing account/key epoch protections; do not invent an unaudited crypto scheme. Chunk boundaries and names remain inside encrypted manifest; server still necessarily observes ciphertext references/sizes. A changed file produces new/retained chunk refs. Publication admission, refset deltas, receipts and GC must treat every reachable chunk as a normal protected blob; removal of one file cannot collect chunks still referenced by another. Use existing root accounting/tombstone fences, with chunk refs included in snapshots and incremental updates. Parent commit acceptance remains atomic even if upload is resumable.
+
+**Compatibility/hard decisions.** Negotiate support before publishing chunked entries. Old clients must refuse unsupported manifests safely, or mixed fleets keep whole-file format; dual representation adds quota/GC complexity and needs explicit product choice. Set chunk count/descriptor/file limits and snapshot recovery bounds. Decide minimum eligible size and whether users opt in before default; preserve historical version restore after chunk rollout.
+
+**Admission and history closure.** Bound aggregate unique encrypted references per current refset/commit as well as chunks per file, encoded descriptor bytes and cumulative staged bytes/FDs. Before upload, compute projected cost including carriers and key-epoch effects against existing server limits; the focused design chooses whole-file fallback or actionable refusal without partial publication. Do not silently raise server caps. Ordered descriptors may legitimately repeat the same chunk hash at different positions: deduplicate storage/admission, preserve occurrences, and reject invalid positions/lengths rather than repeated content. Define whether historical descriptors are self-contained or delta-based and retain their full reconstruction closure through checkpoint/prune boundaries; whole-file SHA alone is not a GC root inventory.
+
+**Gates/rollback.** At least10× fewer transferred bytes on declared sparse-edit cohort, no unacceptable cold-transfer/CPU regression. Validate missing/reordered/duplicated/corrupt chunks, resumption, key rotation, cross-file dedup, writer conflict, pruning/GC race, old-new readers and historical restore, crashes around receipts/commit/adoption. Rollback stops new chunk writers while maintaining readers and retained chunk roots for all existing history. Deleting chunk support after publishing history is feature retirement, never a simple flag rollback.
+
+Distinguish valid repeated-content descriptors from invalid duplicate positions in those tests. Include empty files, size-sum overflow, multiple files crossing aggregate limits, rotation amplification, and removed files whose chunks remain rooted by other files/history. Differentially compare retained chunk sets and restored bytes across prune/checkpoint transitions.
+
+
+## S1 — Postcommit alarm, notification and ACK recovery
+
+**Problem and owner.** `WorkspaceSync.commit` commits `head`, `headWatermark`, `seq:N` and lagging index state in `transactionSync`, then awaits `armAlarm` before fanout and response (`apps/api/src/workspace-sync.ts:714-777`). `initializeIndex` returns for any existing index state (:284). A scheduling failure can therefore leave accepted work undiscovered until polling and roots maintenance unscheduled. A new successful commit can heal it; a restart plus `/latest` currently does not. The audit reproduction used stub storage, so platform ordering must be tested before choosing the final scheduling mechanism.
+
+**Reuse-first algorithm.**
+
+1. Define acceptance once: the durable `(sequence,commitHash)` in `head`/`seq:N`. Return the accepted outcome even if an advisory mirror fails. Preserve existing conflict, watermark and epoch ordering.
+2. Make a complete `ensureMaintenanceScheduled` operation internal to WorkspaceSync. Read authoritative `head` versus `index_synced_seq`; if work remains, ensure a wakeup exists. Call it on bootstrap even when index tables already exist. Do not create a parallel pending-work list for information already represented by these watermarks.
+3. Prove durable ordering in local workerd: determine whether the supported storage transaction API can atomically persist both acceptance and alarm scheduling, preserving the current synchronous CAS semantics. If yes, use that primitive. Do not assume calling an async alarm method inside `transactionSync` is atomic. If not, require a demonstrated durable wakeup/reconciliation mechanism before claiming recovery without another request. Pre-arming alone is insufficient unless the test proves the alarm cannot run and disappear before acceptance.
+4. After acceptance, fanout must not await a nonessential read or D1 mirror. Scheduling exceptions become maintenance errors with accepted-sequence telemetry, not a generic assertion that publication failed. Preserve a background retry owner; unawaited promises are not recovery.
+5. Initially leave the D1 mirror awaited after fanout while closing the alarm bug. A later slice moves ACK ahead of mirror only after adding bounded idempotent catchup from retained `seq:N` entries. The existing signed log is replay input; mirror progress may need one watermark, not another commit queue. Reconcile before pruning the required log interval.
+6. Optional separate change: exact-hash replay returns original acceptance. Authenticate first, match both sequence and complete signed identity, preserve different-hash equivocation, and define response behavior when the record has been pruned. Do not bundle this API semantic change with the alarm fix.
+
+**PR slices.** S1a reproducer and maintenance bootstrap repair; S1b atomic scheduling/recovery and fanout ordering; S1c optional mirror catchup/early ACK; S1d optional exact replay ACK. No schema/wire change for S1a is expected. S1c depends on retained-log limits in S3.
+
+**Bounds and gates.** One work cursor, bounded mirror page, bounded retries/backoff. Inject failure before and after acceptance, alarm get/set, broadcast, mirror and response; kill/rehydrate; verify one sequence, discoverable signed commit and eventual fold without a second edit. Force conflicting publishers. Run `workspace-sync-ws.test.ts` and roots tests in real workerd, not only fakes. Keep telemetry for accepted-but-not-notified, scheduled-versus-lagging, mirror lag and recovery time. Roll back execution to previous transport while retaining accepted log and any catchup watermark; never roll back head to hide failure.
+
+## S2 — Reverse-reference index and bounded local-state garbage collection
+
+**Problem and owner.** `internStagedEntryValues` includes mtime in exact identity; updates remove live references but never reclaim old values. `collectUnreferencedEntryValues` has no runtime caller, and the anti-join/FK checks lack a `plane_entries.entry_id` index (`src/cli/state-plane/store/plane-promotion.ts:115-196`, `schema/v1.ts:81-95`). StateStore must own maintenance; daemon/status adapters must not inspect and delete state rows themselves.
+
+**Schema compatibility first.** The current `schema/application.ts` freezes schema version1, SQLite user_version1 and a DDL fingerprint. `validate-open.ts` checks those identities and required objects, but does not reject additional index names. That makes an optional additive performance index plausible; it does not authorize silently rewriting frozen v1 DDL/fingerprint. First prove against released supported binaries that an extra index is tolerated, then ratify a writer-owned additive index installer or the repository's next schema migration. Keep v1 fixture identity intact. A version bump that makes old executables refuse the folder requires an explicit rollout/support decision.
+
+**Ordered implementation.**
+
+1. Install an index beginning with `entry_id`; benchmark `(entry_id)` versus `(entry_id,path,path_order)` because the composite foreign key also participates in deletion checks. `CREATE INDEX IF NOT EXISTS` belongs in an owned writer maintenance/open operation, never the read-only/foreign observation path.
+2. Add an internal `maintain({maxRows,maxElapsedMs})` operation to StateStore. Use small transactions and existing workspace/state lock ownership. Capture entry IDs about to lose references in BASE or LOCAL updates, then delete only candidates for which no `plane_entries` reference exists. Deduplicate IDs in connection-local TEMP state. Preserve reference sharing between both planes.
+3. Handle historical orphans with keyset scanning of `entry_values.entry_id`, explicit row/work budget and an indexed `NOT EXISTS` check. A maintenance cursor is advisory; restarting an idempotent sweep is safe. Avoid a second durable job table unless bounded restart work demonstrably requires one. Do not require a full correlated sweep in every sync commit.
+4. Account for physical reclamation separately. Publish page_count/freelist_count and orphan/live measures; DELETE makes reusable pages, not a smaller file. Schedule any compaction only at an owned idle boundary with sufficient disk space and interruption recovery; no VACUUM per save.
+5. Retain existing `collectUnreferencedEntryValues` as the reference implementation/test oracle until the bounded version is proven, then consolidate under the same owner.
+
+**PR slices.** S2a extra-index compatibility fixture and migration/install path; S2b bounded exact candidate cleanup; S2c bounded historical sweep and observability; S2d optional physical compaction after measured need. Rollback disables maintenance but keeps the compatible index; deleted values are provably unreferenced, not user history. Do not offer arbitrary downgrade by deleting an in-use DB.
+
+**Gates.** Churn thousands of mtimes/content versions; queue drains and DB reusable-space growth stabilizes. Shared BASE/LOCAL values survive; rejected/busy CAS does not delete live state; crash before/after replace and cleanup; read snapshots; disk full; query-plan assertions show indexed probes. Audit benchmark was 873.9ms→11.3ms for 3k removals with an index, a collector result rather than end-to-end promise. Reuse delta-CAS, fused-consume, schema-open and foreign-file containment suites.
+
+## S3 — Linear roots folding and byte-bounded verified history
+
+**S3a fold.** `workspace-sync.ts:1480` restarts Set traversal for every 5k result chunk. Keep `fold_subcursor` durable recovery semantics, but construct an in-memory iterator once per live fold phase. On resume, skip to `lastSha` once; thereafter yield bounded SQL chunks without revisiting prefixes. A sorted array/binary seek is optional only if memory measurements beat Set reuse. Keep SQL updates and persisted lastSha atomic, and preserve the existing isolate-wide fold-memory guard.
+
+Gate 250k disjoint sets with <=linear visits, identical added/removed results, sparse/empty/equal sets, crash after each SQL chunk, and deterministic key ordering. The existing implementation made6.625M visits for250k refs; this is an algorithmic operation-count win, not a26.5x whole-server claim. Rollback can read the unchanged cursor format.
+
+**S3b history.** `WorkspaceSync.commits` currently accumulates up to5,000 bodies; individual body cap is1MiB (`commit-envelope.ts`). Add negotiated byte-bounded pages with an explicit terminal target `(sequence,hash)` and continuation sequence, while keeping `/commits?since` semantics for old callers. Preflight serialized lengths before parsing/copying many bodies; cap encoded response bytes and maximum single item. The server must not silently return a truncated legacy `{commits}` array: `E2eeRemote.verifiedHead` expects the verified terminal to match `/latest`.
+
+Add a bounded-page operation in `src/cli/remote/commits.ts`, consumed incrementally by `e2ee-remote.ts`. Feed each page into the existing `verifyCommitChain` (`src/engine/e2ee/session.ts`) with an ephemeral verified terminal; verify every link/signature against its own historical roster. Keep the durable pin unchanged until the requested terminal is verified, unless a separately reviewed resumable-pin contract proves safe. Reuse the final head's current-roster/current-epoch `openCommit` gate. History/restore callers require explicit adaptation: their selected retained window remains bounded and authenticated.
+
+**PR slices and rollback.** Fold is independent; history codec/server pages; client incremental verification; optional bounded legacy endpoint safeguard with explicit old-client fallback behavior. New server first, client negotiation second. On interrupted page, restart from durable pin or ephemeral checkpoint within the current operation. Retention racing a page yields the established needs-rebaseline path, not partial success. Test moving head, pruned middle, forged cursor/terminal, rollback, duplicate page, cancellation and near-cap bodies under an RSS budget. Keep old endpoint until supported-reader retirement evidence.
+
+## S4 — Coalesced receipts/envelope publication and signed WS delivery
+
+**Owners and first-order constraint.** Reuse `commitSigned`, `E2eeRemote.commit`, blob receipt admission, WorkspaceSync and RemoteWakeupChannel. `remote/commits.ts:328-336` currently drains receipts then posts an empty map; the server already admits receipts. `routes/sync.ts` mints download grants Worker-side; the DO must not acquire grant secrets merely to optimize notification. Access revocation currently updates D1 and cleans diagnostics (`auth/devices.ts`) without closing sockets. The socket attachment currently takes device identity from the URL (`ws-fanout.ts:11-16`). Correct those before expanding what long-lived sockets deliver.
+
+**Ordered slices.**
+
+1. S4a coalesce small receipts: choose only receipts needed by this attempt under existing request/body/receipt caps; retain overflow/background redemption for cold uploads. Snapshot receipt identity; settle only matching entries after definitive server outcome. Preserve retry and quota/account-then-publish semantics. Keep `beforeManifestPost` at the actual first-send boundary so uncertain-ACK recovery is not armed during earlier upload work.
+2. S4b inline a small encrypted manifest envelope in the authenticated request extension. Verify its ciphertext hash equals the signed `encManifestSha`, enforce actual-byte caps before parse/allocation, durably store it through the existing blob write/receipt/admission owner before advancing head. Preserve canonical blob retrievability for old readers. Larger envelopes use the existing upload path. Negotiate this unsigned transport extension; signed commit identity remains unchanged.
+3. S4c bind WS sessions to trusted Worker principal/account/workspace/device metadata, overriding attacker-controlled identity. Implement the access-revocation policy across device revoke, account unlink/deletion and session expiry; use authenticated close/invalidate messages to relevant workspace DOs with idempotent retry, and specify the bound during partial failure. Account for connection-open versus revoke races. Do not claim cryptographic eviction of already-cached keys: current code explicitly distinguishes token revocation from E2EE rotation. No richer data delivery until this gate is proven.
+4. S4d negotiated bounded frames carry the unchanged signed commit and optionally encrypted envelope. Large frames remain doorbells. Route hints into E2eeRemote's existing verification owner; RemoteWakeupChannel may queue a bounded candidate, never advance a pin. Initially preserve the existing account refresh for each consumed head, overlapping it with acquisition, including when the frame's roster/epoch is already cached. A known roster is not evidence that it remains current; publisher revocation or rotation can leave a recipient connected with stale evidence. Verify parent pin, signature/hash and the terminal current-roster/current-epoch checks against the refreshed account. Eliminating that request requires a separately reviewed authenticated account-state carrier or freshness contract with explicit revocation/rotation ordering and partial-failure bounds; trusted socket identity alone is not a substitute. Duplicates are harmless, gaps use S3 pages, stale/conflicting frames fail closed. Keep only a small byte-bounded queue while not ready, or discard and request catchup.
+5. S4e optional speculative ciphertext prefetch under a byte/concurrency budget; immutable cache only, no apply/state mutation before authorization and signature checks. Parallelize independent account refresh with uploads while still checking fresh epoch before signing/admission. Coalescing must not create stale-key reuse.
+
+**Gates/rollout.** Server capability then client opt-in; old-client/old-server matrix, revoked socket, concurrent epoch rotation, invalid inline hash, partial receipt settlement,409/422 repair, cap overflow, dropped/duplicate/out-of-order frames and staging-cache cancellation. Test a still-connected recipient caching rosterN, publisher revocation/rotation atN+1, then a newly chained frame carrying known rosterN: the refreshed head-opening gate must reject it just as normal pull does. Track HTTP count, payload bytes, acceptance→notification→apply and wasted speculative bytes; request-count targets retain the account-refresh call until an equivalent freshness replacement is accepted. Restore prior wire path through kill switch; old signed bodies remain readable. Keep opaque payload fallback and polling; remove neither as part of this performance change.
+
+## S5 — Parent-bound refset deltas, authenticated checkpoints and retained roots
+
+**Why separate.** Current `readRefMode` and `parseCommit` require inline refs XOR a full sidecar; a third delta form is incompatible with existing readers. Server-side delta *admission* already exists (`computeCommitDelta`, `commit-delta.ts`) but still fetches/compares full parent and child. The goal is change-sized wire and server work, not renaming the existing optimization.
+
+**Design/algorithm.**
+
+1. Specify a canonical signed delta carrier with parent sequence/hash, parent root identity, sorted unique adds/removes, child count/total bytes and child authenticated root. Bind sizes and identity rules; encrypted manifest refs, manifest-chain carriers and historical roots remain separately accounted. Reuse `refset.ts` validation and admission fences; do not let an unverified client removal make GC delete bytes.
+2. In shadow mode derive the proposed incremental result alongside today's full refset and compare bytes/root/count/accounting. The DO owns a durable current-reference representation and retained checkpoints; choose indexed membership plus a defined incremental authenticated tree only if a full canonical hash would otherwise reintroduce O(N). Specify domain-separated hashing/canonical ordering before implementation. Reject absent removals, conflicting duplicate adds, wrong parent/epoch and count/size overflow.
+3. Validate/charge additions and carriers with existing receipt and deletion-fence rules before CAS. Carried refs must preserve current mark/active-delete checks; reusing a parent cannot bypass GC races. In the head transaction commit delta/root identity and sequence together. Batch large membership updates with an invisible staged generation; publication must never expose a partially applied root.
+4. Emit full authenticated checkpoints under measured byte/chain/recovery budgets. Retain every carrier needed by reachable checkpoints/deltas and old-reader paths; roots folding and prune floors share one recovery boundary. GC initially shadow-only, differential to full reconstruction.
+5. Compatibility branch: while old readers are supported, the server may reconstruct/store a conventional full sidecar from deltas, retaining the old signed descriptor. This saves client upload but intentionally retains O(N) server checkpoint cost. Full O(change) requires a negotiated new signed format plus verified reader floor; label these two outcomes honestly.
+
+**Slices.** S5a codec/property tests; S5b shadow incremental membership/root; S5c optional compatible upload reduction; S5d new-format reader support; S5e gated writers/checkpoint recovery; S5f roots/GC differential rollout. Codec/shadow work requires B0 and the existing admission oracle. Production activation requires S1 recovery, accepted root/GC compatibility and explicit format/support approval; S3 bounded replay is a hard dependency only where this recovery protocol consumes it. S4 coalescing/rich WS is rollout coordination, not a prerequisite to refset codec, shadow or compatible-upload work. Revert writers to full checkpoints while continuing to read every published delta; do not drop delta tables/readers until history is no longer reachable. Test crash at every staging/admission/CAS boundary, parent races, key rotations, all GC fences, large adds/removes, checkpoint loss and old releases. Gate sparse-commit metadata bytes and server reads independent of total workspace size.
+
+## S6 — Signed-history acceleration and account-sharding experiments
+
+These are research packages with stop decisions, not prerequisites for correctness fixes.
+
+**S6a history acceleration.** Reuse S3 bounded verification and cache already-verified history keyed by pinned hash/account evidence before inventing skip proofs. Measure signature verification versus network cost. A signed ancestor pointer or Merkle inclusion proof alone does not preserve the current rule that every intervening commit is signed by an active signer in its own roster. Write the threat model first: untrusted server, equivocation, malicious/revoked signers and epoch changes. Prototype skip/checkpoint proofs against adversarial generated chains; distinguish proving log consistency from proving validity of omitted commits. If equivalent validity cannot be established cheaply, stop or present the explicit trust-policy change for product/security decision. No unsigned checkpoint becomes a pin; no downgrade of historical verification via a performance flag. Retain sequential verification and version-history semantics. PRs: benchmark/cached-known-proof path, then isolated proof experiment, then decision document.
+
+**S6b account sharding.** `apps/api/src/db.ts` already defines `dbFor(accountId)` and `dirDb`, but both return one binding; empty-account global lookup sites and account-delete's cross-plane atomic batch are documented limitations. Build a local two-database harness, enumerate secondary-key/global-cron callers and define directory routing as one authority. Prototype an explicit account move: fence writes, copy bounded pages, reconcile counts/digests, switch one routing epoch, resume, then retire old data only after recovery/retention gates. Avoid dual writable shards. Cross-plane revoke/delete/link/billing require idempotent recovery because today's shared-D1 transaction no longer spans them. Measure multi-account contention and p95 isolation, not single-user10x. PRs: inventory+routing contract, two-shard test harness, migration/recovery prototype, measured go/no-go; no infrastructure provisioning or production migration until approved plan and deployment runbook.
+
+
+
+## X1 — Change-proportional manifest representation and metadata identity
+
+**Type:** staged optimization then protocol experiment. **Hard prerequisites for X1a/b:** B0 demonstrated codec cost and exact-input identity. F2/F3/F4 results are measurement inputs, not implementation blockers. X1c format/root changes require accepted admission/GC compatibility, coordinated with S5 and any G6 topology payload being represented; X1a/b do not await those formats. **Owners/files reused:** `engine/manifest-delta.ts:encodeDeltaEnvelope/foldDelta/canonicalManifestHashStreaming`, `engine/diff.ts`, `engine/types.ts:Manifest/FileEntry`, `cli/e2ee-remote.ts` trusted fold/meta, state-plane sorted plane storage. Existing signed hash verification stays authoritative until a new format is reviewed.
+
+**First cut without a new wire format.** X1a measures each validate/diff/hash/materialize pass and threads a trusted, immutable capture revision through private codec entry points so a validation result or already-computed diff can be reused only for the exact same inputs. The public decode boundary always validates untrusted input. Reuse `baseManifestHash` only when existing signed/meta evidence proves its identity. Add read-count assertions; do not let a caller pass a boolean named trusted without a bound observation.
+
+X1b implements sorted-array merge or indexed iteration for delta application, avoiding a full map plus another sort when canonical order is already established. It still verifies the current canonical result hash, so this slice remains O(N) hashing. Preserve duplicate/no-op operation rejection and byte-exact canonical serialization. Streaming avoids peak materialization; it does not make hashing incremental by itself.
+
+**Conditional X1c protocol.** Prototype an authenticated ordered tree over the existing canonical path bytes; radix/Merkle shape and hash/crypto details remain design choices, not approved formats. Include repository/checkouts and file data under unambiguous namespaces, plus all semantically required manifest metadata. Define empty root, ordering, duplicate/deletion semantics and depth/fanout limits. Preserve existing path byte identity by default; Unicode normalization that merges currently distinct names requires separate product/format approval. Update a small path set and its ancestors; a receiver fetches missing immutable nodes under cumulative decoded-byte, edge, traversal and request budgets, including repeated-node/cycle handling.
+
+**Encryption and retention boundary.** The focused design must distinguish logical node identity from ciphertext address and bind signed root, child identities and encrypted blob references without exposing plaintext paths in server-visible keys or payloads. Path-bearing nodes remain encrypted using a reviewed scheme within existing account/key-epoch protections; no deterministic encryption or exact key derivation is approved here. Specify how clients supply the exact node/file retention delta to admission/GC, reusing S5 where compatible. The server cannot discover children by decrypting encrypted nodes, so existing root machinery does not automatically traverse this tree. Keep bounded full recovery checkpoints and every required historical reconstruction node. Measure parent re-encryption, node-upload and key-rotation amplification to prove structural sharing survives encryption.
+
+**mtime decision:** FileEntry describes mtime as a local hashing hint, yet canonical metadata/exact state values carry it. First measure touch-only behavior and write down which CLI/history/restore contracts observe mtime. Keep the current field and identity in X1a/b. Any removal from portable identity is a separately approved schema change with precise old-reader/writer behavior; it cannot be smuggled in as hash optimization.
+
+**Gates and stop.** Differential current encoder/folder at 1k/10k/124k/1M entries; hostile encodings/duplicates/order/depth; directory renames; 1/100/all changes; interrupted tree fetch, corrupted/missing nodes, key rotation, two publishers and retained-history restore. Target one-file authenticated-node work O(path depth), not O(total entries), with a declared maximum cold-read amplification and no unsafe validation shortcut. Stop if node requests/GC complexity erase measured CPU savings. Reader-first rollout only after format ratification; rollback stops tree writers but preserves readers/roots until all published tree history retires.
+
+Require exact file/Git/checkout metadata reconstruction, retained-reference set equality and no plaintext paths at server-visible boundaries. Test aggregate decoded-work budgets and Unicode-distinct names, not only individual node limits. Current-codec optimizations remain independently shippable if the tree experiment fails.
+
+Public node addresses are ciphertext-derived. The signed-root placement must not expose new plaintext metadata/hash commitments beyond the current protocol's confidentiality surface; all content-bearing node bodies remain encrypted. Bind node type, child order and account/workspace/key context against substitution. Include dictionary attacks, cross-account equality leakage and malformed-node substitution in threat-model review. A local data-structure prototype can precede this specification; any network prototype cannot.
+
+## X2 — Authenticated peer-assisted ciphertext transfer
+
+**Type:** experiment, useful only if B0 finds large transfers between reachable owned devices. **Hard prerequisites for real peer acquisition:** verified staging/cancellation from F6 or its current equivalent, explicit network/security design, and a proven current-access/session-binding contract. Coordinate that contract with S4 identity/revocation work; receipt coalescing and rich WS deployment are not prerequisites to an isolated loopback experiment. **Reuse:** `SyncRemote`/BlobStore acquisition interface, encrypted content addresses, existing device identities/roster verification and cloud sequence authority. No peer source can authorize a commit or change BASE.
+
+1. Create a loopback two-peer harness with explicitly configured addresses and synthetic workspaces. Add one optional byte-source implementation under existing acquisition; discovery is not part of the first experiment. Expose only ciphertext by hash/size, never arbitrary filesystem paths or plaintext.
+2. Define mutual authentication from current account/device evidence, replay-resistant challenges and workspace/key context. Verify the chosen credential proves current access; possession of an old E2EE key is not current authorization. Scope requests, rate limits, response-byte caps and connection lifetimes. Do not reuse the server's secret grants on peers.
+
+   Specify a server-verified current-access proof or another reviewed freshness contract bound to requester, intended peer/audience, authorized context and expiration. When authority is stale or unavailable, deny the peer request and use the normal fallback. Apply the account/workspace scope promised by existing acquisition policy; knowing a ciphertext hash is not authorization. If the peer protocol promises narrower workspace scope, define the retained/cache entitlement mapping that enforces it rather than inventing a stronger product policy implicitly. Test unlink, account switch, cross-context cache collisions, stale credentials and replay across peers.
+3. Race a bounded peer lookup against a short fallback budget. Download to the same verified staging path; verify ciphertext address and plaintext/tag before apply. A malicious, stale, offline or truncated peer is merely a failed source. Keep cloud upload/durability before canonical sequence acceptance, even if peer bytes arrive first.
+4. Measure loopback/LAN/WAN corpora, useful hit rate, bytes offloaded, power/CPU, concurrent users, aborted transfers and revocation. Only then design opt-in discovery and private-network exposure, with no automatic public listening/default firewall changes.
+
+**PRs/gates:** harness+authenticated protocol design; explicit-address prototype; adversarial authentication/hash/size tests; network/energy experiment; product go/no-go for discovery/defaults. Seek ≥10× transfer-phase gain only where LAN/WAN capacity supports it; require negligible added delay when no peer is available. Rollback disables the source and falls back to cloud; no new authoritative storage or historical format. No credential provisioning or service exposure is authorized by this planning task.
+
+## X3 — Shared Git object knowledge, missing-object transfer and background compaction
+
+**Type:** experiment/design gate. **Hard prerequisites:** complete required roots from G1 and preserved graph/retention proof semantics. G5 is a measurement/optimization input. Standalone-store inventory/compaction experiments can run without G6; portable sibling sharing requires G6 common-store ownership. New carriers require accepted root/GC compatibility, coordinated with S5. **Reuse:** `GitSection.packChain`, bounded existing incremental bundles, `sync-git/capture.ts`, `git-state-apply.ts`, fingerprint/lineage binding, quarantine/import and keep pins. Do not implement incremental bundles again.
+
+1. Instrument existing bundle generation, chain compaction, encrypted bytes, receiver fetch and graph verification per common store. Separate new-object transfer from repack-induced ciphertext changes. Prototype the existing standalone-store case independently; sibling bundle/import sharing follows G6's authorized store/context binding.
+2. Prototype a receiver possession inventory bound to repository identity, object format, key context and local object-store observation. Treat inventory as a hint after Git GC or corruption: it can omit transfers only if subsequent isolated completeness verification proves all required objects; missing objects trigger bounded request/fallback before any ref/index mutation.
+3. Prefer Git-native bundle prerequisites/pack plumbing over a custom object format. A sender provides the union of required roots for all represented checkouts and complete index/op-state roots. Receiver stages/imports missing objects once, verifies graph closure, then existing transaction owners apply checkout/ref effects. Separate refs and object possession: having an object never means accepting its ref state.
+
+   Completeness evidence must survive receiver GC through effect and recovery settlement. Establish operation-owned retention roots before objects can be collected, using existing pins/journal ownership; retain them until logical acceptance or durable rollback ownership settles, then clean with expected-old evidence. Bind omitted-transfer proof to receiver identity, object format and graph observation. Successful reads, especially from a helper holding an unlinked pack open, do not prove crash-durable possession. Missing-object fallback completes before authoritative ref/index mutation; no new competing object-state authority is implied.
+4. Prototype background full-checkpoint compaction of an immutable captured root set. Publish the compacted replacement through the normal sequence CAS; if current roots changed, either prove it still covers the current section or discard/retry. Retain old chain blobs until no current/history root references them. No aggressive `git gc` on the user's live repo as a side effect.
+5. Cross-workspace dedup remains scoped to an explicitly authorized encryption domain. Equal Git OIDs or remote URLs are not permission to transfer ciphertext across accounts/keys. Default first implementation shares only within one workspace/key context; wider sharing is a new security/format decision.
+
+**Tests/gates:** 100 siblings, detached roots, same object in unrelated clones, source/receiver GC, missing or corrupt prerequisite object, partial clone offline, key rotation, stale inventory, checkpoint race, crash before/after import/CAS and historical restore. Measure bytes/processes once per store, bounded inventory memory and worst-case fallback amplification. Rollback uses current self-contained/incremental bundle route and preserves all published chain readers. Stop if negotiation RTTs cost more than saved bundle work on ordinary commits.
+
+Inject receiver repack/prune between inventory, import, verification and apply; crash after import before retention is established; and race owned-pin cleanup with another actor's replacement. Require current and historical reconstruction after every accepted transition, not only successful live-process reads.
+
+## X4 — Native Git plumbing service or library
+
+**Type:** evidence-gated experiment, last priority. **Hard prerequisite:** G4 subprocess policy/cancellation. G5 batching is the comparison baseline; B0 must still attribute material critical-path cost to launches/parsing before cross-operation service/library work is justified. Operation-scoped native batching can be evaluated with G5 independently. **Reuse:** current Git runner interface, native buffered `cat-file` mode, owned process lifetime, strict output/error classification and canonical index semantics. No separate new control protocol for the first experiment.
+
+X4a first evaluates one bounded native batch process within an operation, with fully qualified OID metadata requests, bounded queries/replies and cancellation-to-reap ownership. Cross-operation process reuse is a separate conditional slice: compare against operation-scoped batching, define idle/resource limits and invalidation for store replacement, relevant config/alternates changes and object-store observations. Do not extend negative lookup or graph-proof cache lifetime solely because a child persists. Batch answers are observations, not durable-possession certificates; a helper can retain an open pack after on-disk removal. Retention/effect authority stays with existing pins/journals. Do not move ref transactions or checkout mutations into the service.
+
+X4b only if X4a leaves a proven bottleneck, evaluate a mature Git library or narrowly scoped native helper on the frozen corpus. Feature coverage must include SHA formats, split/sparse index, worktrees, config, alternates/ref-storage policy and error semantics. Do not parse undocumented binary index details without a compatibility owner. A library that returns different answers for unsupported shapes is not a drop-in optimization.
+
+**Gates:** identical successful and failed observations, zero child/FD leaks, binary replacement and repo-removal safety, crashes during requests, max response/body limits, Windows only if actually within supported platform scope, supported Mac/Linux packaging and upgrade smoke. Require a measured benefit after counting service startup/idle memory/maintenance. Rollback selects the existing Git subprocess implementation. Do not introduce another long-lived daemon unless it beats native batches by a material margin and preserves the full supported contract.
+
+Test deleted/repacked objects while the helper holds pack descriptors, alternates/config changes, an object arriving after a cached miss, and process restart between observation and use. No successful persistent-process answer may bypass the current durable object-retention or absence proof.
+
+## Coverage of every audit recommendation
+
+| Audit item / proposed change | Package(s) | Treatment |
+|---|---|---|
+| Portable split index and stage-only object closure | G1 | Correctness; identity convergence included |
+| NUL worktree paths and path-valued output | G2, G4 | Correctness and runner policy |
+| Early SHA-256 admission / broader formats | G3, G7 | Early refusal now; new support gated |
+| Git environment isolation and hung hydration | G4 | Safe inherited context; cancellation by effect boundary |
+| Git ancestry/index/pin batching | G5 | Existing native batch primitives; differential proof |
+| Shared history with each checkout's state | G6 | Versioned topology/conflict design |
+| Sparse/bare/submodule/LFS/reftable support | G7 | Separate capability decisions and fixtures |
+| Historical content-equivalence semantics | G7 | Product policy review; current guarantees preserved |
+| Tracked-file cache stale identity | F1 | Fix before matcher lifetime extension |
+| Deletion-batch amplification / in-memory full passes | F2, X1 | Ordered batch optimization, then representation |
+| Matcher and directory-cache reuse | F3 | Observation freshness and lazy reads |
+| JSON cache rewrites | F4 | Disposable indexed cache ownership |
+| Local sibling/Git-object reuse | F5 | Verify bytes; copy/reflink, never mutable hardlinks |
+| Multipart concurrency | F6a | Bounded missing-part pool |
+| Streaming/hash/temp/directory duplication | F6b | Verified staging; preserve final apply guard |
+| Debounce preparation and receive prefetch | F6c, S4e | Bounded hints; no new publication authority |
+| Whole-file large edit cost | F7 | Content-defined chunk experiment then gated format |
+| Accepted commit/alarm/mirror recovery | S1 | Durable maintenance and isolated ACK changes |
+| Interned local state growth | S2 | Schema-aware reverse index and bounded maintenance |
+| Server repeated fold prefixes | S3a | One live iterator, unchanged recovery cursor |
+| Large history responses / offline catchup | S3b, S6a | Byte-bounded verification then proof experiment |
+| Receipt/envelope round trips and WS doorbells | S4 | Trusted transport identity/revocation prerequisite |
+| Full refset every commit | S5 | Parent-bound delta/checkpoint protocol |
+| Per-account D1 contention | S6b | Measured two-shard routing/migration experiment |
+| Full canonical manifest work / portable mtime | X1 | Current format optimization then authenticated tree |
+| LAN peer transfer | X2 | Ciphertext source experiment; cloud authority retained |
+| Git object inventory and background compaction | X3 | Shared-store reuse; completeness before mutation |
+| Native Git implementation/service | X4 | Last-mile experiment after batching |
+| Portable agent work sessions | G6 | Emerges from complete checkout snapshots; no extra session authority |
+
+## Verification, integration and release runbook
+
+**Per package:** create a fresh isolated worktree from the intended baseline; recheck next-free design/migration numbers after rebase; read this source and the package's accepted supplement; write red regressions; complete at most three adversarial rounds; implement the smallest coherent slice through the existing owner. An architectural package is not ready to code until its exact durable transition table and compatibility proof are accepted. Update module `Never:` lines when ownership changes.
+
+Run relevant tests and supported-runtime typecheck, `bun run lint:affected`, compiled CLI packaging smoke, and the named real rig scenarios. The initial focused commands include `bun test src/engine/manifest-stability.test.ts src/engine/manifest-scan-fault.test.ts src/engine/manifest-walk-concurrency.test.ts src/cli/daemon/watcher-trust.test.ts`, Git capture/reachability suites, state `delta-cas`/`fused-consume`/`store-open` suites, and `bun run test:api` for API slices. Select actual files at implementation time and record commands/results, including baseline failures. No blanket full-suite repetition after unchanged successful checks.
+
+**Rig acceptance:** `bun run rig doctor`, prepare the compiled candidate and baseline according to the existing rig's binary-selection interface, then run relevant named scenarios. Confirm the rig's current `--help` and use separate ephemeral devices/accounts; do not repoint a live fleet merely to obtain a passing check. API candidates must be tested against DEV. Test user journeys include independent cold receiver, repeated no-change sync, worktree creation/removal/relocation, held-repo recovery, local edits during pull, and restart across every durable Git/state/remote boundary.
+
+**Promotion:** green CI is required before merge. `main` auto-deploys DEV API changes; DEV verification precedes an explicit fast-forward to `production` under `docs/DEPLOYMENTS.md`. API migrations are append-only, chosen after rebase, and tested before production application. CLI release channels and daemon restart behavior follow the same runbook. This plan issues no deployment, merge or release action.
+
+**Rollback matrix:**
+
+| Change class | Allowed rollback | Material that must remain readable |
+|---|---|---|
+| Pure performance optimization | Existing slower path | All current artifacts and recovery records |
+| Correctness/cache identity fix | Conservative miss/refusal/fresh observation | Never restore known-bad cached authority as normal behavior |
+| Disposable cache schema | Discard/rebuild cache; keep logical state | Authoritative state and upload recovery context |
+| Additive state index/maintenance | Disable collector; retain compatible index | Live referenced values, lineage/CAS records |
+| New local schema | Only a tested compatible reader or explicit refusal | Original backup plus all newly committed semantics |
+| New manifest/refset/chunk/topology format | Stop writers, retain readers and GC roots | Every published historical version until proper retirement |
+| Rich WS/prepared data | Doorbell/poll and normal fetch | Signature/pin verification and accepted remote log |
+| Peer/native-plumbing experiment | Disable optional byte/probe source | Cloud/Git canonical fallback and owned process cleanup |
+
+Temporary performance switches should use existing capability/policy mechanisms when sufficient. If a new switch is necessary, its scoped design names owner, default, telemetry, safe fallback, supported-reader floor, removal condition and reevaluation date. No automatic “one flag per package.” No removal of active recovery/migration/rollout code without the full deletion ledger.
+
+**Completion criteria:** each shipped package has before/after evidence, no unsupported change to protected behavior, rollback demonstrated, no unexplained new hold/conflict, bounded resources and an accepted end-to-end result. A program can legitimately stop after measured fixes if later experiments fail their go/no-go gates. That is a successful evidence-driven outcome, not a reason to ship speculative mechanisms.
+
+## Planning evidence and review status
+
+This document was drafted from the audit and current source, with separate Git, file and server/state planning passes. During planning, bounded executable probes validated private split-index normalization without source mutation and demonstrated CRLF Git-object/working-file mismatch. The state schema suite ran with 13 pass / 2 environment failures under Bun 1.3.14; supported-runtime acceptance remains open. These are planning evidence, not implementation validation.
+
+Two adversarial roadmap rounds are complete; both GPT reviewers accepted the revised document as a staged roadmap. This does not certify gated protocols implementation-ready. Findings are recorded in `docs/design/reviews/REVIEW-287-1.md` and subsequent numbered rounds, capped at three. Later scoped designs also use the user-authorized Claude Fable5.1 medium reviews; those verdicts are recorded separately and do not retroactively certify every roadmap package. No reviewer result can approve an unresolved product decision by assumption.
+
+
+## Open Questions
+
+The user accepted all recommended choices in this task after reviewing the plan. Those decisions are recorded below; the form remains available for proposing revisions. Browser-local notes do not override the recorded decisions until communicated in the task.
+
+| Decision | Accepted choice |
+|---|---|
+| Initial execution scope | Correctness and measured local fixes: G1/F1/F2/G5, plus independent S1 recovery; larger formats remain separately gated |
+| Checkout conflicts | Preserve local state and hold the affected checkout and dependent shared-state effects |
+| Essential new formats | Require an enforced capable writer/reader floor before activation |
+| Broader Git priority | Sparse checkout and bare/separate common stores first |
+| Content equivalence | Retain current policy and clarify its evidence/recoverability |
+| Partial-clone hydration | Allow bounded, visible native hydration with cancellation |
+
+**Next execution milestones:** land the four independently committed G1/F1/F2 fixes after green CI, then update `docs/STATUS.md` for a possible agent/host handoff. Stop this implementation batch there, per the user’s latest instruction. Historical split-artifact repair, G5 ancestry batching and S1 scheduling recovery remain separate work. Each candidate requires targeted tests, crash/compatibility checks, the relevant rig run and recorded before/after performance before release. The roadmap authorization does not remove these gates or authorize production deployment.
+
+**Which scope should the first implementation authorization cover?**
+
+- Correctness and measured local fixes **(recommended)**: Start G1/F1/F2/G5 plus independent server recovery; larger formats remain separate approvals.
+- Whole program with gated experiments: Proceed through research packages, with durable-format and product decisions still required before rollout.
+
+**When two devices independently change the same checkout, what should the receiver do?**
+
+- Preserve local state and hold that checkout **(recommended)**: Only checkouts with unaffected shared-state dependencies continue; explicit resolution selects the landing.
+- Create a separate preserved checkout: Requires naming, retention and cleanup policy for additional directories.
+
+**How should essential new topology/refset/chunk formats enter a mixed client fleet?**
+
+- Require a proven capable writer/reader floor **(recommended)**: Keep old format until eligible; old incompatible clients refuse safely after activation.
+- Build a compatibility projection: Additional representation and GC/accounting complexity; must prove old writers cannot erase new semantics.
+
+**Which broader Git capabilities should be prioritized after complete current-format snapshots?**
+
+- Sparse checkout and bare/separate common stores **(recommended)**: Most directly extends seamless worktrees.
+- SHA-256 and reftable: Requires format-aware object/ref plumbing and compatibility gates.
+- Submodules and portable LFS availability: Requires nested object-store ownership and external-content policy.
+
+**Should historical patch equivalence continue authorizing the current preservation behavior?**
+
+- Retain current policy and clarify evidence **(recommended)**: Keep recoverability; distinguish historical occurrence from present-tree content.
+- Require a narrower reviewed proof: Potentially more holds; characterize actual pin retention and approve policy change first.
+
+**What should happen when Git capture needs missing partial-clone objects?**
+
+- Allow bounded, visible native hydration **(recommended)**: Preserves supported online behavior with cancellation/inactivity bounds.
+- Hold until objects are available locally: Avoids network from capture but changes current partial-clone behavior.

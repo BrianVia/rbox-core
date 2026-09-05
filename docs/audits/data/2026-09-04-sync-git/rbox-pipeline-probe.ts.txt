@@ -1,0 +1,35 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
+import {applyWatchEvents} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/manifest.ts';
+import {EncryptAddressCache} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/encrypt-address-cache.ts';
+import {buildIgnoreMatcher} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/ignore.ts';
+const root = await fs.mkdtemp('/private/tmp/rbox-pipeline-probe-');
+const hex=(n:number)=>n.toString(16).padStart(64,'0');
+const median=(a:number[])=>a.sort((a,b)=>a-b)[Math.floor(a.length/2)];
+const time=async(fn:()=>unknown)=>{const t=performance.now();await fn();return performance.now()-t;};
+try{
+for(const n of [1000,10000,124000]){
+const base={generatedAt:'probe',files:Array.from({length:n},(_,i)=>({path:`d/f-${i.toString().padStart(6,'0')}`,sha256:hex(i+1),mode:420,size:32,mtimeMs:0,type:'file' as const}))};
+const watch:number[]=[];
+for(let i=0;i<7;i++)watch.push(await time(()=>applyWatchEvents(base,root,{ignores:()=>true},[{kind:'change',relPath:'ignored.tmp'}])));
+const cache = new EncryptAddressCache({accountId:'probe',workspaceId:'probe',accountEpoch:1,keyEpoch:1});
+for(let i=0;i<n;i++)cache.record(hex(i+1),{encSha:hex(i+1000000),cipherSize:48,path:`d/f-${i.toString().padStart(6,'0')}`});
+await cache.save(root);
+const saves:number[]=[], loads:number[]=[];
+for(let i=0;i<3;i++){
+cache.record(hex(n+1),{encSha:hex(n+1000001+i),cipherSize:48,path:'changed'});
+saves.push(await time(()=>cache.save(root)));
+loads.push(await time(()=>EncryptAddressCache.load(root,{accountId:'probe',workspaceId:'probe',accountEpoch:1,keyEpoch:1})));
+}
+console.log(JSON.stringify({n,watchIgnoredMedianMs:median(watch),watch,encryptCacheBytes:(await fs.stat(path.join(root,'.rbox/state/encrypt-cache.json'))).size,oneChangeSaveMedianMs:median(saves),loadMedianMs:median(loads),saves,loads}));
+}
+const gitRoot=path.join(root,'git-repro');await fs.mkdir(gitRoot);
+const git=(args:string[])=>{const r=spawnSync('git',args,{cwd:gitRoot,encoding:'utf8'});if(r.status!==0)throw Error(r.stderr);return r.stdout;};
+git(['init','-q']);await fs.writeFile(path.join(gitRoot,'.gitignore'),'*.secret\n');await fs.writeFile(path.join(gitRoot,'a.secret'),'aaa');await fs.writeFile(path.join(gitRoot,'b.secret'),'bbb');git(['add','-f','a.secret']);
+const index=path.join(gitRoot,'.git/index');const stamp=new Date(1700000000000);await fs.utimes(index,stamp,stamp);const firstSize=(await fs.stat(index)).size;
+const matcherA=buildIgnoreMatcher(gitRoot,{respectGitignore:true});
+git(['rm','--cached','a.secret']);git(['add','-f','b.secret']);await fs.utimes(index,stamp,stamp);const secondSize=(await fs.stat(index)).size;
+const matcherB=buildIgnoreMatcher(gitRoot,{respectGitignore:true});
+console.log(JSON.stringify({trackedCacheProbe:{firstSize,secondSize,gitTracked:git(['ls-files']),before:{a:matcherA.tracked?.('a.secret'),b:matcherA.tracked?.('b.secret')},after:{a:matcherB.tracked?.('a.secret'),b:matcherB.tracked?.('b.secret'),bIgnored:matcherB.ignores('b.secret')}}}));
+}finally{await fs.rm(root,{recursive:true,force:true});}

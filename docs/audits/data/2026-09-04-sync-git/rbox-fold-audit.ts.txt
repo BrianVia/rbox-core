@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+const source=fs.readFileSync('/Users/via/.codex/worktrees/a53f/rbox-core/apps/api/src/workspace-sync.ts','utf8');
+const begin=source.indexOf('function diffChunk('),end=source.indexOf('\ninterface BodyMirrorHeadRow',begin);
+const module='/private/tmp/rbox-fold-production-extract.ts';
+fs.writeFileSync(module,'const FOLD_CHUNK=5000; export '+source.slice(begin,end));
+const {diffChunk}=await import(module);
+let visits=0;
+class CountedSet extends Set<string>{*[Symbol.iterator](){for(const item of super[Symbol.iterator]()){visits++;yield item;}}}
+const left=new CountedSet(Array.from({length:250000},(_,i)=>i.toString(16).padStart(64,'0'))),right=new Set<string>();
+let cursor='',chunks=0;const t0=performance.now();
+while(true){const chunk=diffChunk(left,right,cursor);if(!chunk.length)break;chunks++;cursor=chunk.at(-1)!;}
+console.log({refs:left.size,chunks,visits,visits_per_ref:visits/left.size,elapsed_ms:performance.now()-t0});

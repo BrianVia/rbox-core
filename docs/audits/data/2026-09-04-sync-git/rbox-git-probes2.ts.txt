@@ -1,0 +1,10 @@
+import fs from 'node:fs/promises';import path from 'node:path';import {execFileSync} from 'node:child_process';
+import {captureGitState} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/capture.ts';
+import {applyGitState} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/git-state-apply.ts';
+import {indexIdentityV2} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/cli/sync-git/index-identity.ts';
+import {setGitSpawnObserver} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/git-spawn.ts';
+import {LocalBlobStore} from '/Users/via/.codex/worktrees/a53f/rbox-core/src/engine/blobstore.ts';
+const temp=await fs.mkdtemp('/private/tmp/rbox-git-probes2-');const root=path.join(temp,'main');await fs.mkdir(root);Object.assign(process.env,{GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1',GIT_AUTHOR_NAME:'test',GIT_AUTHOR_EMAIL:'test@example.invalid',GIT_COMMITTER_NAME:'test',GIT_COMMITTER_EMAIL:'test@example.invalid'});
+const git=(root:string,...args:string[])=>execFileSync('git',['-C',root,...args],{encoding:'utf8'}).trim();git(root,'init','-qb','main');await fs.writeFile(path.join(root,'a'),'a');git(root,'add','.');git(root,'commit','-qm','initial');git(root,'update-index','--split-index');
+const store=new LocalBlobStore(path.join(temp,'store')),kek=Buffer.alloc(32,7);let sec=await captureGitState(root,store,kek);const fresh=path.join(temp,'fresh');await fs.mkdir(fresh);console.log('SPLIT_APPLY',await applyGitState(fresh,sec!,store,kek));try{console.log('FRESH_INDEX',git(fresh,'ls-files','--stage'));}catch(e){console.log('FRESH_INDEX_ERR',String(e));}
+let calls=0;setGitSpawnObserver(()=>calls++);let t=performance.now();let id=await indexIdentityV2(root,path.join(root,'.git/index'));console.log('INDEX_IDENTITY',JSON.stringify({id,ms:performance.now()-t,calls}));setGitSpawnObserver(undefined);console.log('ROOT',temp);
