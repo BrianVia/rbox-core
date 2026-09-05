@@ -90,14 +90,25 @@
   constantly → fingerprint miss), runs the branch-deletion witness, and is
   refused on the first missing branch (`origin-mismatch+artifacts-standing`)
   — 456 times today — after paying ~1.5s of `for-each-ref` in
-  `prepareFollowerBranchProtocol`. **#902 OPEN (design 308)**: decide the
+  `prepareFollowerBranchProtocol`. **#902 MERGED (design 308, `0a3d4565a`)**: decide the
   cheap per-branch refusals (scope, recorded origin) BEFORE the artifact
-  scan — same verdict, ~0 cost. **Product finding for the founder:** that
+  scan — same verdict, ~0 cost; the witness now lives in
+  `sync-git/branch-deletion-witness.ts` (plan.ts back under its ratchet).
+  **307 PROVEN on the desktop:** after the watcher regained trust (~15 min
+  post-restart, `pull local=trusted`), the next push read `discover=0`;
+  empty push 6.3s → 5.4s (git-plan 3.6 → 2.7s). **Product finding for the founder:** that
   repo's BASE has 286 heads but only 9 recorded origins (pre-274 records),
   so the 285 deletions cannot be proven from this device and stay deferred
   ("finishing a branch deletion on checkout unavailable"); finishing them
-  is a product/user action, not perf. **Desktop now dogfoods
-  `2.0.2-dev+60dfaa7`** (pid 2204950, ~22:05Z) to read `discover=` after 307. Codex stalled at startup twice today (rmcp
+  needed a product decision — **founder (2026-09-05 22:20Z): "let this
+  device's capture count as delete"** → **#903 OPEN (design 309)**: an
+  origin-less branch is deletable when the BASE section's design-274 author
+  stamp is this device (the branch existed here at capture); foreign or
+  unstamped sections still refuse. `rbox git resolve` has no verb for
+  outgoing deferrals (noted). **Desktop now dogfoods `2.0.2-dev+0a3d456`**
+  (pid 2401560, ~22:32Z; 308 in). After #903 merges, dev-build the desktop
+  and confirm the 285 deletions publish (tombstones) and the `git-sync
+  deferred Personal/rbox-core` line stops. Codex stalled at startup twice today (rmcp
   AuthRequired on the Cloudflare MCP); part 1 was done by hand. Remaining
   after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
