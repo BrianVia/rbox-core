@@ -130,11 +130,13 @@ export async function stagedIndexObjectOids(repoDir: string, stagedIndex: string
   const oids = new Set<string>();
   for (const entry of stagedEntries.split("\0")) {
     if (!entry) continue;
-    const match = /^\d+\s+([0-9a-f]{40})\s+\d+\t/.exec(entry);
-    if (!match || /^0{40}$/.test(match[1]!)) continue;
-    await git(repoDir, ["cat-file", "-e", `${match[1]}^{object}`]);
-    oids.add(match[1]!);
+    const match = /^(100644|100755|120000|160000|040000) ([0-9a-f]{40}) [0-3]\t[\s\S]+$/.exec(entry);
+    if (!match || /^0{40}$/.test(match[2]!)) throw new Error("invalid staged index object entry");
+    if (match[1] === "160000") continue;
+    const oid = match[2]!;
+    oids.add(oid);
   }
+  for (const oid of oids) await git(repoDir, ["cat-file", "-e", `${oid}^{object}`]);
   return [...oids].sort();
 }
 
@@ -318,7 +320,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     if (wip) pinShas.add(wip);
     const indexTree = stagedIndex ? await indexTreeOfPath(ctx, stagedIndex) : undefined;
     if (opts.resolution && indexTree && /^[0-9a-f]{40}$/.test(indexTree)) pinShas.add(indexTree);
-    if (opts.resolution && stagedIndex && indexTree?.startsWith("raw:")) {
+    if (stagedIndex && indexTree?.startsWith("raw:")) {
       for (const oid of await stagedIndexObjectOids(repoDir, stagedIndex)) pinShas.add(oid);
     }
     if (opts.resolution) for (const oid of Object.values(refs)) pinShas.add(oid);
