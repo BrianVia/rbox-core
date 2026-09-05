@@ -118,7 +118,11 @@
   pays the full artifact scan every push again (`carried≈1.4s`), so
   **#904 OPEN (design 311)** remembers an `(artifacts-standing)` refusal per
   repo under a token of the `refs/rbox-local` plane + missing set and skips
-  the scan while it is unchanged. **Founder decision needed (design 310):** a manual
+  the scan while it is unchanged. **CI runner degradation (evening):** every
+  PR today hit FLAKE-012 at least once; #904's shard 2/6 failed three reruns
+  in a row, twice with a new variant `The Worker returned HTTP 401 while
+  waiting for GitHub's runner assignment`. Founder owes the runner wizard
+  (`npx -y cloudflare-github-actions-runner@latest`). **Founder decision needed (design 310):** a manual
   verb to discard standing CREATE-P receipts (`rbox git resolve <repo>
   discard-incoming --confirm`) vs landing them (take-theirs, which re-creates
   the 206 branches locally so a second local delete records pull-p origins). Then the other
