@@ -41,6 +41,8 @@ export interface WatchOptions {
   onError?: (err: Error) => void;
   /** Fires after matcher filtering and before debounce coalescing. */
   onRawEvent?: (event: WatchEvent) => void;
+  /** Exact `.git` lifecycle invalidation, synchronously before candidate debounce. */
+  onGitCandidate?: () => void;
   /** Daemon-owned shared debouncer, also used by registry arm handshakes. */
   signalDebouncer?: SignalDebouncer;
   /** Initial watcher-start discovery, awaited before readiness. */
@@ -53,13 +55,12 @@ export interface WatchOptions {
   onArm?: () => void;
 }
 
-const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
-  add: "add",
-  change: "change",
-  unlink: "unlink",
-  addDir: "addDir",
-  unlinkDir: "unlinkDir",
-};
+function watchEventKind(event: string): WatchEventKind | undefined {
+  switch (event) {
+    case "add": case "change": case "unlink": case "addDir": case "unlinkDir": return event;
+    default: return undefined;
+  }
+}
 
 /**
  * Watch `root`, honoring the same ignore matcher as the scanner so ignored dirs
@@ -107,6 +108,7 @@ export interface Batcher {
 }
 
 export interface SignalDebouncer {
+  readonly queued: boolean;
   push(reason: GitSignalReason, candidate?: RepoCandidateWork): void;
   dispose(): void;
 }
@@ -203,6 +205,7 @@ export function createSignalDebouncer(
   };
 
   return {
+    get queued() { return signal || candidateReason || other; },
     push(reason, candidate) {
       trace?.debouncerArmed("git");
       if (reason === "signal") signal = true;
@@ -364,6 +367,7 @@ async function startParcel(
         const candidate = classifyRepoCandidate(rel, ev.type);
         if (candidate) {
           opts.propagationTrace?.eventSeen("git");
+          opts.onGitCandidate?.();
           signalDebouncer?.push("candidate", candidate);
           continue;
         }
@@ -463,7 +467,7 @@ function startChokidar(
 
   watcher.on("error", (e) => opts.onError?.(e instanceof Error ? e : new Error(String(e))));
   watcher.on("all", (event: string, abs: string) => {
-    const kind = EVENT_KIND[event];
+    const kind = watchEventKind(event);
     if (!kind) return;
     const rel = toRel(abs);
     if (rel === "" || escapesRoot(rel)) return; // parity with the parcel path
@@ -473,6 +477,7 @@ function startChokidar(
     const candidate = classifyRepoCandidate(rel, candidateKind);
     if (candidate) {
       opts.propagationTrace?.eventSeen("git");
+      opts.onGitCandidate?.();
       signalDebouncer?.push("candidate", candidate);
       return;
     }

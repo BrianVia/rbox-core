@@ -191,7 +191,7 @@ test("the scan forwards its topology observation with the horizon sealed BEFORE 
   const receipt = await h.observer.observe(scanPlan(h, { scanKind: "safety scan", mode: "pruned" }));
 
   expect(h.snapshots).toEqual(["safety scan"]);
-  expect(h.topology).toEqual([{ kind: "scan", repos: [], mode: "pruned", snapshot: { scanKind: "safety scan", registryEpoch: 42 } }]);
+  expect(h.topology).toEqual([{ kind: "scan", repos: [], mode: "pruned", snapshot: { scanKind: "safety scan", registryEpoch: 42 }, complete: true }]);
   expect(receipt.topology?.kind).toBe("scan");
   // Coverage originates from the dircache, never from the plan's prune request.
   expect(receipt.coverage).toBe("full-tree");

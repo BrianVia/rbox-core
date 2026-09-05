@@ -69,7 +69,7 @@ import { envInt } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
 import { createPropagationTrace } from "./propagation-trace.js";
-import { GitDiscoveryContinuity } from "./git-discovery-continuity.js";
+import { GitDiscoveryContinuity, type PlanTopologyGate } from "./git-discovery-continuity.js";
 import {
   WatcherRecoveryScanError,
   WatcherSessionSupervisor,
@@ -606,7 +606,8 @@ export class RboxDaemon {
       dircache: () => (scanPruneEnabled() ? this.dircache : undefined),
       matcherGeneration: () => this.matcherGeneration,
       scanMode: () => this.watcherScanMode(),
-      beginTopologySnapshot: (scanKind) => this.gitDiscovery.beginScanSnapshot(scanKind),
+      beginTopologySnapshot: (scanKind) => this.gitDiscovery.beginScanSnapshot(scanKind, this.planTopologyGate()),
+      planTopologyGate: () => this.planTopologyGate(),
       observeTopology: (observation) => this.gitDiscovery.observe(observation),
       authority: this.local,
       log: (line) => this.log(line),
@@ -716,6 +717,9 @@ export class RboxDaemon {
       },
       onRawEvent: (event) => {
         if (this.resetLifecycle !== "ready") return;
+        if (isIgnoreRuleFile(event.relPath) || event.kind === "addDir" || event.kind === "unlinkDir") {
+          this.gitDiscovery.invalidatePlanTopology();
+        }
         if (isIgnoreRuleFile(event.relPath)) this.watcherSessions.matcherRebuilt();
         const { wasUnsettled } = this.watcherTrust.observe({ kind: "raw-event" });
         this.noteChurn();
@@ -726,6 +730,7 @@ export class RboxDaemon {
         }
       },
       onError: (error) => this.watcherTrust.observe({ kind: "error", error }),
+      onGitCandidate: () => this.gitDiscovery.invalidatePlanTopology(),
       onGitBatch: (batch) => void this.handleGitSignalBatch(batch),
       attachRefBackend: ({ initial, onSignal, onArmed }) => this.gitDiscovery.attachRefBackend({
         root: this.root,
@@ -1972,6 +1977,7 @@ export class RboxDaemon {
     const prologueMs = performance.now() - prologueT0;
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
+    let planTopologyWitness: PlanTopologyGate | undefined;
     const receipt = await this.publishTransition.publish(provenance, {
       appliedBase: this.syncBase?.lastSyncedManifest,
       execute: (request) => classifyPublishOutcome(request, () => pushManifest(this.root, this.cfg, request.manifest, {
@@ -1983,7 +1989,15 @@ export class RboxDaemon {
         report,
         onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
         onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
-        onGitReposDiscovered: async (repos) => { await this.gitDiscovery.observe({ kind: "plan", repos }); },
+        trustedGitTopology: () => {
+          planTopologyWitness = this.planTopologyGate();
+          return this.gitDiscovery.trustedTopologyForPlan(planTopologyWitness);
+        },
+        onGitReposDiscovered: async ({ repos, complete }) => {
+          const gateBefore = planTopologyWitness;
+          planTopologyWitness = undefined;
+          await this.gitDiscovery.observe({ kind: "plan", repos, complete, gateBefore, gateAfter: this.planTopologyGate() });
+        },
         ownedRefMutationBoundary: this.gitDiscovery,
         onGitBusyDeferred: (repos) => { if (repos.length > 0) this.noteGitBusyDeferred(); },
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
@@ -2692,6 +2706,7 @@ export class RboxDaemon {
 
   /** Durable remote-sequence adoption, including Git-ref-only pulls with no file actions. */
   private recordPullAdopted(adoptedSequence: number, phaseMs?: Record<string, number>): void {
+    this.gitDiscovery.invalidatePlanTopology();
     this.log(`pull apply complete ADOPTED sequence ${adoptedSequence}`);
     this.propagationTrace?.applyComplete(adoptedSequence, phaseMs);
   }
@@ -2964,6 +2979,7 @@ export class RboxDaemon {
   }
 
   private rebuildMatcher(state?: { lastSyncedManifest: Manifest }, armRecertification = false): void {
+    this.gitDiscovery.invalidatePlanTopology();
     this.matcher = buildIgnoreMatcher(this.root, {
       respectGitignore: this.cfg.respectGitignore === true,
       ignorePaths: this.cfg.ignorePaths ?? [],
@@ -2973,6 +2989,18 @@ export class RboxDaemon {
     this.matcherGeneration++;
     if (!armRecertification) this.watcherSessions.matcherRebuilt();
     this.watcherTrust.observe({ kind: "matcher-rebuilt", matcher: this.matcher });
+  }
+
+  private planTopologyGate(): PlanTopologyGate {
+    return {
+      topologyEpoch: this.gitDiscovery.currentTopologyEpoch,
+      matcherGeneration: this.matcherGeneration,
+      watcherErrorGeneration: this.watcherTrust.snapshot().errorGeneration,
+      watcherTrusted: this.watcherTrust.trustedForPull(),
+      matcherRebuildPending: this.folderMatcherRebuildPending,
+      policyRecyclePending: this.folderPolicyRecyclePending,
+      queuedCandidateWork: this.watcherSessions.queuedGitWork,
+    };
   }
 
   /**

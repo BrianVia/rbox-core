@@ -4606,3 +4606,49 @@ test("design 226: gitForceForMissingBlobs still re-flushes an artifact the serve
   }
   expect(await retainedGitCiphertext(rootA)).toEqual([]);
 }, 90_000);
+
+test("design 307: ordinary planning reuses exact topology without re-reporting and matches a fresh walk", async () => {
+  const rel = "topology-stable";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const observations: Array<{ repos: readonly { relPath: string }[]; complete: boolean }> = [];
+
+  const walked = await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    onGitReposDiscovered: async (observation) => { observations.push(observation); },
+  });
+  expect(observations).toEqual([{ repos: [{ relPath: rel, kind: "dir" }], complete: true }]);
+
+  observations.length = 0;
+  const reused = await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    trustedGitTopology: () => [{ relPath: rel, kind: "dir" }],
+    onGitReposDiscovered: async (observation) => { observations.push(observation); },
+  });
+  expect(observations).toEqual([]);
+  const stable = (plan: GitPushPlan) => JSON.parse(JSON.stringify(gitPlanSurface(plan)), (key, value) =>
+    key === "generatedAt" || key === "ts" ? "<time>" : value);
+  expect(stable(reused)).toEqual(stable(walked));
+});
+
+test("design 307: invalidation between topology access and planning falls back and captures the new repo", async () => {
+  const rel = "appeared-after-certificate";
+  const observed: string[][] = [];
+  let reads = 0;
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+    trustedGitTopology: () => {
+      reads++;
+      fsSync.mkdirSync(path.join(rootA, rel, ".git"), { recursive: true });
+      return undefined;
+    },
+    onGitReposDiscovered: async ({ repos, complete }) => {
+      expect(complete).toBe(true);
+      observed.push(repos.map((repo) => repo.relPath));
+    },
+    onGitLog: () => {},
+  });
+  expect(reads).toBe(1);
+  expect(observed).toEqual([[rel]]);
+});

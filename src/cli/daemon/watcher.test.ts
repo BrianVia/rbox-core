@@ -44,7 +44,7 @@ async function probeNativeWatch(attempts = 3): Promise<{ ok: boolean; err: strin
   for (let i = 0; i < attempts; i++) {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-probe-")));
     try {
-      const parcel = req("@parcel/watcher") as { subscribe: (d: string, f: () => void, o: object) => Promise<{ unsubscribe(): Promise<void> }> };
+      const parcel = req("@parcel/watcher") as { subscribe: (d: string, f: () => void, o: { ignore?: string[]; backend?: "fs-events" | "inotify" }) => Promise<{ unsubscribe(): Promise<void> }> };
       const sub = await parcel.subscribe(dir, () => {}, {});
       await sub.unsubscribe();
       return { ok: true, err: "" };
@@ -263,17 +263,34 @@ test("chokidar keeps exact .git lifecycle events signal-only", async () => {
   const settled: WatchEvent[] = [];
   const raw: WatchEvent[] = [];
   const signals: GitSignalBatch[] = [];
+  const candidateQueuedAtInvalidation: boolean[] = [];
+  const signalDebouncer = createSignalDebouncer((batch) => signals.push(batch), 30, 3000);
   active = await startWatcher(root, buildIgnoreMatcher(root), (events) => settled.push(...events), {
     backend: "chokidar",
     debounceMs: 30,
     onRawEvent: (event) => raw.push(event),
-    signalDebouncer: createSignalDebouncer((batch) => signals.push(batch), 30, 3000),
+    signalDebouncer,
+    onGitCandidate: () => candidateQueuedAtInvalidation.push(signalDebouncer.queued),
   });
   await new Promise((resolve) => setTimeout(resolve, 150));
   await git(repo, "init", "--initial-branch=main", "--quiet");
   expect(await waitFor(() => signals.some((batch) => batch.reasons.candidate))).toBe(true);
+  expect(candidateQueuedAtInvalidation.length).toBeGreaterThan(0);
+  expect(candidateQueuedAtInvalidation.every((queued) => !queued)).toBe(true);
   expect(settled.some((event) => event.relPath.split("/").includes(".git"))).toBe(false);
   expect(raw.some((event) => event.relPath.split("/").includes(".git"))).toBe(false);
+});
+
+test("signal debouncer exposes only currently queued work", async () => {
+  const batches: GitSignalBatch[] = [];
+  const debouncer = createSignalDebouncer((batch) => batches.push(batch), 20, 3000);
+  expect(debouncer.queued).toBe(false);
+  debouncer.push("candidate", { owner: "repo", dirty: true, discover: true });
+  expect(debouncer.queued).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  expect(batches).toHaveLength(1);
+  expect(debouncer.queued).toBe(false);
+  debouncer.dispose();
 });
 
 test("batcher maxWait cap flushes a sustained burst even without a quiet gap", async () => {
