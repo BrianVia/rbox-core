@@ -9,12 +9,13 @@
  * `setGitSpawnObserver` seam — the same seam the status-performance assertions
  * use — so nothing is mocked and every git call is real.
  */
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { git, setGitSpawnObserver } from "../../engine/git-spawn.js";
-import { deleteRefsBatch, pruneStaleScratchRefs, WIP_NS } from "./pins.js";
+import { createScratchPins, deleteRefsBatch, pruneStaleScratchRefs, WIP_NS } from "./pins.js";
 import { listRefs } from "./refs.js";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -62,8 +63,108 @@ function countUpdateRefSpawns(): () => number {
   return () => spawns;
 }
 
+async function refValues(dir: string, ns: string): Promise<Map<string, string>> {
+  const out = await git(dir, ["for-each-ref", "--format=%(refname) %(objectname)", ns]);
+  return new Map(out.split("\n").filter(Boolean).map((line) => line.split(" ") as [string, string]));
+}
+
 const stale = `${WIP_NS}/${Date.now() - 2 * HOUR_MS}-dead`;
 const fresh = `${WIP_NS}/${Date.now()}-live`;
+
+test("creating 1, 50, or 500 pins takes one transaction with exact ordered values", async () => {
+  for (const count of [1, 50, 500]) {
+    const { dir, head } = await fixture([]);
+    const spawns = countUpdateRefSpawns();
+    const pins = await createScratchPins(dir, Array<string>(count).fill(head));
+
+    expect(spawns()).toBe(1);
+    expect(pins.refs).toHaveLength(count);
+    const namespaces = new Set(pins.refs.map((ref) => ref.slice(0, ref.lastIndexOf("/"))));
+    expect(namespaces.size).toBe(1);
+    const [namespace] = namespaces;
+    expect(pins.refs.every((ref, n) => ref === `${namespace}/${n}`)).toBe(true);
+    const values = await refValues(dir, WIP_NS);
+    expect(values.size).toBe(count);
+    for (const ref of pins.refs) expect(values.get(ref)).toBe(head);
+  }
+});
+
+test("creating no pins returns without spawning git", async () => {
+  const spawns = countUpdateRefSpawns();
+  expect(await createScratchPins("not-a-repository", [])).toEqual({ refs: [] });
+  expect(spawns()).toBe(0);
+});
+
+test("an invalid object aborts, cleans up under one lease, and preserves the git error", async () => {
+  const { dir, head } = await fixture([]);
+  const events: string[] = [];
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "update-ref") events.push("spawn");
+  });
+  let failure: unknown;
+  try {
+    await createScratchPins(dir, [head, "f".repeat(40), head], {
+      enterOwnedRefMutation: async () => {
+        events.push("enter");
+        return { finish: async () => { events.push("finish"); } };
+      },
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  expect(events).toEqual(["enter", "spawn", "spawn", "finish"]);
+  expect(await listRefs(dir, WIP_NS)).toEqual([]);
+  expect(failure).toBeInstanceOf(Error);
+  const gitError = failure as Error & { code?: unknown; stdout?: unknown; stderr?: unknown };
+  expect(gitError.message).toContain("trying to write ref");
+  expect(gitError.code).toBe(128);
+  expect(gitError.stdout).toBe("");
+  expect(gitError.stderr).toBe(gitError.message);
+});
+
+test("one locked target aborts the whole pin batch", async () => {
+  const { dir, head } = await fixture([]);
+  const now = 123456789;
+  const dateNow = spyOn(Date, "now").mockImplementation(() => now);
+  const randomBytes = spyOn(crypto, "randomBytes").mockImplementation((size) => Buffer.alloc(size, 0x66));
+  const ns = `${WIP_NS}/${now}-66666666`;
+  const lock = path.join(dir, ".git", `${ns}/1.lock`);
+  try {
+    await fs.mkdir(path.dirname(lock), { recursive: true });
+    await fs.writeFile(lock, "");
+    await expect(createScratchPins(dir, [head, head, head])).rejects.toThrow();
+    expect(await listRefs(dir, ns)).toEqual([]);
+  } finally {
+    dateNow.mockRestore();
+    randomBytes.mockRestore();
+  }
+});
+
+test("one boundary lease covers the creation transaction", async () => {
+  const { dir, head } = await fixture([]);
+  let entered = 0;
+  let finished = 0;
+  await createScratchPins(dir, Array<string>(50).fill(head), {
+    enterOwnedRefMutation: async () => {
+      entered += 1;
+      return { finish: async () => { finished += 1; } };
+    },
+  });
+  expect(entered).toBe(1);
+  expect(finished).toBe(1);
+});
+
+test("concurrent sibling pin batches use distinct namespaces", async () => {
+  const { dir, head } = await fixture([]);
+  const [left, right] = await Promise.all([
+    createScratchPins(dir, [head, head]),
+    createScratchPins(dir, [head, head]),
+  ]);
+  const namespaceOf = (ref: string) => ref.slice(0, ref.lastIndexOf("/"));
+  expect(namespaceOf(left.refs[0]!)).not.toBe(namespaceOf(right.refs[0]!));
+  expect(await listRefs(dir, WIP_NS)).toHaveLength(4);
+});
 
 test("deleting N refs spawns exactly one git process, and none for N=0", async () => {
   const { dir } = await fixture(["refs/rbox-incoming/1-aa/0", "refs/rbox-incoming/1-aa/1", "refs/rbox-incoming/1-aa/2"]);

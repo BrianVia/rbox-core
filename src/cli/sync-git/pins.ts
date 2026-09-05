@@ -96,18 +96,19 @@ export async function deleteRefsBatch(repoDir: string, refs: string[], boundary?
  *  `refs/rbox-wip/<epochMs>-<rand>/<n>`: linked worktrees share one ref store, so a
  *  single global scratch ref would race under concurrent sibling captures [v2, B2]. */
 export async function createScratchPins(repoDir: string, shas: string[], boundary?: OwnedRefMutationBoundary): Promise<ScratchPins> {
+  if (shas.length === 0) return { refs: [] };
   const ns = `${WIP_NS}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const refs: string[] = [];
+  const refs = shas.map((_, n) => `${ns}/${n}`);
+  const lease = await boundary?.enterOwnedRefMutation(repoDir).catch(() => undefined);
   try {
-    let n = 0;
-    for (const sha of shas) {
-      const ref = `${ns}/${n++}`;
-      await ownedUpdateRef(repoDir, [ref, sha], boundary);
-      refs.push(ref);
-    }
+    await git(repoDir, ["update-ref", "-z", "--stdin"], {
+      stdin: shas.map((sha, n) => `create ${refs[n]!}\0${sha}\0`).join(""),
+    });
   } catch (e) {
-    await deleteScratchPins(repoDir, { refs }, boundary);
+    await deleteScratchPins(repoDir, { refs });
     throw e;
+  } finally {
+    await lease?.finish().catch(() => {});
   }
   return { refs };
 }
