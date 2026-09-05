@@ -1,5 +1,52 @@
 # rbox status — living state snapshot
 
+## 2026-09-05 — Astra sync/Git handoff: four fixes implemented, PR #882 not yet merged
+
+- **PR #882 OPEN, merge pending:** https://github.com/BrianVia/rbox-core/pull/882,
+  branch `codex/astra-sync-git`. Four atomic commits: directory-deletion batching
+  (`2e1cb6e49`), ordinary staged-object closure (`1d47b6755`), portable private
+  split indexes (`09fbf6590`), tracked-index cache freshness (`3e7e6b169`).
+  Audit/roadmap and the subsequent test-only compatibility repair are separate.
+  Preserve feature commits with rebase merge; founder authorized merge after
+  green checks and STATUS-only updates directly to main.
+- **Checkpoint:** remote annotated `pre-astra-changes` points to
+  `c4aa22bbb81c8754230735a73c5a58a28a64b4f7`. No production promotion or CLI
+  release has occurred in this work. Broad worktree topology remains unfinished.
+- **Validated locally:** final compiled Linux ARM64 DEV Git-entanglement passed
+  111 assertions on two devices; synthetic account cleanup returned200. Capture
+  tests32/32, held-skip16/16, ignore/manifest70/70, deletion/safety68/68; affected
+  API15/15, typecheck/guards/lint pass. Designs289/290/291 reviews ALIGNED.
+  Deletion fixture improves42–52× (~1.4s to27–33ms for124k entries/1k consecutive
+  absent directories), not an end-to-end sync claim. Exact artifact/evidence:
+  `docs/design/notes/287/integration-validation.md` on the PR branch.
+- **CI repair awaiting final review/rerun:** initial run33976813037 failed three
+  test shards; all other checks passed. CI moved from baseline Bun1.4.0 to1.4.2.
+  The latter isolates beforeEach async context from test bodies. Design292's
+  test-only callback scoping repair passes93 tests/15,307 assertions on both
+  versions, with one unchanged skip and no production behavior change. The
+  separate unchanged large-ref cap test timed out in CI and passed locally;
+  it remains a suspected environmental timeout, not a waived check.
+- **Review status:** GPT review of292 aligned; no Claude verdict exists.
+  Automatic approval review twice rejected the previous agent sending the new
+  packet to external Claude, interpreting prior permission as insufficient.
+  The receiving Claude agent should inspect292 and its evidence directly and
+  complete review plus exact-head CI before merge. See
+  `docs/design/notes/292/runtime-comparison.md` and287's `CI-validation.md`.
+- **Takeover:** fetch current remote state; if882 is still open, resume its
+  branch in an isolated worktree, not a fresh implementation from main. Full
+  copyable prompt: `docs/design/notes/287/claude-handoff.md` on that branch.
+  Canonical25-package roadmap: `plans/sync-git-improvements/plan.mdx`; consult
+  `docs/design/notes/288/baseline-reconciliation.md` to avoid redoing shipped
+  F3/F4/G5 portions. Source-host path was
+  `/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git`;
+  session-local `/private/tmp` runtime/log paths are not portable setup.
+- **Next:** finish882, update this status, then execute remaining approved
+  packages through their gates. Early candidates: historical broken split-artifact
+  repair, G5 ancestry batching, independent S1 scheduling recovery. Keep atomic
+  commits, oxlint compliance, protected behavior, compiled validation and green
+  CI. Gated protocol/rollout decisions still need their prescribed evidence;
+  the four completed implementations do not finish the entire roadmap.
+
 ## 2026-09-02 (morning) — founder: "shadow it" + 2.0.2 authorized
 
 - **Perf snapshot 2026-09-02 evening**: FM pull of 188K files/125 repos
