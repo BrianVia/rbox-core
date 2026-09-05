@@ -1,8 +1,8 @@
+// Never: resolve native Git index state or own tracked-name cache admission.
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
 import ignore from "ignore";
+import { loadTrackedRepoSet, type TrackedRepoSet } from "./tracked-repo.js";
 
 /**
  * Dev-aware defaults: regenerable state and secrets never leave the machine.
@@ -363,13 +363,6 @@ interface GitRuleLayer {
   ig: IgnoreInstance;
 }
 
-interface TrackedRepoSet {
-  relPath: string;
-  paths: Set<string>;
-  dirPrefixes: Set<string>;
-  known: boolean;
-  available: boolean;
-}
 
 type RuleDecision = { ignored: boolean; source: RuleSource };
 
@@ -714,120 +707,6 @@ function discoverGitReposSync(root: string, prunesForDir: (relPath: string) => b
   };
   walk("");
   return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-/**
- * Two outcomes, never one (design 224 §2.1). `indexUnreadable` keeps the historic
- * fail-open (`available: false` ⇒ "possibly tracked" ⇒ un-ignored and unprunable).
- * `indexAbsent` — a repo that git resolved, whose index is genuinely `ENOENT`, and
- * which has NO commits — has an EMPTY tracked set, not an unknown one, so it must
- * not un-ignore its own `node_modules`/`venv`/`.env`.
- *
- * All three signals are load-bearing. A repo that HAS commits but whose index was
- * deleted also yields ∅ from `git ls-files --cached`, yet its true tracked set is
- * non-empty; classifying it `indexAbsent` would let `rbox ignore --purge` delete
- * committed files fleet-wide.
- */
-function loadTrackedRepoSet(root: string, relPath: string, known: boolean): TrackedRepoSet {
-  const repoDir = relPath === "." ? root : path.join(root, relPath);
-  const indexUnreadable = (): TrackedRepoSet => ({ relPath, paths: new Set(), dirPrefixes: new Set(), known, available: false });
-  const indexPath = gitOutput(repoDir, ["rev-parse", "--git-path", "index"]);
-  if (!indexPath) return indexUnreadable();
-  const resolvedIndex = path.resolve(repoDir, indexPath);
-  const st = safeStat(resolvedIndex);
-  if (st.kind === "absent") {
-    const unbornHead = gitOutput(repoDir, ["rev-parse", "--quiet", "--verify", "HEAD"]) === undefined;
-    return unbornHead ? availableTrackedRepo(relPath, [], known) : indexUnreadable();
-  }
-  if (st.kind === "error") return indexUnreadable();
-  const cacheFile = trackedCachePath(root, relPath, resolvedIndex);
-  const cached = readTrackedCache(cacheFile, resolvedIndex, st.mtimeMs, st.size);
-  if (cached.kind === "corrupt") return indexUnreadable();
-  if (cached.kind === "hit") return availableTrackedRepo(relPath, cached.paths, known);
-  const raw = gitOutput(repoDir, ["ls-files", "-z", "--cached"]);
-  if (raw === undefined) return indexUnreadable();
-  const paths = raw.split("\0").filter(Boolean).map((p) => p.replace(/\\/g, "/"));
-  writeTrackedCache(cacheFile, { version: 1, indexPath: resolvedIndex, mtimeMs: st.mtimeMs, size: st.size, paths });
-  return availableTrackedRepo(relPath, paths, known);
-}
-
-function availableTrackedRepo(relPath: string, paths: string[], known: boolean): TrackedRepoSet {
-  return { relPath, paths: new Set(paths), dirPrefixes: trackedDirPrefixes(relPath, paths), known, available: true };
-}
-
-function trackedDirPrefixes(repoRel: string, paths: string[]): Set<string> {
-  const out = new Set<string>();
-  for (const localPath of paths) {
-    const clean = localPath.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
-    if (!clean) continue;
-    const workspacePath = repoRel === "." ? clean : `${repoRel}/${clean}`;
-    const parts = workspacePath.split("/");
-    for (let i = 1; i < parts.length; i++) out.add(parts.slice(0, i).join("/"));
-  }
-  return out;
-}
-
-/** Errno-aware stat: `absent` is ENOENT SPECIFICALLY, and is the only stat outcome
- *  that can positively classify a missing index. Every other failure is `error`. */
-type SafeStatResult = { kind: "ok"; mtimeMs: number; size: number } | { kind: "absent" } | { kind: "error" };
-
-function safeStat(filePath: string): SafeStatResult {
-  try {
-    const st = fs.statSync(filePath);
-    return { kind: "ok", mtimeMs: st.mtimeMs, size: st.size };
-  } catch (e) {
-    return (e as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "error" };
-  }
-}
-
-function gitOutput(cwd: string, args: string[]): string | undefined {
-  const res = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
-  if (res.status !== 0) return undefined;
-  return res.stdout.endsWith("\n") ? res.stdout.slice(0, -1) : res.stdout;
-}
-
-interface TrackedCacheFile {
-  version: 1;
-  indexPath: string;
-  mtimeMs: number;
-  size: number;
-  paths: string[];
-}
-
-function trackedCachePath(root: string, relPath: string, indexPath: string): string {
-  const key = crypto.createHash("sha256").update(`${relPath}\0${indexPath}`).digest("hex");
-  return path.join(root, ".rbox", "state", "git-tracked", `${key}.json`);
-}
-
-type TrackedCacheRead = { kind: "hit"; paths: string[] } | { kind: "miss" } | { kind: "corrupt" };
-
-function readTrackedCache(filePath: string, indexPath: string, mtimeMs: number, size: number): TrackedCacheRead {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(filePath, "utf8");
-  } catch (e) {
-    return (e as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "miss" } : { kind: "corrupt" };
-  }
-  try {
-    const parsed = JSON.parse(raw) as TrackedCacheFile;
-    if (parsed.version !== 1) return { kind: "corrupt" };
-    if (parsed.indexPath !== indexPath || parsed.mtimeMs !== mtimeMs || parsed.size !== size) return { kind: "miss" };
-    if (!Array.isArray(parsed.paths) || parsed.paths.some((p) => typeof p !== "string")) return { kind: "corrupt" };
-    return { kind: "hit", paths: parsed.paths.map((p) => p.replace(/\\/g, "/")) };
-  } catch {
-    return { kind: "corrupt" };
-  }
-}
-
-function writeTrackedCache(filePath: string, data: TrackedCacheFile): void {
-  try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data));
-    fs.renameSync(tmp, filePath);
-  } catch {
-    // A cache miss next scan is safe; trackedness falls back to the fresh git output above.
-  }
 }
 
 export interface IgnoreRule {

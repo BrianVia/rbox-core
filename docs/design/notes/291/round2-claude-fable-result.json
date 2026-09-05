@@ -1,0 +1,19 @@
+{
+  "model": "claude-fable-5-1",
+  "effort": "medium",
+  "review_scope": "Supplied design and execution-evidence text only; no independent file reads or test execution",
+  "formal_round": 2,
+  "prior_attempt": "No verdict; emitted unavailable tool calls as text",
+  "result": {
+    "verdict": "ALIGNED",
+    "findings": [
+      "No blocking defects. Identity token {dev, ino, size, mtimeNs, ctimeNs} as lossless decimal strings plus required dependency=none, pre/post re-stat, single full-observation retry, and write-only-on-stable-ordinary correctly close the round-1 stale-inode/ctime fault; both historical RED witnesses now pass on supported Bun 1.4.0.",
+      "Corrupt/malformed/future-version handling is preserved as trackedness-unavailable (fail-open, no pruning/purge, no overwrite/delete), matching the protected base behavior and the round-1 rejection of always-fresh fallback; only the known-v1 record becomes a narrow migration miss.",
+      "Split-index path: no cache write, fresh native enumeration every evaluation, main-identity bracketing only; missing/corrupt shared file surfaces as discovery/enumeration failure -> unavailable, never empty trackedness. Bounded 3-call cost is accepted per scope.",
+      "Evidence is consistent with the design gates: 70 pass / 0 fail / 1,102 assertions, call budgets warm=1 cold=3 split=3, drift stops at 2, eight malformed/future refusals, key-order-independent hits, 0555 read-only Git dir probe, pinned reads with no hook invocation or source-byte changes, typecheck/oxlint clean.",
+      "Non-blocking follow-up: add a compiled-rig assertion that live index bytes/identity are unchanged after a cold miss under core.splitIndex=false while pinning -c core.splitIndex=true, to guard against a future Git rewriting on read.",
+      "Non-blocking follow-up: use a per-invocation unique temp filename (pid/random) for the exclusive cache temp so a temp left by a crashed run cannot cause a permanent EEXIST write failure (safe but perpetually cold); consider a bounded stale-temp sweep later.",
+      "Non-blocking follow-up: document that legitimate concurrent index rewrites (e.g. git status stat refresh) change ctime/ino and produce safe cold misses; track cold-miss rate in the deferred 100-repo latency pass so it is not misread as a warm-path regression."
+    ]
+  }
+}
