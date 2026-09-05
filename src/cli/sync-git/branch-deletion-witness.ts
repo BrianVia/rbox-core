@@ -1,6 +1,8 @@
 /** Never: capture/carry decisions, accumulator mutation, tombstone authoring, or ref transactions beyond the verification it commits. */
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { gitRaw } from "../../engine/git-spawn.js";
 import { receiverEquivalentCollisionNames, type GitSection } from "../../engine/index.js";
 import type { GitDeferralReason, RepoRecord, SyncState } from "../config.js";
 import { branchBaseOriginMatches } from "./base-composer.js";
@@ -29,6 +31,30 @@ export interface BranchDeletionWitnessInput {
   selfDeviceId: string | undefined;
   /** Tests only: runs before the authorization reads. */
   beforeAbsencePreflight?: (relPath: string) => void | Promise<void>;
+}
+
+/**
+ * Design 311: a refusal that depends only on the protocol artifact plane
+ * (`artifacts-standing`) is remembered per repository under a token of that
+ * plane (every `refs/rbox-local/*` ref and OID, one for-each-ref) plus the
+ * missing-branch set. While neither changes, the ~200-spawn artifact scan is
+ * skipped and the same refusal is returned. Any retirement or landing changes
+ * the refs, so the memo can never outlive the facts it summarizes. Process-
+ * local like the design 277/302 memos; a proven witness clears the entry.
+ * Deletion condition: when standing CREATE-P receipts can be discarded
+ * (design 310) and this refusal stops recurring per push.
+ */
+const STANDING_ARTIFACT_REFUSALS = new Map<string, { token: string; reason: string; typed: GitDeferralReason }>();
+
+/** Test seam: forget every remembered standing-artifact refusal. */
+export function forgetStandingArtifactRefusalsForTests(): void {
+  STANDING_ARTIFACT_REFUSALS.clear();
+}
+
+async function artifactPlaneToken(repoDir: string, missing: ReadonlyArray<readonly [string, string]>): Promise<string | undefined> {
+  const listing = await gitRaw(repoDir, ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/rbox-local"]).catch(() => undefined);
+  if (listing === undefined) return undefined;
+  return createHash("sha256").update(JSON.stringify([missing, listing])).digest("hex");
 }
 
 export type BranchDeletionWitness =
@@ -81,6 +107,12 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
         break;
       }
     }
+  }
+  const memoKey = `${root}\0${rel}`;
+  const planeToken = refusal ? undefined : await artifactPlaneToken(ctx.repoDir, missing);
+  const remembered = STANDING_ARTIFACT_REFUSALS.get(memoKey);
+  if (remembered && planeToken !== undefined && remembered.token === planeToken) {
+    return { status: "refused", reason: remembered.reason, typed: remembered.typed };
   }
   const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
     workspaceRoot: root, relPath: rel, state, ctx, record,
@@ -158,11 +190,16 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
     }
   }
 
-  if (!refusal && Object.keys(proofs).length === missing.length) return { status: "proven", proofs };
+  if (!refusal && Object.keys(proofs).length === missing.length) {
+    STANDING_ARTIFACT_REFUSALS.delete(memoKey);
+    return { status: "proven", proofs };
+  }
   const reason = refusal ?? "branch deletion proof unavailable";
-  return {
-    status: "refused",
-    reason,
-    typed: refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"),
-  };
+  const typed = refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending");
+  if (planeToken !== undefined && reason.includes("(artifacts-standing)")) {
+    STANDING_ARTIFACT_REFUSALS.set(memoKey, { token: planeToken, reason, typed });
+  } else {
+    STANDING_ARTIFACT_REFUSALS.delete(memoKey);
+  }
+  return { status: "refused", reason, typed };
 }
