@@ -1,5 +1,7 @@
 import { gitSectionDeviceId } from "../../engine/index.js";
-import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
+import * as followerProtocol from "./follower-protocol.js";
+import { forgetStandingArtifactRefusalsForTests } from "./branch-deletion-witness.js";
+import { test as bunTest, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fsSync from "node:fs";
@@ -2648,6 +2650,64 @@ test("design 309: a BASE section with no author stamp still refuses an origin-le
   expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
   expect(plan.gitRepos?.[rel]?.refs["refs/heads/topic"]).toBeDefined();
 });
+
+test("design 311: a standing-artifacts refusal is remembered until the protocol ref plane changes", async () => {
+  const rel = "standing-artifacts-memo";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  await git(repo, "branch", "-D", "topic");
+  forgetStandingArtifactRefusalsForTests();
+  const original = followerProtocol.prepareFollowerBranchProtocol;
+  let protocolCalls = 0;
+  const spy = spyOn(followerProtocol, "prepareFollowerBranchProtocol").mockImplementation(async (input) => {
+    protocolCalls++;
+    const result = await original(input);
+    if (result.status === "ready") {
+      result.protocol.artifacts["refs/heads/topic"] = { absence: "absent", present: "present", keeps: "clear", settledAbsence: "absent" };
+    }
+    return result;
+  });
+  let witnessStage = false;
+  const witnessSpawns: string[][] = [];
+  setGitSpawnObserver((_spawnRoot, args) => { if (witnessStage) witnessSpawns.push([...args]); });
+  try {
+    const run = async () => {
+      witnessStage = false;
+      witnessSpawns.length = 0;
+      const logs: string[] = [];
+      const plan = await planGitSections(
+        rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+          beforeAbsenceWitness: () => { witnessStage = true; },
+          onGitLog: (line) => logs.push(line),
+        },
+      );
+      return { plan, logs };
+    };
+    const first = await run();
+    expect(first.plan.captureDeferrals[rel]).toBe("deletion-pending");
+    expect(first.logs.some((line) => line.includes("refused refs/heads/topic (artifacts-standing)"))).toBe(true);
+    expect(protocolCalls).toBe(1);
+
+    const second = await run();
+    expect(second.plan.captureDeferrals[rel]).toBe("deletion-pending");
+    expect(second.logs.some((line) => line.includes("refused refs/heads/topic (artifacts-standing)"))).toBe(true);
+    expect(protocolCalls).toBe(1); // remembered: no scan
+    expect(witnessSpawns.map((args) => args[0])).toEqual(["for-each-ref"]); // only the plane token
+
+    await git(repo, "update-ref", "refs/rbox-local/keep/0000000000000000000000000000000000000000", (await git(repo, "rev-parse", "HEAD")).trim());
+    const third = await run();
+    expect(third.plan.captureDeferrals[rel]).toBe("deletion-pending");
+    expect(protocolCalls).toBe(2); // the plane changed: scanned again
+  } finally {
+    setGitSpawnObserver(undefined);
+    spy.mockRestore();
+    forgetStandingArtifactRefusalsForTests();
+  }
+}, 30_000);
 
 test("design 308: a missing BASE branch with no recorded origin is refused before any artifact scan", async () => {
   const rel = "cheap-witness-refusal";
