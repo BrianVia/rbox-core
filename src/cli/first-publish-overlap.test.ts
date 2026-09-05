@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, expect, test as bunTest } from "bun:test";
 import {
   beginFirstPublishTiming,
   firstPublishUploadEnd,
@@ -6,10 +6,10 @@ import {
   intervalUnionOverlapMs,
   uploadActiveOverlapMs,
 } from "./upload-lane-timing.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
+import { pushSpanTests } from "./push-spans.test-helper.js";
 
-let firstPublishTiming: FirstPublishTiming;
-beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
+const test = pushSpanTests(bunTest);
+
 afterEach(() => beginFirstPublishTiming(false));
 
 test("intervalUnionOverlapMs intersects a drain with the upload interval union", () => {
@@ -22,7 +22,7 @@ test("intervalUnionOverlapMs intersects a drain with the upload interval union",
   expect(intervalUnionOverlapMs(15, 15, intervals)).toBe(0);
 });
 
-test("nested upload activity produces one closed union interval", () => {
+test("nested upload activity produces one closed union interval", (firstPublishTiming) => {
   beginFirstPublishTiming(true);
   firstPublishUploadStart();
   firstPublishUploadStart();
@@ -35,7 +35,7 @@ test("nested upload activity produces one closed union interval", () => {
   expect(firstPublishTiming.uploadOpenAt).toBe(0);
 });
 
-test("sequential upload activity produces two intervals and extra ends are inert", () => {
+test("sequential upload activity produces two intervals and extra ends are inert", (firstPublishTiming) => {
   beginFirstPublishTiming(true);
   firstPublishUploadStart();
   firstPublishUploadEnd();
@@ -57,7 +57,7 @@ test("uploadActiveOverlapMs includes the currently open upload interval", async 
   expect(uploadActiveOverlapMs(t0, t1)).toBeCloseTo(t1 - t0, 5);
 });
 
-test("uploadActiveOverlapMs sums closed intervals and the open interval without double credit", () => {
+test("uploadActiveOverlapMs sums closed intervals and the open interval without double credit", (firstPublishTiming) => {
   beginFirstPublishTiming(true);
   firstPublishTiming.uploadIntervals = [{ start: 10, end: 20 }, { start: 30, end: 40 }];
   firstPublishTiming.uploadOpenAt = 50; // an upload is still in flight

@@ -1,11 +1,13 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, expect, test as bunTest } from "bun:test";
 import { createHash } from "node:crypto";
 import type { SignedCommit } from "../engine/e2ee/index.js";
 import { CommitRejectedError } from "./remote.js";
 import { RemoteContext } from "./remote/context.js";
 import { commitSigned, RECEIPT_REDEEM_BATCH_MAX, redeemReceipts } from "./remote/commits.js";
 import { beginFirstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart } from "./upload-lane-timing.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
+import { pushSpanTests } from "./push-spans.test-helper.js";
+
+const test = pushSpanTests(bunTest);
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const commit: SignedCommit = { body: "{}", commitHash: "a".repeat(64), sig: "sig" };
@@ -16,8 +18,6 @@ const initBody = (init: Parameters<RemoteContext["fetch"]>[1]): string =>
   String((init instanceof Function ? init() : init)?.body);
 const serverTimings = { totalMs: 7, envelopeMs: 1, accountingMs: 2, sidecarMs: 0, commitMs: 1, mirrorMs: 2, responseMs: 0 };
 
-let firstPublishTiming: FirstPublishTiming;
-beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 afterEach(() => beginFirstPublishTiming(false));
 
 test("redeemReceipts drains 12,001 receipts in 5k batches and clears each successful batch", async () => {
@@ -181,7 +181,7 @@ test("commitSigned preserves bounded 422 missingTotal", async () => {
   });
 });
 
-test("finalDrainMs measures only commit-enclosed receipt drains and accumulates", async () => {
+test("finalDrainMs measures only commit-enclosed receipt drains and accumulates", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.fetch = async (url) => {
     if (url.endsWith("/receipts/redeem")) {
@@ -209,7 +209,7 @@ test("finalDrainMs measures only commit-enclosed receipt drains and accumulates"
   expect(firstPublishTiming.stats.finalDrainMs).toBeGreaterThan(afterFirst);
 });
 
-test("redeemReceipts credits only the upload-active parts of a drain", async () => {
+test("redeemReceipts credits only the upload-active parts of a drain", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   for (let i = 0; i <= RECEIPT_REDEEM_BATCH_MAX; i++) ctx.receipts.set(sha(`overlap-${i}`), `r-${i}`);
   let calls = 0;
@@ -230,7 +230,7 @@ test("redeemReceipts credits only the upload-active parts of a drain", async () 
   expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBeLessThan(firstPublishTiming.stats.receiptRedemptionWallMs);
 });
 
-test("redeemReceipts with no upload activity records no overlap", async () => {
+test("redeemReceipts with no upload activity records no overlap", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(sha("no-overlap"), "receipt");
   ctx.fetch = async () => {
@@ -243,7 +243,7 @@ test("redeemReceipts with no upload activity records no overlap", async () => {
   expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBe(0);
 });
 
-test("a drain that starts unmeasured credits nothing to a measurement armed mid-drain", async () => {
+test("a drain that starts unmeasured credits nothing to a measurement armed mid-drain", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(sha("late-arm"), "receipt");
   ctx.fetch = async () => {
@@ -257,7 +257,7 @@ test("a drain that starts unmeasured credits nothing to a measurement armed mid-
   expect(firstPublishTiming.stats.finalDrainMs).toBe(0);
 });
 
-test("a commit-enclosed drain spanning a disarm/re-arm credits neither measurement", async () => {
+test("a commit-enclosed drain spanning a disarm/re-arm credits neither measurement", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(sha("span"), "receipt");
   ctx.fetch = async (url) => {

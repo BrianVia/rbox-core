@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, expect, test as bunTest } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -11,7 +11,9 @@ import type { SyncRemote } from "./remote.js";
 import type { ReceiptRedeemResult } from "./remote/commits.js";
 import { encryptAndUpload } from "./sync-recovery.js";
 import { beginFirstPublishTiming, uploadActiveOverlapMs } from "./upload-lane-timing.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
+import { pushSpanTests } from "./push-spans.test-helper.js";
+
+const test = pushSpanTests(bunTest);
 
 const savedEnv = {
   RBOX_REDEEM_DRAIN: process.env.RBOX_REDEEM_DRAIN,
@@ -20,9 +22,6 @@ const savedEnv = {
   RBOX_CRYPTO_FUSE: process.env.RBOX_CRYPTO_FUSE,
   RBOX_METRICS: process.env.RBOX_METRICS,
 };
-
-let firstPublishTiming: FirstPublishTiming;
-beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 
 afterEach(() => {
   beginFirstPublishTiming(false);
@@ -206,7 +205,7 @@ test("only 'off' disables draining; other values (and unset) stay ON", async () 
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 
-test("serialized final flush records its independent wall measurement", async () => {
+test("serialized final flush records its independent wall measurement", async (firstPublishTiming) => {
   const fx = await fixture(1);
   try {
     process.env.RBOX_REDEEM_DRAIN = "upload";

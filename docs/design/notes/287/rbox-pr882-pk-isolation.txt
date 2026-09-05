@@ -1,0 +1,20 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/base-artifacts.test.ts:
+(pass) repository and lineage identity > encodes the exact domain and ordered u64-length fields [117.05ms]
+(pass) repository and lineage identity > lineage length-delimits root, stream, nonce, and complete identity bytes [82.83ms]
+(pass) repository and lineage identity > rejects noncanonical identity fields and reads realpath/stat incarnation [119.74ms]
+(pass) A and P/K artifacts > creates and strictly reads canonical direct A [294.93ms]
+(pass) A and P/K artifacts > rejects extra fields, noncanonical bytes, wrong target type, ref mismatch, and indirect refs [387.83ms]
+(pass) A and P/K artifacts > P requires exact prior/next K refs and supports absent-to-present [655.72ms]
+(pass) A and P/K artifacts > scan detects malformed namespaces, orphan K, foreign artifacts, and valid current artifacts [607.72ms]
+(pass) A and P/K artifacts > caps refuse before another proof ref is created [2295.85ms]
+(pass) A and P/K artifacts > P and K caps independently refuse without eviction [5262.22ms]
+(pass) settled absence Z > settles sequential A artifacts atomically into one validated immutable ledger [2247.25ms]
+(pass) settled absence Z > rejects duplicate leaves and strict tree count/hash/binding corruption [804.02ms]
+(pass) settled absence Z > A and an existing matching Z leaf are a contradiction, never silently folded [491.99ms]
+
+ 12 pass
+ 0 fail
+ 76 expect() calls
+Ran 12 tests across 1 file. [13.50s]
