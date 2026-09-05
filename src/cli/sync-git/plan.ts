@@ -974,7 +974,9 @@ export interface GitPlanOptions {
   /** Deterministic design-130 tombstone timestamp seam. */
   now?: () => Date;
   /** Awaited daemon registry observer; errors are observability-only. */
-  onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  onGitReposDiscovered?: (observation: { repos: readonly DiscoveredGitRepo[]; complete: boolean }) => Promise<void>;
+  /** Daemon-only exact topology fast path; foreground plans always walk. */
+  trustedGitTopology?: () => readonly DiscoveredGitRepo[] | undefined;
   /** Daemon-only observation boundary for owned scratch-ref mutations. */
   ownedRefMutationBoundary?: OwnedRefMutationBoundary;
   /** Deterministic test seam for a ref race after B's provisional pre-probe. */
@@ -1122,11 +1124,12 @@ async function planGitSectionsWithRetention(
   // attaches; with zero repos there is nothing owed and commit 1 is terminal (no wasted
   // second push, no "history attached" lie).
   if (options.filesFirstDefer && cfg.syncGit) {
+    let complete = true;
     const discovered = await measure(
       "discoverMs",
-      () => discoverGitRepos(root, matcher),
+      () => discoverGitRepos(root, matcher, () => { complete = false; }),
     );
-    try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
+    try { await options.onGitReposDiscovered?.({ repos: discovered, complete }); } catch { /* daemon observer never changes planning */ }
     const plan = finishGitPlan(accumulator);
     if (discovered.length > 0) plan.filesFirstDeferred = true;
     return plan;
@@ -1151,11 +1154,16 @@ async function planGitSectionsWithRetention(
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
   const kek = cfg.kek;
 
-  const discovered = await measure(
-    "discoverMs",
-    () => discoverGitRepos(root, matcher),
-  );
-  try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
+  const trusted = options.trustedGitTopology?.();
+  let discovered = trusted;
+  if (!discovered) {
+    let complete = true;
+    discovered = await measure(
+      "discoverMs",
+      () => discoverGitRepos(root, matcher, () => { complete = false; }),
+    );
+    try { await options.onGitReposDiscovered?.({ repos: discovered, complete }); } catch { /* daemon observer never changes planning */ }
+  }
   const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
 
   // §9: removal memories are pruned ONLY when the local `.git` genuinely disappears —

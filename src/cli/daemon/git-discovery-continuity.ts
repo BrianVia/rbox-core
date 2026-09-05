@@ -1,4 +1,4 @@
-/** Never: watcher trust, scan scheduling, deferral hygiene, or ref arming/reconcile (the registry's). */
+/** Never: watcher trust, scan scheduling, deferral hygiene, or ref arming/reconcile (the registry's); adapters only invalidate/read its plan-topology certificate. */
 import type { DiscoveredGitRepo } from "../../engine/index.js";
 import type { OwnedRefMutationLease } from "../sync-git/pins.js";
 import { errCode } from "./logger.js";
@@ -55,16 +55,29 @@ export type GitScanKind = "safety scan" | "deep scan";
 export interface ScanTopologySnapshot {
   readonly scanKind: GitScanKind | undefined;
   readonly registryEpoch: number | undefined;
+  readonly planGate?: PlanTopologyGate;
+}
+
+export interface PlanTopologyGate {
+  readonly topologyEpoch: number;
+  readonly matcherGeneration: number;
+  readonly watcherErrorGeneration: number;
+  readonly watcherTrusted: boolean;
+  readonly matcherRebuildPending: boolean;
+  readonly policyRecyclePending: boolean;
+  readonly queuedCandidateWork: boolean;
 }
 
 export type CurrentGitTopologyObservation =
-  | { readonly kind: "plan"; readonly repos: readonly DiscoveredGitRepo[] }
+  | { readonly kind: "plan"; readonly repos: readonly DiscoveredGitRepo[]; readonly complete?: boolean; readonly gateBefore?: PlanTopologyGate; readonly gateAfter?: PlanTopologyGate }
   | { readonly kind: "signal"; readonly discoverAll: boolean; readonly candidates: readonly RepoCandidateWork[] }
   | {
       readonly kind: "scan";
       readonly repos: readonly DiscoveredGitRepo[];
       readonly mode: "pruned" | "unpruned";
       readonly snapshot: ScanTopologySnapshot;
+      readonly complete?: boolean;
+      readonly gateAfter?: PlanTopologyGate;
     };
 
 export type GitRegistryAction =
@@ -113,6 +126,14 @@ export class GitDiscoveryContinuity {
   private authoritativeSnapshotTaken = false;
   private absenceEpoch = 0;
   private proof?: DeferralDiscoveryAuthority;
+  private topologyEpoch = 0;
+  private inFlightCandidates = 0;
+  private planTopology?: {
+    readonly repos: readonly DiscoveredGitRepo[];
+    readonly topologyEpoch: number;
+    readonly matcherGeneration: number;
+    readonly watcherErrorGeneration: number;
+  };
   private readonly linux: boolean;
 
   constructor(private readonly effects: GitDiscoveryEffects) {
@@ -124,6 +145,22 @@ export class GitDiscoveryContinuity {
   get authoritativeRepos(): readonly DiscoveredGitRepo[] { return this.authoritative; }
   get hasAuthoritativeSnapshot(): boolean { return this.authoritativeSnapshotTaken; }
   get refBackendAttached(): boolean { return this.registry !== undefined; }
+  get currentTopologyEpoch(): number { return this.topologyEpoch; }
+  get inFlightCandidateCount(): number { return this.inFlightCandidates; }
+
+  invalidatePlanTopology(): void {
+    this.topologyEpoch++;
+    this.planTopology = undefined;
+  }
+
+  trustedTopologyForPlan(gate: PlanTopologyGate): readonly DiscoveredGitRepo[] | undefined {
+    const certificate = this.planTopology;
+    if (!certificate || !this.gateUsable(gate) || this.inFlightCandidates !== 0) return undefined;
+    if (certificate.topologyEpoch !== gate.topologyEpoch
+      || certificate.matcherGeneration !== gate.matcherGeneration
+      || certificate.watcherErrorGeneration !== gate.watcherErrorGeneration) return undefined;
+    return certificate.repos;
+  }
 
   enterOwnedRefMutation(repoDir: string): Promise<OwnedRefMutationLease | undefined> {
     return this.registry?.enterOwnedRefMutation(repoDir) ?? Promise.resolve(undefined);
@@ -185,15 +222,16 @@ export class GitDiscoveryContinuity {
   /** Seal the registry horizon a walk is about to run under. Capturing it before
    * the walk is what makes the later snapshot unable to retire ownership armed
    * while the walk was in flight. */
-  beginScanSnapshot(scanKind: GitScanKind | undefined): ScanTopologySnapshot {
-    return { scanKind, registryEpoch: scanKind ? this.registry?.beginSnapshot() : undefined };
+  beginScanSnapshot(scanKind: GitScanKind | undefined, planGate?: PlanTopologyGate): ScanTopologySnapshot {
+    const snapshot: ScanTopologySnapshot = { scanKind, registryEpoch: scanKind ? this.registry?.beginSnapshot() : undefined };
+    return planGate ? { ...snapshot, planGate } : snapshot;
   }
 
   async observe(observation: CurrentGitTopologyObservation): Promise<CurrentGitTopologyReceipt> {
     switch (observation.kind) {
-      case "plan": return this.observePlan(observation.repos);
+      case "plan": return this.observePlan(observation.repos, observation.complete ?? false, observation.gateBefore, observation.gateAfter);
       case "signal": return this.observeSignal(observation.discoverAll, observation.candidates);
-      case "scan": return this.observeScan(observation.repos, observation.mode, observation.snapshot);
+      case "scan": return this.observeScan(observation.repos, observation.mode, observation.snapshot, observation.complete ?? false, observation.gateAfter);
     }
   }
 
@@ -202,10 +240,18 @@ export class GitDiscoveryContinuity {
    * owns arming; this owner's claim independently pins Chokidar/fallback until
    * the next complete safety snapshot is allowed to shrink it.
    */
-  private async observePlan(repos: readonly DiscoveredGitRepo[]): Promise<CurrentGitTopologyReceipt> {
+  private async observePlan(
+    repos: readonly DiscoveredGitRepo[],
+    complete: boolean,
+    gateBefore?: PlanTopologyGate,
+    gateAfter?: PlanTopologyGate,
+  ): Promise<CurrentGitTopologyReceipt> {
     const actions: GitRegistryAction[] = [];
     for (const repo of repos) if (repo.kind === "dir") this.planDiscoveredDirOwners.add(repo.relPath);
     await this.upsert(repos, actions);
+    if (complete && gateBefore && gateAfter && this.sameStableGate(gateBefore, gateAfter)) {
+      this.certify(repos, gateAfter);
+    }
     this.refreshFloor("plan-discovery");
     return this.receipt("plan", "additive", "additive", actions);
   }
@@ -215,6 +261,7 @@ export class GitDiscoveryContinuity {
     candidates: readonly RepoCandidateWork[],
   ): Promise<CurrentGitTopologyReceipt> {
     const actions: GitRegistryAction[] = [];
+    this.inFlightCandidates++;
     try {
       if (this.registry) {
         if (discoverAll) {
@@ -237,6 +284,8 @@ export class GitDiscoveryContinuity {
       const code = errCode(error);
       actions.push({ kind: "discovery-failed", code });
       this.effects.log(`git ref candidate discovery failed: ${code}`);
+    } finally {
+      this.inFlightCandidates--;
     }
     return this.receipt("signal", "additive", "additive", actions);
   }
@@ -245,6 +294,8 @@ export class GitDiscoveryContinuity {
     reported: readonly DiscoveredGitRepo[],
     mode: "pruned" | "unpruned",
     snapshot: ScanTopologySnapshot,
+    complete: boolean,
+    gateAfter?: PlanTopologyGate,
   ): Promise<CurrentGitTopologyReceipt> {
     const actions: GitRegistryAction[] = [];
     const repos = [...reported].sort(ownerOrder);
@@ -279,6 +330,8 @@ export class GitDiscoveryContinuity {
       await this.upsert(repos, actions);
       this.refreshFloor(mode === "pruned" ? "pruned-additive-scan" : "additive-scan");
     }
+    if (mode === "unpruned" && complete && snapshot.planGate && gateAfter
+      && this.sameStableGate(snapshot.planGate, gateAfter)) this.certify(repos, gateAfter);
     return this.receipt("scan", mode === "unpruned" ? "authoritative" : "additive", topology, actions);
   }
 
@@ -303,19 +356,45 @@ export class GitDiscoveryContinuity {
     actions.push({ kind: "upsert", repos: repos.map((repo) => repo.relPath) });
   }
 
+  private gateUsable(gate: PlanTopologyGate): boolean {
+    return gate.topologyEpoch === this.topologyEpoch
+      && gate.watcherTrusted
+      && !gate.matcherRebuildPending
+      && !gate.policyRecyclePending
+      && !gate.queuedCandidateWork;
+  }
+
+  private sameStableGate(before: PlanTopologyGate, after: PlanTopologyGate): boolean {
+    return this.gateUsable(before) && this.gateUsable(after)
+      && before.topologyEpoch === after.topologyEpoch
+      && before.matcherGeneration === after.matcherGeneration
+      && before.watcherErrorGeneration === after.watcherErrorGeneration;
+  }
+
+  private certify(repos: readonly DiscoveredGitRepo[], gate: PlanTopologyGate): void {
+    if (this.inFlightCandidates !== 0 || !this.gateUsable(gate)) return;
+    const sorted = repos.map((repo) => Object.freeze({ ...repo })).sort(ownerOrder);
+    this.planTopology = {
+      repos: Object.freeze(sorted),
+      topologyEpoch: gate.topologyEpoch,
+      matcherGeneration: gate.matcherGeneration,
+      watcherErrorGeneration: gate.watcherErrorGeneration,
+    };
+  }
+
   private receipt(
     kind: CurrentGitTopologyObservation["kind"],
     absenceAuthority: CurrentGitTopologyReceipt["absenceAuthority"],
     topology: CurrentGitTopologyReceipt["topology"],
     registryActions: readonly GitRegistryAction[],
   ): CurrentGitTopologyReceipt {
-    return {
+    const receipt: CurrentGitTopologyReceipt = {
       kind,
       absenceAuthority,
-      ...(this.proof ? { absenceProof: this.proof } : {}),
       topology,
       registryActions,
       floorRequired: this.floorHeld,
     };
+    return this.proof ? { ...receipt, absenceProof: this.proof } : receipt;
   }
 }

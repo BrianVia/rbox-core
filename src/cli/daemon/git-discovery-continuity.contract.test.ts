@@ -7,11 +7,22 @@ import {
   type GitDiscoveryEffects,
   type GitRefRegistryPort,
   type GitRegistryAction,
+  type PlanTopologyGate,
 } from "./git-discovery-continuity.js";
 
 const dir = (relPath: string): DiscoveredGitRepo => ({ relPath, kind: "dir" });
 const pointer = (relPath: string): DiscoveredGitRepo => ({ relPath, kind: "pointer" });
 const candidate = (owner: string, discover: boolean): RepoCandidateWork => ({ owner, dirty: true, discover });
+const gate = (over: Partial<PlanTopologyGate> = {}): PlanTopologyGate => ({
+  topologyEpoch: 0,
+  matcherGeneration: 7,
+  watcherErrorGeneration: 3,
+  watcherTrusted: true,
+  matcherRebuildPending: false,
+  policyRecyclePending: false,
+  queuedCandidateWork: false,
+  ...over,
+});
 
 interface FakeRegistry extends GitRefRegistryPort {
   readonly calls: GitRegistryAction[];
@@ -109,6 +120,94 @@ function scan(
 ): Promise<CurrentGitTopologyReceipt> {
   return continuity.observe({ kind: "scan", repos, mode, snapshot: continuity.beginScanSnapshot(scanKind) });
 }
+
+// ── exact plan-topology certificate ──────────────────────────────────────────
+
+test("a complete plan walk installs one frozen sorted certificate and every freshness gate fails closed", async () => {
+  const h = harness();
+  const repos = Array.from({ length: 125 }, (_, index) => dir(`repo-${String(124 - index).padStart(3, "0")}`));
+  const witnessed = gate();
+  await h.continuity.observe({ kind: "plan", repos, complete: true, gateBefore: witnessed, gateAfter: witnessed });
+
+  const trusted = h.continuity.trustedTopologyForPlan(witnessed)!;
+  expect(trusted).toHaveLength(125);
+  expect(trusted[0]?.relPath).toBe("repo-000");
+  expect(trusted[124]?.relPath).toBe("repo-124");
+  expect(Object.isFrozen(trusted)).toBe(true);
+  expect(Object.isFrozen(trusted[0])).toBe(true);
+
+  const refused: PlanTopologyGate[] = [
+    gate({ watcherTrusted: false }),
+    gate({ watcherErrorGeneration: 4 }),
+    gate({ matcherGeneration: 8 }),
+    gate({ matcherRebuildPending: true }),
+    gate({ policyRecyclePending: true }),
+    gate({ queuedCandidateWork: true }),
+    gate({ topologyEpoch: 1 }),
+  ];
+  for (const stale of refused) expect(h.continuity.trustedTopologyForPlan(stale)).toBeUndefined();
+
+  await h.continuity.observe({ kind: "plan", repos: [], complete: false, gateBefore: witnessed, gateAfter: witnessed });
+  expect(h.continuity.trustedTopologyForPlan(witnessed)).toBe(trusted);
+  h.continuity.invalidatePlanTopology();
+  expect(h.continuity.trustedTopologyForPlan(gate({ topologyEpoch: 1 }))).toBeUndefined();
+});
+
+test("candidate work is in-flight across awaited discovery and never certifies or removes topology", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const h = harness({ discoverUnder: async () => { await blocked; return []; } });
+  const witnessed = gate();
+  await h.continuity.observe({ kind: "plan", repos: [dir("kept")], complete: true, gateBefore: witnessed, gateAfter: witnessed });
+
+  const observing = h.continuity.observe({ kind: "signal", discoverAll: false, candidates: [candidate("kept", true)] });
+  expect(h.continuity.inFlightCandidateCount).toBe(1);
+  expect(h.continuity.trustedTopologyForPlan(witnessed)).toBeUndefined();
+  release();
+  await observing;
+  expect(h.continuity.authoritativeRepos).toEqual([]);
+  expect(h.continuity.trustedTopologyForPlan(witnessed)?.map((repo) => repo.relPath)).toEqual(["kept"]);
+});
+
+test("a complete stable unpruned scan seeds the plan certificate; pruned and incomplete scans do not", async () => {
+  const h = harness();
+  const witnessed = gate();
+  const completeSnapshot = h.continuity.beginScanSnapshot("deep scan", witnessed);
+  await h.continuity.observe({ kind: "scan", repos: [dir("b"), pointer("a")], mode: "unpruned", snapshot: completeSnapshot, complete: true, gateAfter: witnessed });
+  expect(h.continuity.trustedTopologyForPlan(witnessed)?.map((repo) => repo.relPath)).toEqual(["a", "b"]);
+
+  h.continuity.invalidatePlanTopology();
+  const next = gate({ topologyEpoch: 1 });
+  await h.continuity.observe({ kind: "scan", repos: [dir("missed")], mode: "unpruned", snapshot: h.continuity.beginScanSnapshot("deep scan", next), complete: false, gateAfter: next });
+  expect(h.continuity.trustedTopologyForPlan(next)).toBeUndefined();
+  await h.continuity.observe({ kind: "scan", repos: [dir("pruned")], mode: "pruned", snapshot: h.continuity.beginScanSnapshot("safety scan", next), complete: true, gateAfter: next });
+  expect(h.continuity.trustedTopologyForPlan(next)).toBeUndefined();
+});
+
+test("a failed scan observer and a race during plan observation retain no certificate", async () => {
+  const scanHarness = harness();
+  scanHarness.registry.applySnapshot = async () => { throw new Error("registry failed"); };
+  const witnessed = gate();
+  await expect(scanHarness.continuity.observe({
+    kind: "scan",
+    repos: [dir("scan")],
+    mode: "unpruned",
+    snapshot: scanHarness.continuity.beginScanSnapshot("deep scan", witnessed),
+    complete: true,
+    gateAfter: witnessed,
+  })).rejects.toThrow("registry failed");
+  expect(scanHarness.continuity.trustedTopologyForPlan(witnessed)).toBeUndefined();
+
+  const planHarness = harness();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  planHarness.registry.upsert = async () => { await blocked; };
+  const observing = planHarness.continuity.observe({ kind: "plan", repos: [dir("plan")], complete: true, gateBefore: witnessed, gateAfter: witnessed });
+  planHarness.continuity.invalidatePlanTopology();
+  release();
+  await observing;
+  expect(planHarness.continuity.trustedTopologyForPlan(gate({ topologyEpoch: 1 }))).toBeUndefined();
+});
 
 // ── absence authority ─────────────────────────────────────────────────────────
 

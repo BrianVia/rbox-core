@@ -100,7 +100,9 @@ export interface SyncDeps {
   onGitDeferralsSaved?: (state: SyncState) => void;
   /** Daemon-owned additive Git discovery observer. It settles only after every
    * input is armed or recorded pending; planning never inherits observer errors. */
-  onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  onGitReposDiscovered?: (observation: { repos: readonly DiscoveredGitRepo[]; complete: boolean }) => Promise<void>;
+  /** Daemon-only exact repository topology fast path. */
+  trustedGitTopology?: () => readonly DiscoveredGitRepo[] | undefined;
   /** Sole prompt-retry report for a completed plan that deferred on Git locks. */
   onGitBusyDeferred?: (repos: readonly string[]) => void;
   /** Per-repo progress during the pull-side git-apply loop (`done` advances once per

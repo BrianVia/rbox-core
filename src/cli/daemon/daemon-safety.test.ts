@@ -108,13 +108,18 @@ interface SafetyInternals {
   folderPolicyRecyclePending: boolean;
   localObserver: { observe(plan: RecycleScanPlan): Promise<{ deferredPaths: ReadonlySet<string> }> };
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
+  recordPullAdopted(sequence: number): void;
   acknowledgeFolderPolicyRecycle(): Promise<boolean>;
   gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
   request(kind: "pull" | "push" | "fullScan" | "deepScan"): void;
   /** The exact effect object the supervisor holds — reached so the fuse-recovery
    *  re-arm route is proven WIRED, not merely present on the daemon. */
-  watcherSessions: { effects: { requestFullScan(): void } };
+  watcherSessions: { effects: {
+    requestFullScan(): void;
+    onGitCandidate(): void;
+    onRawEvent(event: WatchEvent): void;
+  } };
   pump(): Promise<void>;
 }
 
@@ -123,12 +128,41 @@ interface SafetyInternals {
 interface DiscoveryInternals {
   readonly floorRequired: boolean;
   readonly refBackendAttached: boolean;
+  readonly currentTopologyEpoch: number;
   observe(observation: { kind: "plan"; repos: readonly { relPath: string; kind: "dir" | "pointer" }[] }): Promise<unknown>;
   refreshFloor(reason: string): void;
   backendFallbackPending: boolean;
   authoritative: readonly { relPath: string; kind: "dir" | "pointer" }[];
   planDiscoveredDirOwners: Set<string>;
 }
+
+test("design 307: daemon topology hooks invalidate candidates, structural/rule events, matcher rebuilds, and pull adoption", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-topology-hooks-")));
+  const daemon = makeDaemon(root, { log: () => {} });
+  try {
+    let epoch = daemon.gitDiscovery.currentTopologyEpoch;
+    daemon.watcherSessions.effects.onGitCandidate();
+    expect(daemon.gitDiscovery.currentTopologyEpoch).toBe(++epoch);
+
+    daemon.watcherSessions.effects.onRawEvent({ relPath: "plain.txt", kind: "add" });
+    expect(daemon.gitDiscovery.currentTopologyEpoch).toBe(epoch);
+    for (const event of [
+      { relPath: "moved", kind: "addDir" },
+      { relPath: "removed", kind: "unlinkDir" },
+      { relPath: ".rboxignore", kind: "change" },
+    ] as const) {
+      daemon.watcherSessions.effects.onRawEvent(event);
+      expect(daemon.gitDiscovery.currentTopologyEpoch).toBe(++epoch);
+    }
+
+    daemon.rebuildMatcher({ lastSyncedManifest: { generatedAt: "", files: [] } });
+    expect(daemon.gitDiscovery.currentTopologyEpoch).toBe(++epoch);
+    daemon.recordPullAdopted(2);
+    expect(daemon.gitDiscovery.currentTopologyEpoch).toBe(++epoch);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("design 175: ref signal requests push without pending/file-settle state", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-signal-")));

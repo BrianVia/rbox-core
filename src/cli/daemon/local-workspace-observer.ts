@@ -25,6 +25,7 @@ import type {
   CurrentGitTopologyReceipt,
   GitScanKind,
   ScanTopologySnapshot,
+  PlanTopologyGate,
 } from "./git-discovery-continuity.js";
 
 /**
@@ -219,6 +220,7 @@ export interface LocalObservationEffects {
   /** Layer A may prune only while a live watcher is trusted. */
   scanMode(): "pruned" | "unpruned";
   beginTopologySnapshot(scanKind: GitScanKind | undefined): ScanTopologySnapshot;
+  planTopologyGate?(): PlanTopologyGate;
   observeTopology(observation: CurrentGitTopologyObservation): Promise<CurrentGitTopologyReceipt>;
   /** The LOCAL-authority seam: the observer never assigns the manifest itself. */
   readonly authority: LocalAuthorityPort;
@@ -302,7 +304,15 @@ export class LocalWorkspaceObserver {
       deferErrnos.onErrno, this.effects.log);
     deferErrnos.flush();
     await dircache?.save(root);
-    const topology = await this.effects.observeTopology({ kind: "scan", repos: discoveredGitRepos, mode: plan.mode, snapshot: topologySnapshot });
+    const topologyObservation: CurrentGitTopologyObservation = {
+      kind: "scan",
+      repos: discoveredGitRepos,
+      mode: plan.mode,
+      snapshot: topologySnapshot,
+      complete: deferred.size === 0,
+    };
+    const gateAfter = this.effects.planTopologyGate?.();
+    const topology = await this.effects.observeTopology(gateAfter ? { ...topologyObservation, gateAfter } : topologyObservation);
     // Design 202: a scan is a FULL WORKSPACE observation (pruned scans reuse cached
     // listings, they do not omit paths), so it re-derives the unsettled set outright —
     // every previously unsettled path it read cleanly is settled again. `deferred` is

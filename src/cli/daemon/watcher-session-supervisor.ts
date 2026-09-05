@@ -1,4 +1,4 @@
-/** Never: safety/deep cadence, watcher trust arithmetic/classification, disk observation, or sync scheduling policy. */
+/** Never: safety/deep cadence, watcher trust arithmetic/classification, disk observation, sync scheduling policy, or plan-topology invalidation policy. */
 import crypto from "node:crypto";
 import type { WatchEvent, DiscoveredGitRepo } from "../../engine/index.js";
 import { gitRefSideChannelEligible } from "./git-ref-watch.js";
@@ -47,6 +47,7 @@ export interface WatcherSessionEffects {
   stopped(): boolean;
   onEvents(events: WatchEvent[]): void;
   onRawEvent(event: WatchEvent): void;
+  onGitCandidate(): void;
   onError(error: Error): void;
   onGitBatch(batch: GitSignalBatch): void;
   attachRefBackend(input: {
@@ -109,6 +110,8 @@ export class WatcherSessionSupervisor {
       },
     };
   }
+
+  get queuedGitWork(): boolean { return this.session?.debouncer.queued ?? false; }
 
   get watcher(): Watcher | undefined { return this.session?.watcher; }
   get sessionId(): string | undefined { return this.session?.id; }
@@ -207,7 +210,7 @@ export class WatcherSessionSupervisor {
     this.session = watcher ? {
       generation: this.generation,
       watcher,
-      debouncer: { push: () => {}, dispose: () => {} },
+      debouncer: { queued: false, push: () => {}, dispose: () => {} },
       id: sessionId ?? "test-session",
       admission: "",
     } : undefined;
@@ -259,6 +262,7 @@ export class WatcherSessionSupervisor {
           parcelAdmission: authority.admission,
           onInitialGitRepos: async (repos) => { initial = repos; },
           onRawEvent: (event) => { if (live()) this.effects.onRawEvent(event); },
+          onGitCandidate: () => { if (live()) this.effects.onGitCandidate(); },
           onError: (error) => { if (live()) this.effects.onError(error); },
           onArm: rearm ? () => this.recertifyArm(attempt!, admission) : undefined,
         },
@@ -413,6 +417,7 @@ const fingerprint = (admission: readonly string[]): string => admission.join("\n
 function onceDisposable(inner: SignalDebouncer): SignalDebouncer {
   let disposed = false;
   return {
+    get queued() { return !disposed && inner.queued; },
     push: (reason, candidate) => { if (!disposed) inner.push(reason, candidate); },
     dispose: () => {
       if (disposed) return;
