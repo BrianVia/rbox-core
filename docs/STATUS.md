@@ -75,10 +75,13 @@
   `docs/307-plan-topology-design` (`.claude/worktrees/design-307`): plan
   discovery from a continuity-owned plan-topology certificate with three
   invalidation hooks (pre-debounce candidate, raw rule/dir events, pull
-  adoption); part 1 (walk fault sink, `git-discover.ts`) committed there,
-  part 2 (certificate + hooks + wiring + tests) in Codex. Codex has stalled
-  at startup twice today (rmcp AuthRequired on the Cloudflare MCP) — if it
-  stalls again, implement part 2 by hand from §4/§5. Remaining after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
+  adoption); **#900 OPEN** (design doc + part 1 fault sink + part 2
+  certificate/hooks/wiring, 693 tests). Desktop on c61f1aa (306b) still
+  reads `carried≈1400ms`, so the loop's cost is NOT context reads;
+  **#899 OPEN** (304c) adds `[ctx= packed= repos= freshCtx=]` sub-timers to
+  the stages suffix to name it. Codex stalled at startup twice today (rmcp
+  AuthRequired on the Cloudflare MCP); part 1 was done by hand. Remaining
+  after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
   `projection=0.7s` per push with zero changes (F2b/X1a), `drain_wait
   1.5s` (watcher debounce, by design).
