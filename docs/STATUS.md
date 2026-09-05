@@ -54,10 +54,22 @@
   previous daemon did not stop in 60s and was SIGKILLed with no live
   critical-section witness — one-off during the post-restart safety scan,
   watch for recurrence). FM stays on `2.0.2-dev+e3881c3` (shadow), Mac on
-  stable 2.0.2. Next: read the staged slowest line, fix the named stage
-  (candidates: post-capture carried loop recomputing `repoRecordsForState`
-  per repo + per-repo packed-refs/ctx reads that a fingerprint hit already
-  covers; `discoverGitRepos` walk → F3b).
+  stable 2.0.2. **#895 MERGED (304b, `54bc690d0`)** fixed the unapplied
+  print; desktop now on `2.0.2-dev+54bc690` (pid 1697393). First staged line:
+  `Personal/rbox-core fp=miss cp=359 d=43 | stages start=1 pool=846
+  carried=1963 discover=1000` on a 6.3s empty push (git-plan 3.7s,
+  projection 0.7s, drain_wait 1.5s, state-save 0.1s). Root cause of
+  `carried=1963`: `repoCtxFromDisk` spawns two `git rev-parse` per carried
+  repo (≈250 spawns/push) plus `repoRecordsForState` recomputed per repo.
+  **Design 306 in Codex** (`.claude/worktrees/carried-loop`): reuse the
+  classify-stage `preCaptureRepoCtx` memo, hoist the record fold, KEEP the
+  packed-refs stat (fingerprint token is content-based, baseline is mtime-
+  based — skipping would weaken the regression refusal). **#896 OPEN** G5c
+  scratch pins in one `update-ref` transaction (design 305). Remaining
+  after 306: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
+  captured every tick because I edit it; ~0.5s unattributed in the pool),
+  `projection=0.7s` per push with zero changes (F2b/X1a), `drain_wait
+  1.5s` (watcher debounce, by design).
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
