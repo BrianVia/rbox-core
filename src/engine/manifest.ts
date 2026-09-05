@@ -1,3 +1,4 @@
+/** Local file observation and manifest construction. Never: remote transfer, Git/ref mutation, or durable sync-state publication. */
 import fs from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
@@ -270,6 +271,23 @@ export async function applyWatchEvents(
   deferred?: Set<string>
 ): Promise<Manifest> {
   const map = indexByPath(base);
+  const absentDirs = new Set<string>();
+  const flushAbsentDirs = (): void => {
+    if (absentDirs.size === 0) return;
+    for (const key of map.keys()) {
+      let removed = absentDirs.has(key);
+      for (let slash = key.indexOf("/"); !removed && slash !== -1; slash = key.indexOf("/", slash + 1)) {
+        removed = absentDirs.has(key.slice(0, slash));
+      }
+      if (removed) {
+        map.delete(key);
+        cache?.invalidate(key);
+      }
+    }
+    // Exact roots can have cached identities even without a manifest entry.
+    for (const rel of absentDirs) cache?.invalidate(rel);
+    absentDirs.clear();
+  };
   // A watcher event carries no file-vs-symlink fact, so the pre-stat `ignores(rel)`
   // above cannot answer the directory-form question. `statHashEntry` is the second
   // local producer: drop its result once the type is known (design 224 §2.2).
@@ -278,6 +296,7 @@ export async function applyWatchEvents(
 
   for (const ev of events) {
     const rel = ev.relPath;
+    if (ev.kind !== "unlinkDir" || rel.length === 0) flushAbsentDirs();
     if (rel.length === 0) continue;
 
     if (ev.kind === "unlink") {
@@ -309,8 +328,14 @@ export async function applyWatchEvents(
       //  - genuinely gone → drop the exact path + `dir/**` prefix.
       const prefix = `${rel}/`;
       let st: Stats | undefined;
-      try { st = await fs.lstat(path.join(root, rel)); }
-      catch (e) {
+      try {
+        st = await fs.lstat(path.join(root, rel));
+      } catch (e) {
+        if (isAbsent(e)) {
+          absentDirs.add(rel);
+          continue;
+        }
+        flushAbsentDirs();
         if (isPresentButUnreadableError(e)) {
           // Unreadable, not absent: keep every prior entry under rel untouched and let the
           // caller retry — a permission fault must never convert a subtree into deletions.
@@ -319,6 +344,9 @@ export async function applyWatchEvents(
         }
         st = undefined;
       }
+      // Only consecutive confirmed absences commute. Flush before a rescan,
+      // replacement, ignore decision, cache read, or deferred-path mutation.
+      flushAbsentDirs();
       if (st?.isDirectory()) {
         if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
         const sub: FileEntry[] = [];
@@ -380,6 +408,7 @@ export async function applyWatchEvents(
     }
   }
 
+  flushAbsentDirs();
   const files = [...map.values()].sort((a, b) => compareManifestPaths(a.path, b.path));
   return { generatedAt: new Date().toISOString(), files };
 }
@@ -419,16 +448,13 @@ interface WalkCtx {
   observedRuleFiles: Set<string>;
 }
 
-/** Defer a per-file fault (add to the deferred set, report errno-only) — returns
- *  false for a non-deferrable error the caller must rethrow. */
-function deferWalkFault(ctx: WalkCtx, childRel: string, error: unknown): boolean {
-  if (!isDeferrableFileError(error)) return false;
+/** Defer a classified per-file fault: add to the deferred set and report errno-only. */
+function deferWalkFault(ctx: WalkCtx, childRel: string, error: NodeJS.ErrnoException): void {
   ctx.deferred?.add(childRel);
   if (ctx.onDeferErrno) {
     if (ctx.accounting) ctx.accounting.observe(() => ctx.onDeferErrno!(error.code!));
     else ctx.onDeferErrno(error.code!);
   }
-  return true;
 }
 
 class RulesChangedDuringPrune extends Error {}
@@ -589,10 +615,10 @@ async function walk(
           return { target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target) };
         };
         targetAndHash = ctx.accounting ? await ctx.accounting.async("symlinkMs", read) : await read();
-      }
-      catch (error) {
-        if (deferWalkFault(ctx, childRel, error)) continue;
-        throw error;
+      } catch (error) {
+        if (!isDeferrableFileError(error)) throw error;
+        deferWalkFault(ctx, childRel, error);
+        continue;
       }
       ctx.onDiscover?.(targetAndHash.size);
       const append = () => out.push({
@@ -631,10 +657,12 @@ async function statFiles(
       if (!pool.canContinue(absenceScope)) return;
       let st = pending.bulkStat;
       if (!st) {
-        try { st = await fs.stat(pending.abs); }
-        catch (error) {
-          if (deferWalkFault(ctx, pending.childRel, error)) continue;
-          throw error;
+        try {
+          st = await fs.stat(pending.abs);
+        } catch (error) {
+          if (!isDeferrableFileError(error)) throw error;
+          deferWalkFault(ctx, pending.childRel, error);
+          continue;
         }
       }
       observed.push({ pending, st });
