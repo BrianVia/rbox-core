@@ -43,10 +43,21 @@
   keyed by the store's own `active_base_generation` (only a global section
   advances it); `loadRawState` stays fresh so the 269 drift audit still sees
   corruption (that test caught an earlier draft). **Desktop now dogfoods
-  `2.0.2-dev+7f86719`** (pid 1496033, restarted ~19:40Z); watch
-  `state-save` on the push line fall from ~2.4s to <0.2s except when the
-  elision audit rehashes (~0.95s compose). FM stays on
-  `2.0.2-dev+e3881c3` (shadow), Mac on stable 2.0.2.
+  `2.0.2-dev+7f86719`**: first empty push 9.0s → 7.0s, `state-save 0.1s`.
+  Then **#893 MERGED (design 303, `a9b4909a9`)**: the elision audit's ~1s
+  manifest rehash on every unchanged pull is memoized per files array (302
+  hands the array back by identity; 277's immutability precondition makes
+  identity = content). **#894 MERGED (design 304, `6a6dbfedc`)**: the
+  `git-plan slowest:` line now ends with `stages start= pool= carried=
+  discover=` to name the ~1.6s of capture wall not attributable to repos.
+  **Desktop now dogfoods `2.0.2-dev+6a6dbfe`** (pid 1540523, ~20:05Z; the
+  previous daemon did not stop in 60s and was SIGKILLed with no live
+  critical-section witness — one-off during the post-restart safety scan,
+  watch for recurrence). FM stays on `2.0.2-dev+e3881c3` (shadow), Mac on
+  stable 2.0.2. Next: read the staged slowest line, fix the named stage
+  (candidates: post-capture carried loop recomputing `repoRecordsForState`
+  per repo + per-repo packed-refs/ctx reads that a fingerprint hit already
+  covers; `discoverGitRepos` walk → F3b).
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
