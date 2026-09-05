@@ -32,6 +32,17 @@ export async function gitRefStorage(repoDir: string): Promise<string | undefined
   }
 }
 
+/** Repository config is the sole authority for the object format. */
+export async function gitObjectFormat(repoDir: string): Promise<"sha1" | "sha256" | "unsupported"> {
+  try {
+    const value = await git(repoDir, ["config", "--local", "--get", "extensions.objectFormat"]);
+    return value === "sha1" || value === "sha256" ? value : "unsupported";
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 1) return "sha1";
+    throw error;
+  }
+}
+
 // ---- preflight (design 43 §4) ------------------------------------------------
 
 /** Preflight: ordinary non-bare repos whose toplevel IS `repoDir` — as a real `.git`
@@ -67,6 +78,24 @@ export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): 
     return {
       ok: false,
       reason: "reftable ref storage is unsupported — convert this repository to files refs before syncing Git history",
+      kind,
+      structural: true,
+    };
+  }
+  let objectFormat: Awaited<ReturnType<typeof gitObjectFormat>>;
+  try {
+    objectFormat = await gitObjectFormat(repoDir);
+  } catch {
+    return {
+      ok: false,
+      reason: "repository object-format config could not be read — retry after Git configuration is readable",
+      kind,
+    };
+  }
+  if (objectFormat !== "sha1") {
+    return {
+      ok: false,
+      reason: "SHA-256 object format is unsupported — rbox syncs SHA-1 repositories only (convert or exclude this repository)",
       kind,
       structural: true,
     };
