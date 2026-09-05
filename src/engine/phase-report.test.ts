@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test as bunTest } from "bun:test";
 import { PhaseReport } from "./phase-report.js";
 import {
   beginFirstPublishTiming,
@@ -11,10 +11,10 @@ import {
   formatFirstPublishStats,
 } from "../cli/upload-lane-timing.js";
 import { formatPushResiduals } from "../cli/sync/format.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "../cli/push-spans.js";
+import { pushSpanTests } from "../cli/push-spans.test-helper.js";
 
-let firstPublishTiming: FirstPublishTiming;
-beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
+const test = pushSpanTests(bunTest);
+
 
 describe("PhaseReport", () => {
   test("accumulates ms + bytes + count per phase across repeated hits", async () => {
@@ -172,7 +172,7 @@ describe("PhaseReport", () => {
 });
 
 describe("FirstPublishStats", () => {
-  test("has a complete integer-only schema and a privacy-safe token", () => {
+  test("has a complete integer-only schema and a privacy-safe token", (firstPublishTiming) => {
     beginFirstPublishTiming(true);
     firstPublishReady(123, "a".repeat(64));
     firstPublishUploadStart();
@@ -219,7 +219,7 @@ describe("FirstPublishStats", () => {
     expect(stats.authCriticalPathMs).toBe(0);
   });
 
-  test("a second concurrent measurement voids BOTH (ownership invariant, design 108)", () => {
+  test("a second concurrent measurement voids BOTH (ownership invariant, design 108)", (firstPublishTiming) => {
     beginFirstPublishTiming(true);
     expect(firstPublishTiming.enabled).toBe(true);
     beginFirstPublishTiming(true); // overlap: never cross-attribute — void both

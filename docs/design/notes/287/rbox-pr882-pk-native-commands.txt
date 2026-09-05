@@ -1,0 +1,11 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/base-artifacts.test.ts:
+(pass) A and P/K artifacts > P and K caps independently refuse without eviction [5259.98ms]
+{"kind":"pk-cap-native-commands","dependencyQueries":0,"commands":[{"at":105.29254200000001,"args":["rev-parse","--absolute-git-dir"]},{"at":124.972,"args":["rev-parse","--git-common-dir"]},{"at":182.70245799999998,"args":["update-ref","--stdin"]},{"at":736.2345419999999,"args":["rev-parse","--absolute-git-dir"]},{"at":755.661,"args":["rev-parse","--git-common-dir"]},{"at":774.7378329999999,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-absent/v2"]},{"at":775.781292,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-present/v2"]},{"at":776.777875,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-present-keep/v2"]},{"at":910.0302499999999,"args":["rev-parse","--absolute-git-dir"]},{"at":929.050167,"args":["rev-parse","--git-common-dir"]},{"at":949.837417,"args":["update-ref","--stdin"]},{"at":1641.357958,"args":["rev-parse","--absolute-git-dir"]},{"at":1661.5649580000002,"args":["rev-parse","--git-common-dir"]},{"at":1682.926833,"args":["update-ref","--stdin"]},{"at":3268.5129580000003,"args":["rev-parse","--absolute-git-dir"]},{"at":3285.148708,"args":["rev-parse","--git-common-dir"]},{"at":3301.85975,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-absent/v2"]},{"at":3302.8735,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-present/v2"]},{"at":3303.743375,"args":["for-each-ref","--format=%(refname)","refs/rbox-local/base-present-keep/v2"]}]}
+
+ 1 pass
+ 11 filtered out
+ 0 fail
+ 2 expect() calls
+Ran 1 test across 1 file. [5.30s]

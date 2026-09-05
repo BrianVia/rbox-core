@@ -1,4 +1,4 @@
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, expect, test as bunTest } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -16,16 +16,16 @@ import type { WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { encryptAndUpload } from "../sync-recovery.js";
 import { beginFirstPublishTiming } from "../upload-lane-timing.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "../push-spans.js";
+import { pushSpanTests } from "../push-spans.test-helper.js";
 import { runPublishPipeline } from "./pipeline.js";
 import { CipherDescriptorWriter } from "./shared.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
+const test = pushSpanTests(bunTest);
+
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
-let firstPublishTiming: FirstPublishTiming;
 
 beforeEach(() => {
-  firstPublishTiming = enterPushSpansForTest().firstPublish;
   delete process.env.RBOX_PREFLIGHT_DELTA;
   delete process.env.RBOX_PREFLIGHT_FULL;
 });
@@ -400,7 +400,7 @@ test("pipeline preflight defaults to introduced-only and =0 restores the carried
   }
 });
 
-test("failed pipeline PUT closes first-publish upload activity", async () => {
+test("failed pipeline PUT closes first-publish upload activity", async (firstPublishTiming) => {
   const fx = await fixture(64);
   try {
     beginFirstPublishTiming(true);
@@ -418,7 +418,7 @@ test("failed pipeline PUT closes first-publish upload activity", async () => {
   }
 });
 
-test("failed legacy PUT closes first-publish upload activity", async () => {
+test("failed legacy PUT closes first-publish upload activity", async (firstPublishTiming) => {
   const fx = await fixture(1);
   try {
     beginFirstPublishTiming(true);

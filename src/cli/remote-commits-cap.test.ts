@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, expect, test as bunTest } from "bun:test";
 import { RemoteContext } from "./remote/context.js";
 import { RECEIPT_REDEEM_BATCH_MAX, RECEIPT_REDEEM_REQUEST_BYTES_MAX, initialReceiptSendCap, redeemReceipts } from "./remote/commits.js";
 import { beginFirstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
-import { enterPushSpansForTest, type FirstPublishTiming } from "./push-spans.js";
+import { pushSpanTests } from "./push-spans.test-helper.js";
+
+const test = pushSpanTests(bunTest);
 
 const originalSendCap = process.env.RBOX_RECEIPT_SEND_CAP;
 const json = <T>(status: number, body: T) =>
@@ -23,9 +25,6 @@ const resetFirstPublishStats = () => {
   beginFirstPublishTiming(true);
   beginFirstPublishTiming(false);
 };
-
-let firstPublishTiming: FirstPublishTiming;
-beforeEach(() => { firstPublishTiming = enterPushSpansForTest().firstPublish; });
 
 afterEach(() => {
   resetFirstPublishStats();
@@ -182,7 +181,7 @@ test("default receipt send cap preserves the exact legacy request bodies", async
   expect(bodies).toEqual(expected);
 });
 
-test("redeem instrumentation counts bounces as requests but not submitted receipts twice", async () => {
+test("redeem instrumentation counts bounces as requests but not submitted receipts twice", async (firstPublishTiming) => {
   process.env.RBOX_RECEIPT_SEND_CAP = "4";
   const measured = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   for (let i = 0; i < 4; i++) measured.receipts.set(key(i), `receipt-${i}`);
@@ -217,7 +216,7 @@ test("redeem instrumentation counts bounces as requests but not submitted receip
   expect(firstPublishTiming.stats.redeemMaxRequestBytes).toBe(0);
 });
 
-test("redeem instrumentation counts entries on a definitive generic error response", async () => {
+test("redeem instrumentation counts entries on a definitive generic error response", async (firstPublishTiming) => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(key(1), "receipt-1");
   ctx.receipts.set(key(2), "receipt-2");
