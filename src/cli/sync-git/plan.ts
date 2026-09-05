@@ -496,16 +496,20 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       };
       let ctx: RepoCtx | undefined;
       let ctxFailure: unknown;
+      const ctxStartedAt = performance.now();
+      stages.carriedRepos++;
       try {
         if (trustedCarryRepoCtx.has(rel)) {
           ctx = trustedCarryRepoCtx.get(rel);
         } else {
+          stages.carriedFreshCtx++;
           options.onPostCaptureRepoCtxRead?.(rel);
           ctx = await repoCtxFromDisk(repoDirOf(root, rel));
         }
       } catch (error) {
         ctxFailure = error;
       }
+      stages.carriedCtxMs += performance.now() - ctxStartedAt;
       if (!ctx) {
         if (absenceCaptureEnabled && missing.length > 0) {
           refuseBranchDeletion(`repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`, "unreadable");
@@ -514,7 +518,9 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       }
       if (ctx.kind !== "dir") continue;
 
+      const packedStartedAt = performance.now();
       const packedObservation = await observePackedRefsIdentity(ctx.commonDir);
+      stages.carriedPackedMs += performance.now() - packedStartedAt;
       const previousPacked = record?.packedRefsIdentity;
       const packedRegressed = packedRefsMtimeRegressed(previousPacked, packedObservation);
       if (packedObservation.status === "absent") {
@@ -935,7 +941,11 @@ export interface GitPlanStats {
   otherMs: number;
   repoCosts: GitPlanRepoCost[];
   /** Design 304: where the capture stage's wall goes besides per-repo work. */
-  captureStages: { startMs: number; poolMs: number; carriedMs: number };
+  captureStages: {
+    startMs: number; poolMs: number; carriedMs: number;
+    /** Design 304c: inside the carried loop — context resolution, packed-refs stat, counts. */
+    carriedCtxMs: number; carriedPackedMs: number; carriedRepos: number; carriedFreshCtx: number;
+  };
 }
 
 export interface GitPlanRepoCost {
@@ -1004,8 +1014,9 @@ function finishGitPlan(accumulator: GitPlanAccumulator): GitPushPlan {
       .map(({ rel, fingerprint, captureMs, discoverMs }) =>
         `${rel} fp=${fingerprint} cp=${Math.round(captureMs)} d=${Math.round(discoverMs)}`)
       .join("; ");
-    const { startMs, poolMs, carriedMs } = stats.captureStages;
-    const stages = `stages start=${Math.round(startMs)} pool=${Math.round(poolMs)} carried=${Math.round(carriedMs)} discover=${Math.round(stats.discoverMs)}`;
+    const { startMs, poolMs, carriedMs, carriedCtxMs, carriedPackedMs, carriedRepos, carriedFreshCtx } = stats.captureStages;
+    const stages = `stages start=${Math.round(startMs)} pool=${Math.round(poolMs)} carried=${Math.round(carriedMs)}`
+      + `[ctx=${Math.round(carriedCtxMs)} packed=${Math.round(carriedPackedMs)} repos=${carriedRepos} freshCtx=${carriedFreshCtx}] discover=${Math.round(stats.discoverMs)}`;
     accumulator.log(`git-plan slowest: ${slowest} | ${stages}`);
   }
   return plan;
