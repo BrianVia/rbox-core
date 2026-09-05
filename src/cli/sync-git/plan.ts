@@ -989,7 +989,9 @@ function finishGitPlan(accumulator: GitPlanAccumulator): GitPushPlan {
       .map(({ rel, fingerprint, captureMs, discoverMs }) =>
         `${rel} fp=${fingerprint} cp=${Math.round(captureMs)} d=${Math.round(discoverMs)}`)
       .join("; ");
-    accumulator.log(`git-plan slowest: ${slowest}`);
+    const { startMs, poolMs, carriedMs } = stats.captureStages;
+    const stages = `stages start=${Math.round(startMs)} pool=${Math.round(poolMs)} carried=${Math.round(carriedMs)} discover=${Math.round(stats.discoverMs)}`;
+    accumulator.log(`git-plan slowest: ${slowest} | ${stages}`);
   }
   return plan;
 }
