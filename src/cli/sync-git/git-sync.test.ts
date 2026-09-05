@@ -1,3 +1,4 @@
+import { gitSectionDeviceId } from "../../engine/index.js";
 import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -2605,6 +2606,49 @@ test("design 200 kill switch restores pre-200 omission publication without proof
   expect(switchedOffRecord.packedRefsIdentity!.mtimeMs).toBeGreaterThanOrEqual(initialPackedMtime);
 }, 20_000);
 
+test("design 309: a BASE section this device captured is origin evidence for deleting its branches", async () => {
+  const rel = "self-authored-deletion";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  expect(record.base?.deviceId).toBe(gitSectionDeviceId(cfgA.deviceId));
+  // Pre-273 shape: the branch is in BASE with no per-branch origin entry.
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await git(repo, "branch", "-D", "topic");
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+  );
+  expect(plan.captureDeferrals[rel]).toBeUndefined();
+  expect(plan.absentBranchProofs?.[rel]?.["refs/heads/topic"]).toEqual({ priorOid: record.base!.refs["refs/heads/topic"] });
+  expect(plan.gitRepos?.[rel]?.refs["refs/heads/topic"]).toBeUndefined();
+  expect(plan.gitRepos?.[rel]?.refTombstones?.["refs/heads/topic"]?.some((entry) => entry.oid === record.base!.refs["refs/heads/topic"])).toBe(true);
+});
+
+test("design 309: a BASE section with no author stamp still refuses an origin-less deletion", async () => {
+  const rel = "unstamped-deletion";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  const { deviceId: _stamp, ...unstamped } = record.base!;
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins, base: unstamped };
+  await git(repo, "branch", "-D", "topic");
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+  );
+  expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+  expect(plan.gitRepos?.[rel]?.refs["refs/heads/topic"]).toBeDefined();
+});
+
 test("design 308: a missing BASE branch with no recorded origin is refused before any artifact scan", async () => {
   const rel = "cheap-witness-refusal";
   const repo = path.join(rootA, rel);
@@ -2617,7 +2661,9 @@ test("design 308: a missing BASE branch with no recorded origin is refused befor
   // A legacy BASE: the branch exists in BASE but carries no origin evidence, so
   // its deletion can never be proven this cycle.
   const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
-  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  // ...and the section was captured by ANOTHER device, so design 309's
+  // self-authored evidence does not apply either.
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins, base: { ...record.base!, deviceId: "dev_00000000" } };
   await git(repo, "branch", "-D", "topic");
   let witnessStage = false;
   const scanSpawns: string[][] = [];

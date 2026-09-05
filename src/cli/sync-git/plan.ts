@@ -1,7 +1,7 @@
 /** Never: own plan mutation, repo-scoped capture/config state, artifact retention state, persisted resolution authority, or apply-side mutation. */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { discoverGitRepos, isPresentButUnreadableError, oracleFromState, receiverEquivalentCollisionNames, poolMap, type DiscoveredGitRepo, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import { discoverGitRepos, gitSectionDeviceId, isPresentButUnreadableError, oracleFromState, receiverEquivalentCollisionNames, poolMap, type DiscoveredGitRepo, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
 import { GitCaptureDeferredError } from "./capture.js";
 import { artifactBinding, readRepoIdentityV1, readStateLineageV1, stateLineageV1FromRealRoot } from "./repo-lineage.js";
 import { checkoutJournalPresent } from "./journal.js";
@@ -532,6 +532,7 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       const witness = await witnessBranchDeletions({
         root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed,
         binding: publisherAckBindings[rel],
+        selfDeviceId: gitSectionDeviceId(cfg.deviceId),
         beforeAbsencePreflight: options.beforeAbsencePreflight,
       });
       if (witness.status === "proven") {
