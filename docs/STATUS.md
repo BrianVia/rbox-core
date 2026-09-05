@@ -75,15 +75,29 @@
   `docs/307-plan-topology-design` (`.claude/worktrees/design-307`): plan
   discovery from a continuity-owned plan-topology certificate with three
   invalidation hooks (pre-debounce candidate, raw rule/dir events, pull
-  adoption); **#900 OPEN** (design doc + part 1 fault sink + part 2
-  certificate/hooks/wiring, 693 tests), rebased onto #901. Desktop on
+  adoption); **#900 MERGED (design 307, `60dfaa713`)**: plan discovery reuses the
+  daemon's certified topology (design + fault sink + certificate/hooks/
+  wiring; three aligned rounds). Desktop on
   c61f1aa (306b) still read `carried≈1400ms`, so the loop's cost is NOT
   context reads; **#899 MERGED (304c, `f8a05b59d`)** adds `[ctx= packed=
   repos= freshCtx=]` sub-timers to the stages suffix. **#901 MERGED
   (`d08f73d37`)**: the P/K capacity test gets an explicit 60s budget after
   three CI failures at Bun's 15s default (0.7s locally, ~15s on the
-  runner). **Desktop now dogfoods `2.0.2-dev+d08f73d`** (pid 2122284,
-  ~21:40Z) to read the carried split. Codex stalled at startup twice today (rmcp
+  runner). **ROOT CAUSE of `carried≈1.4s` found (design 304c split:
+  `carried=1412[ctx=0 packed=3 repos=125 freshCtx=4]`, confirmed in a quiet
+  foreground push + CPU profile):** it was never the loop. `Personal/rbox-core`
+  had 285 local branches purged this morning; every push captures it (edited
+  constantly → fingerprint miss), runs the branch-deletion witness, and is
+  refused on the first missing branch (`origin-mismatch+artifacts-standing`)
+  — 456 times today — after paying ~1.5s of `for-each-ref` in
+  `prepareFollowerBranchProtocol`. **#902 OPEN (design 308)**: decide the
+  cheap per-branch refusals (scope, recorded origin) BEFORE the artifact
+  scan — same verdict, ~0 cost. **Product finding for the founder:** that
+  repo's BASE has 286 heads but only 9 recorded origins (pre-274 records),
+  so the 285 deletions cannot be proven from this device and stay deferred
+  ("finishing a branch deletion on checkout unavailable"); finishing them
+  is a product/user action, not perf. **Desktop now dogfoods
+  `2.0.2-dev+60dfaa7`** (pid 2204950, ~22:05Z) to read `discover=` after 307. Codex stalled at startup twice today (rmcp
   AuthRequired on the Cloudflare MCP); part 1 was done by hand. Remaining
   after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
