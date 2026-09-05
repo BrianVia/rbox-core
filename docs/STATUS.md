@@ -61,12 +61,18 @@
   projection 0.7s, drain_wait 1.5s, state-save 0.1s). Root cause of
   `carried=1963`: `repoCtxFromDisk` spawns two `git rev-parse` per carried
   repo (≈250 spawns/push) plus `repoRecordsForState` recomputed per repo.
-  **Design 306 in Codex** (`.claude/worktrees/carried-loop`): reuse the
-  classify-stage `preCaptureRepoCtx` memo, hoist the record fold, KEEP the
-  packed-refs stat (fingerprint token is content-based, baseline is mtime-
-  based — skipping would weaken the regression refusal). **#896 OPEN** G5c
-  scratch pins in one `update-ref` transaction (design 305). Remaining
-  after 306: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
+  **#897 MERGED (design 306, `fa5c507a8`)**: fingerprint-hit carries reuse
+  the fingerprint probe's `diskCtx`, record fold hoisted, packed-refs stat
+  KEPT (fingerprint token is content-based, baseline is mtime-based —
+  skipping would weaken the regression refusal). **#896 MERGED (design 305,
+  `ba2d22e12`)**: scratch pins in one `update-ref -z --stdin` `create`
+  transaction (third owned raw site in the design-130 allowlist).
+  **Desktop now dogfoods `2.0.2-dev+fa5c507`** (pid 1877350, ~20:50Z);
+  expect `carried=` to drop from ~1960ms. **Design 307 (design-only) in
+  Codex** (`.claude/worktrees/design-307`): plan discovery from the daemon's
+  `GitDiscoveryContinuity.authoritative` topology with a freshness
+  inventory — verdict decides whether it is one bounded PR. Remaining
+  after 306/307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
   `projection=0.7s` per push with zero changes (F2b/X1a), `drain_wait
   1.5s` (watcher debounce, by design).
