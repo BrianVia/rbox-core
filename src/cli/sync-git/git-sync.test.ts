@@ -2738,23 +2738,47 @@ test("a paused record with no base and no pending still retires under a whole-tr
   expect(await fs.stat(path.join(repo, ".git")).then(() => true)).toBeTrue();
 }, 20_000);
 
-test("carried repositories refresh the packed-refs baseline even when absence capture is switched off", async () => {
-  const repo = path.join(rootA, "carried-packed-baseline");
-  await initRepo(repo);
-  await commitFile(repo, "f.txt", "one", "c1");
-  await git(repo, "pack-refs", "--all");
+test("design 306: carried repos reuse classify contexts and still refresh packed-refs", async () => {
+  const rels = ["carried-context-a", "carried-context-b", "carried-context-c"];
+  for (const rel of rels) {
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", "one", "c1");
+    await git(repo, "pack-refs", "--all");
+  }
   await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const baseline = repoRecordsForState(state)[rels[0]!]!.packedRefsIdentity!.mtimeMs;
+  const moved = new Date(Date.now() + 2_000);
+  await fs.utimes(path.join(rootA, rels[0]!, ".git", "packed-refs"), moved, moved);
+  await markDivergenceCacheTrusted(rootA);
   const previous = process.env.RBOX_GIT_ABSENCE_CAPTURE;
   process.env.RBOX_GIT_ABSENCE_CAPTURE = "0";
   try {
-    const plan = await planGitSections(
-      rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA),
+    process.env.RBOX_GIT_PLAN_LAZY = "0";
+    const legacy = await planGitSections(
+      rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
     );
-    expect(plan.carried).toContain("carried-packed-baseline");
-    expect(plan.packedRefsIdentity?.["carried-packed-baseline"]).toEqual(
-      expect.objectContaining({ mtimeMs: expect.any(Number) }),
+    process.env.RBOX_GIT_PLAN_LAZY = "1";
+    let captureStage = false;
+    let captureRevParseSpawns = 0;
+    const freshContextReads: string[] = [];
+    setGitSpawnObserver((_spawnRoot, args) => {
+      if (captureStage && args[0] === "rev-parse") captureRevParseSpawns++;
+    });
+    const memoized = await planGitSections(
+      rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+        beforeCapturePool: () => { captureStage = true; },
+        onPostCaptureRepoCtxRead: (rel) => freshContextReads.push(rel),
+      },
     );
+    expect(memoized.carried).toEqual(rels);
+    expect(freshContextReads).toEqual([]);
+    expect(captureRevParseSpawns).toBe(0);
+    expect(memoized.packedRefsIdentity?.[rels[0]!]!.mtimeMs).toBeGreaterThan(baseline);
+    expect(gitPlanSurface(memoized)).toEqual(gitPlanSurface(legacy));
   } finally {
+    setGitSpawnObserver(undefined);
     if (previous === undefined) delete process.env.RBOX_GIT_ABSENCE_CAPTURE;
     else process.env.RBOX_GIT_ABSENCE_CAPTURE = previous;
   }

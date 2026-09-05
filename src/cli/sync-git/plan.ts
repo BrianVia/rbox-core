@@ -99,6 +99,7 @@ interface RepoClassificationStage {
 interface RepoClassificationResult {
   attempts: Map<string, RepoCaptureAttempt>;
   toCapture: string[];
+  trustedCarryRepoCtx: ReadonlyMap<string, RepoCtx>;
 }
 
 async function classifyGitRepositories(stage: RepoClassificationStage): Promise<RepoClassificationResult> {
@@ -145,6 +146,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
   let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
   let toCapture: string[] = [];
   let carried = accumulator.carried;
+  const trustedCarryRepoCtx = new Map<string, RepoCtx>();
   const attempts = new Map<string, RepoCaptureAttempt>();
   const repoCost = (rel: string): GitPlanRepoCost => stats.repoCosts.find((cost) => cost.rel === rel)!;
   const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
@@ -299,6 +301,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
           && (options.disableConfigLane || (fastLookup.cachedLocalCfg
             && !shouldPublishGitConfig(baseSection.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced)))) {
           accumulator.carry(rel, baseSection);
+          if (fastLookup.fingerprint.diskCtx) trustedCarryRepoCtx.set(rel, fastLookup.fingerprint.diskCtx);
           if (!options.disableConfigLane) configObserved.add(rel);
           fastPathParentRel.set(rel, probe.parentRel);
           stats.fpHits++;
@@ -378,7 +381,7 @@ async function classifyGitRepositories(stage: RepoClassificationStage): Promise<
   stage.clearPreCaptureCtx();
   await options.beforeCapturePool?.();
   timings.carryMs += performance.now() - startedAt - (timings.fingerprintMs - fingerprintAtStart);
-  return { attempts, toCapture };
+  return { attempts, toCapture, trustedCarryRepoCtx };
 }
 interface RepoCaptureStage {
   accumulator: GitPlanAccumulator;
@@ -392,11 +395,12 @@ interface RepoCaptureStage {
   toCapture: readonly string[];
   artifacts: PlanArtifactLifecycle;
   options: GitPlanOptions;
+  trustedCarryRepoCtx: ReadonlyMap<string, RepoCtx>;
   backoff?: (attempt: number) => Promise<void>;
 }
 
 async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise<void> {
-  const { accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, backoff } = stage;
+  const { accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, trustedCarryRepoCtx, backoff } = stage;
   const { base, pending, captured, out, resolutionCandidates, absentBranchProofs, packedRefsIdentity, publisherAckBindings, timings } = accumulator;
   const carried = accumulator.carried;
   const commitCapture = accumulator.capture.bind(accumulator);
@@ -461,10 +465,12 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
   const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
   stages.poolMs += performance.now() - poolStartedAt;
   const carriedStartedAt = performance.now();
+  const records = repoRecordsForState(state);
+  const capturedRepos = new Set(captured);
   for (const rel of [...new Set([...captured, ...carried])].sort()) {
       const candidate = out[rel];
       if (!candidate) continue;
-      const record = repoRecordsForState(state)[rel];
+      const record = records[rel];
       // A hidden BASE is provenance, never W/L/D refusal authority. A fresh
       // repository at the same path must flow through the normal re-add path.
       if (record?.repoAbsent === true || record?.removedKey !== undefined) continue;
@@ -473,7 +479,7 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       // section legitimately omits held BASE heads (it is protected inbound
       // state, not this cycle's evidence) — carried repos take the packed-refs
       // baseline observation below and nothing else.
-      const missing = !captured.includes(rel) ? [] : Object.entries(baseSection?.refs ?? {})
+      const missing = !capturedRepos.has(rel) ? [] : Object.entries(baseSection?.refs ?? {})
         .filter(([ref]) => ref.startsWith("refs/heads/"))
         .filter(([ref]) => candidate.refs[ref] === undefined);
 
@@ -489,7 +495,12 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
       let ctx: RepoCtx | undefined;
       let ctxFailure: unknown;
       try {
-        ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+        if (trustedCarryRepoCtx.has(rel)) {
+          ctx = trustedCarryRepoCtx.get(rel);
+        } else {
+          options.onPostCaptureRepoCtxRead?.(rel);
+          ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+        }
       } catch (error) {
         ctxFailure = error;
       }
@@ -970,6 +981,8 @@ export interface GitPlanOptions {
   afterJournalPreloop?: () => void | Promise<void>;
   /** Tests only: runs after read-only decisions and memo invalidation, before capture. */
   beforeCapturePool?: () => void | Promise<void>;
+  /** Tests only: observes a fresh context read in the post-capture pass. */
+  onPostCaptureRepoCtxRead?: (relPath: string) => void;
   /** Tests only: observes the repos admitted to the serialized capture work. */
   onCaptureQueued?: (relPath: string) => void;
   /** Tests only: observes the fresh repository context used by hygiene. */
@@ -1227,7 +1240,7 @@ async function planGitSectionsWithRetention(
     }
   });
   await options.afterJournalPreloop?.();
-  const { attempts, toCapture } = await classifyGitRepositories({
+  const { attempts, toCapture, trustedCarryRepoCtx } = await classifyGitRepositories({
     accumulator,
     root,
     state,
@@ -1249,7 +1262,7 @@ async function planGitSectionsWithRetention(
   // is a monotonic completed-count (captures run concurrently, so a settle counter is
   // the only truthful "done") with the just-settled repo's name as the display detail.
   await captureAndAuthorizeRepositories({
-    accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, backoff,
+    accumulator, root, cfg, state, api, kek, force, attempts, toCapture, artifacts, options, trustedCarryRepoCtx, backoff,
   });
   await finalizeCandidates({ accumulator, root, state, artifacts, cache, kek, options, attempts });
 
