@@ -1,0 +1,13 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/lazy-apply-probes.test.ts:
+(pass) 203.11: lazy kill switch restores the legacy probe command order [483.54ms]
+
+src/cli/sync-git/git-sync.test.ts:
+(pass) gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mutation [1266.66ms]
+
+ 2 pass
+ 136 filtered out
+ 0 fail
+ 8 expect() calls
+Ran 2 tests across 2 files. [1.82s]

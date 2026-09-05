@@ -1,0 +1,16 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/capture-identity.test.ts:
+(pass) design 288: captured split index is self-contained in an independent repository [996.21ms]
+(pass) design 288: split-index capture applies to a fresh receiver without changing source staging [1242.27ms]
+(pass) design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver [1326.33ms]
+(pass) design 289: ordinary partial conflict with REUC and monitor config stays stable [1810.77ms]
+(pass) design 289: split partial conflict with REUC and monitor config stays stable [1988.73ms]
+(pass) design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks [1064.67ms]
+(pass) design 289: missing ordinary stage root rejects capture and cleans scratch pins [405.12ms]
+
+ 7 pass
+ 24 filtered out
+ 0 fail
+ 162 expect() calls
+Ran 7 tests across 1 file. [8.89s]

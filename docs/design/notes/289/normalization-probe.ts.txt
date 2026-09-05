@@ -1,0 +1,75 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+
+const disablePrivateSplit = process.argv.includes("--disable-private-split");
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-289-normalization-"));
+const env = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined,
+  GIT_OBJECT_DIRECTORY: undefined, GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+  GIT_INDEX_FILE: undefined, GIT_TEST_SPLIT_INDEX: undefined,
+  GIT_AUTHOR_NAME: "rbox probe", GIT_AUTHOR_EMAIL: "probe@local",
+  GIT_COMMITTER_NAME: "rbox probe", GIT_COMMITTER_EMAIL: "probe@local",
+};
+function git(repo: string, args: string[], index?: string, input?: string): string {
+  const privateArgs = index && disablePrivateSplit ? ["-c", "core.splitIndex=false", ...args] : args;
+  return execFileSync("git", ["-C", repo, ...privateArgs], {
+    env: { ...env, ...(index ? { GIT_INDEX_FILE: index } : {}) },
+    encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+}
+async function hash(file: string): Promise<string> {
+  return crypto.createHash("sha256").update(await fs.readFile(file)).digest("hex");
+}
+async function sourceFiles(repo: string): Promise<Array<{ name: string; sha: string }>> {
+  const dir = path.join(repo, ".git");
+  const names = (await fs.readdir(dir)).filter((name) => name === "index" || name === "config" || name.startsWith("sharedindex.") || name === "index.lock").sort();
+  return Promise.all(names.map(async (name) => ({ name, sha: await hash(path.join(dir, name)) })));
+}
+try {
+  for (const split of ["none", "explicit", "config"] as const) {
+    for (const unmerged of [false, true]) {
+      const repo = path.join(root, `${split}-${unmerged ? "unmerged" : "merged"}`);
+      await fs.mkdir(repo);
+      git(repo, ["init", "-qb", "main"]);
+      await fs.writeFile(path.join(repo, "base.txt"), "base\n");
+      git(repo, ["add", "."]); git(repo, ["commit", "-qm", "base"]);
+      git(repo, ["config", "splitIndex.maxPercentChange", "100"]);
+      if (split === "config") git(repo, ["config", "core.splitIndex", "true"]);
+      if (split !== "none") git(repo, ["update-index", "--split-index"]);
+      if (unmerged) {
+        const oid = git(repo, ["hash-object", "-w", "--stdin"], undefined, "stage-only\n");
+        git(repo, ["update-index", "--index-info"], undefined, `100644 ${oid} 1\tconflict.txt\n100644 ${oid} 2\tconflict.txt\n`);
+      } else {
+        await fs.writeFile(path.join(repo, "added.txt"), "staged\n"); git(repo, ["add", "added.txt"]);
+      }
+      const live = path.join(repo, ".git", "index");
+      const before = await sourceFiles(repo);
+      const sourceHash = await hash(live);
+      const rows = [];
+      for (let trial = 0; trial < 3; trial++) {
+        const dir = path.join(root, `snapshot-${split}-${unmerged}-${trial}`);
+        await fs.mkdir(dir);
+        const index = path.join(dir, "index");
+        await fs.copyFile(live, index);
+        const wasSplit = git(repo, ["rev-parse", "--shared-index-path"], index) !== "";
+        if (wasSplit) git(repo, ["update-index", "--no-split-index"], index);
+        const normalizedHash = await hash(index);
+        const splitAfterNormalize = git(repo, ["rev-parse", "--shared-index-path"], index) !== "";
+        git(repo, ["update-index", "--clear-resolve-undo"], index);
+        const splitAfterClear = git(repo, ["rev-parse", "--shared-index-path"], index) !== "";
+        try { git(repo, ["stash", "create"], index); } catch { /* Native unmerged refusal is expected. */ }
+        let tree: string | undefined;
+        try { tree = git(repo, ["write-tree"], index); } catch { /* Native unmerged refusal is expected. */ }
+        rows.push({ wasSplit, splitAfterNormalize, splitAfterClear, splitAfterAll: git(repo, ["rev-parse", "--shared-index-path"], index) !== "", normalizedHash, finalHash: await hash(index), tree });
+      }
+      console.log(JSON.stringify({ split, unmerged, sourceHash, sourceUnchanged: JSON.stringify(before) === JSON.stringify(await sourceFiles(repo)), rows }));
+    }
+  }
+} finally {
+  await fs.rm(root, { recursive: true, force: true });
+}

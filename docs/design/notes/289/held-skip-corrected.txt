@@ -1,0 +1,24 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/held-skip.test.ts:
+(pass) previous fingerprint epoch misses held-skip with fingerprint-version [43.66ms]
+(pass) held skip is non-vacuous and every blocker must be allowlisted [0.17ms]
+(pass) worktree ownership neutralizes only its causal missing branch proof [0.28ms]
+(pass) deletion-pending maps only to the matching missing branch proof [0.04ms]
+(pass) exact mixed classifier triple grants no extra composer authority [0.11ms]
+(pass) composer-pending neutralizes only ref-mapped allowlisted causal holds [0.06ms]
+(pass) composer-pending retains unmatched, vacuous, and checkout-incomplete blockers as typed evidence [0.11ms]
+(pass) independent non-allowlisted classifier prevents composer neutralization [0.04ms]
+(pass) attempt matching binds nonce/version and the one-hour floor [0.25ms]
+(pass) idxProj-only effective BASE repair invalidates an attempt [0.04ms]
+(pass) same indexSha with a changed incoming locator invalidates an attempt [211.86ms]
+(pass) held classifier identity ignores bundle recapture but not semantic inputs [0.10ms]
+(pass) worktree removal changes the registry digest without changing refs, HEAD, or index [295.32ms]
+(pass) a linked-worktree branch switch inside the observation bracket refuses the attempt [483.01ms]
+(pass) exact consulted stash reflog bytes invalidate T→U→T reflog-only mutation [329.77ms]
+(pass) legacy graft files are structurally unsupported [118.15ms]
+
+ 16 pass
+ 0 fail
+ 90 expect() calls
+Ran 16 tests across 1 file. [1.57s]

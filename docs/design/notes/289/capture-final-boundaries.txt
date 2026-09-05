@@ -1,0 +1,11 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/capture-identity.test.ts:
+(pass) design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks [1212.80ms]
+(pass) design 289: missing shared dependency rejects identity and capture without source mutation [738.48ms]
+
+ 2 pass
+ 30 filtered out
+ 0 fail
+ 34 expect() calls
+Ran 2 tests across 1 file. [2.10s]

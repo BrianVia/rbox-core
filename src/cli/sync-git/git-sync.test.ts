@@ -3576,7 +3576,7 @@ test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mu
 
   let mutated = false;
   setGitSpawnObserver((spawnRoot, args) => {
-    if (mutated || spawnRoot !== repo || args[0] !== "write-tree") return;
+    if (mutated || spawnRoot !== repo || args.at(-1) !== "write-tree") return;
     mutated = true;
     fsSync.writeFileSync(path.join(repo, "late.txt"), "late");
     execFileSync("git", ["-C", repo, "add", "late.txt"], { env: TEST_GIT_ENV });

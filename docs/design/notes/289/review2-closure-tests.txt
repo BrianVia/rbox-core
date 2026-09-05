@@ -1,0 +1,12 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/capture-identity.test.ts:
+(pass) design 289: ordinary partial conflict with REUC and monitor config stays stable [1909.18ms]
+(pass) design 289: split partial conflict with REUC and monitor config stays stable [1893.19ms]
+(pass) design 289: missing shared dependency rejects identity and capture without source mutation [1076.96ms]
+
+ 3 pass
+ 29 filtered out
+ 0 fail
+ 75 expect() calls
+Ran 3 tests across 1 file. [5.03s]

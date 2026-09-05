@@ -1,0 +1,35 @@
+bun test v1.4.0 (34cbb9a40)
+
+../../../../../../../../../private/tmp/rbox-289-adopt-baseline/src/cli/sync-git/capture-identity.test.ts:
+(pass) design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver [1561.74ms]
+(pass) preflight accepts an ordinary repo, rejects non-repo and bare [243.30ms]
+(pass) normalizeSymbolicHeadCasing: pure semantics (FS-independent) [0.65ms]
+(pass) capture normalizes symbolic HEAD casing to the ref store casing [372.83ms]
+(pass) capture refuses ambiguous case-insensitive HEAD ref matches with validation reason [358.05ms]
+(pass) capture names its early bails: empty repo throws a reasoned defer, not undefined [139.16ms]
+(pass) capture→apply reproduces branches, staged state, and stash across repos [1486.12ms]
+(pass) resolve-undo entries with unreachable blobs are stripped on capture and healed before apply fsck [1923.98ms]
+(pass) applyGitState threads compressed index descriptors into artifact decrypt [4680.24ms]
+(pass) incremental dir/all capture uses basis negations and a chained section round-trips [2195.00ms]
+(pass) rewritten refs between increment links import with forced scratch refs, and second apply skips only historical links [3408.69ms]
+(pass) current incremental link is imported even when recorded commit tips are already present [2424.07ms]
+(pass) unchained full-bundle sections do not use presence probes [1844.98ms]
+(pass) preserveGitConflict imports the current WIP link even when commit tips are present [1795.62ms]
+(pass) detached pointer captures use detached HEAD as basis for scoped chains [1883.89ms]
+(pass) capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpdir scratch [495.02ms]
+(pass) stale git capture sweep removes orphan rbox-gitcap directories and preserves live owners [5.36ms]
+(pass) second git capture sweep preserves an aged live staging dir and sweeps a dead owner promptly [515.07ms]
+(pass) scanManifest never includes staged git capture bytes under .rbox [10.22ms]
+(pass) apply with the WRONG key fails closed — no .git mutation (§28 decrypt-before-mutate) [924.21ms]
+(pass) gitIdentity is stable across captures when nothing changed (no echo) [660.82ms]
+(pass) capture stash construction never refreshes the live staged index [757.77ms]
+(pass) capture with an absent index never creates the live index [536.66ms]
+(pass) gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers [1458.42ms]
+(pass) indexTreeOf temp-index write-tree matches direct write-tree for staged dir and pointer repos [778.70ms]
+(pass) design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks [1810.95ms]
+(pass) design 289: missing ordinary stage root rejects capture and cleans scratch pins [676.06ms]
+
+ 27 pass
+ 0 fail
+ 229 expect() calls
+Ran 27 tests across 1 file. [32.98s]

@@ -1,0 +1,163 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/adopt-git.test.ts:
+77 |     const beforeWorktree = await fs.readFile(path.join(f.target, "file.txt"), "utf8");
+78 |     const calls: string[][] = [];
+79 |     await runGitAdoption(f.journal, async () => {}, { runGit: async (repo, args) => { calls.push(args); return git(repo, args); } });
+80 |
+81 |     const branch = f.journal.gitRepos[0]?.branches.find((candidate) => candidate.ref === "refs/heads/main");
+82 |     expect(branch?.state).toBe("index-complete");
+                               ^
+error: expect(received).toBe(expected)
+
+Expected: "index-complete"
+Received: undefined
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:82:27)
+(fail) design 166 exact-OID Git fetch-union > eligible checked-out ahead branch uses literal selective fetch, CAS, saved index, and no worktree write [1432.32ms]
+106 |         await command(f.source, ["checkout", "--detach", f.oldOid]);
+107 |         divergent = await commit(f.source, "divergent.txt", "D\n", "divergent D");
+108 |         await command(f.source, ["update-ref", "refs/heads/main", divergent]);
+109 |       },
+110 |     });
+111 |     expect(fetches[0]?.at(-1)).toBe(f.incomingOid);
+                                     ^
+error: expect(received).toBe(expected)
+
+Expected: "a094c7c73aa45c152c1db341180fe3cd98d21ef8"
+Received: undefined
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:111:32)
+(fail) design 166 exact-OID Git fetch-union > source moved before fetch still transfers only journaled I and excludes divergent D [356.52ms]
+121 |         await command(f.source, ["checkout", "--detach", f.oldOid]);
+122 |         divergent = await commit(f.source, "after.txt", "D\n", "after-fetch D");
+123 |         await command(f.source, ["update-ref", "refs/heads/main", divergent]);
+124 |       },
+125 |     });
+126 |     expect(await command(f.target, ["rev-parse", "main"])).toBe(f.incomingOid);
+                                                                 ^
+error: expect(received).toBe(expected)
+
+Expected: "c2b6b487ed3c56e7e0678a8ae2df3e408f4ca061"
+Received: "e53f3400066c58f728c2a2bf35430ad6368dd351"
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:126:60)
+(fail) design 166 exact-OID Git fetch-union > source moved after exact-I fetch is irrelevant to prepared CAS [427.98ms]
+139 |         await command(f.source, ["reflog", "expire", "--expire=now", "--all"]);
+140 |         await command(f.source, ["gc", "--prune=now"]);
+141 |       },
+142 |     });
+143 |     expect(f.journal.gitRepos[0]?.state).toBe("parked");
+144 |     expect(f.journal.gitRepos[0]?.branches[0]?.state).toBe("parked");
+                                                            ^
+error: expect(received).toBe(expected)
+
+Expected: "parked"
+Received: undefined
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:144:55)
+(fail) design 166 exact-OID Git fetch-union > proved object garbage-collected before fetch PARKS without ref/index mutation [390.00ms]
+162 |     await runGitAdoption(f.journal, async () => {});
+163 |     expect(await refs(f.target)).toEqual(beforeRefs);
+164 |     expect(await command(f.target, ["rev-parse", "main"])).toBe(targetUnique);
+165 |     expect(await gitOk(f.target, ["cat-file", "-e", `${detached}^{commit}`])).toBe(false);
+166 |     expect(await gitOk(f.target, ["show-ref", "--verify", "refs/tags/annotated"])).toBe(false);
+167 |     expect(f.journal.gitRepos[0]?.retainedRefs).toContain("refs/stash");
+                                                      ^
+error: expect(received).toContain(expected)
+
+Expected to contain: "refs/stash"
+Received: []
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:167:49)
+(fail) design 166 exact-OID Git fetch-union > diverged branch, detached HEAD, tags, and stash remain retained-only [651.99ms]
+181 |     await runGitAdoption(f.journal, async () => {}, { runGit: async (repo, args) => { if (args[0] === "fetch") fetches.push(args); return git(repo, args); } });
+182 |     expect(fetches).toEqual([]);
+183 |     expect(await refs(f.target)).toEqual(beforeRefs);
+184 |     expect(await command(f.target, ["rev-parse", "main"])).toBe(targetAhead);
+185 |     expect(await command(f.source, ["rev-parse", "refs/stash"])).toMatch(/^[0-9a-f]{40}$/);
+186 |     expect(f.journal.gitRepos[0]?.retainedRefs).toEqual(expect.arrayContaining(["refs/heads/main", "refs/stash", "refs/tags/behind-tag"]));
+                                                      ^
+error: expect(received).toEqual(expected)
+
+Expected: ExpectArrayContaining {}
+Received: []
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:186:49)
+(fail) design 166 exact-OID Git fetch-union > B-behind branch imports nothing while retained additions/stash/tags remain reachable [440.22ms]
+198 |       const indexBefore = await fs.readFile(path.join(f.target, ".git", "index"));
+199 |       const calls: string[][] = [];
+200 |       await runGitAdoption(f.journal, async () => {}, { runGit: async (repo, args) => { calls.push(args); return git(repo, args); } });
+201 |       expect(calls.some((args) => args[0] === "fetch")).toBe(false);
+202 |       expect(calls.some((args) => args[0] === "update-ref")).toBe(false);
+203 |       expect(f.journal.gitRepos[0]?.branches[0]?.state).toBe("parked");
+                                                              ^
+error: expect(received).toBe(expected)
+
+Expected: "parked"
+Received: undefined
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:203:57)
+(fail) design 166 exact-OID Git fetch-union > dirty index and operation state park the checked-out branch before fetch/read-tree [345.54ms]
+214 |       afterFetchBeforeMutation: async () => {
+215 |         await fs.writeFile(path.join(f.target, "late.txt"), "late\n");
+216 |         await command(f.target, ["add", "late.txt"]);
+217 |       },
+218 |     });
+219 |     expect(calls.some((args) => args[0] === "fetch")).toBe(true);
+                                                            ^
+error: expect(received).toBe(expected)
+
+Expected: true
+Received: false
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:219:55)
+(fail) design 166 exact-OID Git fetch-union > index becoming dirty at the prepared boundary parks after fetch but before CAS [352.10ms]
+227 |     const indexBefore = await fs.readFile(path.join(f.target, ".git", "index"));
+228 |     let killed = false;
+229 |     await runGitAdoption(f.journal, async () => {}, {
+230 |       afterCas: () => { if (!killed) { killed = true; throw new Error("simulated kill after CAS"); } },
+231 |     });
+232 |     expect(f.journal.gitRepos[0]?.state).toBe("paused");
+                                               ^
+error: expect(received).toBe(expected)
+
+Expected: "paused"
+Received: "parked"
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:232:42)
+(fail) design 166 exact-OID Git fetch-union > CAS crash classifier recognizes exact old→new reflog transition and abort restores ref and saved index [349.02ms]
+250 |       await runGitAdoption(f.journal, async () => {}, stage === "index-copy"
+251 |         ? { beforeCas: once }
+252 |         : stage === "ref-cas" ? { afterCas: once }
+253 |           : stage === "read-tree" ? { afterIndexPublish: once }
+254 |             : {});
+255 |       if (stage !== "journal-advance") expect(f.journal.gitRepos[0]?.state).toBe("paused");
+                                                                                  ^
+error: expect(received).toBe(expected)
+
+Expected: "paused"
+Received: "parked"
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:255:77)
+(fail) design 166 exact-OID Git fetch-union > ref/index crash matrix safely resumes after index copy, ref CAS, read-tree publication, and journal advance [346.10ms]
+273 |     await configure(source);
+274 |     await commit(source, "only.txt", "B only\n", "B only");
+275 |     const journal = await makeJournal(root, [emptySource("only")]);
+276 |     await bindRetainedRepoIncarnations(journal);
+277 |     await runGitAdoption(journal, async () => {});
+278 |     expect(journal.gitRepos[0]?.state).toBe("unplaced");
+                                             ^
+error: expect(received).toBe(expected)
+
+Expected: "unplaced"
+Received: "parked"
+
+      at <anonymous> (/Users/via/.codex/worktrees/a53f/rbox-core/.claude/worktrees/astra-sync-git/src/cli/adopt-git.test.ts:278:40)
+(fail) design 166 exact-OID Git fetch-union > B-only repository has no target import and stays an unplaced retained repo [160.88ms]
+(pass) design 166 exact-OID Git fetch-union > linked-worktree source is refused during phase 0 with exact message and no move [145.61ms]
+
+ 1 pass
+ 11 fail
+ 25 expect() calls
+Ran 12 tests across 1 file. [5.46s]

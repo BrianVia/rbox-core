@@ -1,0 +1,23 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/follow.test.ts:
+1691 |
+1692 |   let legacyState: SyncState;
+1693 |   process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE = "0";
+1694 |   try {
+1695 |     const legacyEscalation = await applyIncoming(followedState!, incoming);
+1696 |     expect(legacyEscalation.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+                                                                           ^
+error: expect(received).toBe(expected)
+
+Expected: "worktree-ownership"
+Received: undefined
+
+      at <anonymous> (/private/tmp/rbox-289-git-baseline2/src/cli/sync-git/follow.test.ts:1696:69)
+(fail) design 200 P2 kill switches independently restore legacy ownership behavior [8100.84ms]
+
+ 0 pass
+ 164 filtered out
+ 1 fail
+ 6 expect() calls
+Ran 1 test across 1 file. [8.18s]

@@ -653,7 +653,8 @@ test("203.11: lazy kill switch restores the legacy probe command order", async (
     ["rev-parse", "--git-common-dir"],
     ["rev-parse", "--verify", "HEAD"],
     ["show-ref"],
-    ["write-tree"],
+    ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=keep", "-c", "core.splitIndex=true", "rev-parse", "--shared-index-path"],
+    ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=keep", "write-tree"],
   ];
 
   process.env.RBOX_PULL_TRUST_WATCHER = "0";

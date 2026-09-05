@@ -4,8 +4,9 @@ import path from "node:path";
 import { hashFile } from "../../engine/hash.js";
 import type { GitArtifactRef, GitRefScope, GitSection } from "../../engine/types.js";
 import { type RepoCtx, exists, headBranchOf, readHead, repoCtx } from "./git-state.js";
-import { git, gitOk, gitWithIndexFile } from "../../engine/git-spawn.js";
+import { git, gitOk } from "../../engine/git-spawn.js";
 import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
+import { copyPortableIndex, gitWithPrivateIndex } from "./private-index.js";
 
 /** The stable, plaintext-only identity of a repo's git state (no ciphertext addresses) —
  *  what change-detection compares. Distinct from the stored `GitSection`, whose blob fields
@@ -49,17 +50,19 @@ export async function indexTreeOfPath(ctx: RepoCtx, idx: string): Promise<string
   if (await exists(idx)) {
     let tmpDir: string | undefined;
     let wt: string | undefined;
+    let raw: string | undefined;
     try {
       tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitid-"));
       const tmpIndex = path.join(tmpDir, "index");
-      await fs.copyFile(idx, tmpIndex);
-      wt = (await gitWithIndexFile(ctx.repoDir, tmpIndex, ["write-tree"]).catch(() => "")) || undefined;
-    } catch {
-      wt = undefined;
+      const split = await copyPortableIndex(ctx.repoDir, idx, tmpIndex);
+      // Hash before write-tree: it may refresh private index extensions. Only
+      // dependent split inputs change identity; ordinary raw bytes stay legacy.
+      if (split) raw = `raw:${await hashFile(tmpIndex)}`;
+      wt = (await gitWithPrivateIndex(ctx.repoDir, tmpIndex, ["write-tree"]).catch(() => "")) || undefined;
     } finally {
       if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
-    if (wt) return wt;
+    return wt ?? raw ?? `raw:${await hashFile(idx)}`;
   } else {
     const wt = (await git(ctx.repoDir, ["write-tree"]).catch(() => "")) || undefined;
     if (wt) return wt;

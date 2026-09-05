@@ -1,0 +1,67 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { captureGitState } from "../../../../src/cli/sync-git/capture.js";
+import { applyGitState } from "../../../../src/cli/sync-git/git-state-apply.js";
+import { gitIdentity } from "../../../../src/cli/sync-git/identity.js";
+import { putGitArtifact } from "../../../../src/cli/sync-git/git-state.js";
+import { LocalBlobStore } from "../../../../src/engine/blobstore.js";
+import { decryptFileToPath } from "../../../../src/engine/crypto.js";
+
+const env: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined,
+  GIT_OBJECT_DIRECTORY: undefined, GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+  GIT_INDEX_FILE: undefined, GIT_TEST_SPLIT_INDEX: undefined,
+  GIT_AUTHOR_NAME: "rbox probe", GIT_AUTHOR_EMAIL: "probe@local",
+  GIT_COMMITTER_NAME: "rbox probe", GIT_COMMITTER_EMAIL: "probe@local",
+};
+const saved: NodeJS.ProcessEnv = {};
+for (const [key, value] of Object.entries(env)) {
+  saved[key] = process.env[key];
+  if (value === undefined) delete process.env[key]; else process.env[key] = value;
+}
+function git(repo: string, args: string[], index?: string, input?: string): string {
+  return execFileSync("git", ["-C", repo, ...(index ? ["-c", "core.splitIndex=false"] : []), ...args], {
+    env: { ...process.env, ...(index ? { GIT_INDEX_FILE: index } : {}) },
+    encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+}
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-289-old-reader-"));
+try {
+  for (const split of [false, true]) {
+    const repo = path.join(root, `source-${split}`);
+    await fs.mkdir(repo); git(repo, ["init", "-qb", "main"]);
+    for (const name of ["base", "ours", "theirs"]) await fs.writeFile(path.join(repo, name), `${name}\n`);
+    git(repo, ["add", "."]); git(repo, ["commit", "-qm", "retained stage blobs"]);
+    const oids = ["base", "ours", "theirs"].map((name) => git(repo, ["rev-parse", `HEAD:${name}`]));
+    git(repo, ["update-index", "--index-info"], undefined, oids.map((oid, i) => `100644 ${oid} ${i + 1}\tconflict\n`).join(""));
+    if (split) git(repo, ["update-index", "--split-index"]);
+    const store = new LocalBlobStore(path.join(root, `store-${split}`));
+    const key = Buffer.alloc(32, 7);
+    const section = await captureGitState(repo, store, key);
+    if (!section?.indexSha || !section.indexEncSha) throw new Error("missing captured index");
+    const oldReceiver = path.join(root, `old-artifact-receiver-${split}`); await fs.mkdir(oldReceiver);
+    const oldApply = await applyGitState(oldReceiver, section, store, key);
+    const index = path.join(root, `normalized-${split}.index`);
+    const ct = path.join(root, `index-${split}.ct`);
+    await store.getToFile(section.indexEncSha, ct);
+    await decryptFileToPath(ct, key, section.indexSha, index, { comp: section.indexComp, payloadSha: section.indexPayloadSha });
+    if (git(repo, ["rev-parse", "--shared-index-path"], index)) git(repo, ["update-index", "--no-split-index"], index);
+    git(repo, ["update-index", "--clear-resolve-undo"], index);
+    const raw = `raw:${crypto.createHash("sha256").update(await fs.readFile(index)).digest("hex")}`;
+    const artifact = await putGitArtifact(store, key, index, root);
+    const candidate = { ...section, indexTree: raw, indexSha: artifact.sha, indexEncSha: artifact.encSha, indexCipherSize: artifact.cipherSize };
+    const receiver = path.join(root, `candidate-receiver-${split}`); await fs.mkdir(receiver);
+    const applied = await applyGitState(receiver, candidate, store, key);
+    const receiverIdentity = applied.applied ? await gitIdentity(receiver) : undefined;
+    console.log(JSON.stringify({ split, oldApply, oldRaw: section.indexTree, candidateRaw: raw, oldRawUnchanged: section.indexTree === raw, candidateApplied: applied, oldReaderIdentityMatches: receiverIdentity?.indexTree === raw, stageEntriesMatch: applied.applied && git(receiver, ["ls-files", "--stage", "-z"]) === git(repo, ["ls-files", "--stage", "-z"]) }));
+  }
+} finally {
+  await fs.rm(root, { recursive: true, force: true });
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+}

@@ -9,7 +9,7 @@ import { git } from "../../engine/git-spawn.js";
 import { repoDirOf } from "./shared.js";
 // Classifier semantics participate in the schema because held decisions must
 // be reprobed when an unchanged on-disk marker changes meaning.
-export const GIT_FINGERPRINT_SCHEMA_VERSION = 8;
+export const GIT_FINGERPRINT_SCHEMA_VERSION = 9;
 export interface GitConfigWireBounds {
   maxKeys: number;
   maxSerializedBytes: number;

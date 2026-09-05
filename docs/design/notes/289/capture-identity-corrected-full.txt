@@ -1,0 +1,39 @@
+bun test v1.4.0 (34cbb9a40)
+
+src/cli/sync-git/capture-identity.test.ts:
+(pass) design 288: captured split index is self-contained in an independent repository [1005.07ms]
+(pass) design 288: split-index capture applies to a fresh receiver without changing source staging [1234.82ms]
+(pass) design 288: ordinary capture carries every unmerged stage-only blob to an independent receiver [1296.80ms]
+(pass) preflight accepts an ordinary repo, rejects non-repo and bare [216.77ms]
+(pass) normalizeSymbolicHeadCasing: pure semantics (FS-independent) [0.74ms]
+(pass) capture normalizes symbolic HEAD casing to the ref store casing [363.95ms]
+(pass) capture refuses ambiguous case-insensitive HEAD ref matches with validation reason [368.89ms]
+(pass) capture names its early bails: empty repo throws a reasoned defer, not undefined [128.88ms]
+(pass) capture→apply reproduces branches, staged state, and stash across repos [1277.89ms]
+(pass) resolve-undo entries with unreachable blobs are stripped on capture and healed before apply fsck [1502.79ms]
+(pass) applyGitState threads compressed index descriptors into artifact decrypt [4152.68ms]
+(pass) incremental dir/all capture uses basis negations and a chained section round-trips [1309.68ms]
+(pass) rewritten refs between increment links import with forced scratch refs, and second apply skips only historical links [2023.46ms]
+(pass) current incremental link is imported even when recorded commit tips are already present [1375.09ms]
+(pass) unchained full-bundle sections do not use presence probes [1031.08ms]
+(pass) preserveGitConflict imports the current WIP link even when commit tips are present [1092.46ms]
+(pass) detached pointer captures use detached HEAD as basis for scoped chains [1030.13ms]
+(pass) capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpdir scratch [290.90ms]
+(pass) stale git capture sweep removes orphan rbox-gitcap directories and preserves live owners [2.59ms]
+(pass) second git capture sweep preserves an aged live staging dir and sweeps a dead owner promptly [294.61ms]
+(pass) scanManifest never includes staged git capture bytes under .rbox [8.48ms]
+(pass) apply with the WRONG key fails closed — no .git mutation (§28 decrypt-before-mutate) [499.41ms]
+(pass) gitIdentity is stable across captures when nothing changed (no echo) [390.94ms]
+(pass) capture stash construction never refreshes the live staged index [438.25ms]
+(pass) capture with an absent index never creates the live index [291.18ms]
+(pass) gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers [814.70ms]
+(pass) indexTreeOf temp-index write-tree matches direct write-tree for staged dir and pointer repos [415.05ms]
+(pass) design 289: ordinary partial conflict with REUC and monitor config stays stable [1699.50ms]
+(pass) design 289: split partial conflict with REUC and monitor config stays stable [1959.28ms]
+(pass) design 289: raw intent-to-add carries the native empty blob and excludes foreign gitlinks [978.73ms]
+(pass) design 289: missing ordinary stage root rejects capture and cleans scratch pins [390.49ms]
+
+ 31 pass
+ 0 fail
+ 333 expect() calls
+Ran 31 tests across 1 file. [27.93s]
