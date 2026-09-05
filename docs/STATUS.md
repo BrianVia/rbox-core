@@ -25,14 +25,24 @@
   assignment at least once (5 parallel PRs starve the CF runner pool; rerun
   with `gh run rerun <id> --failed`; #883 needed four reruns). DEV API
   auto-deployed and answers `/version`.
-- **Second wave OPEN (evening):** #888 G4a Git env allowlist (design 299),
-  #889 B0b push-cost attribution lines `git-plan slowest:` /
-  `state-save slow:` (design 298; measured: empty desktop push = git-plan
-  3.8s with cp2376 d1065 + state-save 2.3s and ZERO captures — after merge,
-  dev-build the desktop and read those two lines, then scope the real fix),
-  #890 S2a optional `plane_entries_entry` index (design 300; 200k/3k orphan
-  collector >180s → ~65ms). Merge each on green; then remove worktrees
-  `b0b-attrib`, `g4a-gitenv`, `s2a-index`.
+- **Second wave MERGED (evening):** #888 G4a Git env allowlist (design 299,
+  `cb37aabd3`), #889 B0b push-cost attribution lines `git-plan slowest:` /
+  `state-save slow:` (design 298, `6cb988cba`), #890 S2a optional
+  `plane_entries_entry` index (design 300, `d23c49558`; 200k/3k orphan
+  collector >180s → ~65ms). Zero open PRs. All worktrees removed.
+- **Desktop now dogfoods `2.0.2-dev+6cb988c`** (restarted 2026-09-05 ~19:00Z)
+  to read the two attribution lines for the empty-push cost (git-plan 3.8s
+  with cp2376 d1065 + state-save 2.3s, zero captures). FM stays on
+  `2.0.2-dev+e3881c3` (shadow), Mac on stable 2.0.2. **Next:** read
+  `rbox logs | grep -E "git-plan slowest|state-save slow"`, then scope the
+  fix as its own design (candidates: the one fingerprint-miss repo
+  recapturing every tick; state-save composing a full manifest when nothing
+  changed).
+- **Roadmap 287 disposition so far:** DONE G2, G3a(+G3b discharged), G4a,
+  G5a/G5b, F1, F2a, S1a, S2a, S3a, B0b(partial: push attribution). OPEN:
+  G1 historical repair (founder decision, recommend defer), G4b/c
+  cancellation, G5c/d pins+projections, F2b/c, F3b/c, F4b-d, F5, F6, S1b-d,
+  S2b-d, S3b, S4, S5; G6/G7/F7/S6/X1-X4 are design/experiment gates.
 - **Codex sandbox cannot write `.git/worktrees/*`** (index.lock EROFS): every
   Codex run leaves the diff uncommitted; commit from this session. Also:
   `SPEC.md` at repo root is a TRACKED leftover from #833 — never `cp` a spec
