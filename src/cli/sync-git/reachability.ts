@@ -266,6 +266,18 @@ export async function noDropProof(
   protectedTips: readonly string[],
   options: NoDropProofOptions = {},
 ): Promise<NoDropProof> {
+  return legacyNoDropProofForTest(repoDir, plannedRefs, heldRefs, recoveryPins, protectedTips, options);
+}
+
+/** Test-only semantic oracle for the pre-design-293 no-drop proof (G5a). */
+export async function legacyNoDropProofForTest(
+  repoDir: string,
+  plannedRefs: Readonly<Record<string, string>> | readonly string[],
+  heldRefs: Readonly<Record<string, string>> | readonly string[],
+  recoveryPins: Readonly<Record<string, string>> | readonly string[],
+  protectedTips: readonly string[],
+  options: NoDropProofOptions = {},
+): Promise<NoDropProof> {
   const isShallow = options.ownershipContext ? options.ownershipContext.shallow : await shallow(repoDir);
   if (isShallow !== false) return { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" };
   const values = (v: Readonly<Record<string, string>> | readonly string[]) => Array.isArray(v) ? [...v] : Object.values(v);
