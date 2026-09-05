@@ -101,14 +101,17 @@
   so the 285 deletions cannot be proven from this device and stay deferred
   ("finishing a branch deletion on checkout unavailable"); finishing them
   needed a product decision — **founder (2026-09-05 22:20Z): "let this
-  device's capture count as delete"** → **#903 OPEN (design 309)**: an
+  device's capture count as delete"** → **#903 MERGED (design 309, `793171674`)**: an
   origin-less branch is deletable when the BASE section's design-274 author
   stamp is this device (the branch existed here at capture); foreign or
   unstamped sections still refuse. `rbox git resolve` has no verb for
-  outgoing deferrals (noted). **Desktop now dogfoods `2.0.2-dev+0a3d456`**
-  (pid 2401560, ~22:32Z; 308 in). After #903 merges, dev-build the desktop
-  and confirm the 285 deletions publish (tombstones) and the `git-sync
-  deferred Personal/rbox-core` line stops. Codex stalled at startup twice today (rmcp
+  outgoing deferrals (noted as a gap). **Desktop now dogfoods
+  `2.0.2-dev+7931716`** (pid 2406373, ~22:40Z); watch for the first push
+  that captures `Personal/rbox-core` (tombstones for the 285 branches) and
+  the `git-sync deferred Personal/rbox-core` line stopping. Then the other
+  devices (Mac, FM) delete those branches on their next pull of a build
+  that carries 309 — they are on older builds, so expect that only after a
+  release or a dev-build rollout. Codex stalled at startup twice today (rmcp
   AuthRequired on the Cloudflare MCP); part 1 was done by hand. Remaining
   after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
