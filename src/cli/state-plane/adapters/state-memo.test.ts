@@ -15,6 +15,7 @@ import { saveStateSource } from "../../sync-state.js";
 import { authorityMarkerBytes } from "../authority-marker.js";
 import { sqliteResetPaths, statePath } from "../paths.js";
 import * as storeFacade from "../store-facade.js";
+import * as readSnapshotModule from "../store/read-snapshot.js";
 import { createStateStore, openStateStore, stateStoreDatabase } from "../store/open.js";
 import { runStatement } from "../store/statements.js";
 import { saveStateUnsafeLegacyOrTest } from "./legacy-json-store.js";
@@ -326,62 +327,78 @@ test("the two-read safety argument: state_revision is strictly monotonic per lin
   expect(writer).toContain("frozen.expected.stateRevision + 1");
 });
 
-/** Design 301: a global-free save reuses the snapshot's untouched base file
- * rows and reads the repo records back — the result must equal a fresh
- * read-back exactly, and a stale snapshot must never be trusted. */
-test("a repo-only save returns exactly the read-back while reusing the untouched files", async () => {
-  const root = await sqliteWorkspace("repo-only");
-  const before = await loadState(root, STREAM);
-  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
+/** Design 302: after a global-free save the retained rows are still the store's
+ * rows, so the read-back pages none — and still equals a fresh materialization
+ * (`loadRawState` never reuses, so the drift audit keeps its fresh view). */
+async function pagedFileRows(run: () => Promise<void>): Promise<number> {
+  const original = readSnapshotModule.openReadSnapshot;
+  let pages = 0;
+  const spy = spyOn(readSnapshotModule, "openReadSnapshot").mockImplementation((store) => {
+    const snapshot = original(store);
+    const files = snapshot.files.bind(snapshot);
+    snapshot.files = (plane, after, batch) => { pages += 1; return files(plane, after, batch); };
+    return snapshot;
+  });
+  try { await run(); } finally { spy.mockRestore(); }
+  return pages;
+}
+
+test("a repo-only save reads back without paging file rows and equals a fresh materialization", async () => {
+  const root = await sqliteWorkspace("files-memo");
+  const before = await loadState(root, STREAM); // retained with its rows
   let saved: SyncState | undefined;
-  try {
+  const pages = await pagedFileRows(async () => {
     saved = await saveStateSource(root, before, {
       expectedStream: STREAM, sourceGlobalSeq: before.lastSyncedSequence,
       observedRepos: ["r"], values: { partial: { r: null } },
     });
-    // The one read-back was told which rows it may skip.
-    expect(filesSpy).toHaveBeenCalledTimes(1);
-    expect(filesSpy.mock.calls[0]?.[1]).toEqual({ baseFiles: before.lastSyncedManifest.files });
-  } finally {
-    filesSpy.mockRestore();
-  }
-  expect(saved).toEqual((await loadRawState(root))!);
+  });
+  expect(pages).toBe(0);
   expect(saved!.stateRevision).toBe(before.stateRevision! + 1);
+  expect(saved).toEqual((await loadRawState(root))!);
 });
 
-test("a stale snapshot never gets its files reused", async () => {
-  const root = await sqliteWorkspace("stale-snapshot");
-  const stale = await loadState(root, STREAM);
+test("a load after a foreign revision bump re-reads records but not the untouched rows", async () => {
+  const root = await sqliteWorkspace("files-memo-foreign");
+  await loadState(root, STREAM);
   mutateStoreOutsideTheAdapter(root, "UPDATE state_lineage SET state_revision=state_revision+1");
-  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
-  try {
-    const saved = await saveStateSource(root, stale, {
-      expectedStream: STREAM, sourceGlobalSeq: stale.lastSyncedSequence,
-      observedRepos: ["r"], values: { partial: { r: null } },
-    });
-    // The accepted read-back had no reuse: the CAS token is two past the snapshot.
-    expect(filesSpy.mock.calls.every((call) => call[1] === undefined)).toBe(true);
-    expect(saved).toEqual((await loadRawState(root))!);
-  } finally {
-    filesSpy.mockRestore();
-  }
+  let loaded: SyncState | undefined;
+  const pages = await pagedFileRows(async () => { loaded = await loadState(root, STREAM); });
+  expect(pages).toBe(0);
+  expect(loaded).toEqual((await loadRawState(root))!);
 });
 
-test("a save that carries a global section reads everything back", async () => {
-  const root = await sqliteWorkspace("global-readback");
+test("a global save advances the base generation and the next read-back pages fresh rows", async () => {
+  const root = await sqliteWorkspace("files-memo-global");
   const before = await loadState(root, STREAM);
-  const filesSpy = spyOn(storeFacade, "loadRawStateFromStore");
   let saved: SyncState | undefined;
-  try {
+  const pages = await pagedFileRows(async () => {
     saved = await saveStateSource(root, before, {
       expectedStream: STREAM, sourceGlobalSeq: before.lastSyncedSequence + 1,
       globalManifest: { generatedAt: "2026-09-05T00:00:00.000Z", files: [] },
       observedRepos: [], values: {},
     });
-    expect(filesSpy).toHaveBeenCalledTimes(1);
-    expect(filesSpy.mock.calls[0]?.[1]).toBeUndefined();
-  } finally {
-    filesSpy.mockRestore();
-  }
+  });
+  expect(pages).toBeGreaterThan(0);
   expect(saved).toEqual((await loadRawState(root))!);
+});
+
+test("loadRawState never reuses retained rows", async () => {
+  const root = await sqliteWorkspace("files-memo-raw");
+  await loadState(root, STREAM);
+  const pages = await pagedFileRows(async () => { await loadRawState(root); });
+  expect(pages).toBeGreaterThan(0);
+});
+
+test("RBOX_STATE_LOAD_CACHE=0 disables base-file reuse too", async () => {
+  process.env.RBOX_STATE_LOAD_CACHE = "0";
+  const root = await sqliteWorkspace("files-memo-off");
+  const before = await loadState(root, STREAM);
+  const pages = await pagedFileRows(async () => {
+    await saveStateSource(root, before, {
+      expectedStream: STREAM, sourceGlobalSeq: before.lastSyncedSequence,
+      observedRepos: ["r"], values: { partial: { r: null } },
+    });
+  });
+  expect(pages).toBeGreaterThan(0);
 });

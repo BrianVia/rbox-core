@@ -41,12 +41,11 @@ export const LEGACY_REJECTION_REASON = {
  * applied rather than trusting that the caller only offers one when it may: a
  * packet that carried any section wrote something the projection cannot know.
  *
- * Design 301 narrows what a global-free packet may reuse to the ONE thing it
- * provably did not touch: the base plane's file rows. Repo records are still
- * read back (the store recomposes bases against prior provenance, so a
- * projection of them is not trustworthy), and the reuse is bound to the CAS
- * token being exactly one revision past the snapshot's — every accepted CAS
- * bumps `state_revision` by one, so anything else means the snapshot was stale.
+ * Design 302: `reuse` is the design 277 memo's own retained file rows (owner:
+ * state-memo.ts), offered by the adapter only for a global-free packet whose
+ * post-CAS base generation still matches the retention. It is a skip rule
+ * keyed by store truth, not a caller's claim; records, meta and git
+ * projections are still read back.
  */
 export function translateCasResult(
   result: CasResult,
@@ -54,6 +53,7 @@ export function translateCasResult(
   facade: StoreFacade,
   packet: StateSavePacket,
   acceptedProjection?: SyncState,
+  reuse?: { baseFiles: readonly FileEntry[] },
 ): StateSaveResult {
   switch (result.status) {
     case "accepted":
@@ -61,7 +61,7 @@ export function translateCasResult(
         status: "accepted",
         state: acceptedProjection !== undefined && fullyElidedPacket(packet)
           ? facade.projectAcceptedSavePacket(acceptedProjection, result.token)
-          : facade.loadRawStateFromStore(store, untouchedBaseFiles(packet, result.token, acceptedProjection)),
+          : facade.loadRawStateFromStore(store, reuse),
       };
     case "rejected":
       try {
@@ -83,12 +83,3 @@ export function translateCasResult(
   }
 }
 
-function untouchedBaseFiles(
-  packet: StateSavePacket,
-  token: { stateRevision?: number },
-  projection?: SyncState,
-): { baseFiles: readonly FileEntry[] } | undefined {
-  if (projection === undefined || packet.global !== undefined) return undefined;
-  if (projection.stateRevision === undefined || token.stateRevision !== projection.stateRevision + 1) return undefined;
-  return { baseFiles: projection.lastSyncedManifest.files };
-}

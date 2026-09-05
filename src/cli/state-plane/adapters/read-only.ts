@@ -78,10 +78,11 @@ function withoutUndefinedMembers<T extends object>(record: T): T {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)) as T;
 }
 
-/** `reuse.baseFiles` (design 301): the caller proves the base plane's files did
- * not move (a global-free CAS whose token is exactly one revision past the
- * snapshot's), so only the file rows are skipped — repo records, manifest meta,
- * git projections and every token still come from the store. */
+/** `reuse.baseFiles` (design 302): supplied only by the design 277 memo layer
+ * (`memoizedBaseFiles`), never by a caller's claim — the retained state's own
+ * file rows, valid while the store's lineage and base generation still match.
+ * Only the file cursor is skipped; records, meta, git projections and every
+ * token still come from the store. `loadRawState` never passes it. */
 export function loadRawStateFromStore(store: StateStoreHandle, reuse?: { baseFiles: readonly FileEntry[] }): SyncState {
   const guard = openReadSnapshot(store);
   const token = guard.token;
@@ -128,6 +129,9 @@ export interface StateFreshnessToken {
   readonly authorityId: string;
   readonly lineageId: string;
   readonly stream: string;
+  /** Advances only when a global section lands (write-packet.ts); design 302
+   * keys base-file reuse on it. */
+  readonly baseGeneration: number;
   readonly stateNonce?: string;
   readonly stateRevision?: number;
   readonly telemetryBindingId?: string;
@@ -143,17 +147,19 @@ interface FreshnessRow {
   state_nonce: string | null;
   state_revision: number | null;
   telemetry_binding_id: string | null;
+  active_base_generation: number;
 }
 
 /** One row, no cursor: the freshness probe is O(1) where a materialization is
  * O(files + repos). */
 export function readStateFreshnessFromStore(store: StateStoreHandle): StateFreshnessToken {
   const row = selectRow<FreshnessRow>(stateStoreDatabase(store),
-    `SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,l.telemetry_binding_id
+    `SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,l.telemetry_binding_id,l.active_base_generation
      FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id WHERE m.singleton=1`);
   if (!row) throw new Error("state store singleton disappeared");
   const token: MutableFreshnessToken = {
     authorityId: row.authority_id, lineageId: row.lineage_id, stream: row.stream,
+    baseGeneration: row.active_base_generation,
   };
   // Absent tokens stay absent rather than present-and-undefined: the comparison
   // against a held state is an equality, and `undefined` is one of its values.
