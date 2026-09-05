@@ -541,6 +541,24 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
         packedObservation.status === "unreadable" ? "unreadable" : undefined;
       const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
       if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
+      // Design 308: the two per-branch refusals that need no evidence beyond the
+      // record and the candidate (scope, recorded origin) are decided BEFORE the
+      // artifact scan and the authorization reads. A BASE branch with no recorded
+      // origin can never be proven deleted this cycle, so paying ~1.4s of
+      // `for-each-ref` per push to learn that is pure waste; the verdict and the
+      // deferral type are unchanged, only the forensic reason names the cheap cause.
+      if (!refusal) {
+        for (const [ref, priorOid] of missing) {
+          const cheapRefusals = [
+            ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
+            ...(!branchBaseOriginMatches(record?.branchBaseOrigins?.[ref], priorOid) ? ["origin-mismatch"] : []),
+          ];
+          if (cheapRefusals.length > 0) {
+            refusal = `branch deletion witness refused ${ref} (${cheapRefusals.join("+")})`;
+            break;
+          }
+        }
+      }
       const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
         workspaceRoot: root, relPath: rel, state, ctx, record,
         base: baseSection, incoming: candidate, liveRefs: candidate.refs,
