@@ -1,0 +1,154 @@
+/** Never: capture/carry decisions, accumulator mutation, tombstone authoring, or ref transactions beyond the verification it commits. */
+import fs from "node:fs/promises";
+import path from "node:path";
+import { receiverEquivalentCollisionNames, type GitSection } from "../../engine/index.js";
+import type { GitDeferralReason, RepoRecord, SyncState } from "../config.js";
+import { branchBaseOriginMatches } from "./base-composer.js";
+import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./branch-transition.js";
+import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
+import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
+import { readHead, type RepoCtx } from "./git-state.js";
+import { gitPreflight, isGitBusy } from "./preflight.js";
+import { errMsg, type PackedRefsObservation } from "./shared.js";
+
+export interface BranchDeletionWitnessInput {
+  root: string;
+  rel: string;
+  state: SyncState;
+  ctx: RepoCtx;
+  record: RepoRecord | undefined;
+  baseSection: GitSection | undefined;
+  candidate: GitSection;
+  /** BASE branches absent from the candidate: `[ref, priorOid]`, original order. */
+  missing: ReadonlyArray<readonly [string, string]>;
+  packedObservation: PackedRefsObservation;
+  packedRegressed: boolean;
+  binding: { lineageHash: string; repositoryIdentityHash: string } | undefined;
+  /** Tests only: runs before the authorization reads. */
+  beforeAbsencePreflight?: (relPath: string) => void | Promise<void>;
+}
+
+export type BranchDeletionWitness =
+  | { status: "proven"; proofs: Record<string, { priorOid: string }> }
+  | { status: "refused"; reason: string; typed: GitDeferralReason };
+
+/**
+ * The branch-deletion witness (design 43 W/L/D, 273, 308): decide whether every
+ * BASE branch missing from a captured candidate may be published as a deletion.
+ * Cheap per-branch refusals (scope, recorded origin) come first; only a repo that
+ * passes them pays for the protocol artifact scan and the authorization reads.
+ * Pure decision plus the verification transaction; the caller owns the carry,
+ * the revert and the deferral bookkeeping.
+ */
+export async function witnessBranchDeletions(input: BranchDeletionWitnessInput): Promise<BranchDeletionWitness> {
+  const { root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed, binding, beforeAbsencePreflight } = input;
+
+  let refusal: string | undefined = packedObservation.status === "unreadable"
+    ? `packed-refs baseline could not be read: ${errMsg(packedObservation.error)}`
+    : packedRegressed
+      ? "packed-refs mtime regressed while a BASE branch was absent"
+      : undefined;
+  let refusalType: GitDeferralReason | undefined =
+    packedObservation.status === "unreadable" ? "unreadable" : undefined;
+  const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
+  if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
+  // Design 308: the two per-branch refusals that need no evidence beyond the
+  // record and the candidate (scope, recorded origin) are decided BEFORE the
+  // artifact scan and the authorization reads. A BASE branch with no recorded
+  // origin can never be proven deleted this cycle, so paying ~1.4s of
+  // `for-each-ref` per push to learn that is pure waste; the verdict and the
+  // deferral type are unchanged, only the forensic reason names the cheap cause.
+  if (!refusal) {
+    for (const [ref, priorOid] of missing) {
+      const cheapRefusals = [
+        ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
+        ...(!branchBaseOriginMatches(record?.branchBaseOrigins?.[ref], priorOid) ? ["origin-mismatch"] : []),
+      ];
+      if (cheapRefusals.length > 0) {
+        refusal = `branch deletion witness refused ${ref} (${cheapRefusals.join("+")})`;
+        break;
+      }
+    }
+  }
+  const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
+    workspaceRoot: root, relPath: rel, state, ctx, record,
+    base: baseSection, incoming: candidate, liveRefs: candidate.refs,
+  });
+  if (protocol?.status !== "ready") refusal ??= protocol?.reason ?? "BASE artifact/lineage proof unavailable";
+  const readyProtocol = protocol?.status === "ready" ? protocol.protocol : undefined;
+  if (readyProtocol && (!binding
+    || binding.lineageHash !== readyProtocol.lineageHash
+    || binding.repositoryIdentityHash !== readyProtocol.repositoryIdentityHash)) {
+    refusal ??= "publisher repository binding changed before absence proof";
+  }
+  let busy = false;
+  let preflight: Awaited<ReturnType<typeof gitPreflight>> = { ok: true };
+  let owned = new Map<string, string>();
+  let head = "";
+  if (!refusal) {
+    try {
+      await beforeAbsencePreflight?.(rel);
+      const [busyRead, preflightRead, ownedRead, headRead] = await Promise.all([
+        isGitBusy(ctx.repoDir),
+        gitPreflight(ctx.repoDir),
+        branchesCheckedOutElsewhereStrict(ctx),
+        readHead(ctx),
+      ]);
+      if (ownedRead.status === "unreadable") throw ownedRead.cause;
+      busy = busyRead;
+      preflight = preflightRead;
+      owned = ownedRead.owned;
+      head = headRead;
+    } catch (error) {
+      refusal = `branch deletion authorization evidence could not be read: ${errMsg(error)}`;
+      refusalType = "unreadable";
+    }
+  }
+  if (busy) refusal ??= "repository operation began before absence proof";
+  if (!preflight.ok) refusal ??= preflight.reason;
+  const collisions = receiverEquivalentCollisionNames([
+    ...Object.keys(baseSection?.refs ?? {}),
+    ...Object.keys(candidate.refs),
+    ...owned.keys(),
+  ]);
+  const proofs: Record<string, { priorOid: string }> = {};
+
+  for (const [ref, priorOid] of missing) {
+    if (refusal) break;
+    const origin = record?.branchBaseOrigins?.[ref];
+    const artifacts = readyProtocol!.artifacts[ref];
+    const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
+      && artifacts.present === "absent"
+      && artifacts.keeps === "clear"
+      && artifacts.settledAbsence === "absent");
+    const witnessRefusals = [
+      ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
+      ...(!branchBaseOriginMatches(origin, priorOid) ? ["origin-mismatch"] : []),
+      ...(branchBaseOriginMatches(origin, priorOid) && origin.lineageHash !== readyProtocol!.lineageHash ? ["lineage-changed"] : []),
+      ...(!artifactsClear ? ["artifacts-standing"] : []),
+      ...(owned.has(ref) ? ["worktree-owned"] : []),
+      ...(collisions.has(ref) ? ["name-collision"] : []),
+      ...(head === `ref: ${ref}` ? ["head-symref"] : []),
+    ];
+    if (witnessRefusals.length > 0) {
+      refusal = `branch deletion witness refused ${ref} (${witnessRefusals.join("+")})`;
+      break;
+    }
+    try {
+      const verification = await planAbsentBranchVerification(ctx.repoDir, ref);
+      await commitAbsentBranchVerification(verification);
+      proofs[ref] = { priorOid };
+    } catch (error) {
+      refusal = errMsg(error);
+      break;
+    }
+  }
+
+  if (!refusal && Object.keys(proofs).length === missing.length) return { status: "proven", proofs };
+  const reason = refusal ?? "branch deletion proof unavailable";
+  return {
+    status: "refused",
+    reason,
+    typed: refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"),
+  };
+}
