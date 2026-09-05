@@ -106,9 +106,21 @@
   stamp is this device (the branch existed here at capture); foreign or
   unstamped sections still refuse. `rbox git resolve` has no verb for
   outgoing deferrals (noted as a gap). **Desktop now dogfoods
-  `2.0.2-dev+7931716`** (pid 2406373, ~22:40Z); watch for the first push
-  that captures `Personal/rbox-core` (tombstones for the 285 branches) and
-  the `git-sync deferred Personal/rbox-core` line stopping. Then the other
+  `2.0.2-dev+7931716`** (pid 2406373, ~22:40Z); **Result:** the origin refusal is gone;
+  the witness now refuses the same branch for `artifacts-standing`: this
+  repo holds **206 standing CREATE-P receipts** (`refs/rbox-local/base-
+  present/v2`, `priorOid:null`) = branches a peer created that this desktop
+  never landed (design 286 manual-landing receipts), and I deleted the local
+  namesakes this morning. That refusal is CORRECT (deleting my copy must not
+  delete the peer's branch). Gaps: (1) `rbox git resolve` does not surface
+  standing CREATE-P receipts ("no deferred incoming Git state"), so the user
+  cannot land (take-theirs) or discard them; (2) with 309 the witness now
+  pays the full artifact scan every push again (`carried≈1.4s`), so a
+  standing-artifacts backoff keyed on the ref-plane fingerprint is the next
+  perf slice (design 311). **Founder decision needed (design 310):** a manual
+  verb to discard standing CREATE-P receipts (`rbox git resolve <repo>
+  discard-incoming --confirm`) vs landing them (take-theirs, which re-creates
+  the 206 branches locally so a second local delete records pull-p origins). Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
