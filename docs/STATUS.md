@@ -120,8 +120,14 @@
   `(artifacts-standing)` refusal per repo under a token of the
   `refs/rbox-local` plane + missing set and skips the scan while it is
   unchanged. **Desktop now dogfoods `2.0.2-dev+d234b58`** (pid 2478074,
-  ~23:07Z); expect `carried` to fall from ~1.4s to tens of ms once the
-  watcher is trusted again. **CI runner degradation (evening):** every
+  ~23:07Z); **PROVEN:** three pushes on the new daemon read
+  `carried=19/12/13ms` (was ~1,400); `discover` stays ~950 until the watcher
+  is trusted (~8–15 min post-restart), then 0 as measured earlier. Empty
+  push now 5.2s = drain_wait 1.5–1.9s (watcher debounce, by design) +
+  git-plan 2.3s (pool ≈0.86s: rbox-core recaptured each tick while edited
+  + ~0.5s unattributed in the pool; discover ≈0.95 pre-trust / 0 trusted)
+  + projection 0.6–0.9s + git-plan tail 0.6–0.9s. Day total: 9.0s → ~4s
+  steady-state once trusted (vs 6.2s at the start of this evening). **CI runner degradation (evening):** every
   PR today hit FLAKE-012 at least once; #904's shard 2/6 failed three reruns
   in a row, twice with a new variant `The Worker returned HTTP 401 while
   waiting for GitHub's runner assignment`. Founder owes the runner wizard
