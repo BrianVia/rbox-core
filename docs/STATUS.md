@@ -67,12 +67,18 @@
   skipping would weaken the regression refusal). **#896 MERGED (design 305,
   `ba2d22e12`)**: scratch pins in one `update-ref -z --stdin` `create`
   transaction (third owned raw site in the design-130 allowlist).
-  **Desktop now dogfoods `2.0.2-dev+fa5c507`** (pid 1877350, ~20:50Z);
-  expect `carried=` to drop from ~1960ms. **Design 307 (design-only) in
-  Codex** (`.claude/worktrees/design-307`): plan discovery from the daemon's
-  `GitDiscoveryContinuity.authoritative` topology with a freshness
-  inventory — verdict decides whether it is one bounded PR. Remaining
-  after 306/307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
+  Desktop on fa5c507 measured `carried=1963 → 1433` only: the slow classify
+  path (config lane) still re-read contexts, so **#898 MERGED (306b,
+  `c61f1aa59`)** threads the identity probe's `diskCtx` through the carry
+  command. **Desktop now dogfoods `2.0.2-dev+c61f1aa`** (pid 1968148,
+  ~21:15Z). **Design 307 written and ALIGNED (3 rounds)** on branch
+  `docs/307-plan-topology-design` (`.claude/worktrees/design-307`): plan
+  discovery from a continuity-owned plan-topology certificate with three
+  invalidation hooks (pre-debounce candidate, raw rule/dir events, pull
+  adoption); part 1 (walk fault sink, `git-discover.ts`) committed there,
+  part 2 (certificate + hooks + wiring + tests) in Codex. Codex has stalled
+  at startup twice today (rmcp AuthRequired on the Cloudflare MCP) — if it
+  stalls again, implement part 2 by hand from §4/§5. Remaining after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
   `projection=0.7s` per push with zero changes (F2b/X1a), `drain_wait
   1.5s` (watcher debounce, by design).
