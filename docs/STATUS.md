@@ -76,10 +76,14 @@
   discovery from a continuity-owned plan-topology certificate with three
   invalidation hooks (pre-debounce candidate, raw rule/dir events, pull
   adoption); **#900 OPEN** (design doc + part 1 fault sink + part 2
-  certificate/hooks/wiring, 693 tests). Desktop on c61f1aa (306b) still
-  reads `carried≈1400ms`, so the loop's cost is NOT context reads;
-  **#899 OPEN** (304c) adds `[ctx= packed= repos= freshCtx=]` sub-timers to
-  the stages suffix to name it. Codex stalled at startup twice today (rmcp
+  certificate/hooks/wiring, 693 tests), rebased onto #901. Desktop on
+  c61f1aa (306b) still read `carried≈1400ms`, so the loop's cost is NOT
+  context reads; **#899 MERGED (304c, `f8a05b59d`)** adds `[ctx= packed=
+  repos= freshCtx=]` sub-timers to the stages suffix. **#901 MERGED
+  (`d08f73d37`)**: the P/K capacity test gets an explicit 60s budget after
+  three CI failures at Bun's 15s default (0.7s locally, ~15s on the
+  runner). **Desktop now dogfoods `2.0.2-dev+d08f73d`** (pid 2122284,
+  ~21:40Z) to read the carried split. Codex stalled at startup twice today (rmcp
   AuthRequired on the Cloudflare MCP); part 1 was done by hand. Remaining
   after 307: `discover=1000` (F3b topology reuse), `pool=846` (rbox-core
   captured every tick because I edit it; ~0.5s unattributed in the pool),
