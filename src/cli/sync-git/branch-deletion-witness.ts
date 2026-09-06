@@ -10,6 +10,7 @@ import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
 import { readHead, type RepoCtx } from "./git-state.js";
+import { receiptRetirementLinesForAbsentBranch } from "./p-settlement.js";
 import { gitPreflight, isGitBusy } from "./preflight.js";
 import { errMsg, type PackedRefsObservation } from "./shared.js";
 
@@ -161,9 +162,18 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
     if (refusal) break;
     const origin = record?.branchBaseOrigins?.[ref];
     const artifacts = readyProtocol!.artifacts[ref];
+    // Design 310: a CREATE-P receipt whose branch and target commit are exactly what
+    // this device's own BASE already recorded is a landing that completed but was
+    // never settled (its origin entry predates the ledger). It is the same fact the
+    // BASE states, not standing incoming work, so it is retired in the deletion's
+    // own verification transaction instead of blocking it.
+    const selfSettled = selfAuthored(ref)
+      ? readyProtocol!.presentArtifacts.filter((p) => p.payload.ref === ref)
+      : [];
+    const receiptsSettle = selfSettled.length > 0 && selfSettled.every((p) => p.payload.nextOid === priorOid);
     const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
-      && artifacts.present === "absent"
-      && artifacts.keeps === "clear"
+      && (artifacts.present === "absent" || (receiptsSettle && artifacts.present === "valid-owning"))
+      && (artifacts.keeps === "clear" || (receiptsSettle && artifacts.keeps === "exact"))
       && artifacts.settledAbsence === "absent");
     const witnessRefusals = [
       ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
@@ -181,7 +191,9 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
       break;
     }
     try {
-      const verification = await planAbsentBranchVerification(ctx.repoDir, ref);
+      const verification = await planAbsentBranchVerification(
+        ctx.repoDir, ref, receiptsSettle ? selfSettled.flatMap(receiptRetirementLinesForAbsentBranch) : [],
+      );
       await commitAbsentBranchVerification(verification);
       proofs[ref] = { priorOid };
     } catch (error) {

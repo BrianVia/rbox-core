@@ -1,5 +1,7 @@
 import { gitSectionDeviceId } from "../../engine/index.js";
 import * as followerProtocol from "./follower-protocol.js";
+import { commitProtocolRefTransaction, prepareBasePresentArtifact } from "./base-artifacts.js";
+import { artifactBinding, readRepoIdentityV1, readStateLineageV1 } from "./repo-lineage.js";
 import { forgetStandingArtifactRefusalsForTests } from "./branch-deletion-witness.js";
 import { test as bunTest, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
@@ -19,7 +21,7 @@ import { captureGitState } from "./capture.js";
 import { checkoutJournalDir } from "./journal.js";
 import { gitIdentity, gitIdentityKey } from "./identity.js";
 import { gitPreflight } from "./preflight.js";
-import { gitSectionBlobRefs, gitSectionNewestLink } from "./git-state.js";
+import { gitSectionBlobRefs, gitSectionNewestLink, repoCtx } from "./git-state.js";
 import { setGitSpawnObserver } from "../../engine/git-spawn.js";
 import {
   MAX_GIT_CONFIG_KEYS,
@@ -2708,6 +2710,68 @@ test("design 311: a standing-artifacts refusal is remembered until the protocol 
     forgetStandingArtifactRefusalsForTests();
   }
 }, 30_000);
+
+async function plantCreateReceipt(rel: string, ref: string, nextOid: string, state: SyncState): Promise<void> {
+  const repo = path.join(rootA, rel);
+  const ctx = (await repoCtx(repo))!;
+  const identity = await readRepoIdentityV1(rel, ctx.kind, { worktreeId: ctx.repoDir, gitDirReal: ctx.gitDir, commonDirReal: ctx.commonDir });
+  const binding = artifactBinding(await readStateLineageV1(rootA, state.stream, state.stateNonce!, identity));
+  const prepared = await prepareBasePresentArtifact(repo, binding, ref, "ab".repeat(16), null, nextOid);
+  await commitProtocolRefTransaction(repo, prepared.transactionLines);
+}
+
+async function receiptRefs(rel: string): Promise<string[]> {
+  return (await git(path.join(rootA, rel), "for-each-ref", "--format=%(refname)", "refs/rbox-local/base-present", "refs/rbox-local/base-present-keep"))
+    .split("\n").filter(Boolean);
+}
+
+test("design 310: a CREATE-P receipt matching this device's own BASE is a completed landing and retires with the deletion", async () => {
+  const rel = "self-settled-receipt";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const topicOid = record.base!.refs["refs/heads/topic"]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await plantCreateReceipt(rel, "refs/heads/topic", topicOid, state);
+  expect(await receiptRefs(rel)).toHaveLength(2); // P + next keep
+  await git(repo, "branch", "-D", "topic");
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+  );
+  expect(plan.captureDeferrals[rel]).toBeUndefined();
+  expect(plan.absentBranchProofs?.[rel]?.["refs/heads/topic"]).toEqual({ priorOid: topicOid });
+  expect(plan.gitRepos?.[rel]?.refTombstones?.["refs/heads/topic"]?.some((entry) => entry.oid === topicOid)).toBe(true);
+  expect(await receiptRefs(rel)).toEqual([]); // retired in the same transaction
+}, 20_000);
+
+test("design 310: a CREATE-P receipt for a DIFFERENT commit than BASE still stands and refuses the deletion", async () => {
+  const rel = "foreign-receipt";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await commitFile(repo, "g.txt", "two", "c2"); // a commit BASE never saw
+  const otherOid = (await git(repo, "rev-parse", "HEAD")).trim();
+  await plantCreateReceipt(rel, "refs/heads/topic", otherOid, state);
+  await git(repo, "branch", "-D", "topic");
+  const logs: string[] = [];
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, { onGitLog: (line) => logs.push(line) },
+  );
+  expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+  expect(logs.some((line) => line.includes("refused refs/heads/topic (artifacts-standing)"))).toBe(true);
+  expect(await receiptRefs(rel)).toHaveLength(2);
+}, 20_000);
 
 test("design 308: a missing BASE branch with no recorded origin is refused before any artifact scan", async () => {
   const rel = "cheap-witness-refusal";

@@ -46,6 +46,14 @@ export function exactPresentArtifactEpisodeTop(bytes: Uint8Array, payload: BaseP
   return !!match && match[1] === expectedOld && match[2] === payload.nextOid && match[3] === payload.episode;
 }
 
+/** Design 310: retire a CREATE-P receipt for a branch that is being VERIFIED
+ * ABSENT in the same transaction (the caller carries `verify <ref> 0`). Same
+ * P/K deletions as ordinary settlement, minus the "branch still at next"
+ * check that settlement needs and a deletion witness contradicts. */
+export function receiptRetirementLinesForAbsentBranch(p: PreparedProtocolRef<BasePresentPayload>): string[] {
+  return retirementLines(p).filter((line) => !line.startsWith(`verify ${p.payload.ref} `));
+}
+
 function retirementLines(p: PreparedProtocolRef<BasePresentPayload>): string[] {
   const binding = { lineageHash: p.payload.lineageHash, repositoryIdentityHash: p.payload.repositoryIdentityHash };
   return [
