@@ -10,8 +10,10 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { SyncState } from "../../sync-state-model.js";
-import { saveStateSource } from "../../sync-state.js";
+import type { FileEntry } from "../../../engine/index.js";
+import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
+import { elisionReceipt } from "../../sync-state-elision.js";
+import { composeStateSavePacket, saveStateSource, type StateSource } from "../../sync-state.js";
 import { authorityMarkerBytes } from "../authority-marker.js";
 import { sqliteResetPaths, statePath } from "../paths.js";
 import * as storeFacade from "../store-facade.js";
@@ -20,7 +22,9 @@ import { createStateStore, openStateStore, stateStoreDatabase } from "../store/o
 import { runStatement } from "../store/statements.js";
 import { saveStateUnsafeLegacyOrTest } from "./legacy-json-store.js";
 import { stateWasStreamMismatch } from "../reset-lineage.js";
-import { ensureTelemetryBindingId, loadRawState, loadState } from "./whole-state-compat.js";
+import { readStateFreshnessFromStore } from "./read-only.js";
+import { forgetState, memoizedDeltaFiles } from "./state-memo.js";
+import { applyStateSavePacket, ensureTelemetryBindingId, loadRawState, loadState } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_memo::root";
 const AUTHORITY = "a".repeat(32);
@@ -68,6 +72,47 @@ function save(root: string, state: SyncState): Promise<unknown> {
     observedRepos: [],
     values: {},
   });
+}
+
+const file = (filePath: string, value: number, extra: Partial<FileEntry> = {}): FileEntry => ({
+  path: filePath, sha256: value.toString(16).padStart(64, "0"), size: value,
+  mode: 0o644, mtimeMs: value, type: "file", ...extra,
+});
+
+const DELTA_BASE = [file("a.txt", 1), file("b.txt", 2), file("c.txt", 3)];
+
+async function seedDeltaBase(root: string): Promise<SyncState> {
+  const empty = await loadState(root, STREAM);
+  return saveStateSource(root, empty, {
+    expectedStream: STREAM, sourceGlobalSeq: 1,
+    globalManifest: { generatedAt: "one", files: DELTA_BASE },
+    observedRepos: [], values: {},
+  });
+}
+
+function deltaSource(files: readonly FileEntry[], sourceGlobalSeq = 2): StateSource {
+  return {
+    expectedStream: STREAM, sourceGlobalSeq,
+    globalManifest: { generatedAt: "two", files: [...files] },
+    observedRepos: [], values: {}, baseIsUnscopedRemote: true,
+  };
+}
+
+async function captureReuse<T>(run: () => Promise<T>): Promise<{
+  result: T;
+  reuse: Array<Parameters<typeof storeFacade.loadRawStateFromStore>[1]>;
+}> {
+  const original = storeFacade.loadRawStateFromStore;
+  const reuse: Array<Parameters<typeof storeFacade.loadRawStateFromStore>[1]> = [];
+  const spy = spyOn(storeFacade, "loadRawStateFromStore").mockImplementation((...args) => {
+    reuse.push(args[1]);
+    return original(...args);
+  });
+  try {
+    return { result: await run(), reuse };
+  } finally {
+    spy.mockRestore();
+  }
 }
 
 test("a second load of an unchanged store materializes nothing and returns the same state", async () => {
@@ -401,4 +446,119 @@ test("RBOX_STATE_LOAD_CACHE=0 disables base-file reuse too", async () => {
     });
   });
   expect(pages).toBeGreaterThan(0);
+});
+
+test("design 313: a delta-carrying save reuses retained rows and equals a fresh raw load", async () => {
+  const root = await sqliteWorkspace("delta-reuse");
+  const before = await seedDeltaBase(root);
+  const files = [DELTA_BASE[0]!, file("b.txt", 9), DELTA_BASE[2]!];
+  expect(composeStateSavePacket(before, deltaSource(files)).globalDelta).toBeDefined();
+
+  const captured = await captureReuse(() => saveStateSource(root, before, deltaSource(files)));
+  const raw = (await loadRawState(root))!;
+  expect(captured.reuse).toHaveLength(1);
+  expect(captured.reuse[0]?.baseFiles).toEqual(raw.lastSyncedManifest.files);
+  expect(captured.result).toEqual(raw);
+  expect(await countMaterializations(async () => { await loadState(root, STREAM); })).toBe(0);
+  expect(await loadState(root, STREAM)).toEqual(raw);
+});
+
+test("design 313: upserts normalize like the store", async () => {
+  const cases: FileEntry[] = [
+    { extraZ: null, ...file("b.txt", 9, { mtimeMs: -0 }), extraA: { nested: true } } as FileEntry,
+    file("b.txt", 9, { type: "symlink", symlinkTarget: "target" }),
+  ];
+  for (const [index, changed] of cases.entries()) {
+    const root = await sqliteWorkspace(`delta-normalize-${index}`);
+    const before = await seedDeltaBase(root);
+    const files = [DELTA_BASE[0]!, changed, DELTA_BASE[2]!];
+    const captured = await captureReuse(() => saveStateSource(root, before, deltaSource(files)));
+    const raw = (await loadRawState(root))!;
+    expect(captured.reuse[0]?.baseFiles).toEqual(raw.lastSyncedManifest.files);
+    expect(captured.result).toEqual(raw);
+  }
+});
+
+test("design 313: no retained predecessor pages", async () => {
+  const root = await sqliteWorkspace("delta-no-predecessor");
+  await seedDeltaBase(root);
+  forgetState(root);
+  const before = (await loadRawState(root))!;
+  const files = [DELTA_BASE[0]!, file("b.txt", 9), DELTA_BASE[2]!];
+  const captured = await captureReuse(() => saveStateSource(root, before, deltaSource(files)));
+  expect(captured.reuse.every((reuse) => reuse === undefined)).toBe(true);
+  expect(captured.result).toEqual((await loadRawState(root))!);
+
+  const racedRoot = await sqliteWorkspace("delta-foreign-revision");
+  const racedBefore = await seedDeltaBase(racedRoot);
+  let interleaved = false;
+  const apply: typeof applyStateSavePacket = async (...args) => {
+    if (!interleaved) {
+      interleaved = true;
+      mutateStoreOutsideTheAdapter(racedRoot, "UPDATE state_lineage SET state_revision=state_revision+1");
+    }
+    return applyStateSavePacket(...args);
+  };
+  const raced = await captureReuse(() => saveStateSource(
+    racedRoot, racedBefore, deltaSource(files), { apply },
+  ));
+  expect(raced.reuse.every((reuse) => reuse === undefined)).toBe(true);
+  expect(raced.result).toEqual((await loadRawState(racedRoot))!);
+});
+
+test("design 313: the memo refuses a delta its retained rows cannot satisfy", async () => {
+  const root = await sqliteWorkspace("delta-refusal");
+  const state = await seedDeltaBase(root);
+  const store = openStateStore(sqliteResetPaths.active(root), { readonly: true });
+  const token = readStateFreshnessFromStore(store);
+  store.close();
+  if (state.stateNonce === undefined || state.stateRevision === undefined) throw new Error("seed lacks delta binding");
+  expect(memoizedDeltaFiles(root, {
+    binding: { nonce: state.stateNonce, stateRevision: state.stateRevision },
+    ops: [{ kind: "delete", path: "absent" }],
+  }, { ...token, baseGeneration: token.baseGeneration + 1 })).toBeUndefined();
+});
+
+test("design 313: caller mutation after the call cannot reach staging or the memo", async () => {
+  const root = await sqliteWorkspace("delta-detach");
+  const before = await seedDeltaBase(root);
+  const files = [DELTA_BASE[0]!, file("b.txt", 9), DELTA_BASE[2]!];
+  const packet = composeStateSavePacket(before, deltaSource(files));
+  expect(packet.globalDelta).toBeDefined();
+  if (packet.globalDelta === undefined) return;
+  const callerOps = [...packet.globalDelta.ops];
+  const mutablePacket: StateSavePacket = { ...packet, globalDelta: { ...packet.globalDelta, ops: callerOps } };
+  const pending = applyStateSavePacket(root, mutablePacket);
+  callerOps.push({ kind: "upsert", entry: file("z.txt", 10) });
+  const result = await pending;
+  expect(result.status).toBe("accepted");
+  if (result.status === "accepted") expect(result.state).toEqual((await loadRawState(root))!);
+});
+
+test("design 313: a delta never carries an elisionExpectation", async () => {
+  const root = await sqliteWorkspace("delta-expectation");
+  const before = await seedDeltaBase(root);
+  const files = [DELTA_BASE[0]!, file("b.txt", 9), DELTA_BASE[2]!];
+  const receipt = elisionReceipt(before, { noActions: true, storedBaseIsRemote: true });
+  expect(receipt).toBeDefined();
+  const packet = composeStateSavePacket(before, { ...deltaSource(files), elisionReceipt: receipt });
+  expect(packet.global).toBeDefined();
+  expect(packet.globalDelta).toBeDefined();
+  expect(packet.elisionExpectation).toBeUndefined();
+});
+
+test("design 313: full-global saves page and the cache kill switch refuses delta reuse", async () => {
+  const root = await sqliteWorkspace("delta-full-pages");
+  const before = await seedDeltaBase(root);
+  const reversed = [...DELTA_BASE].reverse();
+  expect(composeStateSavePacket(before, deltaSource(reversed)).globalDelta).toBeUndefined();
+  const full = await captureReuse(() => saveStateSource(root, before, deltaSource(reversed)));
+  expect(full.reuse.every((reuse) => reuse === undefined)).toBe(true);
+
+  const offRoot = await sqliteWorkspace("delta-cache-off");
+  const offBefore = await seedDeltaBase(offRoot);
+  process.env.RBOX_STATE_LOAD_CACHE = "0";
+  const files = [DELTA_BASE[0]!, file("b.txt", 9), DELTA_BASE[2]!];
+  const off = await captureReuse(() => saveStateSource(offRoot, offBefore, deltaSource(files)));
+  expect(off.reuse.every((reuse) => reuse === undefined)).toBe(true);
 });

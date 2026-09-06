@@ -108,6 +108,16 @@ than handled by a branch.
 - full-global (non-ascending input → no delta) pages; kill switch pages.
 - existing corrupted-row drift audit (`save-delta.test.ts`) unchanged and green.
 
+## Evidence (copied desktop store, 198,728 entries, 258 records, memo-retained snapshot)
+
+| packet | before | after |
+|---|---|---|
+| delta only, 1 op, 0 repos | 2382 ms | 187 / 163 ms |
+| 258 repos, no global | 274 ms | 275 / 251 ms |
+| both (the real push shape) | 2779 ms | 336 ms |
+
+548 state-plane / sync-state / push tests green; 8 new design-313 tests.
+
 ## Expected result
 
 Copied store: apply for the real push shape 2.8s → ~0.4s (records only). Desktop

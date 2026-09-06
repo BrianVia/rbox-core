@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
-import { encodeFileEntry } from "./file-entry.js";
+import { authorityMarkerBytes } from "../authority-marker.js";
+import { sqliteResetPaths, statePath } from "../paths.js";
+import { applyStateSavePacket } from "../adapters/whole-state-compat.js";
+import { createStateStore, openStateStore, stateStoreDatabase } from "../store/open.js";
+import { runStatement, selectRow } from "../store/statements.js";
+import { encodeFileEntry, normalizeFileEntry } from "./file-entry.js";
 import { encodeRepoRecord, REPO_RECORD_COLUMN_BY_FIELD } from "./repo-record.js";
 import { canonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 
@@ -56,6 +64,60 @@ test("FileEntry validates hashes, compression joint presence, and known nulls", 
   expect(() => encodeFileEntry({ ...entry(), sha256: "A".repeat(64) })).toThrow("hex64");
   expect(() => encodeFileEntry({ ...entry(), comp: "zstd" })).toThrow("jointly");
   expect(() => encodeFileEntry({ ...entry(), type: "symlink" })).toThrow("symlink requires");
+});
+
+test("design 313: normalization equals a promoted store cursor and corrupt size metadata is not interned", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rbox-codec-normalize-"));
+  const authority = "1".repeat(32);
+  const nonce = "2".repeat(32);
+  const stream = "https://api.test::codec::root";
+  const files: FileEntry[] = [
+    entry("a-common"),
+    { ...entry("b-negative-zero"), mtimeMs: -0 },
+    { extensionZ: null, ...entry("c-extras"), extensionA: { nested: true } } as FileEntry,
+    { ...entry("d-symlink"), type: "symlink", symlinkTarget: "target" },
+    {
+      ...entry("e-compressed"), encSha: "b".repeat(64), comp: "zstd",
+      payloadSha: "c".repeat(64), cipherSize: 9,
+    },
+    { type: "file", size: 3, path: "f-key-order", mtimeMs: 1.25, mode: 0o6755, sha256: sha },
+  ];
+  try {
+    await fsp.mkdir(sqliteResetPaths.stateRoot(root), { recursive: true });
+    createStateStore(sqliteResetPaths.active(root), {
+      authorityId: authority, lineageId: "3".repeat(32), stream,
+      createdBy: "test", stateNonce: nonce, stateRevision: 0,
+    }).close();
+    await fsp.writeFile(statePath(root), authorityMarkerBytes(authority));
+    const first = await applyStateSavePacket(root, {
+      expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 1,
+      global: { manifest: { generatedAt: "", files } }, repos: [],
+    });
+    expect(first.status).toBe("accepted");
+    if (first.status !== "accepted") return;
+    expect(files.map(normalizeFileEntry)).toEqual(first.state.lastSyncedManifest.files);
+
+    const store = openStateStore(sqliteResetPaths.active(root), { readonly: false });
+    const db = stateStoreDatabase(store);
+    const before = selectRow<{ entry_id: string }>(db,
+      "SELECT entry_id FROM entry_values WHERE path='a-common'")!;
+    runStatement(db, "UPDATE entry_values SET canonical_bytes=canonical_bytes+1 WHERE entry_id=?", before.entry_id);
+    store.close();
+
+    const second = await applyStateSavePacket(root, {
+      expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 2,
+      global: { manifest: { generatedAt: "", files } }, repos: [],
+    });
+    expect(second.status).toBe("accepted");
+    expect(second.status === "accepted" && second.state.lastSyncedManifest.files[0]).toEqual(normalizeFileEntry(files[0]!));
+    const reopened = openStateStore(sqliteResetPaths.active(root), { readonly: true });
+    const after = selectRow<{ entry_id: string }>(stateStoreDatabase(reopened),
+      "SELECT entry_id FROM plane_entries WHERE path='a-common'")!;
+    reopened.close();
+    expect(after.entry_id).not.toBe(before.entry_id);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("RepoRecord column map is total, strips resolutionIntent, and rejects known null", () => {
