@@ -28,6 +28,7 @@ import { readHead } from "./git-state.js";
 import { witnessBranchDeletions } from "./branch-deletion-witness.js";
 import { readFolderSourceEvidence } from "../folder-inventory-union.js";
 import { inspectFolderCatalog } from "../folder-catalog-publish.js";
+import { workspaceKey } from "../rbox-paths.js";
 import { asyncMemo } from "./async-memo.js";
 import { republishPlanInput } from "./republish-requests.js";
 import { GitPlanAccumulator } from "./plan-accumulator.js";
@@ -47,13 +48,24 @@ export async function otherWorkspaceClaimsRepoByRegistry(
   if (evidence.unavailable.length > 0) return true;
   const catalog = await (sources.inspectCatalog ?? inspectFolderCatalog)();
   if (catalog.kind === "damaged") return true;
+  // Review 3: a row whose root is relative or whose directory key does not match
+  // its root is damaged evidence, not an unrelated candidate.
+  if (evidence.desiredRows.some((row) => !path.isAbsolute(row.desired.rootPath) || workspaceKey(row.desired.rootPath) !== row.key)) return true;
   const roots = [
     ...evidence.desiredRows.map((row) => row.desired.rootPath),
     ...evidence.persistedEntries.map((entry) => entry.root),
     ...(catalog.kind === "authoritative" ? catalog.snapshot.folders.map((entry) => entry.normalizedPath) : []),
   ];
   for (const candidate of roots) {
-    const other = await fs.realpath(candidate).catch(() => path.resolve(candidate));
+    if (!path.isAbsolute(candidate)) return true;
+    let other: string;
+    try {
+      other = await fs.realpath(candidate);
+    } catch (error) {
+      // Only a missing root is a lexical path; any other failure (EACCES, ELOOP, I/O) is unknown evidence.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+      other = candidate;
+    }
     if (other === rootReal) continue;
     if (repoReal === other || repoReal.startsWith(other + path.sep)) return true;
   }
