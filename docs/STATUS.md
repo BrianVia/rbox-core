@@ -151,11 +151,19 @@
   workspaces sharing one repo dir — and 310 only settles OWNING receipts.
   No prior lineage is retained anywhere (single `state_lineage` row, no
   reset archives, `state.json` is the authority marker), so founder "Yes
-  go" → **#906 OPEN (design 312)**: same-repository (identity hash) foreign
+  go" → **#906 MERGED (design 312, `a9baae0a4`)**: same-repository (identity hash) foreign
   CREATE-P receipts at the BASE OID settle like owning ones under 309's
   evidence — safe because a minting workspace's later settlement of an
-  absent P is a defined no-op (`p-settlement.ts` → `absent`). GPT review
-  in flight. Empty push on the desktop is now 4.1s. Then the other
+  absent P is a defined no-op (`p-settlement.ts` → `absent`). Three GPT
+  review rounds (`docs/design/notes/312/`): P-repair Q guard; a host
+  claim guard that reads daemon rows + binding registry + folder catalog
+  STRICTLY and fails closed (unavailable source, damaged catalog, relative
+  root, key ≠ `workspaceKey(root)`, any non-ENOENT `realpath` failure).
+  **PROVEN on the desktop (2026-09-06):** first push after restart retired
+  all 206 CREATE-P receipts (206 → 139 → 0 in two pushes); the
+  "finishing a branch deletion on checkout unavailable" deferral is gone
+  from the logs; `refs/rbox-local/base-present/v2` is empty. Empty push
+  on the desktop is now 4.1s. Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
