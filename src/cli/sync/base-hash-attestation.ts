@@ -28,7 +28,8 @@
  * publishes a delta against a base no reader can reproduce, so every guard here
  * is fail-closed: any doubt records nothing.
  */
-import type { Manifest } from "../../engine/index.js";
+import type { FileEntry, Manifest } from "../../engine/index.js";
+import { canonicalJson } from "../state-plane/digest/codecs.js";
 import type { GlobalManifestMeta, SyncState } from "../sync-state-model.js";
 
 /** Every top-level member `manifestFromMeta` reconstructs. A manifest carrying
@@ -41,13 +42,22 @@ const RECONSTRUCTED_MANIFEST_KEYS: ReadonlySet<string> = new Set(["generatedAt",
 const reconstructible = (manifest: Manifest): boolean =>
   Object.keys(manifest).every((key) => RECONSTRUCTED_MANIFEST_KEYS.has(key));
 
+/** Every input of the hashed reconstruction other than the files array itself:
+ * the header fields by value, the meta's gitRepos by canonical value (design
+ * 315 round 1: gitRepos is a hashed input and must be part of the key). */
 interface AttestedBase {
-  meta: GlobalManifestMeta;
   encManifestSha: string;
   manifestHash: string;
+  generatedAt: string;
+  manifestSchema: number | undefined;
+  gitReposCanonical: string;
 }
 
-const ATTESTED = new WeakMap<Manifest, AttestedBase>();
+/** Keyed by the files ARRAY: the one object every state projection preserves
+ * (design 277: never mutated in place, so identity is content; design 313b keeps
+ * it across zero-op global saves). Manifest wrappers and meta objects are
+ * rebuilt by every elided save's projection, so they cannot be the key. */
+const ATTESTED = new WeakMap<readonly FileEntry[], AttestedBase>();
 
 export type AttestSavedBaseOutcome =
   | "attested"
@@ -99,15 +109,24 @@ export function attestSavedBase(
   if (base.generatedAt !== committed.generatedAt) return "generatedAt";
   if (base.manifestSchema !== committed.manifestSchema) return "schema";
   if (base.files.length !== committed.files.length) return "count";
-  ATTESTED.set(base, { meta: savedMeta, encManifestSha: savedMeta.encManifestSha, manifestHash: savedMeta.manifestHash });
+  ATTESTED.set(base.files, {
+    encManifestSha: savedMeta.encManifestSha,
+    manifestHash: savedMeta.manifestHash,
+    generatedAt: base.generatedAt,
+    manifestSchema: base.manifestSchema,
+    gitReposCanonical: canonicalJson(savedMeta.gitRepos),
+  });
   return "attested";
 }
 
 /** Does this state carry a standing attestation for exactly this meta? */
 export function baseHashIsAttested(state: SyncState, meta: GlobalManifestMeta): boolean {
-  const attested = ATTESTED.get(state.lastSyncedManifest);
+  const attested = ATTESTED.get(state.lastSyncedManifest.files);
   return attested !== undefined
-    && attested.meta === state.manifestMeta
+    && state.manifestMeta !== undefined
     && attested.encManifestSha === meta.encManifestSha
-    && attested.manifestHash === meta.manifestHash;
+    && attested.manifestHash === meta.manifestHash
+    && attested.generatedAt === state.lastSyncedManifest.generatedAt
+    && attested.manifestSchema === state.lastSyncedManifest.manifestSchema
+    && attested.gitReposCanonical === canonicalJson(state.manifestMeta.gitRepos);
 }

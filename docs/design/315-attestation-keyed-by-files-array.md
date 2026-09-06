@@ -49,3 +49,14 @@ in #816's admission changes.
 
 Desktop: `delta_base` ≈ 0 on every changed push after the first in a process (~1.4s saved
 per push, every device that pushes).
+
+## v3 (315b, field-driven): key = files array + hashed inputs by value
+
+Desktop `attest=miss/attested` on every push after #909 (the `attest=` field from 313b):
+an elided save's projection rebuilds BOTH the manifest wrapper and the meta object
+(`identity-probe`: after `saveStateSource` with a receipt, `manifest same obj: false`,
+`meta same: false`, `files same: true`). So v2's key (manifest + meta object identity)
+misses after every pull. v3 keys by the files ARRAY (preserved by every projection, and
+across zero-op global saves after 313b) and records every other hashed input by value:
+`generatedAt`, `manifestSchema`, the two hashes, and `canonicalJson(meta.gitRepos)` —
+the round-1 blocker's alternative fix, so WHAT is trusted is unchanged.

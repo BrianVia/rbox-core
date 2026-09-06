@@ -126,40 +126,49 @@ test("a sequence the accepted save did not reach is REFUSED", async () => {
   expect(baseHashIsAttested(saved, meta)).toBe(false);
 });
 
-test("a projected state wrapper preserving the manifest and meta objects remains attested", async () => {
+test("a projection that rebuilds the manifest wrapper and the meta object but keeps the files array remains attested", async () => {
   const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
   const { saved, meta } = await publish("attest-projected", committed);
   expect(attestSavedBase(saved, committed, meta, NEXT_SEQ)).toBe("attested");
 
-  const projected = { ...saved, stateRevision: saved.stateRevision! + 1 };
-  expect(projected).not.toBe(saved);
-  expect(projected.lastSyncedManifest).toBe(saved.lastSyncedManifest);
-  expect(projected.manifestMeta).toBe(saved.manifestMeta);
+  // What an elided save's projection actually does on the fleet: new state, new
+  // manifest wrapper, new meta object, SAME files array (design 277/313b).
+  const projected = {
+    ...saved,
+    stateRevision: saved.stateRevision! + 1,
+    lastSyncedManifest: { ...saved.lastSyncedManifest },
+    manifestMeta: { ...saved.manifestMeta! },
+  };
+  expect(projected.lastSyncedManifest).not.toBe(saved.lastSyncedManifest);
+  expect(projected.manifestMeta).not.toBe(saved.manifestMeta);
+  expect(projected.lastSyncedManifest.files).toBe(saved.lastSyncedManifest.files);
   expect(baseHashIsAttested(projected, meta)).toBe(true);
 });
 
-test("the same manifest with a different meta object misses despite equal hashes", async () => {
+test("the same files array with different meta gitRepos misses despite equal hashes", async () => {
   const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
   const { saved, meta } = await publish("attest-meta-identity", committed);
   expect(attestSavedBase(saved, committed, meta, NEXT_SEQ)).toBe("attested");
 
   const differentMeta: GlobalManifestMeta = { ...meta, gitRepos: { repo: SECTION } };
   const projected = { ...saved, manifestMeta: differentMeta };
-  expect(projected.lastSyncedManifest).toBe(saved.lastSyncedManifest);
+  expect(projected.lastSyncedManifest.files).toBe(saved.lastSyncedManifest.files);
   expect(differentMeta.encManifestSha).toBe(meta.encManifestSha);
   expect(differentMeta.manifestHash).toBe(meta.manifestHash);
   expect(baseHashIsAttested(projected, differentMeta)).toBe(false);
+  // A header input changed under the same array misses too.
+  expect(baseHashIsAttested({ ...saved, lastSyncedManifest: { ...saved.lastSyncedManifest, generatedAt: "2026-08-25T00:00:00.000Z" } }, meta)).toBe(false);
 });
 
-test("a rebuilt manifest with equal content misses", async () => {
+test("a rebuilt files array with equal content misses", async () => {
   const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
   const { saved, meta } = await publish("attest-manifest-identity", committed);
   expect(attestSavedBase(saved, committed, meta, NEXT_SEQ)).toBe("attested");
 
-  const rebuiltManifest = structuredClone(saved.lastSyncedManifest);
+  const rebuiltManifest = { ...saved.lastSyncedManifest, files: structuredClone(saved.lastSyncedManifest.files) };
   const projected = { ...saved, lastSyncedManifest: rebuiltManifest };
-  expect(rebuiltManifest).toEqual(saved.lastSyncedManifest);
-  expect(rebuiltManifest).not.toBe(saved.lastSyncedManifest);
+  expect(rebuiltManifest.files).toEqual(saved.lastSyncedManifest.files);
+  expect(rebuiltManifest.files).not.toBe(saved.lastSyncedManifest.files);
   expect(baseHashIsAttested(projected, meta)).toBe(false);
 });
 
