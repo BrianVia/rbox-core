@@ -212,6 +212,16 @@
   meta.gitRepos) by value. **PROVEN on the desktop (`2.0.2-dev+984f5aa`, pid 3615665):**
   ordinary changed pushes log `delta_base=0.0s attest=hit/attested`; wall 23s → 14.6–16.8s.
   The 303 audit memo now holds too (no `compose≈950` after the first elided save).
+- **#912 MERGED (design 317, F6a, `faff65c53`):** finalize on a changed push (`fn≈2850–3200`)
+  was the SEQUENTIAL upload of a capture's artifacts (bundle, index, one per op-state file
+  per worktree), each waiting its own pack-fill window alone. They now flush through
+  `engine/pool.ts` `poolMap` with bound `PACK_MIN_ACTIVATION_COUNT` (16, one owner in
+  `engine/blob-pack.ts`), deduped by encSha, first failure latched so in-flight siblings
+  drain before the plan's retained-ciphertext sweep (two GPT rounds, `notes/317/`; the
+  design-226 tests now assert retry budget + fail-closed PER artifact). **Desktop
+  (`2.0.2-dev+faff65c`, pid 3922384):** `fn1013` (1-blob) and `fn1942` (7-blob) on the
+  first two changed pushes; git-plan 5.2–5.5s → 2.2–4.8s. A 1/2/4/8/16 sweep is the
+  follow-up if `fn` stays above one fill window + one PUT.
 - **Post-restart safety-scan pushes:** two per daemon restart (8 today, 1 yesterday in
   1,346 pushes), 108–140s each, `scan 82.4s` for 377,786 entries (`st48.6 obs36.3`) —
   while the daemon's own `safety scan:` line walks the SAME tree in `wall=1750ms`. The
