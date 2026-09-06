@@ -1,6 +1,6 @@
 # 313 — A delta-carrying save reuses the composer's file array instead of re-reading 198K rows
 
-Status: proposed v3 (2026-09-06; rounds 1–2 in `notes/313/`). Owner: `state-plane/adapters/state-memo.ts` (the reuse rule);
+Status: approved for implementation v3+ (2026-09-06; rounds 1–3 in `notes/313/`; cap reached). Owner: `state-plane/adapters/state-memo.ts` (the reuse rule);
 `whole-state-compat.ts` only routes. Parent: design 302 (global-free reuse), design 277 (memo), 269 (delta).
 
 ## Problem, measured
@@ -112,3 +112,21 @@ than handled by a branch.
 
 Copied store: apply for the real push shape 2.8s → ~0.4s (records only). Desktop
 `state-save slow:` lines for delta pushes drop below the 500ms slow threshold.
+
+## Review round 3 disposition (cap reached; Claude's call)
+
+Accepted as changes:
+- (3) the guard also requires equal `authorityId` (it is already in the token).
+- (1) `plane-promotion.ts` interning `EXACT_MATCH` also compares `canonical_bytes` and
+  `retained_estimate`, so a corrupted pre-existing intern row is never selected for a new
+  upsert (a strict improvement, independent of reuse); tested with a corrupted candidate.
+
+Recorded, not changed — the same trust boundary design 302 shipped with:
+- (2) a memo entry retained from a fully-elided `acceptedProjection` is the caller's LOADED
+  state plus the accepted token, which design 267/302 already define as the durable state and
+  design 302 already reuses rows from. 313 adds no new trust.
+- (4) hand-built delta+expectation packets: the memo rule never reads `elisionExpectation`;
+  the CAS decides it. The composer's exclusivity is pinned only as documentation.
+- (5) same-lineage, same-generation backup restore with different rows is the known 277/302
+  edge; 313 does not widen it (the next full-global save or `loadRawState` re-reads). Kill
+  switch `RBOX_STATE_LOAD_CACHE=0` remains the operator escape.
