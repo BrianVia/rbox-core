@@ -1,6 +1,6 @@
 # 314 — The elision audit accepts the push's standing base-hash attestation
 
-Status: proposed (2026-09-06). Owner: `sync-state-elision.ts` (`globalElisionAudit`).
+Status: WITHDRAWN (2026-09-06, after review round 1 — `notes/314/review1-gpt.md`). Kept so the idea is not retried. Owner: `sync-state-elision.ts` (`globalElisionAudit`).
 Parents: design 303 (audit-hash memo per files array), #816 (`base-hash-attestation.ts`),
 design 313 (delta saves keep the memo's rows).
 
@@ -19,7 +19,21 @@ the same predicate the audit recomputes (`canonicalManifestHashStreaming(manifes
 state.lastSyncedManifest, meta)) === meta.manifestHash`). The design-277 memo hands that
 same object to the next pull, so the audit is re-deriving a proof the process already holds.
 
-## Rule
+## Why it is withdrawn
+
+`attestSavedBase` proves identifiers, sequence, header shape, gitRepos presence and the
+entry COUNT — never the entry values. It is sufficient for #816's purpose (skip re-deriving
+the delta base's hash when the same process just committed it) but it is not a content
+proof. `globalElisionAudit` is design 269's ONLY detector of durable base drift, and a
+push-attested state would renew its attestation on every push, so a same-length corrupted
+read-back (or a same-length divergent memo projection) would evade the detector
+indefinitely. Seeding `auditHash`'s memo from the push instead (review finding 4) fails the
+same way: the push hashed the composer's array, and design 313 (PR #907) returns a
+different array object whose equality to the store is proven structurally, not by hash.
+The 0.85s first audit per new array is the price of the one drift detector; the only
+trust-neutral improvement is making `canonicalManifestHashStreaming` itself cheaper.
+
+## Rule (as proposed; not implemented)
 
 In `globalElisionAudit`, after the existing shape checks (receipt flags, sequence equality,
 deep-equal metas) and BEFORE hashing:
