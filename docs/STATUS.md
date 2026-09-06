@@ -149,11 +149,13 @@
   happened between). The artifact scan therefore classifies them as
   `active-foreign` (valid, not owning) — the design-273/286 guard for two
   workspaces sharing one repo dir — and 310 only settles OWNING receipts.
-  Next step needs a decision: **design 312** would prove "this receipt's
-  lineage is one of THIS workspace's archived prior lineages" (design 283
-  reset archives) and treat such receipts as owning; without that proof
-  they are indistinguishable from another workspace's receipts. Empty push
-  on the desktop is now 4.1s. Then the other
+  No prior lineage is retained anywhere (single `state_lineage` row, no
+  reset archives, `state.json` is the authority marker), so founder "Yes
+  go" → **#906 OPEN (design 312)**: same-repository (identity hash) foreign
+  CREATE-P receipts at the BASE OID settle like owning ones under 309's
+  evidence — safe because a minting workspace's later settlement of an
+  absent P is a defined no-op (`p-settlement.ts` → `absent`). GPT review
+  in flight. Empty push on the desktop is now 4.1s. Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
