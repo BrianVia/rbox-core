@@ -115,7 +115,12 @@ export async function phase1Purge(
   reachable: Set<string>,
   graceMs: number,
   nowMs: number,
+  reachableAtMs: number = nowMs,
 ): Promise<{ purged: number; released: number; resurrected: number; condemned: number }> {
+  if (nowMs - reachableAtMs > graceMs / 2) {
+    console.log(JSON.stringify({ event: "purge_snapshot_stale", ageMs: nowMs - reachableAtMs }));
+    return { purged: 0, released: 0, resurrected: 0, condemned: 0 };
+  }
   const cursorKey = `p1_purge_cursor:${accountId}`;
   const cursor = await readCursor(db, cursorKey);
   // Hoist each candidate's blob size into the candidates query (LEFT JOIN) — no per-candidate
@@ -284,7 +289,7 @@ export async function reconcileUsage(db: D1Database, accountId: string): Promise
  * never starves the rest (idempotent: mark is INSERT OR IGNORE, purge is conditional).
  * D1-only — Phase 2's separately fenced executor runs on its own daily cron hour.
  */
-export async function runPhase1(env: Env, graceMs: number, nowMs: number = Date.now()): Promise<Response> {
+export async function runPhase1(env: Env, graceMs: number, nowMs?: number): Promise<Response> {
   // §32 FLAG: global account fan-out has no account in scope → dbFor(env, "") (the one
   // shard at N=1; a real shard cutover turns this into a per-shard loop, §33 §7).
   const accts = await dbFor(env, "").prepare("SELECT id FROM accounts").all<{ id: string }>();
@@ -297,10 +302,11 @@ export async function runPhase1(env: Env, graceMs: number, nowMs: number = Date.
     // without placing the raw account id in logs.
     const accountKey = (await sha256Hex(accountId)).slice(0, 16);
     try {
+      const reachableAtMs = Date.now();
       const reachable = await perAccountReachable(env, accountId); // fail-closed per account
       const db = dbFor(env, accountId);
-      const m = await phase1Mark(db, accountId, reachable, graceMs, nowMs);
-      const p = await phase1Purge(db, accountId, reachable, graceMs, nowMs);
+      const m = await phase1Mark(db, accountId, reachable, graceMs, nowMs ?? reachableAtMs);
+      const p = await phase1Purge(db, accountId, reachable, graceMs, nowMs ?? Date.now(), reachableAtMs);
       await reconcileUsage(db, accountId);
       totals.marked += m.marked;
       totals.purged += p.purged;
