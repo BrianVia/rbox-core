@@ -238,7 +238,7 @@ describe("A and P/K artifacts", () => {
     expect(scan.foreign).toHaveLength(4);
     expect(scan.foreign).toContainEqual({ refname: invalidForeign, lineageHash: "dd".repeat(32), kind: "absent", status: "invalid", detail: "protocol artifact must target a blob" });
     expect(scan.foreign).toContainEqual({ refname: foreign, lineageHash: foreignBinding.lineageHash, kind: "absent", branchRef: foreignPayload.ref, status: "valid" });
-    expect(scan.foreign).toContainEqual({ refname: foreignP, lineageHash: foreignPBinding.lineageHash, kind: "present", branchRef: foreignPPayload.ref, status: "valid" });
+    expect(scan.foreign).toContainEqual(expect.objectContaining({ refname: foreignP, lineageHash: foreignPBinding.lineageHash, kind: "present", branchRef: foreignPPayload.ref, status: "valid" }));
     expect(scan.foreign).toContainEqual({ refname: foreignK, lineageHash: foreignPBinding.lineageHash, kind: "keep", branchRef: foreignPPayload.ref, status: "valid" });
   });
 

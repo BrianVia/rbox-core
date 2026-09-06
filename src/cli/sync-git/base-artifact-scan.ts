@@ -14,6 +14,7 @@ import {
   type ArtifactReadResult,
   type BaseAbsentPayload,
   type BasePresentPayload,
+  type PreparedProtocolRef,
 } from "./base-artifacts.js";
 import { P_REPAIR_Q_PREFIX } from "./p-repair.js";
 import type { ArtifactBinding } from "./repo-lineage.js";
@@ -33,6 +34,9 @@ export interface ForeignBaseArtifactScanEntry {
   branchRef?: string;
   status: "valid" | "invalid";
   detail?: string;
+  /** Design 312: the inspected receipt of a valid foreign P, so a witness can judge
+   *  it by its target rather than only by its lineage. */
+  artifact?: PreparedProtocolRef<BasePresentPayload>;
 }
 
 type ArtifactNamespaceClassification =
@@ -100,7 +104,7 @@ export async function scanBaseArtifacts(repoDir: string, binding: ArtifactBindin
       const inspected = await inspectBasePresentArtifactRef(repoDir, ref);
       if (inspected.status === "valid") {
         const payload = inspected.artifact.payload;
-        foreign.push({ refname: ref, lineageHash: classified.lineageHash!, kind: "present", branchRef: payload.ref, status: "valid" });
+        foreign.push({ refname: ref, lineageHash: classified.lineageHash!, kind: "present", branchRef: payload.ref, status: "valid", artifact: inspected.artifact });
         const foreignBinding = { lineageHash: payload.lineageHash, repositoryIdentityHash: payload.repositoryIdentityHash };
         if (payload.priorOid !== null) foreignKeeps.set(basePresentKeepRef(foreignBinding, payload.ref, payload.episode, "prior"), { branchRef: payload.ref, lineageHash: payload.lineageHash });
         foreignKeeps.set(basePresentKeepRef(foreignBinding, payload.ref, payload.episode, "next"), { branchRef: payload.ref, lineageHash: payload.lineageHash });

@@ -167,16 +167,28 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
     // never settled (its origin entry predates the ledger). It is the same fact the
     // BASE states, not standing incoming work, so it is retired in the deletion's
     // own verification transaction instead of blocking it.
+    // Design 312: receipts minted under another lineage of this SAME physical
+    // repository (same repositoryIdentityHash) qualify too. Retiring one cannot
+    // hurt its minting workspace: its later settlement of an absent P is a defined
+    // no-op (`p-settlement.ts` returns `absent`), while its BASE and tombstones
+    // are untouched. Lineage history is not retained, so identity + target is the
+    // evidence; a different repository identity still refuses.
     const selfSettled = selfAuthored(ref)
-      ? readyProtocol!.presentArtifacts.filter((p) => p.payload.ref === ref)
+      ? [
+          ...readyProtocol!.presentArtifacts.filter((p) => p.payload.ref === ref),
+          ...readyProtocol!.foreignPresentArtifacts.filter((p) => p.payload.ref === ref
+            && p.payload.repositoryIdentityHash === readyProtocol!.repositoryIdentityHash),
+        ]
       : [];
+    const foreignForRef = readyProtocol!.foreignPresentArtifacts.filter((p) => p.payload.ref === ref).length;
     // CREATE-P only (`priorOid === null`): that is the shape the evidence covers; an
     // UPDATE-P records a move this device may not have applied and keeps refusing.
     const receiptsSettle = selfSettled.length > 0
-      && selfSettled.every((p) => p.payload.priorOid === null && p.payload.nextOid === priorOid);
+      && selfSettled.every((p) => p.payload.priorOid === null && p.payload.nextOid === priorOid)
+      && selfSettled.filter((p) => p.payload.lineageHash !== readyProtocol!.lineageHash).length === foreignForRef;
     const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
-      && (artifacts.present === "absent" || (receiptsSettle && artifacts.present === "valid-owning"))
-      && (artifacts.keeps === "clear" || (receiptsSettle && artifacts.keeps === "exact"))
+      && (artifacts.present === "absent" || (receiptsSettle && (artifacts.present === "valid-owning" || artifacts.present === "active-foreign")))
+      && (artifacts.keeps === "clear" || (receiptsSettle && (artifacts.keeps === "exact" || artifacts.keeps === "mismatched")))
       && artifacts.settledAbsence === "absent");
     const witnessRefusals = [
       ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),

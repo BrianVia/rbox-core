@@ -21,6 +21,10 @@ export interface FollowerBranchProtocol {
   attestations: TombstoneAttestationMap;
   artifacts: Record<string, BranchArtifactDisposition>;
   presentArtifacts: Array<PreparedProtocolRef<BasePresentPayload>>;
+  /** Design 312: valid P receipts minted under ANOTHER lineage of this same
+   *  physical repository. Never owning; a witness may settle a CREATE one whose
+   *  target equals this device's own BASE. */
+  foreignPresentArtifacts: Array<PreparedProtocolRef<BasePresentPayload>>;
   /** A/Z proves a committed absence that stale serialized BASE has not yet
    * materialized. This is a one-cycle breadcrumb-waiver veto, never deletion
    * or BASE authority. */
@@ -136,6 +140,7 @@ export async function prepareFollowerBranchProtocol(input: {
         attestations,
         artifacts,
         presentArtifacts: scan.present.flatMap((entry) => entry.status === "valid" ? [entry.artifact] : []),
+        foreignPresentArtifacts: scan.foreign.flatMap((entry) => entry.kind === "present" && entry.artifact ? [entry.artifact] : []),
         unmaterializedAbsenceRefs,
         absenceWitnesses,
       },
