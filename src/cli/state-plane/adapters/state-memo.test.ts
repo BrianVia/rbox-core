@@ -463,6 +463,20 @@ test("design 313: a delta-carrying save reuses retained rows and equals a fresh 
   expect(await loadState(root, STREAM)).toEqual(raw);
 });
 
+test("design 313b: a zero-op delta keeps the retained file array by identity", async () => {
+  const root = await sqliteWorkspace("delta-zero-op");
+  const before = await seedDeltaBase(root);
+  const source = {
+    ...deltaSource(before.lastSyncedManifest.files),
+    globalManifest: { generatedAt: "two", files: before.lastSyncedManifest.files },
+  };
+  expect(composeStateSavePacket(before, source).globalDelta?.ops).toEqual([]);
+
+  const saved = await saveStateSource(root, before, source);
+  expect(saved.lastSyncedManifest.files).toBe(before.lastSyncedManifest.files);
+  expect(saved).toEqual((await loadRawState(root))!);
+});
+
 test("design 313: upserts normalize like the store", async () => {
   const cases: FileEntry[] = [
     { extraZ: null, ...file("b.txt", 9, { mtimeMs: -0 }), extraA: { nested: true } } as FileEntry,

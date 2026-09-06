@@ -121,7 +121,9 @@ export function memoizedBaseFiles(root: string, token: StateFreshnessToken): { b
   return { baseFiles: entry.state.lastSyncedManifest.files };
 }
 
-/** Design 313: derive post-delta rows only from the retained predecessor. */
+/** Identity is content (design 277/303), and a git-only push saves a global with
+ * zero file ops, so keeping identity lets the design-303 audit memo and #816/315
+ * attestation survive such a push. */
 export function memoizedDeltaFiles(
   root: string,
   delta: GlobalDelta,
@@ -134,6 +136,7 @@ export function memoizedDeltaFiles(
     || retained.token.baseGeneration + 1 !== postToken.baseGeneration
     || retained.state.stateNonce !== delta.binding.nonce
     || retained.state.stateRevision !== delta.binding.stateRevision) return undefined;
+  if (delta.ops.length === 0) return { baseFiles: retained.state.lastSyncedManifest.files };
   try {
     return { baseFiles: applyDeltaOps(retained.state.lastSyncedManifest.files, delta.ops) };
   } catch {
