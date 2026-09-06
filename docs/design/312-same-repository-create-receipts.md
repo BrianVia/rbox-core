@@ -61,3 +61,19 @@ With both guards the remaining case is exactly the measured one: receipts whose 
 lineage no longer exists on this host, describing a landing this device's BASE already
 states. Tests: another workspace claims the folder → standing; a Q for the receipt exists →
 standing; neither → settled.
+
+## Review round 2 (GPT, `notes/312/review2-gpt.md`) and the strict host inventory
+
+NOT ALIGNED on two findings, both accepted:
+
+1. The tolerant registry reader turned unreadable rows into "no claim". Now the guard reads
+   every host source STRICTLY (`readFolderSourceEvidence`: daemon desired rows and the
+   binding registry; `inspectFolderCatalog`: the authoritative folder catalog) and any
+   `unavailable` source or a `damaged` catalog keeps foreign receipts standing.
+2. A workspace that never registered a daemon row was invisible. The claim check now unions
+   all three host sources (desired roots, binding-registry roots, catalog folders), i.e.
+   every way a folder is known to rbox on this machine, including foreground-only use.
+
+Remaining, explicitly out of scope: a workspace that syncs this folder from a different
+HOME on the same machine is not in any of this HOME's sources. That is the same boundary
+every host-local rbox authority already has.

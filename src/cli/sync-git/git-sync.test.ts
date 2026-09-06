@@ -3,6 +3,8 @@ import * as followerProtocol from "./follower-protocol.js";
 import { commitProtocolRefTransaction, prepareBasePresentArtifact } from "./base-artifacts.js";
 import { artifactBinding, readRepoIdentityV1, readStateLineageV1 } from "./repo-lineage.js";
 import { pRepairQRef } from "./p-repair.js";
+import { otherWorkspaceClaimsRepoByRegistry } from "./plan.js";
+import codecInternals from "../folder-config-codec.js";
 import { forgetStandingArtifactRefusalsForTests } from "./branch-deletion-witness.js";
 import { test as bunTest, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
@@ -2852,6 +2854,30 @@ test("design 312: a foreign receipt inside a P-repair recovery (Q present) stays
   expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
   expect(await receiptRefs(rel)).toHaveLength(2);
 }, 20_000);
+
+test("design 312: the host inventory guard fails closed and matches any other root containing the repository", async () => {
+  // The repository lives under rootB; our workspace root is rootA (a foreign checkout).
+  const repo = path.join(rootB, "inventory-guard");
+  await fs.mkdir(repo, { recursive: true });
+  const revision = codecInternals.revision("absent");
+  const evidence = (rows: string[], persisted: string[], unavailable: string[] = []) => async () => ({
+    desiredRows: rows.map((rootPath) => ({ key: rootPath, path: rootPath, desired: { rootPath } })) as never,
+    persistedEntries: persisted.map((root) => ({ root })) as never,
+    unavailable,
+  });
+  const absent = async () => ({ kind: "absent" as const, revision });
+  // Only our own root: no claim.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([rootA], [rootA]), inspectCatalog: absent })).toBe(false);
+  // Another known root that CONTAINS the repository (daemon row, registry, or catalog): claim.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([rootA, rootB], []), inspectCatalog: absent })).toBe(true);
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], [repo]), inspectCatalog: absent })).toBe(true);
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], []), inspectCatalog: async () => ({ kind: "authoritative" as const, revision, snapshot: { folders: [{ normalizedPath: rootB }] } as never }) })).toBe(true);
+  // An unrelated root elsewhere: no claim.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([path.join(rootB, "elsewhere")], []), inspectCatalog: absent })).toBe(false);
+  // Unreadable evidence or a damaged catalog: fail closed.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], [], ["daemons"]), inspectCatalog: absent })).toBe(true);
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], []), inspectCatalog: async () => ({ kind: "damaged" as const, reason: "x", revision }) })).toBe(true);
+});
 
 test("design 312: a CREATE-P receipt from a DIFFERENT repository identity still refuses", async () => {
   const rel = "other-repo-receipt";

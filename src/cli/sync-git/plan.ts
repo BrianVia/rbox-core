@@ -26,19 +26,34 @@ import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolut
 import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
 import { readHead } from "./git-state.js";
 import { witnessBranchDeletions } from "./branch-deletion-witness.js";
-import { readDesiredDaemonRows } from "../autostart/desired-state.js";
+import { readFolderSourceEvidence } from "../folder-inventory-union.js";
+import { inspectFolderCatalog } from "../folder-catalog-publish.js";
 import { asyncMemo } from "./async-memo.js";
 import { republishPlanInput } from "./republish-requests.js";
 import { GitPlanAccumulator } from "./plan-accumulator.js";
 import { RepoCaptureAttempt, type RepoAttemptCommand } from "./repo-capture-attempt.js";
 
-/** Design 312: the host's daemon registry is the only authority on which other
- * workspaces sync a folder on this machine; a registered root other than ours
- * that contains the repository means its receipts are somebody's live state. */
-async function otherWorkspaceClaimsRepoByRegistry(root: string, repoDir: string): Promise<boolean> {
+/** Design 312 (review rounds 1–2): every host-local source that names a folder
+ * rbox syncs on this machine — daemon desired rows, the binding registry and the
+ * folder catalog — read STRICTLY. Any unreadable or damaged source, or any root
+ * other than ours containing the repository, keeps foreign receipts standing. */
+export async function otherWorkspaceClaimsRepoByRegistry(
+  root: string,
+  repoDir: string,
+  sources: { readEvidence?: typeof readFolderSourceEvidence; inspectCatalog?: typeof inspectFolderCatalog } = {},
+): Promise<boolean> {
   const [rootReal, repoReal] = await Promise.all([fs.realpath(root), fs.realpath(repoDir)]);
-  for (const row of await readDesiredDaemonRows()) {
-    const other = await fs.realpath(row.desired.rootPath).catch(() => row.desired.rootPath);
+  const evidence = await (sources.readEvidence ?? readFolderSourceEvidence)();
+  if (evidence.unavailable.length > 0) return true;
+  const catalog = await (sources.inspectCatalog ?? inspectFolderCatalog)();
+  if (catalog.kind === "damaged") return true;
+  const roots = [
+    ...evidence.desiredRows.map((row) => row.desired.rootPath),
+    ...evidence.persistedEntries.map((entry) => entry.root),
+    ...(catalog.kind === "authoritative" ? catalog.snapshot.folders.map((entry) => entry.normalizedPath) : []),
+  ];
+  for (const candidate of roots) {
+    const other = await fs.realpath(candidate).catch(() => path.resolve(candidate));
     if (other === rootReal) continue;
     if (repoReal === other || repoReal.startsWith(other + path.sep)) return true;
   }
