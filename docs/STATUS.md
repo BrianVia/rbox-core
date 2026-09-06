@@ -131,10 +131,16 @@
   PR today hit FLAKE-012 at least once; #904's shard 2/6 failed three reruns
   in a row, twice with a new variant `The Worker returned HTTP 401 while
   waiting for GitHub's runner assignment`. Founder owes the runner wizard
-  (`npx -y cloudflare-github-actions-runner@latest`). **Founder decision needed (design 310):** a manual
-  verb to discard standing CREATE-P receipts (`rbox git resolve <repo>
-  discard-incoming --confirm`) vs landing them (take-theirs, which re-creates
-  the 206 branches locally so a second local delete records pull-p origins). Then the other
+  (`npx -y cloudflare-github-actions-runner@latest`). **Riddle answered with data (2026-09-06):** all 206
+  receipts point at exactly the commit this device's own BASE records for
+  that branch (206/206 same OID, 0 origins) — completed landings that were
+  never settled because settlement needs the origin legacy landings never
+  wrote. One bug, two symptoms; no verb. Founder: "go for it" → **#905 OPEN
+  (design 310)**: under 309's self-authored evidence, a CREATE-P whose
+  `nextOid` equals the BASE OID is a completed landing — it stops counting as
+  standing and its P/K refs retire inside the deletion's own atomic
+  verification transaction. Mismatched/foreign/unstamped still refuse.
+  After merge: dev-build the desktop and confirm the 285 deletions publish. Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
