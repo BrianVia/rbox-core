@@ -172,6 +172,30 @@
   captured every tick because I edit it; ~0.5s unattributed in the pool),
   `projection=0.7s` per push with zero changes (F2b/X1a), `drain_wait
   1.5s` (watcher debounce, by design).
+- **#907 MERGED (design 313, `ef501bcad`) — change-proportional state saves:** every push
+  that carried a real change paid a FULL 198K-row base-plane read-back after the CAS
+  (`state-save slow: apply=2400–3400 repos=258 global=delta ops=1..12`) because design 302
+  offered the memo's rows only for global-free packets. `memoizedDeltaFiles` now derives the
+  post-delta rows from the memo's retained predecessor plus the sealed, store-normalized
+  delta ops (same token discipline and kill switch as 302; three GPT review rounds under
+  `docs/design/notes/313/`; caveats that are 302-equivalent are recorded, not widened).
+  Copied store: 1-op delta apply 2382 → 187ms; real push shape 2779 → 336ms. **Desktop
+  proven (`2.0.2-dev+ef501bc`, pid 3142943):** first changed push after restart logged
+  `compose=62 apply=480 repos=258 global=delta ops=12` (was 2.7–3.4s). Remaining in that
+  line: the 258 repo transitions (~0.3s) — every push observes every carried repo and
+  writes its record even when unchanged, because only a pull receipt can elide a
+  transition (267 §3.3); candidate next slice, needs a design.
+- **Design 314 WITHDRAWN (#908, `e46ced0da`):** letting the elision audit accept the push's
+  #816 base-hash attestation would have removed design 269's only drift detector (the
+  attestation proves entry COUNT, not content). The ~0.85s first audit per new array stays;
+  the doc is kept so the idea is not retried.
+- **CI runner flake escalated (2026-09-06 afternoon):** EVERY run hit "The Worker returned
+  HTTP 401 while waiting for GitHub's runner assignment" / "runner assignment was not
+  observed within 30 seconds" on 1–4 shards; each PR needed 2–3 `gh run rerun --failed`
+  cycles (a Monitor loop that reruns flake-only failures up to 3× worked). Founder still
+  owes the runner wizard (`npx -y cloudflare-github-actions-runner@latest`). Main's run
+  for the #906 merge was cancelled by the next main push; the run for `e46ced0da` is the
+  one to watch.
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
@@ -196,7 +220,8 @@
   (repos that turned split index off after a bad capture). Recommendation:
   DEFER as a measured no-go; note in scratch
   `NOTE-historical-split-repair.md`. Say "build it" to override.
-- **Next bounded candidates (not started):** F2b small-batch manifest merge,
+- **Next bounded candidates (not started):** unchanged-repo transition elision on push
+  (design needed; 0.3s/push), F2b small-batch manifest merge,
   G4a Git env inventory (allowlist routing vars), S2a extra-index
   compatibility fixture, G3b is discharged by the 296 schema bump.
 - **Local hygiene:** all 46 stale worktrees and 285 local branches were purged
