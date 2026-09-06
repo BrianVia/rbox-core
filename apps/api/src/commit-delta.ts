@@ -153,3 +153,12 @@ export function divergenceDigest(shas: string[]): { digest: string; sample: stri
   }
   return { digest: hash.toString(16).padStart(16, "0"), sample: sorted.slice(0, DIVERGENCE_SAMPLE) };
 }
+
+/** Design 316 (founder decision B, 2026-09-06): enforce uses the bounded delta even when
+ * the MARK probe is over cap — that condition only skips regranting carried marked refs for
+ * this commit (benign: Phase 1 resurrects refs that stay head-reachable). The active-intent
+ * probe's over-cap still arrives as a `fallback` (`fence_over_cap`) and still forces full
+ * admission. Supersedes design 204 §3.1's mark-probe precondition. */
+export function shouldUseDeltaAdmission(deltaMode: string, delta: DeltaResult | undefined, fallback: string | undefined): boolean {
+  return deltaMode === "enforce" && !!delta && !fallback;
+}

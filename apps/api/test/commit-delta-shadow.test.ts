@@ -11,16 +11,42 @@ const hash = (x: Uint8Array | string): string => createHash("sha256").update(x).
 
 beforeAll(async () => applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS));
 
-function fakeCtx(parent?: object, headSequence = 1): DurableObjectState {
+interface StoredCommitFixture {
+  body: string;
+  commitHash: string;
+  sig: string;
+}
+
+interface FakeKvStorage {
+  get(key: string): unknown;
+  put<T>(key: string, value: T): void;
+  delete(key: string): boolean;
+  list(): Iterable<[string, unknown]>;
+}
+
+interface FakeDurableObjectState {
+  storage: {
+    kv: FakeKvStorage;
+    sql: { exec(): { toArray(): never[] } };
+    transactionSync(fn: () => void): void;
+    getAlarm(): Promise<number | null>;
+    setAlarm(): Promise<void>;
+  };
+  getWebSockets(): WebSocket[];
+  setWebSocketAutoResponse(): void;
+}
+
+function fakeCtx(parent?: StoredCommitFixture, headSequence = 1): DurableObjectState {
   const kv = new Map<string, unknown>([["head", { sequence: headSequence, commitHash: headSequence === 0 ? "0".repeat(64) : hash("parent") }], ["headWatermark", headSequence]]);
   if (parent !== undefined) kv.set("seq:1", JSON.stringify(parent));
-  return {
+  const state: FakeDurableObjectState = {
     storage: {
-      kv: { get: (k: string) => kv.get(k), put: (k: string, v: unknown) => kv.set(k, v), delete: (k: string) => kv.delete(k), list: () => new Map() },
+      kv: { get: (k: string) => kv.get(k), put: (k, v) => kv.set(k, v), delete: (k: string) => kv.delete(k), list: () => new Map() },
       sql: { exec: () => ({ toArray: () => [] }) }, transactionSync: (fn: () => void) => fn(), getAlarm: async () => null, setAlarm: async () => {},
     },
     getWebSockets: () => [], setWebSocketAutoResponse: () => {},
-  } as unknown as DurableObjectState;
+  };
+  return state as DurableObjectState;
 }
 
 async function fixture(name: string) {
@@ -86,12 +112,13 @@ type CommitBodyFixture = ReturnType<DeltaFixture["body"]> & {
 };
 
 function requestWithBody(f: DeltaFixture, commitBody: CommitBodyFixture, receipts = true): Request {
+  const headers = new Headers({
+    "content-type": "application/json", "x-rbox-account": f.accountId, "x-rbox-account-epoch": "0",
+  });
+  if (receipts) headers.set("x-rbox-protocol", "upload-receipts-v1");
   return new Request("https://api.test/v1/ws/ws/proj/root/manifests", {
     method: "POST",
-    headers: {
-      "content-type": "application/json", "x-rbox-account": f.accountId, "x-rbox-account-epoch": "0",
-      ...(receipts ? { "x-rbox-protocol": "upload-receipts-v1" } : {}),
-    },
+    headers,
     body: JSON.stringify({ parentSequence: commitBody.parentSeq, commit: { body: JSON.stringify(commitBody), commitHash: hash(`custom-${crypto.randomUUID()}`), sig: "sig" }, receipts: {} }),
   });
 }
@@ -204,7 +231,7 @@ describe("design 102 enforce admission with real D1/R2", () => {
     expect(hasDeltaPoint(points, "childParseMs")).toBe(false);
   });
 
-  test("marked-probe over cap falls back to full-refset admission", async () => {
+  test("marked-probe over cap admits only carriers, chain, and added refs", async () => {
     const f = await fixture(`delta-enforce-over-cap-${crypto.randomUUID()}`);
     await env.rbox_dev_db.prepare(`
       WITH digits(n) AS (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9))
@@ -214,18 +241,29 @@ describe("design 102 enforce admission with real D1/R2", () => {
       WHERE a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n <= ?
     `).bind(f.accountId, Date.now(), FENCE_SET_MAX).run();
     await env.rbox_dev_db.prepare("UPDATE blobs SET present=0 WHERE sha256=?").bind(f.refSha).run();
+    const addedSha = hash(`${f.accountId}-added`);
+    const chainSha = hash(`${f.accountId}-chain`);
+    const childSidecar = serializeRefset([{ encSha: f.refSha, size: 7 }, { encSha: addedSha, size: 13 }]);
+    const childSidecarSha = hash(childSidecar);
+    await env.rbox_dev_blobs.put(blobKey(childSidecarSha), childSidecar);
+    for (const [sha, size] of [[addedSha, 13], [chainSha, 17], [childSidecarSha, childSidecar.length]] as const) {
+      await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blobs(sha256,size_bytes,present) VALUES (?,?,1)").bind(sha, size).run();
+      await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blob_refs(account_id,sha256,granted_at) VALUES (?,?,?)").bind(f.accountId, sha, Date.now()).run();
+    }
     const points: Array<{ blobs?: string[]; doubles?: number[] }> = [];
+    const body = { ...f.body(2), manifestChain: [chainSha], blobRefset: { sidecarSha: childSidecarSha, count: 2, totalBytes: 20 } };
 
-    const result = await responseBody(f, "enforce", points);
+    const result = await responseBody(f, "enforce", points, { request: requestWithBody(f, body) });
 
-    expect(result.status).toBe(422);
-    expect(result.body).toMatchObject({
-      error: "unsatisfied_blobs",
-      missing: [f.refSha],
-      missingTotal: 1,
-    });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ sequence: 2 });
+    const commit = points.find((point) => point.blobs?.[0] === "commit" && point.blobs?.[2] === "ok");
+    expect(commit?.doubles?.[5]).toBe(4); // manifest + sidecar + chain + delta.added; carried ref omitted
     expect(hasDeltaPoint(points, "marks_over_cap")).toBe(true);
-    expect(hasDeltaPoint(points, "fallback", "marks_over_cap")).toBe(true);
+    expect(points.find((point) => point.blobs?.[0] === "commit.delta" && point.blobs?.[1] === "marks")?.doubles?.[1])
+      .toBe(FENCE_SET_MAX + 1);
+    expect(hasDeltaPoint(points, "fallback")).toBe(false);
+    expect(hasDeltaPoint(points, "childParseMs")).toBe(false);
   });
 });
 

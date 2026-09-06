@@ -65,7 +65,8 @@ fence/prune/loss handling. Status:
   (`apps/api/src/commit-delta.ts:75-79`) → they are presence-checked and
   422 on loss. Over-cap fails closed: `fence_over_cap` and
   `markedProbeSkipped` both force full-refset admission
-  (`apps/api/src/workspace-sync.ts:84,344`).
+  (`apps/api/src/workspace-sync.ts:84,344`). (mark probe: superseded by design
+  316 — founder decision B, 2026-09-06; intent probe unchanged).
 - **Test half: NOT discharged — this design closes it.** Every carried-ref
   behavioral test today is shadow-mode
   (`apps/api/test/commit-delta-shadow.test.ts:43-54` accepts only

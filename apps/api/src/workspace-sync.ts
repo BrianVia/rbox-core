@@ -10,7 +10,7 @@ import {
   receiptRedeemMax,
 } from "./commit-accounting.js";
 import { loadSidecarRaw, resolveSidecarRaw, loadSidecarShaSet } from "./sidecar.js";
-import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeAddedShas, mergeSortedUnique, type DeltaResult, type ShadowFlags } from "./commit-delta.js";
+import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeAddedShas, mergeSortedUnique, shouldUseDeltaAdmission, type DeltaResult, type ShadowFlags } from "./commit-delta.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { refsetShas } from "../../../src/engine/refset.js";
@@ -103,10 +103,6 @@ export async function loadFenceProbe(db: D1Database, accountId: string): Promise
     intentOverCap: intentRows.results.length > FENCE_SET_MAX,
     observedMarks: markedRows.results.length,
   };
-}
-
-export function shouldUseDeltaAdmission(deltaMode: string, delta: DeltaResult | undefined, fallback: string | undefined): boolean {
-  return deltaMode === "enforce" && !!delta && !fallback && !delta.markedProbeSkipped;
 }
 
 async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
@@ -348,7 +344,7 @@ export class WorkspaceSync {
     commitEpoch: number,
     childBuf: Uint8Array,
     childCount: number,
-  ): Promise<{ fallback?: string; delta?: DeltaResult; admitData: string[] }> {
+  ): Promise<{ fallback?: string; delta?: DeltaResult; admitData: string[]; observedMarks?: number }> {
     const phase = (outcome: string, started: number): void => emitDelta(this.env, outcome, { count: Date.now() - started });
     try {
       if (parent === 0) return { fallback: "first_commit", admitData: [] };
@@ -391,7 +387,7 @@ export class WorkspaceSync {
       if (delta.intentCarriedHit) return { fallback: "fence_violation", admitData: [] };
       emitDelta(this.env, "sizes", { count: delta.addedCount, ratio: delta.carriedCount, bytes: delta.removedCount });
       emitDelta(this.env, "carried_fenced", { count: delta.markedCarried.length });
-      return { delta, admitData: mergeSortedUnique(delta.added, delta.markedCarried) };
+      return { delta, admitData: mergeSortedUnique(delta.added, delta.markedCarried), observedMarks: probe.observedMarks };
     } catch {
       return { fallback: "delta_error", admitData: [] };
     }
@@ -636,7 +632,7 @@ export class WorkspaceSync {
           const response = await runFullAdmission([...new Set([...carriers, ...chainShas, ...refsetShas(child.buf)])]);
           if (response) return response;
         } else {
-          const { fallback, delta, admitData } = await this.computeCommitDelta(db, accountId, parent, commitEpoch, child.buf, child.count);
+          const { fallback, delta, admitData, observedMarks } = await this.computeCommitDelta(db, accountId, parent, commitEpoch, child.buf, child.count);
           let childShas: string[] | undefined;
           const fullChildShas = (): string[] => {
             if (!childShas) {
@@ -675,9 +671,9 @@ export class WorkspaceSync {
             }
           }
           // design 102 enforce — flag-gated, not enabled in this PR.
-          if (deltaMode === "enforce" && delta && !fallback && delta.markedProbeSkipped) {
-            emitDelta(this.env, "fallback", { reason: "marks_over_cap" });
-          }
+          // Design 316: an over-cap mark probe is no longer a fallback; report the
+          // table size so the dashboard shows when it drops back under FENCE_SET_MAX.
+          if (delta) emitDelta(this.env, "marks", { count: observedMarks });
           const useDelta = shouldUseDeltaAdmission(deltaMode, delta, fallback);
           const dataShas = useDelta ? admitData : fullChildShas();
           const response = await runFullAdmission([...new Set([...carriers, ...chainShas, ...dataShas])]);
