@@ -131,6 +131,26 @@ beforeEach(async () => {
 });
 
 describe("§33 mark → grace → purge (the leak fix)", () => {
+  it("refuses a stale reachability snapshot and still purges with a fresh one", async () => {
+    await mkAccount("a");
+    await addRef("a", "stale-snapshot", 7, NOW - 2 * HOUR);
+    await mark("a", "stale-snapshot", NOW - 2 * HOUR);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await phase1Purge(db(), "a", EMPTY, HOUR, NOW, NOW - HOUR / 2 - 1)).toEqual({
+        purged: 0, released: 0, resurrected: 0, condemned: 0,
+      });
+      expect(await refExists("a", "stale-snapshot")).toBe(true);
+      expect(await candExists("a", "stale-snapshot")).toBe(true);
+      expect(log).toHaveBeenCalledWith(JSON.stringify({ event: "purge_snapshot_stale", ageMs: HOUR / 2 + 1 }));
+
+      expect(await phase1Purge(db(), "a", EMPTY, HOUR, NOW, NOW)).toMatchObject({ purged: 1, released: 7 });
+      expect(await refExists("a", "stale-snapshot")).toBe(false);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("chunks 200 unreachable candidates within the phase-1 D1 subrequest budget", async () => {
     await mkAccount("a");
     for (let i = 0; i < 200; i++) {
