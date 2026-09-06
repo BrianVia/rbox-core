@@ -10,6 +10,7 @@ import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
 import { readHead, type RepoCtx } from "./git-state.js";
+import { P_REPAIR_Q_PREFIX, pRepairQRef } from "./p-repair.js";
 import { receiptRetirementLinesForAbsentBranch } from "./p-settlement.js";
 import { gitPreflight, isGitBusy } from "./preflight.js";
 import { errMsg, type PackedRefsObservation } from "./shared.js";
@@ -30,6 +31,9 @@ export interface BranchDeletionWitnessInput {
   /** This device's id (design 309): a BASE section this device captured is origin
    *  evidence for every branch in it, because the branch existed here at capture. */
   selfDeviceId: string | undefined;
+  /** Design 312: does ANOTHER workspace registered on this host contain this
+   *  repository? Foreign receipts settle only when the answer is no. */
+  otherWorkspaceClaimsRepo: () => Promise<boolean>;
   /** Tests only: runs before the authorization reads. */
   beforeAbsencePreflight?: (relPath: string) => void | Promise<void>;
 }
@@ -71,7 +75,16 @@ export type BranchDeletionWitness =
  * the revert and the deferral bookkeeping.
  */
 export async function witnessBranchDeletions(input: BranchDeletionWitnessInput): Promise<BranchDeletionWitness> {
-  const { root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed, binding, beforeAbsencePreflight, selfDeviceId } = input;
+  const { root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed, binding, beforeAbsencePreflight, selfDeviceId, otherWorkspaceClaimsRepo } = input;
+  // Design 312 guards, resolved at most once per witness: another registered
+  // workspace on this host claiming the repository, and any P-repair recovery
+  // ref (Q) for a foreign receipt. Either keeps foreign receipts standing.
+  let claimsMemo: Promise<boolean> | undefined;
+  const otherWorkspaceClaims = (): Promise<boolean> => (claimsMemo ??= otherWorkspaceClaimsRepo().catch(() => true));
+  let qRefsMemo: Promise<Set<string>> | undefined;
+  const pendingRepairRefs = (): Promise<Set<string>> => (qRefsMemo ??= gitRaw(ctx.repoDir, ["for-each-ref", "--format=%(refname)", P_REPAIR_Q_PREFIX])
+    .then((raw) => new Set(raw.split("\n").filter(Boolean)))
+    .catch(() => new Set<string>(["<unreadable>"])));
   // Design 309: origin evidence is either the per-branch ledger entry (designs
   // 273/274) or, for a branch with NO ledger entry, the fact that this device
   // captured the BASE section that lists it — the branch existed locally at that
@@ -181,11 +194,21 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
         ]
       : [];
     const foreignForRef = readyProtocol!.foreignPresentArtifacts.filter((p) => p.payload.ref === ref).length;
+    const foreignSettling = selfSettled.filter((p) => p.payload.lineageHash !== readyProtocol!.lineageHash);
     // CREATE-P only (`priorOid === null`): that is the shape the evidence covers; an
     // UPDATE-P records a move this device may not have applied and keeps refusing.
-    const receiptsSettle = selfSettled.length > 0
+    let receiptsSettle = selfSettled.length > 0
       && selfSettled.every((p) => p.payload.priorOid === null && p.payload.nextOid === priorOid)
-      && selfSettled.filter((p) => p.payload.lineageHash !== readyProtocol!.lineageHash).length === foreignForRef;
+      && foreignSettling.length === foreignForRef;
+    if (receiptsSettle && foreignSettling.length > 0) {
+      // Review-1 findings (312): a foreign receipt whose workspace is still on this
+      // host, or that sits inside a P-repair recovery (Q present), stays standing —
+      // its owner's state machine, not this witness, must resolve it.
+      const qRefs = await pendingRepairRefs();
+      const inRepair = qRefs.has("<unreadable>")
+        || foreignSettling.some((p) => qRefs.has(pRepairQRef(p.payload.lineageHash, p.payload.ref, p.payload.episode)));
+      if (inRepair || await otherWorkspaceClaims()) receiptsSettle = false;
+    }
     const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
       && (artifacts.present === "absent" || (receiptsSettle && (artifacts.present === "valid-owning" || artifacts.present === "active-foreign")))
       && (artifacts.keeps === "clear" || (receiptsSettle && (artifacts.keeps === "exact" || artifacts.keeps === "mismatched")))

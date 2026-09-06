@@ -2,6 +2,7 @@ import { gitSectionDeviceId } from "../../engine/index.js";
 import * as followerProtocol from "./follower-protocol.js";
 import { commitProtocolRefTransaction, prepareBasePresentArtifact } from "./base-artifacts.js";
 import { artifactBinding, readRepoIdentityV1, readStateLineageV1 } from "./repo-lineage.js";
+import { pRepairQRef } from "./p-repair.js";
 import { forgetStandingArtifactRefusalsForTests } from "./branch-deletion-witness.js";
 import { test as bunTest, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
@@ -2796,11 +2797,60 @@ test("design 312: a CREATE-P receipt from another lineage of this same repositor
   expect(await receiptRefs(rel)).toHaveLength(2);
   await git(repo, "branch", "-D", "topic");
   const plan = await planGitSections(
-    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff,
+    { otherWorkspaceClaimsRepo: async () => false },
   );
   expect(plan.captureDeferrals[rel]).toBeUndefined();
   expect(plan.absentBranchProofs?.[rel]?.["refs/heads/topic"]).toEqual({ priorOid: topicOid });
   expect(await receiptRefs(rel)).toEqual([]);
+}, 20_000);
+
+test("design 312: a foreign receipt stays standing while another workspace on this host claims the repository", async () => {
+  const rel = "claimed-foreign-receipt";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const topicOid = record.base!.refs["refs/heads/topic"]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await plantCreateReceipt(rel, "refs/heads/topic", topicOid, state, null, (b) => ({ ...b, lineageHash: "f".repeat(64) }));
+  await git(repo, "branch", "-D", "topic");
+  const claims: string[] = [];
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff,
+    { otherWorkspaceClaimsRepo: async (_root, repoDir) => { claims.push(repoDir); return true; } },
+  );
+  expect(claims).toHaveLength(1);
+  expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+  expect(await receiptRefs(rel)).toHaveLength(2);
+}, 20_000);
+
+test("design 312: a foreign receipt inside a P-repair recovery (Q present) stays standing", async () => {
+  const rel = "repairing-foreign-receipt";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const topicOid = record.base!.refs["refs/heads/topic"]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  const foreignLineage = "f".repeat(64);
+  await plantCreateReceipt(rel, "refs/heads/topic", topicOid, state, null, (b) => ({ ...b, lineageHash: foreignLineage }));
+  await git(repo, "update-ref", pRepairQRef(foreignLineage, "refs/heads/topic", "ab".repeat(16)), topicOid);
+  await git(repo, "branch", "-D", "topic");
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff,
+    { otherWorkspaceClaimsRepo: async () => false },
+  );
+  expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+  expect(await receiptRefs(rel)).toHaveLength(2);
 }, 20_000);
 
 test("design 312: a CREATE-P receipt from a DIFFERENT repository identity still refuses", async () => {
