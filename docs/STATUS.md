@@ -265,6 +265,13 @@
   Observability access (the token gets `Authentication error`; `wrangler tail --env
   production` saw nothing in a 5-minute window around the :23 tick). Founder-owed:
   Cloudflare MCP OAuth or a token with Workers Observability read.
+- **#913 MERGED (design 316, founder decision B, `ed2c723f6` + rider `ff041983d`):** the
+  over-cap MARK probe no longer forces full admission (design 102 Q3 as decided; 204 §3.1
+  superseded for the mark probe only; `fence_over_cap` untouched); `marks{count}` emitted
+  per delta commit; Phase-1 purge refuses a reachable snapshot older than grace/2. DEV
+  auto-deploys from main. **PRODUCTION PROMOTION PENDING — needs the founder's explicit
+  yes** (`git push origin main:production`); verify afterwards with the Analytics Engine
+  query (`admitAccountMs` avg ~4s → ~0.2–0.3s, no `fallback` rows, `marks` ≈ 224K).
 - **REMINDER for 2026-09-07 (founder asked, on the road 09-06):** add "Workers
   Observability: Read" to the Cloudflare token in `~/.secret_env_vars` (or complete the
   Cloudflare MCP OAuth) so Claude can read the GC `phase1_account_outcome` logs and answer
