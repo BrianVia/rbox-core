@@ -1,6 +1,6 @@
-# 315 — The #816 base-hash attestation binds to the files array, not the state object
+# 315 — The #816 base-hash attestation binds to the manifest and meta objects, not the state wrapper
 
-Status: proposed (2026-09-06). Owner: `src/cli/sync/base-hash-attestation.ts`.
+Status: v2 after review round 1 (`notes/315/review1-gpt.md`, blocker accepted), 2026-09-06. Owner: `src/cli/sync/base-hash-attestation.ts`.
 Parents: #816 (attestation), design 277 (loaded states are never mutated; freeze-swept),
 design 303 (audit-hash memo keyed per files array — the same identity discipline).
 
@@ -16,22 +16,19 @@ NEW object with the SAME `lastSyncedManifest` (same files array), and the memo r
 new object. The following push therefore misses the attestation and pays the full 1.4s again.
 Today's desktop log: eight changed pushes, every one `delta_base≈1.3–1.5s`.
 
-## Rule
+## Rule (v2)
 
-Key the attestation by `saved.lastSyncedManifest.files` (a `WeakMap<readonly FileEntry[], …>`)
-and record, next to the two hashes, the other inputs the hash consumed: `generatedAt` and
-`manifestSchema`. `baseHashIsAttested(state, meta)` looks up `state.lastSyncedManifest.files`
-and requires the recorded `encManifestSha`, `manifestHash`, `generatedAt` and `manifestSchema`
-to equal the state's and the meta's. Nothing else in #816's admission changes: the refusals
-(meta not persisted, sequence not reached, non-reconstructible shape, gitRepos presence
-mismatch, entry count) stay exactly as they are.
-
-Why identity = content: design 277's precondition (loaded/retained states are never mutated
-in place, freeze-swept under `RBOX_STATE_FREEZE=1`) is what design 303 already relies on for
-the audit-hash memo. An array that came from the store (or, after design 313, from the memo's
-own derivation) is never edited; a different content is always a different array. The
-reconstruction the hash covers is `{generatedAt, files, manifestSchema?, gitRepos(meta)}` —
-every input is either the array itself, recorded in the attestation, or the meta being checked.
+Key the attestation by the `lastSyncedManifest` OBJECT (`WeakMap<Manifest, …>`) and record the
+`manifestMeta` OBJECT it was minted against next to the two hashes. `baseHashIsAttested(state,
+meta)` looks up `state.lastSyncedManifest` and requires `attested.meta === state.manifestMeta`
+and the recorded `encManifestSha`/`manifestHash` to equal `meta`'s. The elided projection
+(`projectAcceptedSavePacket` = `{ ...snapshot, <token fields> }`) preserves BOTH object
+references, so the next push hits; any state whose manifest or meta was rebuilt (fresh
+read-back, design 313's derived state, a reset) misses exactly as today. Every input of the
+hashed reconstruction — `generatedAt`, `files`, `manifestSchema` (the manifest object) and
+`gitRepos` (the meta object) — is therefore covered by identity. This changes WHERE #816's
+trust applies (the same two objects under a new wrapper), never WHAT it trusts. Nothing else
+in #816's admission changes.
 
 ## Non-goals
 
@@ -42,10 +39,10 @@ every input is either the array itself, recorded in the attestation, or the meta
 ## Tests (`base-hash-attestation.test.ts`)
 
 - replace the "binds to the retained state OBJECT" pin: a state projected from the attested
-  one (`{ ...saved, stateRevision: saved.stateRevision + 1 }`, same manifest) IS attested;
-  a state whose manifest carries a DIFFERENT files array with equal content is NOT (fresh
-  read-back still misses — that is the process-boundary property #816 wants).
-- same array, different `generatedAt` or `manifestSchema` → not attested.
+  one (`{ ...saved, stateRevision: saved.stateRevision + 1 }`, same manifest and meta objects)
+  IS attested; a wrapper with the same manifest object but a different `manifestMeta` object
+  (equal hashes, different `gitRepos`) is NOT; a manifest rebuilt with equal content is NOT
+  (fresh read-back still misses — the process-boundary property #816 wants).
 - a different meta (encManifestSha or manifestHash) → not attested (existing).
 
 ## Expected result
