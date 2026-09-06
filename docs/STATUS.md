@@ -135,12 +135,15 @@
   receipts point at exactly the commit this device's own BASE records for
   that branch (206/206 same OID, 0 origins) — completed landings that were
   never settled because settlement needs the origin legacy landings never
-  wrote. One bug, two symptoms; no verb. Founder: "go for it" → **#905 OPEN
-  (design 310)**: under 309's self-authored evidence, a CREATE-P whose
-  `nextOid` equals the BASE OID is a completed landing — it stops counting as
-  standing and its P/K refs retire inside the deletion's own atomic
-  verification transaction. Mismatched/foreign/unstamped still refuse.
-  After merge: dev-build the desktop and confirm the 285 deletions publish. Then the other
+  wrote. One bug, two symptoms; no verb. Founder: "go for it" → **#905 MERGED
+  (design 310, `e24ef9235`)**: under 309's self-authored evidence, a CREATE-P
+  (`priorOid === null`, per GPT review) whose `nextOid` equals the BASE OID is
+  a completed landing — it stops counting as standing and its P/K refs
+  retire inside the deletion's own atomic verification transaction.
+  Mismatched/UPDATE-P/foreign/unstamped still refuse. **Desktop now dogfoods
+  `2.0.2-dev+e24ef92`** (pid 2871833, ~00:10Z 09-06); watching for the
+  first push that captures `Personal/rbox-core` with the 285 tombstones and
+  retires the 206 P/K receipts. Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
