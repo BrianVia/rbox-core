@@ -170,7 +170,10 @@ export async function witnessBranchDeletions(input: BranchDeletionWitnessInput):
     const selfSettled = selfAuthored(ref)
       ? readyProtocol!.presentArtifacts.filter((p) => p.payload.ref === ref)
       : [];
-    const receiptsSettle = selfSettled.length > 0 && selfSettled.every((p) => p.payload.nextOid === priorOid);
+    // CREATE-P only (`priorOid === null`): that is the shape the evidence covers; an
+    // UPDATE-P records a move this device may not have applied and keeps refusing.
+    const receiptsSettle = selfSettled.length > 0
+      && selfSettled.every((p) => p.payload.priorOid === null && p.payload.nextOid === priorOid);
     const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
       && (artifacts.present === "absent" || (receiptsSettle && artifacts.present === "valid-owning"))
       && (artifacts.keeps === "clear" || (receiptsSettle && artifacts.keeps === "exact"))

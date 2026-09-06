@@ -37,3 +37,13 @@ and the verification transaction learns anything new.
 proof minted, tombstone authored, both P/K refs gone; planted CREATE-P at another commit →
 `(artifacts-standing)` refusal and refs intact. Plan/protocol suites green. Rollback: revert;
 already-retired receipts were provably redundant with BASE.
+
+## Review
+
+GPT round 1 (`notes/310/review1-gpt.md`): NOT ALIGNED on one finding — the implementation
+matched any receipt whose target equalled BASE, including UPDATE-P (a move this device may
+not have applied). Fixed: the rule is CREATE-P only (`priorOid === null`), pinned by a test
+that an UPDATE-P at the BASE commit still refuses. The reviewer found no peer-work loss path
+for a genuine CREATE-P: creation and landing share one ref transaction, retirement CAS-deletes
+the exact P target and episode-specific K refs while verifying the branch absent, and
+verify/delete cannot partially commit.
