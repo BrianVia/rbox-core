@@ -265,6 +265,13 @@
   Observability access (the token gets `Authentication error`; `wrangler tail --env
   production` saw nothing in a 5-minute window around the :23 tick). Founder-owed:
   Cloudflare MCP OAuth or a token with Workers Observability read.
+- **REMINDER for 2026-09-07 (founder asked, on the road 09-06):** add "Workers
+  Observability: Read" to the Cloudflare token in `~/.secret_env_vars` (or complete the
+  Cloudflare MCP OAuth) so Claude can read the GC `phase1_account_outcome` logs and answer
+  why 224K marks are not draining. Design 316 = founder decision **B** ("b it is"),
+  implementation in flight (worktree `delta-marks`); after merge → DEV auto-deploys →
+  verify via Analytics Engine (`admitAccountMs`, no `fallback`) → ask for the explicit
+  production promotion.
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
