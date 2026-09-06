@@ -2711,12 +2711,12 @@ test("design 311: a standing-artifacts refusal is remembered until the protocol 
   }
 }, 30_000);
 
-async function plantCreateReceipt(rel: string, ref: string, nextOid: string, state: SyncState): Promise<void> {
+async function plantCreateReceipt(rel: string, ref: string, nextOid: string, state: SyncState, priorOid: string | null = null): Promise<void> {
   const repo = path.join(rootA, rel);
   const ctx = (await repoCtx(repo))!;
   const identity = await readRepoIdentityV1(rel, ctx.kind, { worktreeId: ctx.repoDir, gitDirReal: ctx.gitDir, commonDirReal: ctx.commonDir });
   const binding = artifactBinding(await readStateLineageV1(rootA, state.stream, state.stateNonce!, identity));
-  const prepared = await prepareBasePresentArtifact(repo, binding, ref, "ab".repeat(16), null, nextOid);
+  const prepared = await prepareBasePresentArtifact(repo, binding, ref, "ab".repeat(16), priorOid, nextOid);
   await commitProtocolRefTransaction(repo, prepared.transactionLines);
 }
 
@@ -2747,6 +2747,32 @@ test("design 310: a CREATE-P receipt matching this device's own BASE is a comple
   expect(plan.absentBranchProofs?.[rel]?.["refs/heads/topic"]).toEqual({ priorOid: topicOid });
   expect(plan.gitRepos?.[rel]?.refTombstones?.["refs/heads/topic"]?.some((entry) => entry.oid === topicOid)).toBe(true);
   expect(await receiptRefs(rel)).toEqual([]); // retired in the same transaction
+}, 20_000);
+
+test("design 310: an UPDATE-P receipt at the BASE commit is not a create landing and still refuses", async () => {
+  const rel = "update-receipt";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  const firstOid = (await git(repo, "rev-parse", "HEAD")).trim();
+  await git(repo, "branch", "topic");
+  await commitFile(repo, "g.txt", "two", "c2");
+  await git(repo, "branch", "-f", "topic", "HEAD");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = state.repoRecords![rel]!;
+  const topicOid = record.base!.refs["refs/heads/topic"]!;
+  const { "refs/heads/topic": _origin, ...origins } = record.branchBaseOrigins ?? {};
+  state.repoRecords![rel] = { ...record, branchBaseOrigins: origins };
+  await plantCreateReceipt(rel, "refs/heads/topic", topicOid, state, firstOid); // prior -> next: an update, not a create
+  await git(repo, "branch", "-D", "topic");
+  const logs: string[] = [];
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, { onGitLog: (line) => logs.push(line) },
+  );
+  expect(plan.captureDeferrals[rel]).toBe("deletion-pending");
+  expect(logs.some((line) => line.includes("refused refs/heads/topic (artifacts-standing)"))).toBe(true);
+  expect(await receiptRefs(rel)).toHaveLength(3); // P + prior keep + next keep
 }, 20_000);
 
 test("design 310: a CREATE-P receipt for a DIFFERENT commit than BASE still stands and refuses the deletion", async () => {
