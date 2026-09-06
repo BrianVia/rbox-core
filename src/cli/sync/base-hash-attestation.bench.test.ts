@@ -61,12 +61,21 @@ test(`the attested base skips both O(${ENTRIES}) base passes a push repeats toda
   const encoderBaseMs = millis(() => { expect(validateManifest(base).ok).toBe(true); });
 
   // AFTER — the attestation is an O(1) lookup, and the encoder is told to skip.
-  const t0 = performance.now();
-  const validated = await encodeDeltaEnvelope(base, target, { ...options, baseValidated: true });
-  const validatedMs = performance.now() - t0;
-  const t1 = performance.now();
-  const plain = await encodeDeltaEnvelope(base, target, options);
-  const plainMs = performance.now() - t1;
+  // Min-of-3, alternating: a single cold-vs-warm shot lost to JIT/GC noise on shared
+  // CI runners three times on 2026-09-06 (validated 4.8s vs plain 4.25s). The claim is
+  // about work skipped, which the minimum isolates; the bytes must still be identical.
+  let validatedMs = Infinity;
+  let plainMs = Infinity;
+  let validated = await encodeDeltaEnvelope(base, target, { ...options, baseValidated: true });
+  let plain = await encodeDeltaEnvelope(base, target, options);
+  for (let round = 0; round < 3; round++) {
+    const t0 = performance.now();
+    validated = await encodeDeltaEnvelope(base, target, { ...options, baseValidated: true });
+    validatedMs = Math.min(validatedMs, performance.now() - t0);
+    const t1 = performance.now();
+    plain = await encodeDeltaEnvelope(base, target, options);
+    plainMs = Math.min(plainMs, performance.now() - t1);
+  }
 
   const recovered = deltaBaseMs + encoderBaseMs;
   console.error(`#816 bench (${ENTRIES} entries): delta_base ${deltaBaseMs.toFixed(0)}ms + encoder assertManifest(base) ${encoderBaseMs.toFixed(0)}ms `
