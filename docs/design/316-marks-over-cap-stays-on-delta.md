@@ -1,6 +1,6 @@
 # 316 — An over-cap mark probe stays on the delta admission path (design 102 Q3, as decided)
 
-Status: proposed (2026-09-06). Owner: `apps/api/src/commit-delta.ts` (`shouldUseDeltaAdmission`)
+Status: DECISION PENDING (founder) after review round 1 (`notes/316/review1-gpt.md`), 2026-09-06. Owner: `apps/api/src/commit-delta.ts` (`shouldUseDeltaAdmission`)
 + `apps/api/src/workspace-sync.ts` (the enforce branch). Parent: design 102 (§3.5A.4, §7.1 Q3).
 
 ## Problem, measured (prod, 2026-09-06 11:00–14:00Z, `commit.delta` analytics)
@@ -34,6 +34,41 @@ markedProbeSkipped = true` (memory stays bounded), and `mergeAddedShas` correctl
 and the enforce branch emits `fallback marks_over_cap`. So the one condition the decision
 said must never cause a full fallback is exactly the one that does, and it is the steady
 state of any account whose mark table exceeds 50K (a 200K-ref workspace after a purge).
+
+## Review round 1 correction: the fallback is deliberate, not drift
+
+GPT found (and `git log 1cf847d7f` confirms) that commit "fix: design 102 — fence probe
+scaling (soak unblock)" implemented Q3 for SHADOW mode only and kept, on purpose, "ENFORCE
+safety: when the marked probe is skipped, enforce falls back to full child validation (never
+silently unfenced)". Design 204 §3.1 then made that fallback a hard precondition of the
+enforce flip and pinned it (`commit-delta-shadow.test.ts:207`). So the current behaviour is
+a product decision: with the mark probe skipped, a prune-marked CARRIED ref cannot be folded
+into `admitData` for a presence+entitlement re-check, and the full-refset validation is the
+only remaining detector of that loss class (a carried ref whose `blob_refs` row Phase-1
+purge dropped). The 4–7 s per commit is the price of that detector on any account whose
+mark table exceeds 50K.
+
+What the detector defends against: a carried ref that GC purged although a head still
+referenced it. Purge only drops refs absent from the DO-roots reachable set, recomputed per
+tick (`runPhase1`), with `marked_at` ≥ 24 h grace and an EXISTS-still-marked guard; a
+carried ref is in the parent head, so it is reachable in any snapshot younger than the
+parent commit. The unguarded case is therefore a GC bug (stale or truncated reachability),
+not a protocol race — which is exactly the class a defense-in-depth detector exists for.
+
+## Decision for the founder (two options)
+
+- **A. Keep the detector (status quo).** Every push on every device pays ~4 s server
+  accounting while this account's marks stay > 50K. Marks are 224K and growing ~39K/day;
+  purge throughput is unknown (the phase-1 outcome logs need Workers Observability access
+  the current token lacks). Nothing to ship.
+- **B. Implement Q3 in enforce (this design's Rule).** ~4 s saved per push, every device,
+  immediately on promotion. Cost: the loss detector for prune-marked carried refs is
+  inactive while marks > 50K; correctness then rests on Phase-1's reachability + grace
+  invariants alone (today's argument above). Ships with the tests below plus a stale-
+  snapshot/publish/purge interleaving test that bounds snapshot age below grace.
+
+Recommendation: **B**, with one rider — a cheap per-commit metric that counts marks so
+we see when the table drops back under the cap, and a follow-up on purge throughput.
 
 ## Rule
 
