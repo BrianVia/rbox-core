@@ -201,9 +201,22 @@
   every changed push paid `delta_base≈1.4s` (validate + canonical hash of 198K entries).
   Now keyed by the `lastSyncedManifest` + `manifestMeta` object identities (GPT round 1
   blocker: gitRepos is a hashed input, so the meta object must be part of the key).
-  Desktop on `2.0.2-dev+c56ee2c` (pid 3166594); proof pending an ordinary changed push
-  (the two pushes right after restart were post-restart safety scans: 117s each, `scan
-  82.4s` = 377,786 entries walked, `st48.6` in stat — a change-proportional-scan item, F2/F3).
+  It still missed on the desktop, so **#910 (313b, `c690ed094`)** added `attest=<hit|miss>/
+  <outcome>` to the push line and made a zero-op delta save hand back the retained files
+  array by identity (a git-only push saves `global=delta ops=0`; the copy broke every
+  identity-keyed memo — design 303's audit hash re-ran on every elided pull, compose≈950ms).
+  `attest=miss/attested` on every push then showed the real culprit: an elided save's
+  projection rebuilds BOTH the manifest wrapper and the meta object; only the files array
+  survives. **#911 (315b, `984f5aa09`)** keys the attestation by the files array and
+  compares the other hashed inputs (generatedAt, manifestSchema, hashes, canonical
+  meta.gitRepos) by value. **PROVEN on the desktop (`2.0.2-dev+984f5aa`, pid 3615665):**
+  ordinary changed pushes log `delta_base=0.0s attest=hit/attested`; wall 23s → 14.6–16.8s.
+  The 303 audit memo now holds too (no `compose≈950` after the first elided save).
+- **Post-restart safety-scan pushes:** two per daemon restart (8 today, 1 yesterday in
+  1,346 pushes), 108–140s each, `scan 82.4s` for 377,786 entries (`st48.6 obs36.3`) —
+  while the daemon's own `safety scan:` line walks the SAME tree in `wall=1750ms`. The
+  push-embedded scan path is ~47× slower than the daemon walker; restart cost only, but a
+  cheap-looking candidate (F3-family) — not started.
 - **SERVER: every changed push pays 4–7 s of commit accounting — root cause found, DECISION
   NEEDED (design 316, worktree `delta-marks`, `docs/design/316-*.md`).** Prod `commit.delta`
   analytics (Cloudflare Analytics Engine SQL, token in `~/.secret_env_vars`), 11:00–14:00Z:
