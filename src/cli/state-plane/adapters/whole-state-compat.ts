@@ -32,7 +32,9 @@ import { sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
 import { stableDbHash } from "../reset/artifacts.js";
 import { LEGACY_REJECTION_REASON, translateCasResult } from "./cas-translation.js";
 import { fencedAuthorityUnderHeldLock, openAuthorityStore, selectAuthority, sqliteAuthority, translateStoreOpenError } from "./authority-open.js";
-import { forgetState, memoizedBaseFiles, memoizedState, rememberState } from "./state-memo.js";
+import {
+  detachGlobalDelta, forgetState, memoizedBaseFiles, memoizedDeltaFiles, memoizedState, rememberState,
+} from "./state-memo.js";
 import type { StateFreshnessToken } from "./read-only.js";
 import { casOwnerTokenFromLock } from "../store/owner-token.js";
 import { markResetLineageProvenance, recoverStandingResetJournal, stateWasStreamMismatch } from "../reset-lineage.js";
@@ -206,6 +208,7 @@ export async function applyStateSavePacket(
   packet: StateSavePacket,
   options: StateSaveOptions = {},
 ): Promise<StateSaveResult> {
+  const sealed = packet.globalDelta === undefined ? undefined : detachGlobalDelta(packet.globalDelta);
   const selection = await selectAuthority(root);
   if (selection.kind === "uninitialized") {
     return {
@@ -216,13 +219,14 @@ export async function applyStateSavePacket(
   if (selection.kind === "legacy-json-store") {
     return applyLegacyJsonSavePacket(root, packet, options);
   }
-  return saveThroughStore(root, packet, options);
+  return saveThroughStore(root, packet, options, sealed);
 }
 
 async function saveThroughStore(
   root: string,
   packet: StateSavePacket,
   options: StateSaveOptions,
+  sealed: StateSavePacket["globalDelta"],
 ): Promise<StateSaveResult> {
   let lock: OwnedLock;
   let releaseLock = false;
@@ -254,19 +258,28 @@ async function saveThroughStore(
     const authority = await fencedAuthorityUnderHeldLock(root);
     const { store, facade } = await openAuthorityStore(authority, false);
     try {
-      const applied = await facade.applySavePacketToStore(store, packet, casOwnerTokenFromLock(lock));
-      // Design 302: a global-free packet left the base generation alone, so the
-      // retained rows (if this root has any) are still the store's rows.
-      const reuse = packet.global === undefined && applied.status === "accepted"
-        ? memoizedBaseFiles(root, facade.readStateFreshnessFromStore(store))
-        : undefined;
+      const applied = await facade.applySavePacketToStore(
+        store,
+        sealed === undefined ? packet : { ...packet, globalDelta: sealed },
+        casOwnerTokenFromLock(lock),
+      );
+      const token = applied.status === "accepted" ? facade.readStateFreshnessFromStore(store) : undefined;
+      const candidateReuse = token === undefined ? undefined
+        : packet.global === undefined ? memoizedBaseFiles(root, token)
+          : sealed !== undefined ? memoizedDeltaFiles(root, sealed, token) : undefined;
+      // The store enforces the same result count while applying the delta. This
+      // also rejects retention invalidated by out-of-band row damage that did
+      // not move the lineage token (design 269's documented drift window).
+      const reuse = candidateReuse !== undefined && packet.global !== undefined
+        && candidateReuse.baseFiles.length !== packet.global.manifest.files.length
+        ? undefined : candidateReuse;
       const result = translateCasResult(applied, store, facade, packet, options.acceptedProjection, reuse);
       // An accepted save already holds the exact state the store now carries;
       // retaining it under the post-write token is what makes the loads that
       // follow a publication free. Every other status leaves the retention
       // alone — the next load's token comparison is the arbiter either way.
-      if (result.status === "accepted") {
-        rememberState(root, facade.readStateFreshnessFromStore(store), result.state);
+      if (result.status === "accepted" && token !== undefined) {
+        rememberState(root, token, result.state);
       }
       return result;
     } finally {

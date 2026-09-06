@@ -25,7 +25,9 @@
  * Deletion condition: two clean fleet weeks (docs/diagnostics.md).
  */
 import type { FileEntry } from "../../../engine/index.js";
+import { applyDeltaOps, type GlobalDelta } from "../../sync-state-delta.js";
 import type { SyncState } from "../../sync-state-model.js";
+import { normalizeFileEntry } from "../codecs/file-entry.js";
 import { stateWasStreamMismatch } from "../reset-lineage.js";
 import type { StateFreshnessToken } from "./read-only.js";
 
@@ -117,6 +119,36 @@ export function memoizedBaseFiles(root: string, token: StateFreshnessToken): { b
   if (!entry || entry.token.lineageId !== token.lineageId || entry.token.stream !== token.stream
     || entry.token.baseGeneration !== token.baseGeneration) return undefined;
   return { baseFiles: entry.state.lastSyncedManifest.files };
+}
+
+/** Design 313: derive post-delta rows only from the retained predecessor. */
+export function memoizedDeltaFiles(
+  root: string,
+  delta: GlobalDelta,
+  postToken: StateFreshnessToken,
+): { baseFiles: readonly FileEntry[] } | undefined {
+  if (!stateMemoEnabled()) return undefined;
+  const retained = MEMO.get(root);
+  if (!retained || retained.token.authorityId !== postToken.authorityId
+    || retained.token.lineageId !== postToken.lineageId || retained.token.stream !== postToken.stream
+    || retained.token.baseGeneration + 1 !== postToken.baseGeneration
+    || retained.state.stateNonce !== delta.binding.nonce
+    || retained.state.stateRevision !== delta.binding.stateRevision) return undefined;
+  try {
+    return { baseFiles: applyDeltaOps(retained.state.lastSyncedManifest.files, delta.ops) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Detach a mutable caller delta and normalize every value as staging does. */
+export function detachGlobalDelta(delta: GlobalDelta): GlobalDelta {
+  return {
+    binding: { ...delta.binding },
+    ops: delta.ops.map((op) => op.kind === "upsert"
+      ? { kind: "upsert", entry: normalizeFileEntry(op.entry) }
+      : { kind: "delete", path: op.path }),
+  };
 }
 
 /** Drop this root's retention — used where the lineage itself is replaced. */

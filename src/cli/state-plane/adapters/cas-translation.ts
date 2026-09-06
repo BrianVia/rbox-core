@@ -46,6 +46,7 @@ export const LEGACY_REJECTION_REASON = {
  * post-CAS base generation still matches the retention. It is a skip rule
  * keyed by store truth, not a caller's claim; records, meta and git
  * projections are still read back.
+ * Design 313 admits the memo's delta-derived rows under its predecessor and post-CAS token checks.
  */
 export function translateCasResult(
   result: CasResult,
@@ -82,4 +83,3 @@ export function translateCasResult(
       return result;
   }
 }
-

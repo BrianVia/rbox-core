@@ -28,7 +28,8 @@ const EXACT_MATCH = `e.exact_fingerprint=t.exact_fingerprint AND e.path=t.path A
   AND e.size=t.size AND e.mode=t.mode AND e.mtime_ms=t.mtime_ms AND e.kind=t.kind
   AND e.symlink_target IS t.symlink_target AND e.enc_sha IS t.enc_sha AND e.comp IS t.comp
   AND e.payload_sha IS t.payload_sha AND e.cipher_size IS t.cipher_size
-  AND e.extras_cjson IS t.extras_cjson`;
+  AND e.extras_cjson IS t.extras_cjson AND e.canonical_bytes=t.canonical_bytes
+  AND e.retained_estimate=t.retained_estimate`;
 
 /** `entry_id` is nullable: the consume path leaves it unset and the intern pass
  * resolves or mints it in SQL. */

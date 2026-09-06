@@ -217,3 +217,26 @@ export function decodeFileEntry(row: FileEntryRow): FileEntry {
   }
   return entry;
 }
+
+/** Normalize an admitted entry exactly as the durable file cursor returns it. */
+export function normalizeFileEntry(entry: FileEntry): FileEntry {
+  const encoded = encodeFileEntryForConsume(
+    fileEntryFromCanonical(encodeFileEntryForConsume(entry).canonical),
+  );
+  return decodeFileEntry({
+    path: encoded.path,
+    sha256: encoded.sha256,
+    size: encoded.size,
+    mode: encoded.mode,
+    mtime_ms: encoded.mtimeMs,
+    kind: encoded.kind,
+    symlink_target: encoded.symlinkTarget,
+    enc_sha: encoded.encSha,
+    comp: encoded.comp,
+    payload_sha: encoded.payloadSha,
+    cipher_size: encoded.cipherSize,
+    extras_cjson: encoded.extrasCjson,
+    canonical_bytes: encoded.canonicalBytes,
+    retained_estimate: encoded.retainedEstimate,
+  });
+}
