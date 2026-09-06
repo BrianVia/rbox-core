@@ -70,6 +70,7 @@ test("complete daemon push line stays byte-identical to the pre-consolidation fi
       await spans.span("commit", async () => { now = 3_500; });
       report.recordDetails("commit", { base: true }, "commit-base");
       spans.note("delta_base_ms", 100);
+      spans.noteAttestation(false, "attested");
       spans.recordTail("commit", 17, 21);
       spans.recordTail("commit", 15, 13);
       await spans.span("state-save", async () => { now = 3_900; });
@@ -91,6 +92,18 @@ test("nested tail wrappers deduplicate without suppressing concurrent siblings",
     timePushTailRequest("missing", 13, async () => "sibling"),
   ]));
   expect(report.toJSON().phases.missing?.details).toMatchObject({ chunks: 2, payloadBytes: 24 });
+});
+
+test("a terminal push before state save reports one skipped attestation", async () => {
+  const report = PhaseReport.push();
+  const spans = new PushSpans(report);
+  await expect(spans.run(async () => {
+    await spans.span("commit", async () => {});
+    spans.noteAttestation(true);
+    throw new Error("terminal");
+  })).rejects.toThrow("terminal");
+  expect(report.summaryLine().match(/attest=/g)).toHaveLength(1);
+  expect(report.summaryLine()).toContain("attest=hit/skipped");
 });
 
 test("concurrent push owners isolate every ambient sink", async () => {

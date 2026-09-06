@@ -1746,7 +1746,7 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   expect(j.phases["git-plan"]!.details?.state_lineage_ms).toBeGreaterThanOrEqual(0);
   expect(j.phases["git-plan"]!.details?.matcher_ms).toBeGreaterThanOrEqual(0);
   expect(j.phases.commit!.details?.delta_base_ms).toBeGreaterThanOrEqual(0);
-  expect(Object.keys(j.phases.commit!.details ?? {}).sort()).toEqual(["delta_base_ms", "encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "serverTimings", "sidecarMs", "uploadMs"]);
+  expect(Object.keys(j.phases.commit!.details ?? {}).sort()).toEqual(["attest", "delta_base_ms", "encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "serverTimings", "sidecarMs", "uploadMs"]);
   expect(j.phases.commit!.details?.serverTimings).toEqual({
     totalMs: 13,
     envelopeMs: 1,
@@ -1767,6 +1767,8 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   expect(lines[0]).toContain("state_lineage=");
   expect(lines[0]).toContain("matcher=");
   expect(lines[0]).toContain("delta_base=");
+  expect(lines[0]).toContain("attest=miss/skipped");
+  expect(lines[0]!.indexOf("attest=")).toBeGreaterThan(lines[0]!.indexOf("delta_base="));
   expect(lines[0]).toContain("r0.0 sc0.0 e0.0 c0.0 u0.0 p0.0 7B");
 });
 

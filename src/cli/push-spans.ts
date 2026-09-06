@@ -2,6 +2,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { PhaseReport, type PhaseName } from "../engine/index.js";
 import { fillVersion } from "./remote/blob-batch/config.js";
+import type { AttestSavedBaseOutcome } from "./sync/base-hash-attestation.js";
 import type { LaneTransport, UploadLaneSample } from "./telemetry/contract.js";
 import { formatPushSpan } from "./sync/format.js";
 
@@ -146,6 +147,7 @@ export class PushSpans {
   private readonly tails = { missing: chunkTimings(), commit: chunkTimings() } satisfies Record<PushTailKind, ChunkTiming[]>;
   private readonly measurements = new Map<PushDetailName, number>();
   private stateSaveWallMs = 0;
+  private baseAttestation: { hit: boolean; outcome: AttestSavedBaseOutcome | "skipped" } | undefined;
 
   constructor(
     readonly report: PhaseReport,
@@ -166,6 +168,10 @@ export class PushSpans {
     try {
       return await scope.run({ owner: this, activeTailKinds: new Set() }, fn);
     } finally {
+      if (this.baseAttestation) {
+        const value = `${this.baseAttestation.hit ? "hit" : "miss"}/${this.baseAttestation.outcome}`;
+        this.report.appendDetails("commit", { attest: value }, `attest=${value}`);
+      }
       this.finishLanes();
       this.finishTails();
     }
@@ -192,6 +198,10 @@ export class PushSpans {
     this.measurements.delete(name);
     const phase = detailPhase[name];
     this.report.appendDetails(phase, { [name]: measured }, formatPushSpan(name, measured));
+  }
+
+  noteAttestation(hit: boolean, outcome: AttestSavedBaseOutcome | "skipped" = "skipped"): void {
+    this.baseAttestation = { hit, outcome };
   }
 
   private async acknowledgement<T>(fn: () => Promise<T>): Promise<T> {

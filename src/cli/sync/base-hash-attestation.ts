@@ -49,6 +49,17 @@ interface AttestedBase {
 
 const ATTESTED = new WeakMap<Manifest, AttestedBase>();
 
+export type AttestSavedBaseOutcome =
+  | "attested"
+  | "no-meta"
+  | "meta-mismatch"
+  | "sequence"
+  | "gitrepos-presence"
+  | "shape"
+  | "generatedAt"
+  | "schema"
+  | "count";
+
 /**
  * Record that `saved` — the state an accepted save returned — reconstructs to a
  * manifest whose canonical hash is `meta.manifestHash`.
@@ -75,20 +86,21 @@ export function attestSavedBase(
   committed: Manifest,
   meta: GlobalManifestMeta,
   acceptedSequence: number,
-): void {
+): AttestSavedBaseOutcome {
   const savedMeta = saved.manifestMeta;
-  if (savedMeta === undefined) return;
-  if (savedMeta.encManifestSha !== meta.encManifestSha || savedMeta.manifestHash !== meta.manifestHash) return;
-  if (saved.lastSyncedSequence !== acceptedSequence) return;
+  if (savedMeta === undefined) return "no-meta";
+  if (savedMeta.encManifestSha !== meta.encManifestSha || savedMeta.manifestHash !== meta.manifestHash) return "meta-mismatch";
+  if (saved.lastSyncedSequence !== acceptedSequence) return "sequence";
   // `manifestFromMeta` restores gitRepos only when the meta's map is non-empty,
   // so those two facts must agree or the reconstruction differs from `committed`.
-  if ((Object.keys(savedMeta.gitRepos).length > 0) !== (committed.gitRepos !== undefined)) return;
+  if ((Object.keys(savedMeta.gitRepos).length > 0) !== (committed.gitRepos !== undefined)) return "gitrepos-presence";
   const base = saved.lastSyncedManifest;
-  if (!reconstructible(committed) || !reconstructible(base)) return;
-  if (base.generatedAt !== committed.generatedAt) return;
-  if (base.manifestSchema !== committed.manifestSchema) return;
-  if (base.files.length !== committed.files.length) return;
+  if (!reconstructible(committed) || !reconstructible(base)) return "shape";
+  if (base.generatedAt !== committed.generatedAt) return "generatedAt";
+  if (base.manifestSchema !== committed.manifestSchema) return "schema";
+  if (base.files.length !== committed.files.length) return "count";
   ATTESTED.set(base, { meta: savedMeta, encManifestSha: savedMeta.encManifestSha, manifestHash: savedMeta.manifestHash });
+  return "attested";
 }
 
 /** Does this state carry a standing attestation for exactly this meta? */
