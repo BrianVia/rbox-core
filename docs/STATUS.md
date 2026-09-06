@@ -222,6 +222,19 @@
   (`2.0.2-dev+faff65c`, pid 3922384):** `fn1013` (1-blob) and `fn1942` (7-blob) on the
   first two changed pushes; git-plan 5.2–5.5s → 2.2–4.8s. A 1/2/4/8/16 sweep is the
   follow-up if `fn` stays above one fill window + one PUT.
+- **Projection 0.7s on EVERY push (incl. empty) — analysed, blocked on F3b:** `projection_
+  ignore_carry 0.1 + casefold 0.2 + sort 0.1 + diff 0.3` = `projectLocalManifest` +
+  `diffManifests`, pure functions of (local files array, base files array, matcher,
+  purgeIgnored). The local array is identity-stable between watch batches, the base array
+  is (277/313b), but `matcherForState` → `buildIgnoreMatcher` builds a NEW matcher every
+  push (`push.ts:521`) and no certification token exists yet (`grep certif` → nothing), so
+  an identity memo cannot see ignore-rule changes. That certification is exactly roadmap
+  **F3b** (certified matcher reuse + invalidation; prerequisites F1 ✓ + a freshness
+  inventory over rule files / repo topology / private index). F3b unlocks both the pull's
+  per-cycle matcher build (plan evidence: 1.7–2.0s warm on 100 repos) and this 0.7s/push
+  memo. **Recommended next design: F3b**, with the projection memo as its first consumer.
+  F2b was measured and parked: the per-watch-batch fixed cost is ~80ms at 198K entries
+  (Map 55ms + sort 24ms), not worth a slice now.
 - **Post-restart safety-scan pushes:** two per daemon restart (8 today, 1 yesterday in
   1,346 pushes), 108–140s each, `scan 82.4s` for 377,786 entries (`st48.6 obs36.3`) —
   while the daemon's own `safety scan:` line walks the SAME tree in `wall=1750ms`. The
@@ -276,8 +289,10 @@
   (repos that turned split index off after a bad capture). Recommendation:
   DEFER as a measured no-go; note in scratch
   `NOTE-historical-split-repair.md`. Say "build it" to override.
-- **Next bounded candidates (not started):** unchanged-repo transition elision on push
-  (design needed; 0.3s/push), F2b small-batch manifest merge,
+- **Next bounded candidates (not started):** F3b certified matcher (unlocks the 0.7s/push
+  projection memo + pull matcher build), design 316 (awaiting founder A/B), unchanged-repo
+  transition elision on push (design needed; 0.3–0.48s/push), the push-embedded scan path
+  (47× slower than the daemon walker; restart-only),
   G4a Git env inventory (allowlist routing vars), S2a extra-index
   compatibility fixture, G3b is discharged by the 296 schema bump.
 - **Local hygiene:** all 46 stale worktrees and 285 local branches were purged
