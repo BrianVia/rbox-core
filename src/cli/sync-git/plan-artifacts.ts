@@ -1,6 +1,8 @@
 /** Never: decide which candidate survives, mutate plan fields, grant proof authority, or publish a manifest. */
 import fs from "node:fs/promises";
 import type { BlobStore } from "../../engine/blobstore.js";
+import { poolMap } from "../../engine/pool.js";
+import { PACK_MIN_ACTIVATION_COUNT } from "../../engine/blob-pack.js";
 import { flushGitArtifact, type GitArtifactReadStore, type PendingGitUpload } from "./git-state.js";
 import { makeGitCaptureDir } from "./capture.js";
 import { errMsg } from "./shared.js";
@@ -65,16 +67,40 @@ export function planReadThroughStore(
  *  because by this point irreversible ref mutations and keep-mine pins have already
  *  happened and no per-repo revert can undo them. Performs no cleanup; the plan's
  *  single `finally` sweep of the retention dir is the only reclamation. */
+/** Design 317 (F6a): a capture's artifacts (bundle, index, one per op-state file per
+ * worktree) were uploaded one round trip after another, and each large one waited its
+ * own pack-fill window (PACK_FILL_ABSOLUTE_MS) alone. Enqueue them together so a whole
+ * capture lands in ONE fill wave: the bound is the pack lane's own activation count,
+ * so a capture with that many artifacts also qualifies for a pack instead of the
+ * single-PUT fallback. One owner for the number: engine/blob-pack.ts. */
+export const GIT_ARTIFACT_FLUSH_CONCURRENCY = PACK_MIN_ACTIVATION_COUNT;
+
 export async function flushGitArtifacts(
   store: BlobStore,
   pending: readonly PendingGitUpload[],
   flushed: Set<string>,
 ): Promise<void> {
+  const owed = new Map<string, PendingGitUpload>();
   for (const artifact of pending) {
-    if (flushed.has(artifact.encSha)) continue;
-    await flushGitArtifact(store, artifact);
-    flushed.add(artifact.encSha);
+    if (!flushed.has(artifact.encSha) && !owed.has(artifact.encSha)) owed.set(artifact.encSha, artifact);
   }
+  // Latch the first failure and let the in-flight siblings drain (poolMap's
+  // documented shape): the plan's finally-sweep deletes the retained ciphertext,
+  // and an unwound plan with detached uploads still reading it would race that.
+  // Artifacts not yet started are skipped once something failed.
+  // (A thrown `undefined` is still a failure: the latch is a flag, not the value.)
+  let failed = false;
+  let failure: unknown;
+  await poolMap([...owed.values()], GIT_ARTIFACT_FLUSH_CONCURRENCY, async (artifact) => {
+    if (failed) return;
+    try {
+      await flushGitArtifact(store, artifact);
+      flushed.add(artifact.encSha);
+    } catch (error) {
+      if (!failed) { failed = true; failure = error; }
+    }
+  });
+  if (failed) throw failure;
 }
 
 /** Owns every plan-lifetime transition of captured ciphertext. A caller names the

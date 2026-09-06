@@ -1299,11 +1299,15 @@ test("git artifact sha_mismatch re-encrypts and retries with resumable uploadsDi
   expect(m.gitRepos?.["r"]).toBeDefined();
   expect(backoffAttempts).toEqual([0]);
   expect(remote.gitPutCalls).toBeGreaterThanOrEqual(2);
-  expect(remote.gitPutUploads[0]!.sha).toBe(remote.gitPutUploads[1]!.sha); // same encSha
+  // Design 317: artifacts flush through a bounded pool, so the retry is the second
+  // upload OF THAT encSha, not necessarily the second upload overall.
+  const retried = remote.gitPutUploads.filter((u, _i, all) => all.filter((o) => o.sha === u.sha).length >= 2);
+  expect(retried.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(retried.map((u) => u.sha)).size).toBe(1); // same encSha
   // DESIGN 226 — DELIBERATE INVERSION of `not.toBe`. The staged plaintext is gone by the
   // flush, so the retry cannot re-encrypt; it re-sends the SAME retained ciphertext after
   // verifying locally that it still hashes to its encSha (and fails closed otherwise).
-  expect(remote.gitPutUploads[0]!.src).toBe(remote.gitPutUploads[1]!.src);
+  expect(new Set(retried.map((u) => u.src)).size).toBe(1); // same retained ciphertext
   const scratch = `${path.join(rootA, ".rbox", "gitcap")}${path.sep}`;
   expect(remote.gitPutUploads[0]!.src.startsWith(scratch)).toBe(true);
   expect(remote.gitPutUploads[1]!.src.startsWith(scratch)).toBe(true);
@@ -1336,8 +1340,15 @@ test("git artifact sha_mismatch retries are bounded; final failure fails the pus
   await expect(push(rootA, cfgA, { ...depsA, backoff: async (attempt) => backoffAttempts.push(attempt) }))
     .rejects.toThrow(/blob PUT rejected/);
 
-  expect(remote.gitPutCalls).toBe(3); // PER_FILE_UPLOAD_ATTEMPTS parity, unchanged
-  expect(backoffAttempts).toEqual([0, 1]); // retry budget unchanged
+  // Design 317: the bundle and the index flush concurrently, so the budget is PER
+  // ARTIFACT (PER_FILE_UPLOAD_ATTEMPTS parity, unchanged) and both may spend it.
+  const attemptsBySha = new Map<string, number>();
+  for (const u of remote.gitPutUploads) attemptsBySha.set(u.sha, (attemptsBySha.get(u.sha) ?? 0) + 1);
+  expect([...attemptsBySha.values()].every((n) => n === 3)).toBe(true);
+  expect(remote.gitPutCalls).toBe(3 * attemptsBySha.size);
+  expect(backoffAttempts.filter((a) => a === 0).length).toBe(attemptsBySha.size); // retry budget unchanged per artifact
+  expect(backoffAttempts.filter((a) => a === 1).length).toBe(attemptsBySha.size);
+  expect(backoffAttempts.some((a) => a >= 2)).toBe(false);
   expect(remote.headSeq()).toBe(seqBefore); // nothing published at all
   expect((await remote.latest()).manifest.files.some((f) => f.path === "note.txt")).toBe(false);
   expect(await retainedGitCiphertext(rootA)).toEqual([]); // the finally sweep still ran
@@ -1360,7 +1371,10 @@ test("design 226: a retained ciphertext corrupted on disk fails CLOSED instead o
 
   await expect(push(rootA, cfgA, { ...depsA, backoff: noBackoff }))
     .rejects.toThrow(/retained git artifact ciphertext no longer matches/);
-  expect(remote.gitPutCalls).toBe(1); // no second send of bytes we cannot vouch for
+  // Design 317: a sibling artifact (with intact bytes) may have been sent by the pool;
+  // the corrupted one is sent exactly once — no second send of bytes we cannot vouch for.
+  const corruptedSha = remote.gitPutUploads[0]!.sha;
+  expect(remote.gitPutUploads.filter((u) => u.sha === corruptedSha).length).toBe(1);
   expect(await retainedGitCiphertext(rootA)).toEqual([]);
 }, 20_000);
 
