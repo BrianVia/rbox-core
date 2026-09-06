@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { classifyShadow, compare32, divergenceDigest, mergeAddedShas, mergeSortedUnique } from "../src/commit-delta.js";
+import { classifyShadow, compare32, divergenceDigest, mergeAddedShas, mergeSortedUnique, shouldUseDeltaAdmission } from "../src/commit-delta.js";
 import { DIVERGENCE_SAMPLE } from "../src/metrics.js";
 import { loadSidecarRaw } from "../src/sidecar.js";
 import { sha256Hex } from "../src/util.js";
 import { REFSET_HEADER, REFSET_REC, serializeRefset } from "../../../src/engine/refset.js";
-import { loadFenceProbe, shouldUseDeltaAdmission } from "../src/workspace-sync.js";
+import { loadFenceProbe } from "../src/workspace-sync.js";
 import { FENCE_SET_MAX } from "../src/commit-delta.js";
 
 const sha = (n: number) => n.toString(16).padStart(64, "0");
@@ -17,7 +17,7 @@ describe("commit delta pure logic", () => {
     const mockDb = { prepare: (sql: string) => ({ bind: (...binds: unknown[]) => ({ all: async () => {
       observed.push({ sql, binds });
       return { results: sql.includes("blob_ref_candidates") ? marks : [] };
-    } }) }) } as unknown as D1Database;
+    } }) }) } as D1Database;
     const probe = await loadFenceProbe(mockDb, "a");
     expect(probe).toMatchObject({ markedProbeSkipped: true, intentOverCap: false, observedMarks: FENCE_SET_MAX + 1 });
     expect(probe.markedSet.size).toBe(0);
@@ -26,7 +26,7 @@ describe("commit delta pure logic", () => {
 
   it("reserves fence_over_cap exclusively for an over-cap active-intent probe", async () => {
     const rows = Array.from({ length: FENCE_SET_MAX + 1 }, (_, i) => ({ sha256: sha(i) }));
-    const mockDb = { prepare: (sql: string) => ({ bind: () => ({ all: async () => ({ results: sql.includes("FROM gc_candidates") ? rows : [] }) }) }) } as unknown as D1Database;
+    const mockDb = { prepare: (sql: string) => ({ bind: () => ({ all: async () => ({ results: sql.includes("FROM gc_candidates") ? rows : [] }) }) }) } as D1Database;
     const probe = await loadFenceProbe(mockDb, "a");
     expect(probe.intentOverCap).toBe(true);
     expect(probe.markedProbeSkipped).toBe(false);
@@ -69,17 +69,17 @@ describe("commit delta pure logic", () => {
     });
   });
 
-  it("uses full admission when enforce skipped the marked probe", () => {
+  it("keeps enforce on delta admission when the marked probe is skipped", () => {
     const delta = mergeAddedShas(buf(1), buf(1), new Set(), new Set());
     delta.markedProbeSkipped = true;
     const fullChildShas = vi.fn(() => [sha(1)]);
     const admitData: string[] = [];
     const useDelta = shouldUseDeltaAdmission("enforce", delta, undefined);
     const dataShas = useDelta ? admitData : fullChildShas();
-    expect(dataShas).toEqual([sha(1)]);
-    expect(fullChildShas).toHaveBeenCalledOnce();
-    delta.markedProbeSkipped = false;
-    expect(shouldUseDeltaAdmission("enforce", delta, undefined)).toBe(true);
+    expect(dataShas).toBe(admitData);
+    expect(fullChildShas).not.toHaveBeenCalled();
+    expect(shouldUseDeltaAdmission("enforce", delta, "fence_over_cap")).toBe(false);
+    expect(shouldUseDeltaAdmission("shadow", delta, undefined)).toBe(false);
   });
 
   it("merges disjoint ascending SHA lists", () => {
@@ -97,7 +97,7 @@ describe("commit delta pure logic", () => {
     const digest = await sha256Hex(child);
     const fakeEnv = {
       rbox_dev_blobs: { get: async () => ({ size: child.length, arrayBuffer: async () => child.buffer.slice(child.byteOffset, child.byteOffset + child.byteLength) }) },
-    } as unknown as Parameters<typeof loadSidecarRaw>[0];
+    } as Parameters<typeof loadSidecarRaw>[0];
     const loaded = await loadSidecarRaw(fakeEnv, digest, 2);
     expect(loaded).toEqual({ ok: false, reason: "refset: not strictly ascending / duplicate sha" });
     const hidden = buf(1, 2);
