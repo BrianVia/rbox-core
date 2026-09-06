@@ -46,6 +46,8 @@ export interface PlannedAbsentBranchVerification {
 export async function planAbsentBranchVerification(
   repoDir: string,
   ref: string,
+  /** Design 310: receipt retirements that ride the same atomic verification. */
+  extraTransactionLines: readonly string[] = [],
 ): Promise<PlannedAbsentBranchVerification> {
   branchRefHash(ref);
   const head = await reserveNonRacingHead(repoDir, ref, true);
@@ -54,7 +56,7 @@ export async function planAbsentBranchVerification(
   return {
     repoDir,
     ref,
-    lines: sortedUniqueLines([...head.lines, `verify ${ref} ${ZERO_OID}`]),
+    lines: sortedUniqueLines([...head.lines, `verify ${ref} ${ZERO_OID}`, ...extraTransactionLines]),
     headReservation: head.reservation,
   };
 }
