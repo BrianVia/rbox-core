@@ -1,6 +1,6 @@
 # 313 — A delta-carrying save reuses the composer's file array instead of re-reading 198K rows
 
-Status: proposed v2 (2026-09-06). Owner: `state-plane/adapters/state-memo.ts` (the reuse rule);
+Status: proposed v3 (2026-09-06; rounds 1–2 in `notes/313/`). Owner: `state-plane/adapters/state-memo.ts` (the reuse rule);
 `whole-state-compat.ts` only routes. Parent: design 302 (global-free reuse), design 277 (memo), 269 (delta).
 
 ## Problem, measured
@@ -37,26 +37,45 @@ New memo operation, `memoizedDeltaFiles(root, delta, postToken)`, returns
    delta.binding.nonce && retained.state.stateRevision === delta.binding.stateRevision` (the
    binding the composer stamped from the snapshot it diffed against, and the same predicate
    the CAS checked);
-4. `applyDeltaOps(retained.state.lastSyncedManifest.files, ops')` succeeds, where `ops'` are the
-   delta's ops with every upsert entry passed through the store's own codec round-trip
-   (`normalizeFileEntry` = `decodeFileEntry(rowOf(encodeFileEntryForConsume(entry)))`, a new
-   export of `codecs/file-entry.ts` so normalization has one owner). A refusal
-   (delete of an absent path, non-ascending ops) returns `undefined` → the existing paging path.
+4. `applyDeltaOps(retained.state.lastSyncedManifest.files, sealed.ops)` succeeds, where `sealed`
+   is the DETACHED delta described below. A refusal (delete of an absent path, non-ascending
+   ops) returns `undefined` → the existing paging path.
+
+### The detached delta (review round 2, findings 1–2)
+
+`StateSavePacket` is mutable and the caller keeps a reference, so neither staging nor the
+memo may read `packet.globalDelta` twice. In `applyStateSavePacket`, BEFORE the CAS, the
+adapter builds ONE private value, `sealed = detachGlobalDelta(packet.globalDelta)`: a fresh
+`{ binding: {...}, ops: [...] }` whose every upsert entry is `normalizeFileEntry(entry)`.
+The store is given `{ ...packet, globalDelta: sealed }` (staging reads `sealed.ops`
+synchronously, `sqlite-state-save.ts`), and `memoizedDeltaFiles` is given the same `sealed`.
+A caller mutation after that point changes nothing either side sees.
+
+`normalizeFileEntry` (new export of `codecs/file-entry.ts`, the one owner of "what the file
+cursor returns") reproduces staging exactly: `fileEntryFromCanonical(encodeFileEntryForConsume
+(entry).canonical)` — the sealed canonical text, which is what the store interns (so
+`mtimeMs: -0` becomes `0`, key order and absent members canonicalize) — then re-encoded to a
+`FileEntryRow` and passed through `decodeFileEntry`. The oracle in tests is an actual store
+cursor over a staged row, never the codec's own output. Because canonicalization is
+idempotent, staging `sealed` seals the same canonical bytes and logical digest as staging
+the caller's ops would have.
 
 Why this equals the store's read-back: (2)+(3) prove the retained rows are the rows the CAS
 applied the delta to (design 302's argument, same known edge: a manual backup restore to the
 same lineage and generation with different rows); `applyDeltaOps` is the documented twin of
-`applyDeltaOpsIntoPlane` (only named paths move, delete-absent refuses, exact result count);
-(4) makes every upserted entry byte-for-byte what the file cursor decodes (the store interns
-`admitted.canonical`, so `mtimeMs: -0`, key order and absent-vs-undefined members normalize
-the same way). Nothing about the caller's `packet.global.manifest.files` is used.
+`applyDeltaOpsIntoPlane` (only named paths move, delete-absent refuses, exact result count),
+and both consume the same `sealed` value. Nothing about the caller's
+`packet.global.manifest.files` or the caller's `globalDelta` object is used after detachment.
 
-Adapter change (`whole-state-compat.ts`, one expression): for an accepted packet,
+Adapter change (`whole-state-compat.ts`): for an accepted packet,
 `reuse = packet.global === undefined ? memoizedBaseFiles(root, token)
-       : packet.globalDelta !== undefined ? memoizedDeltaFiles(root, packet.globalDelta, token)
-       : undefined`. The ops are normalized before the CAS begins (same packet the store
-stages from; the packet is the composer's frozen value, and the store itself reads it once).
+       : sealed !== undefined ? memoizedDeltaFiles(root, sealed, token) : undefined`.
 `loadRawState` still never reuses. Full-global (non-delta) saves still page.
+
+Expectation-carrying deltas do not exist: `composeStateSavePacket` sets `packet.global`
+only when `proven === undefined` and `elisionExpectation` only when `proven !== undefined`
+(`sync-state.ts`), so a delta is never paired with an expectation. Pinned by a test rather
+than handled by a branch.
 
 ## Non-goals
 
@@ -70,12 +89,20 @@ stages from; the packet is the composer's frozen value, and the store itself rea
 - delta save after a retained load: file cursor never paged (spy `loadRawStateFromStore`'s
   `reuse` argument is the memo's derived array), returned state `toEqual` a fresh
   `loadRawState`, AND the next `loadState` is free and equal.
-- normalization: upserts carrying `mtimeMs: -0`, extras, a symlink, and non-canonical key
-  order — reused state equals `loadRawState` exactly (durable rows are the oracle).
+- normalization: upserts carrying `mtimeMs: -0`, extras, a symlink, a compressed entry and
+  non-canonical key order — reused state equals `loadRawState` exactly (durable rows are the
+  oracle), and `normalizeFileEntry(entry)` equals the store cursor's row for the same staged
+  entry (codec test, cursor as oracle).
 - no retained predecessor (memo empty / foreign revision bump between load and save /
   nonce mismatch): reuse `undefined`, pages, equal.
-- delta refused by `applyDeltaOps` (retained rows diverged: mutate the store outside the
-  adapter so a delete targets an absent path) → pages, equal.
+- direct memo test: after a retained load, call `memoizedDeltaFiles` with a sealed delta whose
+  delete names a path the retained rows do not hold → `undefined` (the memo itself refuses,
+  independent of the store's own StageChangedError refusal, which is tested separately).
+- detachment: the caller mutates `packet.globalDelta.ops` (push an upsert) right after
+  `applyStateSavePacket` is called but before it resolves → the accepted state equals a fresh
+  `loadRawState` (both staging and the memo consumed the sealed copy).
+- exclusivity pin: a receipt-carrying source with a differing global composes NO
+  `elisionExpectation`; a delta packet never carries one.
 - CAS retry/recompute: the retried packet carries a NEW binding from the reloaded snapshot;
   the first attempt's stale binding never matches (3).
 - full-global (non-ascending input → no delta) pages; kill switch pages.
