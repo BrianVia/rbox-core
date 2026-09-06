@@ -269,9 +269,14 @@
   over-cap MARK probe no longer forces full admission (design 102 Q3 as decided; 204 §3.1
   superseded for the mark probe only; `fence_over_cap` untouched); `marks{count}` emitted
   per delta commit; Phase-1 purge refuses a reachable snapshot older than grace/2. DEV
-  auto-deploys from main. **PRODUCTION PROMOTION PENDING — needs the founder's explicit
-  yes** (`git push origin main:production`); verify afterwards with the Analytics Engine
-  query (`admitAccountMs` avg ~4s → ~0.2–0.3s, no `fallback` rows, `marks` ≈ 224K).
+  auto-deployed (19:03Z). **PROMOTED TO PRODUCTION (founder "Promote", 20:43Z; deploy
+  run 34058876355 success 20:47Z; production = `555c41f91`, ships 316 + rider + S1a +
+  S3a, no migrations, no web).** PROVEN: the desktop's first changed push after the deploy
+  (20:55Z) logged `commit 4.6s srv0.4 acct0.0` (was `srv4–7 acct3.4–6.7`); push wall 13.3s.
+  Analytics Engine ingestion lags a few minutes; the pre-deploy commit at 20:40Z still
+  showed `admitAccountMs 7621` + `fallback marks_over_cap`, the post-deploy one has delta
+  rows only so far. #914 (attestation bench min-of-3, the day's other CI flake) merged
+  after the promotion candidate; main = `54952f0e6`.
 - **REMINDER for 2026-09-07 (founder asked, on the road 09-06):** add "Workers
   Observability: Read" to the Cloudflare token in `~/.secret_env_vars` (or complete the
   Cloudflare MCP OAuth) so Claude can read the GC `phase1_account_outcome` logs and answer
