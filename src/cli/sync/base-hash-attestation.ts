@@ -42,11 +42,12 @@ const reconstructible = (manifest: Manifest): boolean =>
   Object.keys(manifest).every((key) => RECONSTRUCTED_MANIFEST_KEYS.has(key));
 
 interface AttestedBase {
+  meta: GlobalManifestMeta;
   encManifestSha: string;
   manifestHash: string;
 }
 
-const ATTESTED = new WeakMap<SyncState, AttestedBase>();
+const ATTESTED = new WeakMap<Manifest, AttestedBase>();
 
 /**
  * Record that `saved` — the state an accepted save returned — reconstructs to a
@@ -87,13 +88,14 @@ export function attestSavedBase(
   if (base.generatedAt !== committed.generatedAt) return;
   if (base.manifestSchema !== committed.manifestSchema) return;
   if (base.files.length !== committed.files.length) return;
-  ATTESTED.set(saved, { encManifestSha: savedMeta.encManifestSha, manifestHash: savedMeta.manifestHash });
+  ATTESTED.set(base, { meta: savedMeta, encManifestSha: savedMeta.encManifestSha, manifestHash: savedMeta.manifestHash });
 }
 
 /** Does this state carry a standing attestation for exactly this meta? */
 export function baseHashIsAttested(state: SyncState, meta: GlobalManifestMeta): boolean {
-  const attested = ATTESTED.get(state);
+  const attested = ATTESTED.get(state.lastSyncedManifest);
   return attested !== undefined
+    && attested.meta === state.manifestMeta
     && attested.encManifestSha === meta.encManifestSha
     && attested.manifestHash === meta.manifestHash;
 }

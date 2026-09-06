@@ -12,7 +12,6 @@ import { afterEach, expect, test } from "bun:test";
 import { canonicalManifestHashStreaming, type Manifest } from "../../engine/index.js";
 import { manifestFromMeta, type GlobalManifestMeta, type SyncState } from "../sync-state-model.js";
 import { saveStateSource } from "../sync-state.js";
-import { loadRawState } from "../state-plane/adapters/whole-state-compat.js";
 import { attestSavedBase, baseHashIsAttested } from "./base-hash-attestation.js";
 import {
   cleanupElisionFixtures, file, META_FIELDS, SECTION, SEQ, seededSqlite, STREAM,
@@ -32,7 +31,7 @@ const metaFor = (committed: Manifest): GlobalManifestMeta => ({
 
 /** One real publication: seed a store, commit `committed` through the shipped
  *  save path, and hand back the accepted state exactly as push sees it. */
-async function publish(prefix: string, committed: Manifest): Promise<{ saved: SyncState; meta: GlobalManifestMeta; root: string }> {
+async function publish(prefix: string, committed: Manifest): Promise<{ saved: SyncState; meta: GlobalManifestMeta }> {
   const seed = await seededSqlite(prefix);
   const meta = metaFor(committed);
   const saved = await saveStateSource(seed.root, seed.state, {
@@ -44,7 +43,7 @@ async function publish(prefix: string, committed: Manifest): Promise<{ saved: Sy
     observedRepos: [],
     values: {},
   });
-  return { saved, meta, root: seed.root };
+  return { saved, meta };
 }
 
 /** What the next push would reconstruct as its delta base, and its true hash. */
@@ -127,16 +126,39 @@ test("a sequence the accepted save did not reach is REFUSED", async () => {
   expect(baseHashIsAttested(saved, meta)).toBe(false);
 });
 
-test("the attestation binds to the retained state OBJECT, so any state the store hands back afresh misses", async () => {
+test("a projected state wrapper preserving the manifest and meta objects remains attested", async () => {
   const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
-  const { saved, meta, root } = await publish("attest-identity", committed);
+  const { saved, meta } = await publish("attest-projected", committed);
   attestSavedBase(saved, committed, meta, NEXT_SEQ);
-  expect(baseHashIsAttested(saved, meta)).toBe(true);
 
-  // A load that has to materialize again — which is what every invalidation the
-  // design-277 memo enforces (another writer's CAS, a reset, a new process,
-  // RBOX_STATE_LOAD_CACHE=0) ultimately produces — carries no attestation.
-  const reloaded = (await loadRawState(root))!;
-  expect(reloaded).not.toBe(saved);
-  expect(baseHashIsAttested(reloaded, meta)).toBe(false);
+  const projected = { ...saved, stateRevision: saved.stateRevision! + 1 };
+  expect(projected).not.toBe(saved);
+  expect(projected.lastSyncedManifest).toBe(saved.lastSyncedManifest);
+  expect(projected.manifestMeta).toBe(saved.manifestMeta);
+  expect(baseHashIsAttested(projected, meta)).toBe(true);
+});
+
+test("the same manifest with a different meta object misses despite equal hashes", async () => {
+  const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
+  const { saved, meta } = await publish("attest-meta-identity", committed);
+  attestSavedBase(saved, committed, meta, NEXT_SEQ);
+
+  const differentMeta: GlobalManifestMeta = { ...meta, gitRepos: { repo: SECTION } };
+  const projected = { ...saved, manifestMeta: differentMeta };
+  expect(projected.lastSyncedManifest).toBe(saved.lastSyncedManifest);
+  expect(differentMeta.encManifestSha).toBe(meta.encManifestSha);
+  expect(differentMeta.manifestHash).toBe(meta.manifestHash);
+  expect(baseHashIsAttested(projected, differentMeta)).toBe(false);
+});
+
+test("a rebuilt manifest with equal content misses", async () => {
+  const committed: Manifest = { generatedAt: "2026-08-24T00:00:00.000Z", files: FILES };
+  const { saved, meta } = await publish("attest-manifest-identity", committed);
+  attestSavedBase(saved, committed, meta, NEXT_SEQ);
+
+  const rebuiltManifest = structuredClone(saved.lastSyncedManifest);
+  const projected = { ...saved, lastSyncedManifest: rebuiltManifest };
+  expect(rebuiltManifest).toEqual(saved.lastSyncedManifest);
+  expect(rebuiltManifest).not.toBe(saved.lastSyncedManifest);
+  expect(baseHashIsAttested(projected, meta)).toBe(false);
 });
