@@ -1,6 +1,6 @@
 # 316 — An over-cap mark probe stays on the delta admission path (design 102 Q3, as decided)
 
-Status: DECISION PENDING (founder) after review round 1 (`notes/316/review1-gpt.md`), 2026-09-06. Owner: `apps/api/src/commit-delta.ts` (`shouldUseDeltaAdmission`)
+Status: APPROVED — founder chose **B** (2026-09-06, "b it is"). Supersedes design 204 §3.1's over-cap precondition for the MARK probe only; the active-intent probe's fallback is untouched. Owner: `apps/api/src/commit-delta.ts` (`shouldUseDeltaAdmission`)
 + `apps/api/src/workspace-sync.ts` (the enforce branch). Parent: design 102 (§3.5A.4, §7.1 Q3).
 
 ## Problem, measured (prod, 2026-09-06 11:00–14:00Z, `commit.delta` analytics)
@@ -110,3 +110,15 @@ delta-path cost (validate ≤ a handful of refs: ~100–300 ms), on every device
   `gc_candidates` holds 511K non-deleting rows, oldest 2026-07-17). Delta admission must
   not depend on it — that is the point of Q3.
 - `FENCE_SET_MAX` itself (unchanged, 50K; memory bound stays `FENCE_SET_MAX + 1`).
+
+## Implementation riders (with B)
+
+- `runPhase1` records when the per-account reachable set was computed; `phase1Purge` refuses
+  (returns zeros, logs `purge_snapshot_stale`) when that snapshot is older than half the
+  grace. This makes the snapshot-age-below-grace argument above an enforced bound instead of
+  an observation.
+- Every commit on the delta path emits `marks` with the probe's `observedMarks` count (capped
+  at `FENCE_SET_MAX + 1`), so the dashboard shows when the table drops back under the cap.
+- The `fallback{reason=marks_over_cap}` event is RETIRED (it was a fallback only under the
+  204 precondition); `marks_over_cap{count}` stays. The soak endpoint's fallback totals
+  therefore exclude it — intended: §7 gate 8 measures real fallbacks.
