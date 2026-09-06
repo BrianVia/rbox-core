@@ -41,3 +41,23 @@ only) and `FollowerBranchProtocol.foreignPresentArtifacts`. No wire, ledger or s
 proof minted, both P/K refs retired; foreign receipt with a different repository identity →
 `(artifacts-standing)`, refs intact; 310's tests (owning create, other commit, UPDATE-P)
 unchanged and green. Rollback: revert; retired receipts were redundant with BASE.
+
+## Review round 1 (GPT, `notes/312/review1-gpt.md`) and the guards it added
+
+NOT ALIGNED on two findings, both accepted:
+
+1. A foreign workspace's P-repair can be mid-flight (its state CAS accepted, its P/K→Q
+   transaction not yet committed); deleting that P/K would leave its recovery in
+   `corruption-hold`. Guard: a foreign receipt with a P-repair recovery ref (`Q`, from
+   `pRepairQRef(lineage, ref, episode)`) never settles here.
+2. Identity plus target is not a temporal proof that the foreign workspace's transition was
+   incorporated. Guard: foreign receipts settle only when NO other workspace registered on
+   this host (`readDesiredDaemonRows()` roots) contains the repository. A workspace syncing
+   this folder must be on this machine (repository identity is a local realpath), and the
+   registry is the host's only authority on that. An unreadable registry or Q listing keeps
+   receipts standing.
+
+With both guards the remaining case is exactly the measured one: receipts whose minting
+lineage no longer exists on this host, describing a landing this device's BASE already
+states. Tests: another workspace claims the folder → standing; a Q for the receipt exists →
+standing; neither → settled.

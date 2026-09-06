@@ -26,10 +26,24 @@ import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolut
 import { branchesCheckedOutElsewhereStrict } from "./git-state-apply.js";
 import { readHead } from "./git-state.js";
 import { witnessBranchDeletions } from "./branch-deletion-witness.js";
+import { readDesiredDaemonRows } from "../autostart/desired-state.js";
 import { asyncMemo } from "./async-memo.js";
 import { republishPlanInput } from "./republish-requests.js";
 import { GitPlanAccumulator } from "./plan-accumulator.js";
 import { RepoCaptureAttempt, type RepoAttemptCommand } from "./repo-capture-attempt.js";
+
+/** Design 312: the host's daemon registry is the only authority on which other
+ * workspaces sync a folder on this machine; a registered root other than ours
+ * that contains the repository means its receipts are somebody's live state. */
+async function otherWorkspaceClaimsRepoByRegistry(root: string, repoDir: string): Promise<boolean> {
+  const [rootReal, repoReal] = await Promise.all([fs.realpath(root), fs.realpath(repoDir)]);
+  for (const row of await readDesiredDaemonRows()) {
+    const other = await fs.realpath(row.desired.rootPath).catch(() => row.desired.rootPath);
+    if (other === rootReal) continue;
+    if (repoReal === other || repoReal.startsWith(other + path.sep)) return true;
+  }
+  return false;
+}
 
 function applyRepoAttemptCommands(
   accumulator: GitPlanAccumulator,
@@ -533,6 +547,7 @@ async function captureAndAuthorizeRepositories(stage: RepoCaptureStage): Promise
         root, rel, state, ctx, record, baseSection, candidate, missing, packedObservation, packedRegressed,
         binding: publisherAckBindings[rel],
         selfDeviceId: gitSectionDeviceId(cfg.deviceId),
+        otherWorkspaceClaimsRepo: () => (options.otherWorkspaceClaimsRepo ?? otherWorkspaceClaimsRepoByRegistry)(root, ctx.repoDir),
         beforeAbsencePreflight: options.beforeAbsencePreflight,
       });
       if (witness.status === "proven") {
@@ -912,6 +927,9 @@ export interface GitPlanOptions {
   afterJournalPreloop?: () => void | Promise<void>;
   /** Tests only: runs after read-only decisions and memo invalidation, before capture. */
   beforeCapturePool?: () => void | Promise<void>;
+  /** Design 312: whether another workspace on this host contains `repoDir`
+   *  (default: the daemon registry's desired roots). Tests inject an answer. */
+  otherWorkspaceClaimsRepo?: (root: string, repoDir: string) => Promise<boolean>;
   /** Tests only: observes a fresh context read in the post-capture pass. */
   onPostCaptureRepoCtxRead?: (relPath: string) => void;
   /** Tests only: observes the repos admitted to the serialized capture work. */
