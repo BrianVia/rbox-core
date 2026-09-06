@@ -1,0 +1,3 @@
+NOT ALIGNED
+1. High, src/cli/sync-git/plan.ts:56, `realpath` swallows every error, so EACCES/ELOOP/I/O failure becomes a lexical path and can return “no claim”; only ENOENT may represent a missing root. Minimal fix: ignore/fallback only on ENOENT and return claimed for every other error.
+2. High, src/cli/autostart/desired-state.ts:312, the “strict” reader accepts relative `rootPath` values and rows whose directory key does not match that root; damaged evidence can therefore become an unrelated candidate and produce “no claim.” Minimal fix: require an absolute root and `daemonRuntimeDir(desired.rootPath) === path.dirname(file)`, otherwise throw.

@@ -77,3 +77,11 @@ NOT ALIGNED on two findings, both accepted:
 Remaining, explicitly out of scope: a workspace that syncs this folder from a different
 HOME on the same machine is not in any of this HOME's sources. That is the same boundary
 every host-local rbox authority already has.
+
+## Review round 3 (GPT, `notes/312/review3-gpt.md`) — final round
+
+NOT ALIGNED on two input-trust findings, both accepted in the guard itself (not in the
+shared readers): only ENOENT on a candidate root falls back to the lexical path, every
+other `realpath` failure (EACCES, ELOOP, I/O) is a claim; a desired row whose root is
+relative or whose directory key is not `workspaceKey(rootPath)` is damaged evidence and
+is a claim. The three-round cap is reached; the remaining review is Claude's own.

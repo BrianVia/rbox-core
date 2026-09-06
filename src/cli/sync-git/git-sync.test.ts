@@ -5,6 +5,7 @@ import { artifactBinding, readRepoIdentityV1, readStateLineageV1 } from "./repo-
 import { pRepairQRef } from "./p-repair.js";
 import { otherWorkspaceClaimsRepoByRegistry } from "./plan.js";
 import codecInternals from "../folder-config-codec.js";
+import { workspaceKey } from "../rbox-paths.js";
 import { forgetStandingArtifactRefusalsForTests } from "./branch-deletion-witness.js";
 import { test as bunTest, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
@@ -2861,7 +2862,7 @@ test("design 312: the host inventory guard fails closed and matches any other ro
   await fs.mkdir(repo, { recursive: true });
   const revision = codecInternals.revision("absent");
   const evidence = (rows: string[], persisted: string[], unavailable: string[] = []) => async () => ({
-    desiredRows: rows.map((rootPath) => ({ key: rootPath, path: rootPath, desired: { rootPath } })) as never,
+    desiredRows: rows.map((rootPath) => ({ key: workspaceKey(rootPath), path: rootPath, desired: { rootPath } })) as never,
     persistedEntries: persisted.map((root) => ({ root })) as never,
     unavailable,
   });
@@ -2874,7 +2875,11 @@ test("design 312: the host inventory guard fails closed and matches any other ro
   expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], []), inspectCatalog: async () => ({ kind: "authoritative" as const, revision, snapshot: { folders: [{ normalizedPath: rootB }] } as never }) })).toBe(true);
   // An unrelated root elsewhere: no claim.
   expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([path.join(rootB, "elsewhere")], []), inspectCatalog: absent })).toBe(false);
-  // Unreadable evidence or a damaged catalog: fail closed.
+  // Damaged rows (relative root, key not derived from the root) and unreadable evidence: fail closed.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence(["relative/root"], []), inspectCatalog: absent })).toBe(true);
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: async () => ({ ...(await evidence([], [])()), desiredRows: [{ key: "wrong-key", path: "", desired: { rootPath: path.join(rootB, "elsewhere") } }] as never }), inspectCatalog: absent })).toBe(true);
+  // A missing (ENOENT) root elsewhere is compared lexically: no claim.
+  expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], [path.join(rootB, "gone")]), inspectCatalog: absent })).toBe(false);
   expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], [], ["daemons"]), inspectCatalog: absent })).toBe(true);
   expect(await otherWorkspaceClaimsRepoByRegistry(rootA, repo, { readEvidence: evidence([], []), inspectCatalog: async () => ({ kind: "damaged" as const, reason: "x", revision }) })).toBe(true);
 });
