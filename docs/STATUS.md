@@ -141,9 +141,19 @@
   a completed landing — it stops counting as standing and its P/K refs
   retire inside the deletion's own atomic verification transaction.
   Mismatched/UPDATE-P/foreign/unstamped still refuse. **Desktop now dogfoods
-  `2.0.2-dev+e24ef92`** (pid 2871833, ~00:10Z 09-06); watching for the
-  first push that captures `Personal/rbox-core` with the 285 tombstones and
-  retires the 206 P/K receipts. Then the other
+  `2.0.2-dev+e24ef92`** (pid 2871833, ~00:10Z 09-06); **Overnight result: NOT retired** — the push at
+  09-06 11:09Z still refuses `(artifacts-standing)`, 206 P/K remain. Cause
+  (measured): the receipts carry lineageHash `67cf0a50…` while the current
+  workspace lineage is `1e122d11…` (same repositoryIdentityHash `8a68bacf…`,
+  i.e. same physical repo, different state nonce → a state reset/regenesis
+  happened between). The artifact scan therefore classifies them as
+  `active-foreign` (valid, not owning) — the design-273/286 guard for two
+  workspaces sharing one repo dir — and 310 only settles OWNING receipts.
+  Next step needs a decision: **design 312** would prove "this receipt's
+  lineage is one of THIS workspace's archived prior lineages" (design 283
+  reset archives) and treat such receipts as owning; without that proof
+  they are indistinguishable from another workspace's receipts. Empty push
+  on the desktop is now 4.1s. Then the other
   devices (Mac, FM) delete those branches on their next pull of a build
   that carries 309 — they are on older builds, so expect that only after a
   release or a dev-build rollout. Codex stalled at startup twice today (rmcp
