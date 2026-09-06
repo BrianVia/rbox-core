@@ -196,6 +196,39 @@
   owes the runner wizard (`npx -y cloudflare-github-actions-runner@latest`). Main's run
   for the #906 merge was cancelled by the next main push; the run for `e46ced0da` is the
   one to watch.
+- **#909 MERGED (design 315, `c56ee2c05`):** the #816 base-hash attestation was keyed by
+  the accepted state OBJECT; every pull's elided save returns a shallow-copied wrapper, so
+  every changed push paid `delta_base≈1.4s` (validate + canonical hash of 198K entries).
+  Now keyed by the `lastSyncedManifest` + `manifestMeta` object identities (GPT round 1
+  blocker: gitRepos is a hashed input, so the meta object must be part of the key).
+  Desktop on `2.0.2-dev+c56ee2c` (pid 3166594); proof pending an ordinary changed push
+  (the two pushes right after restart were post-restart safety scans: 117s each, `scan
+  82.4s` = 377,786 entries walked, `st48.6` in stat — a change-proportional-scan item, F2/F3).
+- **SERVER: every changed push pays 4–7 s of commit accounting — root cause found, DECISION
+  NEEDED (design 316, worktree `delta-marks`, `docs/design/316-*.md`).** Prod `commit.delta`
+  analytics (Cloudflare Analytics Engine SQL, token in `~/.secret_env_vars`), 11:00–14:00Z:
+  36 commits, `admitAccountMs` avg 3.9 s / p95 6.7 s, ~22 D1 batches each, refs added per
+  commit avg 1.6, and `fallback marks_over_cap` on EVERY delta-eligible commit. The founder
+  account holds **224,096 `blob_ref_candidates` marks** (D1 read-only; 185K older than the
+  24 h grace; growing ~39K/day since 08-31; `blob_refs` 919,622 vs ~200K reachable), so the
+  50K `FENCE_SET_MAX` mark probe is over cap and `shouldUseDeltaAdmission` forces full
+  ~200K-ref admission. Design 102 §7.1 Q3 said an over-cap MARK probe must stay on the
+  delta path, but commit `1cf847d7f` deliberately kept the enforce fallback ("never silently
+  unfenced") and design 204 §3.1 made it a flip precondition: with the probe skipped, a
+  prune-marked carried ref cannot be re-checked, and full validation is the only detector of
+  that loss class. **Founder options:** A) keep (4 s/push on every device while marks > 50K);
+  B) implement Q3 in enforce (~4 s saved per push, every device; the loss detector is
+  inactive while marks > 50K; safety rests on Phase-1 reachability + grace). Recommendation
+  B with a marks-count metric rider. Not decided by Claude — say "A" or "B".
+- **GC observations from the same dig (prod, read-only `gc_state`):** the Phase-2 R2 purge
+  last ran **2026-07-30** with outcome `roots_budget_exceeded` (purged 0, roots sample
+  154,373 measured 07-20) and has not succeeded since; `gc_candidates` holds 511,527
+  non-deleting rows (oldest 07-17). Phase-1 mark runs hourly (`gc_obs_mark` success
+  2026-09-06 08:24, roots sample 266,496; cursor moving, capped 2,000 rows/tick); whether
+  Phase-1 purge drains is unknown — the `phase1_account_outcome` logs need Workers
+  Observability access (the token gets `Authentication error`; `wrangler tail --env
+  production` saw nothing in a 5-minute window around the :23 tick). Founder-owed:
+  Cloudflare MCP OAuth or a token with Workers Observability read.
 - **Empty-push cost, remaining measured pieces (not fixed):** compose ≈0.95s
   on an elided save (`globalElisionAudit` rehashes the manifest; X1a);
   git-plan discover ≈1.1s (`discoverGitRepos` walks the tree; F3b);
