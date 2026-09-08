@@ -277,7 +277,21 @@
   showed `admitAccountMs 7621` + `fallback marks_over_cap`, the post-deploy one has delta
   rows only so far. #914 (attestation bench min-of-3, the day's other CI flake) merged
   after the promotion candidate; main = `54952f0e6`.
-- **REMINDER for 2026-09-07 (founder asked, on the road 09-06):** add "Workers
+- **GC marks question ANSWERED (2026-09-08, token now has Workers Observability read;
+  query: dataset `cloudflare-workers`, service `rbox-prod-api`, `$workers.eventType=scheduled`,
+  structured `source.event=phase1_account_outcome`; founder accountKey `b8accb9276d0290b`):**
+  Phase-1 runs every hour and SUCCEEDS for the founder account (reachable 124,845 of cap
+  750,000) — but both mark and purge are capped at `PHASE1_MAX_ROWS = 2,000` rows per tick
+  (`gc-phase1.ts`, design 102 "cap/33 batches per cron tick"). Per tick: marked ≈1,790–2,000,
+  purged 2,000, condemned 2,000, released ≈10 MB. With ~800K unreachable `blob_refs`
+  (919,622 total vs 124,845 reachable) the mark backlog refills the table as fast as purge
+  drains it, so `blob_ref_candidates` sits at ~224K indefinitely and the account's
+  `used_bytes` shrinks only ~240 MB/day. Since 316, marks no longer slow commits, so this is
+  now a billing-accuracy/GC-hygiene item, not a perf one. **Candidate (needs a design +
+  founder ok): raise `PHASE1_MAX_ROWS` (2,000 → ~10,000; ≈300 D1 batch subrequests per phase
+  per tick, under the 1,000/invocation limit) or run Phase 1 more often than hourly.**
+  Phase-2 R2 purge is a separate, older failure (`roots_budget_exceeded`, last 07-30).
+- **REMINDER for 2026-09-07 — DONE 09-08 (token scope added by founder).** add "Workers
   Observability: Read" to the Cloudflare token in `~/.secret_env_vars` (or complete the
   Cloudflare MCP OAuth) so Claude can read the GC `phase1_account_outcome` logs and answer
   why 224K marks are not draining. Design 316 = founder decision **B** ("b it is"),
