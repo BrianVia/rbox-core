@@ -32,7 +32,7 @@ Read these from the PR branch where necessary (they may not yet be on main):
 
 1. `AGENTS.md`, `CONTEXT.md`, and the required primitive-first skill.
 2. `docs/STATUS.md` on latest main for the handoff state.
-3. `plans/sync-git-improvements/plan.mdx`: canonical 25-package roadmap and
+3. `docs/plans/sync-git-improvements/plan.mdx`: canonical 25-package roadmap and
    accepted directions. The Markdown design287 and HTML reader are generated
    copies; keep them consistent when changing the canonical plan.
 4. `docs/audits/2026-09-04-sync-git-performance-review.md` and

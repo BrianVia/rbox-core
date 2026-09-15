@@ -3,7 +3,7 @@ import path from 'node:path';
 import MarkdownIt from '/Users/via/.npm/_npx/70c9d65422c7baee/node_modules/markdown-it/lib/index.mjs';
 import {questionFormSchema} from '/Users/via/.npm/_npx/70c9d65422c7baee/node_modules/@agent-native/core/dist/client/blocks/library/question-form.config.js';
 import {diagramSchema} from '/Users/via/.npm/_npx/70c9d65422c7baee/node_modules/@agent-native/core/dist/client/blocks/library/diagram.config.js';
-const root=process.cwd(), dir=path.join(root,'plans/sync-git-improvements');
+const root=process.cwd(), dir=path.join(root,'docs/plans/sync-git-improvements');
 let mdx=fs.readFileSync(path.join(dir,'plan.mdx'),'utf8').replace(/^---\n[\s\S]*?\n---\n/,'').trim();
 const escape=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 const qm=mdx.match(/<QuestionForm id="program-decisions" questions=\{(\[.*\])\} submitLabel="([^"]*)" \/>/);

@@ -242,14 +242,12 @@ and #647's boundary self-invalidation is NOT reachable from this fixture, becaus
 standing P makes resolve's artifact preflight refuse before the locked boundary is
 ever reached. #647 needs its own fixture (dirty worktree, no standing P).
 
-### CI — `.github/workflows/e2e.yml`
+### CI
 
-Manual (`workflow_dispatch`, input `scenario`, default `all`) + nightly
-(`schedule`, ~02:00 San Diego). Targets a **self-hosted** `[macOS, ARM64]` runner —
-**none is registered yet**, so the job queues/skips until the founder registers one
-on the M2 Max (GitHub-hosted runners can't do macOS 26 + vmnet — design 56 §11). Set
-the `RBOX_DEV_BOOTSTRAP` repo secret (and optionally `CLOUDFLARE_ACCOUNT_ID` /
-`CLOUDFLARE_API_TOKEN` for the AE channel) before the runner goes live.
+There is no CI lane for the rig. The former `e2e.yml` targeted a founder-owned
+self-hosted macOS runner and was removed when the repo went public
+(GitHub-hosted runners can't do macOS 26 + vmnet — design 56 §11). Run the rig
+locally with `RBOX_DEV_BOOTSTRAP` set (see `dev-keys.local.secret`).
 
 ## Compiled candidate override
 

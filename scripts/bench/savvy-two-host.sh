@@ -10,7 +10,7 @@ set -euo pipefail
 
 N="${1:-4294}"
 REMOTE="${RBOX_API:-https://rbox-dev-api.brian-via.workers.dev}"
-BOOT="${RBOX_DEV_BOOTSTRAP:-dev-e2ee-dc79eb7ede6151c452232a1ebe91053b}"
+BOOT="${RBOX_DEV_BOOTSTRAP:?set RBOX_DEV_BOOTSTRAP (dev bootstrap secret, see dev-keys.local.secret)}"
 S23_BIN="${S23_BIN:-/tmp/rbox-s23}"
 SAVVY="${SAVVY_DIR:-$HOME/code/savvy-core}"
 WORK=/tmp/rbox-savvy-bench

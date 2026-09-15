@@ -315,8 +315,8 @@
   S2b-d, S3b, S4, S5; G6/G7/F7/S6/X1-X4 are design/experiment gates.
 - **Codex sandbox cannot write `.git/worktrees/*`** (index.lock EROFS): every
   Codex run leaves the diff uncommitted; commit from this session. Also:
-  `SPEC.md` at repo root is a TRACKED leftover from #833 — never `cp` a spec
-  over it and stage it; use `git checkout -- SPEC.md` before committing.
+  A root `SPEC.md` is gitignored (the #833 leftover moved to
+  `docs/design/notes/misc/SPEC-286.md`); per-cycle specs never get committed.
 - **Decision for founder — historical split-artifact repair:** both fleet
   hosts have 0 split-index repos; the only detector has a known hole
   (repos that turned split index off after a bad capture). Recommendation:

@@ -49,7 +49,7 @@ written. Consequences observed:
 - (The test box was fully torn down afterward — key revoked
   (`agent_fyA477u…`, revocation verified in `rbox key list`), ~/Development
   and ~/.rbox wiped. Re-running the dogfood after fixes = mint a fresh key,
-  same one-liner. Raw logs: `tasks/dogfood-evidence/`.)
+  same one-liner. Raw logs: `docs/tasks/dogfood-evidence/`.)
 
 ## P2 — status/prompt lie during the initial populate pull
 

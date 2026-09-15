@@ -1,6 +1,6 @@
 # Design 287 architecture review — round 2
 
-**Verdict: ACCEPT AS A STAGED ROADMAP.** No concrete architecture blocker remains from A1–A7 in the reviewed canonical `plans/sync-git-improvements/plan.mdx`. This accepts the package boundaries, explicit proof obligations and sequencing. It does **not** declare the topology/chunk/tree/refset protocols implementation-ready or approve unresolved product, schema, crypto, support-window or deployment decisions.
+**Verdict: ACCEPT AS A STAGED ROADMAP.** No concrete architecture blocker remains from A1–A7 in the reviewed canonical `docs/plans/sync-git-improvements/plan.mdx`. This accepts the package boundaries, explicit proof obligations and sequencing. It does **not** declare the topology/chunk/tree/refset protocols implementation-ready or approve unresolved product, schema, crypto, support-window or deployment decisions.
 
 ## Disposition
 

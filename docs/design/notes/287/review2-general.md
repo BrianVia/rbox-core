@@ -2,7 +2,7 @@
 
 **Verdict: ACCEPT / ALIGNED as a staged roadmap. No remaining concrete blocker from general round1 findings R1–R5.** This is not acceptance of all implementation specifications, wire formats or production activation. No new test run: round1's executed read-only-index probe remains the directly applicable evidence.
 
-Reviewed the canonical `plans/sync-git-improvements/plan.mdx` corrections, readiness/dependency map and amended X1 confidentiality boundary. Did not restart the source audit or add unrelated scope.
+Reviewed the canonical `docs/plans/sync-git-improvements/plan.mdx` corrections, readiness/dependency map and amended X1 confidentiality boundary. Did not restart the source audit or add unrelated scope.
 
 ## Finding dispositions
 

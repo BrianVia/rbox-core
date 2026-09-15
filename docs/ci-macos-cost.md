@@ -27,7 +27,7 @@ pay-per-use macOS runner service.
 | `compiled TUI · darwin-arm64` | ci.yml | cross-build + smoke on real darwin |
 | `compiled TUI · startup/size budget` | ci.yml | perf budget measured on darwin |
 | release build job | release.yml | builds/signs darwin binaries per `v*` tag; receives the step-scoped signing key |
-| e2e | e2e.yml | already `[self-hosted, macOS, ARM64]` — costs $0 |
+| e2e (rig) | — | no CI lane; `e2e.yml` (self-hosted) was removed at open-sourcing. Run locally. |
 
 ## Hard constraints (settled 2026-08-20)
 

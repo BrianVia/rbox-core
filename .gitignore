@@ -40,3 +40,6 @@ scripts/ux/.smoke-transcript.txt
 .claude/worktrees/
 .claude/settings.local.json
 HERE.md
+
+# per-cycle Codex spec scratch — never commit (see docs/STATUS.md)
+/SPEC.md

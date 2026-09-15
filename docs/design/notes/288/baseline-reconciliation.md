@@ -1,6 +1,6 @@
 # Baseline reconciliation for roadmap287 / first fixture slice288
 
-**Read-only source comparison:** approved audit/MDX baseline `3c78a055a` → execution baseline `c4aa22bbb`, in `.claude/worktrees/astra-sync-git`. No product edits or tests executed. Prior audit timings/reproductions remain historical evidence and must not be presented as fresh measurements of this baseline. The approved decisions were imported into this worktree's `plans/sync-git-improvements/plan.mdx`; design281 is already occupied on current main, so the roadmap is287 and first fixture slice288.
+**Read-only source comparison:** approved audit/MDX baseline `3c78a055a` → execution baseline `c4aa22bbb`, in `.claude/worktrees/astra-sync-git`. No product edits or tests executed. Prior audit timings/reproductions remain historical evidence and must not be presented as fresh measurements of this baseline. The approved decisions were imported into this worktree's `docs/plans/sync-git-improvements/plan.mdx`; design281 is already occupied on current main, so the roadmap is287 and first fixture slice288.
 
 ## Package disposition
 

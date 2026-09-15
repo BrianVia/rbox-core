@@ -4,6 +4,14 @@
 
 Built on Cloudflare (Workers + D1 + R2 + Durable Objects) with a Bun/TypeScript client. rbox treats regenerable build output and secrets as local state.
 
+> **Agent-developed project.** rbox is designed and built almost entirely by
+> AI coding agents (Claude, Codex, and others) working from design docs under
+> [`docs/design/`](docs/design/), with a human founder setting direction,
+> reviewing, and approving releases. Expect agent-oriented artifacts
+> throughout: `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, [`docs/STATUS.md`](docs/STATUS.md),
+> review transcripts, and commit messages written for an agent audience.
+> The code ships to real users, but read it with that provenance in mind.
+
 ## Install
 
 ```bash
