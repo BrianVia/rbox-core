@@ -65,7 +65,7 @@ import {
 } from "./drift-audit.js";
 import { lowerIoPriority } from "../io-priority.js";
 import { QuotaExceededError, RboxApi } from "../remote.js";
-import { envInt } from "../remote/resilient.js";
+import { envInt, retryTransient } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
 import { createPropagationTrace } from "./propagation-trace.js";
@@ -3276,8 +3276,30 @@ export async function runDaemon(root: string): Promise<void> {
     waitForCommittedMutationDrain: () => daemon?.waitForCommittedMutationDrain() ?? Promise.resolve(),
     finish,
   });
+  // Signals are wired before the first network call so `rbox stop` can break the
+  // offline wait below instead of waiting for the retry backoff to notice.
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+  const offline = new AbortController();
+  void stopped.then(() => offline.abort());
   try {
-    const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
+    let authed: Awaited<ReturnType<typeof buildAuthedRemote>>;
+    try {
+      // Boot with no network (DNS not up yet, link flapping) is transient: keep
+      // this process alive and keep trying rather than exiting, or a one-shot
+      // resumer (design 61 §6: no Restart=/KeepAlive) would leave sync stopped
+      // until the next reboot. Non-network faults still exit as before.
+      authed = await retryTransient(() => buildAuthedRemote(root, Date.now, logger.log), { // E2EE transport + injected KEK
+        retries: Infinity,
+        backoffMs: STARTUP_OFFLINE_BACKOFF_MS,
+        signal: offline.signal,
+        onRetry: (attempt) => logger.log(`startup: rbox is unreachable (attempt ${attempt}); waiting for the network`),
+      });
+    } catch (error) {
+      if (offline.signal.aborted) return; // stopped while waiting for the network
+      throw error;
+    }
+    const { cfg, deps } = authed;
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
       // Transport only — `refreshScopeAuthority` is what actually decides, and can
@@ -3286,8 +3308,6 @@ export async function runDaemon(root: string): Promise<void> {
       log: logger.log,
       onStopped: finish,
     });
-    process.on("SIGTERM", shutdown);
-    process.on("SIGINT", shutdown);
     try {
       await daemon.start();
     } catch (error) {
@@ -3303,5 +3323,8 @@ export async function runDaemon(root: string): Promise<void> {
     logger.close();
   }
 }
+
+/** Offline-at-boot wait between startup attempts; the last value repeats forever. */
+const STARTUP_OFFLINE_BACKOFF_MS = [5_000, 10_000, 30_000, 60_000];
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

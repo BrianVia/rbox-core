@@ -138,6 +138,28 @@ describe("retryTransient — bounded retry with idempotency discipline", () => {
     expect((err as DOMException).name).toBe("AbortError");
     expect(calls).toBe(1); // aborted before the second attempt
   });
+
+  // The daemon's offline-at-boot wait: a Bun DNS timeout is transient, `retries: Infinity`
+  // never gives up on its own, the last backoff entry repeats, and abort still ends it.
+  test("retries: Infinity keeps re-driving a DNS timeout until the signal aborts", async () => {
+    const dnsTimeout = () => Object.assign(new Error("getaddrinfo ETIMEOUT api.rbox.to"), { code: "ETIMEOUT" });
+    expect(isTransientNetworkError(dnsTimeout())).toBe(true);
+    const ctrl = new AbortController();
+    const waits: number[] = [];
+    let calls = 0;
+    const p = retryTransient(
+      async () => {
+        calls++;
+        if (calls === 6) ctrl.abort();
+        throw dnsTimeout();
+      },
+      { retries: Infinity, backoffMs: [1, 2], sleep: async (ms) => { waits.push(ms); }, signal: ctrl.signal }
+    ).catch((e) => e);
+    const err = await p;
+    expect((err as DOMException).name).toBe("AbortError");
+    expect(calls).toBe(6);
+    expect(waits).toEqual([1, 2, 2, 2, 2]);
+  });
 });
 
 describe("transferTimeoutMs — size-aware deadline", () => {
