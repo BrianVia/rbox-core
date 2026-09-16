@@ -6,6 +6,13 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Background sync no longer dies when the machine boots before the network is
+  up. A DNS or connection failure during startup now keeps the daemon alive and
+  retrying with backoff until rbox is reachable (or `rbox stop` ends the wait),
+  so an autostart resume during a flaky link no longer leaves every workspace
+  stopped until the next reboot. Other startup failures still exit as before.
+
 ## [2.0.2] - 2026-09-02
 
 2.0.2 is the "adopt the other machine's checkout without a fight" release.
