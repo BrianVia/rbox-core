@@ -144,7 +144,9 @@ export type JournalRecoveryResult<TIntended = unknown> =
   | { status: "human-intervened"; quarantinePath: string; fields: string[] }
   | { status: "binding-mismatch"; quarantinePath: string }
   | { status: "fresh-quarantined"; quarantinePath: string }
-  | { status: "defer"; reason: string; journalPath: string }
+  /** `unrecoverable`: the journal itself is the fault (unparseable or failing
+   * its own schema), so no later cycle can change the verdict. */
+  | { status: "defer"; reason: string; journalPath: string; unrecoverable?: true }
   | { status: "keep"; intended: TIntended; incomingKey: string; journalPath: string;
       /** The refs read off the live repository when the published landing was
        * verified — the witness a caller composes BASE from. */
@@ -335,6 +337,14 @@ function validLegacyExpectedBytes<T>(value: T): value is T & string[] {
   return true;
 }
 
+/** Sanity bound for the branch-scaled collections (reserved refs, prepared
+ * transaction locks, branch inverses). A take-theirs primary transaction
+ * carries one lock per branch plus two keep refs per witnessed branch, so it
+ * must clear 3 × the base artifact capacity (#872: 2048 present artifacts).
+ * The old 256 refused a ~300-branch repository's own journal as "corrupt"
+ * (#879). Every entry is still validated individually. */
+const MAX_JOURNAL_REF_ENTRIES = 16384;
+
 const VALID_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ZERO_ANY_OID = /^(?:0{40}|0{64})$/;
 const safeRefName = (ref: string): boolean => ref.startsWith("refs/") && ref.length <= 1024
@@ -392,10 +402,10 @@ function validCheckoutJournalCore(journal: CheckoutJournal): boolean {
     || !journal.expectedNew.refs || !isRecord(journal.expectedNew.refs) || Array.isArray(journal.expectedNew.refs)
     || !validRefMap(journal.expectedNew.refs, false)
     || (journal.expectedNew.branchInverses !== undefined && (!Array.isArray(journal.expectedNew.branchInverses)
-      || journal.expectedNew.branchInverses.length > 256 || journal.expectedNew.branchInverses.some((inverse) => !validBranchInverse(inverse))))) return false;
+      || journal.expectedNew.branchInverses.length > MAX_JOURNAL_REF_ENTRIES || journal.expectedNew.branchInverses.some((inverse) => !validBranchInverse(inverse))))) return false;
   const reservedRefs = journal.expectedNew.reservedRefs;
   if (reservedRefs !== undefined) {
-    if (!reservedRefs || !isRecord(reservedRefs) || Array.isArray(reservedRefs) || Object.keys(reservedRefs).length > 256) return false;
+    if (!reservedRefs || !isRecord(reservedRefs) || Array.isArray(reservedRefs) || Object.keys(reservedRefs).length > MAX_JOURNAL_REF_ENTRIES) return false;
     for (const [ref, oid] of Object.entries(reservedRefs)) {
       if (!safeRefName(ref) || (oid !== null && (!isString(oid) || !VALID_OID.test(oid)))) return false;
     }
@@ -415,7 +425,7 @@ function validPreparedTransactions(journal: CheckoutJournal, legacy: boolean): b
         || !isBoolean(transaction.prepareStarted) || (transaction.completed !== undefined && !isBoolean(transaction.completed))
         || (legacy ? transaction.owner !== undefined
           : transaction.owner === undefined || !validProcessIncarnation(transaction.owner) || transaction.owner.pid !== transaction.ownerPid)
-        || !Array.isArray(transaction.locks) || transaction.locks.length > 256) return false;
+        || !Array.isArray(transaction.locks) || transaction.locks.length > MAX_JOURNAL_REF_ENTRIES) return false;
       ids.add(transaction.id);
       for (const lock of transaction.locks) {
         if (!lock || !isString(lock.path) || !path.isAbsolute(lock.path) || lock.path.length > 4096
@@ -446,7 +456,7 @@ function validCheckoutLockJournal(journal: CheckoutJournal): boolean {
     || (indexLock.observation !== undefined && !indexLock.acquireStarted))) return false;
   const reservedLocks = journal.expectedNew.reservedLocks;
   if (reservedLocks !== undefined && (!reservedLocks || !isRecord(reservedLocks) || Array.isArray(reservedLocks)
-    || Object.keys(reservedLocks).length > 256 || Object.values(reservedLocks).some((token) => !token || !isRecord(token)
+    || Object.keys(reservedLocks).length > MAX_JOURNAL_REF_ENTRIES || Object.values(reservedLocks).some((token) => !token || !isRecord(token)
       || !isString(token.marker) || Buffer.byteLength(token.marker) > 1024 || !parseLockMarker(token.marker)
       || (token.observation !== undefined && (!deserializeMarkerObservation(token.observation)
         || deserializeMarkerObservation(token.observation)?.raw !== token.marker))
@@ -475,7 +485,7 @@ function validLegacyCheckoutLockJournal(journal: CheckoutJournal): boolean {
     )) return false;
   const reservedLocks = legacy.reservedLocks as unknown;
   if (reservedLocks !== undefined && (!reservedLocks || !isRecord(reservedLocks) || Array.isArray(reservedLocks)
-    || Object.keys(reservedLocks).length > 256 || Object.values(reservedLocks).some((token) => !validLockToken(token)))) return false;
+    || Object.keys(reservedLocks).length > MAX_JOURNAL_REF_ENTRIES || Object.values(reservedLocks).some((token) => !validLockToken(token)))) return false;
   const locks = reservedLocks as LegacyCheckoutLockRecord["reservedLocks"];
   const reservedRefs = journal.expectedNew.reservedRefs;
   if (reservedRefs === undefined) return locks === undefined || Object.keys(locks).length === 0;
@@ -489,6 +499,33 @@ async function uniqueRetirePath(root: string, area: string, key: string): Promis
   let dest = path.join(base, `${Date.now()}-${key}`);
   for (let n = 1; await exists(dest); n++) dest = path.join(base, `${Date.now()}-${key}-${n}`);
   return dest;
+}
+
+const journalRelDir = (relPath: string) => path.join(".rbox", "state", "git-journal", keyFor(relPath));
+
+/** Name the validator that refused a parseable journal plus the branch-scaled
+ * collection sizes, so the deferral reads as a diagnosis rather than as disk
+ * corruption (#879). Coarse by design: the validators stay boolean. */
+function journalValidationFailure(journal: CheckoutJournal | undefined, relPath: string, validId: boolean): string {
+  const count = <T>(value: T): number => Array.isArray(value) ? value.length : isRecord(value) ? Object.keys(value).length : 0;
+  const expectedNew = isRecord(journal?.expectedNew) ? journal!.expectedNew : undefined;
+  const transactions = Array.isArray(expectedNew?.preparedTransactions) ? expectedNew!.preparedTransactions! : [];
+  const sizes = `branchInverses=${count(expectedNew?.branchInverses)} reservedRefs=${count(expectedNew?.reservedRefs)}`
+    + ` preparedLocks=${transactions.reduce((n, transaction) => n + count(isRecord(transaction) ? transaction.locks : undefined), 0)}`;
+  const part = !journal || !isRecord(journal) ? "not a journal object"
+    : journal.phase !== "intent" && journal.phase !== "published" ? "phase"
+    : !validId ? "journal-id"
+    : !validCheckoutJournalBinding(journal.binding) && !validLegacyCheckoutJournalBinding(journal.binding) ? "binding"
+    : !validCheckoutJournalCore(journal) ? "core"
+    : !validPreparedTransactions(journal, false) ? "prepared-transactions"
+    : "lock-record";
+  return `checkout journal failed validation (${part}; ${sizes}); inspect or move aside ${journalRelDir(relPath)}`;
+}
+
+/** Move a journal entry to the quarantine area untouched; the caller has
+ * decided it can no longer act as recovery authority. */
+export async function retireCheckoutJournal(root: string, relPath: string): Promise<string> {
+  return retireJournal(root, relPath);
 }
 
 async function retireJournal(root: string, relPath: string): Promise<string> {
@@ -832,7 +869,7 @@ export async function recoverJournal<T = unknown>(
       await recoverOrigHeadLockFenced(ownership.journalId, binding, options.identity ?? systemLockIdentity);
     }
     if ((error as NodeJS.ErrnoException).code === "ENOENT" && ownership.status !== "invalid") return { status: "none" };
-    return { status: "defer", reason: "unreadable or corrupt journal", journalPath: dir };
+    return { status: "defer", reason: `unreadable or corrupt journal; inspect or move aside ${journalRelDir(relPath)}`, journalPath: dir, unrecoverable: true };
   }
   const journal = parsed as CheckoutJournal<T>;
   const id = (journal as { journalId?: unknown }).journalId;
@@ -842,7 +879,7 @@ export async function recoverJournal<T = unknown>(
     && validLegacyCheckoutLockJournal(journal);
   if (!journal || (journal.phase !== "intent" && journal.phase !== "published") || !validId
     || (!currentSchema && !legacySchema)) {
-    return { status: "defer", reason: "unreadable or corrupt journal", journalPath: dir };
+    return { status: "defer", reason: journalValidationFailure(journal, relPath, validId), journalPath: dir, unrecoverable: true };
   }
   const legacy = legacySchema;
   const journalBindingMatches = legacy

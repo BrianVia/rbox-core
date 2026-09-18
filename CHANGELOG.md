@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `rbox git resolve <repo> take-theirs` no longer fails at the final landing
+  step on a repository with a few hundred branches: the checkout journal it
+  had just written was refused by its own reader as "unreadable or corrupt"
+  (a fixed 256-entry bound, same shape as the 2.0.2 branch limit). The
+  bound is now 16,384, the refusal names the failing check and the journal
+  location, and a journal left behind for a repository that no longer
+  exists retires itself so the repository can be re-adopted instead of
+  being deferred forever (#879).
+
 ## [2.0.2] - 2026-09-02
 
 2.0.2 is the "adopt the other machine's checkout without a fight" release.

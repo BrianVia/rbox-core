@@ -3,7 +3,7 @@
  * unbindable one, clear a settled one. Moved verbatim out of follow.ts. */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { clearCheckoutJournal, recoverJournal, type CheckoutJournalBinding } from "./journal.js";
+import { clearCheckoutJournal, recoverJournal, retireCheckoutJournal, type CheckoutJournalBinding } from "./journal.js";
 import { captureCommonDirIdentity } from "../../engine/lockfile.js";
 import type { RepoCtx } from "./git-state.js";
 import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-published-intent.js";
@@ -73,7 +73,7 @@ export async function recoverAndLandFollowJournal(
  * impossible path binding makes a valid journal retire through the engine's
  * ordinary binding-mismatch path; corrupt journals remain visible/deferred. */
 export async function quarantineUnboundFollowJournal(workspaceRoot: string, relPath: string, stream: string, stateNonce: string) {
-  return recoverJournal<FollowIntended>(workspaceRoot, relPath, {
+  const recovery = await recoverJournal<FollowIntended>(workspaceRoot, relPath, {
     stream,
     stateNonce,
     gitDirReal: "",
@@ -81,6 +81,15 @@ export async function quarantineUnboundFollowJournal(workspaceRoot: string, relP
     commonDirIdentity: { path: "", realpath: "", dev: "", ino: "", birthtimeNs: "" },
     worktreeId: "",
   });
+  // A journal that cannot pass its own schema never will, and with no readable
+  // repository there is nothing left for it to protect. Left in place it
+  // defers the repository forever, even past its own removal and re-adoption
+  // (#879). Retire it exactly as a binding mismatch would; the bytes survive
+  // in quarantine for forensics.
+  if (recovery.status === "defer" && recovery.unrecoverable) {
+    return { status: "binding-mismatch" as const, quarantinePath: await retireCheckoutJournal(workspaceRoot, relPath) };
+  }
+  return recovery;
 }
 
 export async function clearFollowJournal(workspaceRoot: string, relPath: string, crashAt?: FollowOptions["crashAt"]): Promise<void> {
