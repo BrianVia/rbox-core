@@ -81,6 +81,8 @@ export type BriefStatusSnapshot =
       /** Design 276 F2.1: false is the non-halt `w1` recovery, which stops sync
        * for one boundary pass rather than until an operator intervenes. */
       halted: boolean;
+      /** The live daemon holds the state store for a long operation (#875). */
+      busy?: true;
       workspaceLabel: string;
       daemonRunning: boolean;
       account: BriefAccountSummary;
@@ -291,15 +293,21 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
           "⛔ sync halted to protect recovery state · rbox doctor reset-journal",
           briefIdentityLine(snapshot.account),
         ]
-        : [
-          `${snapshot.workspaceLabel} · recovering state`,
-          // Nothing replays while no daemon runs, so name the step that starts
-          // the recovery instead of claiming one is under way.
-          snapshot.daemonRunning
-            ? "↻ replaying write-ahead state after an unclean shutdown"
-            : "↻ recovering on the next daemon start · rbox start",
-          briefIdentityLine(snapshot.account),
-        ],
+        : snapshot.busy
+          ? [
+            `${snapshot.workspaceLabel} · syncing normally — state store busy`,
+            "↻ the daemon is mid-operation; details return when it settles",
+            briefIdentityLine(snapshot.account),
+          ]
+          : [
+            `${snapshot.workspaceLabel} · recovering state`,
+            // Nothing replays while no daemon runs, so name the step that starts
+            // the recovery instead of claiming one is under way.
+            snapshot.daemonRunning
+              ? "↻ replaying write-ahead state after an unclean shutdown"
+              : "↻ recovering on the next daemon start · rbox start",
+            briefIdentityLine(snapshot.account),
+          ],
     };
   }
 

@@ -27,8 +27,7 @@
 
 ## 2026-09-05 (afternoon) — #882 MERGED; roadmap 287 execution continues
 
-- **2026-09-18 Night Shift — #879 PR open (`fix/879-journal-validation-caps`,
-  not merged):** root cause was the checkout-journal validator's 256-entry
+- **2026-09-18 Night Shift — #879 → PR #916 MERGED 2026-09-22:** root cause was the checkout-journal validator's 256-entry
   caps on prepared-transaction locks / reserved refs (one lock per branch +
   two keep refs per witnessed branch) — the take-theirs writer produced a
   journal its own reader refused as "unreadable or corrupt". Caps → 16,384;
@@ -37,6 +36,12 @@
   now retires to `git-journal-quarantine` (the manual fix that worked on FM)
   instead of blocking re-adoption forever. Not addressed: holding the daemon
   off during a CLI resolve (no evidence a restart was the trigger).
+- **2026-09-18 Night Shift — #875 → PR #917:** asks (1)+(2). Status `w1` from a CLI process cannot tell a
+  crashed writer from a live daemon holding the store; the daemon heartbeat's
+  `resetLifecycle === "ready"` now maps it to reason `busy` ("state store
+  busy") instead of "replaying write-ahead state". P-settlement logs
+  `git-sync settling <rel>: N/M branch artifacts` every 25 branches. Ask (3)
+  (per-branch settlement cost) is #832 territory, untouched. #871 remainder filed as #919 (section-hostage design + reason rename).
 - **#882 MERGED (rebase, commits preserved)** onto main at `bc1e618bd`: deletion
   batching `39b7b5cec`, staged-object closure `f91a13f82`, portable private
   indexes `20b705009`, tracked-index cache freshness `3d2cbd1d0`, roadmap docs
