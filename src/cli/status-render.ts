@@ -119,7 +119,7 @@ export function renderResetHalt(projection: HaltProjection): StatusSurfaceRender
     const rendered = renderBriefStatus({
       kind: "reset-halt",
       halted: projection.halted,
-      ...(projection.reason === "busy" ? { busy: true as const } : {}),
+      busy: projection.reason === "busy",
       workspaceLabel: briefWorkspaceLabel(workspace.name, path.basename(workspace.root)),
       daemonRunning: daemon.running,
       account: probes.account,
