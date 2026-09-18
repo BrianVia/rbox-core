@@ -24,9 +24,12 @@ function posixRel(root: string, abs: string): string {
   return rel;
 }
 
-async function linuxMountPoints(): Promise<Set<string>> {
-  if (process.platform !== "linux") return new Set();
-  const raw = await fs.readFile("/proc/self/mountinfo", "utf8").catch(() => "");
+/** Linux mount points from /proc/self/mountinfo, or undefined when that table
+ * cannot be read (non-Linux, or a sandbox without procfs). */
+async function linuxMountPoints(): Promise<Set<string> | undefined> {
+  if (process.platform !== "linux") return undefined;
+  const raw = await fs.readFile("/proc/self/mountinfo", "utf8").catch(() => undefined);
+  if (raw === undefined) return undefined;
   const unescape = (value: string) => value.replace(/\\040/g, " ").replace(/\\011/g, "\t").replace(/\\012/g, "\n").replace(/\\134/g, "\\");
   return new Set(raw.split("\n").filter(Boolean).map((line) => line.split(" ")[4]).filter((v): v is string => !!v).map(unescape).map((value) => path.resolve(value)));
 }
@@ -108,7 +111,15 @@ export async function inventoryAdoptionSource(rootInput: string): Promise<AdoptI
       const abs = path.join(dir, child.name);
       const rel = posixRel(root, abs);
       const stat = await fs.lstat(abs, { bigint: true });
-      if (stat.dev !== rootDev || (path.resolve(abs) !== rootReal && mounts.has(path.resolve(abs)))) {
+      // Design 166 r2a-9: a child on another mount would EXDEV the later rename.
+      // The mount table is the authority when readable; the raw st_dev compare is
+      // only the fallback, because overlayfs (Docker, CI containers) reports a
+      // different st_dev for a file than for its own directory with no mount
+      // between them, and a rename across that "boundary" succeeds.
+      const crossesMount = mounts === undefined
+        ? stat.dev !== rootDev
+        : (path.resolve(abs) !== rootReal && mounts.has(path.resolve(abs)));
+      if (crossesMount) {
         throw new Error(`adoption source is a mount point or crosses devices: ${abs}`);
       }
       if (stat.isFile() && (Number(stat.mode) & 0o444) === 0) throw new Error(`unreadable adoption source file: ${abs}`);
