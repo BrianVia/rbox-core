@@ -82,7 +82,7 @@ export type BriefStatusSnapshot =
        * for one boundary pass rather than until an operator intervenes. */
       halted: boolean;
       /** The live daemon holds the state store for a long operation (#875). */
-      busy?: true;
+      busy?: boolean;
       workspaceLabel: string;
       daemonRunning: boolean;
       account: BriefAccountSummary;
