@@ -27,6 +27,16 @@
 
 ## 2026-09-05 (afternoon) — #882 MERGED; roadmap 287 execution continues
 
+- **2026-09-18 Night Shift — #879 PR open (`fix/879-journal-validation-caps`,
+  not merged):** root cause was the checkout-journal validator's 256-entry
+  caps on prepared-transaction locks / reserved refs (one lock per branch +
+  two keep refs per witnessed branch) — the take-theirs writer produced a
+  journal its own reader refused as "unreadable or corrupt". Caps → 16,384;
+  deferral names the failing validator + sizes + journal dir; an
+  unparseable/schema-invalid journal for a repo with no readable `.git`
+  now retires to `git-journal-quarantine` (the manual fix that worked on FM)
+  instead of blocking re-adoption forever. Not addressed: holding the daemon
+  off during a CLI resolve (no evidence a restart was the trigger).
 - **#882 MERGED (rebase, commits preserved)** onto main at `bc1e618bd`: deletion
   batching `39b7b5cec`, staged-object closure `f91a13f82`, portable private
   indexes `20b705009`, tracked-index cache freshness `3d2cbd1d0`, roadmap docs
