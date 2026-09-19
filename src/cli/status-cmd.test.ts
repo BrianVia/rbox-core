@@ -427,6 +427,19 @@ test("an ordinary WAL crash renders recovering and mutates nothing", async () =>
   expect(liveText).toContain("the daemon replays in place");
   expect(liveText).toContain("no action needed");
 
+  // #875: a live daemon whose own heartbeat says `ready` is not replaying
+  // anything — the WAL sidecars are its open writer, held through a long
+  // git-plane operation. Status must say busy, never "unclean shutdown".
+  const busy = cleanScanDeps();
+  busy.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ bootId: "boot_status", resetLifecycle: "ready" }));
+  expect(JSON.parse(await captureStatusWithDeps({ json: true }, busy))).toMatchObject({ halted: false, reason: "busy" });
+  const busyBrief = await captureStatusWithDeps({}, busy);
+  expect(busyBrief).toContain("syncing normally — state store busy");
+  expect(busyBrief).not.toContain("unclean shutdown");
+  const busyText = await captureStatusWithDeps({ verbose: true }, busy);
+  expect(busyText).toContain("sync busy: the daemon holds the state store");
+  expect(busyText).not.toContain("unclean shutdown");
+
   expect(await rboxTreeDigest()).toEqual(before);
 });
 

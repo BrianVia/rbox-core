@@ -6,6 +6,14 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `rbox status` no longer claims it is "replaying write-ahead state after an
+  unclean shutdown" while a healthy daemon is simply holding the state store
+  through a long operation; it now says the store is busy. The daemon also logs
+  settlement progress (`settling <repo>: N/M branch artifacts`) every 25
+  branches, so a half-hour fresh adoption of a large repository reads as work
+  rather than a hang (#875).
+
 ## [2.0.2] - 2026-09-02
 
 2.0.2 is the "adopt the other machine's checkout without a fight" release.

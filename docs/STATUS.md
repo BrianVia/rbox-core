@@ -27,6 +27,16 @@
 
 ## 2026-09-05 (afternoon) — #882 MERGED; roadmap 287 execution continues
 
+- **2026-09-18 Night Shift — #875 PR open (`fix/875-busy-status-settlement-progress`,
+  not merged):** asks (1)+(2). Status `w1` from a CLI process cannot tell a
+  crashed writer from a live daemon holding the store; the daemon heartbeat's
+  `resetLifecycle === "ready"` now maps it to reason `busy` ("state store
+  busy") instead of "replaying write-ahead state". P-settlement logs
+  `git-sync settling <rel>: N/M branch artifacts` every 25 branches. Ask (3)
+  (per-branch settlement cost) is #832 territory, untouched. Also: main CI is
+  red since f4e348bc8 (onboarding rig + ux regress: "DEV bootstrap login
+  failed" after the bootstrap-secret default was removed; CF runner
+  eligibility fails now the repo is public) — every PR inherits that red.
 - **#882 MERGED (rebase, commits preserved)** onto main at `bc1e618bd`: deletion
   batching `39b7b5cec`, staged-object closure `f91a13f82`, portable private
   indexes `20b705009`, tracked-index cache freshness `3d2cbd1d0`, roadmap docs
