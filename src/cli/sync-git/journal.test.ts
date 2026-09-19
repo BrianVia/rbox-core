@@ -769,3 +769,19 @@ test("design 126 sidecar mismatch never removes a lock matching only the foreign
   expect((await recoverJournal(root, "repo", binding)).status).toBe("defer");
   expect(await fs.readFile(path.join(gitDir, "ORIG_HEAD.lock"), "utf8")).toBe(foreignSidecarId);
 });
+
+test("an unparseable journal for an absent repository retires itself instead of deferring forever (#879)", async () => {
+  const { quarantineUnboundFollowJournal } = await import("./follow-journal.js");
+  const { checkoutJournalDir } = await import("./journal.js");
+  const dir = checkoutJournalDir(root, "gone/repo");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "journal.json"), "{ not json");
+
+  const recovery = await quarantineUnboundFollowJournal(root, "gone/repo", "stream", "nonce");
+  expect(recovery.status).toBe("binding-mismatch");
+  if (recovery.status !== "binding-mismatch") throw new Error("unreachable");
+  expect(await fs.readFile(path.join(recovery.quarantinePath, "journal.json"), "utf8")).toBe("{ not json");
+  await expect(fs.lstat(dir)).rejects.toThrow();
+  // A second look finds nothing: the repository can be re-adopted.
+  expect((await quarantineUnboundFollowJournal(root, "gone/repo", "stream", "nonce")).status).toBe("none");
+});

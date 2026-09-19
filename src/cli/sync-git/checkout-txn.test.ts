@@ -605,7 +605,7 @@ test("malformed prepared-transaction ownership fails closed before lock cleanup"
   }];
   await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
 
-  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: "unreadable or corrupt journal" });
+  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: expect.stringContaining("checkout journal failed validation"), unrecoverable: true });
   expect(await fs.lstat(lockPath).then(() => true, () => false)).toBe(true);
 });
 
@@ -620,7 +620,7 @@ test("malformed reserved-ref paths cannot authorize deletion outside the common 
   journal.expectedNew.reservedLocks = { "refs/../../outside/victim": { marker: raw } };
   await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
 
-  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: "unreadable or corrupt journal" });
+  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: expect.stringContaining("checkout journal failed validation"), unrecoverable: true });
   expect(await fs.readFile(victim, "utf8")).toBe(raw);
 });
 
@@ -648,7 +648,7 @@ test("malformed branch inverse cannot mutate an unrelated branch after lock reco
   }];
   await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
 
-  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: "unreadable or corrupt journal" });
+  expect(await recoverJournal(root, "repo", binding)).toMatchObject({ status: "defer", reason: expect.stringContaining("checkout journal failed validation"), unrecoverable: true });
   expect(await git(repo, "rev-parse", "refs/heads/other")).toBe(oldOid);
 });
 
@@ -896,4 +896,43 @@ test("the post-HEAD transaction probes its own child and surfaces the same unrea
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
   expect(await fs.readdir(path.join(root, ".rbox", "state", "git-journal"))).toEqual([]);
+});
+
+test("a branch-scaled journal (hundreds of reserved refs and prepared locks) is recoverable, not 'corrupt' (#879)", async () => {
+  const { binding, journal } = await checkoutJournal();
+  const owner = { hostId: "a".repeat(32), bootId: "b".repeat(32), pid: 42, startTime: "7" };
+  const refs = Array.from({ length: 300 }, (_, i) => `refs/heads/branch-${i}`);
+  journal.expectedNew.reservedRefs = Object.fromEntries(refs.map((ref) => [ref, null]));
+  journal.expectedNew.preparedTransactions = [{
+    id: "primary",
+    ownerPid: owner.pid,
+    owner,
+    prepareStarted: true,
+    locks: refs.map((ref) => ({ path: path.join(ctx.commonDir, `${ref}.lock`), expectedBytes: [Buffer.alloc(0).toString("base64")] })),
+  }];
+  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
+
+  const recovery = await recoverJournal(root, "repo", binding, {
+    identity: { current: async () => owner, probe: async () => ({ status: "dead" }) },
+  });
+  expect(recovery).toEqual({ status: "rolled-back" });
+});
+
+test("a schema-invalid journal names the failing check and its sizes instead of 'unreadable or corrupt'", async () => {
+  const { binding, journal } = await checkoutJournal();
+  journal.expectedNew.preparedTransactions = [{
+    id: "primary",
+    ownerPid: 42,
+    owner: { hostId: "host", bootId: "boot", pid: 43, startTime: "1" },
+    prepareStarted: true,
+    locks: [{ path: path.join(ctx.commonDir, "refs/heads/main.lock"), expectedBytes: [Buffer.alloc(0).toString("base64")] }],
+  }];
+  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
+
+  const recovery = await recoverJournal(root, "repo", binding);
+  expect(recovery.status).toBe("defer");
+  if (recovery.status !== "defer") throw new Error("unreachable");
+  expect(recovery.reason).toContain("(prepared-transactions; branchInverses=1 reservedRefs=0 preparedLocks=1)");
+  expect(recovery.reason).toContain(path.join(".rbox", "state", "git-journal"));
+  expect(recovery.unrecoverable).toBe(true);
 });
