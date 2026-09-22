@@ -1,5 +1,30 @@
 # rbox status — living state snapshot
 
+## 2026-09-18 — CI unblocked: Cloudflare runner pilot ENDED (public repo), shards on Namespace
+
+- **Root cause of every red PR since ~09-16:** `biw/cloudflare-github-actions-runner` runs
+  jobs for PRIVATE repositories only and `BrianVia/rbox-core` is now PUBLIC. The App posted a
+  failed "Cloudflare runner eligibility" check (not a ci.yml job) and cancelled all 9
+  `cloudflare-ubuntu-latest` jobs. This is NOT the old FLAKE-012 (30s runner-assignment
+  window / HTTP 401), which is now moot along with the runner wizard — unless the repo goes
+  private again. **#918 MERGED (`83854bf3e`)**: the test matrix runs on
+  `nscloud-ubuntu-24.04-amd64-4x8` like every other Linux job; node20 shim dropped, the
+  self-guarding git 2.55 user-space shim stays.
+- **Found on the way (`4e1d98a92`):** design 166's adoption mount-point guard compared
+  each child's `st_dev` to the root's. On overlayfs (Namespace rootfs `overlay …
+  uuid=on`, any Docker container) a regular file reports a different `st_dev` than its
+  own parent directory (probe: dir dev=32, file dev=33) with no mount between them, so the
+  guard refused every fixture and would refuse a real `rbox adopt` inside a container.
+  Fix: `/proc/self/mountinfo` is the authority when readable; `st_dev` stays as the
+  fallback only. Adopt + binding-matrix tests green; shards 2/4 green on Namespace.
+- **Still red on EVERY PR and on main, founder-only:** `compiled TUI · onboarding rig` and
+  `ux · regress flows` need the repo secrets `RBOX_DEV_BOOTSTRAP` and
+  `RBOX_DEV_PLATFORM_SECRET` (GitHub → Settings → Secrets; values in
+  `dev-keys.local.secret`). Branch protection reports UNSTABLE but allows merge.
+- Bot PRs #915/#916/#917 were updated from main (`gh pr update-branch`) so their CI
+  reruns on Namespace. Notion task tracking: MCP disconnected this session — this work is
+  NOT recorded in Notion.
+
 ## 2026-09-05 (afternoon) — #882 MERGED; roadmap 287 execution continues
 
 - **2026-09-18 Night Shift — #879 PR open (`fix/879-journal-validation-caps`,

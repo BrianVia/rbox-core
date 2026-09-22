@@ -135,9 +135,12 @@ jobs:
   test:
     name: ${{ matrix.name }}
     needs: changes
-    # CF-runner pilot (2 vCPU / 8 GiB, per-second billing). Revert to
-    # ubuntu-latest if a shard OOMs or queue time blocks merges.
-    runs-on: cloudflare-ubuntu-latest
+    # Namespace (4 vCPU / 8 GiB), same label as the other Linux jobs. The
+    # Cloudflare-runner pilot (#797) ended 2026-09-18: the upstream Worker runs
+    # PRIVATE repositories only and this repo is public, so every
+    # cloudflare-ubuntu-latest job was cancelled with a failed "Cloudflare
+    # runner eligibility" check. Re-pilot only if the repo goes private.
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -196,21 +199,11 @@ jobs:
         with:
           node-version: 24
 
-      # The Cloudflare runner image prunes the runner's bundled node20, but the
-      # runner still spawns it to evaluate hashFiles() in step templates.
-      # Point node20 at the image's node24 until upstream restores it.
-      - name: Restore pruned node20 external (Cloudflare runner image)
-        if: needs.changes.outputs.run_ci == 'true'
-        run: |
-          ext=/home/runner/actions-runner/externals
-          if [ -d "$ext/node24" ] && [ ! -e "$ext/node20" ]; then
-            ln -s node24 "$ext/node20"
-          fi
-
-      # The Cloudflare runner image ships Ubuntu 24.04's stock git 2.43, below
-      # rbox's checkout-transaction floor of git >= 2.46 (doctor-cmd.ts). The
-      # image has no sudo, so extract the git-core PPA build into the home dir.
-      - name: Upgrade git past the 2.46 floor (Cloudflare runner image)
+      # An Ubuntu 24.04 runner image may ship stock git 2.43, below rbox's
+      # checkout-transaction floor of git >= 2.46 (doctor-cmd.ts). No sudo is
+      # assumed: extract the git-core PPA build into the home dir. No-op when
+      # the image's git already clears the floor.
+      - name: Upgrade git past the 2.46 floor (stock Ubuntu 24.04 image)
         if: needs.changes.outputs.run_ci == 'true'
         run: |
           case "$(git version)" in "git version 2.4"[0-5].*) ;; *) exit 0 ;; esac
