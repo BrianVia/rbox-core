@@ -168,11 +168,8 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const halted = resetInspection.status === "halt"
     || observedDaemon.trustedAmbient?.resetLifecycle === "halted";
   if (halted || resetInspection.status === "w1") {
-    // `w1` is only "an open writer left WAL sidecars" — from another process
-    // that is indistinguishable from a live daemon holding the store through a
-    // long git-plane operation (#875: 30 min of P-settlement rendered as
-    // "replaying write-ahead state"). The daemon's own heartbeat settles it: a
-    // live `ready` lifecycle is busy, not recovering.
+    // #875: from another process, `w1` cannot tell a crashed writer from a live
+    // daemon holding the store; its heartbeat's `ready` lifecycle means busy.
     const busy = resetInspection.status === "w1" && !halted
       && observedDaemon.trustedAmbient?.resetLifecycle === "ready";
     const halt: StatusHaltProjection & { probes: StatusHaltProbes } = {
