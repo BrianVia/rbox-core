@@ -236,6 +236,8 @@ export interface StatusHaltProjection extends StatusProjectionCommon {
    * `w1` case, where an unclean shutdown left write-ahead state the daemon
    * replays in place. False means "recovering", not "sync stopped". */
   halted: boolean;
+  /** "busy" (a live daemon's own heartbeat says `ready`, so the WAL sidecars are
+   * its open writer, not a crash), "recovering", or the halt row's reason. */
   reason: string;
 }
 

@@ -277,6 +277,11 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     "↻ recovering on the next daemon start · rbox start",
     "Signed in as owner@example.com · pro",
   ]);
+  expect(lines({ ...reset(false, true), busy: true })).toEqual([
+    "Development · syncing normally — state store busy",
+    "↻ the daemon is mid-operation; details return when it settles",
+    "Signed in as owner@example.com · pro",
+  ]);
 
   const ordered = lines(full({
     daemonRunning: false,

@@ -292,6 +292,16 @@ export async function withRevalidatedGitPartialApplies<T>(
 /** Retire exact P/K and compact A→Z only after their composed BASE is durable.
  * A moved P episode remains standing for the next preflight's mandatory
  * P-repair; malformed exact-settlement state is surfaced as a hard failure. */
+/** #875: per-branch P-settlement runs one ref transaction per branch (~10 s
+ * each on a large repo), so a fresh adoption can hold the sync lock for half an
+ * hour with no log line. Name the work every SETTLEMENT_PROGRESS_EVERY branches
+ * — path-free (relPath + counts) by the git-sync log contract. */
+export const SETTLEMENT_PROGRESS_EVERY = 25;
+export function settlementProgressLine(relPath: string, done: number, total: number): string | undefined {
+  if (total < SETTLEMENT_PROGRESS_EVERY || done % SETTLEMENT_PROGRESS_EVERY !== 0) return undefined;
+  return `git-sync settling ${relPath}: ${done}/${total} branch artifacts`;
+}
+
 export async function settleCommittedBranchArtifacts(
   root: string,
   initialState: SyncState,
@@ -325,7 +335,12 @@ export async function settleCommittedBranchArtifacts(
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);
       let refused = false;
-      for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses).sort(([a], [b]) => a.localeCompare(b))) {
+      const witnesses = Object.entries(proof.authority.branchWitnesses).sort(([a], [b]) => a.localeCompare(b));
+      let settledCount = 0;
+      for (const [ref, witness] of witnesses) {
+        const progress = settlementProgressLine(rel, settledCount, witnesses.length);
+        if (progress) glog(progress);
+        settledCount++;
         const binding = { lineageHash: witness.lineageHash, repositoryIdentityHash: witness.repositoryIdentityHash };
         if (witness.kind === "absent") {
           if (witness.source === "z") continue;
@@ -359,6 +374,7 @@ export async function settleCommittedBranchArtifacts(
       // Binding this repository's attempt would bind it to a post-settlement
       // state it never reached; unbound fails closed at the next steadySkip.
       if (refused) continue;
+      if (witnesses.length >= SETTLEMENT_PROGRESS_EVERY) glog(`git-sync settling ${rel}: ${witnesses.length}/${witnesses.length} branch artifacts`);
 
       const completedAttempt = outcome.attempt?.[rel];
       if (completedAttempt) attemptsToRebind.push({ relPath: rel, attempt: completedAttempt });

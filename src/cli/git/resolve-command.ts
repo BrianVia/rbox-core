@@ -175,7 +175,8 @@ export async function gitResolveCmd(
     }
     state = recovered.state;
     if (recovered.error || !ctx) {
-      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
+      const canned = RESOLVE_TYPED_REFUSAL["journal-recovery"];
+      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: recovered.error ? `${canned}: ${recovered.error}` : canned }, json, deps, root);
       return 1;
     }
 

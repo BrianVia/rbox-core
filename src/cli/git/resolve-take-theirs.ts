@@ -336,7 +336,10 @@ if (deps.forceMutexBodyRefusal === "incomplete-checkout" || Object.keys(follow.h
 step("landing the published checkout");
 const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
 if (deps.forceMutexBodyRefusal === "journal-recovery" || landed.recovery.status !== "keep") {
-  emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
+  // The deferral reason names the failing check (#879); it carries at most a
+  // workspace-relative journal path, never a path outside the workspace.
+  const detail = landed.recovery.status === "defer" ? landed.recovery.reason : undefined;
+  emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: detail ? `${RESOLVE_TYPED_REFUSAL["journal-recovery"]}: ${detail}` : RESOLVE_TYPED_REFUSAL["journal-recovery"] }, json, deps, root);
   return 1;
 }
 step("settling Git protocol artifacts");

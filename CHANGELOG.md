@@ -12,6 +12,20 @@ All notable changes to rbox are recorded here. The format follows
   retrying with backoff until rbox is reachable (or `rbox stop` ends the wait),
   so an autostart resume during a flaky link no longer leaves every workspace
   stopped until the next reboot. Other startup failures still exit as before.
+- `rbox git resolve <repo> take-theirs` no longer fails at the final landing
+  step on a repository with a few hundred branches: the checkout journal it
+  had just written was refused by its own reader as "unreadable or corrupt"
+  (a fixed 256-entry bound, same shape as the 2.0.2 branch limit). The
+  bound is now 16,384, the refusal names the failing check and the journal
+  location, and a journal left behind for a repository that no longer
+  exists retires itself so the repository can be re-adopted instead of
+  being deferred forever (#879).
+- `rbox status` no longer claims it is "replaying write-ahead state after an
+  unclean shutdown" while a healthy daemon is simply holding the state store
+  through a long operation; it now says the store is busy. The daemon also logs
+  settlement progress (`settling <repo>: N/M branch artifacts`) every 25
+  branches, so a half-hour fresh adoption of a large repository reads as work
+  rather than a hang (#875).
 
 ## [2.0.2] - 2026-09-02
 

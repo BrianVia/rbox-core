@@ -168,11 +168,15 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const halted = resetInspection.status === "halt"
     || observedDaemon.trustedAmbient?.resetLifecycle === "halted";
   if (halted || resetInspection.status === "w1") {
+    // #875: from another process, `w1` cannot tell a crashed writer from a live
+    // daemon holding the store; its heartbeat's `ready` lifecycle means busy.
+    const busy = resetInspection.status === "w1" && !halted
+      && observedDaemon.trustedAmbient?.resetLifecycle === "ready";
     const halt: StatusHaltProjection & { probes: StatusHaltProbes } = {
       kind: "reset-halt",
       ...common,
       halted,
-      reason: resetInspection.status === "halt" ? resetInspection.reason : "recovering",
+      reason: resetInspection.status === "halt" ? resetInspection.reason : busy ? "busy" : "recovering",
       probes: probes.mode === "brief" || probes.mode === "git"
         ? { mode: probes.mode, account: await probes.readBriefAccount(loadedCredentials) }
         : { mode: probes.mode },

@@ -11,7 +11,7 @@ import { gitRaw } from "../../engine/git-spawn.js";
 import { MutationGateClosedError, ShutdownMutationGate, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { loadRawState, saveStateUnsafeLegacyOrTest, type GitHeldAttempt, type SyncState } from "../config.js";
 import type { GitPullOutcome } from "./apply.js";
-import { settleCommittedBranchArtifacts } from "./received-git-transition-commit.js";
+import { settleCommittedBranchArtifacts, settlementProgressLine } from "./received-git-transition-commit.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 
 const exec = promisify(execFile);
@@ -355,4 +355,11 @@ test("a gate close between state CAS release and settlement prevents artifact mu
   expect((await readBasePresentArtifact(repo, binding, ref)).status).toBe("valid");
   expect((await loadRawState(root))?.repoRecords?.repo?.base?.refs[ref]).toBe(prior);
   expect(state.repoRecords?.repo?.base?.refs[ref]).toBe(prior);
+});
+
+test("settlement progress is named only for branch-scaled repositories, every 25 branches (#875)", () => {
+  expect(settlementProgressLine("repo", 0, 3)).toBeUndefined();
+  expect(settlementProgressLine("repo", 0, 256)).toBe("git-sync settling repo: 0/256 branch artifacts");
+  expect(settlementProgressLine("repo", 24, 256)).toBeUndefined();
+  expect(settlementProgressLine("repo", 25, 256)).toBe("git-sync settling repo: 25/256 branch artifacts");
 });
