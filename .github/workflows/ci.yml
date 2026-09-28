@@ -7,6 +7,13 @@ on:
   pull_request:
   push:
     branches: [main]
+    # A main push that only touches docs/ (STATUS updates, design docs) runs no
+    # CI at all. Safe for the release gate (scripts/wait-for-main-ci.ts): a
+    # release commit always changes package.json + src/cli/version.ts, so the
+    # tagged SHA still gets its exact-SHA run. PRs keep running (branch
+    # protection requires the checks); docs-only PRs short-circuit in `changes`.
+    paths-ignore:
+      - "docs/**"
 
 # One in-flight run per branch/PR — a new push cancels the stale run.
 concurrency:
@@ -41,9 +48,10 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Main pushes always run CI: release gates require a successful run
-          # for the exact pushed SHA. Only PRs whose every path is under docs/
-          # receive the lightweight treatment.
+          # Main pushes that reach this job always run CI: release gates require
+          # a successful run for the exact pushed SHA (docs-only main pushes are
+          # filtered out by the trigger's paths-ignore). Only PRs whose every
+          # path is under docs/ receive the lightweight treatment.
           if [ "$EVENT_NAME" != "pull_request" ]; then
             RUN_CI=true
           else
