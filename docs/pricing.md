@@ -5,13 +5,13 @@ Solo and Pro include a 14-day card-upfront trial. Annual billing is two months f
 ### Solo
 - $8/mo or $80/yr
 - 50 GB project storage
-- Unlimited devices
+- Up to 10 devices
 - 30-day version history
 
 ### Pro
 - $20/mo or $200/yr
 - 250 GB project storage
-- Unlimited devices
+- Up to 25 devices
 - 365-day version history
 - Larger manifests/projects
 - Advanced hydration/ignore rules
@@ -19,7 +19,7 @@ Solo and Pro include a 14-day card-upfront trial. Annual billing is two months f
 ### Team
 - $12–15/user/mo
 - 100–150 GB/user pooled storage
-- Unlimited devices
+- Up to 100 devices per team
 - Shared workspaces
 - Roles and audit log
 
