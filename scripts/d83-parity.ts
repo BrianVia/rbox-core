@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { classifyDivergenceCacheEntry } from "../src/cli/sync-git.js";
-import type { JsonValue } from "../src/json.js";
+import type { JsonValue } from "../src/engine/json.js";
 
 const CACHE_REL = ".rbox/state/git-divergence.json";
 const CACHE_VERSION = 3;

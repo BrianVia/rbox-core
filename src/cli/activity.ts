@@ -22,7 +22,7 @@ import {
 import { projectGitDeferralRepos } from "./status-view/git-projection.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { RBOX_DIR } from "./workspace-config.js";
-import { jsonText, type JsonValue } from "../json.js";
+import { jsonText, type JsonValue } from "../engine/json.js";
 
 /** One field read out of the parsed sidecar: a JSON value, or absent. The file
  *  is daemon-written but user-editable, so every slot is validated on read. */

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { rboxDir } from "./rbox-paths.js";
 
 /** Non-secret, best-effort display metadata cached outside credentials.json. */

@@ -27,7 +27,7 @@ import {
   type SignedCommit,
 } from "./commit-envelope.js";
 import { acceptConnection, broadcast as wsBroadcast, broadcastKeyDelivery } from "./ws-fanout.js";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 
 const ROOTS_PAGE_LIMIT = 20_000;
 // A raw gap commit may itself contain a large inline refset. Keep inspection pages

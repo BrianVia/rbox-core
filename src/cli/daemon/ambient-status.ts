@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
 import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";

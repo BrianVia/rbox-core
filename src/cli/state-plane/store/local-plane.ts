@@ -6,7 +6,7 @@
  * through the lineage snapshot token. As on the global side, the header that
  * commits is the one the stage was sealed with. */
 import type { Database } from "bun:sqlite";
-import { jsonText } from "../../../json.js";
+import { jsonText } from "../../../engine/json.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";

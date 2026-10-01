@@ -137,26 +137,6 @@ export {
   type DominantDir,
 } from "./manifest-dominance.js";
 export {
-  detectProjects,
-  hydrateArgv,
-  ECOSYSTEM_RULES,
-  type DetectedProject,
-  type DetectHints,
-  type EcosystemRule,
-  type Ecosystem,
-} from "./detect.js";
-export {
-  evaluateReadiness,
-  parseMajor,
-  minMajor,
-  satisfiesMajor,
-  type HostTool,
-  type ProjectProbe,
-  type ProjectReadiness,
-  type ReadinessReport,
-  type VersionRequirement,
-} from "./doctor.js";
-export {
   abortGeneration,
   candidateRef,
   discardGeneration,

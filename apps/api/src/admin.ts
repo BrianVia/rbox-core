@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import type { JsonObject, JsonValue } from "../../../src/json.js";
+import type { JsonObject, JsonValue } from "../../../src/engine/json.js";
 import { json, logErr } from "./util.js";
 import { PLAN_MONTHLY_CENTS } from "./plans.js";
 import { dbFor, dirDb } from "./db.js";

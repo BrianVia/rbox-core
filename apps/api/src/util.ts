@@ -1,6 +1,6 @@
 /** Shared control-plane helpers (consolidated from per-file copies). */
 
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 
 /** A lowercase-hex SHA-256 (32 bytes) — every content address / blob ref. */
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;

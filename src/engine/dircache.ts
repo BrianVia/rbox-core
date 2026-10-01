@@ -3,7 +3,7 @@ import path from "node:path";
 import type { Stats } from "node:fs";
 import { writeFileAtomic } from "./fsutil.js";
 import { isSafeRelPath } from "./manifest-validate.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "./json.js";
 
 export const RACY_MARGIN_MS = 2_000;
 export const UNPRUNED_DEADLINE_MS = 30 * 60_000;

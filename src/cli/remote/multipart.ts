@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import type { RemoteContext } from "./context.js";
 import { BlobRetryLaterError, BlobShaMismatchError, QuotaExceededError, isRetryLater, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";

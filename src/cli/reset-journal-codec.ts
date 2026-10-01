@@ -2,7 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { assertResetParseAdmission, ResetMemoryAdmissionError } from "./reset-io.js";
 import {
   constructResetJournal,

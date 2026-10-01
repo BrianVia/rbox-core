@@ -1,4 +1,4 @@
-import type { JsonValue } from "../../../json.js";
+import type { JsonValue } from "../../../engine/json.js";
 import { toHex } from "../../../engine/e2ee/index.js";
 import { DEFAULT_BATCH_RECORD_BYTES } from "./config.js";
 

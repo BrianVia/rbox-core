@@ -1,4 +1,4 @@
-import { toB64url } from "./encoding.js";
+import { toB64url } from "../engine/encoding.js";
 
 const PAT_PREFIX = "rbox_pat_";
 const PAT_BODY_CHARS = 43; // base64url(32 random bytes), no padding

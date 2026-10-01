@@ -5,7 +5,7 @@
  *
  * Security (rule 7 / MF5): we run a FIXED argv keyed by detected lockfile, never
  * a string from synced content; never via a shell; lifecycle/build scripts are
- * disabled by default (see engine/detect.hydrateArgv); and the package-manager
+ * disabled by default (see detect.hydrateArgv); and the package-manager
  * binary is resolved from PATH with realpath containment — a repo-shipped
  * `./pnpm` (or a PATH entry inside the workspace) is rejected, so the synced
  * tree can't supply the executable.
@@ -15,17 +15,9 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import {
-  detectProjects,
-  hydrateArgv,
-  evaluateReadiness,
-  scanManifest,
-  type DetectedProject,
-  type DetectHints,
-  type HostTool,
-  type ProjectProbe,
-  type VersionRequirement,
-} from "../engine/index.js";
+import { scanManifest } from "../engine/index.js";
+import { detectProjects, hydrateArgv, type DetectedProject, type DetectHints } from "./detect.js";
+import { evaluateReadiness, type HostTool, type ProjectProbe, type VersionRequirement } from "./host-readiness.js";
 import { style, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 

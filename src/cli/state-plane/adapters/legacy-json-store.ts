@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection, Manifest } from "../../../engine/index.js";
-import { jsonObject, jsonText, type JsonValue } from "../../../json.js";
+import { jsonObject, jsonText, type JsonValue } from "../../../engine/json.js";
 import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../../../engine/lockfile.js";
 import { assertProtocolLockHeld } from "../../../cli/sync-git/protocol-locks.js";

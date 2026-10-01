@@ -4,7 +4,7 @@ import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
-import { jsonObject, jsonText, type JsonValue } from "../../json.js";
+import { jsonObject, jsonText, type JsonValue } from "../../engine/json.js";
 import type { OwnedLock } from "../../engine/lockfile.js";
 import { semverGt } from "../semver.js";
 import { RBOX_VERSION } from "../version.js";

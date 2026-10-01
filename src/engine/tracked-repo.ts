@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import childProcess from "node:child_process";
-import { jsonCounter, jsonObject, jsonText, type JsonValue } from "../json.js";
+import { jsonCounter, jsonObject, jsonText, type JsonValue } from "./json.js";
 
 export interface TrackedRepoSet {
   relPath: string;

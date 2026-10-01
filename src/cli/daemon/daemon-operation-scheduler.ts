@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { writeFileAtomic } from "../../engine/index.js";
 import type { DaemonMutexResult, WorkspaceSyncMutex } from "../sync-mutex.js";
 import { selectPumpOperation, type PumpOperation, type Wants } from "./policy.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 
 /**
  * `ServiceNextDaemonOperation` — the single-flight heart of the daemon (design 178).

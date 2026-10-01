@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { homeDir } from "./rbox-paths.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { trashConfig, type WorkspaceConfig } from "./workspace-config.js";
 import { normalizeIgnorePath } from "../engine/ignore.js";
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { join } from "node:path";
+import { dirname, join, normalize } from "node:path";
 import { DEDICATED_TESTS, FILE_WEIGHTS, SPLIT_FILES, WEIGHTS_MEASURED, WHOLE_FILE_ANTI_AFFINITY } from "./ci-shard-weights.js";
 
 export const INQUIRER_IMPORT_ERROR =
@@ -134,6 +134,39 @@ async function guardBareFetch(root: string): Promise<boolean> {
   return violations.length === 0;
 }
 
+export const ENGINE_BOUNDARY_ERROR =
+  "::error::src/engine is the published @rbox/sync package; its production files may import only node:*, bun:*, its declared dependencies, and files inside src/engine";
+
+/** Bare specifiers the published package declares in src/engine/package.json. */
+const ENGINE_ALLOWED_PACKAGES = new Set(["ignore"]);
+const IMPORT_SPECIFIER =
+  /(?:^\s*(?:import|export)\b[^"']*?\bfrom\s*|^\s*\}\s*from\s*|^\s*import\s*|\bimport\(\s*|\brequire\(\s*)["']([^"']+)["']/g;
+
+export async function findEngineBoundaryViolations(root: string): Promise<string[]> {
+  const violations: string[] = [];
+  for await (const relativePath of new Bun.Glob("src/engine/**/*.ts").scan({ cwd: root, onlyFiles: true })) {
+    const file = relativePath.replaceAll("\\", "/");
+    if (/\.(test|bench-helper|helpers|test-helper)\.ts$|\.d\.ts$/.test(file)) continue;
+    const lines = (await Bun.file(join(root, relativePath)).text()).split("\n");
+    for (let index = 0; index < lines.length; index++) {
+      for (const [, spec] of lines[index]!.matchAll(IMPORT_SPECIFIER)) {
+        if (/^(node|bun):/.test(spec!) || ENGINE_ALLOWED_PACKAGES.has(spec!)) continue;
+        if (spec!.startsWith(".") && normalize(join(dirname(file), spec!)).startsWith("src/engine/")) continue;
+        violations.push(`${file}:${index + 1}:${spec}`);
+      }
+    }
+  }
+  return violations.sort();
+}
+
+async function guardEngineBoundary(root: string): Promise<boolean> {
+  console.log("engine-boundary guard: src/engine imports nothing outside itself");
+  const violations = await findEngineBoundaryViolations(root);
+  for (const violation of violations) console.log(violation);
+  if (violations.length) console.error(ENGINE_BOUNDARY_ERROR);
+  return violations.length === 0;
+}
+
 async function guardTuiImports(root: string): Promise<boolean> {
   console.log(`tui-import guard: @inquirer forbidden; ink/react only in ${ALLOWED_TUI_IMPORT}`);
   const inquirer = await findInquirerImportViolations(root);
@@ -149,7 +182,8 @@ export async function runGuards(root = process.cwd()): Promise<boolean> {
   const shardWeights = await guardShardWeights(root);
   const tui = await guardTuiImports(root);
   const bareFetch = await guardBareFetch(root);
-  return shardWeights && tui && bareFetch;
+  const engineBoundary = await guardEngineBoundary(root);
+  return shardWeights && tui && bareFetch && engineBoundary;
 }
 
 if (import.meta.main && !(await runGuards())) process.exit(1);

@@ -13,7 +13,7 @@ import {
 } from "./folder-config.js";
 import type { FolderAdmission, FolderInventoryRow } from "./folder-inventory.js";
 import { folderCatalogPath } from "./rbox-paths.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 export interface FolderConfigJsonFolderV1 {
   path: string;

@@ -1,4 +1,4 @@
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { loadCredentials, requireCredentials, type CredentialLoadResult } from "./credentials.js";
 import { emitJson } from "./json.js";
 import { style } from "./style.js";

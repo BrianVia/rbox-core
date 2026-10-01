@@ -25,7 +25,7 @@ import {
 } from "../keys.js";
 import type { Principal } from "../authz.js";
 import { cappedJson } from "../util.js";
-import type { JsonValue } from "../../../../src/json.js";
+import type { JsonValue } from "../../../../src/engine/json.js";
 
 async function parsed<T>(req: Request, maxBytes: number, validate: (value: JsonValue) => T | null): Promise<T | Response> {
   const result = await cappedJson(req, { maxBytes }, validate);

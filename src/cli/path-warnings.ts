@@ -4,7 +4,7 @@ import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { isSafeRelPath, type CaseFoldCollisionGroup } from "../engine/manifest-validate.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { boundedJsonRead } from "./reset-io.js";
 
 export const PATH_WARNINGS_MAX_BYTES = 64 * 1024;

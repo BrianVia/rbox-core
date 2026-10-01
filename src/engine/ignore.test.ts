@@ -17,7 +17,7 @@ import {
   normalizeIgnorePath
 } from "./ignore.js";
 import { applyWatchEvents, scanManifest } from "./manifest.js";
-import { jsonObject, type JsonObject, type JsonValue } from "../json.js";
+import { jsonObject, type JsonObject, type JsonValue } from "./json.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());

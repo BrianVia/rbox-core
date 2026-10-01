@@ -14,7 +14,7 @@
  * file boundary is untrusted text on the way back in, and both directions must
  * bound it identically.
  */
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import {
   gitDeferralReasonPresentation,
   isKnownGitDeferralReason,

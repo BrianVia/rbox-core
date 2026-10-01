@@ -3,7 +3,7 @@ import path from "node:path";
 import { canonicalString, parseStrict, sha256Hex, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
 import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 export type GenesisQuarantinePurpose="repaired-legacy"|"abandoned-attempt";
 export type GenesisQuarantineEntry={source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string};

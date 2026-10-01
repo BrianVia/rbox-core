@@ -1,5 +1,5 @@
 import type { GitSection } from "../../engine/types.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 
 /** Pure grammar, projection, and canonical-wire helpers for design 93 git config sync.
  * Keep this module node-free: manifest validation is also bundled into the Worker. */

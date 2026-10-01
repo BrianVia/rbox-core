@@ -1,4 +1,4 @@
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { cappedJson, exactObject, json, sha256Hex, utf8Bytes } from "./util.js";

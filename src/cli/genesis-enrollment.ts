@@ -4,7 +4,7 @@ import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from 
 import { loadDevice } from "./e2ee-keystore.js";
 import { activeGenesisQuarantines, genesisQuarantineStatus } from "./genesis-quarantine.js";
 import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseDestinationProgress, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness, type GenesisBootstrapRequest } from "./genesis-durable.js";
-import type { JsonObject } from "../json.js";
+import type { JsonObject } from "../engine/json.js";
 
 export type EnrollmentClassification=
   |{kind:"pristine"}|{kind:"restart-prepublication";marker:GenesisPrepublishMarker}|{kind:"resume-attempt";journal:GenesisJournal}

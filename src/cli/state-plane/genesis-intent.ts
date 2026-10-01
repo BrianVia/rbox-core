@@ -17,7 +17,7 @@
  * Never: SQLite, writing or retiring the intent, or deciding anything from it.
  */
 import fs, { constants } from "node:fs";
-import { jsonObject, type JsonValue } from "../../json.js";
+import { jsonObject, type JsonValue } from "../../engine/json.js";
 import { checkRecord, type Fields, type Refuse, type Spec } from "./closed-record.js";
 import { StateAuthorityCorruptError } from "./errors.js";
 import { genesisPaths } from "./paths.js";

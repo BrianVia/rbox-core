@@ -27,7 +27,7 @@ import {
   type GitFingerprint,
 } from "./fingerprint.js";
 import { gitIncomingKey } from "./shared.js";
-import { jsonText } from "../../json.js";
+import { jsonText } from "../../engine/json.js";
 
 /**
  * Liveness bound on every held skip: however well the bracket matches, an older

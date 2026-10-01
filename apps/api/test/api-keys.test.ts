@@ -1,7 +1,7 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
-import { createPatToken } from "../../../src/engine/pat-token.js";
+import { createPatToken } from "../../../src/cli/pat-token.js";
 import { createWebSession } from "../src/auth.js";
 import { releaseRoutes } from "../src/routes/release.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";

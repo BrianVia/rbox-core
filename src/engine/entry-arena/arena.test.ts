@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../json.js";
 import type { FileEntry } from "../types.js";
 import { EntryArena, MAX_EXTENSION_DEPTH, canonicalEntryKey, defaultFingerprint, sameEntryExact } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";

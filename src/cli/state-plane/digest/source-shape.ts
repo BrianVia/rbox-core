@@ -12,7 +12,7 @@
  * neither may drag the semantic-digest grammar (or `bun:sqlite`) behind it.
  */
 import type { SyncState } from "../../sync-state-model.js";
-import { jsonObject } from "../../../json.js";
+import { jsonObject } from "../../../engine/json.js";
 import { canonicalJson, type JsonValue } from "./codecs.js";
 
 export interface SourcePresenceFlags {

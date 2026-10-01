@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../engine/lockfile.js";

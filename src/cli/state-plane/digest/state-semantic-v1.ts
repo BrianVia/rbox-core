@@ -11,7 +11,7 @@ import type { Database } from "bun:sqlite";
 import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";
 import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import type { StateSemanticDigest } from "../ports.js";
-import type { JsonObject } from "../../../json.js";
+import type { JsonObject } from "../../../engine/json.js";
 import { canonicalJson, domainHash, parseCanonicalJson } from "./codecs.js";
 import type { NormalizedLegacyState } from "./legacy-state-plan.js";
 import type { LegacyLineageRow, LegacyPlaneHeadRow } from "./legacy-state-plan.js";

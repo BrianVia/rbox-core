@@ -1,7 +1,7 @@
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "../e2ee-remote.js";
 import { AccountAlreadyBootstrappedError, errorCode, GenesisBootstrapTerminalError, LegacyGenesisServiceError, translateRemoteError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
 

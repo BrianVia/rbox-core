@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { canonicalString, fromB64url, parseStrict, rkToPhrase, sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 export const GENESIS_ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/;
 export const GENESIS_REPAIR_ID_RE = /^gra_[0-9a-f]{32}$/;

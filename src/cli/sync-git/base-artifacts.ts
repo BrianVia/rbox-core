@@ -3,7 +3,7 @@ import { hashBytes } from "../../engine/hash.js";
 import { refNameOk } from "./config-sync.js";
 import { gitRaw } from "../../engine/git-spawn.js";
 import type { ArtifactBinding } from "./repo-lineage.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 import { withProtocolLockClass, withRepoOperationLock } from "./protocol-locks.js";
 
 const HEX32 = /^[0-9a-f]{32}$/;

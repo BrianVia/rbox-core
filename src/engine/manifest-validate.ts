@@ -7,7 +7,7 @@
  *
  * Pure string logic only (no node:*), so it bundles cleanly into the Worker.
  */
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "./json.js";
 import type { FileEntry, GitArtifactRef, GitPackLink, GitRefTombstone, GitSection, Manifest } from "./types.js";
 
 /** What a validator is actually handed: JSON straight off the wire, or an

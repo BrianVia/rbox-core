@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { RboxApi, BlobShaMismatchError } from "./remote.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 
 // A live-folder edit between encrypt-time and the streamed PUT makes the ciphertext no
 // longer hash to the declared encSha; the server rejects it. It signals that SAME error

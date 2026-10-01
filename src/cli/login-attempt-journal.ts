@@ -29,7 +29,7 @@ import {
   fsyncDirectory,
   writeFileAtomic,
 } from "../engine/fsutil.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 const VERSION = 1 as const;
 const DEVICE_CODE_RE = /^[0-9a-f]{64}$/;

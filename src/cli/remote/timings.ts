@@ -1,5 +1,5 @@
 /** Never: I/O. */
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 
 /**
  * Defensive reader for numbers-only server timing objects (design 97 / 101).

@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import type { FileEntry } from "../../../engine/index.js";
 import type { DeltaBinding } from "../../sync-state-delta.js";
 import { encodeFileEntryForConsume, fileEntryFromCanonical, type ConsumedFileEntry } from "../codecs/file-entry.js";
-import { jsonCounter, jsonText } from "../../../json.js";
+import { jsonCounter, jsonText } from "../../../engine/json.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import {
   StageDeltaDigestBuilder, type DeltaCounts, type StageDeltaLogicalDigest,

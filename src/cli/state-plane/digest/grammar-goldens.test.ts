@@ -10,7 +10,7 @@
  */
 import { expect, test } from "bun:test";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import type { JsonValue } from "../../../json.js";
+import type { JsonValue } from "../../../engine/json.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
 import type { GitHeldAttempt, RepoRecordInput } from "../../sync-state-model.js";
 import type { DeltaBinding, DeltaOp } from "../../sync-state-delta.js";

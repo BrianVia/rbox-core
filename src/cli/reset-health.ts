@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedJsonRead } from "./reset-io.js";
 

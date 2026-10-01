@@ -1,7 +1,7 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, blobBatchPut, encodeBatchFrameHeader } from "../src/blob-batch.js";
 import { blobsCheck } from "../src/blobs.js";
 import type { Env } from "../src/env.js";

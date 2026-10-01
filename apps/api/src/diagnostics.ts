@@ -1,5 +1,5 @@
 import { readBodyCapped } from "./util.js";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import type { Env } from "./env.js";
 import { emit, OpSpan } from "./metrics.js";
 import { dbFor } from "./db.js";

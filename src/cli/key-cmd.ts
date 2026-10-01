@@ -1,4 +1,4 @@
-import { createPatToken, patDisplayPrefix, PAT_MAX_TTL_MS } from "../engine/pat-token.js";
+import { createPatToken, patDisplayPrefix, PAT_MAX_TTL_MS } from "./pat-token.js";
 import { sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { admitAgentDevice, assertNoPendingGenesis, newAgentId } from "./e2ee-client.js";

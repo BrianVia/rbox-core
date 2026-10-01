@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isIgnorePathList } from "./folder-config-codec.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 /** One field read out of a decoded adoption journal: a JSON value, or absent. */
 type JsonField = JsonValue | undefined;
