@@ -33,5 +33,5 @@ jobs:
           key="$RUNNER_TEMP/rbox-sync-key"
           printf '%s\n' "$DEPLOY_KEY" > "$key" && chmod 600 "$key"
           GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-            git push --force git@github.com:BrianVia/rbox-sync.git "$sha:refs/heads/main"
+            git push --force git@github.com:BrianVia/rbox-sync.git "${sha}:refs/heads/main"
           rm -f "$key"
