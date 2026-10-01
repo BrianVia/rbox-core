@@ -1,0 +1,37 @@
+name: mirror @rbox/sync
+
+# src/engine is the source of truth for @rbox/sync. BrianVia/rbox-sync is a read-only
+# mirror of it, history included. The mirror is force-pushed because it is derived:
+# squash merges rewrite the split history, and nothing is ever committed there directly.
+on:
+  push:
+    branches: [main]
+    paths: ["src/engine/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-rbox-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: split src/engine and push to BrianVia/rbox-sync
+        env:
+          DEPLOY_KEY: ${{ secrets.RBOX_SYNC_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          sha=$(git subtree split --prefix=src/engine HEAD)
+          key="$RUNNER_TEMP/rbox-sync-key"
+          printf '%s\n' "$DEPLOY_KEY" > "$key" && chmod 600 "$key"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git push --force git@github.com:BrianVia/rbox-sync.git "$sha:refs/heads/main"
+          rm -f "$key"

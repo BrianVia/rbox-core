@@ -5,6 +5,10 @@ directory sync. It scans a directory into a manifest, plans a three-way reconcil
 remote manifest, applies the plan through any `BlobStore`, and encrypts blobs client-side so
 a server stores only ciphertext and opaque addresses.
 
+Source: [`src/engine` in BrianVia/rbox-core](https://github.com/BrianVia/rbox-core/tree/main/src/engine).
+[BrianVia/rbox-sync](https://github.com/BrianVia/rbox-sync) is a read-only mirror of that
+folder, updated on every merge. Open issues and pull requests on rbox-core.
+
 Status: pre-release. Bun only (`bun >= 1.4`). The API is the engine rbox ships today and
 will change before 1.0.
 
@@ -29,7 +33,7 @@ const kek = generateKek();
 const blob = await encryptFileToTemp("/data/src/notes.md", kek); // blob.encSha addresses the ciphertext
 ```
 
-The full runnable version is `scripts/sync-package-example.ts` in the repository.
+The full runnable version is [`scripts/sync-package-example.ts`](https://github.com/BrianVia/rbox-core/blob/main/scripts/sync-package-example.ts).
 
 ## What is in the box
 
