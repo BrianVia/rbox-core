@@ -1,5 +1,20 @@
 # rbox status — living state snapshot
 
+## 2026-10-01 — #915 MERGED: daemon survives an offline boot (user-reported 46h silent stop)
+
+- **Shipped:** PR #915 squash-merged to `main` as `cb0e4b33e`. `runDaemon` now
+  drives its first network call (`buildAuthedRemote`) through `retryTransient`
+  with `retries: Infinity`, 5s→10s→30s→60s backoff, SIGTERM/SIGINT-abortable.
+  Bun's c-ares `ETIMEOUT` DNS code added to the transient classifier.
+  Non-network startup faults still exit (design 61 §6 no-Restart= rule holds).
+- **Why:** external user rebooted during an ISP outage; all six daemons died
+  on `getaddrinfo ETIMEOUT`, `__boot-resume` (oneshot, no Restart=) never
+  retried, workspaces silent ~46h. Root cause was the daemon needing the
+  network to even start, not the systemd unit.
+- **Next:** ships in the next CLI release (Unreleased changelog entry present);
+  tell the reporting user to upgrade then. The two secret-gated CI jobs
+  ("ux · regress flows", "compiled TUI · onboarding rig") pass on re-run now.
+
 ## 2026-09-18 — CI unblocked: Cloudflare runner pilot ENDED (public repo), shards on Namespace
 
 - **Root cause of every red PR since ~09-16:** `biw/cloudflare-github-actions-runner` runs
