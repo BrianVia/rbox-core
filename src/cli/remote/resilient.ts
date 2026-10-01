@@ -36,6 +36,7 @@ const TRANSIENT_CODES = new Set([
   "ECONNREFUSED",
   "ECONNABORTED",
   "ETIMEDOUT",
+  "ETIMEOUT", // Bun/c-ares DNS resolver timeout ("getaddrinfo ETIMEOUT host")
   "EPIPE",
   "ENOTFOUND",
   "EAI_AGAIN",

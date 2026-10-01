@@ -7,6 +7,11 @@ All notable changes to rbox are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Background sync no longer dies when the machine boots before the network is
+  up. A DNS or connection failure during startup now keeps the daemon alive and
+  retrying with backoff until rbox is reachable (or `rbox stop` ends the wait),
+  so an autostart resume during a flaky link no longer leaves every workspace
+  stopped until the next reboot. Other startup failures still exit as before.
 - `rbox git resolve <repo> take-theirs` no longer fails at the final landing
   step on a repository with a few hundred branches: the checkout journal it
   had just written was refused by its own reader as "unreadable or corrupt"
