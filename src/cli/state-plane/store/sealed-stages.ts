@@ -9,7 +9,7 @@
  * Never: staging, authority mutation, or ref construction from caller claims.
  */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { jsonObject, jsonText, type JsonObject, type JsonValue } from "../../../json.js";
+import { jsonObject, jsonText, type JsonObject, type JsonValue } from "../../../engine/json.js";
 import {
   decodeFileEntry, encodeFileEntry, encodeFileEntryForConsume,
   type ConsumedFileEntry, type EncodedFileEntry,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fromB64url, utf8, verify } from "../engine/e2ee/index.js";
-import { jsonObject, jsonText, type JsonValue } from "../json.js";
+import { jsonObject, jsonText, type JsonValue } from "../engine/json.js";
 import { RELEASE_KEYS } from "./release-key.js";
 
 const DOMAIN = "rbox-release/v1\n"; // signature domain separator

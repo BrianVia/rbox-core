@@ -8,7 +8,7 @@
  *
  * Never: filesystem access, canonical encoding, or record-specific policy.
  */
-import { jsonCounter, jsonObject, jsonText, type JsonObject, type JsonValue } from "../../json.js";
+import { jsonCounter, jsonObject, jsonText, type JsonObject, type JsonValue } from "../../engine/json.js";
 
 /** A record-minted identifier that is interpolated into a filesystem path
  * template. Bounded, and free of `/`, `.`, and every other character that could

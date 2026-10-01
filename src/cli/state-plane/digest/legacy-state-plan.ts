@@ -11,7 +11,7 @@ import {
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { encodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
-import { jsonObject, jsonText } from "../../../json.js";
+import { jsonObject, jsonText } from "../../../engine/json.js";
 import { canonicalJson, compareUtf16, extrasOf, parseCanonicalJson, type JsonValue } from "./codecs.js";
 import { legacySourcePresenceFlags, type SourcePresenceFlags } from "./source-shape.js";
 

@@ -1,6 +1,6 @@
 /** Never: expected-stream/authority policy, database handles, sealed-artifact refs, engine DTO copies, or cross-format import policy. */
 import type { FileEntry, GitSection, Manifest } from "../../engine/index.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 import type { GlobalManifestMeta, RepoRecord, SyncState } from "../sync-state-model.js";
 
 declare const digestBrand: unique symbol;

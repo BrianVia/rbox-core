@@ -10,7 +10,7 @@ import { timePushTailRequest } from "../push-spans.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 import { RBOX_VERSION } from "../version.js";
 import { debugEnabled } from "../debug.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 
 const authGrantEnabled = (): boolean => process.env.RBOX_AUTH_GRANT !== "0";
 

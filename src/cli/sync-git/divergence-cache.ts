@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 import { gitIdentity, gitIdentityKey, type GitIdentity } from "./identity.js";
 import { gitPreflight, isGitBusy, type GitPreflightResult } from "./preflight.js";
 import { inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, type GitRepoKind, type RepoCtx } from "./git-state.js";

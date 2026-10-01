@@ -7,7 +7,7 @@
  * through this pair, so the fold rules have exactly one home.
  */
 import { MAX_GIT_REPOS } from "../engine/index.js";
-import { jsonCounter, type JsonValue } from "../json.js";
+import { jsonCounter, type JsonValue } from "../engine/json.js";
 import { sanitizeGitSectionForPersistence } from "./sync-git/config-sync.js";
 import { carryRepoBaseProof, composeRepoBase, recordOriginLineage } from "./sync-git/base-composer.js";
 import { adoptLegacyManifestRepoBase } from "./state-plane/base-proof.js";

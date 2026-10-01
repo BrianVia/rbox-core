@@ -1,6 +1,6 @@
 import type { GitSection, ValidationResult } from "../../../engine/index.js";
 import { isSafeRelPath, validateGitRepos } from "../../../engine/index.js";
-import type { JsonValue } from "../../../json.js";
+import type { JsonValue } from "../../../engine/json.js";
 import { canonicalJson, parseCanonicalJson } from "../digest/codecs.js";
 
 /**

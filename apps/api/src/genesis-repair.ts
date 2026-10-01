@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { dbFor, dirDb } from "./db.js";
 import { exactObject, json, objectWithKeys, sha256Hex, utf8Bytes } from "./util.js";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 
 export const GENESIS_TOMBSTONE_SENTINEL = "rbox:genesis-repair-tombstone:v1";
 export const GENESIS_CAPABILITY_HEADER = "x-rbox-genesis-capability";

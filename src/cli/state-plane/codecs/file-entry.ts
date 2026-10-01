@@ -2,7 +2,7 @@ import type { FileEntry } from "../../../engine/index.js";
 import { isSafeRelPath } from "../../../engine/index.js";
 import { createHash, randomBytes } from "node:crypto";
 import { FileEntryOversizeError } from "../errors.js";
-import { jsonObject, jsonText } from "../../../json.js";
+import { jsonObject, jsonText } from "../../../engine/json.js";
 import { canonicalJson, extrasOf, parseCanonicalJson, retainedEstimate, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
 
 export const FILE_ENTRY_KEYS = [

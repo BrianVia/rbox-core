@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import { exactObject, json, objectWithKeys, utf8Bytes } from "./util.js";
 import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";

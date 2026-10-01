@@ -15,7 +15,7 @@ import { finishLoginAttempt, generateLoginAttemptKeys, LoginAttemptAccountClaime
 
 
 import { acknowledgeKeyDeliveryAuth, bootstrapDeviceAuth, pollDeviceAuth, startDeviceAuth } from "../remote/auth-command-wire.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { runGenesisEnrollment, type GenesisApi } from "./genesis-command.js";
 import { NO_KIT } from "./recovery-kit-flow.js";
 import { redeemPair } from "./pairing-command.js";

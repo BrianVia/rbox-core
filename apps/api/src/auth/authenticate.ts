@@ -2,7 +2,7 @@ import type { Env } from "../env.js";
 import { sha256Hex } from "../util.js";
 import type { Principal } from "../authz.js";
 import { dbFor, dirDb } from "../db.js";
-import { isValidPatToken } from "../../../../src/engine/pat-token.js";
+import { isValidPatToken } from "../../../../src/cli/pat-token.js";
 
 const LAST_SEEN_THROTTLE_MS = 10 * 60 * 1000;
 const VERSION_CHANGE_MIN_MS = 60 * 1000;

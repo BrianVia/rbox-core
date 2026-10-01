@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 /** One field read out of a decoded `op --format=json` row: a JSON value, or absent. */
 type JsonField = JsonValue | undefined;

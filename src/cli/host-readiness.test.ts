@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { evaluateReadiness, parseMajor, minMajor, satisfiesMajor, type HostTool, type ProjectProbe } from "./doctor.js";
+import { evaluateReadiness, parseMajor, minMajor, satisfiesMajor, type HostTool, type ProjectProbe } from "./host-readiness.js";
 
 test("parseMajor pulls the first integer", () => {
   expect(parseMajor("v20.11.0")).toBe(20);

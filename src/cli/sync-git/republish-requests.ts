@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import type { GitSection } from "../../engine/types.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { boundedJsonRead } from "../reset-io.js";
 import { assertHealthyOwnedSyncMutex, assertSyncMutex, type WorkspaceSyncMutex } from "../sync-mutex.js";
 

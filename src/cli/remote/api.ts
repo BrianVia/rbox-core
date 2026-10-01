@@ -11,7 +11,7 @@ import { BlobBatchUploader } from "./blob-batch/uploader.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult, type LatestOptions } from "./commits.js";
 import { redeemReceipts } from "./commits.js";
 import type { ReceiptPort } from "../publish-pipeline/receipt-drainer.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
 import {

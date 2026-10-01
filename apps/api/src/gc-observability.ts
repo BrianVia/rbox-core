@@ -1,5 +1,5 @@
 /** Never: health presentation, candidate mutation, root traversal, or leases. */
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import type { Env } from "./env.js";
 import { logErr, objectWithKeys } from "./util.js";
 import { startOp } from "./metrics.js";

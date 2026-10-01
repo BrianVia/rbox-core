@@ -5,7 +5,7 @@ import {
   type GitSection,
   type Manifest,
 } from "../engine/index.js";
-import { jsonCounter, jsonObject, jsonText, type JsonValue } from "../json.js";
+import { jsonCounter, jsonObject, jsonText, type JsonValue } from "../engine/json.js";
 import type { GlobalDelta } from "./sync-state-delta.js";
 import type { AcquireLockOptions, OwnedLock } from "../engine/lockfile.js";
 import type { ConfigStatToken } from "./sync-git/config-txn.js";

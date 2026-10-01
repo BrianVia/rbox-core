@@ -1,7 +1,7 @@
 import { createHash, type Hash } from "node:crypto";
-import type { JsonObject, JsonValue } from "../../../json.js";
+import type { JsonObject, JsonValue } from "../../../engine/json.js";
 
-export type { JsonObject, JsonValue } from "../../../json.js";
+export type { JsonObject, JsonValue } from "../../../engine/json.js";
 
 function encode(value: unknown): string {
   if (value === null) return "null";

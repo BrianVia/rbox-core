@@ -23,7 +23,7 @@ import {
   type Wrap,
 } from "../../engine/e2ee/index.js";
 import type { HeadPin } from "../e2ee-keystore.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 import { loadDevice, loadPin } from "../e2ee-keystore.js";
 import type { AccountKeysDTO } from "../e2ee-remote.js";
 import {

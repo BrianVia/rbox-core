@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "../engine/json.js";
 import type {
   MarkerDisposition,
   NextArtifactDisposition,

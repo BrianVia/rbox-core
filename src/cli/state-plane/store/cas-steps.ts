@@ -27,7 +27,7 @@ import {
 import type { SourceStageBinding } from "../digest/repo-transition-v1.js";
 import type { CasOwnerToken } from "../ports.js";
 import type { CasExpectation } from "./write-packet.js";
-import { jsonText, type JsonValue } from "../../../json.js";
+import { jsonText, type JsonValue } from "../../../engine/json.js";
 
 
 /**

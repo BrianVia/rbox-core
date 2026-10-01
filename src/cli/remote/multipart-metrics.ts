@@ -1,5 +1,5 @@
 import { metricsEnabled } from "../metrics.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { readNumericFields } from "./timings.js";
 
 export const multipartMetricsEnabled = (): boolean => metricsEnabled();

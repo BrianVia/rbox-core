@@ -12,7 +12,7 @@ import { sign, verify, type SignKeyPair } from "./asym.js";
 import { canonicalString, verifyRoundTrip } from "./jcs.js";
 import { fromB64url, fromHex, sha256Hex, toB64url, utf8 } from "./primitives.js";
 import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain } from "../manifest-chain.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 export { MAX_MANIFEST_DELTA_CHAIN } from "../manifest-chain.js";
 
 export const GENESIS_PARENT_HASH = "0".repeat(64);

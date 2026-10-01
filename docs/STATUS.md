@@ -1,5 +1,17 @@
 # rbox status — living state snapshot
 
+## 2026-10-01 — `src/engine` becomes the open-source `@rbox/sync` package (design 318)
+
+- Founder decision: open-source the sync engine as a library. `src/engine/` now has its own
+  `package.json` (`@rbox/sync`, Apache-2.0, `private: true` until first publish), README and
+  LICENSE. Product code moved out (`detect`, `doctor` → `src/cli/host-readiness.ts`,
+  `pat-token`); `src/json.ts` moved in. A new guard keeps engine production files free of
+  imports outside the engine. `scripts/sync-package-smoke.ts` packs, installs and runs the
+  package from a fresh project.
+- Deferred: Node support, a push/pull orchestration API (GPT review rejected a naive
+  `CommitHead`), `FORMAT.md`, and publishing. Founder-only: create the `rbox` npm org and
+  confirm Apache-2.0. The rest of the repo is public but still unlicensed.
+- Notion tracking: Notion MCP unavailable this session. This work is NOT recorded in Notion.
 ## 2026-10-01 — #915 MERGED: daemon survives an offline boot (user-reported 46h silent stop)
 
 - **Shipped:** PR #915 squash-merged to `main` as `cb0e4b33e`. `runDaemon` now

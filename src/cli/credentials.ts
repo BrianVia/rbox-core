@@ -7,7 +7,7 @@ import { compareProcessStart, systemLockIdentity } from "../engine/lockfile.js";
 import { rboxDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 /** The whitelisted, versioned credential document written to disk. */
 export interface CredentialsV1 {

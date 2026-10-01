@@ -12,7 +12,7 @@ import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { RECOVERY_KIT_SERVICE } from "./genesis-seam.js";
 import type { KeychainArtifact, KeychainProbe } from "./recovery-kit-keychain.js";
 import { assertAccountId } from "./account-id.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 export const KIT_BANNER = "rbox RECOVERY KIT — keep this somewhere safe";
 const FILE_MODE = 0o600;

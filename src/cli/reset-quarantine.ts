@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedCopy, boundedHash, boundedJsonRead, boundedRead, RESET_STREAM_BYTE_LIMIT } from "./reset-io.js";
 import { observeResetJournalBytes } from "./reset-journal.js";

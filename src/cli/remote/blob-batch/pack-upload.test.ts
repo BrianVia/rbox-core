@@ -11,7 +11,7 @@ import {
   PACK_TARGET_PAYLOAD_BYTES,
   parsePack,
 } from "../../../engine/blob-pack.js";
-import type { JsonValue } from "../../../json.js";
+import type { JsonValue } from "../../../engine/json.js";
 import { RemoteContext } from "../context.js";
 import { BlobRetryLaterError } from "../errors.js";
 import { getPackUploadTiming, resetPackUploadTimingForTests } from "../../upload-lane-timing.js";

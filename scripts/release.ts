@@ -20,7 +20,7 @@ import { RELEASE_KEYS } from "../src/cli/release-key.js";
 import { parseSemver, releaseChannelForVersion, semverGt, type ReleaseChannel } from "../src/cli/semver.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 import { publishReleaseObjects, wranglerReleaseStore, type ReleaseObjectStore } from "./release-publish.js";
-import { jsonObject, jsonText, type JsonValue } from "../src/json.js";
+import { jsonObject, jsonText, type JsonValue } from "../src/engine/json.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.

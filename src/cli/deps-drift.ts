@@ -14,7 +14,8 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { ECOSYSTEM_RULES, detectProjects, hashFile, writeFileAtomic, type EcosystemRule } from "../engine/index.js";
+import { hashFile, writeFileAtomic } from "../engine/index.js";
+import { ECOSYSTEM_RULES, detectProjects, type EcosystemRule } from "./detect.js";
 import { depsStatePath } from "./rbox-paths.js";
 
 // ── state ────────────────────────────────────────────────────────────────────

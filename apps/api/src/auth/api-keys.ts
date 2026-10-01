@@ -6,7 +6,7 @@ import { isWellFormed, json, objectWithKeys, SHA256_HEX_RE, truncateUtf8, utf8By
 import { revokeDevice } from "./devices.js";
 import { readPlan } from "./mint.js";
 import { isPaidPlan } from "../plans.js";
-import { PAT_MAX_TTL_MS } from "../../../../src/engine/pat-token.js";
+import { PAT_MAX_TTL_MS } from "../../../../src/cli/pat-token.js";
 
 const API_KEY_CAP = 5;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,96}$/;

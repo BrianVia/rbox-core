@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import type { JsonValue } from "../../../src/json.js";
+import type { JsonValue } from "../../../src/engine/json.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { acceptConnection, broadcast, broadcastKeyDelivery } from "../src/ws-fanout.js";
 

@@ -1,5 +1,5 @@
 /** Never: filesystem access, reset authorization, or artifact paths. */
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 
 export type ResetJournalTokenErrorCode =
   | "JSON_SYNTAX" | "DEPTH_LIMIT" | "TOKEN_LIMIT" | "MEMBER_LIMIT"

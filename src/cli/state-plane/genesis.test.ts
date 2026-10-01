@@ -4,7 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import { AUTHORITY_MARKER_MAGIC } from "./authority-marker.js";

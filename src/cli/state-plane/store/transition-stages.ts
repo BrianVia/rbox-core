@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { RepoRecord, RepoRecordInput } from "../../sync-state-model.js";
 import type { RepoBaseProof } from "../../sync-git/base-composer.js";
-import { jsonCounter, jsonObject, type JsonObject, type JsonValue } from "../../../json.js";
+import { jsonCounter, jsonObject, type JsonObject, type JsonValue } from "../../../engine/json.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 import {

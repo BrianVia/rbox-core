@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "./fsutil.js";
 import { isSafeRelPath } from "./manifest-validate.js";
-import type { JsonValue } from "../json.js";
+import type { JsonValue } from "./json.js";
 
 export interface EncryptAddressCacheContext {
   accountId: string;

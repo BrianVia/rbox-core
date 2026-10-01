@@ -7,7 +7,7 @@ import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import { currentWorkspaceId, daemonRuntimeDir, type DaemonModeIntent } from "../daemon-control.js";
 import { credentialsForStrictFlow, loadCredentials } from "../credentials.js";
 import type { DaemonMode } from "../daemon/ambient-status.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 
 const DESIRED_FILE = "desired.json";
 

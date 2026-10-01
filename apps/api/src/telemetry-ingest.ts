@@ -5,7 +5,7 @@ import { readBodyCapped } from "./util.js";
 import { dbFor } from "./db.js";
 import { rateLimited } from "./ratelimit.js";
 import { json } from "./util.js";
-import type { JsonObject, JsonValue } from "../../../src/json.js";
+import type { JsonObject, JsonValue } from "../../../src/engine/json.js";
 
 const BODY_CAP_BYTES = 32 * 1024;
 export const TELEMETRY_BATCH_CAP = 64;

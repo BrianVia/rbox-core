@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { findShardWeightViolations, INQUIRER_IMPORT_ERROR, TUI_IMPORT_ERROR } from "./guards";
+import { ENGINE_BOUNDARY_ERROR, findShardWeightViolations, INQUIRER_IMPORT_ERROR, TUI_IMPORT_ERROR } from "./guards";
 import { FILE_WEIGHTS } from "./ci-shard-weights";
 
 const fixtureRoots: string[] = [];
@@ -91,6 +91,20 @@ describe("repository guards", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain('src/stray.ts:1:import { input } from "@inquirer/input";');
     expect(result.stderr).toContain(INQUIRER_IMPORT_ERROR);
+  });
+
+  test("keeps the published engine package free of rbox imports", async () => {
+    const root = await makeFixture();
+    await put(root, "src/engine/ok.ts", 'import fs from "node:fs";\nimport ignore from "ignore";\nimport { a } from "./sub/a.js";\n// a comment that says from "../cli/x.js"\n');
+    await put(root, "src/engine/leak.ts", 'import {\n  b,\n} from "../cli/config.js";\nexport { c } from "react";\n');
+    await put(root, "src/engine/leak.test.ts", 'import { d } from "../cli/config.js";\n');
+    const result = await runFixture(root);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("src/engine/leak.ts:3:../cli/config.js");
+    expect(result.stdout).toContain("src/engine/leak.ts:4:react");
+    expect(result.stdout).not.toContain("src/engine/ok.ts");
+    expect(result.stdout).not.toContain("leak.test.ts");
+    expect(result.stderr).toContain(ENGINE_BOUNDARY_ERROR);
   });
 
   test("rejects Ink outside the shared runtime", async () => {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { jsonObject, jsonText, type JsonValue } from "../json.js";
+import { jsonObject, jsonText, type JsonValue } from "../engine/json.js";
 import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
 import { isStandaloneBinary } from "./runtime.js";

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { canonicalize } from "../engine/e2ee/jcs.js";
-import type { JsonObject, JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../engine/json.js";
 import {
   repositoryIdentityHash,
   validateRepoIdentityV1,

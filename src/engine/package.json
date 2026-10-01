@@ -1,0 +1,32 @@
+{
+  "name": "@rbox/sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end encrypted, content-addressed directory sync engine",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrianVia/rbox-core.git",
+    "directory": "src/engine"
+  },
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./*.js": "./*.ts"
+  },
+  "files": [
+    "**/*.ts",
+    "!**/*.test.ts",
+    "!**/*.helpers.ts",
+    "!**/*.test-helper.ts",
+    "!**/*.bench-helper.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "ignore": "^5.3.2"
+  }
+}

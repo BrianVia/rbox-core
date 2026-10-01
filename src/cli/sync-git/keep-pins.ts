@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { writeFileAtomic, fsyncDirectory } from "../../engine/fsutil.js";
 import type { GitSection } from "../../engine/types.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 import { enumerateRefReflogOids, HEX40, repoCtx } from "./git-state.js";
 import { cleanGitEnv, git } from "../../engine/git-spawn.js";
 import { tipOwnedByIncoming } from "./reachability.js";

@@ -7,7 +7,7 @@ import {
 import {
   type RepoRecord, type StateSaveOptions, type SyncState,
 } from "../sync-state-model.js";
-import { jsonCounter } from "../../json.js";
+import { jsonCounter } from "../../engine/json.js";
 import {
   expectedStateNonce, repoRecordsForState,
 } from "../sync-state-records.js";

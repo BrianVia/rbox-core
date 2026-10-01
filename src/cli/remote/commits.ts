@@ -6,7 +6,7 @@ import type { RemoteContext } from "./context.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
 import { timePushTailRequest } from "../push-spans.js";
 import { errorCode, NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
-import type { JsonValue } from "../../json.js";
+import type { JsonValue } from "../../engine/json.js";
 import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;

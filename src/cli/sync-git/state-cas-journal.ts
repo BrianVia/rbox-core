@@ -12,7 +12,7 @@ import {
   type ProcessIncarnation,
   type SerializedMarkerObservation,
 } from "../../engine/lockfile.js";
-import type { JsonObject, JsonValue } from "../../json.js";
+import type { JsonObject, JsonValue } from "../../engine/json.js";
 
 const JOURNAL_DIR = path.join(".rbox", "state", "git-lock-transactions", "v1");
 const HEX_32 = /^[0-9a-f]{32}$/;
